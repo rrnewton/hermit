@@ -1,0 +1,1171 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
+//! Keeping each thread's [`SignalShadow`] in step with the guest.
+//!
+//! Every function here runs after the guest operation it records has
+//! committed, uses only values Detcore already holds for that operation, and
+//! issues no injection and no scheduler request: recording changes nothing the
+//! guest or the schedule can observe, and adds no log line at INFO or above
+//! while the copy matches (one TRACE line per check, for counting).
+//!
+//! Where the backend's kernel signal state is the guest's own
+//! ([`kernel_state_is_the_guests`]), the
+//! copy is checked against the kernel after each recorded call: the old action
+//! or old mask the kernel wrote back, and `SigBlk`, `SigIgn` and `SigCgt`. A
+//! mismatch is logged once, by name, and the thread's copy is dropped: it is
+//! never repaired from the kernel, which would hide the defect the check is
+//! for.
+
+use reverie::Errno;
+use reverie::Guest;
+use reverie::syscalls::Addr;
+use reverie::syscalls::AddrMut;
+use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Syscall;
+use tracing::debug;
+use tracing::trace;
+use tracing::warn;
+
+use super::threads::KernelSigaction;
+use super::threads::KernelSigset;
+use super::threads::host_signal_state_reads_refused;
+use super::threads::read_thread_signal_state;
+use crate::Detcore;
+use crate::record_or_replay::RecordOrReplay;
+use crate::signal_state::Action;
+use crate::signal_state::Dispositions;
+use crate::signal_state::SignalShadow;
+use crate::signal_state::ThreadSignals;
+use crate::signal_state::sigbit;
+
+/// The prefix of the one log line a divergence produces, for log searches.
+pub(crate) const DIVERGED: &str = "SIGNAL_STATE_COPY_DIVERGED";
+
+/// Signals whose kernel state differs from the guest's by design, left out of
+/// every comparison:
+/// - Reverie's preemption signal is Hermit's, and Detcore keeps the guest from
+///   installing or blocking it (`handle_rt_sigaction`, `rt_sigprocmask_inner`).
+/// - SIGTRAP, which Detcore already reports as appropriated
+///   (`warn_appropriated_signal`): when the ptrace backend single-steps the
+///   guest, the kernel force-delivers the step trap, which unblocks SIGTRAP
+///   and resets an ignored, or caught but blocked, SIGTRAP to its default
+///   (`force_sig_info_to_task`). Reverie characterizes this
+///   in `reverie-ptrace/src/plain_guest_regression_tests.rs`
+///   (`sigtrap_profile_follows_each_handler_shape`).
+fn reserved() -> KernelSigset {
+    sigbit(reverie::PERF_EVENT_SIGNAL as i32) | sigbit(libc::SIGTRAP)
+}
+
+impl From<KernelSigaction> for Action {
+    fn from(action: KernelSigaction) -> Self {
+        Action {
+            handler: action.handler,
+            flags: action.flags,
+            restorer: action.restorer,
+            mask: action.mask,
+        }
+    }
+}
+
+/// Whether this backend's kernel signal state for a guest thread is the
+/// guest's own: the guest thread is a host task, and no runtime in the
+/// guest's process installs handlers or masks of its own. This is the mechanism
+/// fact `supports_blocked_wait_signal_interruption` describes (true for
+/// ptrace, and for e9patch, which runs under ptrace). Threads must also be
+/// serialized: otherwise two threads sharing actions could change them in the
+/// kernel in one order and in the copy in another. Elsewhere the copy is
+/// neither seeded from the kernel nor checked against it.
+fn kernel_state_is_the_guests<G, T>(guest: &G) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let config = guest.config();
+    config.sequentialize_threads
+        && config.backend.supports_blocked_wait_signal_interruption
+        && !host_signal_state_reads_refused()
+}
+
+/// Applies `change` to this thread's copy: the actions its group shares and
+/// its own masks. Returns `None`, and drops the thread's copy without a new
+/// report, when the shared actions are unknown because another thread
+/// sharing them lost its copy (that loss was reported).
+fn with_copy<G, T, R>(
+    guest: &mut G,
+    change: impl FnOnce(&mut Dispositions, &mut ThreadSignals) -> R,
+) -> Option<R>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let shadow = guest.thread_state_mut().signal_shadow.as_mut()?;
+    let actions = std::sync::Arc::clone(&shadow.dispositions);
+    let mut actions = actions.lock().unwrap();
+    match actions.as_mut() {
+        Some(dispositions) => Some(change(dispositions, &mut shadow.thread)),
+        None => {
+            drop(actions);
+            debug!(
+                "[dtid {}] signal-state copy dropped: a thread sharing its actions lost its copy",
+                guest.thread_state().dettid
+            );
+            drop_copy(guest);
+            None
+        }
+    }
+}
+
+/// Drops this thread's copy for good: it is never seeded again, and threads
+/// this one creates start without one.
+fn drop_copy<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    guest.thread_state_mut().signal_shadow = None;
+    guest.thread_state_mut().signal_shadow_lost = true;
+}
+
+/// At a syscall's entry, the thread has run guest code since its last event:
+/// a temporary-mask restore no handler took has happened, and an open
+/// handler frame may have returned unseen. Accounts for both before the call
+/// can depend on the mask (a clone copies it; an exec keeps it). Then, for a
+/// wait that sleeps under a temporary mask, keeps that mask as Linux copies it
+/// now, at the call's entry ([`ThreadSignals::wait_mask`]).
+pub(crate) fn at_syscall_entry<G, T>(guest: &mut G, call: &Syscall)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let Some(shadow) = guest.thread_state_mut().signal_shadow.as_mut() else {
+        return;
+    };
+    shadow.thread.settle();
+    shadow.thread.wait_mask = None;
+    reconcile_returns(guest, "syscall entry");
+    let Some(mask) = temporary_wait_mask(guest, call) else {
+        return;
+    };
+    if let Some(shadow) = guest.thread_state_mut().signal_shadow.as_mut() {
+        // Linux never installs SIGKILL or SIGSTOP (`set_current_blocked`).
+        shadow.thread.wait_mask = Some(super::signal::kernel_installed_signal_mask(mask));
+    }
+}
+
+/// The temporary mask `call` sleeps under, read from the guest as the kernel
+/// reads it: `rt_sigsuspend`, `ppoll`, `pselect6` (through its `{ mask, size }`
+/// pair), `epoll_pwait` and `epoll_pwait2`. `None` for any other call, for no
+/// mask, and for a mask the kernel would refuse (wrong size, unreadable).
+fn temporary_wait_mask<G, T>(guest: &G, call: &Syscall) -> Option<KernelSigset>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let memory = guest.memory();
+    let read_set = |address: usize, size: usize| {
+        if size != super::threads::KERNEL_SIGSET_SIZE {
+            return None;
+        }
+        memory
+            .read_value::<_, KernelSigset>(Addr::<KernelSigset>::from_raw(address)?)
+            .ok()
+    };
+    match *call {
+        Syscall::RtSigsuspend(call) => read_set(call.mask()?.as_raw(), call.sigsetsize()),
+        Syscall::Ppoll(call) => read_set(call.sigmask()?.as_raw(), call.sigsetsize()),
+        Syscall::EpollPwait(call) => read_set(call.sigmask()?.as_raw(), call.sigsetsize()),
+        // epoll_pwait2(epfd, events, maxevents, timeout, sigmask, sigsetsize)
+        // is untyped in Reverie.
+        Syscall::Other(reverie::syscalls::Sysno::epoll_pwait2, args) => {
+            read_set(args.arg4, args.arg5)
+        }
+        Syscall::Pselect6(call) => {
+            let argument = memory
+                .read_value::<_, super::io::Pselect6SigmaskArg>(
+                    call.sigmask()?.cast::<super::io::Pselect6SigmaskArg>(),
+                )
+                .ok()?;
+            read_set(argument.sigmask, argument.sigsetsize)
+        }
+        _ => None,
+    }
+}
+
+/// Accounts for handler returns the kernel ran without a report (the ptrace
+/// backend never traps `rt_sigreturn`), from the kernel's current mask, before
+/// a transition that depends on the mask. Does nothing while no handler frame
+/// is open, or where the kernel's state is not the guest's.
+fn reconcile_returns<G, T>(guest: &mut G, before: &str)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let open_frames = guest
+        .thread_state()
+        .signal_shadow
+        .as_ref()
+        .is_some_and(|shadow| !shadow.thread.activations.is_empty());
+    if !open_frames || !kernel_state_is_the_guests(guest) {
+        return;
+    }
+    let Some(kernel) = read_or_give_up(guest, before) else {
+        return;
+    };
+    let Some(shadow) = guest.thread_state_mut().signal_shadow.as_mut() else {
+        return;
+    };
+    let copy = shadow.thread.blocked;
+    let open = shadow.thread.activations.len();
+    if shadow.thread.reconcile_returns(kernel.blocked, reserved()) {
+        let closed = open - shadow.thread.activations.len();
+        if closed > 0 {
+            debug!(
+                "[dtid {}] signal-state copy: {closed} handler frame(s) taken as returned at {before}",
+                guest.thread_state().dettid
+            );
+        }
+    } else {
+        diverged(
+            guest,
+            before,
+            &format!(
+                "SigBlk kernel {:#018x} is neither the copy's {:#018x} nor an open handler frame's",
+                kernel.blocked & !reserved(),
+                copy & !reserved()
+            ),
+        );
+    }
+}
+
+/// Seeds the first image's copy, or applies `execve`'s reset to a later one.
+/// Called from the new image's first callback. The first image's ignored set
+/// and mask are what it inherited from the launcher, read from the kernel
+/// before it runs a guest instruction; where that read is unavailable, the
+/// copy stays unknown. Seeding there needs the backend to report the first
+/// image's inherited state, which the A5 design puts in the `Guest` contract
+/// (its step 3).
+pub(crate) fn at_exec<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if let Some(shadow) = guest.thread_state_mut().signal_shadow.as_mut() {
+        if !shadow.exec() {
+            drop_copy(guest);
+            return;
+        }
+        check_against_kernel(guest, "execve");
+        return;
+    }
+    // A thread with no copy is seeded at its exec, where the ignored set and
+    // the mask describe the whole state; a copy dropped earlier is never
+    // rebuilt from the kernel.
+    if guest.thread_state().signal_shadow_lost || !kernel_state_is_the_guests(guest) {
+        return;
+    }
+    if let Ok(state) = read_thread_signal_state(guest.pid(), guest.tid()) {
+        guest.thread_state_mut().signal_shadow =
+            Some(SignalShadow::seeded(state.ignored, state.blocked));
+    }
+}
+
+/// Records a committed `rt_sigaction`. `new` is the action the kernel
+/// installed (Detcore's sanitized copy of an action the kernel validated),
+/// `None` for a query. `result` is the call's result: an `EFAULT` after the
+/// new action was read can only come from writing `old_action`, after the new
+/// action is installed.
+pub(super) fn record_rt_sigaction<G, T>(
+    guest: &mut G,
+    signum: i32,
+    new: Option<KernelSigaction>,
+    old_action: Option<AddrMut<'_, libc::sigaction>>,
+    result: &Result<i64, Errno>,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let committed = result.is_ok() || (new.is_some() && *result == Err(Errno::EFAULT));
+    if !committed {
+        return;
+    }
+    let Some(predicted) = with_copy(guest, |dispositions, _| {
+        dispositions.sigaction(signum, new.map(Action::from))
+    }) else {
+        return;
+    };
+    let old = match predicted {
+        Ok(old) => old,
+        Err(errno) => {
+            return diverged(
+                guest,
+                "rt_sigaction",
+                &format!(
+                    "the kernel accepted signal {signum}, which the copy refuses with {errno}"
+                ),
+            );
+        }
+    };
+    if result.is_ok()
+        && sigbit(signum) & reserved() == 0
+        && let Some(address) = old_action
+        && let Ok(written) = guest
+            .memory()
+            .read_value::<_, KernelSigaction>(address.cast::<KernelSigaction>())
+        && Action::from(written) != old
+    {
+        return diverged(
+            guest,
+            "rt_sigaction",
+            &format!(
+                "old action of signal {signum}: the kernel wrote {:?}, the copy holds {old:?}",
+                Action::from(written)
+            ),
+        );
+    }
+    check_against_kernel(guest, "rt_sigaction");
+}
+
+/// What Detcore knows of an `rt_sigprocmask` call's set.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum SetInput {
+    /// The call passed no set: a query.
+    None,
+    /// Detcore never injected the call: its own check of the set failed
+    /// first, so the kernel did nothing.
+    NotRun,
+    /// The kernel read this set and accepted it (the `SIG_BLOCK` and
+    /// `SIG_SETMASK` paths validate it before injecting). It is the set
+    /// without Hermit's reserved signal.
+    Validated(KernelSigset),
+    /// The call ran with a set only Detcore's plain read saw (`None` when even
+    /// that failed); the read can succeed where the kernel's fails.
+    Unvalidated(Option<KernelSigset>),
+}
+
+/// Records a committed `rt_sigprocmask`. An `EFAULT` is a committed change
+/// only when it can come from writing `oldset` alone.
+pub(super) fn record_rt_sigprocmask<G, T>(
+    guest: &mut G,
+    how: i32,
+    set: SetInput,
+    oldset: Option<AddrMut<'_, libc::sigset_t>>,
+    result: &Result<i64, Errno>,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let valid_how = matches!(how, libc::SIG_BLOCK | libc::SIG_UNBLOCK | libc::SIG_SETMASK);
+    let set = match (set, result) {
+        (SetInput::NotRun, _) => return,
+        (SetInput::None, Ok(_)) => None,
+        (SetInput::Validated(set), Ok(_) | Err(Errno::EFAULT)) => Some(set),
+        (SetInput::Unvalidated(Some(set)), Ok(_)) => Some(set),
+        (SetInput::Unvalidated(None), Ok(_)) => {
+            return diverged(
+                guest,
+                "rt_sigprocmask",
+                "the kernel read a set that Detcore could not read",
+            );
+        }
+        // The kernel reads the set before checking `how`, and before writing
+        // the old mask: without an old mask, or with an invalid `how`, the
+        // fault was the set's and nothing changed.
+        (SetInput::Unvalidated(_), Err(Errno::EFAULT)) if oldset.is_none() || !valid_how => {
+            return;
+        }
+        (SetInput::Unvalidated(_), Err(Errno::EFAULT)) => {
+            // The set or the old mask: Linux leaves no way to tell which.
+            debug!(
+                "[dtid {}] signal-state copy dropped: rt_sigprocmask's EFAULT may come from \
+                 its set or its old mask",
+                guest.thread_state().dettid
+            );
+            drop_copy(guest);
+            return;
+        }
+        _ => return,
+    };
+    let Some(predicted) = with_copy(guest, |_, thread| thread.sigprocmask(how, set)) else {
+        return;
+    };
+    let old = match predicted {
+        Ok(old) => old,
+        Err(errno) => {
+            return diverged(
+                guest,
+                "rt_sigprocmask",
+                &format!("the kernel accepted how={how}, which the copy refuses with {errno}"),
+            );
+        }
+    };
+    if result.is_ok()
+        && let Some(address) = oldset
+        && let Ok(written) = guest
+            .memory()
+            .read_value::<_, KernelSigset>(address.cast::<KernelSigset>())
+        && written & !reserved() != old & !reserved()
+    {
+        return diverged(
+            guest,
+            "rt_sigprocmask",
+            &format!(
+                "old mask: the kernel wrote {:#x}, the copy holds {:#x}",
+                written & !reserved(),
+                old & !reserved()
+            ),
+        );
+    }
+    check_against_kernel(guest, "rt_sigprocmask");
+}
+
+/// Records that the Tool approved `signal` for delivery to this thread, so the
+/// backend delivers it now: a caught signal enters its handler with
+/// `sa_mask` added, and `SA_RESETHAND` puts the default back. The handler
+/// mask is checked at the thread's next recorded call, when the frame has been
+/// written. A delivery whose frame cannot be written becomes a SIGSEGV and
+/// leaves the old mask, which the check can take for the frame's return: that
+/// case is not told apart.
+pub(crate) fn record_delivery<G, T>(guest: &mut G, signal: i32)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    // At a delivery stop the kernel has not installed the handler mask yet.
+    take_wait_outcome(guest);
+    reconcile_returns(guest, "signal delivery");
+    let Some(delivered) = with_copy(guest, |dispositions, thread| {
+        crate::signal_state::deliver(dispositions, thread, signal)
+    }) else {
+        return;
+    };
+    match delivered {
+        Ok(Some(action)) => {
+            // A handler whose mask equals an open frame's saved mask cannot
+            // be told from that frame's return: the next check verifies
+            // nothing about this entry.
+            if let Some(shadow) = guest.thread_state().signal_shadow.as_ref()
+                && action.handler > 1
+                && shadow.thread.activations[..shadow.thread.activations.len() - 1]
+                    .contains(&shadow.thread.blocked)
+            {
+                debug!(
+                    "[dtid {}] signal-state copy: the handler mask of signal {signal} equals an \
+                     open frame's, so its entry is unverifiable",
+                    guest.thread_state().dettid
+                );
+            }
+        }
+        Ok(None) => {
+            debug!(
+                "[dtid {}] signal-state copy dropped: more than {} handler frames open",
+                guest.thread_state().dettid,
+                crate::signal_state::MAX_OPEN_FRAMES
+            );
+            drop_copy(guest);
+        }
+        Err(errno) => diverged(
+            guest,
+            "signal delivery",
+            &format!("the backend delivers signal {signal}, which the copy refuses with {errno}"),
+        ),
+    }
+}
+
+/// At a delivery stop inside a temporary-mask wait, Linux holds one of two
+/// masks: the wait's, when the kernel ran the call (the handler's frame then
+/// saves the thread's own mask), or the thread's own, when the signal arrived
+/// before the call started, which depends on host timing (see
+/// `record_or_replay_rt_sigsuspend`). The kernel's current mask tells which;
+/// any other mask is left for the checks that follow to report.
+fn take_wait_outcome<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let Some(wait_mask) = guest
+        .thread_state()
+        .signal_shadow
+        .as_ref()
+        .and_then(|shadow| shadow.thread.wait_mask)
+    else {
+        return;
+    };
+    if !kernel_state_is_the_guests(guest) {
+        return;
+    }
+    let Some(kernel) = read_or_give_up(guest, "signal delivery") else {
+        return;
+    };
+    let Some(shadow) = guest.thread_state_mut().signal_shadow.as_mut() else {
+        return;
+    };
+    let unreserved = !reserved();
+    if kernel.blocked & unreserved == wait_mask & unreserved
+        && shadow.thread.blocked & unreserved != wait_mask & unreserved
+    {
+        shadow.thread.interrupted_under_temporary_mask(wait_mask);
+    }
+}
+
+/// Unused until a backend reports `rt_sigreturn` (A5 step 3): the ptrace
+/// backend, the only one whose copy is seeded today, never traps it.
+///
+/// Records an `rt_sigreturn` at its entry, before it runs: Linux installs the
+/// frame's `uc_sigmask` as soon as it can read it, before restoring the
+/// registers can fail (`arch/x86/kernel/signal_64.c`). A frame whose mask
+/// cannot be read changes no mask; the kernel then sends SIGSEGV.
+pub(crate) async fn record_rt_sigreturn<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if guest.thread_state().signal_shadow.is_none() {
+        return;
+    }
+    let sp = guest.regs().await.rsp as usize;
+    let restored = Addr::<u64>::from_raw(sp.wrapping_add(super::signal::UC_SIGMASK_OFFSET))
+        .and_then(|address| guest.memory().read_value(address).ok());
+    if let Some(mask) = restored {
+        with_copy(guest, |_, thread| thread.sigreturn(mask & !reserved()));
+    }
+}
+
+/// Compares the copy with the kernel's `/proc` view of this thread, where that
+/// view is the guest's own.
+fn check_against_kernel<G, T>(guest: &mut G, after: &str)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if !kernel_state_is_the_guests(guest) || guest.thread_state().signal_shadow.is_none() {
+        return;
+    }
+    let Some(kernel) = read_or_give_up(guest, after) else {
+        return;
+    };
+    let Some(copy) = with_copy(guest, |dispositions, thread| {
+        (
+            thread.blocked,
+            dispositions.ignored(),
+            dispositions.caught(),
+        )
+    }) else {
+        return;
+    };
+    let (blocked, ignored, caught) = copy;
+    let unreserved = !reserved();
+    let mismatches: Vec<String> = [
+        ("SigBlk", kernel.blocked, blocked),
+        ("SigIgn", kernel.ignored, ignored),
+        ("SigCgt", kernel.caught, caught),
+    ]
+    .into_iter()
+    .filter(|(_, kernel, copy)| kernel & unreserved != copy & unreserved)
+    .map(|(field, kernel, copy)| {
+        format!(
+            "{field} kernel {:#018x} copy {:#018x}",
+            kernel & unreserved,
+            copy & unreserved
+        )
+    })
+    .collect();
+    if mismatches.is_empty() {
+        CHECKS_MATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        trace!(
+            "[dtid {}] signal-state copy matches the kernel after {after}",
+            guest.thread_state().dettid
+        );
+    } else {
+        diverged(guest, after, &mismatches.join(", "));
+    }
+}
+
+/// How many kernel checks found the copy matching, process-wide: the
+/// denominator of "no divergence".
+pub(crate) static CHECKS_MATCHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many divergences were reported, process-wide.
+pub(crate) static DIVERGENCES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// This thread's kernel signal state, where a check or a choice needs it.
+/// A thread whose state cannot be read (it may be exiting) gives up its copy
+/// without a divergence report, rather than go on unchecked.
+fn read_or_give_up<G, T>(guest: &mut G, at: &str) -> Option<super::threads::KernelSignalState>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match read_thread_signal_state(guest.pid(), guest.tid()) {
+        Ok(state) => Some(state),
+        Err(errno) => {
+            debug!(
+                "[dtid {}] signal-state copy dropped at {at}: the kernel state is unreadable ({errno})",
+                guest.thread_state().dettid
+            );
+            drop_copy(guest);
+            None
+        }
+    }
+}
+
+/// The temporary mask a wait's handler copied in the wait's own turn, the
+/// mask the kernel installs; it replaces the one read at the call's entry
+/// ([`ThreadSignals::wait_mask`]), which a sibling could change before the
+/// turn.
+pub(crate) fn note_wait_mask<G, T>(guest: &mut G, mask: KernelSigset)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if let Some(shadow) = guest.thread_state_mut().signal_shadow.as_mut() {
+        shadow.thread.wait_mask = Some(super::signal::kernel_installed_signal_mask(mask));
+    }
+}
+
+/// Reports a divergence once, drops this thread's copy and marks the actions
+/// it shares unknown, so no sharing thread reports the consequence again.
+fn diverged<G, T>(guest: &mut G, after: &str, what: &str)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    DIVERGENCES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    warn!(
+        "[dtid {}] {DIVERGED} after {after}: {what}; this thread's copy is dropped",
+        guest.thread_state().dettid
+    );
+    if let Some(shadow) = guest.thread_state().signal_shadow.as_ref() {
+        shadow.forget_dispositions();
+    }
+    drop_copy(guest);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    use reverie::GlobalRPC;
+    use reverie::GlobalTool;
+    use reverie::Pid;
+    use reverie::syscalls::LocalMemory;
+    use reverie::syscalls::SyscallInfo;
+
+    use super::*;
+    use crate::Config;
+    use crate::GlobalState;
+    use crate::ThreadState;
+    use crate::syscalls::threads::KernelSignalState;
+    use crate::syscalls::threads::signal_state_read_seam;
+    use crate::types::DetPid;
+
+    /// A guest whose memory is this process's own and whose `/proc` signal
+    /// state is scripted; anything else it is asked to do fails the test.
+    struct ShadowGuest {
+        config: Config,
+        thread: ThreadState<()>,
+    }
+
+    struct NoStack;
+    struct NoStackGuard;
+
+    impl Drop for NoStackGuard {
+        fn drop(&mut self) {}
+    }
+
+    impl reverie::Stack for NoStack {
+        type StackGuard = NoStackGuard;
+        fn size(&self) -> usize {
+            panic!("recording uses no scratch stack")
+        }
+        fn capacity(&self) -> usize {
+            panic!("recording uses no scratch stack")
+        }
+        fn push<'stack, T>(&mut self, _: T) -> Addr<'stack, T> {
+            panic!("recording uses no scratch stack")
+        }
+        fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
+            panic!("recording uses no scratch stack")
+        }
+        fn commit(self) -> Result<Self::StackGuard, Errno> {
+            Ok(NoStackGuard)
+        }
+    }
+
+    #[reverie::tool]
+    impl GlobalRPC<GlobalState> for ShadowGuest {
+        async fn send_rpc(
+            &self,
+            message: <GlobalState as GlobalTool>::Request,
+        ) -> <GlobalState as GlobalTool>::Response {
+            panic!("recording must not send an RPC: {:?}", message.2)
+        }
+        fn config(&self) -> &Config {
+            &self.config
+        }
+    }
+
+    #[reverie::tool]
+    impl Guest<Detcore> for ShadowGuest {
+        type Memory = LocalMemory;
+        type Stack = NoStack;
+
+        fn tid(&self) -> Pid {
+            Pid::from_raw(std::process::id() as i32)
+        }
+        fn pid(&self) -> Pid {
+            Pid::from_raw(std::process::id() as i32)
+        }
+        fn ppid(&self) -> Option<Pid> {
+            None
+        }
+        fn memory(&self) -> Self::Memory {
+            LocalMemory::new()
+        }
+        fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
+            &mut self.thread
+        }
+        fn thread_state(&self) -> &ThreadState<()> {
+            &self.thread
+        }
+        async fn regs(&mut self) -> libc::user_regs_struct {
+            panic!("recording on a ptrace-like backend reads no registers")
+        }
+        async fn stack(&mut self) -> Self::Stack {
+            NoStack
+        }
+        async fn daemonize(&mut self) {
+            panic!("recording must not daemonize")
+        }
+        async fn inject<S: SyscallInfo>(&mut self, _: S) -> Result<i64, Errno> {
+            panic!("recording must not inject")
+        }
+        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
+            panic!("recording must not retire the guest")
+        }
+        fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), reverie::Error> {
+            panic!("recording must not set a timer")
+        }
+        fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), reverie::Error> {
+            panic!("recording must not set a timer")
+        }
+        fn read_clock(&mut self) -> Result<u64, reverie::Error> {
+            panic!("recording must not read a clock")
+        }
+    }
+
+    /// The kernel's signal state as the scripted `/proc` reports it.
+    #[derive(Clone, Default)]
+    struct Kernel(Rc<Cell<(KernelSigset, KernelSigset, KernelSigset)>>);
+
+    impl Kernel {
+        fn set(&self, blocked: KernelSigset, ignored: KernelSigset, caught: KernelSigset) {
+            self.0.set((blocked, ignored, caught));
+        }
+        fn install(&self) -> signal_state_read_seam::Installed {
+            let state = self.0.clone();
+            signal_state_read_seam::install(move |_, _| {
+                let (blocked, ignored, caught) = state.get();
+                Some(Ok(KernelSignalState {
+                    blocked,
+                    ignored,
+                    caught,
+                    ..KernelSignalState::default()
+                }))
+            })
+        }
+    }
+
+    /// A ptrace-like guest whose first image inherited `blocked` and nothing
+    /// ignored, seeded through `at_exec` from the scripted kernel.
+    fn seeded(kernel: &Kernel, blocked: KernelSigset) -> ShadowGuest {
+        // The ptrace backend's capabilities: its kernel signal state is the
+        // guest's own.
+        let config = Config {
+            sequentialize_threads: true,
+            backend: reverie::BackendCapabilities::PTRACE,
+            ..Config::default()
+        };
+        let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut guest = ShadowGuest { config, thread };
+        kernel.set(blocked, 0, 0);
+        at_exec(&mut guest);
+        assert!(
+            guest.thread.signal_shadow.is_some(),
+            "the first image is seeded"
+        );
+        guest
+    }
+
+    fn blocked(guest: &ShadowGuest) -> Option<KernelSigset> {
+        guest
+            .thread
+            .signal_shadow
+            .as_ref()
+            .map(|shadow| shadow.thread.blocked)
+    }
+
+    const USR1: KernelSigset = 1 << (libc::SIGUSR1 - 1);
+    const USR2: KernelSigset = 1 << (libc::SIGUSR2 - 1);
+
+    #[test]
+    fn a_matching_mask_change_is_recorded_and_checked() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = seeded(&kernel, 0);
+        kernel.set(USR1, 0, 0);
+        let matched = CHECKS_MATCHED.load(std::sync::atomic::Ordering::Relaxed);
+        // The old mask the kernel wrote: none was blocked.
+        let mut old: KernelSigset = 0;
+        let oldset = AddrMut::from_raw(&mut old as *mut KernelSigset as usize);
+        record_rt_sigprocmask(
+            &mut guest,
+            libc::SIG_BLOCK,
+            SetInput::Validated(USR1),
+            oldset,
+            &Ok(0),
+        );
+        assert_eq!(blocked(&guest), Some(USR1));
+        assert!(!guest.thread.signal_shadow_lost);
+        assert!(
+            CHECKS_MATCHED.load(std::sync::atomic::Ordering::Relaxed) > matched,
+            "the check ran and matched"
+        );
+    }
+
+    #[test]
+    fn the_wait_handlers_snapshot_replaces_the_entry_read_and_epoll_pwait2_is_decoded() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = seeded(&kernel, 0);
+        let entry: KernelSigset = USR2;
+        let call = Syscall::Other(
+            reverie::syscalls::Sysno::epoll_pwait2,
+            reverie::syscalls::SyscallArgs {
+                arg0: 3,
+                arg1: 0,
+                arg2: 1,
+                arg3: 0,
+                arg4: &entry as *const KernelSigset as usize,
+                arg5: 8,
+            },
+        );
+        at_syscall_entry(&mut guest, &call);
+        let wait_mask = |guest: &ShadowGuest| {
+            guest
+                .thread
+                .signal_shadow
+                .as_ref()
+                .and_then(|shadow| shadow.thread.wait_mask)
+        };
+        assert_eq!(
+            wait_mask(&guest),
+            Some(USR2),
+            "epoll_pwait2's mask, at entry"
+        );
+        note_wait_mask(&mut guest, USR1);
+        assert_eq!(
+            wait_mask(&guest),
+            Some(USR1),
+            "the handler's own snapshot wins"
+        );
+        let getpid = Syscall::Getpid(reverie::syscalls::Getpid::new());
+        at_syscall_entry(&mut guest, &getpid);
+        assert_eq!(wait_mask(&guest), None, "the next call is not in the wait");
+    }
+
+    #[test]
+    fn a_mismatch_drops_the_copy_for_good_and_its_sharers_quietly() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = seeded(&kernel, 0);
+        let sharer = guest
+            .thread
+            .signal_shadow
+            .as_ref()
+            .unwrap()
+            .for_clone(libc::CLONE_SIGHAND as u64 | libc::CLONE_VM as u64)
+            .unwrap();
+        // The kernel says USR2 is blocked; the copy, told USR1, disagrees.
+        kernel.set(USR2, 0, 0);
+        record_rt_sigprocmask(
+            &mut guest,
+            libc::SIG_BLOCK,
+            SetInput::Validated(USR1),
+            None,
+            &Ok(0),
+        );
+        assert_eq!(blocked(&guest), None, "the copy is dropped");
+        assert!(
+            DIVERGENCES.load(std::sync::atomic::Ordering::Relaxed) > 0,
+            "the divergence was reported"
+        );
+        assert!(guest.thread.signal_shadow_lost);
+        assert!(
+            sharer.dispositions.lock().unwrap().is_none(),
+            "the actions it shared are unknown now"
+        );
+        at_exec(&mut guest);
+        assert!(
+            guest.thread.signal_shadow.is_none(),
+            "a lost copy is never reseeded"
+        );
+    }
+
+    #[test]
+    fn an_efault_counts_only_when_the_kernel_ran_the_call_and_the_fault_was_the_old_masks() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = seeded(&kernel, 0);
+        let mut old: KernelSigset = 0;
+        let oldset = AddrMut::from_raw(&mut old as *mut KernelSigset as usize);
+        // Detcore's own check of the set failed: nothing ran.
+        record_rt_sigprocmask(
+            &mut guest,
+            libc::SIG_BLOCK,
+            SetInput::NotRun,
+            oldset,
+            &Err(Errno::EFAULT),
+        );
+        assert_eq!(blocked(&guest), Some(0));
+        // A validated set whose old-mask write failed: the change happened.
+        kernel.set(USR1, 0, 0);
+        record_rt_sigprocmask(
+            &mut guest,
+            libc::SIG_BLOCK,
+            SetInput::Validated(USR1),
+            oldset,
+            &Err(Errno::EFAULT),
+        );
+        assert_eq!(blocked(&guest), Some(USR1));
+        // An unvalidated set without an old mask: the set faulted.
+        record_rt_sigprocmask(
+            &mut guest,
+            libc::SIG_UNBLOCK,
+            SetInput::Unvalidated(Some(USR1)),
+            None,
+            &Err(Errno::EFAULT),
+        );
+        assert_eq!(blocked(&guest), Some(USR1));
+        // With an old mask, either could have faulted: the copy is given up,
+        // without a divergence report.
+        record_rt_sigprocmask(
+            &mut guest,
+            libc::SIG_UNBLOCK,
+            SetInput::Unvalidated(Some(USR1)),
+            oldset,
+            &Err(Errno::EFAULT),
+        );
+        assert_eq!(blocked(&guest), None);
+        assert!(guest.thread.signal_shadow_lost);
+    }
+
+    #[test]
+    fn a_delivery_inside_a_wait_follows_the_mask_the_kernel_holds() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let action = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        let int = 1 << (libc::SIGINT - 1);
+        for kernel_ran_the_wait in [true, false] {
+            let mut guest = seeded(&kernel, USR1 | USR2);
+            kernel.set(USR1 | USR2, 0, 1 << (libc::SIGINT - 1));
+            record_rt_sigaction(&mut guest, libc::SIGINT, Some(action), None, &Ok(0));
+            // rt_sigsuspend(&{USR1}) at its entry.
+            let temporary: KernelSigset = USR1;
+            let call = Syscall::RtSigsuspend(
+                reverie::syscalls::RtSigsuspend::new()
+                    .with_mask(Addr::from_raw(&temporary as *const KernelSigset as usize))
+                    .with_sigsetsize(8),
+            );
+            at_syscall_entry(&mut guest, &call);
+            // The delivery stop: the kernel holds the wait's mask if it ran the
+            // call, else the thread's own (the not-run case of
+            // record_or_replay_rt_sigsuspend).
+            kernel.set(
+                if kernel_ran_the_wait {
+                    USR1
+                } else {
+                    USR1 | USR2
+                },
+                0,
+                int,
+            );
+            record_delivery(&mut guest, libc::SIGINT);
+            let shadow = guest.thread.signal_shadow.as_ref().unwrap();
+            let expected = if kernel_ran_the_wait {
+                USR1
+            } else {
+                USR1 | USR2
+            };
+            assert_eq!(
+                shadow.thread.blocked,
+                expected | int,
+                "{kernel_ran_the_wait}"
+            );
+            assert_eq!(
+                shadow.thread.activations,
+                vec![USR1 | USR2],
+                "the frame saves the thread's own mask either way"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreported_return_is_recognised_at_the_next_syscall() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = seeded(&kernel, 0);
+        let action = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: USR2,
+        };
+        kernel.set(0, 0, USR1);
+        record_rt_sigaction(&mut guest, libc::SIGUSR1, Some(action), None, &Ok(0));
+        record_delivery(&mut guest, libc::SIGUSR1);
+        assert_eq!(blocked(&guest), Some(USR1 | USR2));
+        // The handler returned unseen; the next syscall finds the old mask.
+        let getpid = Syscall::Getpid(reverie::syscalls::Getpid::new());
+        at_syscall_entry(&mut guest, &getpid);
+        assert_eq!(blocked(&guest), Some(0));
+        // A mask that is neither is a divergence.
+        record_delivery(&mut guest, libc::SIGUSR1);
+        kernel.set(USR2, 0, USR1);
+        at_syscall_entry(&mut guest, &getpid);
+        assert_eq!(blocked(&guest), None);
+    }
+
+    #[test]
+    fn sigtrap_and_the_preemption_signal_are_left_out_of_old_values() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let trap = 1 << (libc::SIGTRAP - 1);
+        let mut guest = seeded(&kernel, trap);
+        // The kernel unblocked SIGTRAP behind the guest's back (a single-step).
+        kernel.set(0, 0, 0);
+        let mut old: KernelSigset = 0;
+        let oldset = AddrMut::from_raw(&mut old as *mut KernelSigset as usize);
+        record_rt_sigprocmask(&mut guest, libc::SIG_BLOCK, SetInput::None, oldset, &Ok(0));
+        assert!(guest.thread.signal_shadow.is_some());
+        // An ignored SIGTRAP the kernel reset: its old action is not compared.
+        let mut written = KernelSigaction {
+            handler: 0,
+            flags: 0,
+            restorer: 0,
+            mask: 0,
+        };
+        let old_action = AddrMut::from_raw(&mut written as *mut KernelSigaction as usize);
+        let ignore = KernelSigaction {
+            handler: 1,
+            flags: 0,
+            restorer: 0,
+            mask: 0,
+        };
+        record_rt_sigaction(&mut guest, libc::SIGTRAP, Some(ignore), None, &Ok(0));
+        record_rt_sigaction(&mut guest, libc::SIGTRAP, None, old_action, &Ok(0));
+        assert!(guest.thread.signal_shadow.is_some());
+    }
+
+    #[test]
+    fn a_wait_mask_from_sigfillset_matches_what_the_kernel_installs() {
+        // sigfillset sets SIGKILL and SIGSTOP; Linux never installs them.
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let int = 1 << (libc::SIGINT - 1);
+        let action = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        let filled: KernelSigset = !(int | (1 << 31) | (1 << 32));
+        let installed = filled & !((1 << (libc::SIGKILL - 1)) | (1 << (libc::SIGSTOP - 1)));
+        for kernel_ran_the_wait in [true, false] {
+            let mut guest = seeded(&kernel, USR1);
+            kernel.set(USR1, 0, int);
+            record_rt_sigaction(&mut guest, libc::SIGINT, Some(action), None, &Ok(0));
+            let call = Syscall::RtSigsuspend(
+                reverie::syscalls::RtSigsuspend::new()
+                    .with_mask(Addr::from_raw(&filled as *const KernelSigset as usize))
+                    .with_sigsetsize(8),
+            );
+            at_syscall_entry(&mut guest, &call);
+            let at_stop = if kernel_ran_the_wait { installed } else { USR1 };
+            kernel.set(at_stop, 0, int);
+            record_delivery(&mut guest, libc::SIGINT);
+            let shadow = guest.thread.signal_shadow.as_ref().unwrap();
+            assert_eq!(
+                shadow.thread.blocked,
+                at_stop | int,
+                "{kernel_ran_the_wait}"
+            );
+            assert_eq!(shadow.thread.activations, vec![USR1]);
+        }
+    }
+
+    #[test]
+    fn an_old_mask_the_kernel_wrote_differently_is_a_divergence() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = seeded(&kernel, 0);
+        // The kernel says the old mask was USR2; the copy holds 0.
+        let mut old: KernelSigset = USR2;
+        let oldset = AddrMut::from_raw(&mut old as *mut KernelSigset as usize);
+        record_rt_sigprocmask(&mut guest, libc::SIG_BLOCK, SetInput::None, oldset, &Ok(0));
+        assert_eq!(blocked(&guest), None);
+    }
+
+    #[test]
+    fn rt_sigaction_installs_even_when_the_old_action_cannot_be_written() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = seeded(&kernel, 0);
+        let action = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        kernel.set(0, 0, USR1);
+        record_rt_sigaction(
+            &mut guest,
+            libc::SIGUSR1,
+            Some(action),
+            None,
+            &Err(Errno::EFAULT),
+        );
+        let shadow = guest.thread.signal_shadow.as_ref().unwrap();
+        let caught = shadow
+            .dispositions
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .caught();
+        assert_eq!(caught, USR1);
+    }
+
+    #[test]
+    fn nothing_is_seeded_where_the_kernel_state_is_not_the_guests() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let config = Config::default();
+        let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let mut guest = ShadowGuest { config, thread };
+        at_exec(&mut guest);
+        assert!(guest.thread.signal_shadow.is_none());
+    }
+}

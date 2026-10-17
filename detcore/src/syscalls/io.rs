@@ -369,7 +369,9 @@ where
         return None;
     }
     let mask_addr = Addr::<libc::sigset_t>::from_raw(argument.sigmask)?;
-    read_kernel_sigset(guest, mask_addr).await.ok()
+    let mask = read_kernel_sigset(guest, mask_addr).await.ok()?;
+    super::signal_shadow::note_wait_mask(guest, mask);
+    Some(mask)
 }
 
 /// The temporary mask a replayed zero-timeout pselect6 sleeps under, read
@@ -1216,6 +1218,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let mask_addr =
                     Addr::<libc::sigset_t>::from_raw(argument.sigmask).ok_or(Errno::EFAULT)?;
                 let mask = read_kernel_sigset(guest, mask_addr).await?;
+                super::signal_shadow::note_wait_mask(guest, mask);
                 Some(sanitize_ppoll_signal_mask(mask))
             } else {
                 None
@@ -1974,6 +1977,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     return Err(Errno::EINVAL.into());
                 }
                 let signal_mask = read_kernel_sigset(guest, signal_mask).await?;
+                super::signal_shadow::note_wait_mask(guest, signal_mask);
                 let signal_mask = sanitize_ppoll_signal_mask(signal_mask);
                 blocked_signal_mask = Some(kernel_installed_signal_mask(signal_mask));
                 temporary_mask = Some(signal_mask);
@@ -2069,6 +2073,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     return Err(Errno::EINVAL.into());
                 }
                 let signal_mask = read_kernel_sigset(guest, signal_mask).await?;
+                super::signal_shadow::note_wait_mask(guest, signal_mask);
                 // The probe's temporary mask lets the kernel take a pending
                 // real-time timer expiration that every thread blocked when it
                 // expired (https://github.com/rrnewton/hermit/issues/4089).
@@ -2548,6 +2553,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let mask_address = call.sigmask().ok_or(Errno::EFAULT)?;
         let mask = read_kernel_sigset(guest, mask_address.cast()).await?;
+        super::signal_shadow::note_wait_mask(guest, mask);
         // A pending real-time timer expiration that the mask lets the kernel
         // deliver or discard (https://github.com/rrnewton/hermit/issues/4089).
         observe_under_mask(guest, mask).await?;
@@ -2632,6 +2638,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let mask_address = call.sigmask().ok_or(Errno::EFAULT)?;
         let mask = read_kernel_sigset(guest, mask_address.cast()).await?;
+        super::signal_shadow::note_wait_mask(guest, mask);
         // The copy may go in the red zone on a stack with no scratch below it,
         // clear of the events buffer the kernel writes (`stage_private_cells`;
         // re-review of https://github.com/rrnewton/hermit/pull/4087).
@@ -2842,6 +2849,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let mask_address = Addr::<libc::sigset_t>::from_raw(args.arg4).ok_or(Errno::EFAULT)?;
         let mask = read_kernel_sigset(guest, mask_address).await?;
+        super::signal_shadow::note_wait_mask(guest, mask);
         // A pending real-time timer expiration that the mask lets the kernel
         // deliver or discard (https://github.com/rrnewton/hermit/issues/4089).
         observe_under_mask(guest, mask).await?;
@@ -2896,6 +2904,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let mask_address = Addr::<libc::sigset_t>::from_raw(args.arg4).ok_or(Errno::EFAULT)?;
         let mask = read_kernel_sigset(guest, mask_address).await?;
+        super::signal_shadow::note_wait_mask(guest, mask);
         // The copy may go in the red zone on a stack with no scratch below it,
         // clear of the events buffer the kernel writes and of the timeout it
         // reads, as for epoll_pwait (`stage_private_cells`).
