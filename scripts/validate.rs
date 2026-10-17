@@ -2813,7 +2813,6 @@ impl SubmoduleFixtureChild {
             // This independent checkout starts a new top-level run, not the
             // enclosing validation run's same-process scope re-exec.
             .env_remove("VALIDATE_RUN_STATE")
-            .env_remove(RUN_STATE_SCOPE_REEXEC_ENV)
             .env_remove(OWN_SCOPE_DEADLINE_ENV)
             // The enclosing validation's run identity names its durable log,
             // and both cases run in this one checkout: an inherited
