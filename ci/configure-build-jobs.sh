@@ -1868,8 +1868,15 @@ fi
 # source and DBT inventory 961 remain unchanged. The calibrated SDK budget,
 # job width and limits carry without increase; final runtime/source-closure
 # checks must bind this composition rather than older receipts.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 51ecc8fb0c7b38ff03ce1596d765a9a0055e7d09 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 51ecc8fb0c7b38ff03ce1596d765a9a0055e7d09 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 82c77e3841432e366ba710f7021a076a4fe51c18 (2026-10-16): from
+# 51ecc8fb0c7b38ff03ce1596d765a9a0055e7d09 through the SaBRe pair (the plugin's
+# readlink emulation deleted; the loader's mallopt moved ahead of its
+# launch-specification read). Both commits touch only
+# experimental/reverie-sabre; the DBT runtime, its source catalog, all seven
+# SDK inputs, native client source and DBT inventory 961 are unchanged. The
+# calibrated SDK budget, job width and limits carry without increase.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 82c77e3841432e366ba710f7021a076a4fe51c18 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 82c77e3841432e366ba710f7021a076a4fe51c18 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
