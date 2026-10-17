@@ -148,15 +148,137 @@ fn render(output: &Output) -> String {
     )
 }
 
-/// Compiles `tests/c/<guest>.c` into a directory of this test process's own.
-fn compile_guest(guest: &str, directory: &Path) -> PathBuf {
-    let source = repository().join("tests/c").join(format!("{guest}.c"));
+/// The C compiler's arguments for a guest, before the output and source.
+const GUEST_CFLAGS: [&str; 5] = ["-O2", "-g", "-pthread", "-D_GNU_SOURCE", "-I"];
+
+/// The file in a guest's build directory naming the run that built it.
+const GUEST_RUN_STAMP: &str = ".run";
+
+/// How long another run's unused guest build is kept before a later run
+/// removes it. A run refreshes a build's modification time every time it
+/// reuses it, so only builds no run has touched for this long are removed.
+const GUEST_BUILD_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// This test run's identity: nextest's run id (a fresh UUID per invocation,
+/// shared by every test process of it), or else this process's identity.
+/// `cargo test` runs every case in one process; a pid alone can recur, so the
+/// fallback also names the boot, the pid namespace and the process start time.
+fn test_run_identity() -> String {
+    if let Ok(run) = std::env::var("NEXTEST_RUN_ID") {
+        return format!("nextest-{run}");
+    }
+    let stat = std::fs::read_to_string("/proc/self/stat").expect("failed to read /proc/self/stat");
+    // Field 22, the start time, follows the parenthesized command name.
+    let start = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(19))
+        .expect("malformed /proc/self/stat");
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .expect("failed to read the boot id");
+    let namespace =
+        std::fs::read_link("/proc/self/ns/pid").expect("failed to read the pid namespace");
+    format!(
+        "process-{}-{}-{}-{start}",
+        boot.trim(),
+        namespace.display(),
+        std::process::id()
+    )
+}
+
+/// Compiles `tests/c/<guest>.c` once per test run and returns the binary.
+///
+/// Each case used to compile its guest into a directory of its own: 360
+/// compiles of 43 distinct sources per full validate (the 2026-10-17 test
+/// audit). Now the first case of a run to need a guest compiles it, and every
+/// later case and test process of the same run reuses it. Reuse is scoped to
+/// the run ([`test_run_identity`]), recorded in the build directory and checked
+/// before every reuse, so a source, header, compiler or library change between
+/// runs never reuses an old binary.
+///
+/// The directory is `replay-<guest>-<six characters>` under CARGO_TARGET_TMPDIR,
+/// the same length as the per-case `tempfile` directory it replaces, so the
+/// guest sees an executable path of the same length as before. The name is
+/// derived from the run; if another run owns that name, the next derived name
+/// is tried, so no run ever removes or reuses another run's build. A per-guest
+/// lock file makes concurrent cases wait for one compile; the compile goes to a
+/// temporary directory that is renamed into place only once the binary and its
+/// stamp exist. Other runs' builds untouched for [`GUEST_BUILD_RETENTION`] are
+/// removed, best effort.
+fn compile_guest(guest: &str) -> PathBuf {
+    use std::hash::Hash;
+    use std::hash::Hasher;
+
+    let run = test_run_identity();
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let lock_path = root.join(format!(".replay-{guest}.lock"));
+    let lock = std::fs::File::create(&lock_path)
+        .unwrap_or_else(|error| panic!("failed to create {}: {error}", lock_path.display()));
+    lock.lock()
+        .unwrap_or_else(|error| panic!("failed to lock {}: {error}", lock_path.display()));
+
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let owner = |path: &Path| std::fs::read_to_string(path.join(GUEST_RUN_STAMP)).ok();
+    let directory = (0u32..)
+        .map(|attempt| {
+            let mut hasher = std::hash::DefaultHasher::new();
+            run.hash(&mut hasher);
+            guest.hash(&mut hasher);
+            attempt.hash(&mut hasher);
+            let mut key = hasher.finish();
+            let suffix: String = (0..6)
+                .map(|_| {
+                    let character = ALPHABET[(key % 36) as usize] as char;
+                    key /= 36;
+                    character
+                })
+                .collect();
+            root.join(format!("replay-{guest}-{suffix}"))
+        })
+        .find(|directory| !directory.exists() || owner(directory).as_deref() == Some(&run))
+        .expect("an unused guest build name");
     let binary = directory.join(guest);
+    if binary.is_file() {
+        // Refresh the build's age so no other run's retention removes it.
+        let _ = std::fs::File::open(&directory)
+            .and_then(|handle| handle.set_modified(std::time::SystemTime::now()));
+        return binary;
+    }
+
+    // Best effort: remove this guest's builds that belong to other runs and
+    // that no run has used for the retention period.
+    let prefix = format!("replay-{guest}-");
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for path in entries.flatten().map(|entry| entry.path()) {
+            let foreign = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.strip_prefix(&prefix))
+                .is_some_and(|rest| rest.len() == 6)
+                && owner(&path).is_some_and(|stamp| stamp != run);
+            let unused = std::fs::metadata(&path)
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|modified| {
+                    modified
+                        .elapsed()
+                        .is_ok_and(|age| age > GUEST_BUILD_RETENTION)
+                });
+            if foreign && unused {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+        }
+    }
+
+    let include = repository().join("tests/c");
+    let source = include.join(format!("{guest}.c"));
+    let staging = tempfile::Builder::new()
+        .prefix(&format!(".replay-{guest}-"))
+        .tempdir_in(root)
+        .expect("failed to create the guest build directory");
     let output = Command::new("cc")
-        .args(["-O2", "-g", "-pthread", "-D_GNU_SOURCE", "-I"])
-        .arg(repository().join("tests/c"))
+        .args(GUEST_CFLAGS)
+        .arg(&include)
         .arg("-o")
-        .arg(&binary)
+        .arg(staging.path().join(guest))
         .arg(&source)
         .arg("-lm")
         .output()
@@ -167,6 +289,18 @@ fn compile_guest(guest: &str, directory: &Path) -> PathBuf {
         source.display(),
         render(&output)
     );
+    std::fs::write(staging.path().join(GUEST_RUN_STAMP), &run)
+        .expect("failed to record the guest build's run");
+    std::fs::rename(staging.path(), &directory).unwrap_or_else(|error| {
+        panic!(
+            "failed to install {} at {}: {error}",
+            staging.path().display(),
+            directory.display()
+        )
+    });
+    // The staging path has moved; give up its ownership so dropping it can
+    // never remove a directory another process created at that name since.
+    let _ = staging.keep();
     binary
 }
 
@@ -183,11 +317,7 @@ fn rust_guest(guest: &str) -> PathBuf {
 }
 
 fn run_replay_case(guest: &str, scenario: Option<&str>, mode: Mode) {
-    let directory = tempfile::Builder::new()
-        .prefix(&format!("replay-{guest}-"))
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .expect("failed to create the guest build directory");
-    let binary = compile_guest(guest, directory.path());
+    let binary = compile_guest(guest);
     run_replay(&binary, scenario, mode);
 }
 
