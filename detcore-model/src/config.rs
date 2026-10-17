@@ -2298,6 +2298,7 @@ impl LegacyBackendKeys {
         // legacy key that read back as false, and each is false for DBT, the
         // form's only reader, so a DBT configuration stays exact.
         backend.supports_blocked_wait_signal_interruption = false;
+        backend.reports_sigreturns = false;
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
         backend
@@ -2934,6 +2935,7 @@ mod tests {
         backend.supports_blocked_wait_signal_interruption = false;
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
+        backend.reports_sigreturns = false;
         // The legacy discover_live_file_metadata bit couples four facts.
         backend.rediscovers_descriptors_after_exec = backend.tool_shares_guest_descriptor_table;
         backend.internal_pipe_turns_are_host_timed = backend.tool_shares_guest_descriptor_table;

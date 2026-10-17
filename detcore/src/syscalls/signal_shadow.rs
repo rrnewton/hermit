@@ -360,7 +360,9 @@ where
         .signal_shadow
         .as_ref()
         .is_some_and(|shadow| !shadow.thread.activations.is_empty());
-    if !open_frames || !kernel_state_is_the_guests(guest) {
+    // Where the backend reports every rt_sigreturn, frames close only on its
+    // reports, so there is nothing to infer.
+    if !open_frames || !kernel_state_is_the_guests(guest) || observes_sigreturns(guest.config()) {
         return;
     }
     let Some(kernel) = read_or_give_up(guest, before) else {
@@ -766,8 +768,42 @@ where
     }
 }
 
-/// Unused until a backend reports `rt_sigreturn` (A5 step 3): the ptrace
-/// backend, the only one whose copy is seeded today, never traps it.
+/// Whether this tool asks the backend to report every guest `rt_sigreturn`
+/// (`Tool::observes_sigreturns`): where the copy is kept and the backend can
+/// report them. Handler frames then close only on those reports
+/// ([`record_sigreturn_report`]), not by inference ([`reconcile_returns`]).
+pub(crate) fn observes_sigreturns(config: &crate::Config) -> bool {
+    enabled() && config.backend.reports_sigreturns
+}
+
+/// Records a guest `rt_sigreturn` the backend reported before it runs
+/// (`Tool::handle_sigreturn`): the innermost handler frame closes and the
+/// frame's mask is installed, as Linux installs it as soon as it reads it.
+/// A frame whose mask cannot be read changes no mask; the kernel then sends
+/// SIGSEGV.
+pub(crate) fn record_sigreturn_report<T>(
+    thread: &mut crate::tool_local::ThreadState<T>,
+    report: reverie::SigreturnReport,
+) {
+    let dettid = thread.dettid;
+    let Some(shadow) = thread.signal_shadow.as_mut() else {
+        return;
+    };
+    let Some(mask) = report.restored_mask() else {
+        trace!("[dtid {dettid}] signal-state copy: rt_sigreturn's frame mask cannot be read");
+        return;
+    };
+    shadow.thread.sigreturn(mask & !reserved());
+    #[cfg(test)]
+    REPORTED_RETURNS.with(|count| count.set(count.get() + 1));
+    trace!(
+        "[dtid {dettid}] signal-state copy: rt_sigreturn reported, installing {:#x}",
+        shadow.thread.blocked
+    );
+}
+
+/// For a backend that shows `rt_sigreturn` as a syscall, which none does
+/// today; the ptrace backend reports it through [`record_sigreturn_report`].
 ///
 /// Records an `rt_sigreturn` at its entry, before it runs: Linux installs the
 /// frame's `uc_sigmask` as soon as it can read it, before restoring the
@@ -869,6 +905,8 @@ thread_local! {
     /// This test thread's handler entries taken as returned before any
     /// check saw their mask.
     static UNVERIFIED_ENTRIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// This test thread's `rt_sigreturn` reports applied to a copy.
+    static REPORTED_RETURNS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// This thread's kernel signal state, where a check or a choice needs it.
@@ -1065,14 +1103,23 @@ mod tests {
         }
     }
 
-    /// A ptrace-like guest whose first image inherited `blocked` and nothing
-    /// ignored, seeded through `at_exec` from the scripted kernel.
+    /// A guest on e9patch preprocessing with the ptrace backend, whose first
+    /// image inherited `blocked` and nothing ignored, seeded through `at_exec`
+    /// from the scripted kernel. Its kernel signal state is the guest's own,
+    /// and it does not report `rt_sigreturn`, so the copy infers returns.
     fn seeded(kernel: &Kernel, blocked: KernelSigset) -> ShadowGuest {
-        // The ptrace backend's capabilities: its kernel signal state is the
-        // guest's own.
+        seeded_on(kernel, blocked, reverie::BackendCapabilities::E9PATCH)
+    }
+
+    /// As [`seeded`], on a backend with capabilities `backend`.
+    fn seeded_on(
+        kernel: &Kernel,
+        blocked: KernelSigset,
+        backend: reverie::BackendCapabilities,
+    ) -> ShadowGuest {
         let config = Config {
             sequentialize_threads: true,
-            backend: reverie::BackendCapabilities::PTRACE,
+            backend,
             ..Config::default()
         };
         let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
@@ -1562,6 +1609,114 @@ mod tests {
         assert_eq!(UNVERIFIED_ENTRIES.with(std::cell::Cell::get), before + 1);
         assert!(guest.thread.signal_shadow.is_none());
         assert_eq!(DIVERGENCES.with(std::cell::Cell::get), reported);
+    }
+
+    /// A handler for SIGUSR1 that also blocks SIGUSR2, installed and entered
+    /// on `backend`, with one frame open.
+    fn in_handler(kernel: &Kernel, backend: reverie::BackendCapabilities) -> ShadowGuest {
+        let mut guest = seeded_on(kernel, 0, backend);
+        let action = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: USR2,
+        };
+        kernel.set(0, 0, USR1);
+        record_rt_sigaction(&mut guest, libc::SIGUSR1, Some(action), None, &Ok(0));
+        record_delivery(&mut guest, libc::SIGUSR1);
+        assert_eq!(blocked(&guest), Some(USR1 | USR2));
+        guest
+    }
+
+    fn open_frames(guest: &ShadowGuest) -> usize {
+        guest
+            .thread
+            .signal_shadow
+            .as_ref()
+            .map_or(0, |shadow| shadow.thread.activations.len())
+    }
+
+    #[test]
+    fn sigreturns_are_observed_only_where_the_backend_reports_them() {
+        let config = |backend| Config {
+            backend,
+            ..Config::default()
+        };
+        assert!(observes_sigreturns(&config(
+            reverie::BackendCapabilities::PTRACE
+        )));
+        for backend in [
+            reverie::BackendCapabilities::E9PATCH,
+            reverie::BackendCapabilities::KVM,
+            reverie::BackendCapabilities::DBT,
+            reverie::BackendCapabilities::SABRE,
+            reverie::BackendCapabilities::LITEINST_IN_GUEST,
+        ] {
+            assert!(!observes_sigreturns(&config(backend)));
+        }
+    }
+
+    #[test]
+    fn a_reported_return_installs_the_frame_mask_the_handler_left() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = in_handler(&kernel, reverie::BackendCapabilities::PTRACE);
+        let (reported, matched, returns) = (
+            DIVERGENCES.with(std::cell::Cell::get),
+            CHECKS_MATCHED.with(std::cell::Cell::get),
+            REPORTED_RETURNS.with(std::cell::Cell::get),
+        );
+        // The handler rewrote its frame's uc_sigmask to SIGUSR2, which no
+        // frame saved; inference would have had to give the copy up.
+        let tid = guest.tid();
+        record_sigreturn_report(
+            &mut guest.thread,
+            reverie::SigreturnReport::new(tid, Some(USR2)),
+        );
+        assert_eq!(REPORTED_RETURNS.with(std::cell::Cell::get), returns + 1);
+        assert_eq!(blocked(&guest), Some(USR2));
+        assert_eq!(open_frames(&guest), 0);
+        kernel.set(USR2, 0, USR1);
+        at_syscall_entry(&mut guest);
+        check_against_kernel(&mut guest, "a test check");
+        assert_eq!(blocked(&guest), Some(USR2), "the copy is kept");
+        assert_eq!(CHECKS_MATCHED.with(std::cell::Cell::get), matched + 1);
+        assert_eq!(DIVERGENCES.with(std::cell::Cell::get), reported);
+    }
+
+    #[test]
+    fn a_reported_return_whose_frame_mask_cannot_be_read_changes_nothing() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = in_handler(&kernel, reverie::BackendCapabilities::PTRACE);
+        let tid = guest.tid();
+        record_sigreturn_report(&mut guest.thread, reverie::SigreturnReport::new(tid, None));
+        assert_eq!(blocked(&guest), Some(USR1 | USR2));
+        assert_eq!(open_frames(&guest), 1);
+    }
+
+    #[test]
+    fn where_returns_are_reported_none_is_inferred() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        for (backend, inferred) in [
+            (reverie::BackendCapabilities::PTRACE, false),
+            (reverie::BackendCapabilities::E9PATCH, true),
+        ] {
+            let mut guest = in_handler(&kernel, backend);
+            // A syscall inside the handler: the kernel holds its mask.
+            kernel.set(USR1 | USR2, 0, USR1);
+            at_syscall_entry(&mut guest);
+            // The kernel holds the mask the frame saved, as after a return.
+            kernel.set(0, 0, USR1);
+            at_syscall_entry(&mut guest);
+            assert_eq!(open_frames(&guest), usize::from(!inferred), "{backend:?}");
+            assert_eq!(
+                blocked(&guest),
+                Some(if inferred { 0 } else { USR1 | USR2 }),
+                "{backend:?}"
+            );
+        }
     }
 
     #[test]
