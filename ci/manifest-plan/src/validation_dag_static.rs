@@ -2490,7 +2490,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // coordinator): 2045.
     // And the guest_log exit-hook flush test: 2046.
     // And +5 from 77350e52: 2051.
-    ("test.detcore_unit", 2051),
+    // And the refused_signal_controls warning-text test: 2052.
+    ("test.detcore_unit", 2052),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3560,7 +3561,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore_warns_from_inside_the_guest_once_per_run_on_every_backend:
     // 518.
     // And +3 from 77350e52: 521.
-    ("test.cli", 521),
+    // And a_refused_guest_signal_handler_is_announced_once_per_run: 522.
+    ("test.cli", 522),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4006,7 +4008,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore_warns_from_inside_the_guest_once_per_run_on_every_backend:
     // 453.
     // And +3 from 77350e52: 456.
-    ("test.cli_on_host", 456),
+    // And a_refused_guest_signal_handler_is_announced_once_per_run: 457.
+    ("test.cli_on_host", 457),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4327,7 +4330,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the five guest_log tests: 2045.
     // And the guest_log exit-hook flush test: 2046.
     // And +5 from 77350e52: 2051.
-    ("test.detcore_unit_on_host", 2051),
+    // And the refused_signal_controls warning-text test: 2052.
+    ("test.detcore_unit_on_host", 2052),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

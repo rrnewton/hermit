@@ -1911,7 +1911,15 @@ fi
 # vendor/dynamorio, native/, third-party, the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml have the same object ids: all seven SDK inputs, DBT
 # inventory 961, calibrated budget, job width and limits are unchanged.
-expected_pin=7230ef91248b2a42ad212c5b991cea75cfa29c26
+# CARRY TO 70004ceb8b0240b1f56a1c7f9689a9729dd600b6 (2026-10-17): from
+# 7230ef91248b2a42ad212c5b991cea75cfa29c26. Two commits: 115b31fc (reverie-ptrace tests reap each paused
+# sentinel even when the test panics; test code only) and 70004ceb
+# (reverie-inguest records each guest signal control the runtime refuses, for
+# the Tool to report; reverie-inguest only). git diff is empty under
+# reverie-dbt/, and the root Cargo.toml, Cargo.lock and rust-toolchain.toml
+# have the same object ids: all seven SDK inputs, DBT inventory 961,
+# calibrated budget, job width and limits are unchanged.
+expected_pin=70004ceb8b0240b1f56a1c7f9689a9729dd600b6
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

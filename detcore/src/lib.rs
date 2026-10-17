@@ -72,6 +72,7 @@ mod procmaps;
 pub mod race_probe;
 pub mod random;
 mod record_or_replay;
+pub mod refused_signal_controls;
 mod resources;
 mod scheduler;
 mod shared_open_files;
@@ -3406,6 +3407,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // that was waiting returns).
         Self::unmap_orphaned_staging_pages(guest).await;
         crate::syscalls::signal_shadow::at_syscall_entry(guest);
+        // Signal controls an in-guest runtime refused since this process's
+        // last report, which Detcore did not see as calls.
+        crate::refused_signal_controls::report(guest).await;
         // Signal phase 1: before this syscall's first scheduler request. A
         // delivery prepared here runs the guest's handler before the syscall,
         // which then starts again; what this returns is discarded.
@@ -4918,6 +4922,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // them, go out while the hook's connection still serves it
         // (`crate::guest_log`).
         guest_log::flush_unsent_through(global_state).await;
+        // So do the signal controls an in-guest runtime refused since this
+        // process's last report: a guest that dies of a signal it asked to
+        // handle reaches no other syscall entry (`crate::refused_signal_controls`).
+        refused_signal_controls::report_at_exit(global_state).await;
         let pending_chaos_epochs = thread_state.take_pending_chaos_epochs();
         let deregistration = ThreadDeregistration {
             dettid,
