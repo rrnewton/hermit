@@ -3215,7 +3215,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             );
         }
 
-        tool_global::mark_past_first_execve(guest).await;
+        // In a run that declares a launcher, an exec Detcore did not prepare
+        // leaves the new image without a record: resolve it here from the
+        // path the exec was given.
+        let unprepared_exe = if self.declares_launcher() {
+            self.exec_image_from_execfn(guest)
+        } else {
+            None
+        };
+        tool_global::mark_past_first_execve(guest, unprepared_exe).await;
         // The new image's program-break model, checked against the kernel's
         // once its exec record is in place.
         self.check_brk_model(guest).await;
