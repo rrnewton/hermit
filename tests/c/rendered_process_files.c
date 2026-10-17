@@ -29,8 +29,18 @@
  *   the parent's open), and at /proc/<parent>/cgroup; the parent reads the
  *   child's at /proc/<child>/cgroup;
  * - a /proc/self directory received over SCM_RIGHTS names its sender's file;
- * - a zombie still has the file, a reaped child does not (ENOENT), nor a pid
- *   or a task no process holds, nor a number with a leading zero;
+ * - a zombie still has the file, owned by global root (as /proc/sys/kernel
+ *   is) and writable only with CAP_DAC_OVERRIDE where global root is mapped;
+ *   a reaped child does not (ENOENT), nor a pid or a task no process holds,
+ *   nor a number with a leading zero;
+ * - a descriptor kept past its task's reap reads ESRCH wherever the file's
+ *   show runs again (a first read, a read after a rewind, a pread), and end
+ *   of file after a whole read;
+ * - every name below a /proc/<pid> or /proc/self directory whose task was
+ *   reaped is ESRCH, for its own process and for one that inherited the
+ *   directory;
+ * - its listing in /proc/self, its path and a descriptor on it have one
+ *   inode, and (--chroot) still after chroot, where the kernel serves it;
  * - it seeks as a seq_file (SEEK_END is EINVAL), reads in parts and at a
  *   position, and continues across exec from the position the old image
  *   left;
@@ -40,10 +50,19 @@
  *   attribute need CAP_DAC_OVERRIDE; a write through a write-mode descriptor
  *   is EINVAL, ftruncate succeeds, fallocate is EOPNOTSUPP, sendfile and
  *   splice into it are EINVAL, and none of them changes what it reads; a
- *   mapping is ENODEV; times may be set; chmod is EPERM; O_NOATIME and
- *   F_SET_RW_HINT are its owner's; a lease is EINVAL.
+ *   mapping is ENODEV; chmod is EPERM; O_NOATIME is its owner's; a lease is
+ *   EINVAL;
+ * - access mode 3 (O_ACCMODE) opens with write permission and neither reads
+ *   (EBADF) nor writes (EBADF, ftruncate EINVAL, pwrite ESPIPE, a mapping
+ *   EACCES);
+ * - times its owner sets (utimensat, UTIME_NOW, UTIME_OMIT, futimens) are the
+ *   file's, seen through its number and every descriptor, and not the
+ *   thread's file's;
+ * - F_SET_RW_HINT is the file's: another descriptor and a reopening through
+ *   the descriptor link read it back, the thread's file has its own.
  *
  * usage: rendered_process_files [--hermit] [--no-process-directories]
+ *        [--chroot]
  *        rendered_process_files --inherited <fd> <ino>
  *   --hermit: under Hermit, which renders the file: its bytes are the root
  *   of the cgroup v2 hierarchy, "0::/\n", its identity Detcore's procfs
@@ -55,11 +74,14 @@
  *   thread's /proc directory (also inherited across fork, reopened and
  *   received over SCM_RIGHTS), named on stderr, for a backend whose own /proc
  *   cannot open those directories yet (KVM), and print none of their lines.
+ *   --chroot: also check the file's inode after chroot("/") in a child, which
+ *   needs CAP_SYS_CHROOT.
  *   --inherited is the program after it execs itself.
  * The program must be started by its absolute path, which it execs again.
  */
 
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/capability.h>
@@ -86,10 +108,12 @@
 #define PROC_SUPER_MAGIC 0x9fa0
 #define RENDERED_DEVICE 0xf000ffULL
 #define F_SET_RW_HINT_COMMAND 1036
+#define F_GET_RW_HINT_COMMAND 1035
 
 static int failures;
 static int hermit;
 static int process_directories = 1;
+static int after_chroot;
 static const char* program;
 static pid_t pid;
 
@@ -274,6 +298,21 @@ static unsigned long long effective_capabilities(void) {
   memset(data, 0, sizeof(data));
   CHECK(syscall(SYS_capget, &header, data) == 0, "capget: %s", strerror(errno));
   return (unsigned long long)data[0].effective | ((unsigned long long)data[1].effective << 32);
+}
+
+/* Whether the caller is in the initial user namespace: its uid map is the
+ * identity over every id. */
+static int in_initial_user_namespace(void) {
+  FILE* map = fopen("/proc/self/uid_map", "r");
+  if (map == NULL) {
+    return 0;
+  }
+  unsigned long inside = 1;
+  unsigned long outside = 1;
+  unsigned long count = 0;
+  int fields = fscanf(map, "%lu %lu %lu", &inside, &outside, &count);
+  fclose(map);
+  return fields == 3 && inside == 0 && outside == 0 && count == 4294967295UL;
 }
 
 static void check_spellings(void) {
@@ -488,26 +527,139 @@ static void check_spellings(void) {
   /* A task of the child is not a thread of this process. */
   snprintf(path, sizeof(path), "/proc/self/task/%d/cgroup", child);
   nonexistent(path, "the child as a thread of the parent");
+  /* Descriptors on the child's file kept past its reap: one never read, one
+   * read whole. */
+  snprintf(path, sizeof(path), "/proc/%d/cgroup", child);
+  int unread = open(path, O_RDONLY);
+  int consumed = open(path, O_RDONLY);
+  char directory_path[64];
+  snprintf(directory_path, sizeof(directory_path), "/proc/%d", child);
+  int child_directory = process_directories ? open(directory_path, O_RDONLY | O_DIRECTORY) : -1;
+  CHECK(!process_directories || child_directory >= 0, "open the child's directory: %s",
+        strerror(errno));
+  CHECK(unread >= 0 && consumed >= 0, "open the child's file: %s", strerror(errno));
+  char buffer[sizeof(reference)];
+  CHECK(read_fd(consumed, buffer, sizeof(buffer)) == reference_length,
+        "read the child's file whole");
   CHECK(write(done[1], "d", 1) == 1, "release the child");
-  /* The child, exited and not yet reaped, is a zombie and keeps its file. */
+  /* The child, exited and not yet reaped, is a zombie and keeps its file,
+   * which Linux gives to global root once the task has no memory map: its
+   * owner is /proc/sys/kernel's, and it is writable only with
+   * CAP_DAC_OVERRIDE where global root is mapped. */
   siginfo_t info;
   CHECK(waitid(P_PID, (id_t)child, &info, WEXITED | WNOWAIT) == 0, "waitid: %s", strerror(errno));
-  snprintf(path, sizeof(path), "/proc/%d/cgroup", child);
   int zombie = openat(AT_FDCWD, path, O_RDONLY);
   CHECK(zombie >= 0, "a zombie's cgroup file: %s", strerror(errno));
   if (zombie >= 0) {
     close(zombie);
   }
+  if (child_directory >= 0) {
+    zombie = openat(child_directory, "cgroup", O_RDONLY);
+    CHECK(zombie >= 0, "a zombie's cgroup below its directory: %s", strerror(errno));
+    if (zombie >= 0) {
+      close(zombie);
+    }
+  }
+  struct stat global_root;
+  struct stat zombie_metadata;
+  stat_of("/proc/sys/kernel", &global_root, "global root");
+  stat_of(path, &zombie_metadata, "a zombie's file");
+  CHECK(zombie_metadata.st_uid == global_root.st_uid &&
+            zombie_metadata.st_gid == global_root.st_gid,
+        "a zombie's file is owned by %u:%u, not global root's %u:%u", zombie_metadata.st_uid,
+        zombie_metadata.st_gid, global_root.st_uid, global_root.st_gid);
+  int zombie_writes = (global_root.st_uid == 0 &&
+                       ((effective_capabilities() >> CAP_DAC_OVERRIDE) & 1))
+                          ? 0
+                          : EACCES;
+  int zombie_writer = open(path, O_WRONLY);
+  CHECK(zombie_writes == 0 ? zombie_writer >= 0 : (zombie_writer == -1 && errno == EACCES),
+        "open O_WRONLY of a zombie's file: %d (%s)", zombie_writer, strerror(errno));
+  if (zombie_writer >= 0) {
+    close(zombie_writer);
+  }
+  ANSWERS(access(path, W_OK), zombie_writes, "access(W_OK) of a zombie's file");
   int status;
   CHECK(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
         "the child failed its checks (status %#x)", status);
   nonexistent(path, "a reaped child");
+  if (child_directory >= 0) {
+    REFUSED(openat(child_directory, "cgroup", O_RDONLY), ESRCH,
+            "a name below a reaped child's directory");
+    close(child_directory);
+  }
+  /* Its `show` runs again at a first read, a rewind's read and a positioned
+   * read: a task that is gone is ESRCH. A read after the whole file was read
+   * is end of file, from the buffer. */
+  if (unread >= 0) {
+    REFUSED(read(unread, buffer, sizeof(buffer)), ESRCH, "the first read after a reap");
+    close(unread);
+  }
+  if (consumed >= 0) {
+    RETURNS(read(consumed, buffer, sizeof(buffer)), 0, "a read at end after a reap");
+    REFUSED(pread(consumed, buffer, sizeof(buffer), 0), ESRCH, "a pread after a reap");
+    RETURNS(lseek(consumed, 0, SEEK_SET), 0, "a rewind after a reap");
+    REFUSED(read(consumed, buffer, sizeof(buffer)), ESRCH, "a read after a rewind after a reap");
+    struct stat kept;
+    CHECK(fstat(consumed, &kept) == 0, "fstat after a reap: %s", strerror(errno));
+    close(consumed);
+  }
   say("fork: the child's /proc/self/cgroup is its own; its /proc/<parent>/cgroup is the "
-      "parent's; the parent reads /proc/<child>/cgroup; a zombie's exists; a reaped "
-      "child's does not");
+      "parent's; the parent reads /proc/<child>/cgroup; a zombie's exists, owned by global "
+      "root and not writable through its owner; a reaped child's does not, and a descriptor "
+      "on it reads ESRCH where its show runs again");
   if (process_directories) {
     say("fork directories: the child's inherited /proc/self, reopened /proc/self and "
         "/proc/thread-self directories name the parent's");
+  }
+
+  /* A /proc/self directory whose process is gone has nothing below it: a
+   * child opens its /proc/self, forks a grandchild that inherits it, and
+   * exits; once this process reaps the child, every name the grandchild
+   * looks up below the directory is ESRCH, as Linux checks the directory's
+   * task at each lookup. */
+  if (process_directories) {
+    int result[2];
+    int go[2];
+    CHECK(pipe(result) == 0 && pipe(go) == 0, "pipe");
+    fflush(stdout);
+    pid_t opener = fork();
+    if (opener == 0) {
+      int directory = open("/proc/self", O_RDONLY | O_DIRECTORY);
+      pid_t grandchild = fork();
+      if (grandchild == 0) {
+        char token;
+        if (read(go[0], &token, 1) != 1) {
+          _exit(2);
+        }
+        errno = 0;
+        int opened = openat(directory, "cgroup", O_RDONLY) == -1 && errno == ESRCH;
+        struct stat ignored;
+        errno = 0;
+        int stated = fstatat(directory, "cgroup", &ignored, 0) == -1 && errno == ESRCH;
+        errno = 0;
+        int accessed = faccessat(directory, "cgroup", R_OK, 0) == -1 && errno == ESRCH;
+        char answer = opened && stated && accessed ? 'e' : 'x';
+        if (write(result[1], &answer, 1) != 1) {
+          _exit(2);
+        }
+        _exit(0);
+      }
+      _exit(directory >= 0 && grandchild > 0 ? 0 : 1);
+    }
+    int opened;
+    CHECK(waitpid(opener, &opened, 0) == opener && WIFEXITED(opened) && WEXITSTATUS(opened) == 0,
+          "the opener failed (status %#x)", opened);
+    CHECK(write(go[1], "g", 1) == 1, "release the grandchild");
+    char answer = 0;
+    CHECK(read(result[0], &answer, 1) == 1 && answer == 'e',
+          "a /proc/self directory of a reaped process answers other than ESRCH below it");
+    close(result[0]);
+    close(result[1]);
+    close(go[0]);
+    close(go[1]);
+    say("stale: below a /proc/self directory of a reaped process, open, stat and access are "
+        "ESRCH");
   }
 
   /* A /proc/self directory received over SCM_RIGHTS names its sender's. */
@@ -693,6 +845,22 @@ static void check_owner_calls(void) {
   if (fd >= 0) {
     close(fd);
   }
+  /* Access mode 3 asks for both permissions and gives neither. */
+  fd = open(path, O_ACCMODE);
+  CHECK(dac_override ? fd >= 0 : (fd == -1 && errno == EACCES), "open O_ACCMODE: %d (%s)", fd,
+        strerror(errno));
+  if (fd >= 0) {
+    char byte;
+    REFUSED(read(fd, &byte, 1), EBADF, "read of mode 3");
+    REFUSED(write(fd, "x", 1), EBADF, "write of mode 3");
+    REFUSED(ftruncate(fd, 0), EINVAL, "ftruncate of mode 3");
+    REFUSED(fallocate(fd, 0, 0, 1), EBADF, "fallocate of mode 3");
+    REFUSED(pwrite(fd, "x", 1, 0), ESPIPE, "pwrite of mode 3");
+    void* mapping = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    CHECK(mapping == MAP_FAILED && errno == EACCES, "a mapping of mode 3: %s",
+          mapping == MAP_FAILED ? strerror(errno) : "mapped");
+    close(fd);
+  }
   ANSWERS(access(path, W_OK), writes, "access(W_OK)");
   ANSWERS(syscall(SYS_faccessat2, AT_FDCWD, path, W_OK, AT_EACCESS), writes,
           "faccessat2(W_OK, AT_EACCESS)");
@@ -700,16 +868,57 @@ static void check_owner_calls(void) {
   REFUSED(access(path, X_OK), EACCES, "access(X_OK)");
   ANSWERS(truncate(path, 0), writes, "truncate");
   REFUSED(truncate(path, -1), EINVAL, "truncate(-1)");
-  RETURNS(utimensat(AT_FDCWD, path, NULL, 0), 0, "utimensat(now)");
-  struct timespec times[2] = {{1, 0}, {2, 0}};
+  /* Times its owner sets stay on the file, for every spelling and
+   * descriptor; another file (the thread's) keeps its own. */
+  char numbered[64];
+  snprintf(numbered, sizeof(numbered), "/proc/%d/cgroup", pid);
+  int held = open(path, O_RDONLY);
+  struct stat thread_before;
+  stat_of("/proc/thread-self/cgroup", &thread_before, "thread-self");
+  struct timespec times[2] = {{1, 0}, {1234, 5}};
   RETURNS(utimensat(AT_FDCWD, path, times, 0), 0, "utimensat(times)");
+  struct stat after;
+  stat_of(numbered, &after, "mtime by number");
+  CHECK(after.st_mtim.tv_sec == 1234 && after.st_mtim.tv_nsec == 5,
+        "an explicit mtime reads back as %ld.%09ld", (long)after.st_mtim.tv_sec,
+        after.st_mtim.tv_nsec);
+  if (held >= 0) {
+    CHECK(fstat(held, &after) == 0 && after.st_mtim.tv_sec == 1234 && after.st_mtim.tv_nsec == 5,
+          "fstat shows another mtime");
+  }
+  struct timespec omitted[2] = {{0, UTIME_NOW}, {0, UTIME_OMIT}};
+  RETURNS(utimensat(AT_FDCWD, path, omitted, 0), 0, "utimensat(now, omit)");
+  stat_of(path, &after, "mtime after UTIME_OMIT");
+  CHECK(after.st_mtim.tv_sec == 1234 && after.st_mtim.tv_nsec == 5, "UTIME_OMIT changed mtime");
+  RETURNS(utimensat(AT_FDCWD, path, NULL, 0), 0, "utimensat(now)");
+  struct stat now;
+  stat_of(path, &now, "mtime after now");
+  CHECK(now.st_mtim.tv_sec != 1234, "utimensat(now) left the mtime");
+  if (held >= 0) {
+    struct stat by_fd;
+    CHECK(fstat(held, &by_fd) == 0 && by_fd.st_mtim.tv_sec == now.st_mtim.tv_sec &&
+              by_fd.st_mtim.tv_nsec == now.st_mtim.tv_nsec,
+          "fstat after utimensat(now) shows another mtime");
+    RETURNS(futimens(held, times), 0, "futimens(times)");
+    stat_of(numbered, &after, "mtime after futimens");
+    CHECK(after.st_mtim.tv_sec == 1234, "futimens did not set the mtime");
+    close(held);
+  }
+  struct stat thread_after;
+  stat_of("/proc/thread-self/cgroup", &thread_after, "thread-self");
+  CHECK(thread_after.st_mtim.tv_sec == thread_before.st_mtim.tv_sec &&
+            thread_after.st_mtim.tv_nsec == thread_before.st_mtim.tv_nsec,
+        "the process file's times changed the thread file's");
   REFUSED(chmod(path, 0444), EPERM, "chmod");
   ANSWERS(setxattr(path, "user.x", "1", 1, 0), dac_override ? EOPNOTSUPP : EACCES,
           "setxattr(user.x)");
   ANSWERS(removexattr(path, "user.x"), dac_override ? EOPNOTSUPP : EACCES, "removexattr(user.x)");
   ANSWERS(setxattr(path, "security.x", "1", 1, 0), sys_admin ? EOPNOTSUPP : EPERM,
           "setxattr(security.x)");
-  REFUSED(setxattr(path, "trusted.x", "1", 1, 0), EPERM, "setxattr(trusted.x)");
+  /* A trusted. attribute needs CAP_SYS_ADMIN in the initial user namespace,
+   * which a guest of Hermit (in a user namespace of its own) never has. */
+  ANSWERS(setxattr(path, "trusted.x", "1", 1, 0),
+          sys_admin && in_initial_user_namespace() ? EOPNOTSUPP : EPERM, "setxattr(trusted.x)");
   char value[16];
   REFUSED(getxattr(path, "user.x", value, sizeof(value)), EOPNOTSUPP, "getxattr(user.x)");
   RETURNS(listxattr(path, value, sizeof(value)), 0, "listxattr");
@@ -728,8 +937,35 @@ static void check_owner_calls(void) {
     REFUSED(fcntl(fd, F_SETFL, O_DIRECT), EINVAL, "F_SETFL O_DIRECT");
     REFUSED(fcntl(fd, F_SETLEASE, F_RDLCK), EINVAL, "F_SETLEASE");
     RETURNS(fcntl(fd, F_GETLEASE), F_UNLCK, "F_GETLEASE");
-    unsigned long long hint = 1;
+    unsigned long long hint = 2;
     RETURNS(fcntl(fd, F_SET_RW_HINT_COMMAND, &hint), 0, "F_SET_RW_HINT");
+    /* The hint is the inode's: another descriptor, a reopening through the
+     * descriptor link, read it; the thread's file has its own. */
+    unsigned long long read_back = 0;
+    int other = open(path, O_RDONLY);
+    CHECK(other >= 0 && fcntl(other, F_GET_RW_HINT_COMMAND, &read_back) == 0 && read_back == 2,
+          "F_GET_RW_HINT through another descriptor read %llu", read_back);
+    if (other >= 0) {
+      close(other);
+    }
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+    other = open(link, O_RDONLY);
+    read_back = 0;
+    CHECK(other >= 0 && fcntl(other, F_GET_RW_HINT_COMMAND, &read_back) == 0 && read_back == 2,
+          "F_GET_RW_HINT through a reopening read %llu", read_back);
+    if (other >= 0) {
+      close(other);
+    }
+    other = open("/proc/thread-self/cgroup", O_RDONLY);
+    read_back = 9;
+    CHECK(other >= 0 && fcntl(other, F_GET_RW_HINT_COMMAND, &read_back) == 0 && read_back == 0,
+          "the thread file's hint is %llu", read_back);
+    if (other >= 0) {
+      close(other);
+    }
+    hint = 9;
+    REFUSED(fcntl(fd, F_SET_RW_HINT_COMMAND, &hint), EINVAL, "F_SET_RW_HINT(9)");
     REFUSED(fcntl(fd, F_ADD_SEALS, F_SEAL_SEAL), EPERM, "F_ADD_SEALS");
     REFUSED(fcntl(fd, F_GET_SEALS), EINVAL, "F_GET_SEALS");
     REFUSED(fsync(fd), EINVAL, "fsync");
@@ -745,8 +981,62 @@ static void check_owner_calls(void) {
   }
   say("owner: write-mode opens, access(W_OK), truncate and user. attributes follow "
       "CAP_DAC_OVERRIDE; writes EINVAL, ftruncate 0, fallocate EOPNOTSUPP, sendfile and "
-      "splice EINVAL, mappings ENODEV, and the file unchanged; times 0; chmod EPERM; "
-      "O_NOATIME and F_SET_RW_HINT allowed; leases EINVAL");
+      "splice EINVAL, mappings ENODEV, and the file unchanged; mode 3 neither reads nor "
+      "writes; times set stay on the file for every alias; chmod EPERM; O_NOATIME allowed; "
+      "the write hint is the file's; leases EINVAL");
+}
+
+/* The file /proc/self/cgroup names is one file whichever way it is
+ * described: its listing in /proc/self, its path and a descriptor on it have
+ * one inode. */
+static void check_listing(const char* when) {
+  DIR* directory = opendir("/proc/self");
+  CHECK(directory != NULL, "%s: opendir /proc/self: %s", when, strerror(errno));
+  if (directory == NULL) {
+    return;
+  }
+  unsigned long long listed = 0;
+  struct dirent* entry;
+  while ((entry = readdir(directory)) != NULL) {
+    if (strcmp(entry->d_name, "cgroup") == 0) {
+      listed = (unsigned long long)entry->d_ino;
+    }
+  }
+  closedir(directory);
+  struct stat by_path;
+  struct stat by_descriptor;
+  stat_of("/proc/self/cgroup", &by_path, when);
+  int fd = open("/proc/self/cgroup", O_RDONLY);
+  CHECK(fd >= 0 && fstat(fd, &by_descriptor) == 0, "%s: fstat", when);
+  if (fd >= 0) {
+    close(fd);
+  }
+  CHECK(listed != 0 && listed == (unsigned long long)by_path.st_ino &&
+            by_path.st_ino == by_descriptor.st_ino && by_path.st_dev == by_descriptor.st_dev,
+        "%s: listed inode %llu, path %llu, descriptor %llu", when, listed,
+        (unsigned long long)by_path.st_ino, (unsigned long long)by_descriptor.st_ino);
+}
+
+/* After chroot, where Detcore names no files by path and the kernel serves
+ * the file, its metadata is the kernel's file's as well: one inode, still. */
+static void check_after_chroot(void) {
+  fflush(stdout);
+  pid_t child = fork();
+  if (child == 0) {
+    failures = 0;
+    if (chroot("/") != 0) {
+      fprintf(stderr, "FAIL chroot: %s\n", strerror(errno));
+      _exit(1);
+    }
+    check_listing("after chroot");
+    _exit(failures == 0 ? 0 : 1);
+  }
+  int status;
+  CHECK(child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+            WEXITSTATUS(status) == 0,
+        "the chroot child failed");
+  say("chroot: after chroot, the listing, path and descriptor of /proc/self/cgroup are one "
+      "inode");
 }
 
 int main(int argc, char** argv) {
@@ -777,8 +1067,10 @@ int main(int argc, char** argv) {
       hermit = 1;
     } else if (strcmp(argv[arg], "--no-process-directories") == 0) {
       process_directories = 0;
+    } else if (strcmp(argv[arg], "--chroot") == 0) {
+      after_chroot = 1;
     } else {
-      fprintf(stderr, "usage: %s [--hermit] [--no-process-directories]\n", argv[0]);
+      fprintf(stderr, "usage: %s [--hermit] [--no-process-directories] [--chroot]\n", argv[0]);
       return 2;
     }
   }
@@ -799,6 +1091,13 @@ int main(int argc, char** argv) {
   check_spellings();
   check_reads();
   check_owner_calls();
+  if (process_directories) {
+    check_listing("listing");
+    say("listing: the listing, path and descriptor of /proc/self/cgroup are one inode");
+    if (after_chroot) {
+      check_after_chroot();
+    }
+  }
   /* Across exec: the descriptor read in part continues where it was. */
   fd = open("/proc/self/cgroup", O_RDONLY);
   char head[2];

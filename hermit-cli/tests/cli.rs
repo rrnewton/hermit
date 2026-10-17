@@ -6443,10 +6443,14 @@ fn detcore_renders_process_cgroup_on_every_backend() {
             "--",
             guest.to_str().expect("guest path is UTF-8"),
             "--hermit",
+            // After chroot Detcore names no files by path and the kernel
+            // serves this one: its metadata must be the kernel's as well.
+            "--chroot",
         ];
         // KVM's own /proc cannot open a process's or a thread's directory
         // yet (slice B3a-4 of https://github.com/rrnewton/hermit/issues/4266),
-        // so the names relative to one are not checked there.
+        // so the names relative to one, the listing and the check after
+        // chroot are not made there.
         if backend == "kvm" {
             args.push("--no-process-directories");
         }
@@ -6473,6 +6477,10 @@ fn detcore_renders_process_cgroup_on_every_backend() {
         "contents: 0::/\n",
         "capabilities: dac_override=1 sys_admin=1\n",
         "exec: the descriptor continues from its position, 2+3 bytes\n",
+        "stale: below a /proc/self directory of a reaped process, open, stat and access are \
+         ESRCH\n",
+        "chroot: after chroot, the listing, path and descriptor of /proc/self/cgroup are one \
+         inode\n",
     ] {
         assert!(
             first.contains(line),
@@ -6483,8 +6491,9 @@ fn detcore_renders_process_cgroup_on_every_backend() {
         if *backend == "kvm" {
             eprintln!(
                 "{test}: kvm: NOT CHECKED: names relative to a process's or a thread's /proc \
-                 directory, inherited across fork, reopened and received over SCM_RIGHTS (KVM's \
-                 own /proc cannot open those directories yet)"
+                 directory, inherited across fork, reopened, received over SCM_RIGHTS and left \
+                 by a reaped task; the /proc/self listing; the inode after chroot (KVM's own \
+                 /proc cannot open those directories yet)"
             );
             let without_directories = first
                 .lines()
@@ -6492,6 +6501,9 @@ fn detcore_renders_process_cgroup_on_every_backend() {
                     !line.starts_with("process directories:")
                         && !line.starts_with("fork directories:")
                         && !line.starts_with("scm_rights:")
+                        && !line.starts_with("stale:")
+                        && !line.starts_with("listing:")
+                        && !line.starts_with("chroot:")
                 })
                 .map(|line| format!("{line}\n"))
                 .collect::<String>();
