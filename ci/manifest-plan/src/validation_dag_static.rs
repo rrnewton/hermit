@@ -2476,7 +2476,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_process_cgroup_inode_refuses_a_pid_beyond_its_field,
     // a_process_cgroup_inode_refuses_an_incarnation_beyond_its_field}
     // (https://github.com/rrnewton/hermit/issues/4213): 2010, executed.
-    ("test.detcore_unit", 2010),
+    // And util::canonicalize_tests::canonicalize_matches_realpath and
+    // util::canonicalize_tests::a_long_directory_path_is_found_by_walking_up: 2012, listed.
+    ("test.detcore_unit", 2012),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4286,7 +4288,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 4213 received-directory task-position test: 1993, executed.
     // And the eleven 4213 per-process mechanism tests: 2004, executed.
     // And the six 4213 process-cgroup tests: 2010, executed.
-    ("test.detcore_unit_on_host", 2010),
+    // And the same two canonicalize tests: 2012, listed.
+    ("test.detcore_unit_on_host", 2012),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
