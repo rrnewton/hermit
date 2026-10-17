@@ -2435,7 +2435,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And its 21 syscalls::signal_shadow::tests: 1977, listed.
     // And syscalls::files::test::a_received_procfs_directory_names_its_task_positions
     // (https://github.com/rrnewton/hermit/issues/4213): 1978, executed.
-    ("test.detcore_unit", 1978),
+    // And syscalls::files::test::a_proc_selector_leads_to_the_openers_task and
+    // syscalls::files::rendered_procfs::tests::{open_flags_follow_linux_for_a_process_file_its_owner_opens,
+    // path_calls_follow_linux_for_a_process_file_its_owner_names,
+    // a_process_file_maps_as_a_file_without_mmap,
+    // a_process_file_exists_for_exactly_the_tasks_the_table_lists,
+    // a_process_file_is_owned_by_the_guest_and_named_by_path_calls}
+    // (https://github.com/rrnewton/hermit/issues/4213): 1984, executed.
+    ("test.detcore_unit", 1984),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4224,7 +4231,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 24 A5 signal_state tests: 1956, listed.
     // And the same 21 signal_shadow tests: 1977, listed.
     // And the 4213 received-directory task-position test: 1978, executed.
-    ("test.detcore_unit_on_host", 1978),
+    // And the six 4213 per-process mechanism tests: 1984, executed.
+    ("test.detcore_unit_on_host", 1984),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
