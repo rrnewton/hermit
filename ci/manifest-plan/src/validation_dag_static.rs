@@ -2486,7 +2486,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // syscalls::memory::tests::a_break_grows_and_shrinks_only_where_linuxs_brk_would and
     // memory::brk_tests::a_modeled_heap_is_the_models_from_the_first_growth: 2031, listed.
     // And +9 from 3a281d97: 2040.
-    ("test.detcore_unit", 2040),
+    // And +5 from A5 step 2b-2 (published masks): 2045.
+    ("test.detcore_unit", 2045),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4314,7 +4315,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two blocked-resume guard units: 2028.
     // And the same load-bias, brk-room and modeled-heap tests: 2031, listed.
     // And +9 from 3a281d97: 2040.
-    ("test.detcore_unit_on_host", 2040),
+    // And +5 from A5 step 2b-2 (published masks): 2045.
+    ("test.detcore_unit_on_host", 2045),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
