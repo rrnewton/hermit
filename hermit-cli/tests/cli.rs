@@ -189,6 +189,7 @@ static VFORK_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GET_MEMPOLICY_ONE_NODE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PID_NAMESPACE_NESTED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RENDERED_PROCFS_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static RECEIVED_DIRECTORY_OPENAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LISTINGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VIRTUAL_KERNEL_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1430,6 +1431,32 @@ fn rendered_procfs_files_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "rendered-procfs-files guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn received_directory_openat_guest() -> &'static Path {
+    RECEIVED_DIRECTORY_OPENAT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("received-directory-openat");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create received-directory-openat directory");
+        let guest = build_root.join("received_directory_openat");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/received_directory_openat.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile received-directory-openat guest");
+        assert!(
+            output.status.success(),
+            "received-directory-openat guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -6217,6 +6244,116 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
             identities[0].0
         );
     }
+}
+
+/// A name relative to a directory descriptor the guest received over
+/// SCM_RIGHTS is looked up below that directory by `openat`, `fstatat`,
+/// `statx`, `faccessat` and `readlinkat`, as Linux looks it up, for a `/tmp`
+/// directory and for `/proc`. Detcore keeps no record of a received
+/// descriptor where its tool does not discover descriptors as they are used
+/// (ptrace, KVM), and each of those calls failed with EBADF before the kernel
+/// was asked, though the descriptor was open (DBT, which discovers it, opened
+/// the file). Below a received `/proc`, a name the run's `--proc` level omits
+/// (`interrupts` at the default `minimal`) is absent, as at its absolute
+/// spelling; below a received `/proc/self/ns` and `/proc/self/fd`, the
+/// namespace, socket and pipe links read as their absolute spellings, which
+/// Detcore canonicalizes. The guest checks the same natively first, then
+/// runs at bitwise parity on ptrace, DBT and KVM, each available here, and
+/// prints the same lines on each. Only these three backends: the case is the
+/// tool's record of a descriptor, which the in-guest backends (SaBRe,
+/// LiteInst, in-guest-trap) keep as DBT does, by discovering descriptors as
+/// they are used; their own runs of the guest are not part of this test.
+/// KVM's own /proc cannot open a process's directory yet, so its run skips
+/// the `/proc/self/ns` and `/proc/self/fd` directories, named as not checked.
+#[test]
+fn a_name_below_a_received_directory_is_looked_up_on_ptrace_dbt_and_kvm() {
+    let test = "a_name_below_a_received_directory_is_looked_up_on_ptrace_dbt_and_kvm";
+    let guest = received_directory_openat_guest();
+    let native = Command::new(guest)
+        .output()
+        .expect("run received-directory-openat natively");
+    assert!(native.status.success(), "native: {native:?}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut outputs = Vec::new();
+    for backend in ["ptrace", "dbt", "kvm"] {
+        let unavailable = match backend {
+            "dbt" => dbt_unavailable(test),
+            "kvm" => kvm_unavailable(test),
+            _ => false,
+        };
+        if unavailable {
+            continue;
+        }
+        let report = directory.path().join(format!("{backend}.json"));
+        let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+        let mut args = vec![
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            &report_arg,
+            "--epoch=2026-01-01T00:00:00Z",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().expect("guest path is UTF-8"),
+            "--hermit",
+            "--minimal",
+        ];
+        if backend == "kvm" {
+            args.push("--no-process-directories");
+        }
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+                .expect("parse the verification report");
+        assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
+        let compared = &verdict["compared_log_messages"];
+        assert!(
+            compared["left"].as_u64().is_some_and(|count| count > 0)
+                && compared["left"] == compared["right"],
+            "{backend} compared no INFO messages: {verdict}"
+        );
+        outputs.push((backend, stdout(&output)));
+    }
+    let (first_backend, first) = &outputs[0];
+    assert_eq!(
+        first.lines().count(),
+        5,
+        "{first_backend} printed other lines: {first}"
+    );
+    for (backend, output) in &outputs[1..] {
+        if *backend == "kvm" {
+            eprintln!(
+                "{test}: kvm: NOT CHECKED: a received /proc/self/ns and /proc/self/fd \
+                 directory (KVM's own /proc cannot open a process's directory yet)"
+            );
+            let without_directories = first
+                .lines()
+                .filter(|line| {
+                    !line.starts_with("a received /proc/self/ns")
+                        && !line.starts_with("a received /proc/self/fd")
+                })
+                .map(|line| format!("{line}\n"))
+                .collect::<String>();
+            assert_eq!(
+                output, &without_directories,
+                "{backend} differs from {first_backend}"
+            );
+        } else {
+            assert_eq!(output, first, "{backend} differs from {first_backend}");
+        }
+    }
+    eprintln!(
+        "{test} compared {:?}",
+        outputs
+            .iter()
+            .map(|(backend, _)| *backend)
+            .collect::<Vec<_>>()
+    );
 }
 
 /// DBT launches through the same container as ptrace
