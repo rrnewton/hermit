@@ -1633,7 +1633,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And run::strict_refuses_an_epoch_or_seed_drawn_from_the_host: 1137.
     // And global_opts::tests::a_reported_event_is_a_tracing_record_in_the_log_file: 1138.
     // And +15 from 2447c8e8: 1153.
-    ("test.hermit_unit", 1153),
+    // And metadata::tests::record_version_rejects_streams_from_before_received_directory_lookups
+    // (https://github.com/rrnewton/hermit/issues/4213): 1154, executed.
+    ("test.hermit_unit", 1154),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2431,7 +2433,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 24 signal_state::tests of audit step A5's shadow signal state
     // (https://github.com/rrnewton/hermit/issues/4485): 1956, listed.
     // And its 21 syscalls::signal_shadow::tests: 1977, listed.
-    ("test.detcore_unit", 1977),
+    // And syscalls::files::test::a_received_procfs_directory_names_its_task_positions
+    // (https://github.com/rrnewton/hermit/issues/4213): 1978, executed.
+    ("test.detcore_unit", 1978),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3488,7 +3492,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // A6 adds 4 explicit-refusal/configuration/timer controls; combined source count, listing pending.
     // And +4 from 2447c8e8: 492.
     // And the eight run_dbt_timerfd_virtual_* tests (B3 step 1): 500.
-    ("test.cli", 500),
+    // And a_name_below_a_received_directory_is_looked_up_on_ptrace_dbt_and_kvm
+    // (a relative name below a descriptor received over SCM_RIGHTS): 501.
+    ("test.cli", 501),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -3914,7 +3920,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // A6 adds 4 explicit-refusal/configuration/timer controls; combined source count, listing pending.
     // And +4 from 2447c8e8: 427.
     // And the same eight run_dbt_timerfd_virtual_* tests: 435.
-    ("test.cli_on_host", 435),
+    // And the received-directory lookup test: 436.
+    ("test.cli_on_host", 436),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4219,7 +4226,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five exec-record tests: 1932, executed.
     // And the same 24 A5 signal_state tests: 1956, listed.
     // And the same 21 signal_shadow tests: 1977, listed.
-    ("test.detcore_unit_on_host", 1977),
+    // And the 4213 received-directory task-position test: 1978, executed.
+    ("test.detcore_unit_on_host", 1978),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4497,7 +4505,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the strict host-drawn-input refusal test: 1137.
     // And the reported-event log-file test: 1138.
     // And +15 from 2447c8e8: 1153.
-    ("test.hermit_unit_on_host", 1153),
+    // And the 4213 received-directory record-version test: 1154.
+    ("test.hermit_unit_on_host", 1154),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
