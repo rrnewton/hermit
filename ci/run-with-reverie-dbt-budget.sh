@@ -1814,7 +1814,12 @@ fi
 # only). git diff is empty under reverie-dbt/, and the root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml are unchanged. All seven SDK inputs,
 # inventory 961, calibrated budget, job width and limits are unchanged.
-expected_pin=638ee64ae72b819ef12aa90321423e38117c50a1
+# CARRY TO 0741c299a0fc21998f3c5b010541aef9ba5182f4 (2026-10-17): from
+# 638ee64ae72b819ef12aa90321423e38117c50a1 through A5 step 2's UnreportedSignal change (realtime
+# signals shown to Tool::filter_unreported_signal; reverie-core and
+# reverie-ptrace only). reverie-dbt tree, root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml are unchanged, so the budget carries unchanged.
+expected_pin=0741c299a0fc21998f3c5b010541aef9ba5182f4
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
