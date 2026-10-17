@@ -1911,7 +1911,15 @@ fi
 # vendor/dynamorio, native/, third-party, the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml have the same object ids: all seven SDK inputs, DBT
 # inventory 961, calibrated budget, job width and limits are unchanged.
-expected_pin=7230ef91248b2a42ad212c5b991cea75cfa29c26
+# CARRY TO 60c43813e200c6cde9e2b4e552cafe41eb582224 (2026-10-17): from
+# 7230ef91248b2a42ad212c5b991cea75cfa29c26. One commit: 60c43813 (Guest::initial_stack_pointer
+# reports the image's initial stack pointer to a Tool; reverie, reverie-ptrace
+# and reverie-kvm only). git diff is empty under reverie-dbt/ (tree c01780c7 at
+# both pins), and build.rs, vendor/dynamorio, native/, third-party, the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml have the same object ids: all
+# seven SDK inputs, DBT inventory 961, calibrated budget, job width and limits
+# are unchanged.
+expected_pin=60c43813e200c6cde9e2b4e552cafe41eb582224
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
