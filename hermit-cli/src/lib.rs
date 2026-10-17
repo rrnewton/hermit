@@ -6892,6 +6892,7 @@ mod tests {
             "delivers_preemption_timer_events":
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "runs_guest_code_between_injections": sabre || in_guest_liteinst,
+            "promotes_open_files_before_native_lifecycle": dbt,
         })
     }
 

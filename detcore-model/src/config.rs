@@ -2279,6 +2279,11 @@ impl LegacyBackendKeys {
         backend.supports_madv_dontneed = self.backend_supports_madvise || self.backend_is_kvm;
         backend.provides_process_signal_control = self.backend_is_kvm;
         backend.emulates_child_waits = self.backend_is_kvm;
+        // A legacy encoding predates this key. Only DBT's runtime promotes
+        // shared open-file descriptions before a native fork or exec, and
+        // DBT alone requires thread-directed process signals.
+        backend.promotes_open_files_before_native_lifecycle =
+            self.backend_requires_thread_directed_process_signals;
         // Added after the legacy form froze. Each was a `Config` field with no
         // legacy key that read back as false, and each is false for DBT, the
         // form's only reader, so a DBT configuration stays exact.
@@ -3262,7 +3267,8 @@ mod tests {
                 "backend_tracks_process_children" => expected.tracks_process_children = false,
                 "backend_runs_exit_robust_list" => expected.runs_exit_robust_list = false,
                 "backend_requires_thread_directed_process_signals" => {
-                    expected.requires_thread_directed_process_signals = true
+                    expected.requires_thread_directed_process_signals = true;
+                    expected.promotes_open_files_before_native_lifecycle = true;
                 }
                 "backend_is_kvm" => {
                     expected.provides_process_signal_control = true;

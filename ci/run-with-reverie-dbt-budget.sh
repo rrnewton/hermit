@@ -1791,7 +1791,14 @@ fi
 # source and DBT inventory 961 remain unchanged. The calibrated SDK budget,
 # job width and limits carry without increase; final runtime/source-closure
 # checks must bind this composition rather than older receipts.
-expected_pin=51ecc8fb0c7b38ff03ce1596d765a9a0055e7d09
+# CARRY TO 93db138ba3ddf1704c685fb581271d2d52f4ebad (2026-10-16): from
+# 51ecc8fb0c7b38ff03ce1596d765a9a0055e7d09. The interval is one commit, 93db138b, which adds the
+# promotes_open_files_before_native_lifecycle field to reverie-core's
+# BackendCapabilities (reverie/src/capabilities.rs only). git diff is empty under
+# reverie-dbt/, and the root Cargo.toml, Cargo.lock and rust-toolchain.toml are
+# unchanged. All seven SDK inputs, inventory 961, calibrated budget, job width
+# and limits are unchanged.
+expected_pin=93db138ba3ddf1704c685fb581271d2d52f4ebad
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
