@@ -59,7 +59,7 @@ use crate::syscalls::helpers::refuse_held_signal_loss;
 use crate::syscalls::helpers::result_after_restore;
 use crate::syscalls::helpers::retry_blocking_wait_under_mask;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
-use crate::syscalls::helpers::unblocked_by;
+use crate::syscalls::helpers::unblocked_by_ignored;
 use crate::syscalls::network_trace::received_descriptors;
 use crate::syscalls::signal::STACK_RED_ZONE;
 use crate::syscalls::signal::kernel_installed_signal_mask;
@@ -1379,10 +1379,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if pending != 0 {
                         let (observable, discarded) = match (signals.as_ref(), sigmask) {
                             (Some(signals), _) => (signals.observable_now()?, 0),
-                            (None, Some(mask)) => unblocked_by(
-                                &read_thread_wait_signal_state(guest.pid(), guest.tid())?,
-                                mask,
-                            ),
+                            (None, Some(mask)) => {
+                                let ignored =
+                                    match crate::syscalls::signal_shadow::copied_dispositions(guest)
+                                    {
+                                        Some(copied) => copied.ignored,
+                                        None => {
+                                            read_thread_wait_signal_state(guest.pid(), guest.tid())?
+                                                .ignored
+                                        }
+                                    };
+                                unblocked_by_ignored(ignored, mask)
+                            }
                             (None, None) => (0, 0),
                         };
                         act_on_pending_real_time(guest, pending, observable, discarded).await;
