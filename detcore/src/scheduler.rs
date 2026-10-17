@@ -1712,6 +1712,13 @@ pub struct Scheduler {
     /// the kernel's.
     saved_guest_sigmasks: BTreeMap<DetTid, u64>,
 
+    /// Each thread's mask as Detcore's signal-state copy holds it, published
+    /// by the thread before each request that can let another thread run
+    /// (A5 step 2b, `syscalls::signal_shadow::publish_mask`), where it is the
+    /// mask the kernel holds whenever the thread is stopped at a request.
+    /// Read in place of the kernel's `SigBlk` (`published_mask_for`).
+    pub(crate) published_masks: BTreeMap<DetTid, u64>,
+
     /// Each process's signal dispositions as Detcore's signal-state copy
     /// holds them, published by its threads before each request that can let
     /// another thread run (A5 step 2b,
@@ -3955,6 +3962,7 @@ impl Scheduler {
             delivery_mask_override: None,
             signal_control_caller: None,
             saved_guest_sigmasks: Default::default(),
+            published_masks: Default::default(),
             published_dispositions: Default::default(),
             pending_real_time_expirations: Default::default(),
             sending_child_exit: None,
@@ -4888,6 +4896,7 @@ impl Scheduler {
         self.release_vfork_child(*dtid);
         self.vfork_registration_origins.remove(dtid);
         self.saved_guest_sigmasks.remove(dtid);
+        self.published_masks.remove(dtid);
         let retired = self
             .discarded_at_send
             .retire(discarded_at_send::QueueId::Thread(*dtid));
@@ -6206,6 +6215,60 @@ impl Scheduler {
             held: entry.generation,
             taken,
         })
+    }
+
+    /// Record (`Some`) or withdraw (`None`) `thread`'s mask as Detcore's copy
+    /// holds it (`published_masks`). A thread publishes only its own mask, in
+    /// order. Returns false, taking nothing, for a thread the scheduler does
+    /// not know, one logically killed, or a retired exec incarnation of its
+    /// tid (`rpc_incarnation_matches` with the request's `mm`).
+    pub(crate) fn publish_signal_mask(
+        &mut self,
+        thread: DetTid,
+        mm: MmId,
+        mask: Option<u64>,
+    ) -> bool {
+        if !self.next_turns.contains_key(&thread)
+            || self.thread_is_logically_killed(thread)
+            || !self.rpc_incarnation_matches(thread, mm)
+        {
+            return false;
+        }
+        match mask {
+            Some(mask) => self.published_masks.insert(thread, mask),
+            None => self.published_masks.remove(&thread),
+        };
+        true
+    }
+
+    /// The mask `thread` published (`publish_signal_mask`), where it decides
+    /// about `signal`: the copy holds that signal exactly, no unreported
+    /// signal, whose handler entry would have changed the mask unseen, is
+    /// noted (`signal_shadow::published_dispositions_decide`), and Detcore
+    /// holds the thread under no private mask (`saved_guest_sigmasks`). The
+    /// published mask is the guest's; while a private mask is installed, a
+    /// reader that asks for the kernel's mask gets `SigBlk`, as before.
+    pub(crate) fn published_mask_for(&self, thread: DetTid, signal: i32) -> Option<u64> {
+        if !crate::syscalls::signal_shadow::published_dispositions_decide(signal)
+            || self.saved_guest_sigmasks.contains_key(&thread)
+        {
+            return None;
+        }
+        self.published_masks.get(&thread).copied()
+    }
+
+    /// `thread`'s mask as it decides about `signal` for a thread stopped at a
+    /// request: the one it published (`published_mask_for`), and otherwise
+    /// the kernel's `SigBlk` (`read_thread_blocked_mask`).
+    fn blocked_mask_for(&self, thread: DetTid, signal: i32) -> Option<u64> {
+        if let Some(mask) = self.published_mask_for(thread, signal) {
+            trace!(
+                "[dtid {}] signal {} reads its published mask {:#x}",
+                thread, signal, mask
+            );
+            return Some(mask);
+        }
+        self.read_thread_blocked_mask(thread)
     }
 
     /// The dispositions `thread`'s process published
@@ -9957,7 +10020,7 @@ impl Scheduler {
                 self.run_queue.contains_non_polling_tid(**thread)
                     && self.awaits_sigchld_delivery(**thread).is_some()
                     && self
-                        .thread_signal_mask(**thread)
+                        .thread_signal_mask_for(**thread, libc::SIGCHLD)
                         .is_some_and(|mask| mask & sigchld == 0)
             })
             .copied()
@@ -10418,7 +10481,7 @@ impl Scheduler {
         // Stable, so the rest stay in thread-ID order.
         threads.sort_by_key(|thread| *thread != preferred);
         let unblocked = |thread: &DetTid| {
-            self.thread_signal_mask(*thread)
+            self.thread_signal_mask_for(*thread, signo)
                 .is_some_and(|mask| mask & bit == 0)
         };
         threads
@@ -10509,21 +10572,33 @@ impl Scheduler {
     /// committed (`BlockedPool::out_of_scheduler_masks`); and otherwise the
     /// kernel's (`SigBlk`) for a thread stopped at a request.
     fn thread_signal_mask(&self, thread: DetTid) -> Option<u64> {
+        self.recorded_signal_mask(thread)
+            .unwrap_or_else(|| self.read_thread_blocked_mask(thread))
+    }
+
+    /// `thread_signal_mask` for a decision about `signal` alone, which may
+    /// take the mask `thread` published in place of the kernel's
+    /// (`blocked_mask_for`).
+    fn thread_signal_mask_for(&self, thread: DetTid, signal: i32) -> Option<u64> {
+        self.recorded_signal_mask(thread)
+            .unwrap_or_else(|| self.blocked_mask_for(thread, signal))
+    }
+
+    /// The sources of `thread_signal_mask` before the kernel's, in order;
+    /// `None` when none applies.
+    fn recorded_signal_mask(&self, thread: DetTid) -> Option<Option<u64>> {
         if let Some((receiver, mask)) = self.delivery_mask_override
             && receiver == thread
         {
-            return Some(mask);
+            return Some(Some(mask));
         }
         if let Some(watch) = self
             .parked_futex_waiter(thread)
             .and_then(|waiter| waiter.signal_watch)
         {
-            return Some(!watch.unblocked);
+            return Some(Some(!watch.unblocked));
         }
-        if let Some(recorded) = self.blocked.out_of_scheduler_masks.get(&thread) {
-            return *recorded;
-        }
-        self.read_thread_blocked_mask(thread)
+        self.blocked.out_of_scheduler_masks.get(&thread).copied()
     }
 
     /// `thread`'s current signal mask (`SigBlk`), read from the kernel; `None`
@@ -10682,7 +10757,7 @@ impl Scheduler {
         }
         let mask = match self.saved_guest_sigmasks.get(&dettid) {
             Some(saved) => Some(*saved),
-            None => self.read_thread_blocked_mask(dettid),
+            None => self.blocked_mask_for(dettid, signal.raw()),
         };
         mask.is_none_or(|mask| mask & kernel_signal_bit(signal.raw()) == 0)
     }
@@ -20735,6 +20810,98 @@ mod test {
                 ..Default::default()
             },
             "the process's last thread took its dispositions with it, not the generation"
+        );
+    }
+
+    /// A5 step 2b: where a decision reads a thread's kernel mask, it reads the
+    /// mask the thread published in place of `SigBlk`, for a signal Detcore's
+    /// copy holds exactly. A withdrawn mask, a signal Linux force-delivers, a
+    /// noted unreported signal and a private mask Detcore installed read the
+    /// kernel's; the mask goes with its thread.
+    #[test]
+    fn mask_readers_take_the_mask_the_thread_published() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let segv = kernel_signal_bit(libc::SIGSEGV);
+        let mut scheduler = gated_scheduler();
+        let (target, _) = parked_futex_target(&mut scheduler);
+        let process = DetPid::from_raw(target.as_raw());
+        let mm = MmId::initial(process);
+        scheduler.thread_tree.add_child(target, target, true);
+        // The kernel shows SIGUSR1 and SIGSEGV blocked, the published copy
+        // neither.
+        let mut state = signal_state(0, 0);
+        state.blocked = usr1 | segv;
+        scheduler.test_kernel_signal_states.insert(target, state);
+        let mask = |scheduler: &Scheduler, signal| scheduler.discard_mask(target, signal);
+        assert_eq!(
+            mask(&scheduler, libc::SIGUSR1),
+            Some(usr1 | segv),
+            "the kernel's"
+        );
+        assert!(
+            !scheduler.publish_signal_mask(DetTid::from_raw(999), mm, Some(0)),
+            "a thread the scheduler does not know"
+        );
+        assert!(scheduler.publish_signal_mask(target, mm, Some(0)));
+        assert_eq!(mask(&scheduler, libc::SIGUSR1), Some(0), "published");
+        assert!(scheduler.poll_mask_admits(target, SigWrapper(libc::SIGUSR1)));
+        assert_eq!(
+            scheduler.thread_signal_mask_for(target, libc::SIGUSR1),
+            Some(0)
+        );
+        assert_eq!(
+            scheduler.thread_signal_mask(target),
+            Some(usr1 | segv),
+            "a whole mask still reads the kernel's"
+        );
+        assert_eq!(
+            mask(&scheduler, libc::SIGSEGV),
+            Some(usr1 | segv),
+            "a signal Linux force-delivers reads the kernel's"
+        );
+        crate::syscalls::signal_shadow::note_unreported(1, i32::MAX - 1, libc::SIGUSR2);
+        assert_eq!(
+            mask(&scheduler, libc::SIGUSR1),
+            Some(usr1 | segv),
+            "a noted unreported signal"
+        );
+        assert!(!crate::syscalls::signal_shadow::unreported_pending());
+        assert!(scheduler.publish_signal_mask(target, mm, None));
+        assert_eq!(
+            mask(&scheduler, libc::SIGUSR1),
+            Some(usr1 | segv),
+            "withdrawn"
+        );
+        assert!(scheduler.publish_signal_mask(target, mm, Some(0)));
+        // The process-directed target choice: the published mask unblocks
+        // SIGUSR1, where SigBlk blocks it.
+        assert_eq!(
+            scheduler.kernel_signal_target(process, target, libc::SIGUSR1),
+            Some(target)
+        );
+        // While Detcore holds the thread under a mask of its own, readers that
+        // ask for the kernel's mask get SigBlk, as before.
+        assert!(scheduler.set_saved_guest_sigmask(target, Some(0)));
+        assert_eq!(
+            scheduler.thread_signal_mask_for(target, libc::SIGUSR1),
+            Some(usr1 | segv),
+            "a private mask is installed"
+        );
+        assert_eq!(
+            scheduler.kernel_signal_target(process, target, libc::SIGUSR1),
+            None
+        );
+        assert!(scheduler.set_saved_guest_sigmask(target, None));
+        scheduler.install_test_exec_incarnation(target, MmId::initial(DetPid::from_raw(555)));
+        assert!(
+            !scheduler.publish_signal_mask(target, mm, None),
+            "a retired incarnation"
+        );
+        assert_eq!(mask(&scheduler, libc::SIGUSR1), Some(0), "unchanged");
+        scheduler.logically_kill_thread(&target, &process, mm);
+        assert!(
+            !scheduler.published_masks.contains_key(&target),
+            "the mask went with its thread"
         );
     }
 
