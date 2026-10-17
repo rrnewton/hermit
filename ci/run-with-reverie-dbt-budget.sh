@@ -1869,7 +1869,10 @@ fi
 # native/, third-party, the root Cargo.toml, Cargo.lock and rust-toolchain.toml
 # have the same object ids: all seven SDK inputs, DBT inventory 961, calibrated
 # budget, job width and limits are unchanged.
-expected_pin=bb86c5d9801493eddd4089b8b34091b40603ef87
+# CARRY TO b2c021944ec3be50f1d7063edad65a3f481acbec (2026-10-17, LOCAL TEST PIN): from
+# bb86c5d9801493eddd4089b8b34091b40603ef87. One commit, reverie-sabre/src/tool.rs only; reverie-dbt tree,
+# root Cargo.toml, Cargo.lock and rust-toolchain.toml unchanged.
+expected_pin=b2c021944ec3be50f1d7063edad65a3f481acbec
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
