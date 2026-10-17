@@ -41,6 +41,29 @@ use reverie_syscalls::Syscall;
 use reverie_syscalls::SyscallArgs;
 use reverie_syscalls::Sysno;
 
+/// Carries shared open file control messages to Detcore's global state from
+/// inside a Tool callback, through `reverie_sabre::blocking_global_rpc` on the
+/// calling thread's connection. A `DetFd` method is synchronous code inside a
+/// callback's poll, between the callback's own requests.
+struct CoordinatorOpenFiles;
+
+impl detcore::OpenFileControlTransport for CoordinatorOpenFiles {
+    fn call(
+        &self,
+        control: detcore::OpenFileControl,
+    ) -> Result<detcore::OpenFileControlReply, detcore::SharedOpenFileError> {
+        let response = sabre::blocking_global_rpc::<detcore::GlobalState>(
+            detcore::shared_open_file_request(control),
+        )
+        .map_err(|error| {
+            detcore::SharedOpenFileError(format!(
+                "the coordinator connection refused a shared open file message: {error}"
+            ))
+        })?;
+        detcore::shared_open_file_reply(response)
+    }
+}
+
 /// Environment variable containing the coordinator's Unix-domain socket path.
 // TODO-HUMAN-REVIEW(PR-745): Review the private SaBRe exec environment contract.
 pub const RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
@@ -409,6 +432,12 @@ impl Plugin {
             },
         )
         .expect("failed to connect Detcore SaBRe plugin to coordinator");
+        // A description a fork shares is reached through the coordinator, over
+        // the calling thread's connection. The first installation in a process
+        // image is the only one, and a forked child inherits it.
+        let _ = detcore::install_shared_open_file_channel(Box::new(
+            detcore::ChunkedOpenFileChannel::new(CoordinatorOpenFiles),
+        ));
 
         Self {
             adapter,

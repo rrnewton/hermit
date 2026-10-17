@@ -1748,9 +1748,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (random devices and timerfds, `ThreadState::promote_shared_open_files`)
     /// before this handler's native fork, process-copying clone or exec, on a
     /// backend whose tool runs inside the guest and whose runtime routes those
-    /// operations through this handler (in-guest LiteInst). DBT runs them
-    /// natively and its runtime promotes there; ptrace and KVM keep the one
-    /// copy outside the guest. It runs inside the caller's turn, before the
+    /// operations through this handler (in-guest LiteInst, SaBRe). DBT runs
+    /// them natively and its runtime promotes there; ptrace and KVM keep the
+    /// one copy outside the guest. It runs inside the caller's turn, before the
     /// operation can expose a child or a new image
     /// (<https://github.com/rrnewton/hermit/issues/4381>).
     fn promote_before_native_lifecycle<G: Guest<Self>>(&self, guest: &G) {

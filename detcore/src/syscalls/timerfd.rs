@@ -44,10 +44,10 @@
 //! child, so there the runtime must promote the description to Detcore's
 //! global state before each native fork or exec and carry it across exec as a
 //! survivor (`promotes_open_files_before_native_lifecycle`). DBT's runtime
-//! does, for the calls it performs natively; on in-guest LiteInst every such
-//! call goes through Detcore's own handler, which promotes first. SaBRe does
-//! not yet, so there a strict run's timerfd is refused by name
-//! ([`refuse_unshared_model`]) rather than left on host time. Also not under record/replay,
+//! does, for the calls it performs natively; on in-guest LiteInst and SaBRe
+//! every such call goes through Detcore's own handler, which promotes first.
+//! A backend whose model is not shared refuses a strict run's timerfd by name
+//! ([`refuse_unshared_model`]) rather than leaving it on host time. Also not under record/replay,
 //! whose recordings keep the host's answers, or without sequentialized
 //! threads. `TFD_TIMER_CANCEL_ON_SET` is accepted and never fires, because
 //! Hermit's virtual clock is never set; an absolute deadline is read on the
@@ -897,15 +897,15 @@ mod tests {
     /// Detcore runs outside the guest on the ptrace family and KVM, not on
     /// SaBRe, DBT or in-guest LiteInst. Its timerfd models are shared there,
     /// on DBT, whose runtime promotes them before a native fork or exec, and
-    /// on in-guest LiteInst, where Detcore's fork and exec handlers do; SaBRe
-    /// shares none, so a timerfd is refused there.
+    /// on in-guest LiteInst and SaBRe, where Detcore's fork and exec handlers
+    /// do.
     #[test]
     fn timerfd_models_are_shared_per_backend() {
         for (name, backend, outside, shared) in [
             ("ptrace", BackendCapabilities::PTRACE, true, true),
             ("e9patch", BackendCapabilities::E9PATCH, true, true),
             ("kvm", BackendCapabilities::KVM, true, true),
-            ("sabre", BackendCapabilities::SABRE, false, false),
+            ("sabre", BackendCapabilities::SABRE, false, true),
             ("dbt", BackendCapabilities::DBT, false, true),
             (
                 "liteinst in-guest",

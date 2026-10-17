@@ -1853,7 +1853,14 @@ fi
 # bb913edb at both pins), and the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml are unchanged: all seven SDK inputs, DBT inventory 961,
 # calibrated budget, job width and limits are unchanged.
-expected_pin=586d929ed48607c751606552593241eabeca047e
+# CARRY TO 565710d610b7242b38fa76e1477829f27cfbdd53 (2026-10-17, PROVISIONAL): from
+# 586d929ed48607c751606552593241eabeca047e. Five commits: liteinst's 3b4ae2d5 and e611da33,
+# vspeed's 3da25ef3 (reverie-ptrace/src/timer.rs) and B3 step 3's 57ca7d14
+# (reverie-sabre) and 565710d6 (reverie/src/capabilities.rs). git diff is
+# empty under reverie-dbt/ (tree bb913edb at both pins); root Cargo.toml and
+# rust-toolchain.toml are unchanged. Cargo.lock gains one reverie-inguest
+# dependency entry from 3b4ae2d5, which liteinst's own pin commit carries.
+expected_pin=565710d610b7242b38fa76e1477829f27cfbdd53
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

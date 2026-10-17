@@ -1004,45 +1004,89 @@ int main(void) {
     assert_eq!(report["bitwise_parity"], false, "{report}");
 }
 
-/// SaBRe's runtime does not promote open-file descriptions before a native
-/// fork or exec, so Detcore cannot keep one model of a timerfd there. A strict
-/// run's timerfd is refused by name instead of following the host clock (B3,
-/// `promotes_open_files_before_native_lifecycle`).
-#[test]
-fn sabre_refuses_a_timerfd_by_name() {
-    const GUEST: &str = r#"
-#include <stdio.h>
-#include <sys/timerfd.h>
-#include <time.h>
-
-int main(void) {
-  int fd = timerfd_create(CLOCK_MONOTONIC, 0);
-  printf("timerfd %d\n", fd);
-  return 0;
+/// The timerfd fixture the CLI tests use, compiled for these SaBRe runs.
+fn timerfd_fixture(dir: &Path) -> PathBuf {
+    compile_guest_with(
+        dir,
+        "timerfd_virtual_time",
+        include_str!("fixtures/timerfd_virtual_time.c"),
+        &["-std=gnu11"],
+    )
 }
-"#;
+
+/// Each `mode` of the timerfd fixture reaches canonical L2 parity on SaBRe:
+/// Detcore keeps the timer on virtual time there (B3 step 3). SaBRe forks and
+/// execs only from Detcore's handler, which promotes the timer's model before
+/// the native call (`promotes_open_files_before_native_lifecycle`), so a
+/// parent and its forked child share one model, as Linux shares one timer.
+/// SaBRe delivers no preemption timer, so these are the modes that also pass
+/// on ptrace with `--max-timeslice=disabled`, with the same output there.
+fn assert_timerfd_modes_at_parity(modes: &[&str], label: &str) {
     let Some(loader) = sabre_loader() else {
         return;
     };
     let dir = tempfile::Builder::new()
-        .prefix("sabre-timerfd-refused-")
+        .prefix("sabre-timerfd-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create the guest directory");
-    let guest = compile_guest(dir.path(), "timerfd", GUEST);
+    let guest = timerfd_fixture(dir.path());
+    for mode in modes {
+        assert_sabre_verify(&guest, &[mode], &loader, &format!("{label} {mode}"));
+    }
+}
+
+#[test]
+fn sabre_timerfds_stay_on_virtual_time() {
+    assert_timerfd_modes_at_parity(&["catchup", "nonblock", "zero-timeout"], "timerfd");
+}
+
+/// One timer shared by a parent and its forked child (`dup-fork`), and a
+/// child-exit storm against a periodic timer.
+#[test]
+fn sabre_timerfds_share_one_model_across_fork() {
+    assert_timerfd_modes_at_parity(&["dup-fork", "sigchld-storm"], "timerfd");
+}
+
+#[test]
+fn sabre_timerfd_reads_and_waits_stay_on_virtual_time() {
+    assert_timerfd_modes_at_parity(
+        &[
+            "readv",
+            "epollet",
+            "masked-ppoll-expired",
+            "catchup-sigcont",
+        ],
+        "timerfd",
+    );
+}
+
+/// A timerfd passed over `SCM_RIGHTS` is refused by name, as on ptrace: its
+/// receiver keeps no model of the timer.
+#[test]
+fn sabre_refuses_a_timerfd_passed_over_scm_rights_by_name() {
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    let dir = tempfile::Builder::new()
+        .prefix("sabre-timerfd-scm-rights-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest directory");
+    let guest = timerfd_fixture(dir.path());
     let mut command = Command::new(hermit_binary());
     command
         .env("HERMIT_SABRE_BINARY", &loader)
         .args(["--backend", "sabre", "run", "--strict", COMPARISON_EPOCH])
         .arg("--")
-        .arg(&guest);
-    let (status, stderr) = run_expecting_failure(command, "SaBRe guest that creates a timerfd");
+        .arg(&guest)
+        .arg("scm-rights");
+    let (status, stderr) = run_expecting_failure(command, "SaBRe guest that passes a timerfd");
     assert_eq!(
         status.code(),
         Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
         "{stderr}"
     );
     assert!(
-        stderr.contains("timerfd_create on a backend whose runtime does not keep one model")
+        stderr.contains("a message passes timerfd")
             && stderr.contains("https://github.com/rrnewton/hermit/issues/1923"),
         "the refusal does not name the timerfd:\n{stderr}"
     );

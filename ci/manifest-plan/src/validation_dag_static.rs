@@ -3549,7 +3549,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // sabre_exe_link_names_the_guest_image_as_natively retains all 28: 29.
     // sabre_refuses_exe_links_it_cannot_answer_by_name retains all 29: 30.
     // sabre_refuses_a_timerfd_by_name (B3) retains all 30: 31.
-    ("test.sabre_examples", 31),
+    // B3 step 3 replaces it with sabre_refuses_a_timerfd_passed_over_scm_rights_by_name
+    // and adds sabre_timerfds_stay_on_virtual_time,
+    // sabre_timerfds_share_one_model_across_fork and
+    // sabre_timerfd_reads_and_waits_stay_on_virtual_time: 34.
+    ("test.sabre_examples", 34),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -4708,7 +4712,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // limit-read test: 27. And the same --pipe-wake-latency exec test: 28.
     // And the same exe-link test: 29, and the same refusal test: 30.
     // And the same timerfd refusal test: 31.
-    ("test.sabre_examples_on_host", 31),
+    // B3 step 3: one SaBRe timerfd test replaced, three added: 34.
+    ("test.sabre_examples_on_host", 34),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
