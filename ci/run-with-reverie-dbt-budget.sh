@@ -2050,7 +2050,7 @@ fi
 # These are capped local builds with existing dependencies, not a cold-build
 # recalibration or equality to either historical SDK key. Inventory is 966;
 # all existing job, memory, CPU and elapsed limits remain unchanged.
-expected_pin=3090b098a5efbe124815ca6babec849511b52558
+expected_pin=aaed1ab669b079a7f0a3adf00cf92d274e34649b
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

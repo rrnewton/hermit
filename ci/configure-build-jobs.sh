@@ -2127,8 +2127,8 @@ fi
 # These are capped local builds with existing dependencies, not a cold-build
 # recalibration or equality to either historical SDK key. Inventory is 966;
 # all existing job, memory, CPU and elapsed limits remain unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 3090b098a5efbe124815ca6babec849511b52558 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 3090b098a5efbe124815ca6babec849511b52558 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != aaed1ab669b079a7f0a3adf00cf92d274e34649b ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie aaed1ab669b079a7f0a3adf00cf92d274e34649b (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
