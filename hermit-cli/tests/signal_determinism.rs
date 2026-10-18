@@ -1252,3 +1252,154 @@ fn run_against_an_undrained_pipe(
     });
     Some((status, delivered))
 }
+
+static DELIVERY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// tests/c/signal_delivery_check.c, built once: caught deliveries of known
+/// shapes from one thread, each checking what Linux guarantees about it.
+fn delivery_guest() -> &'static Path {
+    DELIVERY_GUEST
+        .get_or_init(|| {
+            let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("hermit-cli should be inside the repository");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("signal-delivery-check-{}", std::process::id()));
+            fs::create_dir_all(&build_root)
+                .expect("failed to create signal delivery check build directory");
+            let binary = build_root.join("signal_delivery_check");
+            let mut command = Command::new("cc");
+            command
+                .args([
+                    "-O0",
+                    "-g",
+                    "-D_GNU_SOURCE",
+                    "-std=c11",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                ])
+                .arg(repository.join("tests/c/signal_delivery_check.c"))
+                .arg("-o")
+                .arg(&binary);
+            command_output(command, "signal delivery check guest compilation");
+            binary
+        })
+        .as_path()
+}
+
+/// Runs `mode` of the delivery guest on ptrace twice:
+/// - under `--strict --verify --verify-strict`, which must pass (a delivery
+///   the kernel contradicts ends a strict run);
+/// - under `--strict` with Detcore's delivery counters logged
+///   (`RUST_LOG=detcore::signal_delivery=trace`).
+///
+/// Both runs must print the guest's `OK <mode>`. Returns the one counter line
+/// of the guest's one thread, from `approved=` on.
+fn delivery_counters(mode: &str) -> String {
+    let expected = format!("OK {mode}\n");
+    let mut verify = Command::new(hermit_test::hermit_binary());
+    verify.args(["run", "--strict", "--verify", "--verify-strict", "--"]);
+    verify.arg(delivery_guest()).arg(mode);
+    let output = command_output(
+        verify,
+        &format!("delivery check {mode} under --verify-strict"),
+    );
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+
+    let log = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "signal-delivery-check-{}-{mode}.log",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&log);
+    let mut counted = Command::new(hermit_test::hermit_binary());
+    counted
+        .env("RUST_LOG", "detcore::signal_delivery=trace")
+        .arg("--log-file")
+        .arg(&log)
+        .args(["run", "--strict", "--"]);
+    counted.arg(delivery_guest()).arg(mode);
+    let output = command_output(counted, &format!("delivery check {mode} with counters"));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), expected);
+    let log_text = fs::read_to_string(&log).expect("read the counter log");
+    let lines: Vec<&str> = log_text
+        .lines()
+        .filter_map(|line| line.split("signal deliveries: ").nth(1))
+        .collect();
+    assert_eq!(lines.len(), 1, "one thread, one counter line:\n{log_text}");
+    lines[0].to_owned()
+}
+
+/// The counter line of a mode whose one caught delivery is approved.
+const ONE_APPROVAL: &str = "approved=1 mismatched=0 interruption_from_registers=0 skipped={}";
+
+#[test]
+fn ptrace_delivery_check_approves_a_raised_signal() {
+    let _guard = hermit_signal_lock();
+    assert_eq!(delivery_counters("raise"), ONE_APPROVAL);
+}
+
+#[test]
+fn ptrace_delivery_check_approves_a_signal_that_interrupts_pause() {
+    let _guard = hermit_signal_lock();
+    assert_eq!(delivery_counters("pause"), ONE_APPROVAL);
+}
+
+#[test]
+fn ptrace_delivery_check_approves_a_signal_that_interrupts_nanosleep() {
+    let _guard = hermit_signal_lock();
+    assert_eq!(delivery_counters("nanosleep"), ONE_APPROVAL);
+}
+
+#[test]
+fn ptrace_delivery_check_approves_a_signal_that_interrupts_a_pipe_read() {
+    let _guard = hermit_signal_lock();
+    assert_eq!(delivery_counters("read"), ONE_APPROVAL);
+}
+
+#[test]
+fn ptrace_delivery_check_approves_a_signal_whose_handler_restarts_a_pipe_read() {
+    let _guard = hermit_signal_lock();
+    assert_eq!(delivery_counters("read-restart"), ONE_APPROVAL);
+}
+
+#[test]
+fn ptrace_delivery_check_approves_a_signal_to_a_thread_in_user_code() {
+    let _guard = hermit_signal_lock();
+    assert_eq!(delivery_counters("spin"), ONE_APPROVAL);
+}
+
+#[test]
+fn ptrace_delivery_check_approves_a_signal_admitted_by_sigsuspend() {
+    let _guard = hermit_signal_lock();
+    assert_eq!(delivery_counters("suspend"), ONE_APPROVAL);
+}
+
+#[test]
+fn ptrace_delivery_check_approves_a_queued_realtime_signal() {
+    let _guard = hermit_signal_lock();
+    assert_eq!(delivery_counters("realtime"), ONE_APPROVAL);
+}
+
+#[test]
+fn ptrace_delivery_check_approves_an_sa_resethand_delivery() {
+    let _guard = hermit_signal_lock();
+    assert_eq!(delivery_counters("resethand"), ONE_APPROVAL);
+}
+
+#[test]
+fn ptrace_delivery_check_approves_an_sa_nodefer_delivery() {
+    let _guard = hermit_signal_lock();
+    assert_eq!(delivery_counters("nodefer"), ONE_APPROVAL);
+}
+
+/// An ignored signal is never offered for approval: Detcore checks caught
+/// deliveries only.
+#[test]
+fn ptrace_delivery_check_never_offers_an_ignored_signal() {
+    let _guard = hermit_signal_lock();
+    assert_eq!(
+        delivery_counters("ignored"),
+        r#"approved=0 mismatched=0 interruption_from_registers=0 skipped={"not caught": 1}"#
+    );
+}
