@@ -111,6 +111,54 @@ the run:
   scheduled differently from the same run with it off. The two are not the
   same run.
 
+Each caught signal the backend reports is also checked at its delivery,
+before the copy records it (A5 step 3.2). Detcore builds the delivery from
+the copy, and the backend checks it against the kernel at the stop, reading
+only, through `Guest::deliver_signal`. On ptrace:
+- the mask the frame saves and the current mask are compared with the
+  kernel's (`PTRACE_GETSIGMASK` and procfs `SigBlk`);
+- where the thread is at the exit of a syscall Detcore finished, the
+  syscall number and the result are compared with `orig_ax` and `rax`;
+- the handler's mask is the copy's own transition, compared with Linux's
+  rule over the same masks and action. The action itself is not read from
+  the kernel; the copy checks it where the guest sets it.
+
+On ptrace the kernel still delivers the signal, with its own action and
+frame. Checking changes the copy exactly as it would unchecked, and at the
+same point, with one exception: when the kernel's current mask blocks the
+signal, resuming with it requeues it instead of delivering it, so nothing is
+recorded until its later delivery. A delivery the backend cannot check at
+that point is counted by reason and goes on unchanged, for example a stop
+after an injection or a thread with no copy. A caught force-delivered signal
+(a fault) that the copy holds blocked gives the copy up quietly, since the
+kernel unblocked it and reset its action before the stop.
+
+A delivery the kernel contradicts, where the copy and the kernel are both
+certain, is a Detcore defect. It is logged as `SIGNAL_STATE_COPY_DIVERGED`
+and drops the copy. Under `hermit run --strict` it instead ends the run as
+an internal failure (exit 125). The log then holds the line
+`HERMIT_INTERNAL_FAILURE class=signal-delivery-check`, naming the signal,
+the thread and what differed. Hermit's own final class line reads
+`container-child-panic` or `container-child-exit`, depending on which
+thread failed. Commands that `hermit analyze` rebuilds from a configuration
+do not carry `--strict`, so there a contradiction is logged instead.
+
+Each thread logs its counts when it exits, at TRACE under the target
+`detcore::signal_delivery`, below the level that runs compare. The counts
+are approvals (frame and current masks matched the kernel's),
+contradictions, deliveries whose interruption was taken from
+the registers, approvals that compared Detcore's syscall result
+(`result_checked`), and deliveries not checked, by reason. To see them:
+
+```bash
+RUST_LOG=detcore::signal_delivery=trace hermit --log-file run.log run --strict -- ./program
+```
+
+Until Reverie keeps a guest's SIGTRAP state across its own single-steps
+(https://github.com/rrnewton/reverie/pull/1070, A5 step 3.0), a
+multithreaded glibc program loses its copy at its first `pthread_create`.
+Its deliveries are then counted as "no copy".
+
 What it reports:
 
 - A WARN line starting `SIGNAL_STATE_COPY_DIVERGED` when the copy and the

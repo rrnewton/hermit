@@ -1122,7 +1122,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // crate: 1731.
     // And the 46 replay-tool tests that moved out of the hermit library into
     // hermit-replay (replayer, its fs, mmap and network submodules, desync): 1777.
-    ("test.regular_crates", 1_777),
+        // And detcore-model's a_fatal_delivery_check_is_off_by_default_and_never_enters_the_legacy_form
+    // (A5 step 3.2): 1778.
+    ("test.regular_crates", 1_778),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2536,7 +2538,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4504): 2085, freshly listed.
     // And the_first_child_exit_sigchld_taken_stands_for_the_exit_without_publication
     // (dev-hermit minibeads dh-l1fk): 2086.
-    ("test.detcore_unit", 2086),
+        // And signal_shadow's ten delivery-check tests (A5 step 3.2): 2096.
+    ("test.detcore_unit", 2096),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2856,7 +2859,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And procfs_determinism::a_staged_binds_root_rewrite_holds_on_the_kernel_path_after_chroot
     // and a_bind_through_a_symbolic_link_stays_shown_after_a_later_bind_replaces_it
     // (https://github.com/rrnewton/hermit/issues/4213, K3a): 256.
-    ("test.hermit_integration_3", 256),
+    // And signal_determinism's eighteen ptrace_delivery_check_* tests (A5
+    // step 3.2): 61 + 263 + 274 = 598.
+    ("test.hermit_integration_3", 274),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4423,7 +4428,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same already-woken poll unit: 2085, freshly listed.
     // And the_first_child_exit_sigchld_taken_stands_for_the_exit_without_publication
     // (dev-hermit minibeads dh-l1fk): 2086.
-    ("test.detcore_unit_on_host", 2086),
+        // And the same ten delivery-check tests: 2096.
+    ("test.detcore_unit_on_host", 2096),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4503,7 +4509,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 4213 directory-alias record/replay test: 577.
     // And runtime-private maps target/alias/lifetime coverage: 578, listed.
     // And the 4213 staged-bind kernel-path and install-time bind tests: 580.
-    ("test.hermit_integration_on_host", 580),
+    // And signal_determinism's eighteen delivery-check tests (A5 step 3.2): 598.
+    ("test.hermit_integration_on_host", 598),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -4883,7 +4890,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twenty container_mounts tests: 1634.
     // And the same 83 moved record/replay tests: 1717.
     // And the same 46 replay-tool tests: 1763.
-    ("test.regular_crates_on_host", 1_763),
+        // And the same detcore-model fatal-delivery-check test: 1764.
+    ("test.regular_crates_on_host", 1_764),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
