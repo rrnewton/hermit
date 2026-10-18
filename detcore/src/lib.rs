@@ -2131,6 +2131,25 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         config.backend.provides_process_signal_control && config.sequentialize_threads
     }
 
+    /// A sequentialized run lets one guest thread run at a time, and Detcore
+    /// refuses every way to install a seccomp filter: `seccomp(2)`
+    /// (`handle_seccomp`, EOPNOTSUPP or an earlier argument error) and
+    /// `prctl(PR_SET_SECCOMP)` (not a supported option, ENOSYS). Both
+    /// refusals need the call intercepted, so the declaration also requires
+    /// both in the subscriptions. The ptrace backend then keeps the guest's SIGTRAP
+    /// action and mask across its own single-steps
+    /// (<https://github.com/rrnewton/hermit/issues/4409>).
+    fn enforces_serialized_execution(config: &Config) -> bool {
+        let subscriptions = Self::subscriptions(config);
+        config.sequentialize_threads
+            && subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::seccomp)
+            && subscriptions
+                .iter_syscalls()
+                .any(|sysno| sysno == Sysno::prctl)
+    }
+
     async fn handle_signal_dequeue<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -5265,6 +5284,30 @@ mod subscription_tests {
                 "passthru_opt={passthru_opt}: the syscall set must not depend on CPUID virtualization"
             );
         }
+    }
+
+    /// Detcore declares the serialized-execution contract only where it holds:
+    /// threads sequentialized, and both seccomp-filter routes intercepted and
+    /// refused.
+    #[test]
+    fn serialized_execution_is_declared_only_where_detcore_enforces_it() {
+        let enforces = <Detcore as Tool>::enforces_serialized_execution;
+        for passthru_opt in [false, true] {
+            let config = strict_config(passthru_opt);
+            let subscriptions = <Detcore as Tool>::subscriptions(&config);
+            for sysno in [Sysno::seccomp, Sysno::prctl] {
+                assert!(
+                    subscriptions.iter_syscalls().any(|s| s == sysno),
+                    "passthru_opt={passthru_opt}: {sysno} must reach its refusal"
+                );
+            }
+            assert!(enforces(&config), "passthru_opt={passthru_opt}");
+        }
+        assert!(!enforces(&Config {
+            sequentialize_threads: false,
+            ..strict_config(false)
+        }));
+        // The refusals themselves are pinned in `syscalls::misc`'s tests.
     }
 
     #[test]
