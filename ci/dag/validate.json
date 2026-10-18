@@ -9218,6 +9218,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/sigreturn-preemption",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigsuspend-sibling-signal-wake",
           "mode": "verify",
           "backend": "ptrace"
@@ -27177,6 +27184,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/sigreturn-preemption",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigsuspend-sibling-signal-wake",
           "mode": "verify",
           "backend": "ptrace"
@@ -35027,6 +35041,13 @@
           "test": "c-programs/sigprocmask-state",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigreturn-preemption",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -55300,6 +55321,13 @@
           "test": "c-programs/sigprocmask-state",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigreturn-preemption",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
