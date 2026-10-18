@@ -8,7 +8,7 @@
 
 //! Keeping each thread's [`SignalShadow`] in step with the guest.
 //!
-//! Off unless [`SIGNAL_STATE_CHECK_ENV`] is `1` (docs/SIGNAL_STATE_CHECK.md).
+//! On unless [`SIGNAL_STATE_CHECK_ENV`] is `0` (docs/SIGNAL_STATE_CHECK.md).
 //!
 //! Every function here runs after the guest operation it records has
 //! committed, uses only values Detcore already holds for that operation, and
@@ -50,16 +50,17 @@ use crate::signal_state::SignalShadow;
 use crate::signal_state::ThreadSignals;
 use crate::signal_state::sigbit;
 
-/// The environment variable that turns the copy on: `1` seeds, records and
-/// checks it, and lets the decisions A5 step 2 converted read it; unset (the
-/// default) leaves every run as it was. The ptrace backend reports
-/// handler returns to it (`Tool::handle_sigreturn`), but not every delivery,
-/// and asking for the reports adds a stop at each handler return, so it is
-/// opt-in.
+/// The environment variable that turns the copy off: `0` leaves every run as
+/// it was before A5. Unset, or any other value, keeps the copy on (A5 step
+/// 2d): it is seeded, recorded and checked, and the decisions A5 step 2
+/// converted read it. The ptrace backend reports handler returns to it
+/// (`Tool::handle_sigreturn`), at the cost of a stop at each one, but not
+/// every delivery; where a delivery goes unreported, the copy gives itself
+/// up and the decisions read `/proc`, as without it.
 pub const SIGNAL_STATE_CHECK_ENV: &str = "HERMIT_SIGNAL_STATE_CHECK";
 
-/// Whether [`SIGNAL_STATE_CHECK_ENV`] turns the copy on, read once. Tests
-/// always have it on.
+/// Whether the copy is on: unless [`SIGNAL_STATE_CHECK_ENV`] is `0`, read
+/// once. Tests always have it on.
 pub(crate) fn enabled() -> bool {
     #[cfg(test)]
     {
@@ -68,7 +69,7 @@ pub(crate) fn enabled() -> bool {
     #[cfg(not(test))]
     {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os(SIGNAL_STATE_CHECK_ENV).is_some_and(|v| v == "1"))
+        *ENABLED.get_or_init(|| std::env::var_os(SIGNAL_STATE_CHECK_ENV).is_none_or(|v| v != "0"))
     }
 }
 
