@@ -740,8 +740,8 @@ pub(super) fn record_rt_sigprocmask<G, T>(
 /// kernel through the backend (`check_delivery`, A5 step 3.2). Checking adds
 /// only reads and a refusal: the copy changes exactly as it would unchecked,
 /// at the same point, unless a check fails, which drops the copy, or the
-/// backend reports that the kernel will requeue the signal rather than deliver
-/// it, when nothing is recorded until its later delivery. This must
+/// backend reports that the kernel will not deliver the signal at this
+/// resume, when nothing is recorded until a later delivery. This must
 /// be the last thing the signal callback does before it returns the signal:
 /// a later injection would void the backend's approval.
 pub(crate) async fn check_and_record_delivery<G, T>(guest: &mut G, signal: i32)
@@ -749,13 +749,14 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    let had_copy = guest.thread_state().signal_shadow.is_some();
     // At a delivery stop the kernel has not installed the handler mask yet.
     take_unreported(guest);
     take_wait_outcome(guest);
     reconcile_returns(guest, "signal delivery");
-    // A signal the kernel requeues instead of delivering is delivered, and
-    // recorded, at a later stop.
-    if check_delivery(guest, signal).await {
+    // A signal the kernel does not deliver at this resume is delivered, and
+    // recorded, at a later stop, if at all.
+    if check_delivery(guest, signal, had_copy).await {
         commit_delivery(guest, signal);
     }
 }
@@ -901,8 +902,10 @@ fn unavailable_reason(reason: reverie::SignalDeliveryUnavailable) -> &'static st
 ///   syscall, so a syscall record with `orig_ax` -1 means the thread returned
 ///   to user code since: no syscall.
 /// - A frame's chained delivery at the same exit stops before any guest
-///   instruction, at the handler's first instruction; anywhere else, the
-///   guest ran since, and with `orig_ax` -1 that is no syscall.
+///   instruction, at the handler's first instruction. Anywhere else, either
+///   the guest ran since, and with `orig_ax` -1 that is no syscall, or the
+///   frame was not built (a frame fault, whose SIGSEGV comes at the same
+///   exit), and the registers' answer is used.
 /// - A record naming the syscall `orig_ax` names is sent as it stands, so
 ///   `rax` is compared with the result Detcore finished the call with. Any
 ///   other record is sent as it stands too, so a contradiction is reported.
@@ -946,8 +949,11 @@ where
             Some(Interruption::Return { .. } | Interruption::KernelRun { .. }) if orig < 0 => {
                 (Interruption::NotInSyscall, true)
             }
-            // A stale frame record at a syscall stop contradicts the registers.
-            Some(Interruption::AfterFrame) => (Interruption::NotInSyscall, false),
+            // Still at the syscall's exit, away from the handler: the frame
+            // was not built (a frame fault raises SIGSEGV at the same exit).
+            // Detcore has no result of its own for the kernel's restart
+            // handling of that frame, so the registers decide.
+            Some(Interruption::AfterFrame) => (from_registers, true),
             Some(record) => (record, false),
         }
     }
@@ -964,13 +970,16 @@ where
 /// - a point the backend cannot check is counted by reason and changes
 ///   nothing.
 ///
-/// Not checked, and counted: no copy, the shared actions unknown, a signal
+/// Not checked, and counted: no copy (told apart from a copy this delivery's
+/// reconciliation gave up, `had_copy`), the shared actions unknown, a signal
 /// that is not caught (the kernel ignores it or takes its default action).
 ///
 /// Returns false only when the backend says the kernel will not deliver the
-/// signal at this resume ([`reverie::SignalDeliveryUnavailable::BlockedAtResume`]:
-/// it requeues it), so the copy must not record a delivery.
-async fn check_delivery<G, T>(guest: &mut G, signal: i32) -> bool
+/// signal at this resume, so the copy must not record a delivery:
+/// [`reverie::SignalDeliveryUnavailable::BlockedAtResume`] (it requeues it)
+/// and [`reverie::SignalDeliveryUnavailable::NotADeliveryStop`] (it queues
+/// it anew or drops it).
+async fn check_delivery<G, T>(guest: &mut G, signal: i32, had_copy: bool) -> bool
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -1000,21 +1009,28 @@ where
         true
     };
     let (action, frame_mask, current_mask, mut entered) = match state {
+        None if had_copy => return skip(guest, "copy given up at this delivery"),
         None => return skip(guest, "no copy"),
         Some((None, ..)) => return skip(guest, "dispositions unknown"),
         Some((Some(Err(_)), ..)) => return skip(guest, "invalid signal"),
         Some((Some(Ok(action)), frame, current, thread)) => (action, frame, current, thread),
     };
+    // A force-delivered signal the copy holds blocked or ignored was
+    // unblocked, and its action reset to the default, by the kernel before
+    // this stop (`force_sig_info_to_task`), which the copy did not see: it is
+    // not the copy's to check, and the copy no longer knows the action.
+    if forced() & sigbit(signal) != 0 {
+        if current_mask & sigbit(signal) != 0 {
+            forced_changed(guest, "signal delivery");
+            return skip(guest, "forced while blocked");
+        }
+        if action.is_ignored() {
+            forced_changed(guest, "signal delivery");
+            return skip(guest, "forced while ignored");
+        }
+    }
     if !action.is_caught() {
         return skip(guest, "not caught");
-    }
-    // A force-delivered signal the copy holds blocked was unblocked, and its
-    // action reset to the default, by the kernel before this stop
-    // (`force_sig_info_to_task`), which the copy did not see: it is not the
-    // copy's to check, and the copy no longer knows the action.
-    if forced() & sigbit(signal) & current_mask != 0 {
-        forced_changed(guest, "signal delivery");
-        return skip(guest, "forced while blocked");
     }
     // The handler's mask as the copy will record it (`enter_handler`), which
     // the backend compares with Linux's rule over the same masks and action.
@@ -1046,11 +1062,14 @@ where
     };
     let result_checked = matches!(interruption, reverie::Interruption::Return { .. });
     let outcome = guest.deliver_signal(delivery).await;
-    let requeued = outcome
-        == reverie::SignalDeliveryOutcome::Unavailable(
-            reverie::SignalDeliveryUnavailable::BlockedAtResume,
-        );
-    if !requeued {
+    let not_delivered = matches!(
+        outcome,
+        reverie::SignalDeliveryOutcome::Unavailable(
+            reverie::SignalDeliveryUnavailable::BlockedAtResume
+                | reverie::SignalDeliveryUnavailable::NotADeliveryStop
+        )
+    );
+    if !not_delivered {
         // The kernel builds this handler's frame as the guest resumes: a
         // further delivery before a guest instruction runs is at the handler's
         // first instruction.
@@ -1065,7 +1084,9 @@ where
             counters.approved += 1;
             counters.result_checked += u64::from(result_checked);
             trace!(
-                "[dtid {}] signal-state copy: the delivery of signal {signal} is approved",
+                target: "detcore::signal_delivery",
+                "[dtid {}] signal-state copy: the delivery of signal {signal} is approved, \
+                 interrupting {interruption:?}",
                 guest.thread_state().dettid
             );
         }
@@ -1098,7 +1119,7 @@ where
             counters.skip("frame-building outcome");
         }
     }
-    !requeued
+    !not_delivered
 }
 
 /// At a delivery stop inside a temporary-mask wait, Linux holds one of two
@@ -3539,17 +3560,18 @@ mod tests {
     }
 
     /// A point the backend cannot check is counted by reason, and the copy
-    /// records the delivery as it does unchecked; but a signal the kernel
-    /// requeues instead of delivering (`BlockedAtResume`) is not recorded,
+    /// records the delivery as it does unchecked; but a signal the kernel will
+    /// not deliver at this resume (`BlockedAtResume`, which requeues it, and
+    /// `NotADeliveryStop`, which queues it anew or drops it) is not recorded,
     /// and no handler frame follows it.
     #[test]
-    fn an_unavailable_check_is_counted_and_a_requeued_signal_is_not_recorded() {
+    fn an_unavailable_check_is_counted_and_an_undelivered_signal_is_not_recorded() {
         let kernel = Kernel::default();
         let _seam = kernel.install();
         let unavailable = reverie::SignalDeliveryOutcome::Unavailable;
         let mut guest = catching(
             &kernel,
-            unavailable(reverie::SignalDeliveryUnavailable::NotADeliveryStop),
+            unavailable(reverie::SignalDeliveryUnavailable::TracerFiltered),
         );
         let mut unchecked = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
         guest.delivery.orig_rax = Some(-1);
@@ -3557,11 +3579,7 @@ mod tests {
         check(&mut guest, libc::SIGUSR1);
         record_delivery(&mut unchecked, libc::SIGUSR1);
         assert_eq!(
-            guest
-                .thread
-                .delivery_counters
-                .skipped
-                .get("not a delivery stop"),
+            guest.thread.delivery_counters.skipped.get("tracer filtered"),
             Some(&1)
         );
         assert_eq!(
@@ -3581,45 +3599,51 @@ mod tests {
             Some(reverie::Interruption::AfterFrame)
         );
 
-        let mut requeued = catching(
-            &kernel,
-            unavailable(reverie::SignalDeliveryUnavailable::BlockedAtResume),
-        );
-        requeued.delivery.orig_rax = Some(-1);
-        requeued.thread.delivery_interruption = Some(reverie::Interruption::NotInSyscall);
-        let before = requeued
-            .thread
-            .signal_shadow
-            .as_ref()
-            .map(|shadow| shadow.thread.clone());
-        check(&mut requeued, libc::SIGUSR1);
-        assert_eq!(
-            requeued
-                .thread
-                .delivery_counters
-                .skipped
-                .get("blocked at resume"),
-            Some(&1)
-        );
-        assert_eq!(
-            requeued
+        for (reason, name) in [
+            (
+                reverie::SignalDeliveryUnavailable::BlockedAtResume,
+                "blocked at resume",
+            ),
+            (
+                reverie::SignalDeliveryUnavailable::NotADeliveryStop,
+                "not a delivery stop",
+            ),
+        ] {
+            let mut undelivered = catching(&kernel, unavailable(reason));
+            undelivered.delivery.orig_rax = Some(-1);
+            undelivered.thread.delivery_interruption = Some(reverie::Interruption::NotInSyscall);
+            let before = undelivered
                 .thread
                 .signal_shadow
                 .as_ref()
-                .map(|shadow| shadow.thread.clone()),
-            before,
-            "nothing is recorded for a signal the kernel requeues"
-        );
-        assert_eq!(
-            requeued.thread.delivery_interruption,
-            Some(reverie::Interruption::NotInSyscall),
-            "no frame follows a requeued signal"
-        );
+                .map(|shadow| shadow.thread.clone());
+            check(&mut undelivered, libc::SIGUSR1);
+            assert_eq!(
+                undelivered.thread.delivery_counters.skipped.get(name),
+                Some(&1)
+            );
+            assert_eq!(
+                undelivered
+                    .thread
+                    .signal_shadow
+                    .as_ref()
+                    .map(|shadow| shadow.thread.clone()),
+                before,
+                "nothing is recorded for a signal the kernel does not deliver ({name})"
+            );
+            assert_eq!(
+                undelivered.thread.delivery_interruption,
+                Some(reverie::Interruption::NotInSyscall),
+                "no frame follows an undelivered signal ({name})"
+            );
+        }
     }
 
     /// A frame's chained delivery at the same exit stops at the handler's
     /// first instruction and is `AfterFrame`; once the guest has run on
-    /// (anywhere else, with `orig_ax` -1) it is no syscall.
+    /// (anywhere else, with `orig_ax` -1) it is no syscall; and still at the
+    /// syscall's exit away from the handler, where a frame fault's SIGSEGV
+    /// stops, the registers decide.
     #[test]
     fn after_frame_holds_only_at_the_handlers_first_instruction() {
         let kernel = Kernel::default();
@@ -3644,6 +3668,15 @@ mod tests {
             guest.delivery.asked[2].interruption,
             reverie::Interruption::NotInSyscall
         );
+        guest.delivery.orig_rax = Some(libc::SYS_tgkill);
+        check(&mut guest, libc::SIGUSR1);
+        assert_eq!(
+            guest.delivery.asked[3].interruption,
+            reverie::Interruption::KernelRun {
+                syscall: libc::SYS_tgkill
+            }
+        );
+        assert_eq!(guest.thread.delivery_counters.interruption_from_registers, 2);
     }
 
     /// A caught force-delivered signal the copy holds blocked reaches its stop
@@ -3676,6 +3709,40 @@ mod tests {
                 .delivery_counters
                 .skipped
                 .get("forced while blocked"),
+            Some(&1)
+        );
+    }
+
+    /// A force-delivered signal the copy holds ignored reaches its stop reset
+    /// to the default by the kernel: the copy is given up quietly, and nothing
+    /// is checked.
+    #[test]
+    fn a_forced_signal_the_copy_ignores_gives_the_copy_up_unchecked() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
+        let segv = sigbit(libc::SIGSEGV);
+        let ignore = KernelSigaction {
+            handler: 1,
+            flags: 0x0400_0000,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        kernel.set(sigbit(libc::SIGINT), segv, USR1);
+        record_rt_sigaction(&mut guest, libc::SIGSEGV, Some(ignore), None, &Ok(0));
+        assert!(guest.thread.signal_shadow.is_some());
+        let before = DIVERGENCES.with(Cell::get);
+        check(&mut guest, libc::SIGSEGV);
+        assert!(guest.delivery.asked.is_empty());
+        assert!(guest.thread.signal_shadow.is_none());
+        assert!(!guest.thread.signal_shadow_lost, "given up quietly");
+        assert_eq!(DIVERGENCES.with(Cell::get), before);
+        assert_eq!(
+            guest
+                .thread
+                .delivery_counters
+                .skipped
+                .get("forced while ignored"),
             Some(&1)
         );
     }
@@ -3716,6 +3783,33 @@ mod tests {
             guest.thread.delivery_counters.skipped.get("no copy"),
             Some(&1)
         );
+    }
+
+    /// A copy that this delivery's reconciliation gives up is counted apart
+    /// from a thread that had no copy at the stop.
+    #[test]
+    fn a_copy_given_up_by_the_deliverys_reconciliation_is_counted_apart() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
+        guest.delivery.orig_rax = Some(-1);
+        guest.thread.delivery_interruption = Some(reverie::Interruption::NotInSyscall);
+        check(&mut guest, libc::SIGUSR1);
+        assert_eq!(guest.thread.delivery_counters.approved, 1);
+        // The handler's frame is open, and the kernel does not hold its mask.
+        kernel.set(sigbit(libc::SIGINT) | sigbit(libc::SIGHUP), 0, USR1);
+        check(&mut guest, libc::SIGUSR1);
+        assert!(guest.thread.signal_shadow.is_none());
+        assert_eq!(guest.delivery.asked.len(), 1);
+        assert_eq!(
+            guest
+                .thread
+                .delivery_counters
+                .skipped
+                .get("copy given up at this delivery"),
+            Some(&1)
+        );
+        assert_eq!(guest.thread.delivery_counters.skipped.get("no copy"), None);
     }
 
     /// The interruption sent is Detcore's record where the registers say the
