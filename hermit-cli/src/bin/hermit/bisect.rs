@@ -289,6 +289,10 @@ mod tests {
                 &["--preemption-stacktrace-log-file=requested.log"][..],
                 "refuse --preemption-stacktrace-log-file in the run arguments",
             ),
+            (
+                &["--preempt-at=main"][..],
+                "refuse --preempt-at in the run arguments",
+            ),
         ] {
             let error = bisect(run_args);
             assert!(

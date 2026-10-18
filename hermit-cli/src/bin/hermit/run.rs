@@ -62,6 +62,9 @@ use hermit::host_input_change::explains_divergence;
 use hermit::host_input_change::find_pattern_difference;
 use hermit::host_input_change::open_position;
 use hermit::host_input_change::read_host_inputs;
+use hermit::preempt_hints::HintSpec;
+use hermit::preempt_hints::ResolvedHint;
+use hermit::preempt_hints::resolve_hints;
 use reverie::process::Bind;
 use reverie::process::Command;
 use reverie::process::Container;
@@ -1105,6 +1108,33 @@ pub struct RunOpts {
     #[clap(long, requires = "happens_before")]
     hb_list_events: bool,
 
+    /// End a guest thread's time slice when it reaches a code location in the
+    /// guest's main executable, as the preemption timer would (source-level
+    /// preemption hints, https://github.com/rrnewton/hermit/issues/4371). Meant for
+    /// `--chaos`: hints at code suspected of a race make chaos explore the
+    /// interleavings there much more often. LOCATION is `func`, `file:line` or
+    /// `func:line`; names are raw symbols, so write `file:line` for Rust or C++
+    /// code. `thread=main|spawn:N|dettid:N` limits whose visits count;
+    /// `every=K` ends the slice on every Kth visit (the default is every
+    /// visit) and `nth=N` only on the Nth. A line hints every statement
+    /// address the debug info gives it, so one execution of a line can be
+    /// several visits. Repeatable; two hints may not share an address. Runs on
+    /// the ptrace backend only, and combinations it cannot honor are refused
+    /// before the guest starts. Preview the resolved addresses with
+    /// `--preempt-at-list`.
+    #[clap(
+        long = "preempt-at",
+        value_name = "LOCATION[,thread=T][,every=K|,nth=N]",
+        value_parser = clap::builder::ValueParser::new(|text: &str| text.parse::<HintSpec>())
+    )]
+    preempt_at: Vec<HintSpec>,
+
+    /// Resolve every `--preempt-at` hint against the guest program's symbol
+    /// table and debug info, print each hint's addresses with their function
+    /// and source line, and exit without running the guest.
+    #[clap(long, requires = "preempt_at")]
+    preempt_at_list: bool,
+
     /// Runtime-only cache of the resolved happens-before program. Populated in
     /// `main()` after the guest binary's debug info is available (so anchor code
     /// locations resolve to addresses), then copied into `DetConfig` for the
@@ -1125,6 +1155,13 @@ pub struct RunOpts {
     /// never serialized, like `resolved_happens_before`.
     #[clap(skip)]
     host_input_log: Option<PathBuf>,
+
+    /// Runtime-only: the manifest this run reruns, when `--from` named one.
+    /// `--from` is consumed when the command line is rewritten from the
+    /// manifest (`run_config::expand_argv_noting_manifest`), so `from` is
+    /// never set by then; `main` sets this instead. Never a CLI argument.
+    #[clap(skip)]
+    rerun_manifest: Option<PathBuf>,
 
     /// Opt in to keeping a core file for each guest process that a
     /// core-dumping signal (SIGSEGV, SIGABRT, SIGBUS, ...) kills. The core is
@@ -6258,6 +6295,9 @@ impl RunOpts {
         // happens-before spec this launch cannot enforce needs neither, so it
         // is refused at once rather than after input or availability checks.
         self.refuse_unenforceable_happens_before()?;
+        // For the same reason: a launch that cannot honor `--preempt-at` is
+        // refused before it reads input or probes a backend.
+        self.refuse_unsupported_preemption_hints()?;
         // Before stdin or any backend: a pair whose shared inputs are missing,
         // unsealed or not the manifest's objects is refused before it starts.
         #[cfg(feature = "native-exec")]
@@ -6424,6 +6464,22 @@ impl RunOpts {
         self.validate_program()?;
         if self.hb_list_events {
             return self.list_happens_before_events();
+        }
+        if self.preempt_at_list {
+            return self.list_preemption_hints();
+        }
+        if !self.preempt_at.is_empty() {
+            // Resolved strictly first, so a hint that names nothing is refused
+            // with its own reason; then refused as a whole, because this build
+            // places no breakpoints yet and must not run with hints ignored.
+            self.resolve_preemption_hints()?;
+            return Err(Error::msg(
+                "--preempt-at: the hints resolve (see --preempt-at-list), but this build does \
+                 not enforce them yet; source-level preemption hints are being implemented \
+                 (https://github.com/rrnewton/hermit/issues/4371). Run without --preempt-at \
+                 meanwhile",
+            )
+            .context(super::container::PolicyRefusal));
         }
         // After the event listing, which runs no guest and writes no summary.
         self.validate_summary_json_visibility()?;
@@ -7080,6 +7136,12 @@ impl RunOpts {
                  the adapter's port",
             ),
             (
+                !self.preempt_at.is_empty(),
+                "--preempt-at",
+                "the trials replay preemption points, and hints are not carried into those \
+                 replays yet",
+            ),
+            (
                 config.record_preemptions_to.is_some(),
                 "--record-preemptions-to",
                 SHARED,
@@ -7507,6 +7569,135 @@ impl RunOpts {
         };
         hermit::happens_before::refuse_hold_without_preemption(&program, path, &reason)
             .map_err(|error| error.context(super::container::PolicyRefusal))
+    }
+
+    /// Refuse a `--preempt-at` launch this build cannot honor, before input
+    /// is read or a backend probed (design of
+    /// https://github.com/rrnewton/hermit/issues/4371, section 8). Each refusal names
+    /// the option to drop. `--preempt-at-list` runs no guest and is not
+    /// refused here.
+    fn refuse_unsupported_preemption_hints(&self) -> Result<(), Error> {
+        if self.preempt_at.is_empty() || self.preempt_at_list {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        let refusal = if !cfg!(target_arch = "x86_64") {
+            Some("hints need an x86-64 host; run on one, or drop --preempt-at".to_owned())
+        } else if self.selected_backend() != Backend::Ptrace {
+            Some(format!(
+                "hints run on the ptrace backend only, and this run selected the {:?} backend; \
+                 drop --backend",
+                self.selected_backend()
+            ))
+        } else if self.namespace_only {
+            Some("--namespace-only runs the guest without interception; drop it".to_owned())
+        } else if self.no_sequentialize_threads && !self.strict {
+            Some(
+                "hints need sequentialized threads, so that one thread runs at a time; drop \
+                 --no-sequentialize-threads"
+                    .to_owned(),
+            )
+        } else if config.gdbserver || self.dap_listen.is_some() {
+            Some(
+                "a debugger shares the guest's breakpoints with the hints; drop --gdbserver or \
+                 --dap-listen"
+                    .to_owned(),
+            )
+        } else if config.replay_preemptions_from.is_some() {
+            Some(
+                "a preemption replay takes its hints from the record it replays; drop \
+                 --preempt-at"
+                    .to_owned(),
+            )
+        } else if config.record_preemptions_to.is_some() && !config.chaos {
+            Some(
+                "recording preemptions with hints needs --chaos, whose change points the record \
+                 holds; add --chaos or drop --record-preemptions-to"
+                    .to_owned(),
+            )
+        } else if config.record_preemptions_to.is_some() && config.max_timeslice.is_none() {
+            Some(
+                "recording preemptions with hints needs the preemption timer, which identifies \
+                 each hit by its branch count; drop --max-timeslice=disabled"
+                    .to_owned(),
+            )
+        } else if config.replay_schedule_from.is_some() {
+            Some(
+                "a schedule replay cannot carry hints yet; drop --replay-schedule-from or \
+                 --preempt-at"
+                    .to_owned(),
+            )
+        } else {
+            self.rerun_manifest.as_ref().map(|manifest| {
+                format!(
+                    "a rerun of a manifest ({}) cannot carry hints yet; give the run's full \
+                     command line instead of --from",
+                    manifest.display()
+                )
+            })
+        };
+        match refusal {
+            Some(reason) => Err(Error::msg(format!("--preempt-at: {reason}"))
+                .context(super::container::PolicyRefusal)),
+            None => Ok(()),
+        }
+    }
+
+    /// Resolve every `--preempt-at` hint against the guest program, strictly
+    /// (`hermit::preempt_hints::resolve_hints`). A hint that cannot be
+    /// resolved exactly is a policy refusal naming why.
+    fn resolve_preemption_hints(&self) -> Result<(DebugInfoResolver, Vec<ResolvedHint>), Error> {
+        let (_, host) = self.resolve_guest_and_host_program()?;
+        let refuse =
+            |message: String| Err(Error::msg(message).context(super::container::PolicyRefusal));
+        let resolver = match DebugInfoResolver::open(&host) {
+            Ok(resolver) if !resolver.is_empty() => resolver,
+            Ok(_) => {
+                return refuse(format!(
+                    "--preempt-at: {} has no symbol table or debug info to resolve hints \
+                     against; build it with -g",
+                    host.display()
+                ));
+            }
+            Err(error) => {
+                return refuse(format!(
+                    "--preempt-at: cannot read {} to resolve hints: {error:#}",
+                    host.display()
+                ));
+            }
+        };
+        let program = host.display().to_string();
+        match resolve_hints(&self.preempt_at, &resolver, &program) {
+            Ok(hints) => Ok((resolver, hints)),
+            Err(problems) => refuse(problems),
+        }
+    }
+
+    /// `--preempt-at-list`: print each hint's resolved addresses, with their
+    /// function and source line, and exit without running the guest.
+    fn list_preemption_hints(&self) -> Result<ExitStatus, Error> {
+        let (resolver, hints) = self.resolve_preemption_hints()?;
+        for hint in &hints {
+            let count = hint.addrs.len();
+            println!(
+                "--preempt-at {}: {count} address{}",
+                hint.spec,
+                if count == 1 { "" } else { "es" }
+            );
+            for addr in &hint.addrs {
+                let place = resolver.describe(*addr);
+                let function = place.function.as_deref().unwrap_or("?");
+                match (place.file.as_deref(), place.line) {
+                    (Some(file), Some(line)) => println!("  {addr:#x}  {function} ({file}:{line})"),
+                    _ => println!("  {addr:#x}  {function}"),
+                }
+            }
+        }
+        println!(
+            "A visit is one trap at any of a hint's addresses, so one execution of a line with \
+             several statement addresses can be several visits."
+        );
+        Ok(ExitStatus::SUCCESS)
     }
 
     fn list_happens_before_events(&self) -> Result<ExitStatus, Error> {
@@ -9228,6 +9419,11 @@ impl RunOpts {
                     && hermit::backend_delivers_preemption_timer(self.selected_backend()),
             ),
         }
+    }
+
+    /// Note that this run reruns `manifest` (`hermit run --from`).
+    pub(crate) fn set_rerun_manifest(&mut self, manifest: PathBuf) {
+        self.rerun_manifest = Some(manifest);
     }
 
     /// The run config `--save-config` writes: the captured options with the

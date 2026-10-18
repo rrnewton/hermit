@@ -17837,6 +17837,286 @@ fn happens_before_unusable_spec_is_a_named_policy_refusal() {
     }
 }
 
+/// The `--preempt-at` test program, compiled with `-g` in `directory`.
+/// `square` spans lines 2-5 and line 6 is blank, so a hint there has no code.
+fn preempt_at_program(directory: &Path) -> String {
+    let source = directory.join("hints.c");
+    fs::write(
+        &source,
+        "#include <stdio.h>\n\
+         int square(int x) {\n\
+         \x20   int y = x * x;\n\
+         \x20   return y;\n\
+         }\n\
+         \n\
+         int main(void) {\n\
+         \x20   printf(\"ran %d\\n\", square(3));\n\
+         \x20   return 0;\n\
+         }\n",
+    )
+    .expect("failed to write the --preempt-at test program");
+    let program = directory.join("hints");
+    let output = Command::new("cc")
+        .args(["-g", "-O0", "-fno-pie", "-no-pie"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&program)
+        .output()
+        .expect("failed to run cc for the --preempt-at test program");
+    assert!(
+        output.status.success(),
+        "--preempt-at test program compilation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    program.to_str().unwrap().to_owned()
+}
+
+/// `--preempt-at-list` resolves each hint against the program's symbols and
+/// line table, prints every address with its function and source line, and
+/// exits 0 without running the guest
+/// (https://github.com/rrnewton/hermit/issues/4371).
+#[test]
+fn preempt_at_list_prints_each_hint_address_and_runs_no_guest() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let program = preempt_at_program(directory.path());
+    let output = hermit(&[
+        "run",
+        "--preempt-at=square",
+        "--preempt-at=hints.c:3,thread=main,nth=2",
+        "--preempt-at-list",
+        "--",
+        &program,
+    ]);
+    let listing = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{listing}\n{}",
+        stderr(&output)
+    );
+    let lines: Vec<&str> = listing.lines().collect();
+    assert_eq!(lines[0], "--preempt-at square: 1 address", "{listing}");
+    assert!(
+        lines[1].starts_with("  0x")
+            && lines[1].contains(" square (")
+            && lines[1].ends_with("hints.c:2)"),
+        "the function hint is its entry, on line 2:\n{listing}"
+    );
+    assert!(
+        lines[2].starts_with("--preempt-at hints.c:3,thread=main,nth=2: "),
+        "the line hint keeps its selectors:\n{listing}"
+    );
+    let line_addresses: Vec<&&str> = lines
+        .iter()
+        .skip(3)
+        .take_while(|line| line.starts_with("  0x"))
+        .collect();
+    assert!(
+        !line_addresses.is_empty()
+            && line_addresses
+                .iter()
+                .all(|line| line.contains(" square (") && line.ends_with("hints.c:3)")),
+        "each address of line 3 is in square, on line 3:\n{listing}"
+    );
+    assert!(
+        listing.contains("A visit is one trap at any of a hint's addresses"),
+        "{listing}"
+    );
+    assert!(
+        !listing.contains("ran 9"),
+        "the guest ran under --preempt-at-list:\n{listing}"
+    );
+}
+
+/// Every `--preempt-at` launch this build cannot honor is a policy refusal
+/// (exit 122) that names what to change, and the guest never runs
+/// (https://github.com/rrnewton/hermit/issues/4371, design section 8):
+/// options that would leave the hints unenforced or make their stops
+/// unreproducible, hints that do not resolve exactly, and, until the hints are
+/// enforced, a run whose hints all resolve. A malformed hint is a usage error.
+#[test]
+fn preempt_at_refuses_what_it_cannot_honor_and_names_the_remedy() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let program = preempt_at_program(directory.path());
+    let file = |name: &str| directory.path().join(name).to_str().unwrap().to_owned();
+    let (replayed, recorded, schedule) = (
+        file("replayed.preempts"),
+        file("recorded.preempts"),
+        file("schedule.json"),
+    );
+    let refusals: Vec<(Vec<&str>, &str)> = vec![
+        (
+            vec!["--namespace-only"],
+            "--preempt-at: --namespace-only runs the guest without interception; drop it",
+        ),
+        (
+            vec!["--no-sequentialize-threads"],
+            "drop --no-sequentialize-threads",
+        ),
+        (vec!["--gdbserver"], "drop --gdbserver or --dap-listen"),
+        (
+            vec!["--replay-preemptions-from", &replayed],
+            "a preemption replay takes its hints from the record it replays; drop --preempt-at",
+        ),
+        (
+            vec!["--record-preemptions-to", &recorded],
+            "add --chaos or drop --record-preemptions-to",
+        ),
+        (
+            vec![
+                "--chaos",
+                "--record-preemptions-to",
+                &recorded,
+                "--max-timeslice=disabled",
+            ],
+            "drop --max-timeslice=disabled",
+        ),
+        (
+            vec!["--replay-schedule-from", &schedule],
+            "drop --replay-schedule-from or --preempt-at",
+        ),
+        (vec![], "does not enforce them yet"),
+    ];
+    for (options, expected) in refusals {
+        let mut args = vec!["run"];
+        args.extend(options);
+        args.extend(["--preempt-at=square", "--", program.as_str()]);
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{args:?}: must be a policy refusal:\n{log}"
+        );
+        assert!(
+            log.contains(expected),
+            "{args:?}: no refusal naming {expected:?}:\n{log}"
+        );
+        assert!(
+            !stdout(&output).contains("ran 9"),
+            "{args:?}: the guest ran although the hints were refused"
+        );
+    }
+
+    // A hint that does not resolve exactly is refused with its remedy, on
+    // the run path and the --preempt-at-list path alike, and every unresolved
+    // hint is named, not only the first.
+    for list in [false, true] {
+        let mut args = vec![
+            "run",
+            "--preempt-at=sqaure",
+            "--preempt-at=hints.c:6",
+            "--preempt-at=hint.c:3",
+            "--preempt-at=hints.c:2",
+        ];
+        if list {
+            args.push("--preempt-at-list");
+        }
+        args.extend(["--", program.as_str()]);
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{args:?}: an unresolved hint must be a policy refusal:\n{log}"
+        );
+        for expected in [
+            "--preempt-at sqaure: ",
+            "has no function symbol \"sqaure\"",
+            "--preempt-at hints.c:6: ",
+            "name a line that has code, and check the addresses with --preempt-at-list",
+            "\"hint.c\" names neither a source file",
+            "build the program with -g",
+        ] {
+            assert!(log.contains(expected), "{args:?}: no {expected:?}:\n{log}");
+        }
+        assert!(
+            stdout(&output).is_empty(),
+            "{args:?}: printed a listing or ran"
+        );
+    }
+    // Two hints may not share an address: `square` is the entry of the
+    // function whose line 2 begins there.
+    let output = hermit(&[
+        "run",
+        "--preempt-at=square",
+        "--preempt-at=hints.c:2",
+        "--preempt-at-list",
+        "--",
+        &program,
+    ]);
+    let log = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "overlapping hints must be a policy refusal:\n{log}"
+    );
+    assert!(
+        log.contains("--preempt-at square and --preempt-at hints.c:2 share the address")
+            && log.contains("hints may not overlap"),
+        "{log}"
+    );
+
+    // A malformed hint is refused by the parser, naming the problem.
+    let output = hermit(&["run", "--preempt-at=square,nth=0", "--", &program]);
+    let log = stderr(&output);
+    assert_eq!(output.status.code(), Some(2), "{log}");
+    assert!(log.contains("--preempt-at"), "{log}");
+}
+
+/// A rerun of a manifest cannot carry hints yet, so `--preempt-at` with
+/// `--from` is a policy refusal that names the manifest and the remedy. The
+/// rewritten command line no longer names `--from`; the refusal must still
+/// see that the run is a rerun.
+#[test]
+fn preempt_at_refuses_a_manifest_rerun() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let program = preempt_at_program(directory.path());
+    let data = directory.path().join("data");
+    let config_home = directory.path().join("config-home");
+    let run = |args: &[&str]| {
+        let mut command = hermit_command(args);
+        command
+            .env("HERMIT_DATA_DIR", &data)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env_remove("HERMIT_MANIFEST")
+            .env_remove("HERMIT_EPOCH")
+            .stdin(Stdio::null());
+        hermit_test::hermit_output("hermit run", &mut command)
+    };
+    let original = run(&["run", "--manifest=always", "--", &program]);
+    assert_eq!(original.status.code(), Some(0), "{}", stderr(&original));
+    assert_eq!(stdout(&original), "ran 9\n");
+    let recording = fs::read_dir(&data)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.join("manifest.json").exists())
+        .expect("the run wrote no manifest");
+    let recording = recording.to_str().unwrap();
+
+    let output = run(&["run", "--from", recording, "--preempt-at=square"]);
+    let log = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a manifest rerun with hints must be a policy refusal:\n{log}"
+    );
+    assert!(
+        log.contains(&format!("a rerun of a manifest ({recording}"))
+            && log.contains("give the run's full command line instead of --from"),
+        "{log}"
+    );
+    assert!(
+        stdout(&output).is_empty(),
+        "the guest ran: {}",
+        stdout(&output)
+    );
+    // The same rerun without hints runs.
+    let rerun = run(&["run", "--from", recording]);
+    assert_eq!(rerun.status.code(), Some(0), "{}", stderr(&rerun));
+    assert_eq!(stdout(&rerun), "ran 9\n");
+}
+
 /// `--hb-list-events` prints the resolved spec and exits 0 without running
 /// the guest; the anchors it cannot resolve are named on stderr.
 #[test]

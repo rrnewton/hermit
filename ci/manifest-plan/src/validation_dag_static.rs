@@ -1660,7 +1660,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And dbt_launched_program_tests::a_relative_path_entry_is_taken_from_the_guests_directory_not_the_launchers:
     // 1155.
     // And +2 from ca5325c1: 1157.
-    ("test.hermit_unit", 1157),
+    // And the three preempt_hints tests (https://github.com/rrnewton/hermit/issues/4371): 1160, listed.
+    ("test.hermit_unit", 1160),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3594,7 +3595,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And run_dbt_answers_brk_for_a_child_spawned_from_a_long_path: 532.
     // Focused chroot program-break regression: 533, freshly listed.
     // Restored aggregation and diagnostic-isolation cases: 535, freshly listed.
-    ("test.cli", 535),
+    // And the three --preempt-at tests (https://github.com/rrnewton/hermit/issues/4371): 538, listed.
+    ("test.cli", 538),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4048,7 +4050,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the long-path spawn one: 467.
     // The same focused chroot program-break regression: 468, freshly listed.
     // The same two restored cases remain selected on host: 470, freshly listed.
-    ("test.cli_on_host", 470),
+    // And the three --preempt-at tests (https://github.com/rrnewton/hermit/issues/4371): 473, listed.
+    ("test.cli_on_host", 473),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4659,7 +4662,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 4213 received-directory record-version test: 1154.
     // And the same DBT launched-program test: 1155.
     // And +2 from ca5325c1: 1157.
-    ("test.hermit_unit_on_host", 1157),
+    // And the three preempt_hints tests (https://github.com/rrnewton/hermit/issues/4371): 1160, listed.
+    ("test.hermit_unit_on_host", 1160),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
