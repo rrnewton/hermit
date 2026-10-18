@@ -1988,7 +1988,16 @@ fi
 # changes. git diff is empty under reverie-dbt/, and the root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml are unchanged. All seven SDK inputs,
 # inventory 963, calibrated budget, job width and limits are unchanged.
-expected_pin=ed29a09d102ffa3bf33c3efce9401025e80b7e4e
+# CARRY TO b36c69b71133689a3394cf9f8d2bc4a5429d9af6 (2026-10-18): from
+# ed29a09d102ffa3bf33c3efce9401025e80b7e4e. SaBRe's shared patcher/installer
+# and the ordinary AT_RANDOM startup seed change Rust, bootstrap and qualifier
+# inputs, so fresh runtime/package checks are required.
+# The complete reverie-dbt tree remains fc8ae744acd4a7c4d19fc64e7177afdc03085725;
+# its build.rs, native/CMake/vendor/SDK inputs, root Cargo.toml and toolchain
+# are byte-identical. Root Cargo.lock adds only the reverie-inguest -> goblin
+# edge. SDK inventory 963, calibrated budget, job width and limits carry
+# unchanged; this source comparison does not transfer any earlier receipt.
+expected_pin=b36c69b71133689a3394cf9f8d2bc4a5429d9af6
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
