@@ -768,6 +768,14 @@ impl Scheduler {
             } else if let SignalTimerId::Alarm(process) = id {
                 self.fire_itimer_real(deadline, process, tid, signal);
             } else {
+                // Without publication reports, the child-exit ledger must know
+                // that the scheduler's copy was sent, whichever path sent it
+                // (`ChildExitSigchldLedger::note_generic_send`).
+                if let SignalTimerId::ChildExit { child, parent } = id
+                    && !self.backend.reports_child_exit_publication
+                {
+                    self.child_exit_sigchld.note_generic_send(parent, child);
+                }
                 self.fire_alarm(id.process(), tid, signal);
             }
         }
@@ -958,11 +966,11 @@ impl Scheduler {
         creator: DetTid,
     ) -> Option<DetTid> {
         if !self.models_signal_targets {
-            return self
-                .blocked
-                .sigchld_deferred
-                .contains(&process)
-                .then_some(process);
+            // A delivery the child-exit ledger matched to another child's exit
+            // stands for that one (`ChildExitSigchldLedger::attributed`).
+            return (self.blocked.sigchld_deferred.contains(&process)
+                && !self.child_exit_sigchld.attributed.contains(&process))
+            .then_some(process);
         }
         // A delivery the child-exit ledger matched to another child's exit
         // stands for that one, not this (`ChildExitSigchldLedger::attributed`).
