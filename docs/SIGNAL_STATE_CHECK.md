@@ -65,12 +65,23 @@ the run:
 
 - Each handler return becomes one extra ptrace stop.
 - A preemption timer event due within 10005 retired branches of a handler
-  return is cancelled at that stop (Reverie's keep margin). The thread is
-  then preempted only at its next syscall. A thread that spins without
-  syscalls after its handler returns is never preempted, which can hang a
-  run whose progress depends on preemption.
-- So a run with the switch on can be scheduled differently from the same
-  run with it off. Each is deterministic, but the two are not the same run.
+  return (Reverie's keep margin) is cancelled at that stop and requested
+  again at the same target, so it fires where it fires without the
+  reports. If a late notification already let the thread pass the target,
+  it fires one branch after the return, and the run is refused as a skid
+  overshoot, as it is without the reports.
+- Two cases still cancel the event at that stop:
+  - the mask the handler's frame restores blocks the timer's signal, or
+    cannot be read;
+  - the run uses `--imprecise-timers`, whose events are cancelled past
+    their period.
+
+  The thread is then preempted only at its next syscall. A thread that
+  spins without syscalls after its handler returns is never preempted,
+  which can hang a run whose progress depends on preemption. In those two
+  cases a run with the switch on can be scheduled differently from the
+  same run with it off. Each run is deterministic, but the two are not the
+  same run.
 
 What it reports:
 
@@ -88,5 +99,5 @@ What it reports:
   much was actually checked.
 
 It stays opt-in because the backend does not report every delivery yet, and
-because of the timer cost above, which must be resolved before the copy can
-be on by default.
+because the two timer cases above must be handled before the copy can be on
+by default.
