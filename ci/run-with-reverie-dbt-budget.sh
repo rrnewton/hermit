@@ -1971,7 +1971,14 @@ fi
 # 48e0d7f1's only in a loader.c comment) 13.32s (213.16 job-seconds), against
 # the 572 job-second ceiling. Calibrated job width and CPU/wall limits carry
 # unchanged.
-expected_pin=48e0d7f1fa9a89aa70f379c5ff6f6d24ee9dda6f
+# CARRY TO 1ca2c374562109a97c83418bd67cdfd2c27a759e (2026-10-18): from
+# 48e0d7f1fa9a89aa70f379c5ff6f6d24ee9dda6f. One commit, 1ca2c374
+# (DbtGuest::auxv reads the application's vector from its initial stack),
+# touching only reverie-dbt/src/lib.rs. No file is added or removed (DBT
+# inventory 963). reverie-dbt/vendor, native/, build.rs, third-party, the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml have the same object ids: all
+# seven SDK inputs, calibrated budget, job width and limits are unchanged.
+expected_pin=1ca2c374562109a97c83418bd67cdfd2c27a759e
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
