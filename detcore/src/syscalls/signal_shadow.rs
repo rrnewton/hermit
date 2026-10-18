@@ -1001,15 +1001,22 @@ where
         }
         reverie::SignalDeliveryOutcome::Mismatch(mismatch) => {
             counters.mismatched += 1;
-            diverged(
-                guest,
-                "signal delivery",
-                &format!(
-                    "the kernel contradicts the delivery of signal {signal} in {:?}: the copy \
-                     holds {:#x}, the kernel {:#x}",
-                    mismatch.field, mismatch.expected, mismatch.actual
-                ),
+            let what = format!(
+                "the kernel contradicts the delivery of signal {signal} in {:?}: the copy holds \
+                 {:#x}, the kernel {:#x}",
+                mismatch.field, mismatch.expected, mismatch.actual
             );
+            if guest.config().signal_delivery_check_fatal {
+                // A Detcore defect where both sides are certain: a strict run
+                // ends rather than continue on the kernel's word alone.
+                let failure = format!(
+                    "HERMIT_INTERNAL_FAILURE class=signal-delivery-check dtid={} {what}",
+                    guest.thread_state().dettid
+                );
+                tracing::error!("{failure}");
+                panic!("{failure}");
+            }
+            diverged(guest, "signal delivery", &what);
         }
         reverie::SignalDeliveryOutcome::Unavailable(reason) => {
             counters.skip(unavailable_reason(reason));
@@ -1678,6 +1685,17 @@ mod tests {
     struct ShadowGuest {
         config: Config,
         thread: ThreadState<()>,
+        delivery: DeliveryScript,
+    }
+
+    /// What the scripted backend answers `Guest::deliver_signal`, and what it
+    /// was asked, with the `orig_rax` its registers show.
+    #[derive(Default)]
+    struct DeliveryScript {
+        answer: Option<reverie::SignalDeliveryOutcome>,
+        asked: Vec<reverie::SignalDelivery>,
+        orig_rax: Option<i64>,
+        registers_read: usize,
     }
 
     struct NoStack;
@@ -1746,7 +1764,24 @@ mod tests {
             &self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
-            panic!("recording on a ptrace-like backend reads no registers")
+            let orig_rax = self
+                .delivery
+                .orig_rax
+                .expect("recording on a ptrace-like backend reads no registers");
+            self.delivery.registers_read += 1;
+            // SAFETY: an all-zero `user_regs_struct` is a valid value.
+            let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+            regs.orig_rax = orig_rax as u64;
+            regs
+        }
+        async fn deliver_signal(
+            &mut self,
+            delivery: reverie::SignalDelivery,
+        ) -> reverie::SignalDeliveryOutcome {
+            self.delivery.asked.push(delivery);
+            self.delivery
+                .answer
+                .expect("this test does not expect a delivery check")
         }
         async fn stack(&mut self) -> Self::Stack {
             NoStack
@@ -1824,7 +1859,11 @@ mod tests {
             ..Config::default()
         };
         let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
-        let mut guest = ShadowGuest { config, thread };
+        let mut guest = ShadowGuest {
+            config,
+            thread,
+            delivery: DeliveryScript::default(),
+        };
         kernel.set(blocked, 0, 0);
         at_exec(&mut guest);
         assert!(
@@ -2799,7 +2838,11 @@ mod tests {
             ..Config::default()
         };
         let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
-        let guest = ShadowGuest { config, thread };
+        let guest = ShadowGuest {
+            config,
+            thread,
+            delivery: DeliveryScript::default(),
+        };
         guest
             .thread
             .published_dispositions
@@ -2905,6 +2948,7 @@ mod tests {
             ShadowGuest {
                 config: parent.config.clone(),
                 thread,
+                delivery: DeliveryScript::default(),
             }
         };
         let thread_flags = (libc::CLONE_VM | libc::CLONE_SIGHAND | libc::CLONE_THREAD) as u64;
@@ -3259,7 +3303,11 @@ mod tests {
             },
         ] {
             let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
-            let mut guest = ShadowGuest { config, thread };
+            let mut guest = ShadowGuest {
+                config,
+                thread,
+                delivery: DeliveryScript::default(),
+            };
             at_exec(&mut guest);
             assert!(guest.thread.signal_shadow.is_none());
         }
@@ -3275,8 +3323,277 @@ mod tests {
             ..Config::default()
         };
         let thread = ThreadState::new(DetPid::from_raw(1), &config, ());
-        let mut guest = ShadowGuest { config, thread };
+        let mut guest = ShadowGuest {
+            config,
+            thread,
+            delivery: DeliveryScript::default(),
+        };
         at_exec(&mut guest);
         assert!(guest.thread.signal_shadow.is_none());
+    }
+
+    /// A guest whose copy catches SIGUSR1 with `sa_mask` SIGUSR2, blocks
+    /// SIGINT, and whose scripted backend answers delivery checks `answer`.
+    fn catching(kernel: &Kernel, answer: reverie::SignalDeliveryOutcome) -> ShadowGuest {
+        let int = sigbit(libc::SIGINT);
+        let mut guest = seeded(kernel, int);
+        let action = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: USR2,
+        };
+        kernel.set(int, 0, USR1);
+        record_rt_sigaction(&mut guest, libc::SIGUSR1, Some(action), None, &Ok(0));
+        assert!(guest.thread.signal_shadow.is_some());
+        guest.delivery.answer = Some(answer);
+        guest
+    }
+
+    fn check(guest: &mut ShadowGuest, signal: i32) {
+        futures::executor::block_on(check_and_record_delivery(guest, signal));
+    }
+
+    /// The delivery a check builds is the copy's, before it records the
+    /// delivery: the caught action, the frame and current masks, Linux's
+    /// handler mask, every reserved and forced signal unchecked except the
+    /// delivered one, and the interruption Detcore recorded.
+    #[test]
+    fn a_checked_delivery_is_built_from_the_copy_and_recorded_as_unchecked() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let int = sigbit(libc::SIGINT);
+        let mut guest = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
+        let mut unchecked = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
+        let interruption = reverie::Interruption::Return {
+            syscall: libc::SYS_pause,
+            result: -514,
+        };
+        guest.thread.delivery_interruption = Some(interruption);
+        guest.delivery.orig_rax = Some(libc::SYS_pause);
+        check(&mut guest, libc::SIGUSR1);
+        record_delivery(&mut unchecked, libc::SIGUSR1);
+        let asked = guest.delivery.asked.clone();
+        assert_eq!(asked.len(), 1);
+        let d = asked[0];
+        assert_eq!(d.signal, libc::SIGUSR1);
+        assert_eq!(d.action.handler, 0x4000);
+        assert_eq!(d.action.mask, USR2);
+        assert_eq!((d.frame_mask, d.current_mask), (int, int));
+        assert_eq!(d.handler_mask, int | USR2 | USR1);
+        assert_eq!(d.unchecked_mask, reserved() | forced());
+        assert_eq!(d.interruption, interruption);
+        assert_eq!(guest.thread.delivery_counters.approved, 1);
+        // Checking changes the copy exactly as not checking does.
+        assert_eq!(
+            guest
+                .thread
+                .signal_shadow
+                .as_ref()
+                .map(|shadow| shadow.thread.clone()),
+            unchecked
+                .thread
+                .signal_shadow
+                .as_ref()
+                .map(|shadow| shadow.thread.clone()),
+        );
+        assert_eq!(
+            guest.thread.delivery_interruption,
+            Some(reverie::Interruption::AfterFrame),
+            "the next delivery at this exit follows this frame"
+        );
+    }
+
+    /// Inside a temporary-mask wait whose restore is pending, the frame saves
+    /// the mask from before the wait, and the current mask is the wait's.
+    #[test]
+    fn a_delivery_inside_a_temporary_mask_wait_saves_the_mask_from_before_it() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let int = sigbit(libc::SIGINT);
+        let mut guest = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
+        let shadow = guest.thread.signal_shadow.as_mut().unwrap();
+        shadow.thread.blocked = int | USR1;
+        shadow.thread.interrupted_under_temporary_mask(0);
+        guest.thread.delivery_interruption = Some(reverie::Interruption::AfterFrame);
+        kernel.set(0, 0, USR1);
+        check(&mut guest, libc::SIGUSR1);
+        let d = guest.delivery.asked[0];
+        assert_eq!((d.frame_mask, d.current_mask), (int | USR1, 0));
+        assert_eq!(d.handler_mask, USR2 | USR1);
+        assert_eq!(
+            guest.delivery.registers_read, 0,
+            "AfterFrame reads no registers"
+        );
+    }
+
+    /// A contradiction where both sides are certain is a divergence: it is
+    /// counted, the copy is dropped, and nothing more is recorded.
+    #[test]
+    fn a_mismatch_is_a_divergence_that_drops_the_copy() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mismatch = reverie::SignalDeliveryMismatch {
+            field: reverie::SignalDeliveryField::FrameMask,
+            expected: 1,
+            actual: 2,
+        };
+        let mut guest = catching(&kernel, reverie::SignalDeliveryOutcome::Mismatch(mismatch));
+        guest.delivery.orig_rax = Some(-1);
+        guest.thread.delivery_interruption = Some(reverie::Interruption::NotInSyscall);
+        let before = DIVERGENCES.with(Cell::get);
+        check(&mut guest, libc::SIGUSR1);
+        assert_eq!(DIVERGENCES.with(Cell::get), before + 1);
+        assert!(guest.thread.signal_shadow.is_none());
+        assert!(guest.thread.signal_shadow_lost);
+        assert_eq!(guest.thread.delivery_counters.mismatched, 1);
+    }
+
+    /// Under `--strict` (`Config::signal_delivery_check_fatal`) the same
+    /// contradiction ends the run as an internal failure.
+    #[test]
+    #[should_panic(expected = "HERMIT_INTERNAL_FAILURE class=signal-delivery-check")]
+    fn a_mismatch_ends_a_strict_run() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mismatch = reverie::SignalDeliveryMismatch {
+            field: reverie::SignalDeliveryField::InterruptedResult,
+            expected: 1,
+            actual: 2,
+        };
+        let mut guest = catching(&kernel, reverie::SignalDeliveryOutcome::Mismatch(mismatch));
+        guest.config.signal_delivery_check_fatal = true;
+        guest.delivery.orig_rax = Some(-1);
+        guest.thread.delivery_interruption = Some(reverie::Interruption::NotInSyscall);
+        check(&mut guest, libc::SIGUSR1);
+    }
+
+    /// A point the backend cannot check is counted by reason, and the copy
+    /// records the delivery as it does unchecked.
+    #[test]
+    fn an_unavailable_check_is_counted_and_changes_nothing() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = catching(
+            &kernel,
+            reverie::SignalDeliveryOutcome::Unavailable(
+                reverie::SignalDeliveryUnavailable::BlockedAtResume,
+            ),
+        );
+        let mut unchecked = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
+        guest.delivery.orig_rax = Some(-1);
+        guest.thread.delivery_interruption = Some(reverie::Interruption::NotInSyscall);
+        check(&mut guest, libc::SIGUSR1);
+        record_delivery(&mut unchecked, libc::SIGUSR1);
+        assert_eq!(
+            guest
+                .thread
+                .delivery_counters
+                .skipped
+                .get("blocked at resume"),
+            Some(&1)
+        );
+        assert_eq!(
+            guest
+                .thread
+                .signal_shadow
+                .as_ref()
+                .map(|shadow| shadow.thread.clone()),
+            unchecked
+                .thread
+                .signal_shadow
+                .as_ref()
+                .map(|shadow| shadow.thread.clone()),
+        );
+    }
+
+    /// A signal that is not caught, and a thread with no copy, are not
+    /// checked; each is counted.
+    #[test]
+    fn uncaught_signals_and_threads_without_a_copy_are_not_checked() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let mut guest = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
+        check(&mut guest, libc::SIGUSR2);
+        assert!(guest.delivery.asked.is_empty());
+        assert_eq!(
+            guest.thread.delivery_counters.skipped.get("not caught"),
+            Some(&1)
+        );
+        guest.thread.signal_shadow = None;
+        check(&mut guest, libc::SIGUSR1);
+        assert!(guest.delivery.asked.is_empty());
+        assert_eq!(
+            guest.thread.delivery_counters.skipped.get("no copy"),
+            Some(&1)
+        );
+    }
+
+    /// The interruption sent is Detcore's record where the registers say the
+    /// thread is at that syscall; no syscall where the thread has returned to
+    /// user code since; the registers' own answer where there is no record or
+    /// Detcore does not see every syscall; and the record as it stands where
+    /// it contradicts the registers, so the backend reports it.
+    #[test]
+    fn the_interruption_is_the_record_where_the_registers_agree_on_the_syscall() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let read = reverie::Interruption::Return {
+            syscall: libc::SYS_read,
+            result: -512,
+        };
+        let cases = [
+            (Some(read), libc::SYS_read, false, read, false),
+            (
+                Some(read),
+                -1,
+                false,
+                reverie::Interruption::NotInSyscall,
+                false,
+            ),
+            (Some(read), libc::SYS_write, false, read, false),
+            (
+                None,
+                libc::SYS_read,
+                false,
+                reverie::Interruption::KernelRun {
+                    syscall: libc::SYS_read,
+                },
+                true,
+            ),
+            (None, -1, false, reverie::Interruption::NotInSyscall, true),
+            (
+                Some(read),
+                libc::SYS_write,
+                true,
+                reverie::Interruption::KernelRun {
+                    syscall: libc::SYS_write,
+                },
+                true,
+            ),
+            (
+                Some(reverie::Interruption::NotInSyscall),
+                libc::SYS_read,
+                false,
+                reverie::Interruption::NotInSyscall,
+                false,
+            ),
+        ];
+        for (record, orig, passthru, expected, from_registers) in cases {
+            let mut guest = catching(&kernel, reverie::SignalDeliveryOutcome::Accepted);
+            guest.config.passthru_opt = passthru;
+            guest.thread.delivery_interruption = record;
+            guest.delivery.orig_rax = Some(orig);
+            check(&mut guest, libc::SIGUSR1);
+            assert_eq!(
+                guest.delivery.asked[0].interruption, expected,
+                "record {record:?}, orig_rax {orig}, passthru {passthru}"
+            );
+            assert_eq!(
+                guest.thread.delivery_counters.interruption_from_registers,
+                u64::from(from_registers),
+                "record {record:?}, orig_rax {orig}, passthru {passthru}"
+            );
+        }
     }
 }
