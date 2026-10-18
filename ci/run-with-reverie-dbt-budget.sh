@@ -2006,7 +2006,7 @@ fi
 # controller-capture commits onto b1e81ac276ccebe31d1a41e4c1f648bbcbd5e16f.
 # Incoming changes are disjoint from DBT/native/vendor/build inputs; the
 # SDK and native component inputs equal 5ac above. All limits stay unchanged.
-expected_pin=9451327184143f9046c80415f65eafbc0b25bd43
+expected_pin=b1e81ac276ccebe31d1a41e4c1f648bbcbd5e16f
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
