@@ -25252,6 +25252,13 @@
           "backend": "ptrace"
         },
         {
+          "lane": "privileged",
+          "category": "c-programs",
+          "test": "c-programs/sigreturn-preemption",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
           "kind": "structured-test-results",
           "schema": 2,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
@@ -29836,6 +29843,13 @@
           "lane": "privileged",
           "category": "c-programs",
           "test": "c-programs/cpuid-probe",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "privileged",
+          "category": "c-programs",
+          "test": "c-programs/sigreturn-preemption",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -39421,6 +39435,13 @@
           "lane": "privileged",
           "category": "c-programs",
           "test": "c-programs/cpuid-probe",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "privileged",
+          "category": "c-programs",
+          "test": "c-programs/sigreturn-preemption",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -63436,6 +63457,13 @@
           "lane": "privileged",
           "category": "c-programs",
           "test": "c-programs/cpuid-probe",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "privileged",
+          "category": "c-programs",
+          "test": "c-programs/sigreturn-preemption",
           "mode": "verify",
           "backend": "ptrace"
         },
