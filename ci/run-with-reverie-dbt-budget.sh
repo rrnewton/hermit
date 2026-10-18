@@ -1900,11 +1900,12 @@ fi
 # rust-toolchain.toml are byte-identical to 25f8b656. Inventory 961,
 # calibrated job width and CPU/wall limits carry unchanged. Fresh runtime
 # and native artifact qualification remain separate from this budget carry.
-# CARRY TO a0071f59586039e6cc6cd2e9aff04a21267bbf1e (2026-10-17): from
+# CARRY TO 5b7432f7da556c7498bf4b848437817122035075 (2026-10-17): from
 # e53cc6f4a20318730eacfb10804acf5fee80e077: Reverie main 0b583715 (two
-# reverie-sabre commits, nothing under reverie-dbt) plus b891b1e2
-# (DbtRunner::tool_answers_brk) and a0071f59 (Auxv::at_execfn, in
-# reverie/src only). b891b1e2 edits two
+# reverie-sabre commits, nothing under reverie-dbt) plus 57406bba
+# (DbtRunner::tool_answers_brk), cf46ad3e (Auxv::at_execfn, in reverie/src
+# only) and 5b7432f7 (DbtGuest::auxv reads the application's vector, in
+# reverie-dbt/src/lib.rs only). 57406bba edits two
 # vendored DynamoRIO sources, vendor/dynamorio/core/lib/globals_shared.h (+4
 # lines) and core/unix/loader.c (+12 lines), and adds reverie-dbt unit tests,
 # a live test and its C fixture. build.rs, native/, third-party, the root
@@ -1916,7 +1917,7 @@ fi
 # loader.c comment),
 # against the 572 job-second ceiling. Calibrated job width and CPU/wall limits
 # carry unchanged.
-expected_pin=a0071f59586039e6cc6cd2e9aff04a21267bbf1e
+expected_pin=5b7432f7da556c7498bf4b848437817122035075
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

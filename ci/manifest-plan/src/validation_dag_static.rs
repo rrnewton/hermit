@@ -3566,7 +3566,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_dbt_program_break_of_a_pie_starts_at_linuxs_rule and
     // run_dbt_heap_records_are_ptraces (DBT brk servicing): 521.
     // And run_dbt_answers_brk_for_a_program_found_through_path: 522.
-    ("test.cli", 522),
+    // And run_dbt_answers_brk_for_a_child_spawned_from_a_long_path: 523.
+    ("test.cli", 523),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4012,7 +4013,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore_warns_from_inside_the_guest_once_per_run_on_every_backend:
     // 453.
     // And the same three DBT program-break tests: 456, and the PATH one: 457.
-    ("test.cli_on_host", 457),
+    // And the long-path spawn one: 458.
+    ("test.cli_on_host", 458),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
