@@ -1644,7 +1644,10 @@ fn sabre_program_break_is_the_guests_as_natively() {
 /// A position-independent image's program break starts where Linux's rule
 /// puts it for wherever the image was loaded: its highest loaded segment's
 /// end at the image's bias, page-aligned (natively, under ptrace, and under
-/// SaBRe, whose loader picks another bias).
+/// SaBRe, whose loader picks another bias). It then grows by 64 pages: SaBRe's
+/// loader keeps free address space above a PIE image (Reverie 80fc77fa); before
+/// that the page above the image was usually its own last allocation, and
+/// `c-programs/mmap-determinism-heap` failed with `sbrk: ENOMEM`.
 #[test]
 fn sabre_program_break_of_a_pie_starts_at_linuxs_rule() {
     const GUEST: &str = include_str!("fixtures/program_break_pie.c");
@@ -1665,7 +1668,7 @@ fn sabre_program_break_of_a_pie_starts_at_linuxs_rule() {
     assert!(native.status.success(), "{native:?}");
     assert_eq!(
         String::from_utf8_lossy(&native.stdout),
-        "start as load_elf_binary puts it: yes\n"
+        "start as load_elf_binary puts it: yes\ngrows 64 pages: yes\n"
     );
     let ptrace = parity_run(&guest, &[], None, "ptrace brk_pie");
     assert_eq!(ptrace.stdout, native.stdout, "ptrace brk_pie");

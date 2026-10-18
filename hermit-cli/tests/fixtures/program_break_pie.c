@@ -8,7 +8,8 @@
 
 /* A position-independent image's program break starts where Linux's rule puts
  * it for wherever the image was loaded: its highest loaded segment's end at
- * the image's bias, page-aligned. */
+ * the image's bias, page-aligned. And it can grow: SaBRe's loader keeps free
+ * address space above the image, as Linux's placement does. */
 
 #define _GNU_SOURCE
 #include <link.h>
@@ -34,5 +35,13 @@ int main(void) {
   long start = syscall(SYS_brk, 0);
   dl_iterate_phdr(own_image, NULL);
   printf("start as load_elf_binary puts it: %s\n", (unsigned long)start == expected ? "yes" : "no");
+  long target = start + 64 * 4096;
+  int grows = syscall(SYS_brk, target) == target;
+  if (grows) {
+    volatile char *last = (volatile char *)(target - 1);
+    *last = 1;
+    grows = *last == 1;
+  }
+  printf("grows 64 pages: %s\n", grows ? "yes" : "no");
   return 0;
 }
