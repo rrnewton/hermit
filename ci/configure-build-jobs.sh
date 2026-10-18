@@ -2101,8 +2101,8 @@ fi
 # experimental/reverie-sabre (vendor/sabre/loader/elf_loading.c and a new test
 # pair). git diff is empty under reverie-dbt/, so inventory 964, the SDK and
 # native component inputs, calibrated budget, job width and limits are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 80fc77faa79da855612517666bd87134a915e2fc ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 80fc77faa79da855612517666bd87134a915e2fc (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != aaed1ab669b079a7f0a3adf00cf92d274e34649b ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie aaed1ab669b079a7f0a3adf00cf92d274e34649b (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

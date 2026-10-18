@@ -2024,7 +2024,7 @@ fi
 # experimental/reverie-sabre (vendor/sabre/loader/elf_loading.c and a new test
 # pair). git diff is empty under reverie-dbt/, so inventory 964, the SDK and
 # native component inputs, calibrated budget, job width and limits are unchanged.
-expected_pin=80fc77faa79da855612517666bd87134a915e2fc
+expected_pin=aaed1ab669b079a7f0a3adf00cf92d274e34649b
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
