@@ -1997,7 +1997,7 @@ fi
 # are byte-identical. Root Cargo.lock adds only the reverie-inguest -> goblin
 # edge. SDK inventory 963, calibrated budget, job width and limits carry
 # unchanged; this source comparison does not transfer any earlier receipt.
-expected_pin=b36c69b71133689a3394cf9f8d2bc4a5429d9af6
+expected_pin=80fc77faa79da855612517666bd87134a915e2fc
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

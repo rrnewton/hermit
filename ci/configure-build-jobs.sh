@@ -2074,8 +2074,8 @@ fi
 # are byte-identical. Root Cargo.lock adds only the reverie-inguest -> goblin
 # edge. SDK inventory 963, calibrated budget, job width and limits carry
 # unchanged; this source comparison does not transfer any earlier receipt.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b36c69b71133689a3394cf9f8d2bc4a5429d9af6 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie b36c69b71133689a3394cf9f8d2bc4a5429d9af6 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 80fc77faa79da855612517666bd87134a915e2fc ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 80fc77faa79da855612517666bd87134a915e2fc (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
