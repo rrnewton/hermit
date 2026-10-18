@@ -144,9 +144,21 @@ pub enum DequeuedCopy {
 
 /// Which copy the `SIGCHLD` with siginfo `info` is.
 pub fn dequeued_copy(info: &[u8; 128], tracer: u32) -> Option<DequeuedCopy> {
+    let (code, pid, value) = siginfo_code_pid_and_value(info);
+    Some(copy_of(code, pid, value, tracer))
+}
+
+/// The `si_code`, `si_pid` and `si_int` of a raw `siginfo_t`.
+fn siginfo_code_pid_and_value(info: &[u8; 128]) -> (i32, i32, i32) {
     let (code, pid) = siginfo_code_and_pid(info);
     let value = i32::from_ne_bytes(info[24..28].try_into().expect("four bytes"));
-    Some(if is_child_exit_code(code) {
+    (code, pid, value)
+}
+
+/// Which copy a `SIGCHLD` with `si_code` `code`, `si_pid` `pid` and `si_int`
+/// `value` is, where the scheduler's own copies come from `tracer`.
+fn copy_of(code: i32, pid: i32, value: i32, tracer: u32) -> DequeuedCopy {
+    if is_child_exit_code(code) {
         DequeuedCopy::Kernel {
             child: DetPid::from_raw(pid),
         }
@@ -156,7 +168,21 @@ pub fn dequeued_copy(info: &[u8; 128], tracer: u32) -> Option<DequeuedCopy> {
         DequeuedCopy::Thread
     } else {
         DequeuedCopy::Other
-    })
+    }
+}
+
+/// The control message for a `SIGCHLD` with siginfo `info` that the calling
+/// thread took at a delivery stop (`admits`) or otherwise
+/// ([`ChildExitSigchldControl::Taken`]): the scheduler, which sends its own
+/// copies, tells which copy it is.
+pub fn taken_control(info: &[u8; 128], admits: bool) -> ChildExitSigchldControl {
+    let (code, pid, value) = siginfo_code_pid_and_value(info);
+    ChildExitSigchldControl::Taken {
+        code,
+        pid,
+        value,
+        admits,
+    }
 }
 
 /// The control message for taking the `SIGCHLD` with siginfo `info`
@@ -264,6 +290,18 @@ pub enum ChildExitSigchldControl {
     /// once. Deferred, a sibling that spins until that handler runs held it
     /// back for ever. Appended after `WindowUnusable`.
     ClaimedDelivery,
+    /// [`ChildExitSigchldControl::Dequeue`] for a `SIGCHLD` with these
+    /// `si_code`, `si_pid` and `si_int` fields, which the scheduler classifies
+    /// ([`taken_control`]). The scheduler sends its own copies, so only it
+    /// knows their sender as the receiver sees it; a tool that runs in the
+    /// guest process (SaBRe) is not that sender. Appended after
+    /// `ClaimedDelivery`.
+    Taken {
+        code: i32,
+        pid: i32,
+        value: i32,
+        admits: bool,
+    },
 }
 
 /// What becomes of a `SIGCHLD` the scheduler sent, at its delivery stop.
@@ -788,6 +826,19 @@ impl Scheduler {
         dtid: DetTid,
         control: ChildExitSigchldControl,
     ) -> ChildExitSigchldAnswer {
+        // The scheduler is the sender of its own copies.
+        let control = match control {
+            ChildExitSigchldControl::Taken {
+                code,
+                pid,
+                value,
+                admits,
+            } => ChildExitSigchldControl::Dequeue {
+                copy: copy_of(code, pid, value, std::process::id()),
+                admits,
+            },
+            other => other,
+        };
         let Some(namespace) = self.thread_tree.pid_namespaces.namespace_of(dtid) else {
             return self.child_exit_sigchld_control(dtid, control);
         };
@@ -869,6 +920,12 @@ impl Scheduler {
             ChildExitSigchldControl::Dequeue { copy, admits } => {
                 self.dequeue_sigchld(dtid, copy, admits)
             }
+            ChildExitSigchldControl::Taken {
+                code,
+                pid,
+                value,
+                admits,
+            } => self.dequeue_sigchld(dtid, copy_of(code, pid, value, std::process::id()), admits),
             ChildExitSigchldControl::Flushed => {
                 let parent = self.sigchld_process(dtid);
                 self.child_exit_sigchld.flush(parent);
@@ -1410,6 +1467,30 @@ mod tests {
             control_for(&siginfo(libc::SI_TKILL, 1), tracer, true),
             dequeue(DequeuedCopy::Thread, true)
         );
+        // A taken copy carries its fields to the scheduler, which classifies
+        // them the same way with its own pid as the sender of its copies.
+        for (code, pid) in [
+            (libc::CLD_KILLED, 20),
+            (libc::SI_USER, 1),
+            (libc::SI_USER, 30),
+            (libc::SI_TKILL, 1),
+        ] {
+            let info = siginfo(code, pid);
+            let ChildExitSigchldControl::Taken {
+                code: taken_code,
+                pid: taken_pid,
+                value,
+                admits,
+            } = taken_control(&info, true)
+            else {
+                panic!("not a taken copy");
+            };
+            assert_eq!((taken_code, taken_pid, value, admits), (code, pid, 0, true));
+            assert_eq!(
+                Some(copy_of(taken_code, taken_pid, value, tracer)),
+                dequeued_copy(&info, tracer)
+            );
+        }
     }
 
     /// At a receiver in a nested PID namespace the scheduler's copy arrives
