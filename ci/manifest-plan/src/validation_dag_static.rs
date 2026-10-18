@@ -1112,7 +1112,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the validate of d4594afa, which also carried the 2 since-reverted
     // qualified-runtime tests.
     // Restore the two qualified-runtime preparation tests: 1623.
-    ("test.regular_crates", 1_626),
+    // And detcore-model's every_named_reading_is_its_legacy_expression_on_every_backend
+    // (A5 step 3.3): 1627, measured on the host.
+    ("test.regular_crates", 1_627),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4812,7 +4814,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 5 session-census tests (3920bf94): 1600.
     // And the same 7 Buck e2e cell tests (456dbc38, 5ebcb9dd, 1722f214): 1607.
     // Restore the two qualified-runtime preparation tests: 1609.
-    ("test.regular_crates_on_host", 1_612),
+    // And the same detcore-model legacy-expression test (A5 step 3.3): 1613.
+    ("test.regular_crates_on_host", 1_613),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
