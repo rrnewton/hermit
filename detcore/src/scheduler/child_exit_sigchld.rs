@@ -144,9 +144,21 @@ pub enum DequeuedCopy {
 
 /// Which copy the `SIGCHLD` with siginfo `info` is.
 pub fn dequeued_copy(info: &[u8; 128], tracer: u32) -> Option<DequeuedCopy> {
+    let (code, pid, value) = siginfo_code_pid_and_value(info);
+    Some(copy_of(code, pid, value, tracer))
+}
+
+/// The `si_code`, `si_pid` and `si_int` of a raw `siginfo_t`.
+fn siginfo_code_pid_and_value(info: &[u8; 128]) -> (i32, i32, i32) {
     let (code, pid) = siginfo_code_and_pid(info);
     let value = i32::from_ne_bytes(info[24..28].try_into().expect("four bytes"));
-    Some(if is_child_exit_code(code) {
+    (code, pid, value)
+}
+
+/// Which copy a `SIGCHLD` with `si_code` `code`, `si_pid` `pid` and `si_int`
+/// `value` is, where the scheduler's own copies come from `tracer`.
+fn copy_of(code: i32, pid: i32, value: i32, tracer: u32) -> DequeuedCopy {
+    if is_child_exit_code(code) {
         DequeuedCopy::Kernel {
             child: DetPid::from_raw(pid),
         }
@@ -156,7 +168,21 @@ pub fn dequeued_copy(info: &[u8; 128], tracer: u32) -> Option<DequeuedCopy> {
         DequeuedCopy::Thread
     } else {
         DequeuedCopy::Other
-    })
+    }
+}
+
+/// The control message for a `SIGCHLD` with siginfo `info` that the calling
+/// thread took at a delivery stop (`admits`) or otherwise
+/// ([`ChildExitSigchldControl::Taken`]): the scheduler, which sends its own
+/// copies, tells which copy it is.
+pub fn taken_control(info: &[u8; 128], admits: bool) -> ChildExitSigchldControl {
+    let (code, pid, value) = siginfo_code_pid_and_value(info);
+    ChildExitSigchldControl::Taken {
+        code,
+        pid,
+        value,
+        admits,
+    }
 }
 
 /// The control message for taking the `SIGCHLD` with siginfo `info`
@@ -264,6 +290,18 @@ pub enum ChildExitSigchldControl {
     /// once. Deferred, a sibling that spins until that handler runs held it
     /// back for ever. Appended after `WindowUnusable`.
     ClaimedDelivery,
+    /// [`ChildExitSigchldControl::Dequeue`] for a `SIGCHLD` with these
+    /// `si_code`, `si_pid` and `si_int` fields, which the scheduler classifies
+    /// ([`taken_control`]). The scheduler sends its own copies, so only it
+    /// knows their sender as the receiver sees it; a tool that runs in the
+    /// guest process (SaBRe) is not that sender. Appended after
+    /// `ClaimedDelivery`.
+    Taken {
+        code: i32,
+        pid: i32,
+        value: i32,
+        admits: bool,
+    },
 }
 
 /// What becomes of a `SIGCHLD` the scheduler sent, at its delivery stop.
@@ -490,6 +528,20 @@ impl ChildExitSigchldLedger {
         Some(info)
     }
 
+    /// Whether the kernel's copy of owned `child`'s notification to `parent`
+    /// was taken before the scheduler sent its own (`ChildExit` timer not yet
+    /// fired), while no copy the scheduler sent to `parent` is outstanding, so
+    /// none can have merged into it.
+    fn kernel_copy_before_any_send(&self, parent: DetPid, child: DetPid) -> bool {
+        let Some(children) = self.owned.get(&parent) else {
+            return false;
+        };
+        matches!(children.get(&child), Some(Notification::Unsent(_)))
+            && !children
+                .values()
+                .any(|state| matches!(state, Notification::Sent(_)))
+    }
+
     /// Whether the kernel's copy of `child`'s notification to `parent` is
     /// dropped, because a `SIGCHLD` for that exit was delivered already. The
     /// first one is delivered.
@@ -705,6 +757,11 @@ impl ChildExitSigchldLedger {
     pub(crate) fn forget_process(&mut self, process: DetPid) {
         self.forget_window(process);
         self.outside_takers.remove(&process);
+        // Its children's notifications have no receiver any more. Without a
+        // send window (no signal-target modelling), an exit whose two copies
+        // merged in the kernel's queue leaves its entry until now.
+        self.owned.remove(&process);
+        self.sent.remove(&process);
     }
 
     /// At the `Exit` grant of `thread` of `process` (`group`: an
@@ -788,6 +845,19 @@ impl Scheduler {
         dtid: DetTid,
         control: ChildExitSigchldControl,
     ) -> ChildExitSigchldAnswer {
+        // The scheduler is the sender of its own copies.
+        let control = match control {
+            ChildExitSigchldControl::Taken {
+                code,
+                pid,
+                value,
+                admits,
+            } => ChildExitSigchldControl::Dequeue {
+                copy: copy_of(code, pid, value, std::process::id()),
+                admits,
+            },
+            other => other,
+        };
         let Some(namespace) = self.thread_tree.pid_namespaces.namespace_of(dtid) else {
             return self.child_exit_sigchld_control(dtid, control);
         };
@@ -869,6 +939,12 @@ impl Scheduler {
             ChildExitSigchldControl::Dequeue { copy, admits } => {
                 self.dequeue_sigchld(dtid, copy, admits)
             }
+            ChildExitSigchldControl::Taken {
+                code,
+                pid,
+                value,
+                admits,
+            } => self.dequeue_sigchld(dtid, copy_of(code, pid, value, std::process::id()), admits),
             ChildExitSigchldControl::Flushed => {
                 let parent = self.sigchld_process(dtid);
                 self.child_exit_sigchld.flush(parent);
@@ -950,6 +1026,24 @@ impl Scheduler {
 
     fn claim_kernel_copy(&mut self, dtid: DetTid, child: DetPid) -> ChildExitSigchldAnswer {
         let parent = self.sigchld_process(dtid);
+        // Without a publication report, nothing places the kernel's copy: it
+        // arrives when the real child exits, and a thread outside the schedule
+        // (a native blocking call) takes it then. Before the scheduler has sent
+        // its own copy, it is dropped, and the `ChildExit` timer's copy, sent at
+        // a point the schedule fixes, stands for the exit. Where publication is
+        // reported, the kernel's copy is pending at a point the schedule fixes,
+        // and delivering it first stays right.
+        if !self.backend.reports_child_exit_publication
+            && self
+                .child_exit_sigchld
+                .kernel_copy_before_any_send(parent, child)
+        {
+            debug!(
+                "[dtid {}] dropping the kernel's SIGCHLD for child {}: it came before the scheduler's, at a host-timed moment",
+                dtid, child
+            );
+            return ChildExitSigchldAnswer::Claimed(true);
+        }
         if let Some(info) = self.child_exit_sigchld.claim_for_cohort(parent, child) {
             debug!(
                 "[dtid {}] the kernel's SIGCHLD for child {} stands for child {}, its cohort's first",
@@ -1410,6 +1504,30 @@ mod tests {
             control_for(&siginfo(libc::SI_TKILL, 1), tracer, true),
             dequeue(DequeuedCopy::Thread, true)
         );
+        // A taken copy carries its fields to the scheduler, which classifies
+        // them the same way with its own pid as the sender of its copies.
+        for (code, pid) in [
+            (libc::CLD_KILLED, 20),
+            (libc::SI_USER, 1),
+            (libc::SI_USER, 30),
+            (libc::SI_TKILL, 1),
+        ] {
+            let info = siginfo(code, pid);
+            let ChildExitSigchldControl::Taken {
+                code: taken_code,
+                pid: taken_pid,
+                value,
+                admits,
+            } = taken_control(&info, true)
+            else {
+                panic!("not a taken copy");
+            };
+            assert_eq!((taken_code, taken_pid, value, admits), (code, pid, 0, true));
+            assert_eq!(
+                Some(copy_of(taken_code, taken_pid, value, tracer)),
+                dequeued_copy(&info, tracer)
+            );
+        }
     }
 
     /// At a receiver in a nested PID namespace the scheduler's copy arrives
