@@ -2066,7 +2066,23 @@ fi
 # reverie-dbt file is added or removed (inventory 966), and the root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml are unchanged. SDK and native inputs,
 # calibrated budget, job width and limits are unchanged.
-expected_pin=38a30d7a4912d046487d4a517ffad092cfb5d4c0
+# CARRY TO b02cd6034ead5e119e23b4fc20577e2310c58bb1 (2026-10-18): from
+# 38a30d7a4912d046487d4a517ffad092cfb5d4c0. Four commits: 476112ef, 7259c9a8 and a22f4adf
+# (reverie-loader: fixed-address loader images, their audit, the built-image
+# check and the stage 1a probe; reverie-inguest's dev-dependency on it; the
+# LiteInst runtime's source catalog entries for the two manifests that changed;
+# a new safeptrace syscall_info module) and b02cd603 (reverie-sabre gives the
+# tool each signal's siginfo and honours its answer, and BackendCapabilities
+# gains reports_kernel_child_exit_signals; reverie/src and
+# experimental/reverie-sabre). git diff is empty under reverie-dbt/, no
+# reverie-dbt file is added or removed (inventory 966), and rust-toolchain.toml
+# is unchanged. The root Cargo.toml and Cargo.lock change only to add the
+# reverie-loader member, its dependencies and reverie-inguest's dev-dependency
+# on it; none of them is in reverie-dbt's dependency closure (reverie-core,
+# reverie-memory, reverie-rpc-transport and external crates, whose versions are
+# unchanged). SDK and native inputs, calibrated budget, job width and limits are
+# unchanged.
+expected_pin=b02cd6034ead5e119e23b4fc20577e2310c58bb1
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
