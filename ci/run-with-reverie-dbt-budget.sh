@@ -1988,7 +1988,7 @@ fi
 # changes. git diff is empty under reverie-dbt/, and the root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml are unchanged. All seven SDK inputs,
 # inventory 963, calibrated budget, job width and limits are unchanged.
-expected_pin=ed29a09d102ffa3bf33c3efce9401025e80b7e4e
+expected_pin=80fc77faa79da855612517666bd87134a915e2fc
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
