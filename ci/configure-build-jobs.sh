@@ -2030,8 +2030,8 @@ fi
 # removed (DBT inventory 961). reverie-dbt/vendor, third-party, build.rs, the root
 # Cargo.toml, Cargo.lock and rust-toolchain.toml have the same object ids: all
 # seven SDK inputs, calibrated budget, job width and limits are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0afd4fe6e9292853e253a9b0d1accf79ea6c25d2 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0afd4fe6e9292853e253a9b0d1accf79ea6c25d2 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 8214c7ee0d87b7a68eff6dbc1a02782035f42d54 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 8214c7ee0d87b7a68eff6dbc1a02782035f42d54 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

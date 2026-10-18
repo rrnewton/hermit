@@ -1953,7 +1953,7 @@ fi
 # removed (DBT inventory 961). reverie-dbt/vendor, third-party, build.rs, the root
 # Cargo.toml, Cargo.lock and rust-toolchain.toml have the same object ids: all
 # seven SDK inputs, calibrated budget, job width and limits are unchanged.
-expected_pin=0afd4fe6e9292853e253a9b0d1accf79ea6c25d2
+expected_pin=8214c7ee0d87b7a68eff6dbc1a02782035f42d54
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
