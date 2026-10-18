@@ -1111,7 +1111,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's the_signal_state_copy_is_on_by_default_and_its_off_switch_round_trips
     // and hermit-verify's interpolate_refuses_schedules_recorded_under_different_signal_state_copy_settings
     // (A5 step 2d): 1618.
-    ("test.regular_crates", 1_618),
+    // And manifest-plan's a_relaxed_verify_cell_with_its_own_timeslice_is_refused_on_an_inexact_counter: 1619.
+    ("test.regular_crates", 1_619),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -4804,7 +4805,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 5 session-census tests (3920bf94): 1600.
     // The same two qualified-runtime preparation tests: 1602, listed.
     // And the same two signal-state copy tests: 1604.
-    ("test.regular_crates_on_host", 1_604),
+    // And the same relaxed-timeslice withholding test: 1605.
+    ("test.regular_crates_on_host", 1_605),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
