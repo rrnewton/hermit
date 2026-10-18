@@ -111,6 +111,40 @@ the run:
   scheduled differently from the same run with it off. The two are not the
   same run.
 
+Each caught signal the backend reports is also checked at its delivery,
+before the copy records it (A5 step 3.2). Detcore builds the delivery from
+the copy, and the backend checks it against the kernel at the stop,
+reading only, through `Guest::deliver_signal`. The delivery is the signal's
+action, the mask its frame saves, the current mask, the mask its handler
+runs under, and what the thread was doing (the syscall it is in and the
+result Detcore finished it with).
+
+On ptrace the kernel still delivers the signal, with its own action and
+frame. Checking changes the copy exactly as it would unchecked, and at the
+same point. A delivery the backend cannot check at that point is counted by
+reason and goes on unchanged: a stop after an injection, a signal the
+kernel's current mask blocks, a thread with no copy, and so on.
+
+A delivery the kernel contradicts, where the copy and the kernel are both
+certain, is a Detcore defect. It is logged as `SIGNAL_STATE_COPY_DIVERGED`
+and drops the copy. Under `hermit run --strict` it instead ends the run
+with `HERMIT_INTERNAL_FAILURE class=signal-delivery-check`, naming the
+signal, the thread and what differed.
+
+Each thread logs its counts when it exits, at TRACE under the target
+`detcore::signal_delivery`, below the level that runs compare. The counts
+are approvals, contradictions, deliveries whose interruption was taken from
+the registers, and deliveries not checked, by reason. To see them:
+
+```bash
+RUST_LOG=detcore::signal_delivery=trace hermit --log-file run.log run --strict -- ./program
+```
+
+Until Reverie keeps a guest's SIGTRAP state across its own single-steps
+(https://github.com/rrnewton/reverie/pull/1070, A5 step 3.0), a
+multithreaded glibc program loses its copy at its first `pthread_create`.
+Its deliveries are then counted as "no copy".
+
 What it reports:
 
 - A WARN line starting `SIGNAL_STATE_COPY_DIVERGED` when the copy and the

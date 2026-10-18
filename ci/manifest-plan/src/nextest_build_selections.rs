@@ -892,7 +892,9 @@ mod tests {
             // record/replay test (+1,
             // https://github.com/rrnewton/hermit/issues/4213).
             // Runtime-private maps target/alias/lifetime coverage adds one.
-            assert_eq!(population, 578);
+            // signal_determinism's eleven ptrace_delivery_check_* tests (A5
+            // step 3.2) add eleven.
+            assert_eq!(population, 589);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

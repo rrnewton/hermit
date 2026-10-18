@@ -436,6 +436,19 @@ pub struct Config {
     #[clap(long = "no-signal-state-copy", action = clap::ArgAction::SetFalse)]
     pub signal_state_copy: bool,
 
+    /// Whether a signal delivery that the kernel contradicts, where Detcore's
+    /// copy and the kernel are both certain (A5 step 3.2), ends the run as an
+    /// internal failure (`HERMIT_INTERNAL_FAILURE class=signal-delivery-check`)
+    /// rather than being logged as a divergence that drops the copy. It is a
+    /// Detcore defect either way. `hermit run --strict` sets it; nothing else
+    /// does, and it changes nothing while the copy matches the kernel.
+    ///
+    /// The host sets it. It has no legacy key: [`to_legacy_backend_json`]
+    /// leaves it out and [`from_legacy_backend_json`] reads it back as false.
+    #[serde(default)]
+    #[clap(skip)]
+    pub signal_delivery_check_fatal: bool,
+
     /// Schedule threads chaotically.
     ///
     /// The behavior of this flag is subject to change. Current behavior is to randomize thread
@@ -2401,8 +2414,10 @@ mod legacy_backend_json {
     /// the x86-64-v3 profile, so they are never written and read as v2.
     /// `signal_state_copy` came after it too. The copy is never kept on DBT
     /// (its kernel signal state is not the guest's), so it is never written
-    /// and reads as on, its serde default.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 15] = [
+    /// and reads as on, its serde default. `signal_delivery_check_fatal`
+    /// matters only where the copy is kept, so it is never written and reads
+    /// as false.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 16] = [
         "backend",
         "record_host_inputs",
         "guest_may_inherit_a_terminal",
@@ -2418,6 +2433,7 @@ mod legacy_backend_json {
         "cpu_profile",
         "cpu_profile_host",
         "signal_state_copy",
+        "signal_delivery_check_fatal",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -2549,7 +2565,8 @@ mod legacy_backend_json {
                     | "in_guest_site_patching_off"
                     | "target_timeslice_syscalls_only"
                     | "futex_wake_yields"
-                    | "replaying",
+                    | "replaying"
+                    | "signal_delivery_check_fatal",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // On, as its serde default is.
                 Some("signal_state_copy") => {
@@ -2837,7 +2854,8 @@ mod legacy_backend_json {
                 | "inherited_seccomp"
                 | "cpu_profile"
                 | "cpu_profile_host"
-                | "signal_state_copy" => Ok(()),
+                | "signal_state_copy"
+                | "signal_delivery_check_fatal" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -3484,7 +3502,8 @@ mod tests {
                 | "inherited_seccomp"
                 | "cpu_profile"
                 | "cpu_profile_host"
-                | "signal_state_copy" => {}
+                | "signal_state_copy"
+                | "signal_delivery_check_fatal" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -3499,10 +3518,11 @@ mod tests {
         // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
         // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
         // `pipe_wake_latency`, `replaying`, `scheduler_turn_cost`,
-        // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host` and
-        // `signal_state_copy` none: fourteen more keys, and fourteen fewer.
+        // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`,
+        // `signal_state_copy` and `signal_delivery_check_fatal` none: fourteen
+        // more keys, and fifteen fewer, so one key fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len());
+        assert_eq!(fields.len(), keys.len() + 1);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -4393,6 +4413,31 @@ mod tests {
 
         config.runs_post_fork = RunsPostFork::Random;
         assert!(config.to_string().contains(" --runs-post-fork=random"));
+    }
+
+    #[test]
+    fn a_fatal_delivery_check_is_off_by_default_and_never_enters_the_legacy_form() {
+        assert!(!Config::default().signal_delivery_check_fatal);
+        let fatal = Config {
+            signal_delivery_check_fatal: true,
+            ..Config::default()
+        };
+        let json = serde_json::to_string(&fatal).unwrap();
+        let reparsed: Config = serde_json::from_str(&json).unwrap();
+        assert!(reparsed.signal_delivery_check_fatal);
+        let mut old = serde_json::to_value(Config::default()).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("signal_delivery_check_fatal");
+        let old: Config = serde_json::from_value(old).unwrap();
+        assert!(!old.signal_delivery_check_fatal);
+        let legacy = to_legacy_backend_json(&fatal).unwrap();
+        assert!(!legacy.contains("signal_delivery_check_fatal"), "{legacy}");
+        assert!(
+            !from_legacy_backend_json(&legacy)
+                .unwrap()
+                .signal_delivery_check_fatal
+        );
     }
 
     #[test]
