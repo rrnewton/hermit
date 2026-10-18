@@ -1116,7 +1116,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // dev_profile_pinned_consumers_do_not_wait_for_the_e2e_artifact: 1627.
     // And detcore-model's twenty container_mounts tests
     // (https://github.com/rrnewton/hermit/issues/4213, K3a): 1648.
-    ("test.regular_crates", 1_648),
+    // And detcore-model's a_fatal_delivery_check_is_off_by_default_and_never_enters_the_legacy_form
+    // (A5 step 3.2): 1649.
+    ("test.regular_crates", 1_649),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2520,7 +2522,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_global::tests::a_changed_root_follows_fork_and_goes_at_exit
     // and tool_global::tests::a_root_is_shared_by_a_filesystem_group
     // (https://github.com/rrnewton/hermit/issues/4213, K3a): 2084.
-    ("test.detcore_unit", 2084),
+    // And signal_shadow's ten delivery-check tests (A5 step 3.2): 2094.
+    ("test.detcore_unit", 2094),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2840,7 +2843,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And procfs_determinism::a_staged_binds_root_rewrite_holds_on_the_kernel_path_after_chroot
     // and a_bind_through_a_symbolic_link_stays_shown_after_a_later_bind_replaces_it
     // (https://github.com/rrnewton/hermit/issues/4213, K3a): 256.
-    ("test.hermit_integration_3", 256),
+    // And signal_determinism's eighteen ptrace_delivery_check_* tests (A5
+    // step 3.2): 61 + 263 + 274 = 598.
+    ("test.hermit_integration_3", 274),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4396,7 +4401,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same nine runtime-private maps units: 2080, freshly listed.
     // Shared unsupported-report ownership: 2081, freshly listed.
     // And the 4213 mount-table files, changed-root and filesystem-group tests: 2084.
-    ("test.detcore_unit_on_host", 2084),
+    // And the same ten delivery-check tests: 2094.
+    ("test.detcore_unit_on_host", 2094),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4476,7 +4482,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the 4213 directory-alias record/replay test: 577.
     // And runtime-private maps target/alias/lifetime coverage: 578, listed.
     // And the 4213 staged-bind kernel-path and install-time bind tests: 580.
-    ("test.hermit_integration_on_host", 580),
+    // And signal_determinism's eighteen delivery-check tests (A5 step 3.2): 598.
+    ("test.hermit_integration_on_host", 598),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -4850,7 +4857,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Restore the two qualified-runtime preparation tests: 1609.
     // And the same dev-profile consumer ordering test: 1613.
     // And the same twenty container_mounts tests: 1634.
-    ("test.regular_crates_on_host", 1_634),
+    // And the same detcore-model fatal-delivery-check test: 1635.
+    ("test.regular_crates_on_host", 1_635),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
