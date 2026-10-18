@@ -132,6 +132,10 @@ impl Action {
     pub(crate) fn is_caught(&self) -> bool {
         self.handler != SIG_DFL && self.handler != SIG_IGN
     }
+
+    pub(crate) fn is_ignored(&self) -> bool {
+        self.handler == SIG_IGN
+    }
 }
 
 /// The actions of one disposition domain, indexed by signal number - 1.
