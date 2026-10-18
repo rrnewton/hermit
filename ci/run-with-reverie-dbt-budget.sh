@@ -2114,7 +2114,12 @@ fi
 # for the root Cargo.toml, Cargo.lock and rust-toolchain.toml in both steps, so
 # the inventory (973), SDK and native inputs, calibrated budget, job width and
 # limits are unchanged from the 45615034 carry.
-expected_pin=6bdd0533a38f68a5742b361df656e32b2237d78a
+# CARRY TO 1418122e9dbd724fd45fa714d6576a30e1d01e63 (2026-10-18): from
+# 6bdd0533a38f68a5742b361df656e32b2237d78a; verified ptrace CPUID arming restored.
+# reverie-dbt/, root Cargo.toml, Cargo.lock and rust-toolchain.toml are
+# byte-identical. Native build inputs and job/budget limits are unchanged.
+# DBT inventory stays 973; fresh runtime validation is still required.
+expected_pin=1418122e9dbd724fd45fa714d6576a30e1d01e63
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

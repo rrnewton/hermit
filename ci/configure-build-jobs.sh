@@ -2190,8 +2190,13 @@ fi
 # for the root Cargo.toml, Cargo.lock and rust-toolchain.toml in both steps, so
 # the inventory (973), SDK and native inputs, calibrated budget, job width and
 # limits are unchanged from the 45615034 carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6bdd0533a38f68a5742b361df656e32b2237d78a ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 6bdd0533a38f68a5742b361df656e32b2237d78a (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 1418122e9dbd724fd45fa714d6576a30e1d01e63 (2026-10-18): from
+# 6bdd0533a38f68a5742b361df656e32b2237d78a; verified ptrace CPUID arming restored.
+# reverie-dbt/, root Cargo.toml, Cargo.lock and rust-toolchain.toml are
+# byte-identical. Native build inputs and job/budget limits are unchanged.
+# DBT inventory stays 973; fresh runtime validation is still required.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 1418122e9dbd724fd45fa714d6576a30e1d01e63 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 1418122e9dbd724fd45fa714d6576a30e1d01e63 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
