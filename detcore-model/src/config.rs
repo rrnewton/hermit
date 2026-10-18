@@ -424,6 +424,18 @@ pub struct Config {
     #[clap(long)]
     pub imprecise_timers: bool,
 
+    /// Turn off Detcore's own copy of each guest thread's signal dispositions
+    /// and masks (A5, docs/SIGNAL_STATE_CHECK.md). The copy is on by default
+    /// where it can run (ptrace with serialized threads): it is checked
+    /// against the kernel, and decisions A5 converted read it in place of the
+    /// kernel's `/proc` view. With it off, those decisions read `/proc`, and
+    /// no handler return is reported. `HERMIT_SIGNAL_STATE_CHECK=0` turns it
+    /// off as well. A recorded schedule states the setting it ran under, and
+    /// replaying it under the other setting is refused.
+    #[serde(default = "signal_state_copy_default")]
+    #[clap(long = "no-signal-state-copy", action = clap::ArgAction::SetFalse)]
+    pub signal_state_copy: bool,
+
     /// Schedule threads chaotically.
     ///
     /// The behavior of this flag is subject to change. Current behavior is to randomize thread
@@ -1903,6 +1915,12 @@ fn fingerprint_of_config_material(
     format!("{hash:016x}")
 }
 
+/// `Config::signal_state_copy` for a serialized configuration written before
+/// the field existed: on, the default.
+fn signal_state_copy_default() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         let v: Vec<String> = vec![];
@@ -2376,7 +2394,10 @@ mod legacy_backend_json {
     /// written and reads as unknown.
     /// `cpu_profile` and `cpu_profile_host` came after it as well. DBT refuses
     /// the x86-64-v3 profile, so they are never written and read as v2.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 14] = [
+    /// `signal_state_copy` came after it too. The copy is never kept on DBT
+    /// (its kernel signal state is not the guest's), so it is never written
+    /// and reads as on, its serde default.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 15] = [
         "backend",
         "record_host_inputs",
         "guest_may_inherit_a_terminal",
@@ -2391,6 +2412,7 @@ mod legacy_backend_json {
         "inherited_seccomp",
         "cpu_profile",
         "cpu_profile_host",
+        "signal_state_copy",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -2524,6 +2546,10 @@ mod legacy_backend_json {
                     | "futex_wake_yields"
                     | "replaying",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
+                // On, as its serde default is.
+                Some("signal_state_copy") => {
+                    seed.deserialize(BoolDeserializer::new(true)).map(Some)
+                }
                 // Unset, as its serde default is.
                 Some(
                     "in_guest_detlog_forward_policy"
@@ -2805,7 +2831,8 @@ mod legacy_backend_json {
                 | "scheduler_turn_cost"
                 | "inherited_seccomp"
                 | "cpu_profile"
-                | "cpu_profile_host" => Ok(()),
+                | "cpu_profile_host"
+                | "signal_state_copy" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -3451,7 +3478,8 @@ mod tests {
                 | "scheduler_turn_cost"
                 | "inherited_seccomp"
                 | "cpu_profile"
-                | "cpu_profile_host" => {}
+                | "cpu_profile_host"
+                | "signal_state_copy" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -3466,10 +3494,10 @@ mod tests {
         // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
         // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
         // `pipe_wake_latency`, `replaying`, `scheduler_turn_cost`,
-        // `inherited_seccomp`, `cpu_profile` and `cpu_profile_host` none:
-        // fourteen more keys, and thirteen fewer.
+        // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host` and
+        // `signal_state_copy` none: fourteen more keys, and fourteen fewer.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len() + 1, keys.len());
+        assert_eq!(fields.len(), keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:

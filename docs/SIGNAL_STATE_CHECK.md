@@ -2,18 +2,27 @@
 
 Detcore can keep its own copy of every guest thread's signal dispositions and
 blocked mask, and check it against the kernel. This is audit step A5
-(https://github.com/rrnewton/hermit/issues/4485). It is off by default. Turn
-it on with:
+(https://github.com/rrnewton/hermit/issues/4485). It is on by default since
+A5 step 2d. Turn it off with:
 
 ```bash
-HERMIT_SIGNAL_STATE_CHECK=1 hermit run --strict --epoch=2026-01-01T00:00:00Z -- ./program
+hermit run --no-signal-state-copy --strict --epoch=2026-01-01T00:00:00Z -- ./program
 ```
+
+The environment variable `HERMIT_SIGNAL_STATE_CHECK` supplements the flag:
+`0` turns the copy off as well, `1` keeps it on (and is refused beside
+`--no-signal-state-copy`), and any other value is refused.
+
+A schedule recorded with `--record-preemptions` states the setting it ran
+under, and replaying it under the other setting (`--replay-preemptions-from`,
+`--replay-schedule-from`) is refused. Record and replay (`hermit record`) run
+with the copy off, as recordings made before step 2d did.
 
 It runs only where the kernel's signal state for a guest thread is the
 guest's own, which means the ptrace backend (and e9patch preprocessing,
 which Hermit runs on ptrace), with serialized threads. Elsewhere, and
-whenever the variable is not `1`, nothing is recorded or checked, and runs
-are exactly as they would be without it.
+whenever it is turned off, nothing is recorded or checked, and runs are
+exactly as they would be without it.
 
 Where the copy is kept, some decisions read it in place of the kernel's
 `/proc` view of the thread:
@@ -55,7 +64,7 @@ the target's `/proc` file cannot be read (for example a thread the host has
 already removed), the published state still decides, where the `/proc` read
 would have decided as if nothing were known.
 
-On ptrace, turning it on also asks the backend to report each guest
+On ptrace, the copy also asks the backend to report each guest
 `rt_sigreturn` before it runs, so the copy follows handler returns exactly
 instead of guessing them. It asks only when Hermit measured that the guest
 inherits no seccomp filter and no gdbserver is attached (`--gdbserver`),
@@ -109,5 +118,10 @@ What it reports:
   reported handler return and matched check, so a trace-level run shows how
   much was actually checked.
 
-It stays opt-in because the backend does not report every delivery yet, and
-because of the timer cases above.
+It was opt-in until A5 step 2d. It is on by default now that a reported
+return no longer loses a precise preemption event (step 2c), and no longer
+loses an imprecise one, because the reports are off under
+`--imprecise-timers`. The backend still does not report every delivery.
+Where one goes unreported, the copy gives itself up for that thread, and
+the decisions above read `/proc` as they do without it. The timer cases
+above remain where the switch can still change a run.

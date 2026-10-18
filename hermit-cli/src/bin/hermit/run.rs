@@ -3527,6 +3527,61 @@ fn replay_networking_adopts_the_trace_epoch_and_refuses_another() {
     );
 }
 
+/// The documented environment supplement to `--no-signal-state-copy`
+/// (docs/SIGNAL_STATE_CHECK.md).
+const SIGNAL_STATE_CHECK_ENV: &str = "HERMIT_SIGNAL_STATE_CHECK";
+
+/// The signal-state copy setting of a run whose flags give `flag` (off for
+/// `--no-signal-state-copy`) and whose environment gives `value` for
+/// [`SIGNAL_STATE_CHECK_ENV`]: `0` turns the copy off, `1` keeps it on and
+/// contradicts the flag, and anything else is refused, so that a value such
+/// as `false` does not silently leave the copy on.
+fn signal_state_copy_with_env(flag: bool, value: Option<&std::ffi::OsStr>) -> Result<bool, String> {
+    let Some(value) = value else {
+        return Ok(flag);
+    };
+    match value.to_str() {
+        Some("0") => Ok(false),
+        Some("1") if flag => Ok(true),
+        Some("1") => Err(format!(
+            "{SIGNAL_STATE_CHECK_ENV}=1 asks for the signal-state copy, which \
+             --no-signal-state-copy turns off"
+        )),
+        _ => Err(format!(
+            "{SIGNAL_STATE_CHECK_ENV} must be 0 (the signal-state copy off) or 1 (on), not {value:?}"
+        )),
+    }
+}
+
+/// `HERMIT_SIGNAL_STATE_CHECK` only supplements the flag: unset leaves it,
+/// `0` turns the copy off, `1` agrees with the default and contradicts
+/// `--no-signal-state-copy`, and any other value is refused.
+#[test]
+fn the_signal_state_copy_environment_supplement_is_strict() {
+    use std::ffi::OsStr;
+    assert_eq!(signal_state_copy_with_env(true, None), Ok(true));
+    assert_eq!(signal_state_copy_with_env(false, None), Ok(false));
+    assert_eq!(
+        signal_state_copy_with_env(true, Some(OsStr::new("0"))),
+        Ok(false)
+    );
+    assert_eq!(
+        signal_state_copy_with_env(false, Some(OsStr::new("0"))),
+        Ok(false)
+    );
+    assert_eq!(
+        signal_state_copy_with_env(true, Some(OsStr::new("1"))),
+        Ok(true)
+    );
+    assert!(signal_state_copy_with_env(false, Some(OsStr::new("1"))).is_err());
+    for value in ["", "false", "off", "no", "2", " 0"] {
+        assert!(
+            signal_state_copy_with_env(true, Some(OsStr::new(value))).is_err(),
+            "{value:?}"
+        );
+    }
+}
+
 /// A replay of a record made under another `--pipe-wake-latency` is refused,
 /// in both directions and for a different latency, under both replay flags;
 /// `0` is not off; a record without the field is off
@@ -5593,6 +5648,36 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Refuses a replay of a recorded schedule under the other signal-state
+    /// copy setting (`--no-signal-state-copy`), as
+    /// `refuse_replay_under_another_pipe_wake_latency` refuses another
+    /// latency. A record written before the setting was stored is replayed
+    /// under either.
+    fn refuse_replay_under_another_signal_state_copy(&self) -> Result<(), Error> {
+        if self.namespace_only {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        for (option, path) in [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            let recorded =
+                detcore::preemptions::read_recorded_signal_state_copy(path).map_err(Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::signal_state_copy_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                config.signal_state_copy,
+            ) {
+                return Err(Error::new(PolicyRefusal).context(refusal));
+            }
+        }
+        Ok(())
+    }
+
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
     /// Used by `hermit oci run`, which resolves the user's reference to the
@@ -6243,6 +6328,7 @@ impl RunOpts {
         // explicit, and still before stdin is read or anything is launched.
         self.refuse_strict_with_host_drawn_inputs()?;
         self.refuse_replay_under_another_pipe_wake_latency()?;
+        self.refuse_replay_under_another_signal_state_copy()?;
         if !self.namespace_only
             && (self.verify_verbose
                 || global
@@ -6507,6 +6593,12 @@ impl RunOpts {
     /// Some arguments imply others. This is the place where that validation occurs.
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
+        let config = &mut self.det_opts.det_config;
+        config.signal_state_copy = signal_state_copy_with_env(
+            config.signal_state_copy,
+            std::env::var_os(SIGNAL_STATE_CHECK_ENV).as_deref(),
+        )
+        .map_err(Error::msg)?;
         let timer = if self.arms_reverie_ptrace_pmu_timer() {
             reverie_timer_support()
         } else {
