@@ -1953,7 +1953,14 @@ fi
 # removed (DBT inventory 961). reverie-dbt/vendor, third-party, build.rs, the root
 # Cargo.toml, Cargo.lock and rust-toolchain.toml have the same object ids: all
 # seven SDK inputs, calibrated budget, job width and limits are unchanged.
-expected_pin=0afd4fe6e9292853e253a9b0d1accf79ea6c25d2
+# CARRY TO 7324210272a3f3a611d37ea2138fe2c5a4d05ac2 (2026-10-18): from
+# 0afd4fe6e9292853e253a9b0d1accf79ea6c25d2. The artifact qualifier moves inside its
+# package for independent Reindeer vendoring; script/test includes and its
+# declared content paths follow the same source. No runtime code changes.
+# git diff is empty under reverie-dbt/, and the root Cargo.toml, Cargo.lock
+# and rust-toolchain.toml are unchanged. All seven SDK inputs, inventory
+# 961, calibrated budget, job width and limits are unchanged.
+expected_pin=7324210272a3f3a611d37ea2138fe2c5a4d05ac2
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
