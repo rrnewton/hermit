@@ -1112,7 +1112,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the validate of d4594afa, which also carried the 2 since-reverted
     // qualified-runtime tests.
     // Restore the two qualified-runtime preparation tests: 1623.
-    ("test.regular_crates", 1_626),
+    // And detcore-model's twenty container_mounts tests
+    // (https://github.com/rrnewton/hermit/issues/4213, K3a): 1646.
+    ("test.regular_crates", 1_646),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1659,7 +1661,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1155.
     // And +2 from ca5325c1 and one initial-image auxv refusal: 1158.
     // Rebased expected sum; exact-head listing is required before hand-back.
-    ("test.hermit_unit", 1158),
+    // And metadata::tests::record_version_rejects_streams_from_before_the_container_mount_table,
+    // tests::kvm_mountinfo_config_refuses_a_mount_table_of_another_namespace
+    // and container::tests::installations_record_their_install_time_mountpoints
+    // (https://github.com/rrnewton/hermit/issues/4213, K3a): 1161.
+    ("test.hermit_unit", 1161),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2507,7 +2513,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 2067.
     // And +1 from ca5325c1: 2068.
     // Guarded controller capture adds three units: 2071, freshly listed.
-    ("test.detcore_unit", 2071),
+    // And procfs::tests::the_mount_table_files_are_rendered_per_process_where_the_session_has_a_table,
+    // tool_global::tests::a_changed_root_follows_fork_and_goes_at_exit
+    // and tool_global::tests::a_root_is_shared_by_a_filesystem_group
+    // (https://github.com/rrnewton/hermit/issues/4213, K3a): 2074.
+    ("test.detcore_unit", 2074),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2823,7 +2833,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And procfs_determinism::a_name_outside_the_level_through_a_directory_alias_is_refused_before_its_turn
     // in the third shard (https://github.com/rrnewton/hermit/issues/4213):
     // 61 + 263 + 253 = 577.
-    ("test.hermit_integration_3", 253),
+    // And procfs_determinism::a_staged_binds_root_rewrite_holds_on_the_kernel_path_after_chroot
+    // and a_bind_through_a_symbolic_link_stays_shown_after_a_later_bind_replaces_it
+    // (https://github.com/rrnewton/hermit/issues/4213, K3a): 61 + 263 + 255 = 579.
+    ("test.hermit_integration_3", 255),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -3591,7 +3604,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Focused chroot program-break regression: 533, freshly listed.
     // Activating both AT_RANDOM startup guards (+2) and two constructor
     // replacement controls (+2) from the LiteInst lane: 537.
-    ("test.cli", 537),
+    // And detcore_renders_the_mount_table_on_every_backend,
+    // the_guest_mount_table_ignores_a_host_mount_made_before_the_run and
+    // detcore_follows_the_target_processs_root_for_its_mount_table
+    // (https://github.com/rrnewton/hermit/issues/4213, K3a): 540.
+    ("test.cli", 540),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4044,7 +4061,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three DBT program-break tests: 465, and the PATH one: 466.
     // And the long-path spawn one: 467.
     // The same focused chroot program-break regression: 468, freshly listed.
-    ("test.cli_on_host", 468),
+    // And the three 4213 container-mount-table tests: 471.
+    ("test.cli_on_host", 471),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4371,7 +4389,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same own-record test: 2067.
     // And +1 from ca5325c1: 2068.
     // The same three guarded controller-capture units: 2071, freshly listed.
-    ("test.detcore_unit_on_host", 2071),
+    // And the 4213 mount-table files, changed-root and filesystem-group tests: 2074.
+    ("test.detcore_unit_on_host", 2074),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4449,7 +4468,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Ten DBT SIGKILL scenarios replace one aggregate test: 575.
     // And the container-init parent-died-before-arming test: 576, listed.
     // And the 4213 directory-alias record/replay test: 577.
-    ("test.hermit_integration_on_host", 577),
+    // And the 4213 staged-bind kernel-path and install-time bind tests: 579.
+    ("test.hermit_integration_on_host", 579),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -4653,7 +4673,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same DBT launched-program test: 1155.
     // And +2 from ca5325c1 and one initial-image auxv refusal: 1158.
     // Rebased expected sum; exact-head listing is required before hand-back.
-    ("test.hermit_unit_on_host", 1158),
+    // And the 4213 container-mount-table record-version, KVM table and
+    // install-time mountpoint tests: 1161.
+    ("test.hermit_unit_on_host", 1161),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -4820,7 +4842,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 5 session-census tests (3920bf94): 1600.
     // And the same 7 Buck e2e cell tests (456dbc38, 5ebcb9dd, 1722f214): 1607.
     // Restore the two qualified-runtime preparation tests: 1609.
-    ("test.regular_crates_on_host", 1_612),
+    // And the same twenty container_mounts tests: 1632.
+    ("test.regular_crates_on_host", 1_632),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
