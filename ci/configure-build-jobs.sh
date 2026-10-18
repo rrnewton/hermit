@@ -2162,8 +2162,20 @@ fi
 # reports_kernel_child_exit_signals). git diff is empty under reverie-dbt/ and for
 # the root Cargo.toml, Cargo.lock and rust-toolchain.toml, so the inventory (968),
 # SDK and native inputs, calibrated budget, job width and limits are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c58a4137af163e3ebb35b41b3c48e478daeb0fcf ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c58a4137af163e3ebb35b41b3c48e478daeb0fcf (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 51fed06fd4d28adf91f77b57d7ec2ecc55683c74 (2026-10-18):
+# The terminal-app-UBR translation repair changes vendored interp.c and adds
+# five regression files (tracked DBT inventory 968 -> 973). It preserves true
+# successor translations and original source extent; no clock policy changes.
+# Fresh maintained SDK MISS 49724b2667ab56f2408fb932c1d7dc06aa45677336fda523df9b47cd804c1c6a
+# measured 26.87s with 7 available jobs (NUM_JOBS=8), 188.10 job-seconds,
+# below the default native ratchet572. The portable1050 effective-job-second
+# limit and all job/selection limits remain unchanged, not recalibrated.
+# Actual producer: source80514d16 on R3d, terminal-translation-candidate-r1
+# under dbt-continuous-clock-main09ec59c4-20261018. The c58 restack preserves
+# all six changed blobs and SDK recipe inputs; this is one qualified sample,
+# not a fresh final-head SDK build or a five-sample calibration campaign.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 51fed06fd4d28adf91f77b57d7ec2ecc55683c74 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 51fed06fd4d28adf91f77b57d7ec2ecc55683c74 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
