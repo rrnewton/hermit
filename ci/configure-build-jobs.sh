@@ -2190,8 +2190,19 @@ fi
 # for the root Cargo.toml, Cargo.lock and rust-toolchain.toml in both steps, so
 # the inventory (973), SDK and native inputs, calibrated budget, job width and
 # limits are unchanged from the 45615034 carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6bdd0533a38f68a5742b361df656e32b2237d78a ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 6bdd0533a38f68a5742b361df656e32b2237d78a (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 2df22d5eb00ebfcf5fdecee67bbebbb1239d7081 (2026-10-18): from
+# 6bdd0533a38f68a5742b361df656e32b2237d78a. Default-off internal original-conditional facts
+# append ABI12/80, checked task births, and native cache-abandonment/guarded-return
+# support. Fourteen maintained source/test files are added (inventory973 -> 987).
+# Vendor/native inputs changed; neither the old SDK37 nor SDK497 is reused as
+# the candidate recipe. Fresh SDK MISS
+# a15e54f33b6693b6796540d3179389e897c30d7ee370a6bbf158c93fc5e6bc93 measured36.65s with7
+# available jobs (NUM_JOBS=8),256.52 job-seconds, below default native ratchet572.
+# This is one qualified source07 sample, not a recalibration campaign. The
+# existing portable1050 effective-job-second budget, jobs, limits and selections
+# stay unchanged. Collection is default off; shared clock/timer policy is unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 2df22d5eb00ebfcf5fdecee67bbebbb1239d7081 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 2df22d5eb00ebfcf5fdecee67bbebbb1239d7081 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
