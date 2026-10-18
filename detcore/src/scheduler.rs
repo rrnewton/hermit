@@ -22431,15 +22431,6 @@ mod test {
         assert!(!scheduler.blocked.sigchld_takers.contains(&target));
     }
 
-    /// A second `SIGCHLD` sent while the first is still pending in the
-    /// process's shared queue coalesces, as Linux does not queue a standard
-    /// signal already pending (`legacy_queue`): it wakes no thread and makes
-    /// none a taker, so the thread the first send woke takes the one copy.
-    /// Before, the second send woke its own target and marked it too, and the
-    /// lower-numbered target was resumed first and took the copy (the Codex
-    /// review of https://github.com/rrnewton/hermit/issues/4304). Where the
-    /// window and the queue disagree, one is stale and the thread is woken,
-    /// as before.
     /// A5 step 2b: the first SIGCHLD taker is chosen by the mask its thread
     /// published in place of `SigBlk`, and by the kernel's under a private
     /// mask or once the mask is withdrawn.
@@ -22484,6 +22475,15 @@ mod test {
         assert_eq!(scheduler.first_sigchld_taker(), None, "withdrawn");
     }
 
+    /// A second `SIGCHLD` sent while the first is still pending in the
+    /// process's shared queue coalesces, as Linux does not queue a standard
+    /// signal already pending (`legacy_queue`): it wakes no thread and makes
+    /// none a taker, so the thread the first send woke takes the one copy.
+    /// Before, the second send woke its own target and marked it too, and the
+    /// lower-numbered target was resumed first and took the copy (the Codex
+    /// review of https://github.com/rrnewton/hermit/issues/4304). Where the
+    /// window and the queue disagree, one is stale and the thread is woken,
+    /// as before.
     #[test]
     fn a_coalesced_sigchld_wakes_no_thread() {
         let chld = kernel_signal_bit(libc::SIGCHLD);
