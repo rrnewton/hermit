@@ -735,7 +735,14 @@ pub(super) fn record_rt_sigprocmask<G, T>(
 /// written. A delivery whose frame cannot be written becomes a SIGSEGV and
 /// leaves the old mask, which the check can take for the frame's return: that
 /// case is not told apart.
-pub(crate) fn record_delivery<G, T>(guest: &mut G, signal: i32)
+///
+/// Before the copy changes, a caught signal's delivery is checked against the
+/// kernel through the backend (`check_delivery`, A5 step 3.2). Checking adds
+/// only reads and a refusal: the copy changes exactly as it would unchecked,
+/// at the same point, unless a check fails, which drops the copy. This must
+/// be the last thing the signal callback does before it returns the signal:
+/// a later injection would void the backend's approval.
+pub(crate) async fn check_and_record_delivery<G, T>(guest: &mut G, signal: i32)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -744,6 +751,31 @@ where
     take_unreported(guest);
     take_wait_outcome(guest);
     reconcile_returns(guest, "signal delivery");
+    check_delivery(guest, signal).await;
+    commit_delivery(guest, signal);
+}
+
+/// [`check_and_record_delivery`] without the check, for a delivery the
+/// backend makes with no check (and for tests).
+#[cfg(test)]
+fn record_delivery<G, T>(guest: &mut G, signal: i32)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    take_unreported(guest);
+    take_wait_outcome(guest);
+    reconcile_returns(guest, "signal delivery");
+    commit_delivery(guest, signal);
+}
+
+/// The copy's half of [`check_and_record_delivery`], after reconciliation:
+/// `signal` is delivered as the copy holds it.
+fn commit_delivery<G, T>(guest: &mut G, signal: i32)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
     let Some(delivered) = with_copy(guest, |dispositions, thread| {
         crate::signal_state::deliver(dispositions, thread, signal)
     }) else {
@@ -782,6 +814,212 @@ where
             "signal delivery",
             &format!("the backend delivers signal {signal}, which the copy refuses with {errno}"),
         ),
+    }
+}
+
+/// One thread's counts of the deliveries [`check_delivery`] saw (A5 step 3.2):
+/// approved, contradicted, checked with the interruption taken from the
+/// registers (`delivery_interruption`), and not checked, by reason. Logged at
+/// TRACE when the thread exits, below INFO so the logs that runs compare are
+/// unchanged.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct DeliveryCounters {
+    approved: u64,
+    mismatched: u64,
+    interruption_from_registers: u64,
+    skipped: std::collections::BTreeMap<&'static str, u64>,
+}
+
+impl DeliveryCounters {
+    fn skip(&mut self, reason: &'static str) {
+        *self.skipped.entry(reason).or_default() += 1;
+    }
+
+    /// Logs the counts, if any delivery was seen.
+    pub(crate) fn log(&self, dettid: crate::types::DetTid) {
+        if self.approved + self.mismatched == 0 && self.skipped.is_empty() {
+            return;
+        }
+        trace!(
+            target: "detcore::signal_delivery",
+            "[dtid {dettid}] signal deliveries: approved={} mismatched={} interruption_from_registers={} skipped={:?}",
+            self.approved,
+            self.mismatched,
+            self.interruption_from_registers,
+            self.skipped
+        );
+    }
+}
+
+/// The name of a reason the backend could not check a delivery, for
+/// [`DeliveryCounters`].
+fn unavailable_reason(reason: reverie::SignalDeliveryUnavailable) -> &'static str {
+    use reverie::SignalDeliveryUnavailable as U;
+    match reason {
+        U::NotInSignalCallback => "not in signal callback",
+        U::NotTheReportedSignal { .. } => "not the reported signal",
+        U::NoSignalRecord => "no signal record",
+        U::NotADeliveryStop => "not a delivery stop",
+        U::FrameModeStop => "frame-mode stop",
+        U::TracerFiltered => "tracer filtered",
+        U::AlreadyApproved => "already approved",
+        U::AfterMismatch => "after mismatch",
+        U::UncheckedSignal => "unchecked signal",
+        U::BlockedAtResume => "blocked at resume",
+        U::Gone => "gone",
+        U::Unreadable(_) => "unreadable",
+        U::UnsupportedArchitecture => "unsupported architecture",
+    }
+}
+
+/// What the thread was doing at this delivery stop, for the backend's check of
+/// the syscall registers, and whether it was taken from the registers
+/// themselves rather than from Detcore's record.
+///
+/// Detcore's record (`ThreadState::delivery_interruption`) is set at each
+/// guest event: the syscall entered, the result Detcore finished it with, a
+/// handler frame approved at this exit, or no syscall (a preemption or a
+/// trapped instruction). Between events the guest runs unseen, so the record
+/// cannot know whether the thread is still at that syscall's exit or has
+/// returned to user code since. The registers' `orig_ax` is the kernel's own
+/// answer to that one question (-1 once the thread entered the kernel other
+/// than by a syscall), so:
+/// - a record naming the syscall `orig_ax` names is checked as it stands, so
+///   `rax` is compared with the result Detcore finished the call with;
+/// - a syscall record with `orig_ax` -1 means the thread returned to user
+///   code since: no syscall;
+/// - any other record is checked as it stands, so a contradiction is
+///   reported;
+/// - with no record (a new thread or image), or where Detcore does not see
+///   every syscall (`--passthru-opt`), the registers' answer is used, and the
+///   check of the syscall registers verifies nothing.
+async fn delivery_interruption<G, T>(guest: &mut G) -> (reverie::Interruption, bool)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    use reverie::Interruption;
+    let record = guest.thread_state().delivery_interruption;
+    if record == Some(Interruption::AfterFrame) {
+        return (Interruption::AfterFrame, false);
+    }
+    // Only x86-64's registers are read here; elsewhere nothing is checked.
+    #[cfg(not(target_arch = "x86_64"))]
+    return (Interruption::AfterFrame, true);
+    #[cfg(target_arch = "x86_64")]
+    let orig = guest.regs().await.orig_rax as i64;
+    let from_registers = if orig < 0 {
+        Interruption::NotInSyscall
+    } else {
+        Interruption::KernelRun { syscall: orig }
+    };
+    if guest.config().passthru_opt {
+        return (from_registers, true);
+    }
+    match record {
+        None => (from_registers, true),
+        Some(Interruption::Return { .. } | Interruption::KernelRun { .. }) if orig < 0 => {
+            (Interruption::NotInSyscall, false)
+        }
+        Some(record) => (record, false),
+    }
+}
+
+/// Checks a caught signal's delivery against the kernel through the backend
+/// (`Guest::deliver_signal`), from the reconciled copy, before the copy
+/// records it (A5 step 3.2). Reads only:
+/// - the backend's approval binds the guest's resume to exactly this signal
+///   and these masks;
+/// - a contradiction, where the copy and the kernel are both certain, is a
+///   Detcore defect: it is reported once, as a divergence, and the copy is
+///   dropped, so the delivery goes on as the kernel makes it;
+/// - a point the backend cannot check is counted by reason and changes
+///   nothing.
+///
+/// Not checked, and counted: no copy, the shared actions unknown, a signal
+/// that is not caught (the kernel ignores it or takes its default action).
+async fn check_delivery<G, T>(guest: &mut G, signal: i32)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if !kernel_state_is_the_guests(guest) {
+        return;
+    }
+    let state = guest.thread_state().signal_shadow.as_ref().map(|shadow| {
+        let actions = shadow.dispositions.lock().unwrap();
+        (
+            actions
+                .as_ref()
+                .map(|dispositions| dispositions.action(signal)),
+            shadow.thread.saved.unwrap_or(shadow.thread.blocked),
+            shadow.thread.blocked,
+        )
+    });
+    let skip = |guest: &mut G, reason| guest.thread_state_mut().delivery_counters.skip(reason);
+    let (action, frame_mask, current_mask) = match state {
+        None => return skip(guest, "no copy"),
+        Some((None, ..)) => return skip(guest, "dispositions unknown"),
+        Some((Some(Err(_)), ..)) => return skip(guest, "invalid signal"),
+        Some((Some(Ok(action)), frame, current)) => (action, frame, current),
+    };
+    if !action.is_caught() {
+        return skip(guest, "not caught");
+    }
+    let (interruption, from_registers) = delivery_interruption(guest).await;
+    let action = reverie::SignalAction {
+        handler: action.handler,
+        flags: action.flags,
+        restorer: action.restorer,
+        mask: action.mask,
+    };
+    let delivery = reverie::SignalDelivery {
+        signal,
+        action,
+        frame_mask,
+        current_mask,
+        handler_mask: action.handler_mask(current_mask, signal),
+        // The signals whose kernel state differs from the copy's by design or
+        // unseen (`compare`), except the delivered one, which every check
+        // must cover.
+        unchecked_mask: (reserved() | forced()) & !sigbit(signal),
+        interruption,
+    };
+    let outcome = guest.deliver_signal(delivery).await;
+    // The next delivery before a guest instruction runs is at this exit,
+    // after this handler's frame.
+    guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::AfterFrame);
+    let counters = &mut guest.thread_state_mut().delivery_counters;
+    counters.interruption_from_registers += u64::from(from_registers);
+    match outcome {
+        reverie::SignalDeliveryOutcome::Accepted => {
+            counters.approved += 1;
+            trace!(
+                "[dtid {}] signal-state copy: the delivery of signal {signal} is approved",
+                guest.thread_state().dettid
+            );
+        }
+        reverie::SignalDeliveryOutcome::Mismatch(mismatch) => {
+            counters.mismatched += 1;
+            diverged(
+                guest,
+                "signal delivery",
+                &format!(
+                    "the kernel contradicts the delivery of signal {signal} in {:?}: the copy \
+                     holds {:#x}, the kernel {:#x}",
+                    mismatch.field, mismatch.expected, mismatch.actual
+                ),
+            );
+        }
+        reverie::SignalDeliveryOutcome::Unavailable(reason) => {
+            counters.skip(unavailable_reason(reason));
+        }
+        reverie::SignalDeliveryOutcome::Refused(_) => counters.skip("backend refuses"),
+        // Only a frame-building backend answers these, and no backend that
+        // keeps a copy builds frames.
+        reverie::SignalDeliveryOutcome::Installed | reverie::SignalDeliveryOutcome::FrameFault => {
+            counters.skip("frame-building outcome");
+        }
     }
 }
 
