@@ -223,10 +223,10 @@ pub struct Config {
     /// SIGHUP and SIGCONT when it hangs up, SIGINT, SIGQUIT and SIGTSTP for its
     /// interrupt, quit and suspend characters, SIGWINCH when it is resized, and
     /// SIGTTIN and SIGTTOU for a background process group's reads and writes.
-    /// The guest makes no traced call that arms them, so where blocked waits
-    /// decide interruption from the kernel's signal state
-    /// (`BackendCapabilities::supports_blocked_wait_signal_interruption`) the
-    /// scheduler records all eight as host-timed for every process before the
+    /// The guest makes no traced call that arms them, so where such signals
+    /// really reach the guest from the host
+    /// ([`crate::bundled_signal_facts::host_timed_signal_sources_are_physical`])
+    /// the scheduler records all eight as host-timed for every process before the
     /// guest's first instruction, and no gated wait ends for them
     /// (<https://github.com/rrnewton/hermit/issues/3146>).
     ///

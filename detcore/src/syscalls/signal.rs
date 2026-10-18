@@ -10,6 +10,7 @@
 
 use std::time::Duration;
 
+use detcore_model::bundled_signal_facts;
 use detcore_model::schedule::SigWrapper;
 use nix::sys::signal::Signal;
 use reverie::Errno;
@@ -2627,10 +2628,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let signals = orphaned_group_signals(sig);
         if signals != 0
-            && guest
-                .config()
-                .backend
-                .supports_blocked_wait_signal_interruption
+            && bundled_signal_facts::host_timed_signal_sources_are_physical(&guest.config().backend)
         {
             record_host_timed_signals(guest, HostTimedSignalScope::Container, signals).await;
         }
@@ -3451,11 +3449,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // may use), goes to it unchanged; a copy that certainly faults is
         // answered EFAULT here; and a `siginfo_t` Hermit cannot read whole is
         // refused by name (`rt_sigqueueinfo_precheck`).
-        if guest
-            .config()
-            .backend
-            .supports_blocked_wait_signal_interruption
-        {
+        if bundled_signal_facts::host_task_reads_enabled(&guest.config().backend) {
             match self.rt_sigqueueinfo_precheck(guest, &call) {
                 RtSigqueueinfoPrecheck::KernelFails => {
                     return Ok(self.record_or_replay(guest, call).await?);
