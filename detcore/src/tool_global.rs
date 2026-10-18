@@ -4164,6 +4164,12 @@ impl GlobalState {
                 sched.fail_parked(dettid, error);
                 return (SchedulerRpcResult::ThreadExited, None);
             }
+            if sched.parallelism_probe.is_some() {
+                let thread_time = self.global_time.lock().unwrap().threads_time(dettid);
+                if let Some(probe) = sched.parallelism_probe.as_mut() {
+                    probe.note_request(dettid, detpid, thread_time);
+                }
+            }
             sched.request_put(&nextturn.req, rs.clone(), &self.global_time);
             nextturn.resp
         };
@@ -7264,6 +7270,7 @@ where
         }
         let dettid = guest.thread_state().dettid;
         let detpid = guest.thread_state().detpid.expect("detpid unset");
+        crate::parallelism_probe::flush_segment(dettid);
         trace!(
             "[detcore, dtid {}] BLOCKING on resource_request rpc... {:?}",
             &dettid, r

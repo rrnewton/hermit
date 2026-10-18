@@ -65,6 +65,7 @@ mod memory;
 pub mod native_exec;
 pub mod netlink_route;
 pub mod nonwaiting_write;
+pub mod parallelism_probe;
 mod pipe_wake;
 mod procfs;
 mod procfs_inode;
@@ -2502,6 +2503,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let result = if guest.config().virtualize_time {
             let dettid = guest.thread_state().dettid;
             guest.thread_state_mut().thread_logical_time.add_rdtsc();
+            crate::parallelism_probe::note_event(dettid, "rdtsc");
             info!(
                 "[dtid {}] inbound rdtsc, new logical time: {:?}",
                 dettid,
@@ -3497,6 +3499,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 "[syscall][detcore, dtid {}] inbound syscall: {} = ?",
                 dettid,
                 call.display(&guest.memory())
+            );
+        }
+        if crate::parallelism_probe::enabled() {
+            let args = call.into_parts().1;
+            let shown = crate::parallelism_probe::wants_rendering(call.name())
+                .then(|| call.display(&guest.memory()).to_string());
+            crate::parallelism_probe::note_syscall(
+                dettid,
+                call.name(),
+                [args.arg0 as u64, args.arg1 as u64, args.arg2 as u64],
+                guest.tid().as_raw(),
+                shown.as_deref(),
             );
         }
 
