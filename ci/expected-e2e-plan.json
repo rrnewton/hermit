@@ -41084,7 +41084,7 @@
       "category": "c-programs",
       "classification": "required",
       "cpu_timeout_seconds": 22,
-      "lane": "privileged",
+      "lane": "portable",
       "mode": "verify",
       "requires": [
         "linux",
