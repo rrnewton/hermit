@@ -2037,8 +2037,8 @@ fi
 # git diff is empty under reverie-dbt/, and the root Cargo.toml, Cargo.lock
 # and rust-toolchain.toml are unchanged. All seven SDK inputs, inventory
 # 961, calibrated budget, job width and limits are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 7324210272a3f3a611d37ea2138fe2c5a4d05ac2 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 7324210272a3f3a611d37ea2138fe2c5a4d05ac2 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 8214c7ee0d87b7a68eff6dbc1a02782035f42d54 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 8214c7ee0d87b7a68eff6dbc1a02782035f42d54 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
