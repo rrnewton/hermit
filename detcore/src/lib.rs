@@ -2165,7 +2165,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
     }
 
-    /// The opt-in signal-state copy follows handler returns from the backend's
+    /// The signal-state copy follows handler returns from the backend's
     /// reports where it has them (`syscalls::signal_shadow`).
     fn observes_sigreturns(config: &Config) -> bool {
         crate::syscalls::signal_shadow::observes_sigreturns(config)
