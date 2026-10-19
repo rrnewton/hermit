@@ -2201,8 +2201,16 @@ fi
 # This is one qualified source07 sample, not a recalibration campaign. The
 # existing portable1050 effective-job-second budget, jobs, limits and selections
 # stay unchanged. Collection is default off; shared clock/timer policy is unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 2df22d5eb00ebfcf5fdecee67bbebbb1239d7081 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 2df22d5eb00ebfcf5fdecee67bbebbb1239d7081 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO bfe01a465bd53a00eff185f3130e37344938982e (2026-10-18): from
+# 2df22d5eb00ebfcf5fdecee67bbebbb1239d7081. Bind each task from its already
+# admitted birth so an unrelated sibling reservation cannot leave PendingOwner.
+# Two native regression-support paths are added (inventory987 -> 989).
+# Vendor/build.rs and SDK recipe inputs are unchanged; the qualified a15e SDK
+# sample above carries under the same CMake/generator/epoch settings. The native
+# client changes and requires a new build receipt. ABI12/80, portable1050 budget,
+# default ratchet572, job width, limits, selectors and clock policy stay unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bfe01a465bd53a00eff185f3130e37344938982e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie bfe01a465bd53a00eff185f3130e37344938982e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
