@@ -2319,8 +2319,12 @@ fi
 # build.rs, native/CMakeLists.txt and vendor/dynamorio stay byte-identical, so
 # the existing SDK recipe and resource budget carry without a cold SDK build.
 # This is not runtime-correctness or binary/package identity evidence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 826ada27fcae71e1b00a91fed65cb36aa7529062 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 826ada27fcae71e1b00a91fed65cb36aa7529062 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO c85f7d4667e396bf16e1a2c18525cba39f38e003 (2026-10-19): from 826ada27fcae71e1b00a91fed65cb36aa7529062
+# only native/client.c readiness placement and scoped comments change.
+# SDK vendor/build.rs/CMake recipe inputs remain identical; retain the existing
+# a15e SDK budget, widths and limits. Native client/runtime validation must be fresh.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c85f7d4667e396bf16e1a2c18525cba39f38e003 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c85f7d4667e396bf16e1a2c18525cba39f38e003 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

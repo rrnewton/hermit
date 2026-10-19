@@ -2244,7 +2244,11 @@ fi
 # native/CMakeLists.txt and vendor/dynamorio are unchanged, so the existing
 # SDK recipe/budget carry remains valid. The native client and Hermit runtime
 # must be rebuilt; this does not carry runtime correctness or package bytes.
-expected_pin=826ada27fcae71e1b00a91fed65cb36aa7529062
+# CARRY TO c85f7d4667e396bf16e1a2c18525cba39f38e003 (2026-10-19): from 826ada27fcae71e1b00a91fed65cb36aa7529062
+# only native/client.c readiness placement and scoped comments change.
+# SDK vendor/build.rs/CMake recipe inputs remain identical; retain the existing
+# a15e SDK budget, widths and limits. Native client/runtime validation must be fresh.
+expected_pin=c85f7d4667e396bf16e1a2c18525cba39f38e003
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
