@@ -2557,7 +2557,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_sigreturn_continuation_rule_reads_no_request_when_none_is_marked
     // (https://github.com/rrnewton/hermit/issues/4505): 2127, freshly listed.
     // And +4 from 16eca47a: 2131.
-    ("test.detcore_unit", 2131),
+    // And parallelism_probe's ten units (the default-off parallelism
+    // profile): 2141, freshly listed.
+    ("test.detcore_unit", 2141),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4481,7 +4483,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 7c9958d1: 2124.
     // And the same three sigreturn-continuation units: 2127, freshly listed.
     // And +4 from 16eca47a: 2131.
-    ("test.detcore_unit_on_host", 2131),
+    // And the same ten parallelism_probe units: 2141, freshly listed.
+    ("test.detcore_unit_on_host", 2141),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
