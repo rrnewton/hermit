@@ -2195,8 +2195,15 @@ fi
 # reverie-dbt/, root Cargo.toml, Cargo.lock and rust-toolchain.toml are
 # byte-identical. Native build inputs and job/budget limits are unchanged.
 # DBT inventory stays 973; fresh runtime validation is still required.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 1418122e9dbd724fd45fa714d6576a30e1d01e63 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 1418122e9dbd724fd45fa714d6576a30e1d01e63 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO f962560b9b3dee329d0ac474e09423999e0f05c8 (2026-10-18): from
+# 1418122e9dbd724fd45fa714d6576a30e1d01e63. Only inguest/loader ownership and fixtures move.
+# reverie-dbt/, root Cargo.toml and rust-toolchain.toml are byte-identical.
+# Cargo.lock changes only reverie-inguest and reverie-loader dependency edges;
+# neither is in the DBT dependency closure, whose locked packages are identical.
+# Native SDK recipe/source inputs, inventory 973, budgets and job limits carry
+# unchanged. This is not a claim that the whole workspace lock is unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f962560b9b3dee329d0ac474e09423999e0f05c8 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie f962560b9b3dee329d0ac474e09423999e0f05c8 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

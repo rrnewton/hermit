@@ -2119,7 +2119,14 @@ fi
 # reverie-dbt/, root Cargo.toml, Cargo.lock and rust-toolchain.toml are
 # byte-identical. Native build inputs and job/budget limits are unchanged.
 # DBT inventory stays 973; fresh runtime validation is still required.
-expected_pin=1418122e9dbd724fd45fa714d6576a30e1d01e63
+# CARRY TO f962560b9b3dee329d0ac474e09423999e0f05c8 (2026-10-18): from
+# 1418122e9dbd724fd45fa714d6576a30e1d01e63. Only inguest/loader ownership and fixtures move.
+# reverie-dbt/, root Cargo.toml and rust-toolchain.toml are byte-identical.
+# Cargo.lock changes only reverie-inguest and reverie-loader dependency edges;
+# neither is in the DBT dependency closure, whose locked packages are identical.
+# Native SDK recipe/source inputs, inventory 973, budgets and job limits carry
+# unchanged. This is not a claim that the whole workspace lock is unchanged.
+expected_pin=f962560b9b3dee329d0ac474e09423999e0f05c8
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
