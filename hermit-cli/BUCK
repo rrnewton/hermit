@@ -93,8 +93,12 @@ rust_library(
                     "reverie-rpc-transport": {"optional": True},
                     "reverie-sabre-stats": {"optional": True},
                 },
+                "dev-dependencies": {
+                    "reverie-inguest": {"default-features": False, "features": ["exec-stop"]},
+                },
             },
             "features": {
+                "exec-stop-launcher": ["dep:reverie-inguest", "reverie-inguest/exec-stop"],
                 "default": [],
                 "dbt": ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"],
                 "sabre": ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"],
@@ -190,8 +194,12 @@ rust_binary(
                     "reverie-rpc-transport": {"optional": True},
                     "reverie-sabre-stats": {"optional": True},
                 },
+                "dev-dependencies": {
+                    "reverie-inguest": {"default-features": False, "features": ["exec-stop"]},
+                },
             },
             "features": {
+                "exec-stop-launcher": ["dep:reverie-inguest", "reverie-inguest/exec-stop"],
                 "default": [],
                 "dbt": ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"],
                 "sabre": ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"],

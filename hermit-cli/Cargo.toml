@@ -29,6 +29,8 @@ crate-type = ["rlib"]
 # patching-backends architecture audit); every validation still builds it
 # through `third-party-backends`.
 [features]
+# Shared exec-stop observations/cancellation; production release stays refused.
+exec-stop-launcher = ["dep:reverie-inguest", "reverie-inguest/exec-stop"]
 default = []
 # Native controls exercise real KVM ownership/RPC helpers without a VM.
 kvm-native-test-support = ["reverie-kvm/native-test-support"]
@@ -94,6 +96,8 @@ tracing-subscriber = { version = "0.3.23", features = ["chrono", "env-filter", "
 uuid = { version = "1.24.0", features = ["rng-getrandom", "serde", "v4", "v5", "v6", "v7", "v8"] }
 
 [dev-dependencies]
+# Keep the shared physical-launcher regression in the ordinary unit gate.
+reverie-inguest = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "956522100b5f6dbd3bb5a105087aa450db8648aa", default-features = false, features = ["exec-stop"] }
 # Exact token locations and digests bind the complete source inventory.
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 quote = "1.0.47"

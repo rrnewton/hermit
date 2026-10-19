@@ -1881,10 +1881,14 @@ source = "git+https://github.com/rrnewton/reverie.git?rev=956522100b5f6dbd3bb5a1
 dependencies = [
  "bincode 2.0.1",
  "libc",
+ "nix 0.30.1",
  "reverie-core",
+ "reverie-loader",
+ "reverie-memory",
  "reverie-ptrace",
  "reverie-rpc-transport",
  "reverie-syscalls",
+ "safeptrace",
  "serde",
  "sha2",
  "syscalls",
@@ -1950,6 +1954,11 @@ dependencies = [
  "serde_json",
  "sha2",
 ]
+
+[[package]]
+name = "reverie-loader"
+version = "0.4.1"
+source = "git+https://github.com/rrnewton/reverie.git?rev=956522100b5f6dbd3bb5a105087aa450db8648aa#956522100b5f6dbd3bb5a105087aa450db8648aa"
 
 [[package]]
 name = "reverie-memory"
