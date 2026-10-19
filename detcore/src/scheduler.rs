@@ -7641,6 +7641,47 @@ impl Scheduler {
     /// (<https://github.com/rrnewton/hermit/issues/3999>). Dropping the
     /// barriers instead would let other threads be selected at a moment the
     /// host chose.
+    /// Step 2a: readmit a vfork parent whose barrier ended at its
+    /// continuation, ahead of other work, where Linux resumes it: at its
+    /// child's successful exec or exit (`vfork(2)`). Before this, the
+    /// continuation stayed a background completion that was readmitted only
+    /// once nothing else could run, so a vfork parent such as make resumed
+    /// only after the child it started had finished, and its next
+    /// `wait4(WNOHANG)` always found that child exited.
+    ///
+    /// The readmission point is fixed by the child's committed release edge
+    /// and the barrier wait above, which commits no turn until the parent's
+    /// continuation arrives; host timing can only lengthen that wait. Record
+    /// logs the readmission in the rejoin log; replay applies it here too, at
+    /// the same point of the pass: everything later in the pass that reads the
+    /// run queue must see the parent queued in both, or the schedules part.
+    /// A logged entry due elsewhere stays with `step2c_replay_rejoin`, which
+    /// refuses one that does not match.
+    fn vfork_rejoin_readmit(&mut self, parent: DetTid) {
+        let Some(op_id) = self.blocked.external_io_blockers.get(&parent).copied() else {
+            return;
+        };
+        if let Some(rejoins) = self.rejoin_replay.as_mut() {
+            let point = (self.turn, self.empty_queue_wakes);
+            let due_here = rejoins.front().is_some_and(|next| {
+                next.point() == point && next.calls == [(parent, op_id.sequence)]
+            });
+            if !due_here {
+                return;
+            }
+            rejoins.pop_front();
+            self.rejoin_stalled_since = None;
+        } else {
+            self.log_rejoin(&[(parent, op_id, false)], &[parent]);
+        }
+        self.blocked.external_io_blockers.remove(&parent);
+        self.blocked.replay_log_served.remove(&parent);
+        let _ = self.blocked.out_of_scheduler_masks.remove(&parent);
+        // The message `step2c_process_io_blockers` logs for a readmission.
+        info!("[step2] Reschedule formerly backgrounded dtid {:?}", parent);
+        self.readmit_ready_thread(parent);
+    }
+
     fn step2a_wait_for_vfork_barrier(&mut self) -> Result<(), SkipTurn> {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-1152): Review deferred vfork child registration.
@@ -7676,11 +7717,30 @@ impl Scheduler {
                     }
                     _ => false,
                 };
-                remove.then_some(*parent)
+                // The child's successful exec or exit released the parent in
+                // the kernel, which is the parent's continuation: Linux
+                // resumes a vfork parent then (`vfork(2)`), so readmit it
+                // now rather than when nothing else can run.
+                let rejoins = remove
+                    && child_registered
+                    && self
+                        .next_turns
+                        .get(parent)
+                        .and_then(|turn| turn.req.try_read())
+                        .and_then(|req| req.ok())
+                        .is_some_and(|resources| {
+                            resources.resources.keys().any(|resource| {
+                                matches!(resource, ResourceID::BlockedExternalContinue(_))
+                            })
+                        });
+                remove.then_some((*parent, rejoins))
             })
             .collect();
-        for parent in completed_parents {
+        for (parent, rejoins) in completed_parents {
             self.drop_vfork_barrier(parent);
+            if rejoins {
+                self.vfork_rejoin_readmit(parent);
+            }
         }
 
         // A pending barrier waits for its child's registration, a released one
@@ -11417,6 +11477,15 @@ impl Scheduler {
                 // Replay readmits each call at the turn the recording logged, not when
                 // it finishes (see `rejoin_log`).
                 if self.rejoin_replay.is_some() {
+                    // As record does below: with nothing to run and no
+                    // readmission due, a parent parked for its deferred
+                    // SIGCHLD goes to step2e.
+                    if self.run_queue.is_empty()
+                        && !self.blocked.sigchld_deferred.is_empty()
+                        && !self.rejoin_due_now()
+                    {
+                        return Ok(());
+                    }
                     return self.step2c_replay_rejoin(&blockers, &ready, requeue_ready);
                 }
 
@@ -11472,6 +11541,16 @@ impl Scheduler {
                 // records the wake count with the turn so replay agrees.
                 // TODO-HUMAN-REVIEW(PR-3908)
                 if self.next_deadline_is_reachable() {
+                    return Ok(());
+                }
+
+                // A parent parked for its deferred SIGCHLD is work: step2e
+                // admits it once nothing else can run, which is now. Spinning
+                // here instead never reached step2e, and hung a recording of
+                // make -jN once vfork parents resume at their child's exec:
+                // make waited in a backgrounded pselect6 for the SIGCHLD of a
+                // job whose driver waited for its own deferred SIGCHLD.
+                if !self.blocked.sigchld_deferred.is_empty() {
                     return Ok(());
                 }
 
