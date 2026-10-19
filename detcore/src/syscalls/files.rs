@@ -9063,9 +9063,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// in-guest backend registered on reception) can leave that other
     /// identity's entry stale, so no lock on that file's inode number counts
     /// from then on (`procfs::locks::LockLedger::alias_inode`): hidden, never
-    /// a host's row admitted. If that descriptor's fdinfo cannot be read for
-    /// ambient or resource state, every later `/proc/locks` read refuses
-    /// instead ([`Self::note_alias`]).
+    /// a host's row admitted. So does any of these calls through a
+    /// descriptor an in-guest backend rediscovered in the table it rebuilt
+    /// after an exec (`ThreadState::may_know_under_another_identity`): the
+    /// old image's tables, and those forked from them, may name its
+    /// description under the old identity, and a lock change through either
+    /// identity leaves the other's entry stale. If that descriptor's fdinfo
+    /// cannot be read for ambient or resource state, every later
+    /// `/proc/locks` read refuses instead ([`Self::note_alias`]).
     pub(crate) async fn refresh_description_locks<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -9089,8 +9094,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             return Ok(());
         };
+        // A descriptor rediscovered in a table an in-guest backend rebuilt
+        // after an exec, such as an exec survivor registered again under an
+        // identity of the rebuilt table's: any entry this call gives it could
+        // go stale against the old identity's, in either direction, so no
+        // lock on its file counts from the first such call on. Whether it was
+        // also registered on reception changes nothing.
+        let rebuilt = guest.thread_state().may_know_under_another_identity(fd);
         let fdinfo = self.read_own_fdinfo(guest, fd, call.name()).await?;
-        if received && call.changes_locks() {
+        if (received && call.changes_locks()) || rebuilt {
             Self::note_alias(guest, &fdinfo).await;
         }
         let held = matches!(&fdinfo, FdinfoRead::Contents(_));

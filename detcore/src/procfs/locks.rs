@@ -65,9 +65,10 @@
 //! owns it. A group whose granted row goes, goes whole, as Linux drops a whole
 //! group whose granted row's owner it cannot see.
 //!
-//! What still differs from Linux, named rather than hidden. One case can show
-//! a host row; every other case hides a row of the guest's own, and none
-//! shows a host row:
+//! What still differs from Linux, named rather than hidden. In the first case
+//! below a host's row takes the place of the guest's identical one; every
+//! other case in this list hides a row of the guest's own. The ways a host
+//! row can still appear are listed after it.
 //! - a host lock whose row is, field for field, a lock a guest description
 //!   holds now (in practice a shared read lock on the same range of the same
 //!   file, or a file in another btrfs subvolume, whose rows print the one
@@ -82,8 +83,7 @@
 //!   until a call through a modelled descriptor of it: a description
 //!   inherited already locked at the start; one received over `SCM_RIGHTS`
 //!   where Detcore keeps no model of the receiver's descriptor (ptrace), once
-//!   the sender's tables let go of it; one received through `recvmmsg`; one an
-//!   in-guest backend's exec rebuilds under a new identity;
+//!   the sender's tables let go of it; one received through `recvmmsg`;
 //! - fork before lock, for OFD locks: a table that referenced a description
 //!   before Detcore first read its locks (the parent of a child that then
 //!   locks it) is not followed, so once the tables Detcore did see let go of
@@ -102,19 +102,43 @@
 //!   in-guest backend registered on reception), no lock on that inode number,
 //!   on any device, is shown again; if that descriptor's fdinfo cannot be
 //!   read, no OFD or flock lock is shown again;
+//! - likewise once any call that reads a description's locks goes through a
+//!   descriptor rediscovered in a table an in-guest backend rebuilt after an
+//!   exec (DBT, SaBRe), whether or not it was also registered on reception:
+//!   no lock on that inode number is shown again, though Linux shows the
+//!   description's lock, with the same outcomes when that descriptor's fdinfo
+//!   cannot be read (and, when ambient or resource state is why, every later
+//!   `/proc/locks` read is refused). Such a table registers again, under a
+//!   new identity, each descriptor that survived the exec, while the tables
+//!   forked before the exec still name its description under the old one.
+//!   The rule is broader than the survivors: it covers every descriptor the
+//!   rebuilt table found already open rather than saw created (one a call
+//!   Detcore does not register made, or one received through `recvmmsg`).
+//!   Before such a call a survivor's lock is shown while a table forked
+//!   before the exec names its old identity, and is not shown once none
+//!   does. The rebuilt table also continues the old image's numbering, so a
+//!   description the new image creates never takes an identity the old
+//!   image's tables still name;
 //! - a lease set by a process that was then reaped, under `--no-namespace`,
 //!   is not shown; leases are kept by their owner's pid only;
 //! - the guest's own `F_GETLK`, `F_OFD_GETLK` and conflicting lock calls still
 //!   see host locks on files it shares with the host: this filter changes only
 //!   what `/proc/locks` shows.
 //!
-//! Remaining ways a host row can still appear, until `/proc/locks` is decided
-//! from the kernel's state at the snapshot: a description an in-guest
-//! backend's exec rebuilds under a new identity, whose lock changes through
-//! the new identity leave the old one's entry stale in a table forked before
-//! the exec; and a lock change the guest makes without Detcore seeing the call
-//! at all (DBT refuses the one known case, a copied `vfork` child, while the
-//! parent's descriptions may hold an OFD lock).
+//! Ways a host row can still appear, until `/proc/locks` is decided from the
+//! kernel's state at the snapshot; each is an entry the ledger keeps for one
+//! identity of a description while the lock changes through another:
+//! - a descriptor an in-guest backend registered on reception over
+//!   `SCM_RIGHTS` (outside a rebuilt table) records the locks its description
+//!   held then; an unlock through another identity of that description, such
+//!   as the sender's own descriptor, leaves the receiver's entry stale while
+//!   it keeps the descriptor;
+//! - the run's initial descriptors get one identity each, even where two
+//!   share a description (fd 1 and fd 2 of `1<>file 2>&1`): a lock through
+//!   one and an unlock through the other leaves the first one's entry stale;
+//! - a lock change the guest makes without Detcore seeing the call at all
+//!   (DBT refuses the one known case, a copied `vfork` child, while the
+//!   parent's descriptions may hold an OFD lock).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -590,9 +614,11 @@ impl LockLedger {
     }
 
     /// A lock or unlock went through a descriptor whose description the
-    /// ledger may know under another identity, on the file with inode number
-    /// `inode` (from that descriptor's fdinfo), so another identity's entry
-    /// may be stale: from now on no lock on that inode number counts, on any
+    /// ledger may know under another identity, or any call that reads a
+    /// description's locks went through a descriptor an in-guest backend
+    /// registered again after an exec, on the file with inode number `inode`
+    /// (from that descriptor's fdinfo), so another identity's entry may be
+    /// stale: from now on no lock on that inode number counts, on any
     /// device. Without an inode (its fdinfo could not be read), no lock
     /// counts at all.
     pub(crate) fn alias_inode(&mut self, inode: Option<String>) {
@@ -1015,6 +1041,52 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         assert!(ledger.held().is_empty());
         let mut ledger = LockLedger::default();
         ledger.note_locks(process, description(0), vec![lock("0")], 1);
+        ledger.alias_inode(None);
+        assert!(ledger.held().is_empty());
+    }
+
+    /// An exec on an in-guest backend that rebuilds the descriptor table:
+    /// the process locked description 0 and forked a child, whose copy names
+    /// it; after the exec, the survivor is registered again as description 1,
+    /// which `LockLedger::exec_kept` never names (no lock of it is followed
+    /// yet).
+    fn ledger_after_a_rebuilding_exec() -> LockLedger {
+        let [parent, child] = [3, 4].map(DetPid::from_raw);
+        let mut ledger = LockLedger::default();
+        ledger.note_locks(parent, description(0), vec![lock("0")], 1);
+        ledger.fork(parent, child, false);
+        ledger.exec(parent);
+        // The child's copy still names the locked description: shown, as
+        // Linux shows it.
+        assert_eq!(ledger.held(), [lock("0")]);
+        ledger
+    }
+
+    #[test]
+    fn a_survivor_an_exec_registered_again_counts_on_no_identity_once_aliased() {
+        let parent = DetPid::from_raw(3);
+        // Without the alias, an unlock through the new identity leaves the
+        // old one's entry claiming the lock the kernel released: a host's
+        // identical row would be admitted.
+        let mut stale = ledger_after_a_rebuilding_exec();
+        stale.note_locks(parent, description(1), Vec::new(), 1);
+        assert_eq!(stale.held(), [lock("0")]);
+        // The first call through the new identity aliases the file's inode
+        // number (from that call's fdinfo) before the ledger hears of it, so
+        // neither identity's entry counts, whichever changes after.
+        let mut ledger = ledger_after_a_rebuilding_exec();
+        ledger.alias_inode(Some("7".to_string()));
+        ledger.note_locks(parent, description(1), Vec::new(), 1);
+        assert!(ledger.held().is_empty());
+        ledger.note_locks(DetPid::from_raw(4), description(0), vec![lock("0")], 1);
+        ledger.note_locks(parent, description(1), vec![lock("0")], 1);
+        assert!(ledger.held().is_empty());
+        // A lock on another file still counts.
+        let other = held_locks_in_fdinfo(b"lock:\t1: OFDLCK ADVISORY READ -1 00:18:8 0 0\n");
+        ledger.note_locks(parent, description(2), other.clone(), 1);
+        assert_eq!(ledger.held(), other);
+        // A survivor whose fdinfo names no inode hides every lock.
+        let mut ledger = ledger_after_a_rebuilding_exec();
         ledger.alias_inode(None);
         assert!(ledger.held().is_empty());
     }

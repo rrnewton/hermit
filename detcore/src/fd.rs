@@ -566,6 +566,14 @@ struct OpenFileDescription {
     /// its lock calls natively, while one does. Not printed.
     #[serde(default)]
     may_hold_ofd_lock: bool,
+    /// True once this description was registered by rediscovery: Detcore
+    /// met its descriptor already open (`FileMetadata::discover_fd_from_current_process`).
+    /// In an image a backend rebuilt its descriptor table for after `exec`
+    /// (`FileMetadata::rebuilt_by_exec`), such a description may be one the
+    /// old image's tables still name in `procfs::locks::LockLedger` under
+    /// the old image's identity. Shared by every alias. Not printed.
+    #[serde(default)]
+    rediscovered: bool,
 }
 /// Written out, not derived, so that `channel` is printed only when it is set:
 /// a run without `--pipe-wake-latency` logs every description exactly as
@@ -846,6 +854,7 @@ impl DetFd {
                 lock_tracked: false,
                 received_for_locks: false,
                 may_hold_ofd_lock: false,
+                rediscovered: false,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             }))),
@@ -1794,6 +1803,16 @@ impl DetFd {
     /// Whether this description may hold an OFD lock.
     pub(crate) fn may_hold_ofd_lock(&self) -> bool {
         self.with_description(|d| d.may_hold_ofd_lock)
+    }
+
+    /// Mark this description as registered by rediscovery. Permanent.
+    pub(crate) fn set_rediscovered(&self) {
+        self.with_description(|d| d.rediscovered = true);
+    }
+
+    /// Whether this description was registered by rediscovery.
+    pub(crate) fn is_rediscovered(&self) -> bool {
+        self.with_description(|d| d.rediscovered)
     }
 
     /// Mark this open file as passed over `SCM_RIGHTS`. Permanent.

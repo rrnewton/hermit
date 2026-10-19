@@ -126,6 +126,18 @@ pub struct FileMetadata {
     /// says whether they are placeholders (`decide_cpuinfo_placeholders`).
     #[serde(default)]
     pending_cpuinfo_placeholders: Vec<RawFd>,
+    /// Whether this table is one a backend rebuilt for an image an `exec`
+    /// started, rediscovering the descriptors that survived the exec under
+    /// identities of its own (`BackendCapabilities::rediscovers_descriptors_after_exec`,
+    /// not the run's first image): set at the image's first guest callback
+    /// (`Self::mark_rebuilt_by_exec`), after which a description it
+    /// registered by rediscovery may be one the old image's tables still
+    /// name in `procfs::locks::LockLedger` under its old identity
+    /// (`ThreadState::may_know_under_another_identity`). Kept by `fork_for`; a
+    /// table `for_exec` keeps for the next image keeps its identities, so it
+    /// starts without it. False when absent from an older serialized table.
+    #[serde(default)]
+    rebuilt_by_exec: bool,
 }
 
 /// Deserializes a descriptor table with its aliases restored, so a table
@@ -240,12 +252,14 @@ pub struct ExecFdState {
     /// reattached after rediscovery (`crate::pipe_wake`).
     #[serde(default)]
     pub(crate) channels: BTreeMap<RawFd, crate::pipe_wake::ChannelEnd>,
-    /// Under `--pipe-wake-latency`, on such a backend, at every exec: the old
-    /// table's open-file creator and next sequence, reserved before any
-    /// rediscovery, so that no description of the new image reuses an id a
-    /// channel elsewhere may still carry.
+    /// On a backend that rediscovers its descriptors after exec, at every
+    /// exec: the old table's open-file creator, next sequence and next socket
+    /// sequence, reserved before any rediscovery, so that no description the
+    /// new image creates reuses an id that a table forked before the exec
+    /// still names, whether in `procfs::locks::LockLedger` or as a channel
+    /// (`crate::pipe_wake`).
     #[serde(default)]
-    pub(crate) open_file_namespace: Option<(DetTid, u64)>,
+    pub(crate) open_file_namespace: Option<(DetTid, u64, u64)>,
     /// The image the exec runs, as Detcore resolved it from the exec's
     /// arguments before the exec ([`crate::exec_record`]), or for the
     /// registered root's first image the one its launch named
@@ -367,7 +381,7 @@ impl ExecFdState {
         self.open_files
             .as_ref()
             .map(|files| files.creator)
-            .or_else(|| self.open_file_namespace.map(|(creator, _)| creator))
+            .or_else(|| self.open_file_namespace.map(|(creator, _, _)| creator))
             .or_else(|| self.maps.as_ref().map(|maps| maps.creator))
     }
 
@@ -794,7 +808,22 @@ impl FileMetadata {
             next_accept_wait: 0,
             cpuinfo_placeholders: None,
             pending_cpuinfo_placeholders: Vec::new(),
+            rebuilt_by_exec: false,
         }
+    }
+
+    /// This table is one a backend rebuilt after an `exec`, rediscovering
+    /// the surviving descriptors under identities of its own (see
+    /// [`Self::rebuilt_by_exec`]). Called at the image's first guest
+    /// callback, so it also covers descriptors rediscovered before it.
+    pub(crate) fn mark_rebuilt_by_exec(&mut self) {
+        self.rebuilt_by_exec = true;
+    }
+
+    /// Whether this table is one a backend rebuilt after an `exec` (see
+    /// [`Self::rebuilt_by_exec`]).
+    pub(crate) fn is_rebuilt_by_exec(&self) -> bool {
+        self.rebuilt_by_exec
     }
 
     /// Take the session's answer to whether it renders `/proc/cpuinfo`
@@ -935,6 +964,7 @@ impl FileMetadata {
             next_accept_wait: 0,
             cpuinfo_placeholders: self.cpuinfo_placeholders,
             pending_cpuinfo_placeholders: self.pending_cpuinfo_placeholders.clone(),
+            rebuilt_by_exec: self.rebuilt_by_exec,
         }
     }
 
@@ -953,6 +983,7 @@ impl FileMetadata {
             next_accept_wait: 0,
             cpuinfo_placeholders: self.cpuinfo_placeholders,
             pending_cpuinfo_placeholders: self.pending_cpuinfo_placeholders.clone(),
+            rebuilt_by_exec: false,
         }
     }
 
@@ -1205,7 +1236,7 @@ impl FileMetadata {
                 .is_some_and(|files| files.creator != maps.creator)
                 || state
                     .open_file_namespace
-                    .is_some_and(|(creator, _)| creator != maps.creator)
+                    .is_some_and(|(creator, _, _)| creator != maps.creator)
             {
                 return Err(Errno::EIO);
             }
@@ -1214,6 +1245,25 @@ impl FileMetadata {
         // Legacy discovery also allocates IDs. Reserve the complete old
         // namespace before it can create any nonrandom descriptions, including
         // same-leader exec where the creator did not change.
+        if shared_guest_table
+            && let (Some(open_files), Some((creator, _, _))) =
+                (&state.open_files, state.open_file_namespace)
+            && open_files.creator != creator
+        {
+            return Err(Errno::EIO);
+        }
+        // The old table's whole numbering: no description this image creates
+        // may take an id that a table forked before the exec still names, in
+        // `procfs::locks::LockLedger` or as a carried channel
+        // (`crate::pipe_wake`).
+        if shared_guest_table
+            && let Some((_, next_sequence, next_socket_sequence)) = state.open_file_namespace
+        {
+            self.next_open_file_sequence = self.next_open_file_sequence.max(next_sequence);
+            self.next_socket_open_file_sequence = self
+                .next_socket_open_file_sequence
+                .max(next_socket_sequence);
+        }
         let owner = if shared_guest_table && let Some(open_files) = &state.open_files {
             self.next_open_file_sequence =
                 self.next_open_file_sequence.max(open_files.next_sequence);
@@ -1221,12 +1271,7 @@ impl FileMetadata {
                 .next_socket_open_file_sequence
                 .max(open_files.next_socket_sequence);
             open_files.creator
-        } else if shared_guest_table
-            && let Some((creator, next_sequence)) = state.open_file_namespace
-        {
-            // `--pipe-wake-latency`: no new description may take an id that a
-            // carried channel names (`crate::pipe_wake`).
-            self.next_open_file_sequence = self.next_open_file_sequence.max(next_sequence);
+        } else if shared_guest_table && let Some((creator, _, _)) = state.open_file_namespace {
             creator
         } else if shared_guest_table && let Some(maps) = &state.maps {
             maps.creator
@@ -1422,7 +1467,13 @@ impl FileMetadata {
         self.add_fd(owner, fd, flags, ty, Some(raw_stat.into()))?;
         // This newly discovered description predates our observation. Its
         // kernel lock may be held, but no cached lock claim existed to go stale.
-        self.with_detfd(fd, |detfd| detfd.mark_flock_mode_unobserved())?;
+        // In a table rebuilt after an exec it may be a survivor that
+        // `procfs::locks::LockLedger` knows under the old image's identity
+        // (`ThreadState::may_know_under_another_identity`).
+        self.with_detfd(fd, |detfd| {
+            detfd.mark_flock_mode_unobserved();
+            detfd.set_rediscovered();
+        })?;
         // A placeholder for a procfs file Detcore renders, which the backend
         // rediscovers after `exec`: the file again, at the position the old
         // image left and with the snapshot it took, as a backend that keeps
@@ -2391,7 +2442,11 @@ mod file_metadata_tests {
         let namespace = before.open_file_namespace_for_exec();
         assert_eq!(
             namespace,
-            (leader, before.metadata().next_open_file_sequence)
+            (
+                leader,
+                before.metadata().next_open_file_sequence,
+                before.metadata().next_socket_open_file_sequence
+            )
         );
 
         let after = ThreadState::new(leader, &config, ());
@@ -2453,10 +2508,10 @@ mod file_metadata_tests {
         assert_ne!(b_end.channel, a_end.channel);
     }
 
-    /// With the option off the exec state carries neither field: nothing is
-    /// reserved, the new image numbers as a fresh one does, and the state's
-    /// trace prints as it did before the fields existed. A channel-only state
-    /// is not empty.
+    /// An exec state that carries neither field (a backend that keeps its
+    /// table across exec) reserves nothing: the new image numbers as a fresh
+    /// one does, and the state's trace prints as it did before the fields
+    /// existed. A channel-only state is not empty.
     #[test]
     fn an_exec_without_the_pipe_wake_latency_is_unchanged() {
         let leader = DetTid::from_raw(9017);
@@ -2659,6 +2714,98 @@ mod file_metadata_tests {
             metadata.file_handles[&after.as_raw_fd()].procfs_rendered_path(),
             Some(std::path::Path::new("/proc/cpuinfo"))
         );
+    }
+
+    /// A backend that rebuilds the descriptor table after exec carries the old
+    /// numbering at every exec (`tool_global::prepare_exec`): a file or socket
+    /// the new image creates takes no identity the old table allocated, which
+    /// a table forked before the exec may still name in
+    /// `procfs::locks::LockLedger`. Without it the same calls take the old
+    /// identities.
+    #[test]
+    fn a_rebuilding_exec_reserves_the_old_file_and_socket_numbering() {
+        let leader = DetTid::from_raw(9033);
+        let config = Config::default();
+        let create = |thread: &ThreadState<()>| {
+            thread
+                .add_fd(100_000, OFlag::empty(), FdType::Regular, None)
+                .unwrap();
+            thread
+                .add_fd(100_001, OFlag::empty(), FdType::Socket, None)
+                .unwrap();
+            let metadata = thread.metadata();
+            [100_000, 100_001].map(|fd| metadata.file_handles[&fd].open_file_id())
+        };
+        let before = ThreadState::new(leader, &config, ());
+        let old = create(&before);
+        let namespace = before.open_file_namespace_for_exec();
+        let after = ThreadState::new(leader, &config, ());
+        after
+            .metadata()
+            .apply_exec_fd_state(
+                leader,
+                ExecFdState {
+                    open_file_namespace: Some(namespace),
+                    ..ExecFdState::default()
+                },
+                true,
+            )
+            .unwrap();
+        let new = create(&after);
+        assert!(new.iter().all(|id| !old.contains(id)), "{old:?} {new:?}");
+        assert!(new[1].is_socket());
+        let fresh = ThreadState::new(leader, &config, ());
+        assert_eq!(create(&fresh), old);
+    }
+
+    /// After an exec on a backend that rebuilds the descriptor table, a
+    /// description the new table registered by rediscovery may be one that
+    /// survived the exec, which `procfs::locks::LockLedger` knows under the
+    /// old image's identity; one it registered from a modelled call is its
+    /// own. Both facts cross a fork, serialized, and a table `for_exec` keeps
+    /// for the next image, whose identities survive, starts without the
+    /// first.
+    #[test]
+    fn a_table_rebuilt_after_exec_names_its_rediscovered_descriptions() {
+        let owner = DetTid::from_raw(9031);
+        let thread = ThreadState::new(owner, &Config::default(), ());
+        let file = tempfile::tempfile().unwrap();
+        let fd = file.as_raw_fd();
+        thread
+            .file_metadata
+            .lock()
+            .unwrap()
+            .discover_fd_from_current_process(owner, fd)
+            .unwrap();
+        thread
+            .add_fd(100_000, OFlag::empty(), FdType::Regular, None)
+            .unwrap();
+        // The run's first image, or any table not rebuilt by an exec.
+        assert!(!thread.may_know_under_another_identity(fd));
+        thread.mark_table_rebuilt_by_exec();
+        assert!(thread.may_know_under_another_identity(fd));
+        assert!(!thread.may_know_under_another_identity(100_000));
+        assert!(!thread.may_know_under_another_identity(100_001));
+        // A duplicate names the same description, and so the same mark.
+        thread
+            .file_metadata
+            .lock()
+            .unwrap()
+            .dup_fd(fd, 100_002, OFlag::empty())
+            .unwrap();
+        assert!(thread.may_know_under_another_identity(100_002));
+        let child = thread
+            .file_metadata
+            .lock()
+            .unwrap()
+            .fork_for(DetTid::from_raw(9032));
+        let child: FileMetadata =
+            serde_json::from_slice(&serde_json::to_vec(&child).unwrap()).unwrap();
+        assert!(child.is_rebuilt_by_exec());
+        assert!(child.file_handles[&fd].is_rediscovered());
+        assert!(!child.file_handles[&100_000].is_rediscovered());
+        let next_image = thread.file_metadata.lock().unwrap().for_exec(owner);
+        assert!(!next_image.is_rebuilt_by_exec());
     }
 
     #[test]
@@ -5406,11 +5553,14 @@ impl<T> ThreadState<T> {
             .collect()
     }
 
-    /// The open-file creator and next sequence of this thread's table.
-    pub(crate) fn open_file_namespace_for_exec(&self) -> (DetTid, u64) {
+    /// The open-file creator, next sequence and next socket sequence of this
+    /// thread's table.
+    pub(crate) fn open_file_namespace_for_exec(&self) -> (DetTid, u64, u64) {
+        let metadata = self.metadata();
         (
             self.open_file_creator.unwrap_or(self.dettid),
-            self.metadata().next_open_file_sequence,
+            metadata.next_open_file_sequence,
+            metadata.next_socket_open_file_sequence,
         )
     }
 
@@ -5581,6 +5731,28 @@ impl<T> ThreadState<T> {
             .filter(|detfd| detfd.open_file_id() == open_file)
             .count();
         u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
+    /// Whether `procfs::locks::LockLedger` may know the description that
+    /// `fd` names under another identity because this thread's table was
+    /// rebuilt after an `exec` ([`FileMetadata::mark_rebuilt_by_exec`]): the
+    /// description was registered by rediscovery in such a table, so it may
+    /// be one that survived the exec, which the old image's tables, and the
+    /// tables forked from them, still name under the old image's identity.
+    /// False for a descriptor this table does not hold.
+    pub(crate) fn may_know_under_another_identity(&self, fd: RawFd) -> bool {
+        let metadata = self.metadata();
+        metadata.is_rebuilt_by_exec()
+            && metadata
+                .file_handles
+                .get(&fd)
+                .is_some_and(DetFd::is_rediscovered)
+    }
+
+    /// Record that this thread's table is one a backend rebuilt after an
+    /// `exec` ([`FileMetadata::mark_rebuilt_by_exec`]).
+    pub(crate) fn mark_table_rebuilt_by_exec(&self) {
+        self.metadata().mark_rebuilt_by_exec();
     }
 
     /// The descriptions in this thread's table whose locks

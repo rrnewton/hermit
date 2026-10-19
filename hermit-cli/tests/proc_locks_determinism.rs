@@ -1250,6 +1250,227 @@ static int receive_descriptor(int socket) {
   return received;
 }
 
+// The parent locks, forks a child that keeps the description open, and execs
+// itself with the descriptor surviving. The child's descriptor names the same
+// description, so an unlock through either releases the kernel's lock. On a
+// backend that rebuilds its descriptor table after exec, the survivor is
+// registered again under a new identity while the child's copy keeps the old.
+// The child unlocks through the old identity when it reads a byte on `go`,
+// answers on `done`, and exits at end of file. The new image runs `variant`
+// (`rebuilt_after_exec`).
+static int stale_rebuilt_exec_scenario(const char* path, const char* self, const char* variant) {
+  int fd = open_path(path, O_RDWR);
+  ofd(fd, F_RDLCK, 0, 1);
+  int go[2];
+  int done[2];
+  if (pipe(go) != 0 || pipe(done) != 0) {
+    die("pipe");
+  }
+  fflush(stdout);
+  pid_t child = fork();
+  if (child < 0) {
+    die("fork");
+  }
+  if (child == 0) {
+    close(go[1]);
+    close(done[0]);
+    for (;;) {
+      char byte = 0;
+      ssize_t count = read(go[0], &byte, 1);
+      if (count < 0 && errno == EINTR) {
+        continue;
+      }
+      if (count != 1) {
+        _exit(count == 0 ? 0 : 1);
+      }
+      ofd(fd, F_UNLCK, 0, 1);
+      byte_out(done[1]);
+    }
+  }
+  close(go[0]);
+  close(done[1]);
+  char descriptors[96];
+  if (snprintf(descriptors, sizeof(descriptors), "%d:%d:%d:%s", fd, go[1], done[0], variant) >=
+      (int)sizeof(descriptors)) {
+    die("descriptors");
+  }
+  execl(self, self, "rebuilt-after-exec", descriptors, (char*)NULL);
+  die("execl");
+  return 1;
+}
+
+// Receive one byte into a control buffer that already holds an SCM_RIGHTS
+// header naming `fd` from an earlier use; the sender attaches no descriptor,
+// so the kernel returns no ancillary data and the header is stale.
+static void receive_into_a_stale_header(int fd) {
+  int pair[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+    die("socketpair");
+  }
+  byte_out(pair[0]);
+  char byte = 0;
+  char control[CMSG_SPACE(sizeof(int))];
+  memset(control, 0, sizeof(control));
+  struct iovec vector = {.iov_base = &byte, .iov_len = 1};
+  struct msghdr message = {
+      .msg_iov = &vector,
+      .msg_iovlen = 1,
+      .msg_control = control,
+      .msg_controllen = sizeof(control),
+  };
+  struct cmsghdr* header = CMSG_FIRSTHDR(&message);
+  header->cmsg_level = SOL_SOCKET;
+  header->cmsg_type = SCM_RIGHTS;
+  header->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(header), &fd, sizeof(fd));
+  if (recvmsg(pair[1], &message, 0) != 1 || message.msg_controllen != 0) {
+    die("recvmsg");
+  }
+  close(pair[0]);
+  close(pair[1]);
+}
+
+// The new image of `stale_rebuilt_exec_scenario`, whose descriptors arrive as
+// "fd:go:done:variant":
+// - `unlock`: unlock through the survivor;
+// - `lock-free-first`: fstat and pread the survivor first, then unlock;
+// - `child`: a child forked after the exec unlocks through its copy;
+// - `stale-header`: a receive into a stale SCM_RIGHTS header naming the
+//   survivor, then the pre-exec child unlocks through the old identity;
+// - `self-send`: the survivor sent to this process over SCM_RIGHTS and kept
+//   open as a second descriptor, then the pre-exec child unlocks through the
+//   old identity.
+// Each ends with no guest lock in the kernel.
+static int rebuilt_after_exec(const char* descriptors) {
+  int fd = -1;
+  int go = -1;
+  int done = -1;
+  char variant[32] = {0};
+  if (sscanf(descriptors, "%d:%d:%d:%31s", &fd, &go, &done, variant) != 4) {
+    die("descriptors");
+  }
+  if (strcmp(variant, "lock-free-first") == 0) {
+    struct stat status;
+    char byte = 0;
+    if (fstat(fd, &status) != 0 || pread(fd, &byte, 1, 0) != 1) {
+      die("lock-free use");
+    }
+  }
+  snapshot("exec-held");
+  if (strcmp(variant, "unlock") == 0 || strcmp(variant, "lock-free-first") == 0) {
+    ofd(fd, F_UNLCK, 0, 1);
+    snapshot("survivor-unlocked");
+  } else if (strcmp(variant, "child") == 0) {
+    fflush(stdout);
+    pid_t child = fork();
+    if (child < 0) {
+      die("fork");
+    }
+    if (child == 0) {
+      ofd(fd, F_UNLCK, 0, 1);
+      _exit(0);
+    }
+    wait_for(child);
+    snapshot("child-unlocked");
+  } else if (strcmp(variant, "stale-header") == 0 || strcmp(variant, "self-send") == 0) {
+    int pair[2] = {-1, -1};
+    int received = -1;
+    if (strcmp(variant, "stale-header") == 0) {
+      receive_into_a_stale_header(fd);
+    } else {
+      if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) {
+        die("socketpair");
+      }
+      send_descriptor(pair[0], fd);
+      received = receive_descriptor(pair[1]);
+    }
+    byte_out(go);
+    byte_in(done);
+    snapshot("old-identity-unlocked");
+    if (received >= 0) {
+      close(received);
+      close(pair[0]);
+      close(pair[1]);
+    }
+  } else {
+    die("variant");
+  }
+  close(go);
+  int status = 0;
+  if (wait(&status) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    die("pre-exec child");
+  }
+  return 0;
+}
+
+// An exec that rebuilds the descriptor table must not hand out again an
+// identity the old image used while a table forked before the exec still
+// names it. The old image opens and closes `other` PADDING times, opens it
+// once more (close-on-exec), reads its locks with an unlock, forks a child
+// that keeps it, and execs itself. The new image's first OPENS opens, of
+// `path`, cover that identity whether its own startup numbered a few more or
+// a few fewer descriptions than the old image's, if the old numbering were
+// not reserved. It locks each, then closes them all: the kernel holds no
+// guest lock.
+enum { PADDING = 16, OPENS = 32 };
+static int stale_rebuilt_reuse_scenario(const char* path, const char* self) {
+  char other[4096];
+  if (snprintf(other, sizeof(other), "%s-other", path) >= (int)sizeof(other)) {
+    die("path");
+  }
+  for (int i = 0; i < PADDING; i++) {
+    close(open_path(other, O_RDWR | O_CLOEXEC));
+  }
+  int fd = open_path(other, O_RDWR | O_CLOEXEC);
+  ofd(fd, F_UNLCK, 0, 1);
+  int go[2];
+  if (pipe(go) != 0) {
+    die("pipe");
+  }
+  fflush(stdout);
+  pid_t child = fork();
+  if (child < 0) {
+    die("fork");
+  }
+  if (child == 0) {
+    close(go[1]);
+    char byte = 0;
+    ssize_t count;
+    do {
+      count = read(go[0], &byte, 1);
+    } while (count < 0 && errno == EINTR);
+    _exit(count == 0 ? 0 : 1);
+  }
+  close(go[0]);
+  char descriptors[32];
+  if (snprintf(descriptors, sizeof(descriptors), "%d", go[1]) >= (int)sizeof(descriptors)) {
+    die("descriptors");
+  }
+  execl(self, self, "rebuilt-reuse-after-exec", path, descriptors, (char*)NULL);
+  die("execl");
+  return 1;
+}
+
+static int rebuilt_reuse_after_exec(const char* path, const char* descriptors) {
+  int go = atoi(descriptors);
+  int files[OPENS];
+  for (int i = 0; i < OPENS; i++) {
+    files[i] = open_path(path, O_RDWR);
+    ofd(files[i], F_RDLCK, 0, 1);
+  }
+  snapshot("fresh-held");
+  for (int i = 0; i < OPENS; i++) {
+    close(files[i]);
+  }
+  snapshot("fresh-closed");
+  close(go);
+  int status = 0;
+  if (wait(&status) < 0 || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    die("pre-exec child");
+  }
+  return 0;
+}
+
 // The parent locks and sends its descriptor to the child, which unlocks
 // through the one it received while the parent keeps its own open: the
 // shared description, and so the kernel, holds no lock.
@@ -1599,6 +1820,9 @@ static int descriptors_scenario(const char* directory, int read_after) {
 }
 
 int main(int argc, char** argv) {
+  if (argc == 4 && strcmp(argv[1], "rebuilt-reuse-after-exec") == 0) {
+    return rebuilt_reuse_after_exec(argv[2], argv[3]);
+  }
   if (argc != 3) {
     return 2;
   }
@@ -1675,6 +1899,27 @@ int main(int argc, char** argv) {
   }
   if (strcmp(mode, "failed-exec") == 0) {
     return failed_exec_scenario(where);
+  }
+  if (strcmp(mode, "stale-rebuilt-exec") == 0) {
+    return stale_rebuilt_exec_scenario(where, argv[0], "unlock");
+  }
+  if (strcmp(mode, "stale-rebuilt-lock-free-first") == 0) {
+    return stale_rebuilt_exec_scenario(where, argv[0], "lock-free-first");
+  }
+  if (strcmp(mode, "stale-rebuilt-child") == 0) {
+    return stale_rebuilt_exec_scenario(where, argv[0], "child");
+  }
+  if (strcmp(mode, "stale-rebuilt-stale-header") == 0) {
+    return stale_rebuilt_exec_scenario(where, argv[0], "stale-header");
+  }
+  if (strcmp(mode, "stale-rebuilt-self-send") == 0) {
+    return stale_rebuilt_exec_scenario(where, argv[0], "self-send");
+  }
+  if (strcmp(mode, "rebuilt-after-exec") == 0) {
+    return rebuilt_after_exec(where);
+  }
+  if (strcmp(mode, "stale-rebuilt-reuse") == 0) {
+    return stale_rebuilt_reuse_scenario(where, argv[0]);
   }
   if (strcmp(mode, "ofd-after-fork") == 0) {
     return lock_after_fork_scenario(where, 0);
@@ -2135,6 +2380,14 @@ fn lock_scenarios_replay_from_their_recordings() {
 /// - a parent that closes after forking, once the child exits too;
 /// - a description sent over `SCM_RIGHTS`, once sender and receiver closed it;
 /// - a close-on-exec descriptor, after a successful exec;
+/// - after a successful exec, while a child forked before it keeps the
+///   description of a descriptor that survived it (which DBT registers again
+///   under a new identity in the table it rebuilds): an unlock through the
+///   survivor, also after a lock-free first use; an unlock by a child forked
+///   after the exec; an unlock through the old identity after a receive into
+///   a stale SCM_RIGHTS header, or after the survivor was received again;
+/// - fresh descriptions the new image locks and closes, which must not take
+///   identities the old image used;
 /// - an unlock through a descriptor received over `SCM_RIGHTS` while the
 ///   sender keeps its own;
 /// - `dup2` over the only slot, from a received source;
@@ -2200,6 +2453,67 @@ fn stale_ledger_entries_admit_no_host_row(backend: &str) {
             "failed-exec",
             shared.as_os_str(),
             expected(vec![("exec-failed", vec!["OFDLCK"])]),
+        ),
+        // Exec survivors, while a child forked before the exec keeps the
+        // description. On DBT the survivor is registered again under a new
+        // identity, so once a call through it reads its locks, no lock on that
+        // file is shown again (`LockLedger::alias_inode`); on ptrace its
+        // identity survives the exec. Each ends with no guest lock in the
+        // kernel: an unlock through the survivor; the same after a lock-free
+        // first use (fstat, pread); an unlock by a child forked after the
+        // exec; and an unlock through the old identity after a receive into a
+        // stale SCM_RIGHTS header naming the survivor, or after the survivor
+        // was received again over SCM_RIGHTS and kept.
+        (
+            "stale-rebuilt-exec",
+            shared.as_os_str(),
+            expected(vec![
+                ("exec-held", vec!["OFDLCK"]),
+                ("survivor-unlocked", vec![]),
+            ]),
+        ),
+        (
+            "stale-rebuilt-lock-free-first",
+            shared.as_os_str(),
+            expected(vec![
+                ("exec-held", vec!["OFDLCK"]),
+                ("survivor-unlocked", vec![]),
+            ]),
+        ),
+        (
+            "stale-rebuilt-child",
+            shared.as_os_str(),
+            expected(vec![
+                ("exec-held", vec!["OFDLCK"]),
+                ("child-unlocked", vec![]),
+            ]),
+        ),
+        (
+            "stale-rebuilt-stale-header",
+            shared.as_os_str(),
+            expected(vec![
+                ("exec-held", vec!["OFDLCK"]),
+                ("old-identity-unlocked", vec![]),
+            ]),
+        ),
+        (
+            "stale-rebuilt-self-send",
+            shared.as_os_str(),
+            expected(vec![
+                ("exec-held", vec!["OFDLCK"]),
+                ("old-identity-unlocked", vec![]),
+            ]),
+        ),
+        // An exec that rebuilds the table hands out no identity the old image
+        // used while a table forked before the exec still names it: the new
+        // image locks and closes 32 fresh descriptions of the file.
+        (
+            "stale-rebuilt-reuse",
+            shared.as_os_str(),
+            expected(vec![
+                ("fresh-held", vec!["OFDLCK"]),
+                ("fresh-closed", vec![]),
+            ]),
         ),
         (
             "ofd-after-fork",

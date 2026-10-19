@@ -3356,6 +3356,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // control buffer to overlap this header, so rereading it afterward can
         // turn a successful consuming receive into an artificial EFAULT.
         let message: libc::msghdr = guest.memory().read_value(message_address)?;
+        // The header's address, to read back the kernel's `msg_controllen`
+        // after the receive (`AddrMut` is not `Send`, so it is not held
+        // across the receive).
+        let header_address = message_address.as_raw();
         if message.msg_control.is_null() || message.msg_controllen == 0 {
             return self
                 .handle_socket_receive(guest, call, call.sockfd(), true)
@@ -3372,22 +3376,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         let now = self.observe_socket_receive(guest, call.sockfd()).await?;
         let mut control = vec![0; control_len];
         guest.memory().read_exact(control_address, &mut control)?;
+        // Only the ancillary bytes the kernel returned are messages: the
+        // length it writes back to `msg_controllen`, last
+        // (`____sys_recvmsg`). The rest of the buffer is whatever the guest
+        // left there, which may look like an old `SCM_RIGHTS` or timestamp
+        // message. A header that can no longer be read names none.
+        let returned = {
+            let header: Result<libc::msghdr, Errno> = AddrMut::from_raw(header_address)
+                .ok_or(Errno::EFAULT)
+                .and_then(|address: AddrMut<'_, libc::msghdr>| guest.memory().read_value(address));
+            header.map_or(0, |header| header.msg_controllen.min(control_len))
+        };
+        let control = &mut control[..returned];
         // A descriptor received over `SCM_RIGHTS` that Detcore models (an
         // in-guest backend discovers it as it is used) joins this process's
         // table in `procfs::locks::LockLedger` with whatever OFD or flock
         // locks its description holds. One Detcore keeps no model of (ptrace)
         // is left out, so its locks are hidden once no modelled table names
         // the description (a named residual).
-        for fd in received_descriptors(&control) {
+        for fd in received_descriptors(control) {
             self.refresh_description_locks(guest, fd, super::files::LockCall::Recvmsg)
                 .await?;
         }
-        if socket_timestamp_messages(&control).is_empty() {
+        if socket_timestamp_messages(control).is_empty() {
             return Ok(result);
         }
 
-        canonicalize_socket_timestamps(&mut control, now);
-        guest.memory().write_exact(control_address, &control)?;
+        canonicalize_socket_timestamps(control, now);
+        guest.memory().write_exact(control_address, control)?;
         Ok(result)
     }
 

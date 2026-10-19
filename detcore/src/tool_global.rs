@@ -6695,18 +6695,24 @@ pub async fn prepare_exec<G, T>(
             None
         },
         channels: Default::default(),
-        open_file_namespace: None,
+        // A backend that rediscovers its descriptors after exec builds the
+        // new image's table afresh: reserve the old numbering at every exec,
+        // so that no description the new image creates takes an id a table
+        // forked before the exec still names (`procfs::locks::LockLedger`,
+        // `crate::pipe_wake`).
+        open_file_namespace: guest
+            .config()
+            .backend
+            .rediscovers_descriptors_after_exec
+            .then(|| guest.thread_state().open_file_namespace_for_exec()),
         exe,
     };
-    // `--pipe-wake-latency` on a backend that rediscovers its descriptors
-    // after exec: carry the channels, and reserve the old numbering at every
-    // exec (`crate::pipe_wake`).
+    // `--pipe-wake-latency` on such a backend: carry the channels too.
     let fd_state = if guest.config().pipe_wake_latency_in_effect().is_some()
         && guest.config().backend.rediscovers_descriptors_after_exec
     {
         ExecFdState {
             channels: guest.thread_state().pipe_channels_for_exec(),
-            open_file_namespace: Some(guest.thread_state().open_file_namespace_for_exec()),
             ..fd_state
         }
     } else {
@@ -6770,6 +6776,20 @@ pub async fn mark_past_first_execve<G, T>(
     };
     if controlled {
         guest.thread_state_mut().signal_task_identity = signal_identity;
+    }
+    // A backend that rediscovers descriptors after exec built this image's
+    // table afresh: a descriptor that survived the exec is registered again,
+    // under an identity of the new table's, while the old image's tables (a
+    // child forked before the exec) still name its description under the old
+    // one in `procfs::locks::LockLedger` (`ThreadState::may_know_under_another_identity`).
+    // Not for the run's first image, whose descriptors come from outside the
+    // run. Rediscovery happens only where the tool shares the guest's table,
+    // and there the coordinator's first-image answer is
+    // `initialize_inherited_stdio`.
+    if guest.config().backend.rediscovers_descriptors_after_exec
+        && !overrides.initialize_inherited_stdio
+    {
+        guest.thread_state().mark_table_rebuilt_by_exec();
     }
     // The new image's `/proc/<pid>/exe` link answers from its record, or
     // without one is the kernel's.
