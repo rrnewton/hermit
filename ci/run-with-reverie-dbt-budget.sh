@@ -2237,7 +2237,15 @@ fi
 # reverie-dbt/ and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml,
 # so the inventory (989), SDK and native inputs, calibrated budget, job width
 # and limits are unchanged from the e7bf2d9b carry.
-expected_pin=9547c3594d3881dead7d0e7a04ea5f32df7a7745
+# CARRY TO 96ba76f9dbeceb8b529f49bb8cab234f7ce8d6fd (2026-10-19): from
+# 9547c3594d3881dead7d0e7a04ea5f32df7a7745. One commit (signals lane, A5 step 3.0b:
+# the SIGSEGV state a trapped rdtsc or cpuid resets is put back). It changes
+# reverie-ptrace/src/task.rs, lib.rs, the new segv_state.rs, and its plain-guest
+# fixture and tests only; git diff is empty under reverie-dbt/ and for the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml, so the inventory (989), SDK and
+# native inputs, calibrated budget, job width and limits are unchanged from the
+# 9547c359 carry.
+expected_pin=96ba76f9dbeceb8b529f49bb8cab234f7ce8d6fd
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
