@@ -339,6 +339,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrcs = Resources::new(dettid);
             rsrcs.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
             rsrcs.fyi(call.name());
+            // The mask the thread is stopped under here: the call's temporary
+            // mask when a signal ended the call, as the scheduler may decide
+            // from it before this turn (`BlockedPool::continuation_masks`);
+            // otherwise the kernel has restored the thread's own. Decided from
+            // the result, which replay serves as recorded.
+            if temporary_mask_survives(call, &res) {
+                rsrcs.blocked_signal_mask = blocked_signal_mask;
+                rsrcs.blocked_signal_mask_unknown = blocked_signal_mask_unknown;
+            }
             resource_request(guest, rsrcs).await;
         }
         res
@@ -7242,5 +7251,54 @@ mod turn_signal_tests {
             turn_signals_before_discard(&caught_rt, 0, 0, rt, ByDisposition, 0).named,
             rt
         );
+    }
+}
+
+/// Whether `call`, having returned `result`, leaves the thread stopped under
+/// the temporary signal mask the call installed. Linux restores the saved mask
+/// before the call returns unless a signal ended the call, in which case the
+/// signal is delivered under the temporary mask and `rt_sigreturn` restores
+/// the saved one: `poll_select_finish` keeps it for `-ERESTARTNOHAND`
+/// (pselect6, ppoll), `epoll_pwait` for `-EINTR`, and `rt_sigsuspend` always
+/// (`restore_saved_sigmask_unless`, fs/select.c, fs/eventpoll.c and
+/// kernel/signal.c at v6.9).
+pub(crate) fn temporary_mask_survives(call: Syscall, result: &Result<i64, Error>) -> bool {
+    let ended_by = |errno: Errno| matches!(result, Err(Error::Errno(error)) if *error == errno);
+    match call {
+        Syscall::RtSigsuspend(_) => true,
+        Syscall::Pselect6(_) | Syscall::Ppoll(_) => ended_by(Errno::ERESTARTNOHAND),
+        Syscall::EpollPwait(_) => ended_by(Errno::EINTR),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod temporary_mask_tests {
+    use super::*;
+
+    /// The temporary mask survives the call only where Linux keeps it: an
+    /// interrupted pselect6 or ppoll (`-ERESTARTNOHAND`), an interrupted
+    /// epoll_pwait (`-EINTR`), and every rt_sigsuspend; never a normal return,
+    /// another errno, or a call without a temporary mask.
+    #[test]
+    fn the_temporary_mask_survives_only_a_call_a_signal_ended() {
+        let restart = Err(Error::Errno(Errno::ERESTARTNOHAND));
+        let eintr = Err(Error::Errno(Errno::EINTR));
+        let pselect = Syscall::Pselect6(syscalls::Pselect6::new());
+        let ppoll = Syscall::Ppoll(syscalls::Ppoll::new());
+        let epoll = Syscall::EpollPwait(syscalls::EpollPwait::new());
+        let sigsuspend = Syscall::RtSigsuspend(syscalls::RtSigsuspend::new());
+        let read = Syscall::Read(syscalls::Read::new());
+        for call in [pselect, ppoll] {
+            assert!(temporary_mask_survives(call, &restart), "{call:?}");
+            assert!(!temporary_mask_survives(call, &eintr), "{call:?}");
+            assert!(!temporary_mask_survives(call, &Ok(1)), "{call:?}");
+        }
+        assert!(temporary_mask_survives(epoll, &eintr));
+        assert!(!temporary_mask_survives(epoll, &restart));
+        assert!(!temporary_mask_survives(epoll, &Ok(0)));
+        assert!(temporary_mask_survives(sigsuspend, &restart));
+        assert!(temporary_mask_survives(sigsuspend, &eintr));
+        assert!(!temporary_mask_survives(read, &restart));
     }
 }
