@@ -60075,7 +60075,6 @@ fn a_small_max_timeslice_gets_one_notice() {
             log.matches("NOTICE: --max-timeslice=").count(),
             usize::from(small && timer),
             "{args:?}: {log}"
-        );
     }
 }
 
@@ -60087,13 +60086,10 @@ fn a_small_max_timeslice_gets_one_notice() {
 /// the size of its root thread's event stream, then again under an
 /// `RLIMIT_FSIZE` one byte short of it, with SIGXFSZ ignored, so only the
 /// stream's last write crosses the limit, as one to a full disk would fail.
-#[test]
 fn a_recording_whose_stream_cannot_be_written_in_full_is_refused() {
     use std::os::unix::process::CommandExt as _;
-
     use hermit_record_format::event_stream::EventStreamId;
     use hermit_record_format::event_stream::EventWriter;
-
     let _lock = hermit_run_guard();
     let record = |limit: Option<u64>| {
         let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
@@ -60137,7 +60133,6 @@ fn a_recording_whose_stream_cannot_be_written_in_full_is_refused() {
             .expect("record start committed no recording");
         (data_dir, data_dir_arg, id, output)
     };
-
     // The root stream's file name, from a fresh writer.
     let scratch = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     drop(EventWriter::create(scratch.path(), &EventStreamId::root()).unwrap());
@@ -60146,11 +60141,9 @@ fn a_recording_whose_stream_cannot_be_written_in_full_is_refused() {
         .map(|entry| entry.unwrap().file_name())
         .find(|name| std::path::Path::new(name).extension().is_none())
         .unwrap();
-
     let (whole, _, whole_id, _) = record(None);
     let whole = whole.path().join(&whole_id);
     let size = std::fs::metadata(whole.join("thread").join(&root_stream))
-        .unwrap()
         .len();
     // Every other file the recording writes must stay under the limit.
     let mut directories = vec![whole.clone()];
@@ -60165,10 +60158,6 @@ fn a_recording_whose_stream_cannot_be_written_in_full_is_refused() {
                     metadata.len() < size - 1,
                     "{path:?} is as large as the root stream"
                 );
-            }
-        }
-    }
-
     let (_cut, cut_arg, cut_id, recorded) = record(Some(size - 1));
     let reason = format!(
         "the recording of thread stream {} could not be written in full",
@@ -60180,22 +60169,15 @@ fn a_recording_whose_stream_cannot_be_written_in_full_is_refused() {
             "WARNING: replay will refuse this recording: {reason}"
         )) && !record_stderr.contains("RECORDING COMPLETE"),
         "record did not report the stream:\n{record_stderr}"
-    );
     let args = ["replay", "--autopilot", &cut_arg, &cut_id];
     let replay = hermit(&args);
-    assert!(
         !replay.status.success(),
         "{args:?} replayed a cut recording"
-    );
     let stderr = String::from_utf8_lossy(&replay.stderr);
-    assert!(
         stderr.contains(&format!(
             "This recording cannot be replayed faithfully: {reason}"
         )) && stderr.contains("File too large"),
         "{args:?}:\n{stderr}"
-    );
-}
-
 /// A descriptor one process sends another in a binder transaction is usable
 /// in the receiver under Hermit. Linux installs it when the receiver reads
 /// the transaction (`binder_apply_fd_fixups`), with no call naming it as new,
@@ -60204,7 +60186,6 @@ fn a_recording_whose_stream_cannot_be_written_in_full_is_refused() {
 /// device to a private binderfs instance, which the test mounts in a user and
 /// mount namespace of its own. Where the kernel has no binder filesystem, or will
 /// not mount one there, the test says so and skips.
-#[test]
 fn a_descriptor_received_in_a_binder_transaction_is_usable() {
     let filesystems = fs::read_to_string("/proc/filesystems").unwrap_or_default();
     if !filesystems
@@ -60213,7 +60194,6 @@ fn a_descriptor_received_in_a_binder_transaction_is_usable() {
     {
         eprintln!("skipping: this kernel has no binder filesystem (CONFIG_ANDROID_BINDERFS)");
         return;
-    }
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let mountpoint = directory.path().join("binderfs");
     fs::create_dir(&mountpoint).unwrap();
@@ -60227,7 +60207,6 @@ fn a_descriptor_received_in_a_binder_transaction_is_usable() {
         "mount -t binder binder {mountpoint} || {{ echo NO-BINDERFS; exit 0; }}; \
          exec timeout --kill-after 5s 120s {hermit} run --base-env=minimal -- \
          {guest} {mountpoint}"
-    );
     let mut command = Command::new("unshare");
     command.args(["--user", "--map-root-user", "--mount", "sh", "-c", &script]);
     let label = format!("{command:?}");
@@ -60236,17 +60215,10 @@ fn a_descriptor_received_in_a_binder_transaction_is_usable() {
         eprintln!(
             "skipping: binderfs cannot be mounted in a user namespace here: {}",
             String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
     assert_success(&output, &["binder_fd_passing"]);
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
         stdout.starts_with("received fd ") && stdout.trim_end().ends_with(": hello"),
         "{stdout}"
-    );
-}
-
 /// `preadv2` and `pwritev2` at offset -1, the current position, with no
 /// flags, on a pipe, socket, eventfd, timerfd or FIFO the guest left blocking, wait as
 /// `readv` and `writev` do, as Linux runs them as those (`preadv2` calls
@@ -60261,12 +60233,10 @@ fn a_descriptor_received_in_a_binder_transaction_is_usable() {
 /// --verify --verify-strict --verify-json`, `bitwise_parity` with nonzero
 /// compared log counts), and both print the native line; one read and one
 /// write mode also record and replay.
-#[test]
 fn preadv2_and_pwritev2_at_the_current_offset_wait_as_readv_and_writev_do() {
     let _guard = hermit_run_guard();
     let guest = poll_recheck_c_guest(&RWF_CURRENT_OFFSET_GUEST, "guest_rwf_current_offset")
         .to_str()
-        .unwrap()
         .to_owned();
     for (mode, result) in [
         ("preadv2-pipe", "16 0"),
@@ -60279,7 +60249,6 @@ fn preadv2_and_pwritev2_at_the_current_offset_wait_as_readv_and_writev_do() {
         ("pwritev2-pipe-full", "16 0"),
         ("pwritev2-pipe-large", "70000 0"),
         ("pwritev2-socket-full", "16 0"),
-    ] {
         let expected = format!("{mode} {result}\n");
         let native = Command::new(&guest)
             .arg(mode)
@@ -60290,20 +60259,15 @@ fn preadv2_and_pwritev2_at_the_current_offset_wait_as_readv_and_writev_do() {
         assert_eq!(stdout(&native), expected, "{mode}: native");
         let directory = tempfile::tempdir().expect("failed to create report directory");
         let report = directory.path().join("verify.json");
-        let args = [
             "run",
             "--strict",
             "--verify",
             "--verify-strict",
             "--verify-json",
             report.to_str().expect("report path is UTF-8"),
-            "--",
             guest.as_str(),
             mode,
-        ];
         let output = hermit(&args);
-        let log = stderr(&output);
-        assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{mode}: stderr:\n{log}");
         let verdict: serde_json::Value =
             serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
@@ -60314,7 +60278,6 @@ fn preadv2_and_pwritev2_at_the_current_offset_wait_as_readv_and_writev_do() {
             compared["left"].as_u64().is_some_and(|left| left > 0)
                 && compared["left"] == compared["right"],
             "{mode}: {verdict}"
-        );
         if matches!(mode, "preadv2-pipe" | "pwritev2-pipe-large") {
             let record_args = ["record", "--verify", "--", guest.as_str(), mode];
             let recorded = hermit(&record_args);
@@ -60324,17 +60287,11 @@ fn preadv2_and_pwritev2_at_the_current_offset_wait_as_readv_and_writev_do() {
                 stderr(&recorded).contains("Success: replay matched recording."),
                 "{mode}: replay must match the recording: {recorded:?}"
             );
-        }
-    }
-}
-
 /// Known omissions are refused before a guest or verification artifact exists.
 /// The small monotonic history is an actual recording; no PMU overshoot is
 /// required to distinguish admission from the original warning-only behavior.
-#[test]
 fn run_refuses_incomplete_replay_before_guest_execution() {
     let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let ordinary = directory.path().join("ordinary.preempts");
     let marked = directory.path().join("marked.preempts");
     let rerecorded = directory.path().join("exploration.preempts");
@@ -60345,7 +60302,6 @@ fn run_refuses_incomplete_replay_before_guest_execution() {
             "--epoch=2026-01-01T00:00:00Z".into(),
             "--max-timeslice=disabled".into(),
             "--timeout=10".into(),
-        ];
         args.extend_from_slice(extra);
         args.extend([
             "--".into(),
@@ -60357,12 +60313,10 @@ fn run_refuses_incomplete_replay_before_guest_execution() {
             "incomplete replay admission",
             hermit_command(&argv).stdin(Stdio::null()),
         )
-    };
     let recorded = run(&[format!("--record-preemptions-to={}", ordinary.display())]);
     assert_eq!(recorded.status.code(), Some(0), "{}", stderr(&recorded));
     assert_eq!(stdout(&recorded), "HERMIT_4843_GUEST_RAN\n");
     let record = detcore::preemptions::PreemptionReader::try_new(&ordinary)
-        .unwrap()
         .into_inner();
     record.validate().unwrap();
     assert!(record.contains_schedevents());
@@ -60371,20 +60325,15 @@ fn run_refuses_incomplete_replay_before_guest_execution() {
         .clone()
         .retain_replay_departure(Some(0))
         .write_to_disk(&marked)
-        .unwrap();
     let marked_record = detcore::preemptions::PreemptionReader::try_new(&marked)
-        .unwrap()
-        .into_inner();
     assert_eq!(marked_record.schedevents(), record.schedevents());
     assert_eq!(marked_record.extract_all(), record.extract_all());
     assert_eq!(marked_record.replay_departed_at(), Some(0));
-
     let history = format!("--replay-preemptions-from={}", ordinary.display());
     for flags in [vec![history.clone()], vec![history, "--verify".into()]] {
         let replayed = run(&flags);
         assert_eq!(replayed.status.code(), Some(0), "{}", stderr(&replayed));
         assert_eq!(stdout(&replayed), "HERMIT_4843_GUEST_RAN\n");
-    }
     let edited = run(&[
         format!("--replay-preemptions-from={}", marked.display()),
         "--replay-edited-preemptions".into(),
@@ -60396,19 +60345,14 @@ fn run_refuses_incomplete_replay_before_guest_execution() {
     assert_eq!(
         detcore::preemptions::read_recorded_replay_departure(&rerecorded).unwrap(),
         Some(0)
-    );
-
     for flag in ["--replay-preemptions-from", "--replay-schedule-from"] {
         let refused = run(&[format!("{flag}={}", marked.display())]);
         // EXIT-CLASS: hermit (the incomplete-record refusal's own exit status)
         assert_eq!(refused.status.code(), Some(122), "{}", stderr(&refused));
-        assert!(
             refused.stdout.is_empty(),
             "guest ran despite incomplete-record refusal"
-        );
         assert!(stderr(&refused).contains("HERMIT_INCOMPLETE_REPLAY_RECORD"));
         assert!(stderr(&refused).contains("replay_departed_at=0"));
-    }
     for (index, path) in [&ordinary, &marked].into_iter().enumerate() {
         let capture = directory.path().join(format!("verification-{index}"));
         for verification in [
@@ -60424,23 +60368,15 @@ fn run_refuses_incomplete_replay_before_guest_execution() {
             let refused = run(&flags);
             // EXIT-CLASS: hermit (the exploration-only refusal's own exit status)
             assert_eq!(refused.status.code(), Some(122), "{}", stderr(&refused));
-            assert!(
                 refused.stdout.is_empty(),
                 "guest ran despite exploration-only refusal"
-            );
             assert!(stderr(&refused).contains("exploration-only"));
             assert!(stderr(&refused).contains("verification"));
-            assert!(
                 !capture.exists(),
                 "refused exploration created a verification artifact"
-            );
-        }
-    }
-}
 /// Legacy Chosen fixtures are explicit admission negatives. They must fail
 /// before ID probes, input consumption or a target instruction, by their
 /// provenance policy rather than a schedule mismatch/desync.
-#[test]
 fn chosen_json_requires_provenance_before_the_cli_starts_the_guest() {
     let directory = tempfile::tempdir().unwrap();
     let schedule = directory.path().join("legacy-chosen.json");
@@ -60453,7 +60389,6 @@ fn chosen_json_requires_provenance_before_the_cli_starts_the_guest() {
         });
         if let Some(metadata) = metadata {
             value["reserved_input"] = metadata;
-        }
         // Reach the provenance gate with a valid format-3 fixture: an empty
         // time-skip history has its canonical omitted representation.
         assert!(value.get("time_skips").is_none());
@@ -60475,61 +60410,33 @@ fn chosen_json_requires_provenance_before_the_cli_starts_the_guest() {
                 "printf started > \"$1\"",
                 "admission-marker",
                 marker.to_str().unwrap(),
-            ];
             let output = hermit(&args);
             assert_eq!(
                 output.status.code(),
                 Some(HERMIT_POLICY_REFUSAL_EXIT),
                 "{args:?}: {output:?}"
-            );
             let diagnostic = stderr(&output);
-            assert!(
                 diagnostic.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE:"),
                 "{diagnostic}"
-            );
             assert!(diagnostic.contains("guest has not started"), "{diagnostic}");
-            assert!(
                 !diagnostic.to_ascii_lowercase().contains("desync"),
-                "{diagnostic}"
-            );
             assert!(!marker.exists(), "refused guest wrote its start marker");
-        }
-    }
-}
-
 /// Direct exec bypasses Detcore replay and its Chosen provenance admission.
 /// Replay options still undergo the inherited settings-metadata validation:
 /// readable records with unqualified provenance are ignored by execution, while
 /// absent files and malformed JSON remain ordinary pre-start CLI errors.
-#[test]
 fn namespace_only_keeps_ignoring_schedule_inputs() {
-    let directory = tempfile::tempdir().unwrap();
     let schedule = directory.path().join("unqualified-chosen.json");
-    let marker = directory.path().join("guest-started");
     // Namespace-only supplies a private /tmp. Bind this fixture explicitly so
     // successful execution proves the same marker path used by the negatives.
     let mount = format!(
         "--mount=type=bind,source={},target={}",
         directory.path().display(),
         directory.path().display()
-    );
     let chosen = detcore_model::pid::GuestIds::Chosen {
         base: 5000,
         refuse_host_ids: true,
-    };
-    for metadata in [None, Some(serde_json::json!({"contract": "future-input"}))] {
-        let mut value = serde_json::json!({
             "per_thread": {}, "global": [], "guest_ids": chosen,
-            "format_version": 3
-        });
-        if let Some(metadata) = metadata {
-            value["reserved_input"] = metadata;
-        }
-        let fixture: detcore::preemptions::PreemptionRecord =
-            serde_json::from_value(value.clone()).unwrap();
-        assert_eq!(fixture.format_version(), Some(3));
-        fixture.validate_format().unwrap();
-        assert!(value.get("time_skips").is_none());
         // These same bytes require a provenance refusal for Chosen replay;
         // the positive below must exercise the direct-exec bypass instead.
         let refusal = fixture
@@ -60539,38 +60446,22 @@ fn namespace_only_keeps_ignoring_schedule_inputs() {
         assert!(refusal.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE:"));
         let bytes = serde_json::to_vec(&value).unwrap();
         fs::write(&schedule, &bytes).unwrap();
-        for option in ["--replay-schedule-from", "--replay-preemptions-from"] {
-            let args = [
-                "run",
                 "--namespace-only",
                 &mount,
-                option,
-                schedule.to_str().unwrap(),
-                "--",
-                "/bin/sh",
-                "-c",
                 "printf 'namespace-only-started\n'; printf started > \"$1\"",
                 "namespace-marker",
-                marker.to_str().unwrap(),
-            ];
-            let output = hermit(&args);
             assert_success(&output, &args);
             assert_eq!(stdout(&output), "namespace-only-started\n");
             assert!(!stderr(&output).contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE"));
             assert_eq!(fs::read(&schedule).unwrap(), bytes);
             assert_eq!(fs::read(&marker).unwrap(), b"started");
             fs::remove_file(&marker).unwrap();
-        }
-    }
-
     let absent = directory.path().join("absent-schedule.json");
     let malformed = directory.path().join("malformed-schedule.json");
     fs::write(&malformed, b"{").unwrap();
     for (path, diagnostic_kind) in [
         (&absent, "cannot read preemption record"),
         (&malformed, "cannot parse preemption record"),
-    ] {
-        for option in ["--replay-schedule-from", "--replay-preemptions-from"] {
             for mode in ["--namespace-only", "--no-namespace"] {
                 let mut args = vec!["run", mode];
                 if mode == "--namespace-only" {
@@ -60591,31 +60482,21 @@ fn namespace_only_keeps_ignoring_schedule_inputs() {
                     output.status.code(),
                     Some(HERMIT_INTERNAL_FAILURE_EXIT),
                     "{args:?}: {output:?}"
-                );
                 let diagnostic = stderr(&output);
-                assert!(
                     diagnostic.contains(&format!("{diagnostic_kind} {}:", path.display())),
                     "{args:?}: {diagnostic}"
-                );
                 assert!(diagnostic.contains("HERMIT_INTERNAL_FAILURE class=cli-error"));
                 assert!(!diagnostic.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE"));
                 assert_eq!(stdout(&output), "");
                 assert!(!marker.exists(), "invalid metadata ran the target");
                 assert!(!absent.exists());
                 assert_eq!(fs::read(&malformed).unwrap(), b"{");
-            }
-        }
-    }
-}
-
 /// This declaration must come from the real target-image setup callback. The
 /// fixture exercises threads, fork, vfork and clone3; replay must retain the
 /// producer's complete events and timing metadata through either loader.
 /// Supplying both CLI replay options is a parse error before target startup.
 /// Synthetic JSON is not the producer.
-#[test]
 fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let recording = directory.path().join("qualified.json");
     let record_flag = format!("--record-preemptions-to={}", recording.display());
     let epoch = "--epoch=2026-01-01T00:00:00Z";
@@ -60627,11 +60508,9 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
             &record_flag,
         ],
         &[],
-    );
     assert_success(&recorded, &["qualified producer"]);
     let recording_bytes = fs::read(&recording).unwrap();
     let original: serde_json::Value = serde_json::from_slice(&recording_bytes).unwrap();
-    assert_eq!(
         original["reserved_input"],
         serde_json::json!({
             "contract": "sealed-private-input-v1",
@@ -60639,7 +60518,6 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
             "page_bytes": unsafe { libc::sysconf(libc::_SC_PAGESIZE) },
             "abi": std::env::consts::ARCH,
         })
-    );
     assert_eq!(original["guest_ids"]["Chosen"]["base"], 5000);
     assert_eq!(original["format_version"], 3);
     let event_count = original["global"].as_array().unwrap().len();
@@ -60659,19 +60537,13 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
     // field exact; priority replay still expects the original.
     let mut schedule_per_thread = original["per_thread"].clone();
     for (tid, history) in schedule_per_thread.as_object_mut().unwrap() {
-        assert!(
             tid.parse::<u64>().unwrap() >= 5000,
             "unexpected chosen ID {tid}"
-        );
         for field in ["prio_changes", "preemption_rcbs", "chaos_epochs"] {
-            assert_eq!(
                 history[field],
                 serde_json::json!([]),
                 "producer {tid}: {field}"
-            );
-        }
         history["final_prio"] = serde_json::json!(if tid == "5004" { 999 } else { 1000 });
-    }
     let schedule_flag = format!("--replay-schedule-from={}", recording.display());
     let priority_flag = format!("--replay-preemptions-from={}", recording.display());
     for route in ["schedule", "priority", "both"] {
@@ -60679,42 +60551,31 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
         let summary = directory.path().join(format!("summary-{route}.json"));
         let output_flag = format!("--record-preemptions-to={}", output_record.display());
         let summary_flag = format!("--summary-json={}", summary.display());
-        let mut args = vec![
-            "--max-timeslice=disabled",
-            epoch,
             &output_flag,
             &summary_flag,
-        ];
         if route != "priority" {
             args.push(&schedule_flag);
-        }
         if route != "schedule" {
             args.push(&priority_flag);
-        }
         let replayed = no_namespace_in_own_pid_namespace(&args, &[]);
         if route == "both" {
             // Config's inherited CLI grammar rejects this combination before
             // either replay loader or the target is entered.
             assert_eq!(replayed.status.code(), Some(2), "{route}: {replayed:?}");
-            assert_eq!(
                 stderr(&replayed).lines().next(),
                 Some(
                     "error: the argument '--replay-schedule-from <filepath>' cannot be used with '--replay-preemptions-from <filepath>'"
                 )
-            );
             assert_eq!(stdout(&replayed), "", "invalid flags ran the target");
             assert!(!output_record.exists(), "invalid flags wrote a recording");
             assert!(!summary.exists(), "invalid flags wrote a summary");
             assert_eq!(fs::read(&recording).unwrap(), recording_bytes);
             continue;
-        }
         assert_success(&replayed, &args);
-        assert_eq!(
             stdout(&replayed),
             stdout(&recorded),
             "{route}: {}",
             stderr(&replayed)
-        );
         let actual: serde_json::Value =
             serde_json::from_slice(&fs::read(&output_record).unwrap()).unwrap();
         for field in [
@@ -60724,126 +60585,61 @@ fn chosen_json_provenance_follows_real_target_setup_and_both_replay_loaders() {
             "time_skips",
             "global",
             "per_thread",
-        ] {
             let expected = if route == "schedule" && field == "per_thread" {
                 &schedule_per_thread
             } else {
                 &original[field]
             };
             assert_eq!(&actual[field], expected, "{route}: changed {field}");
-        }
         let summary: serde_json::Value =
             serde_json::from_slice(&fs::read(&summary).unwrap()).unwrap();
         assert_eq!(summary["schedevent_desynced"], 0, "{route}: {summary}");
-        if route != "priority" {
-            assert_eq!(
                 summary["schedevent_replayed"], event_count,
                 "{route}: {summary}"
-            );
-        }
-        assert!(
             !stderr(&replayed).contains("got a host ID"),
-            "{route}: {}",
-            stderr(&replayed)
-        );
-    }
-}
-
 /// These bytes were produced by the retained pre-facility 49487f73 ELF. The
 /// complete old recording is refused by name on every CLI replay route, before
 /// the target can write its marker. A schema constructed by this test would not
 /// establish the old-producer compatibility boundary.
-#[test]
 fn authentic_legacy_chosen_json_is_refused_before_cli_target_start() {
-    let directory = tempfile::tempdir().unwrap();
     let schedule = directory.path().join("authentic-legacy.json");
-    let marker = directory.path().join("guest-started");
     let bytes = include_bytes!("fixtures/chosen-before-reserved-input.json");
     fs::write(&schedule, bytes).unwrap();
     let original: serde_json::Value = serde_json::from_slice(bytes).unwrap();
-    assert_eq!(original["guest_ids"]["Chosen"]["base"], 5000);
-    assert_eq!(original["format_version"], 3);
     assert_eq!(original["global"].as_array().unwrap().len(), 96);
     assert!(!original.as_object().unwrap().contains_key("reserved_input"));
-    for route in ["schedule", "priority", "both"] {
         let mut args = vec!["run", "--no-namespace", "--max-timeslice=disabled"];
-        if route != "priority" {
             args.extend(["--replay-schedule-from", schedule.to_str().unwrap()]);
-        }
-        if route != "schedule" {
             args.extend(["--replay-preemptions-from", schedule.to_str().unwrap()]);
-        }
-        args.extend([
-            "--",
             "/bin/sh",
             "-c",
             "printf started > \"$1\"",
             "admission-marker",
             marker.to_str().unwrap(),
-        ]);
-        let output = hermit(&args);
         let diagnostic = stderr(&output);
-        if route == "both" {
             // This invalid CLI combination is refused by Clap before provenance
             // admission; it is not a third executable replay route.
             assert_eq!(output.status.code(), Some(2), "{route}: {output:?}");
-            assert_eq!(
                 diagnostic.lines().next(),
-                Some(
-                    "error: the argument '--replay-schedule-from <filepath>' cannot be used with '--replay-preemptions-from <filepath>'"
-                )
-            );
             assert_eq!(stdout(&output), "", "invalid flags ran the target");
             assert!(!diagnostic.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE:"));
         } else {
-            assert_eq!(
-                output.status.code(),
-                Some(HERMIT_POLICY_REFUSAL_EXIT),
                 "{route}: {output:?}"
-            );
-            assert!(
-                diagnostic.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE:"),
                 "{route}: {diagnostic}"
-            );
-            assert!(
                 diagnostic.contains("missing reserved_input provenance"),
-                "{route}: {diagnostic}"
-            );
-            assert!(
                 diagnostic.contains("guest has not started"),
-                "{route}: {diagnostic}"
-            );
-        }
-        assert!(
             !diagnostic.to_ascii_lowercase().contains("desync"),
             "{route}: {diagnostic}"
-        );
-        assert!(
             !marker.exists(),
             "{route}: legacy replay executed its target"
-        );
-        assert_eq!(
             fs::read(&schedule).unwrap(),
             bytes,
             "{route}: input fixture was changed"
-        );
-    }
-}
-
 /// Ordinary Namespace replay keeps the existing typed format-refusal status at
 /// the early loader. This does not use Chosen provenance or namespace-only exec.
-#[test]
 fn namespace_record_format_refusals_are_policy_before_guest_startup() {
     use detcore::preemptions::RecordFormatRefusal;
     use detcore::preemptions::boundary_recording::Recording;
-
-    let directory = tempfile::tempdir().unwrap();
-    let marker = directory.path().join("guest-started");
-    let mount = format!(
-        "--mount=type=bind,source={},target={}",
-        directory.path().display(),
-        directory.path().display()
-    );
     // Exercise the same ordinary Namespace guest and marker mount before using
     // absence of the marker to distinguish admission from target execution.
     let positive = [
@@ -60856,13 +60652,11 @@ fn namespace_record_format_refusals_are_policy_before_guest_startup() {
         "printf 'namespace-format-started\n'; printf started > \"$1\"",
         "format-marker",
         marker.to_str().unwrap(),
-    ];
     let output = hermit(&positive);
     assert_success(&output, &positive);
     assert_eq!(stdout(&output), "namespace-format-started\n");
     assert_eq!(fs::read(&marker).unwrap(), b"started");
     fs::remove_file(&marker).unwrap();
-
     for (name, value, reason) in [
         (
             "future-format.json",
@@ -60873,115 +60667,36 @@ fn namespace_record_format_refusals_are_policy_before_guest_startup() {
             }),
             "record format Some(4) with 0 time skips: this Hermit reads formats 1 to 3, and time skips need format 2 or later",
         ),
-        (
             "empty-time-skips.json",
-            serde_json::json!({
-                "per_thread": {}, "global": [],
-                "guest_ids": detcore_model::pid::GuestIds::Namespace,
                 "format_version": 3, "time_skips": []
-            }),
             "an empty list of time skips is written as no list",
-        ),
-    ] {
         let schedule = directory.path().join(name);
-        let bytes = serde_json::to_vec(&value).unwrap();
-        let fixture: detcore::preemptions::PreemptionRecord =
             serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(
             fixture.guest_ids(),
             Some(detcore_model::pid::GuestIds::Namespace)
-        );
         assert_eq!(fixture.validate_format().unwrap_err(), reason);
         let refusal = Recording::decode(&bytes).unwrap_err();
         assert!(refusal.is::<RecordFormatRefusal>());
         assert_eq!(refusal.to_string(), reason);
-        fs::write(&schedule, &bytes).unwrap();
-        for option in ["--replay-schedule-from", "--replay-preemptions-from"] {
-            let args = [
-                "run",
-                "--max-timeslice=disabled",
-                &mount,
-                option,
-                schedule.to_str().unwrap(),
-                "--",
-                "/bin/sh",
-                "-c",
-                "printf started > \"$1\"",
                 "format-marker",
-                marker.to_str().unwrap(),
-            ];
-            let output = hermit(&args);
-            assert_eq!(
-                output.status.code(),
-                Some(HERMIT_POLICY_REFUSAL_EXIT),
-                "{args:?}: {output:?}"
-            );
-            let diagnostic = stderr(&output);
             assert!(diagnostic.contains(reason), "{args:?}: {diagnostic}");
-            assert!(
                 diagnostic.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
                 "{args:?}: {diagnostic}"
-            );
-            assert!(
                 !diagnostic.contains("HERMIT_INTERNAL_FAILURE"),
-                "{diagnostic}"
-            );
             assert!(!diagnostic.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE"));
             assert!(!diagnostic.to_ascii_lowercase().contains("desync"));
             assert_eq!(stdout(&output), "");
             assert!(!marker.exists(), "format-refused Namespace guest ran");
-            assert_eq!(fs::read(&schedule).unwrap(), bytes);
-        }
-    }
-
-    let absent = directory.path().join("absent-schedule.json");
-    let malformed = directory.path().join("malformed-schedule.json");
-    fs::write(&malformed, b"{").unwrap();
-    for (path, diagnostic_kind) in [
-        (&absent, "cannot read preemption record"),
-        (&malformed, "cannot parse preemption record"),
-    ] {
-        for option in ["--replay-schedule-from", "--replay-preemptions-from"] {
-            let args = [
-                "run",
-                "--max-timeslice=disabled",
-                &mount,
-                option,
                 path.to_str().unwrap(),
-                "--",
-                "/bin/sh",
-                "-c",
-                "printf started > \"$1\"",
-                "format-marker",
-                marker.to_str().unwrap(),
-            ];
-            let output = hermit(&args);
-            assert_eq!(
-                output.status.code(),
                 Some(HERMIT_INTERNAL_FAILURE_EXIT),
-                "{args:?}: {output:?}"
-            );
-            let diagnostic = stderr(&output);
-            assert!(
                 diagnostic.contains(&format!("{diagnostic_kind} {}:", path.display())),
-                "{args:?}: {diagnostic}"
-            );
             assert!(diagnostic.contains("HERMIT_INTERNAL_FAILURE class=cli-error"));
             assert!(!diagnostic.contains("HERMIT_POLICY_REFUSAL"));
-            assert!(!diagnostic.contains("HERMIT_CHOSEN_JSON_INPUT_PROVENANCE"));
-            assert_eq!(stdout(&output), "");
-            assert!(
                 !marker.exists(),
                 "invalid Namespace metadata ran the target"
-            );
             assert!(!absent.exists());
             assert_eq!(fs::read(&malformed).unwrap(), b"{");
-        }
-    }
-}
-
 static PROC_FDINFO_LINES_GUEST: OnceLock<PathBuf> = OnceLock::new();
-
 /// `tests/c/proc_fdinfo_lines.c`, built once per test process.
 fn proc_fdinfo_lines_guest() -> &'static Path {
     PROC_FDINFO_LINES_GUEST.get_or_init(|| {
@@ -60996,30 +60711,23 @@ fn proc_fdinfo_lines_guest() -> &'static Path {
             .arg(repository.join("tests/c/proc_fdinfo_lines.c"))
             .arg("-o")
             .arg(&guest)
-            .output()
             .expect("failed to compile proc-fdinfo-lines guest");
-        assert!(
             output.status.success(),
             "proc-fdinfo-lines guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
-        );
         guest
     })
-}
-
 /// The fdinfo-lines guest's stdout on `backend` with `guest_args`, at L2:
 /// `--strict --verify --verify-strict`, whose report must show bitwise
 /// parity over a nonzero number of compared INFO messages.
 fn proc_fdinfo_lines_at_l2(backend: &str, guest_args: &[&str]) -> String {
     let guest = proc_fdinfo_lines_guest();
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let report = directory.path().join(format!("{backend}.json"));
     let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
     let mut args = vec![
         "--backend",
         backend,
-        "run",
         "--strict",
         "--proc=standard",
         "--verify",
@@ -61028,9 +60736,7 @@ fn proc_fdinfo_lines_at_l2(backend: &str, guest_args: &[&str]) -> String {
         &report_arg,
         "--epoch=2026-01-01T00:00:00Z",
         "--base-env=minimal",
-        "--",
         guest.to_str().expect("guest path is UTF-8"),
-    ];
     args.extend_from_slice(guest_args);
     let output = hermit(&args);
     assert_success(&output, &args);
@@ -61039,14 +60745,10 @@ fn proc_fdinfo_lines_at_l2(backend: &str, guest_args: &[&str]) -> String {
             .expect("parse the verification report");
     assert_eq!(verdict["bitwise_parity"], true, "{backend}: {verdict}");
     let compared = &verdict["compared_log_messages"];
-    assert!(
         compared["left"].as_u64().is_some_and(|count| count > 0)
             && compared["left"] == compared["right"],
         "{backend} compared no INFO messages: {verdict}"
-    );
     stdout(&output)
-}
-
 /// What Detcore says when it refuses a `/proc/locks` snapshot or a fdinfo read
 /// that would show a guest's record lock (`F_SETLK`) that KVM's provider holds
 /// as an OFD lock: Linux shows a `POSIX` lock with its taker's pid, released at
@@ -61056,41 +60758,20 @@ fn proc_fdinfo_lines_at_l2(backend: &str, guest_args: &[&str]) -> String {
 const RECORD_LOCK_HELD_AS_OFD: &str = "is held by the backend as an OFD lock of its open file \
                                        description \
                                        (https://github.com/rrnewton/reverie/issues/1223)";
-
 /// The fdinfo-lines guest on KVM under `run --strict`, without `--verify`,
 /// with `guest_args`: the run must stop with the policy-refusal exit, and its
 /// stderr name each of `reasons`. Its stdout, up to the refusal.
 fn proc_fdinfo_lines_refused_on_kvm(guest_args: &[&str], reasons: &[&str]) -> String {
-    let guest = proc_fdinfo_lines_guest();
-    let mut args = vec![
         "--backend=kvm",
-        "run",
-        "--strict",
-        "--proc=standard",
-        "--epoch=2026-01-01T00:00:00Z",
-        "--base-env=minimal",
-        "--",
-        guest.to_str().expect("guest path is UTF-8"),
-    ];
-    args.extend_from_slice(guest_args);
-    let output = hermit(&args);
-    assert_eq!(
         output.status.code(),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
         "{args:?} did not stop with the policy-refusal exit\nstdout:\n{}\nstderr:\n{}",
         stdout(&output),
         stderr(&output)
-    );
     for reason in reasons {
-        assert!(
             stderr(&output).contains(reason),
             "{args:?} does not name {reason:?}\nstderr:\n{}",
             stderr(&output)
-        );
-    }
-    stdout(&output)
-}
-
 /// What KVM shows of the fdinfo-lines guest's native transcript, line by
 /// line, under the named differences between KVM and Linux, each the
 /// provider's, none Detcore's rendering:
@@ -61116,26 +60797,20 @@ fn with_kvm_fdinfo_differences(native: &str) -> String {
             "F_ADD_SEALS: ok" => "F_ADD_SEALS: -1 ENOSYS".to_owned(),
             "signalfd update with SFD_NONBLOCK: ok" => {
                 "signalfd update with SFD_NONBLOCK: EINVAL".to_owned()
-            }
             "seals: 6" => "seals: -1".to_owned(),
             "F_SETLEASE F_RDLCK: ok" => {
                 leased = true;
                 "F_SETLEASE F_RDLCK: -1 ENOSYS".to_owned()
-            }
             "F_SETLEASE F_UNLCK: ok" => {
                 leased = false;
                 "F_SETLEASE F_UNLCK: -1 ENOSYS".to_owned()
-            }
             line if leased && line.starts_with("lock:\t") && line.contains("LEASE") => continue,
             line if leased && line == "flags:\t02120000" => "flags:\t02100000".to_owned(),
             line => line.to_owned(),
         };
         shown.push_str(&line);
         shown.push('\n');
-    }
     shown
-}
-
 /// The fdinfo-lines guest's `--standard-stream-kinds` run and its report:
 /// each standard stream's kind, by its own `fstat`, and the names of its
 /// fdinfo's lines, run natively (`backend` `None`) or on `backend` under
@@ -61151,7 +60826,6 @@ fn standard_stream_kinds(
     hermit_flags: &[&str],
 ) -> (std::process::Output, String) {
     use std::os::unix::fs::OpenOptionsExt;
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let regular_path = directory.path().join("regular");
     fs::write(&regular_path, "data\n").expect("write the regular file");
     let regular = fs::OpenOptions::new()
@@ -61160,8 +60834,6 @@ fn standard_stream_kinds(
         .open(&regular_path)
         .expect("open the regular file");
     let master = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
         .custom_flags(libc::O_NOCTTY)
         .open("/dev/ptmx")
         .expect("open a pseudo-terminal master");
@@ -61169,9 +60841,7 @@ fn standard_stream_kinds(
         (regular, master)
     } else {
         (master, regular)
-    };
     let guest = proc_fdinfo_lines_guest()
-        .to_str()
         .expect("guest path is UTF-8");
     let directory_arg = directory.path().to_str().expect("directory path is UTF-8");
     let output = match backend {
@@ -61179,7 +60849,6 @@ fn standard_stream_kinds(
             .args([directory_arg, "--standard-stream-kinds"])
             .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout))
-            .output()
             .expect("run proc-fdinfo-lines natively"),
         Some(backend) => {
             let mut args = vec!["--backend", backend, "run"];
@@ -61188,7 +60857,6 @@ fn standard_stream_kinds(
                 "--proc=standard",
                 "--epoch=2026-01-01T00:00:00Z",
                 "--base-env=minimal",
-                "--",
                 guest,
                 directory_arg,
                 "--standard-stream-kinds",
@@ -61198,12 +60866,8 @@ fn standard_stream_kinds(
                 .stdin(Stdio::from(stdin))
                 .stdout(Stdio::from(stdout));
             hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command)
-        }
-    };
     let report = fs::read_to_string(directory.path().join("standard-streams")).unwrap_or_default();
     (output, report)
-}
-
 /// Detcore renders the caller's own `/proc/<pid>/fdinfo/<fd>` on KVM, whose
 /// procfs is not the kernel's (package K slice K8-h), as Linux prints it:
 /// for a pipe, a sealed memfd, eventfds (the count after writes and a read,
@@ -61220,7 +60884,6 @@ fn standard_stream_kinds(
 /// [`with_kvm_fdinfo_differences`]. Both run without a record lock
 /// (`--skip-posix`): with one, KVM stops at the fdinfo read after it, by
 /// name ([`RECORD_LOCK_HELD_AS_OFD`]), where Linux shows a `POSIX` lock.
-///
 /// Each standard stream's fdinfo follows its own object, whatever the others
 /// are ([`standard_stream_kinds`]): with a pseudo-terminal master as standard
 /// output or as standard input and a regular file as the other, a read of
@@ -61230,13 +60893,9 @@ fn standard_stream_kinds(
 /// `--allow-unsupported-syscalls` (which `--strict` refuses) the read fails
 /// with `EOPNOTSUPP`, while the regular file's and the pipe's are rendered as
 /// Linux prints them.
-#[test]
 fn run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences() {
     let test = "run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences";
     if kvm_unavailable(test) {
-        return;
-    }
-    let guest = proc_fdinfo_lines_guest();
     let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let native = Command::new(guest)
         .arg(native_directory.path())
@@ -61246,105 +60905,64 @@ fn run_kvm_renders_fdinfo_as_linux_does_apart_from_named_differences() {
     assert!(native.status.success(), "native: {native:?}");
     let native = stdout(&native);
     assert!(native.ends_with("failures=0\n"), "native:\n{native}");
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let kvm = proc_fdinfo_lines_at_l2(
         "kvm",
-        &[
             directory.path().to_str().expect("directory path is UTF-8"),
             "--skip-flock",
             "--skip-posix",
-        ],
-    );
     assert_eq!(kvm, with_kvm_fdinfo_differences(&native), "{test}");
-
     // With a record lock, the fdinfo read after it is refused by name.
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let refused = proc_fdinfo_lines_refused_on_kvm(
-        &[
-            directory.path().to_str().expect("directory path is UTF-8"),
-            "--skip-flock",
-        ],
         &["the rendered fdinfo of descriptor", RECORD_LOCK_HELD_AS_OFD],
-    );
-    assert!(
         refused.ends_with("F_SETLK write 0-9: ok\n"),
         "{test}: KVM stops at the fdinfo read after the record lock\n{refused}"
-    );
-
     for (pty_out, master) in [(true, 1), (false, 0)] {
         let (native_run, native) = standard_stream_kinds(None, pty_out, &[]);
-        assert!(
             native_run.status.success(),
             "{test}: native: {native_run:?}"
-        );
         let master_line =
             format!("{master} (character device 5:2): pos flags mnt_id ino tty-index\n");
         assert!(native.contains(&master_line), "{test}: native:\n{native}");
-        assert!(
             native.ends_with("failures=0\n"),
             "{test}: native:\n{native}"
-        );
         let (refused, _) = standard_stream_kinds(Some("kvm"), pty_out, &["--strict"]);
-        assert_eq!(
             refused.status.code(),
             Some(HERMIT_POLICY_REFUSAL_EXIT),
             "{test}: KVM refuses the master's fdinfo by name, standard stream {master}\n\
              stderr:\n{}",
             stderr(&refused)
-        );
-        assert!(
             stderr(&refused).contains(&format!(
                 "the rendered fdinfo of descriptor {master}: a character device 5:2 whose \
                  driver prints lines of its own"
             )),
-            "{test}: KVM refuses the master's fdinfo by name, standard stream {master}\n\
-             stderr:\n{}",
-            stderr(&refused)
-        );
         let (allowed, kvm) =
             standard_stream_kinds(Some("kvm"), pty_out, &["--allow-unsupported-syscalls"]);
-        assert!(
             allowed.status.success(),
             "{test}: KVM with --allow-unsupported-syscalls, standard stream {master}: \
              {allowed:?}"
-        );
-        assert_eq!(
             kvm,
             native
                 .replace(
                     &master_line,
                     &format!("{master} (character device 5:2): open or read EOPNOTSUPP\n")
-                )
                 .replace("failures=0\n", "failures=1\n"),
             "{test}: a pseudo-terminal master as standard stream {master}"
-        );
-    }
-}
-
 /// The fdinfo-lines guest at L2 on ptrace, whose fdinfo the kernel prints
 /// and Detcore sanitizes as before package K slice K8-h (unchanged by it):
 /// every host identity it shows agrees with `statx` and `fstat`, and every
 /// step runs.
-#[test]
 fn proc_fdinfo_lines_verify_at_bitwise_parity_on_ptrace() {
     // The guest's own line checks refuse every malformed line before they
     // mask one (timer nanoseconds, IDs, owners, ranges).
     let self_test = Command::new(proc_fdinfo_lines_guest())
         .arg("--self-test")
-        .output()
         .expect("run the fdinfo-lines guest's self-test");
-    assert!(
         self_test.status.success() && stdout(&self_test).ends_with("self-test ok\n"),
         "self-test: {self_test:?}"
-    );
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let ptrace = proc_fdinfo_lines_at_l2(
         "ptrace",
         &[directory.path().to_str().expect("directory path is UTF-8")],
-    );
     assert!(ptrace.ends_with("failures=0\n"), "ptrace:\n{ptrace}");
-}
-
 /// Where the guest's procfs is not the kernel's (KVM), Detcore renders
 /// `/proc/locks` from its lock ledger (package K slice K8-h), which learns
 /// each description's locks from the backend's `descriptor_status` fact:
@@ -61354,7 +60972,6 @@ fn proc_fdinfo_lines_verify_at_bitwise_parity_on_ptrace() {
 /// (`F_SETLK`), which KVM's provider holds as an OFD lock, stops KVM's run at
 /// the first snapshot that would show it, by name
 /// ([`RECORD_LOCK_HELD_AS_OFD`]), where ptrace shows Linux's `POSIX` row.
-///
 /// Two more cases follow Linux where the kernel snapshot's filter cannot:
 /// - two opens of one file holding identical shared OFD locks are two rows,
 ///   and a dup of one adds none (Linux lists each lock object);
@@ -61432,7 +61049,6 @@ fn proc_fdinfo_lines_verify_at_bitwise_parity_on_ptrace() {
 ///   (which joins the description it sent) and execs, keeping both
 ///   descriptors, shows its one lock once, before the exec and after it, as
 ///   ptrace does.
-#[test]
 fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
     let test = "run_kvm_renders_proc_locks_from_the_lock_ledger";
     // The reserved standard input case's own process (below): the guest's
@@ -61466,30 +61082,19 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
                 hermit::run_with_backend(command, config, false, &None, hermit::Backend::Kvm)
                     .map_err(|error| format!("{error:#}"))
             })
-            .unwrap()
             .join()
             .unwrap();
-        assert_eq!(
             status,
             Ok(reverie::process::ExitStatus::Exited(0)),
             "{test}: the library KVM run with a reserved standard input"
-        );
-        return;
-    }
-    if kvm_unavailable(test) {
-        return;
-    }
     let rows = |backend: &str, record_lock: bool| {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let directory = directory.path().to_str().expect("directory path is UTF-8");
         let mut args = vec![directory, "--proc-locks"];
         if !record_lock {
             args.push("--skip-posix");
-        }
         proc_fdinfo_lines_at_l2(backend, &args)
-    };
     // ptrace shows Linux's rows of the record lock, with its taker.
-    assert_eq!(
         rows("ptrace", true),
         "F_SETLK a: ok\n\
          --- record lock on a ---\n\
@@ -61500,62 +61105,33 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
          2: POSIX ADVISORY WRITE 1 00:00:2 0 EOF\n\
          child's F_OFD_SETLK: ok\n\
          --- and the child's OFD lock on c ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
          2: OFDLCK ADVISORY WRITE -1 00:00:2 0 EOF\n\
          3: POSIX ADVISORY WRITE 1 00:00:3 0 EOF\n\
          --- after the child exited ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
-         2: POSIX ADVISORY WRITE 1 00:00:2 0 EOF\n\
          F_SETLK a unlock: ok\n\
          --- after a's unlock ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
          --- after b's close ---\n\
          failures=0\n",
         "{test}: ptrace's rows of a record lock"
-    );
     // KVM stops at the first snapshot that would show it.
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    assert_eq!(
         proc_fdinfo_lines_refused_on_kvm(
             &[
                 directory.path().to_str().expect("directory path is UTF-8"),
                 "--proc-locks",
             ],
             &["/proc/locks: a record lock", RECORD_LOCK_HELD_AS_OFD],
-        ),
         "F_SETLK a: ok\n",
         "{test}: KVM refuses the record lock's rows by name"
-    );
     // Without it, KVM's rows are ptrace's.
     let kvm = rows("kvm", false);
     assert_eq!(kvm, rows("ptrace", false), "{test}");
-    assert_eq!(
         kvm,
         "F_OFD_SETLK b: ok\n\
-         --- and an OFD lock on b ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
-         child's F_OFD_SETLK: ok\n\
-         --- and the child's OFD lock on c ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
-         2: OFDLCK ADVISORY WRITE -1 00:00:2 0 EOF\n\
-         --- after the child exited ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
-         --- after b's close ---\n\
-         failures=0\n",
         "{test}"
-    );
-
     let twins = {
-        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         proc_fdinfo_lines_at_l2(
             "kvm",
-            &[
-                directory.path().to_str().expect("directory path is UTF-8"),
                 "--twin-ofd-locks",
-            ],
-        )
-    };
-    assert_eq!(
         twins,
         "F_OFD_SETLK through the first open: ok\n\
          F_OFD_SETLK through the second open: ok\n\
@@ -61563,15 +61139,10 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
          --- two opens' identical shared OFD locks and a dup ---\n\
          1: OFDLCK ADVISORY READ -1 00:00:1 0 9\n\
          2: OFDLCK ADVISORY READ -1 00:00:1 0 9\n\
-         failures=0\n",
         "{test}: two opens' identical OFD locks"
-    );
-
     for (option, call) in [
         ("--inherited-stdin-lock", "F_OFD_SETLK"),
         ("--inherited-stdin-lock=record", "F_SETLK"),
-    ] {
-        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let input_path = directory.path().join("standard-input");
         fs::write(&input_path, "data\n").expect("write the standard input file");
         let input = fs::File::open(&input_path).expect("open the standard input file");
@@ -61580,20 +61151,13 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
         assert_eq!(locked, 0, "{test}: the launcher's flock");
         let guest = proc_fdinfo_lines_guest();
         let directory_arg = directory.path().to_str().expect("directory path is UTF-8");
-        let args = [
             "--backend",
-            "kvm",
-            "run",
-            "--strict",
             "--proc=standard",
             "--epoch=2026-01-01T00:00:00Z",
             "--base-env=minimal",
-            "--",
             guest.to_str().expect("guest path is UTF-8"),
             directory_arg,
             option,
-        ];
-        let mut command = hermit_command(&args);
         command.stdin(Stdio::from(
             input.try_clone().expect("share the standard input"),
         ));
@@ -61601,24 +61165,12 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
         if call == "F_SETLK" {
             // KVM's provider holds the record lock as an OFD lock: the fdinfo
             // read that would show it is refused by name.
-            assert_eq!(
-                output.status.code(),
-                Some(HERMIT_POLICY_REFUSAL_EXIT),
                 "{test}: KVM refuses the record lock's fdinfo line by name\nstderr:\n{}",
                 stderr(&output)
-            );
-            assert!(
                 stderr(&output).contains("the rendered fdinfo of descriptor 0")
                     && stderr(&output).contains(RECORD_LOCK_HELD_AS_OFD),
-                "{test}: KVM refuses the record lock's fdinfo line by name\nstderr:\n{}",
-                stderr(&output)
-            );
             assert_eq!(stdout(&output), "F_SETLK on standard input: ok\n", "{test}");
             drop(input);
-            continue;
-        }
-        assert_success(&output, &args);
-        assert_eq!(
             stdout(&output),
             format!(
                 "{call} on standard input: ok\n\
@@ -61634,46 +61186,19 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
                  failures=0\n"
             ),
             "{test}: the launcher's flock through {call}"
-        );
         drop(input);
-    }
-
     // The fdinfo-lines guest on KVM, without --verify, with standard input
     // and output as given and its scratch files in `directory`.
     let run_with_streams = |directory: &Path, mode: &str, stdin: fs::File, stdout: fs::File| {
-        let guest = proc_fdinfo_lines_guest();
         let directory_arg = directory.to_str().expect("directory path is UTF-8");
-        let args = [
-            "--backend",
-            "kvm",
-            "run",
-            "--strict",
-            "--proc=standard",
-            "--epoch=2026-01-01T00:00:00Z",
-            "--base-env=minimal",
-            "--",
-            guest.to_str().expect("guest path is UTF-8"),
-            directory_arg,
-            mode,
-        ];
-        let mut command = hermit_command(&args);
         command
-            .stdin(Stdio::from(stdin))
             .stdout(Stdio::from(stdout));
-        let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
-        assert_success(&output, &args);
-    };
     let read_write = |path: &Path| {
         fs::OpenOptions::new()
-            .read(true)
-            .write(true)
             .create(true)
             .truncate(false)
             .open(path)
             .expect("open a standard streams' file")
-    };
-
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let shared_path = directory.path().join("shared-standard-streams");
     let shared = read_write(&shared_path);
     run_with_streams(
@@ -61683,117 +61208,49 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
             .try_clone()
             .expect("share the standard streams' file"),
         shared,
-    );
-    assert_eq!(
         fs::read_to_string(&shared_path).expect("read the shared standard streams' file"),
         "F_OFD_SETLK through standard input: ok\n\
          --- one lock through standard input ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
          F_OFD_SETLK through standard output: ok\n\
          --- the same lock through standard output ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
          F_OFD_SETLK unlock through standard output: ok\n\
          --- after the unlock through standard output ---\n\
-         failures=0\n",
         "{test}: one description as standard input and output"
-    );
-
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let opens_path = directory.path().join("independent-standard-streams");
-    run_with_streams(
-        directory.path(),
-        "--shared-stdio-locks",
         read_write(&opens_path),
-        read_write(&opens_path),
-    );
-    assert_eq!(
         fs::read_to_string(&opens_path).expect("read the independent standard streams' file"),
-        "F_OFD_SETLK through standard input: ok\n\
-         --- one lock through standard input ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
-         F_OFD_SETLK through standard output: ok\n\
-         --- the same lock through standard output ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
          2: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
-         F_OFD_SETLK unlock through standard output: ok\n\
-         --- after the unlock through standard output ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
-         failures=0\n",
         "{test}: two opens of one file as standard input and output"
-    );
-
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let forked = read_write(&directory.path().join("forked-standard-streams"));
-    run_with_streams(
-        directory.path(),
         "--shared-stdio-fork-unlock",
         forked
-            .try_clone()
-            .expect("share the standard streams' file"),
         forked,
-    );
-    assert_eq!(
         fs::read_to_string(directory.path().join("shared-stdio-fork"))
             .expect("read the fork case's report"),
-        "F_OFD_SETLK through standard input: ok\n\
-         --- one lock through standard input ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
          child's close of standard input: ok\n\
          close of standard output: ok\n\
          --- each process holding the description through one stream ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
          F_OFD_SETLK unlock through standard input: ok\n\
          --- after the parent's unlock through standard input ---\n\
-         failures=0\n",
         "{test}: one description left in each process through one stream"
-    );
-
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let close_exec_path = directory.path().join("close-exec-standard-streams");
     let close_exec = read_write(&close_exec_path);
-    run_with_streams(
-        directory.path(),
         "--shared-stdio-close-exec",
         close_exec
-            .try_clone()
-            .expect("share the standard streams' file"),
         close_exec,
-    );
-    assert_eq!(
         fs::read_to_string(&close_exec_path).expect("read the close-exec case's file"),
-        "F_OFD_SETLK through standard input: ok\n\
          close of standard input: ok\n\
          --- standard output holding the description ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
          --- after an exec that kept standard output ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
-         failures=0\n",
         "{test}: standard input closed before an exec that keeps standard output"
-    );
-
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let closed = read_write(&directory.path().join("closed-standard-streams"));
-    run_with_streams(
-        directory.path(),
         "--shared-stdio-close-both",
         closed
-            .try_clone()
-            .expect("share the standard streams' file"),
         closed,
-    );
-    assert_eq!(
         fs::read_to_string(directory.path().join("shared-stdio-close-both"))
             .expect("read the close-both case's report"),
-        "F_OFD_SETLK through standard input: ok\n\
-         --- one lock through standard input ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
-         close of standard output: ok\n\
-         close of standard input: ok\n\
          --- after both streams closed ---\n\
-         failures=0\n",
         "{test}: both streams of one description closed"
-    );
-
     // The guest's report in `text`: from its first words, which may follow
     // the test harness's own on a line, to the end of its `failures=` line.
     let report_in = |text: &str| {
@@ -61806,33 +61263,19 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
                 report[failures..]
                     .find('\n')
                     .map(|newline| failures + newline + 1)
-            })
             .unwrap_or(report.len());
         report[..end].to_owned()
-    };
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let ptrace_output_path = directory.path().join("output");
-    let guest = proc_fdinfo_lines_guest();
     let args = [
-        "run",
-        "--strict",
-        "--proc=standard",
-        "--epoch=2026-01-01T00:00:00Z",
-        "--base-env=minimal",
-        "--",
-        guest.to_str().expect("guest path is UTF-8"),
         directory.path().to_str().expect("directory path is UTF-8"),
         "--stdin-and-stdout-locks",
-    ];
     let mut command = hermit_command(&args);
     command
         .stdin(Stdio::from(read_write(&directory.path().join("input"))))
         .stdout(Stdio::from(read_write(&ptrace_output_path)));
     let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
-    assert_success(&output, &args);
     let ptrace =
         report_in(&fs::read_to_string(&ptrace_output_path).expect("read the ptrace run's output"));
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     read_write(&directory.path().join("reserved-stdin"));
     let ambient_path = directory.path().join("ambient-standard-streams");
     let ambient = read_write(&ambient_path);
@@ -61847,60 +61290,31 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
         ))
         .stdout(Stdio::from(ambient))
         .stderr(Stdio::piped())
-        .output()
         .expect("run the reserved standard input case");
     let ambient_text =
         fs::read_to_string(&ambient_path).expect("read the ambient standard streams' file");
-    assert!(
         child.status.success(),
         "{test}: the reserved standard input's process: {:?}\nstdout:\n{ambient_text}\nstderr:\n{}",
         child.status,
         String::from_utf8_lossy(&child.stderr)
-    );
     let kvm = report_in(&ambient_text);
     assert_eq!(kvm, ptrace, "{test}: a reserved standard input of its own");
-    assert_eq!(
-        kvm,
-        "F_OFD_SETLK through standard input: ok\n\
          --- a lock through standard input ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
-         F_OFD_SETLK through standard output: ok\n\
          --- and one through standard output ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
          2: OFDLCK ADVISORY READ -1 00:00:2 2 2\n\
-         failures=0\n",
         "{test}: a reserved standard input of its own"
-    );
-
     let from_parent = |backend: &str| {
-        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-        proc_fdinfo_lines_at_l2(
             backend,
-            &[
-                directory.path().to_str().expect("directory path is UTF-8"),
                 "--received-from-parent",
-            ],
-        )
-    };
     let kvm = from_parent("kvm");
-    assert_eq!(
-        kvm,
         from_parent("ptrace"),
         "{test}: a descriptor received from a parent"
-    );
-    assert_eq!(
-        kvm,
         "F_OFD_SETLK: ok\n\
          sendmsg to the child: 1\n\
          child's receipt: ok\n\
          close of the parent's descriptor: ok\n\
          --- the child holding the description the parent closed ---\n\
          1: OFDLCK ADVISORY WRITE -1 00:00:1 0 EOF\n\
-         --- after the child exited ---\n\
-         failures=0\n",
-        "{test}: a descriptor received from a parent"
-    );
-
     // A lock held through a description in flight when its sender lets go:
     // a child locks a file it opened after the fork, sends the descriptor,
     // and exits (the parent looks while the child is a zombie) or closes its
@@ -61923,7 +61337,6 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
             {
                 sections.push((label.to_owned(), Vec::new()));
                 continue;
-            }
             let fields: Vec<&str> = line.split_whitespace().collect();
             let is_row = fields.first().is_some_and(|first| {
                 first.ends_with(':') && first[..first.len() - 1].parse::<u64>().is_ok()
@@ -61937,16 +61350,11 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
             if let Some((_, rows)) = sections.last_mut()
                 && is_row
                 && ours
-            {
                 rows.push(fields[1].to_owned());
-            }
-        }
         sections
-    };
     for (variant, first) in [
         ("exits", "in flight after the sender exited"),
         ("closes", "in flight after the sender closed its descriptor"),
-    ] {
         let in_flight_sections = |rows: [&[&str]; 3]| {
             [first, "received", "closed"]
                 .into_iter()
@@ -61956,14 +61364,11 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
                         label.to_owned(),
                         rows.iter().map(|row| (*row).to_owned()).collect::<Vec<_>>(),
                     )
-                })
                 .collect::<Vec<_>>()
-        };
         for (kind, linux) in [
             ("ofd", in_flight_sections([&["OFDLCK"], &["OFDLCK"], &[]])),
             ("flock", in_flight_sections([&["FLOCK"], &["FLOCK"], &[]])),
             ("posix", in_flight_sections([&[], &[], &[]])),
-        ] {
             let case = format!("the sender {variant}, {kind}");
             let mode = format!("--in-flight-sender-{variant}={kind}");
             let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -61972,21 +61377,16 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
                 .arg(&mode)
                 .output()
                 .expect("run the fdinfo-lines guest natively");
-            assert!(
                 native.status.success(),
                 "{test}: native, {case}: {native:?}"
-            );
             let inode = std::os::unix::fs::MetadataExt::ino(
                 &fs::metadata(native_directory.path().join("in-flight"))
                     .expect("the native run's locked file"),
-            );
             let native_rows = lock_classes(&stdout(&native), Some(inode));
-            assert_eq!(
                 native_rows,
                 linux,
                 "{test}: native, {case}\n{}",
                 stdout(&native)
-            );
             let ptrace_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
             let ptrace = proc_fdinfo_lines_at_l2(
                 "ptrace",
@@ -61997,12 +61397,8 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
                         .expect("directory path is UTF-8"),
                     &mode,
                 ],
-            );
-            assert_eq!(
                 lock_classes(&ptrace, None),
-                native_rows,
                 "{test}: ptrace, {case}\n{ptrace}"
-            );
             let kvm_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
             let kvm_directory_arg = kvm_directory
                 .path()
@@ -62017,48 +61413,25 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
                     "--proc=standard",
                     "--epoch=2026-01-01T00:00:00Z",
                     "--base-env=minimal",
-                    "--",
                     guest.to_str().expect("guest path is UTF-8"),
                     kvm_directory_arg,
-                    &mode,
                 ];
-                let output = hermit(&args);
-                assert_eq!(
-                    output.status.code(),
                     Some(HERMIT_POLICY_REFUSAL_EXIT),
                     "{test}: KVM refuses the sender's flock by name, {case}\nstderr:\n{}",
                     stderr(&output)
-                );
-                assert!(
                     stderr(&output).contains("refused by the backend: KVM flock is unsupported"),
-                    "{test}: KVM refuses the sender's flock by name, {case}\nstderr:\n{}",
-                    stderr(&output)
-                );
-                continue;
-            }
             if kind == "posix" {
                 let refused = proc_fdinfo_lines_refused_on_kvm(
                     &[kvm_directory_arg, &mode],
                     &["/proc/locks: a record lock", RECORD_LOCK_HELD_AS_OFD],
-                );
                 // The guest prints a snapshot's label before it reads.
-                assert!(
                     refused.ends_with(&format!(": ok\n--- {first} ---\n"))
                         && refused.matches("--- ").count() == 1,
                     "{test}: KVM refuses the first snapshot by name, {case}\n{refused}"
-                );
-                continue;
-            }
             let kvm = proc_fdinfo_lines_at_l2("kvm", &[kvm_directory_arg, &mode]);
-            assert_eq!(
                 lock_classes(&kvm, None),
-                native_rows,
                 "{test}: KVM, {case}\n{kvm}"
-            );
             assert_eq!(kvm, ptrace, "{test}: KVM and ptrace, {case}");
-        }
-    }
-
     // Each section's rows as `lock_classes` gives them, under `labels`.
     let sections = |labels: &[&str], rows: &[&[&str]]| {
         labels
@@ -62068,11 +61441,7 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
                 (
                     (*label).to_owned(),
                     rows.iter().map(|row| (*row).to_owned()).collect::<Vec<_>>(),
-                )
-            })
             .collect::<Vec<_>>()
-    };
-
     // A lock only a message queued to a receiving socket holds, when that
     // socket goes without a close: a child holds its only descriptor
     // (close-on-exec), and execs, kills itself with SIGKILL, leaves through a
@@ -62094,123 +61463,71 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
     // conflicting lock fails with EAGAIN, until the parent closes its
     // descriptor, which takes the socket's last reference.
     let gone = sections(
-        &[
             "in flight to the child's socket",
             "after the child's socket went",
             "after a fresh open's lock and unlock",
             "at the end",
-        ],
         &[&["OFDLCK"], &[], &[], &[]],
-    );
     let kept = sections(
-        &[
-            "in flight to the child's socket",
             "after the child's death",
             "after a fresh open's attempt",
             "after the parent's receiving end closed",
-            "at the end",
-        ],
         &[&["OFDLCK"], &["OFDLCK"], &["OFDLCK"], &[], &[]],
-    );
     const GRANTED: &str = "a fresh open's conflicting F_OFD_SETLK: ok\n";
     for (how, expected, lines) in [
         ("exec", &gone, &["the child's exec: ok\n", GRANTED][..]),
-        (
             "kills-itself",
             &gone,
             &["the child's death by SIGKILL: ok\n", GRANTED][..],
-        ),
         ("exits", &gone, &["the child's raw exit: ok\n", GRANTED][..]),
-        (
             "killed",
-            &gone,
-            &["the child's death by SIGKILL: ok\n", GRANTED][..],
-        ),
-        (
             "terminated",
-            &gone,
             &["the child's death by SIGTERM: ok\n", GRANTED][..],
-        ),
-        (
             "aborts",
-            &gone,
             &["the child's death by SIGABRT: ok\n", GRANTED][..],
-        ),
-        (
             "faults",
-            &gone,
             &["the child's death by SIGSEGV: ok\n", GRANTED][..],
-        ),
-        (
             "exec-terminated",
-            &gone,
-            &[
                 "the child's exec: ok\n",
                 "the child's death by SIGTERM: ok\n",
                 GRANTED,
             ][..],
-        ),
-        (
             "parent-keeps-socket",
             &kept,
-            &[
-                "the child's death by SIGTERM: ok\n",
                 "a fresh open's conflicting F_OFD_SETLK: -1 EAGAIN\n",
                 "close of the parent's receiving end: ok\n",
                 "a second fresh open's conflicting F_OFD_SETLK: ok\n",
-            ][..],
-        ),
-    ] {
         let case = format!("the receiving socket's process goes by {how}");
         let shows_every_line = |transcript: &str| {
             lines.iter().all(|line| transcript.contains(line))
                 && transcript.ends_with("failures=0\n")
-        };
         let mode = format!("--in-flight-receiver-gone={how}");
         let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let native = Command::new(proc_fdinfo_lines_guest())
             .arg(native_directory.path())
             .arg(&mode)
-            .output()
             .expect("run the fdinfo-lines guest natively");
-        assert!(
             native.status.success(),
             "{test}: native, {case}: {native:?}"
-        );
         let native = stdout(&native);
-        assert!(
             shows_every_line(&native),
             "{test}: native, {case}\n{native}"
-        );
         let inode = std::os::unix::fs::MetadataExt::ino(
             &fs::metadata(native_directory.path().join("receiver-gone"))
                 .expect("the native run's locked file"),
-        );
-        assert_eq!(
             &lock_classes(&native, Some(inode)),
             expected,
-            "{test}: native, {case}\n{native}"
-        );
         let ptrace_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let ptrace = proc_fdinfo_lines_at_l2(
             "ptrace",
-            &[
                 ptrace_directory
                     .path()
                     .to_str()
                     .expect("directory path is UTF-8"),
                 &mode,
-            ],
-        );
-        assert!(
             shows_every_line(&ptrace),
             "{test}: ptrace, {case}\n{ptrace}"
-        );
-        assert_eq!(
             &lock_classes(&ptrace, None),
-            expected,
-            "{test}: ptrace, {case}\n{ptrace}"
-        );
         let kvm_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let kvm_directory_arg = kvm_directory
             .path()
@@ -62218,44 +61535,19 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
             .expect("directory path is UTF-8");
         if how == "killed" {
             let guest = proc_fdinfo_lines_guest();
-            let args = [
                 "--backend=kvm",
-                "run",
                 "--strict",
-                "--proc=standard",
-                "--epoch=2026-01-01T00:00:00Z",
-                "--base-env=minimal",
-                "--",
                 guest.to_str().expect("guest path is UTF-8"),
                 kvm_directory_arg,
-                &mode,
-            ];
-            let output = hermit(&args);
-            assert_eq!(
-                output.status.code(),
-                Some(HERMIT_POLICY_REFUSAL_EXIT),
                 "{test}: KVM refuses the parent's SIGKILL by name, {case}\nstderr:\n{}",
-                stderr(&output)
-            );
-            assert!(
                 stderr(&output).contains(
                     "kill refused by the backend: KVM signal delivery refused: KVM cannot \
                      deliver a signal to another process"
                 ),
-                "{test}: KVM refuses the parent's SIGKILL by name, {case}\nstderr:\n{}",
-                stderr(&output)
-            );
-            continue;
-        }
         let kvm = proc_fdinfo_lines_at_l2("kvm", &[kvm_directory_arg, &mode]);
-        assert_eq!(
             &lock_classes(&kvm, None),
-            expected,
             "{test}: KVM, {case}\n{kvm}"
-        );
         assert_eq!(kvm, ptrace, "{test}: KVM and ptrace, {case}");
-    }
-
     // The same, where the child that holds the receiving socket has a second
     // thread that keeps calling through the child's descriptors while the
     // main thread ends the process, by SIGKILL to itself or by exit_group.
@@ -62270,71 +61562,31 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
                                 its calls through the child's descriptors that failed: 0\n\
                                 its reads of /proc/locks that listed no lock: 0\n";
     let busy = sections(
-        &[
-            "in flight to the child's socket",
-            "after the child's death",
-            "after a fresh open's lock and unlock",
-        ],
         &[&["OFDLCK"], &[], &[]],
-    );
     for how in ["kills-itself", "exit-group"] {
         let case = format!("the busy receiver ends itself by {how}");
         let mode = format!("--in-flight-receiver-dies-busy={how}");
-        let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-        let native = Command::new(proc_fdinfo_lines_guest())
-            .arg(native_directory.path())
-            .arg(&mode)
-            .output()
-            .expect("run the fdinfo-lines guest natively");
-        assert!(
-            native.status.success(),
-            "{test}: native, {case}: {native:?}"
-        );
-        let native = stdout(&native);
-        assert!(
             native.contains(BUSY_SIBLING)
                 && native.contains("a fresh open's conflicting F_OFD_SETLK: ok\n")
                 && native.ends_with("failures=0\n"),
-            "{test}: native, {case}\n{native}"
-        );
-        let inode = std::os::unix::fs::MetadataExt::ino(
             &fs::metadata(native_directory.path().join("receiver-dies-busy"))
-                .expect("the native run's locked file"),
-        );
-        assert_eq!(
             lock_classes(&native, Some(inode)),
             busy,
-            "{test}: native, {case}\n{native}"
-        );
         let mut transcripts = Vec::new();
         for backend in ["ptrace", "kvm"] {
             let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
             let transcript = proc_fdinfo_lines_at_l2(
                 backend,
-                &[
                     directory.path().to_str().expect("directory path is UTF-8"),
-                    &mode,
-                ],
-            );
-            assert!(
                 transcript.contains(BUSY_SIBLING)
                     && transcript.contains("a fresh open's conflicting F_OFD_SETLK: ok\n")
                     && transcript.ends_with("failures=0\n"),
                 "{test}: {backend}, {case}\n{transcript}"
-            );
-            assert_eq!(
                 lock_classes(&transcript, None),
                 busy,
-                "{test}: {backend}, {case}\n{transcript}"
-            );
             transcripts.push(transcript);
-        }
-        assert_eq!(
             transcripts[1], transcripts[0],
             "{test}: KVM and ptrace, {case}"
-        );
-    }
-
     // One description as standard input and output: a lock through standard
     // input, then standard input sent to this process itself and closed, so
     // that only the message queued to the receiving socket holds that
@@ -62347,144 +61599,66 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
     let native = Command::new(proc_fdinfo_lines_guest())
         .arg(alias_directory.path())
         .arg("--stdio-alias-in-flight")
-        .stdin(Stdio::from(
             alias.try_clone().expect("share the standard streams' file"),
-        ))
         .stdout(Stdio::from(alias))
-        .output()
         .expect("run the fdinfo-lines guest natively");
-    assert!(
         native.status.success(),
         "{test}: native, standard input in flight: {native:?}"
-    );
     let native = fs::read_to_string(&alias_path).expect("read the native run's report");
     let inode = std::os::unix::fs::MetadataExt::ino(
         &fs::metadata(&alias_path).expect("the native run's standard streams' file"),
-    );
     let in_flight_alias = sections(
-        &[
             "one lock through standard input",
             "standard input in flight",
             "after the unlock through standard output",
             "received",
             "closed",
-        ],
         &[&["OFDLCK"], &["OFDLCK"], &[], &[], &[]],
-    );
-    assert_eq!(
         lock_classes(&native, Some(inode)),
         in_flight_alias,
         "{test}: native, standard input in flight\n{native}"
-    );
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let alias_path = directory.path().join("in-flight-standard-streams");
-    let alias = read_write(&alias_path);
-    run_with_streams(
-        directory.path(),
         "--stdio-alias-in-flight",
         alias.try_clone().expect("share the standard streams' file"),
         alias,
-    );
-    assert_eq!(
         fs::read_to_string(&alias_path).expect("read the in-flight standard input case's file"),
-        "F_OFD_SETLK through standard input: ok\n\
-         --- one lock through standard input ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
          sendmsg of standard input: 1\n\
-         close of standard input: ok\n\
          --- standard input in flight ---\n\
-         1: OFDLCK ADVISORY READ -1 00:00:1 0 0\n\
-         F_OFD_SETLK unlock through standard output: ok\n\
-         --- after the unlock through standard output ---\n\
          recvmsg: 1 descriptors\n\
          --- received ---\n\
          close of the received descriptor: ok\n\
          --- closed ---\n\
-         failures=0\n",
         "{test}: one description as standard input and output, standard input in flight"
-    );
-
     // Two opens of one file holding identical OFD read locks; the parent sends
     // the second to a child forked before, which receives it, and closes its
     // own. Linux lists each lock object.
     let twins = sections(
-        &[
             "two opens' identical OFD locks",
             "the child holding the second open",
             "after the child closed the second open",
             "after the first open's close",
-        ],
-        &[
-            &["OFDLCK", "OFDLCK"],
             &["OFDLCK", "OFDLCK"],
             &["OFDLCK"],
             &[],
-        ],
-    );
-    let native_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let native = Command::new(proc_fdinfo_lines_guest())
-        .arg(native_directory.path())
         .arg("--joined-twin-locks")
-        .output()
-        .expect("run the fdinfo-lines guest natively");
-    assert!(
-        native.status.success(),
         "{test}: native, joined twins: {native:?}"
-    );
-    let native = stdout(&native);
-    let inode = std::os::unix::fs::MetadataExt::ino(
         &fs::metadata(native_directory.path().join("joined-twins"))
             .expect("the native run's locked file"),
-    );
-    assert_eq!(
-        lock_classes(&native, Some(inode)),
-        twins,
         "{test}: native, joined twins\n{native}"
-    );
     let kvm_directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let kvm = proc_fdinfo_lines_at_l2(
-        "kvm",
-        &[
             kvm_directory
-                .path()
-                .to_str()
                 .expect("directory path is UTF-8"),
             "--joined-twin-locks",
-        ],
-    );
-    assert!(
         kvm.ends_with("failures=0\n"),
         "{test}: KVM, joined twins\n{kvm}"
-    );
-    assert_eq!(
         lock_classes(&kvm, None),
-        twins,
-        "{test}: KVM, joined twins\n{kvm}"
-    );
-
     let received = |backend: &str| {
-        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-        proc_fdinfo_lines_at_l2(
-            backend,
-            &[
-                directory.path().to_str().expect("directory path is UTF-8"),
                 "--received-lock-exec",
-            ],
-        )
-    };
     let kvm = received("kvm");
-    assert_eq!(
-        kvm,
         received("ptrace"),
         "{test}: a received copy across an exec"
-    );
-    assert_eq!(
-        kvm,
-        "F_OFD_SETLK: ok\n\
          sendmsg of the locked descriptor: 1\n\
-         recvmsg: 1 descriptors\n\
          --- one lock through the opened and the received descriptor ---\n\
-         1: OFDLCK ADVISORY WRITE -1 00:00:1 0 EOF\n\
          --- after an exec that kept both ---\n\
          1: OFDLCK ADVISORY WRITE -1 00:00:1 0 EOF\n\
          failures=0\n",
@@ -62493,12 +61667,9 @@ fn run_kvm_renders_proc_locks_from_the_lock_ledger() {
 }
 
 static PROCFS_DOTDOT_SPELLINGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
-
 /// `tests/c/procfs_dotdot_spellings.c`'s guest.
 fn procfs_dotdot_spellings_guest() -> &'static Path {
     compiled_c_guest(&PROCFS_DOTDOT_SPELLINGS_GUEST, "procfs_dotdot_spellings")
-}
-
 /// The spellings guest's transcript under Hermit on `backend` at
 /// `--proc=level`, in the guest's `modes`, at L2: two runs at bitwise parity
 /// under `--verify-strict`, with the same nonzero number of INFO records
@@ -62539,10 +61710,7 @@ fn procfs_dotdot_spellings_at_l2(backend: &str, level: &str, modes: &[&str]) -> 
         compared["left"].as_u64().is_some_and(|count| count > 0)
             && compared["left"] == compared["right"],
         "{backend} compared no INFO messages: {verdict}"
-    );
     stdout(&output)
-}
-
 /// Spellings with `..` of `/proc/locks` and of a descriptor's fdinfo
 /// (`tests/c/procfs_dotdot_spellings.c`: through `self`, `thread-self`, the
 /// caller's numbers, `task/<tid>`, `fd` and `fdinfo`, and past either file)
@@ -62564,7 +61732,6 @@ fn read_the_dotdot_spellings_of_proc_locks_and_fdinfo(backend: &str) {
         procfs_dotdot_spellings_at_l2(backend, "standard", &[]),
         native,
         "{backend} at --proc=standard"
-    );
     let minimal: String = native
         .lines()
         .map(|line| match line.split_once(": ") {
@@ -62578,20 +61745,15 @@ fn read_the_dotdot_spellings_of_proc_locks_and_fdinfo(backend: &str) {
             _ => format!("{line}\n"),
         })
         .collect();
-    assert_eq!(
         procfs_dotdot_spellings_at_l2(backend, "minimal", &[]),
         minimal,
         "{backend} at --proc=minimal"
-    );
-}
-
 /// The spellings guest's transcript run natively in `modes`, in its `native`
 /// mode, which tries a comparison that mismatches, or an ELOOP, again. The
 /// ELOOP retry is for a known divergence,
 /// https://github.com/rrnewton/hermit/issues/5045: Linux 7.1.3 keeps the link
 /// count across its RCU-walk retry.
 fn procfs_dotdot_spellings_native(modes: &[&str]) -> String {
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let output = Command::new(procfs_dotdot_spellings_guest())
         .arg(directory.path())
         .arg("native")
@@ -62600,9 +61762,6 @@ fn procfs_dotdot_spellings_native(modes: &[&str]) -> String {
         .output()
         .expect("run the dot-dot spellings guest natively");
     assert!(output.status.success(), "native {modes:?}: {output:?}");
-    stdout(&output)
-}
-
 /// Linux's limit on the links one lookup follows, through the spellings
 /// guest's links mode at `--proc=standard` on `backend`, at L2: 40 passes
 /// through `/proc/self` resolve, the 41st is ELOOP, and a missing task or a
@@ -62638,61 +61797,83 @@ fn read_the_link_limit_spellings(backend: &str) {
             "{line}: {native}"
         );
     }
-    assert_eq!(
         procfs_dotdot_spellings_at_l2(backend, "standard", &["links"]),
-        native,
         "{backend} links at --proc=standard"
-    );
-}
-
 /// [`read_the_dotdot_spellings_of_proc_locks_and_fdinfo`] on ptrace. Not
 /// [`read_the_link_limit_spellings`], a known divergence,
-/// https://github.com/rrnewton/hermit/issues/5045: Linux 7.1.3 keeps the link
 /// count across its RCU-walk retry, so ptrace's answer at 21 to 40 links
 /// depends on host timing.
 #[test]
 fn the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux() {
     read_the_dotdot_spellings_of_proc_locks_and_fdinfo("ptrace");
-}
-
 /// [`read_the_dotdot_spellings_of_proc_locks_and_fdinfo`] and
 /// [`read_the_link_limit_spellings`] on KVM. Then the one other path that
 /// reached the backend's own fdinfo, a descriptor's fdinfo of the run's pid 1,
 /// Hermit's own init: KVM's backend no longer has an fdinfo of its own, and
 /// its procfs would answer from the supervisor's descriptor table, host
 /// state, so the run stops with the policy's exit and names why.
-#[test]
 fn run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux() {
     let test = "run_kvm_the_dotdot_spellings_of_proc_locks_and_fdinfo_answer_as_linux";
     if kvm_unavailable(test) {
         return;
-    }
     read_the_dotdot_spellings_of_proc_locks_and_fdinfo("kvm");
     read_the_link_limit_spellings("kvm");
-    let guest = procfs_dotdot_spellings_guest();
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let args = [
-        "--backend",
         "kvm",
-        "run",
-        "--strict",
         "--proc=standard",
-        "--epoch=2026-01-01T00:00:00Z",
-        "--base-env=minimal",
-        "--",
-        guest.to_str().expect("guest path is UTF-8"),
-        directory.path().to_str().expect("directory path is UTF-8"),
         "init",
-    ];
-    let output = hermit(&args);
     let log = stderr(&output);
-    assert_eq!(
         output.status.code(),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
         "kvm init did not stop with the policy's exit: {log}"
-    );
-    assert!(
         log.contains("a descriptor's fdinfo of Hermit's own init, cannot be served"),
         "kvm init: the refusal does not name its reason: {log}"
-    );
-}
+/// The first `--cpu-profile x86-64-v3` run on a host measures the XINUSE
+/// probe, says so in one stderr warning and caches the pass under
+/// `XDG_CACHE_HOME`; a second run reuses it, warning nothing and rewriting
+/// nothing (https://github.com/rrnewton/hermit/issues/4515). A host that
+/// `hermit host-capabilities --cpu-profile x86-64-v3` refuses skips the test.
+fn cpu_profile_v3_qualifies_the_host_once_and_reuses_the_verdict() {
+    let cache_home = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = cache_home
+        .path()
+        .join("hermit")
+        .join("cpu-profile-x86-64-v3-probe.json");
+    let args = ["run", "--cpu-profile", "x86-64-v3", "--", "/bin/true"];
+    let run = || {
+            .env("XDG_CACHE_HOME", cache_home.path())
+            .stdin(Stdio::null());
+        (output.status.code(), stdout(&output), stderr(&output), ())
+    let Some((_, first, ())) = v3_run_or_refusal(run) else {
+            "cpu_profile_v3_qualifies_the_host_once_and_reuses_the_verdict: SKIPPED: this host does \
+             not qualify for x86-64-v3"
+    let warning = "WARNING: qualifying this host for --cpu-profile x86-64-v3";
+    assert_eq!(first.matches(warning).count(), 1, "{first}");
+    let written = std::fs::read(&path).expect("the first v3 run caches its probe");
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    let (_, second, ()) = v3_run_or_refusal(run).expect("the host qualified a moment ago");
+        !second.contains(warning),
+        "a cached verdict is not measured again:\n{second}"
+    assert_eq!(std::fs::read(&path).unwrap(), written);
+        std::fs::metadata(&path).unwrap().modified().unwrap(),
+        modified
+/// Every Hermit command a test builds points `XDG_CACHE_HOME` at this test
+/// process's own directory, so Hermit's host qualification cache never carries
+/// a verdict between tests or from the developer's runs
+/// (https://github.com/rrnewton/hermit/issues/4515); a test that sets its own
+/// keeps it.
+fn every_test_command_gets_its_own_cache_directory() {
+    let cache_home = |command: &Command| {
+            .get_envs()
+            .find(|(key, _)| *key == "XDG_CACHE_HOME")
+            .and_then(|(_, value)| value.map(PathBuf::from))
+    let first = cache_home(&hermit_command(&["run", "--", "/bin/true"]))
+        .expect("hermit_command sets XDG_CACHE_HOME");
+    assert!(first.starts_with(env!("CARGO_TARGET_TMPDIR")), "{first:?}");
+    assert!(first.is_dir(), "{first:?}");
+        cache_home(&hermit_command(&["--version"])),
+        Some(first.clone())
+    let mut chosen = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    chosen.env("XDG_CACHE_HOME", "/chosen");
+    hermit_test::pin_canonical_epoch(&mut chosen);
+    assert_eq!(cache_home(&chosen), Some(PathBuf::from("/chosen")));
