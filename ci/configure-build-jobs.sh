@@ -2197,8 +2197,15 @@ fi
 # Cargo.lock and rust-toolchain.toml, so the inventory (973), SDK and native
 # inputs, calibrated budget, job width and limits are unchanged from the
 # 45615034 carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 50b0e681d2215a73c113e6c2200f589fa66db29f ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 50b0e681d2215a73c113e6c2200f589fa66db29f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 48226866ed690b56d81cf7a6abd402ead43b286e (2026-10-18): from
+# 50b0e681d2215a73c113e6c2200f589fa66db29f. One commit (signals lane, the SIGTRAP keep without
+# procfs on its hot paths). It changes reverie-ptrace/src/task.rs only; git
+# diff is empty under reverie-dbt/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory (973), SDK and native inputs,
+# calibrated budget, job width and limits are unchanged from the 45615034
+# carry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 48226866ed690b56d81cf7a6abd402ead43b286e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 48226866ed690b56d81cf7a6abd402ead43b286e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
