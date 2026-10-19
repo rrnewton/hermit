@@ -793,6 +793,17 @@ pub struct Config {
     #[clap(long, value_name = "filepath", conflicts_with = "replay_schedule_from")]
     pub replay_preemptions_from: Option<PathBuf>,
 
+    /// Follow a `--replay-preemptions-from` record this run cannot reproduce
+    /// (an edited record) instead of refusing it: a recorded preemption whose
+    /// time has passed while its RCB target is ahead still ends at that
+    /// target, and recorded preemptions the thread has already passed are
+    /// skipped. The run is a deterministic exploration of the record, not a
+    /// faithful replay; the run summary counts each divergence
+    /// (<https://github.com/rrnewton/hermit/issues/4497>).
+    #[clap(long, requires = "replay_preemptions_from")]
+    #[serde(default)]
+    pub replay_preemptions_lenient: bool,
+
     /// File to read recorded schedule trace from. This execution will replay the schedule verbatim
     /// from the file.
     #[clap(
@@ -2146,6 +2157,9 @@ impl fmt::Display for Config {
         if let Some(p) = &self.replay_schedule_from {
             let s = p.to_str().expect("valid unicode path");
             write!(f, " --replay-schedule-from={}", shell_words::quote(s))?;
+        }
+        if self.replay_preemptions_lenient {
+            write!(f, " --replay-preemptions-lenient")?;
         }
         if self.replay_exhausted_panic {
             write!(f, " --replay-exhausted-panic")?;
@@ -3630,6 +3644,10 @@ mod legacy_backend_json {
     /// `standard_stream_aliases` came after it too, and is set only for KVM;
     /// it is never written and reads as unset.
     const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 46] = [
+    /// `replay_preemptions_lenient` came after the legacy form froze, and DBT
+    /// refuses the preemption timer that preemption replay needs, so it is
+    /// never written and reads as false.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 21] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3676,6 +3694,7 @@ mod legacy_backend_json {
         "access_trace_max_bytes",
         "replay_continue_fairly",
         "standard_stream_aliases",
+        "replay_preemptions_lenient",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3823,6 +3842,7 @@ mod legacy_backend_json {
                     | "replay_edited_preemptions"
                     | "eager_lone_preemptions"
                     | "replay_continue_fairly",
+                    | "replay_preemptions_lenient",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is; and 0, the default.
                 Some("in_guest_reserved_signals" | "access_trace_from") => {
@@ -4177,6 +4197,7 @@ mod legacy_backend_json {
                 | "access_trace_max_records"
                 | "access_trace_max_bytes" => Ok(()),
                 "replay_continue_fairly" => Ok(()),
+                | "replay_preemptions_lenient" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -5090,6 +5111,7 @@ mod tests {
                 | "access_trace_max_records"
                 | "access_trace_max_bytes" => {}
                 "replay_continue_fairly" => {}
+                | "replay_preemptions_lenient" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -5129,6 +5151,10 @@ mod tests {
         // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
         assert_eq!(fields.len(), keys.len() + 31);
+        // `mountinfo_mount_namespace`, `signal_delivery_check_fatal`,
+        // `work_span_report` and `replay_preemptions_lenient` none: fourteen
+        // more keys, and twenty fewer, so six keys fewer than fields.
+        assert_eq!(fields.len(), keys.len() + 6);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -7271,8 +7297,37 @@ mod tests {
                     .unwrap()
                     .expired_wait_charge,
                 None
-            );
         }
+    /// `--replay-preemptions-lenient` is off by default, round-trips, reads
+    /// as off from a configuration written before it existed, and never
+    /// enters the legacy form, so the DBT guest's environment keeps its bytes
+    /// (https://github.com/rrnewton/hermit/issues/4497).
+    fn lenient_preemption_replay_is_off_by_default_and_never_enters_the_legacy_form() {
+        assert!(!Config::default().replay_preemptions_lenient);
+        let lenient = Config::parse_from([
+            "hermit",
+            "--replay-preemptions-from=/tmp/r.json",
+            "--replay-preemptions-lenient",
+        ]);
+        assert!(lenient.replay_preemptions_lenient);
+            lenient
+                .contains(" --replay-preemptions-lenient")
+        let reparsed: Config =
+            serde_json::from_str(&serde_json::to_string(&lenient).unwrap()).unwrap();
+        assert!(reparsed.replay_preemptions_lenient);
+        let mut old = serde_json::to_value(Config::default()).unwrap();
+        old.as_object_mut()
+            .unwrap()
+            .remove("replay_preemptions_lenient");
+        let old: Config = serde_json::from_value(old).unwrap();
+        assert!(!old.replay_preemptions_lenient);
+        let legacy = to_legacy_backend_json(&lenient).unwrap();
+        assert!(!legacy.contains("replay_preemptions_lenient"), "{legacy}");
+            !from_legacy_backend_json(&legacy)
+                .unwrap()
+                .replay_preemptions_lenient
+        // It needs a record to replay.
+        assert!(Config::try_parse_from(["hermit", "--replay-preemptions-lenient"]).is_err());
     }
 
     #[test]

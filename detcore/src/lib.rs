@@ -322,6 +322,7 @@ pub use shared_open_files::OpenFileControlReply;
 pub use shared_open_files::OpenFileControlTransport;
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
+pub use tool_local::PreemptionReplayDivergence;
 /// Returns whether the audited runtime policy classifies `sysno` as unsupported.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the copied-DBT-child classification surface.
@@ -442,6 +443,21 @@ use crate::types::SigWrapper;
 
 #[macro_use]
 extern crate bitflags;
+
+/// Ends the run with the policy-refusal exit, by name, because the replayed
+/// `--replay-preemptions-from` record cannot be followed
+/// (<https://github.com/rrnewton/hermit/issues/4497>).
+#[cold]
+async fn refuse_preemption_replay<G, T>(guest: &G, divergence: PreemptionReplayDivergence) -> !
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let message = format!("hermit: {divergence}");
+    error!("{message}");
+    let _ = writeln!(crate::util::RetryingStderr, "{message}");
+    unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT).await
+}
 
 #[cold]
 fn report_rcb_overshoot(
@@ -3327,8 +3343,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                     (closed.next_priority, Some(Box::new(closed.boundary)))
                 } else {
                     (thread.next_timeslice(&self.cfg), None)
-                }
-            };
 
             // A preemption replay's change point at or before the thread's
             // last one means the thread left its record (a slice closed with
@@ -3338,7 +3352,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             // replay-departure refusal instead. Publication is acknowledged before
             // abandonment, even if no other resource request follows.
             if !replay_checkpoint && maybe_prio.is_some() {
-                let thread = guest.thread_state_mut();
                 if let Err(last) = thread.file_replay_change_point(&self.cfg, end_time) {
                     tool_local::report_stale_replay_filing(
                         self.cfg.panic_on_rcb_overshoot,
@@ -3351,8 +3364,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     tool_global::replay_departure::publish(guest, last, end_time, slice).await;
                     guest.thread_state_mut().abandon_replayed_slices(&self.cfg);
                     break;
-                }
             }
+            let maybe_prio = match guest.thread_state_mut().next_timeslice(&self.cfg) {
+                Ok(prio) => prio,
+                Err(divergence) => refuse_preemption_replay(guest, divergence).await,
 
             // Depending on chaos mode, a received timer event is either a preemption or a changepoint
             let mut req = if replay_checkpoint {
@@ -5401,6 +5416,36 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let th = tool_global::thread_start_request(&self.cfg, guest, detpid).await;
 
         tool_global::finish_thread_start(&self.cfg, guest, th);
+        // Finish the delayed initialization of the full threadstate:
+        let start_priority = {
+            let ts = guest.thread_state_mut();
+            ts.preemption_points = th.map(|x| x.into_iter());
+            // The scheduler queued a replayed thread at its record's initial
+            // priority (`StartNewThread`).
+            let queued = ts
+                .preemption_points
+                .as_ref()
+                .map(crate::preemptions::ThreadHistoryIterator::initial_priority);
+            // Must be after preemption_points is set.
+            match ts.next_timeslice(&self.cfg) {
+                Ok(priority) => priority.filter(|priority| Some(*priority) != queued),
+                Err(divergence) => refuse_preemption_replay(guest, divergence).await,
+            }
+        };
+        // The start grant's deadline hint arrived before the first slice
+        // existed; cap the slice now.
+        let deadline = guest.thread_state_mut().last_grant_deadline.take();
+        tool_global::cap_timeslice_at_deadline(guest, deadline);
+        // A lenient replay that skipped the thread's first recorded
+        // preemptions starts it at another priority than the one it was
+        // queued at: publish it before the thread runs, as the end of any
+        // later slice does, so that it competes at that priority from its
+        // first instruction (https://github.com/rrnewton/hermit/issues/4497).
+        if let Some(priority) = start_priority {
+            let now = guest.thread_state().thread_logical_time.as_nanos();
+            let request = Self::priority_changepoint_request(guest, now, priority);
+            resource_request(guest, request).await;
+        }
 
         // The prehook is a noop for a thread just starting.  Can't end the timeslice.  There's no
         // RCB progress to record.  However, we call it for consistency with all the other handlers.
@@ -7714,6 +7759,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             thread_start_entered: thread_state.thread_start_entered,
             vfork_origin: thread_state.vfork_origin,
             timeslice_stats: thread_state.stats.timeslice_stats,
+            preemption_replay: thread_state.stats.preemption_replay,
             syscall_count: thread_state.stats.syscall_count,
             syscall_histogram: (&thread_state.stats.syscall_histogram).into(),
             chaos_epochs: pending_chaos_epochs,

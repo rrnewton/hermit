@@ -1847,12 +1847,15 @@
       "path": "tests/c/preemption_charge_replay.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/preemption_charge_replay.c is owned by hermit-cli/tests/cli.rs: a_capped_chaos_recording_replays_its_schedule_with_the_recordings_clock records two threads of short syscalls under --chaos --target-timeslice=20000 --cap-preemption-charge, replays the schedule with --replay-schedule-from, and requires no desync and the recording's printed virtual times; it remains a guest fixture because a generic manifest cannot compare a recording's output with its replay's."
-    },
-    {
       "disposition": "cargo-integration-test-fixture",
       "path": "tests/c/preemption_replay_syscall_slice_end.c",
       "runner": "cargo test -p hermit-run --test cli",
       "why": "tests/c/preemption_replay_syscall_slice_end.c is compiled and exercised by hermit-cli/tests/cli.rs: a sleeper's pending timed wait ends a computing worker's --chaos slices at the prehook of its next write, and the guest prints the virtual clock last; on PMU hosts (privileged-test.pmu_cli_cases) a replay of such a recording must reproduce it, so that no replayed slice ends at a PMU stop on the branch count before the prehook"
+      "path": "tests/c/preemption_replay_fork_order.c",
+      "runner": "cargo test -p hermit --test cli",
+      "why": "tests/c/preemption_replay_fork_order.c is compiled and exercised by hermit-cli/tests/cli.rs (PMU hosts, privileged-test.pmu_cli_cases): the parent prints P and the child C at once, so the output order shows which thread the scheduler ran first; a hand-written preemption record whose child's first recorded preemption has passed must, under --replay-preemptions-lenient, start the child at the surviving priority, giving the same order as the record without that entry (https://github.com/rrnewton/hermit/issues/4497)"
+      "path": "tests/c/preemption_replay_pingpong.c",
+      "why": "tests/c/preemption_replay_pingpong.c is compiled and exercised by hermit-cli/tests/cli.rs (PMU hosts, privileged-test.pmu_cli_cases): two threads pass a turn through a condition variable, so a --chaos recording carries dozens of RCB-anchored preemption points per thread; the test edits the recording and shows that a strict replay refuses a time skew and a time lag by kind with exit 122 instead of panicking, and that --replay-preemptions-lenient finishes the same edits with the guest's output and counts each divergence (https://github.com/rrnewton/hermit/issues/4497)"
     },
     {
       "disposition": "manifest-test",

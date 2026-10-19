@@ -8952,6 +8952,12 @@ impl RunOpts {
     /// A record is parsed here once more than before; for a large
     /// `--replay-schedule-from` that is a measurable but one-off cost.
     fn refuse_an_invalid_replayed_record(&self) -> Result<(), Error> {
+    /// A replayed preemption or schedule record that Detcore could not load
+    /// (unreadable, malformed, or failing `PreemptionRecord::validate`, as an
+    /// edited record can) is refused here, by name, before anything is
+    /// launched, instead of panicking in the container
+    /// (<https://github.com/rrnewton/hermit/issues/4497>).
+    fn refuse_invalid_replayed_record(&self) -> Result<(), Error> {
         if self.namespace_only {
             return Ok(());
         }
@@ -8989,6 +8995,14 @@ impl RunOpts {
                     path.display()
                 )));
             }
+        for path in [
+            &config.replay_preemptions_from,
+            &config.replay_schedule_from,
+        ]
+        .into_iter()
+        .flatten()
+            detcore::preemptions::read_valid_preemption_record(path)
+                .map_err(|why| Error::new(super::container::PolicyRefusal).context(why))?;
         }
         Ok(())
     }
@@ -10357,6 +10371,7 @@ impl RunOpts {
         // Before the epoch read below, so an unreadable, unparsable or
         // invalid replayed record is refused one way, whichever flag names it.
         self.refuse_an_invalid_replayed_record()?;
+        self.refuse_invalid_replayed_record()?;
         self.adopt_replayed_schedule_epoch()?;
         self.adopt_replayed_rng_seed()?;
         // After the replayed epoch is adopted, which makes an omitted epoch

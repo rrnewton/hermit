@@ -68,6 +68,7 @@ use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::Position;
 use detcore_model::happens_before::Strength;
 use detcore_model::happens_before::ThreadRef;
+use detcore_model::summary::PreemptionReplayDivergences;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
 use detcore_model::syscall_histogram::SparseSyscallHistogram;
@@ -2403,6 +2404,9 @@ pub struct Scheduler {
 
     /// Final syscall count reported by each thread when it deregisters.
     pub per_thread_syscalls: BTreeMap<DetTid, u64>,
+
+    /// The exited threads' lenient preemption-replay divergences, summed.
+    pub preemption_replay_divergences: PreemptionReplayDivergences,
 
     /// Counts already consumed from displaced leaders before the current
     /// transferred incarnation began reporting under the same leader TID.
@@ -5595,6 +5599,7 @@ impl Scheduler {
             granted: Default::default(),
             per_thread_timeslice: Default::default(),
             per_thread_syscalls: Default::default(),
+            preemption_replay_divergences: Default::default(),
             transferred_exec_syscall_offsets: Default::default(),
             per_thread_syscall_histograms: Default::default(),
             transferred_exec_syscall_histograms: Default::default(),
@@ -20792,6 +20797,8 @@ impl Scheduler {
                 realtime_elapsed: None,
                 timeslice_stats,
                 per_thread_timeslice,
+                preemption_replay_divergences: (!self.preemption_replay_divergences.is_empty())
+                    .then_some(self.preemption_replay_divergences),
                 // The backend, not the scheduler, measures dispatch.
                 dispatch_stats: None,
                 replay_departure: self.replay_departure.clone(),
