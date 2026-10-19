@@ -119,6 +119,10 @@ struct Segment {
     fs_paths: BTreeSet<(&'static str, String)>,
     /// The path the current syscall names, if it is a file-system syscall.
     current_path: Option<String>,
+    /// Every syscall entry and trapped instruction since the last request,
+    /// with the thread's host CPU time at that point, for offline simulation
+    /// of protocols that stop a thread at each one.
+    trace: Vec<(&'static str, u64)>,
 }
 
 /// File-system syscalls whose path the probe records when they run without
@@ -201,6 +205,11 @@ pub fn note_syscall(
     let mut segments = segments().lock().unwrap();
     let segment = segments.entry(tid.as_raw()).or_default();
     let path = shown.and_then(first_quoted);
+    if enabled() {
+        segment
+            .trace
+            .push((name, host_cpu_ns(proc_tid).unwrap_or(0)));
+    }
     if let Some((previous, _, _)) = segment.current.replace((name, args, proc_tid)) {
         *segment.counts.entry(previous).or_default() += 1;
         if let Some(previous_path) = segment.current_path.take() {
@@ -220,17 +229,15 @@ pub fn current_syscall(tid: DetTid) -> Option<(&'static str, [u64; 3])> {
 
 /// Count a trapped instruction `name` (such as `rdtsc`) that thread `tid`
 /// executed without a turn, alongside its untracked syscalls.
-pub fn note_event(tid: DetTid, name: &'static str) {
+pub fn note_event(tid: DetTid, name: &'static str, proc_tid: i32) {
     if !enabled() {
         return;
     }
+    let cpu = host_cpu_ns(proc_tid).unwrap_or(0);
     let mut segments = segments().lock().unwrap();
-    *segments
-        .entry(tid.as_raw())
-        .or_default()
-        .counts
-        .entry(name)
-        .or_default() += 1;
+    let segment = segments.entry(tid.as_raw()).or_default();
+    segment.trace.push((name, cpu));
+    *segment.counts.entry(name).or_default() += 1;
 }
 
 /// Write the syscalls thread `tid` ran since its previous request, other than
@@ -243,17 +250,25 @@ pub fn flush_segment(tid: DetTid) {
     if !enabled() {
         return;
     }
-    let (counts, requesting, fs_paths) = {
+    let (counts, requesting, fs_paths, trace) = {
         let mut segments = segments().lock().unwrap();
         let segment = segments.entry(tid.as_raw()).or_default();
         // The syscall filing this request is the next turn's own, covered by
         // its resources, so it is not counted as untracked.
         segment.current_path = None;
         let fs_paths = std::mem::take(&mut segment.fs_paths);
+        let mut trace = std::mem::take(&mut segment.trace);
+        let requesting = segment.current.take();
+        if let (Some((name, _, _)), Some((last, _))) = (requesting, trace.last())
+            && *last == name
+        {
+            trace.pop();
+        }
         (
             std::mem::take(&mut segment.counts),
-            segment.current.take(),
+            requesting,
             fs_paths,
+            trace,
         )
     };
     let target = requesting.and_then(|(name, args, proc_tid)| {
@@ -280,6 +295,7 @@ pub fn flush_segment(tid: DetTid) {
         "requesting_fd": target,
         "requesting_open_flags": open_flags,
         "fs": fs_paths.into_iter().map(|(name, path)| json!([name, path])).collect::<Vec<_>>(),
+        "trace": trace.into_iter().map(|(name, cpu)| json!([name, cpu])).collect::<Vec<_>>(),
     }));
 }
 

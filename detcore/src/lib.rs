@@ -2504,7 +2504,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let result = if guest.config().virtualize_time {
             let dettid = guest.thread_state().dettid;
             guest.thread_state_mut().thread_logical_time.add_rdtsc();
-            crate::parallelism_probe::note_event(dettid, "rdtsc");
+            crate::parallelism_probe::note_event(dettid, "rdtsc", guest.tid().as_raw());
             info!(
                 "[dtid {}] inbound rdtsc, new logical time: {:?}",
                 dettid,

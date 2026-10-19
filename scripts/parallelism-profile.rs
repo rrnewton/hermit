@@ -102,6 +102,12 @@ struct Node {
     spawn_pred: Option<usize>,
     untracked: BTreeMap<String, u64>,
     label: String,
+    /// Syscall entries and trapped instructions inside the node, as (CPU
+    /// offset from the node's start, name).
+    events: Vec<(u64, String)>,
+    /// Whether the node starts with an effect (a committed turn) rather than
+    /// a thread's birth.
+    starts_with_effect: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -121,12 +127,13 @@ struct Options {
     json_out: Option<String>,
     print_path: bool,
     print_threads: bool,
+    waves: bool,
 }
 
 fn usage() -> ExitCode {
     eprintln!(
         "usage: parallelism-profile.rs <profile.jsonl> [--run N] [--cost cpu|ltime] \
-         [--untracked-fs] [--refine] [--ablate K]... [--top N] [--json <out>] [--path] [--threads]"
+         [--untracked-fs] [--refine] [--ablate K]... [--top N] [--json <out>] [--path] [--threads] [--waves]"
     );
     ExitCode::from(2)
 }
@@ -144,6 +151,7 @@ fn parse_args() -> Result<Options, String> {
         json_out: None,
         print_path: false,
         print_threads: false,
+        waves: false,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -166,6 +174,7 @@ fn parse_args() -> Result<Options, String> {
             "--json" => opts.json_out = Some(args.next().ok_or("--json needs a value")?),
             "--path" => opts.print_path = true,
             "--threads" => opts.print_threads = true,
+            "--waves" => opts.waves = true,
             "-h" | "--help" => return Err(String::new()),
             s if s.starts_with('-') => return Err(format!("unknown option {s}")),
             s => {
@@ -241,16 +250,37 @@ struct Commit {
     /// The (syscall, path) pairs of this node's untracked file-system
     /// syscalls, when the profile recorded them.
     fs_paths: Option<Vec<(String, String)>>,
+    /// Every syscall entry and trapped instruction of this node, with the
+    /// thread's host CPU time there (profiles that record `trace`).
+    trace: Vec<(String, u64)>,
+    /// The same for the thread's work before its first commit.
+    pre_trace: Vec<(String, u64)>,
+}
+
+fn parse_trace(v: &Value) -> Vec<(String, u64)> {
+    v["trace"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| Some((e[0].as_str()?.to_string(), e[1].as_u64()?)))
+        .collect()
 }
 
 fn load_runs(path: &str) -> Result<Vec<Vec<Commit>>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    parse_runs(&text, path)
+}
+
+/// Parse a profile's text; `path` names it in errors.
+fn parse_runs(text: &str, path: &str) -> Result<Vec<Vec<Commit>>, String> {
     let mut runs: Vec<Vec<Commit>> = Vec::new();
     // Segment lines precede the commit of the request they close; they
     // describe that thread's previous node.
     let mut pending: HashMap<i64, BTreeMap<String, u64>> = HashMap::new();
     type FsPaths = Option<Vec<(String, String)>>;
-    let mut seg_for_prev: Vec<(usize, usize, BTreeMap<String, u64>, FsPaths)> = Vec::new();
+    type Trace = Vec<(String, u64)>;
+    let mut seg_for_prev: Vec<(usize, usize, BTreeMap<String, u64>, FsPaths, Trace)> = Vec::new();
+    let mut pending_trace: HashMap<i64, Trace> = HashMap::new();
     let mut last_commit_of: HashMap<i64, (usize, usize)> = HashMap::new();
     let mut requesting_fd: HashMap<i64, String> = HashMap::new();
     let mut open_flags: HashMap<i64, u64> = HashMap::new();
@@ -287,9 +317,12 @@ fn load_runs(path: &str) -> Result<Vec<Vec<Commit>>, String> {
                         .filter_map(|e| Some((e[0].as_str()?.to_string(), e[1].as_str()?.to_string())))
                         .collect()
                 });
+                let trace = parse_trace(&v);
                 // Attribute to the thread's latest commit, if any.
                 if let Some(&(r, i)) = last_commit_of.get(&tid) {
-                    seg_for_prev.push((r, i, std::mem::take(counts), fs));
+                    seg_for_prev.push((r, i, std::mem::take(counts), fs, trace));
+                } else {
+                    pending_trace.entry(tid).or_default().extend(trace);
                 }
             }
             Some("commit") => {
@@ -307,14 +340,17 @@ fn load_runs(path: &str) -> Result<Vec<Vec<Commit>>, String> {
                     requesting_fd,
                     open_flags,
                     fs_paths: None,
+                    trace: Vec::new(),
+                    pre_trace: pending_trace.remove(&tid).unwrap_or_default(),
                 });
                 last_commit_of.insert(tid, (r, runs[r].len() - 1));
             }
             _ => {}
         }
     }
-    for (r, i, counts, fs) in seg_for_prev {
+    for (r, i, counts, fs, trace) in seg_for_prev {
         let commit = &mut runs[r][i];
+        commit.trace.extend(trace);
         for (k, c) in counts {
             *commit.untracked.entry(k).or_default() += c;
         }
@@ -424,6 +460,10 @@ fn build_graph(commits: &[Commit], opts: &Options) -> Graph {
                     spawn_pred: None,
                     untracked: BTreeMap::new(),
                     label: format!("birth of tid {tid}"),
+                    // A thread's CPU time starts at zero, so a pre-commit
+                    // trace's offsets are its CPU times.
+                    events: c.pre_trace.iter().map(|(n, cpu)| (*cpu, n.clone())).collect(),
+                    starts_with_effect: false,
                 });
                 if let Some(&(_, j)) = spawned_by.get(&tid) {
                     match node_of_commit.get(j) {
@@ -607,6 +647,12 @@ fn build_graph(commits: &[Commit], opts: &Options) -> Graph {
             spawn_pred: None,
             untracked: c.untracked.clone(),
             label,
+            events: c
+                .trace
+                .iter()
+                .map(|(n, cpu)| (cpu.saturating_sub(c.v["cpu_ns"].as_u64().unwrap_or(0)), n.clone()))
+                .collect(),
+            starts_with_effect: true,
         });
         last_node_of.insert(tid, idx);
         if let Some(births) = pending_birth.remove(&node_of_commit.len()) {
@@ -623,6 +669,306 @@ fn build_graph(commits: &[Commit], opts: &Options) -> Graph {
         kinds,
         untracked_total,
     }
+}
+
+
+/// Syscalls that run inside a compute segment in the wave protocol's first
+/// prototype: memory management, signal state and identity reads.
+const PRIVATE_MIN: &[&str] = &[
+    "brk", "mmap", "munmap", "mprotect", "madvise", "mremap", "rt_sigaction",
+    "rt_sigprocmask", "sigaltstack", "getpid", "gettid", "getuid", "geteuid", "getgid",
+    "getegid", "getppid", "arch_prctl", "set_tid_address", "set_robust_list", "rseq",
+    "prlimit64", "sched_getaffinity", "uname",
+];
+/// Descriptor I/O that is private once Detcore tracks private open files.
+const PRIVATE_FDIO: &[&str] = &[
+    "read", "pread64", "readv", "write", "pwrite64", "writev", "lseek", "fstat", "close",
+];
+
+/// One wave-simulation configuration.
+#[derive(Clone, Copy, Debug)]
+struct WaveConfig {
+    width: usize,
+    effect_ns: u64,
+    quantum_ns: Option<u64>,
+    fdio_private: bool,
+}
+
+#[derive(Debug, Default)]
+struct WaveResult {
+    wall_ns: u64,
+    waves: u64,
+    effects: u64,
+    compute_ns: u64,
+}
+
+/// Fine segments of a node: (begins with an effect, compute duration).
+fn fine_segments(node: &Node, cfg: &WaveConfig) -> Vec<(bool, u64)> {
+    let private = |name: &str| {
+        PRIVATE_MIN.contains(&name) || (cfg.fdio_private && PRIVATE_FDIO.contains(&name))
+    };
+    let mut cuts: Vec<u64> = node
+        .events
+        .iter()
+        .filter(|(_, name)| !private(name))
+        .map(|(offset, _)| (*offset).min(node.cost))
+        .collect();
+    cuts.sort_unstable();
+    let mut bounds = vec![0u64];
+    bounds.extend(cuts);
+    bounds.push(node.cost);
+    let mut segs = Vec::new();
+    for k in 0..bounds.len() - 1 {
+        let effect = if k == 0 { node.starts_with_effect } else { true };
+        let mut length = bounds[k + 1] - bounds[k];
+        let mut first = true;
+        loop {
+            let piece = match cfg.quantum_ns {
+                Some(q) if length > q => q,
+                _ => length,
+            };
+            segs.push((effect && first, piece));
+            length -= piece;
+            first = false;
+            if length == 0 {
+                break;
+            }
+        }
+    }
+    segs
+}
+
+
+type Preds = (Vec<Vec<usize>>, Vec<Vec<usize>>, BTreeMap<i64, Vec<usize>>);
+
+/// Per node: the earlier nodes that must be done before it starts (its
+/// thread's previous node, its spawner's, the previous holder of its address
+/// space) and those whose starting effect must have committed (earlier
+/// conflicting checkouts, effect model); and each thread's nodes in order.
+fn wave_predecessors(g: &Graph) -> Preds {
+    let n = g.nodes.len();
+    // Predecessors that must be done, and whose starting effect must have run.
+    let mut preds_done: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut preds_start: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut last_writer: HashMap<&str, usize> = HashMap::new();
+    let mut readers: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut last_mm: HashMap<&str, usize> = HashMap::new();
+    let mut last_of_tid: HashMap<i64, usize> = HashMap::new();
+    let mut thread_nodes: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    for (i, node) in g.nodes.iter().enumerate() {
+        if let Some(&p) = last_of_tid.get(&node.tid) {
+            preds_done[i].push(p);
+        }
+        if let Some(p) = node.spawn_pred {
+            preds_done[i].push(p);
+        }
+        if let Some(mm) = &node.mm {
+            if let Some(&p) = last_mm.get(mm.as_str()) {
+                if g.nodes[p].tid != node.tid {
+                    preds_done[i].push(p);
+                }
+            }
+            last_mm.insert(mm.as_str(), i);
+        }
+        for (_, key, perm) in &node.res {
+            if let Some(&w) = last_writer.get(key.as_str()) {
+                preds_start[i].push(w);
+            }
+            match perm {
+                Perm::W => {
+                    if let Some(rs) = readers.remove(key.as_str()) {
+                        preds_start[i].extend(rs);
+                    }
+                    last_writer.insert(key.as_str(), i);
+                }
+                Perm::R => readers.entry(key.as_str()).or_default().push(i),
+            }
+        }
+        last_of_tid.insert(node.tid, i);
+        thread_nodes.entry(node.tid).or_default().push(i);
+    }
+    (preds_done, preds_start, thread_nodes)
+}
+
+/// Simulate the logical-wave protocol of the compute-overlap design over the
+/// happens-before graph: in each wave every ready thread (one per address
+/// space) executes its pending effect, serially, then its next compute
+/// segment, all segments in parallel on `width` CPUs, then a barrier.
+/// Readiness follows the effect model: a node may start once its thread's
+/// and its spawner's earlier nodes are done, every earlier node holding its
+/// address space is done, and every earlier conflicting checkout's starting
+/// effect has executed in an earlier wave.
+fn simulate_waves(g: &Graph, cfg: &WaveConfig) -> WaveResult {
+    let n = g.nodes.len();
+    let (preds_done, preds_start, thread_nodes) = wave_predecessors(g);
+    let segs: Vec<Vec<(bool, u64)>> = g.nodes.iter().map(|nd| fine_segments(nd, cfg)).collect();
+    let mut started: Vec<Option<u64>> = vec![None; n];
+    let mut done = vec![false; n];
+    // Per thread: position (index into its node list, segment index).
+    let mut pos: BTreeMap<i64, (usize, usize)> = thread_nodes.keys().map(|t| (*t, (0, 0))).collect();
+    let mut result = WaveResult::default();
+    let mut remaining = n;
+    let mut wave: u64 = 0;
+    while remaining > 0 {
+        // Candidates in key order: the index of each thread's current node.
+        let mut cands: Vec<(usize, i64)> = Vec::new();
+        for (tid, (ni, si)) in &pos {
+            let list = &thread_nodes[tid];
+            if *ni >= list.len() {
+                continue;
+            }
+            let node = list[*ni];
+            let ready = *si > 0
+                || (preds_done[node].iter().all(|p| done[*p])
+                    && preds_start[node]
+                        .iter()
+                        .all(|p| started[*p].is_some_and(|w| w < wave)));
+            if ready {
+                cands.push((node, *tid));
+            }
+        }
+        cands.sort_unstable();
+        let mut used_mm: HashSet<&str> = HashSet::new();
+        let mut members: Vec<(usize, i64)> = Vec::new();
+        for (node, tid) in cands {
+            if let Some(mm) = &g.nodes[node].mm {
+                if !used_mm.insert(mm.as_str()) {
+                    continue;
+                }
+            }
+            members.push((node, tid));
+        }
+        if members.is_empty() {
+            // Nothing can start: the graph orders something this protocol
+            // cannot reach (should not happen); stop rather than spin.
+            eprintln!("parallelism-profile: wave simulation stalled with {remaining} nodes left");
+            break;
+        }
+        let mut effects = 0u64;
+        let mut durations: Vec<u64> = Vec::with_capacity(members.len());
+        for (node, tid) in &members {
+            let (_, si) = pos[tid];
+            let (effect, length) = segs[*node].get(si).copied().unwrap_or((false, 0));
+            if effect {
+                effects += 1;
+            }
+            if si == 0 {
+                started[*node] = Some(wave);
+            }
+            durations.push(length);
+        }
+        // Longest-processing-time list schedule on `width` CPUs.
+        durations.sort_unstable_by(|a, b| b.cmp(a));
+        let mut cpus = vec![0u64; cfg.width.max(1)];
+        for d in &durations {
+            let least = cpus.iter_mut().min().unwrap();
+            *least += d;
+        }
+        let makespan = *cpus.iter().max().unwrap();
+        result.wall_ns += effects * cfg.effect_ns + makespan;
+        result.effects += effects;
+        result.compute_ns += durations.iter().sum::<u64>();
+        result.waves += 1;
+        for (node, tid) in &members {
+            let p = pos.get_mut(tid).unwrap();
+            p.1 += 1;
+            if p.1 >= segs[*node].len() {
+                done[*node] = true;
+                remaining -= 1;
+                p.0 += 1;
+                p.1 = 0;
+            }
+        }
+        wave += 1;
+    }
+    result
+}
+
+
+/// Simulate the barrier-free protocol of the compute-overlap design with
+/// unbounded CPUs: threads compute independently, and every effect commits
+/// through one serial server, in the order the effects become ready (which is
+/// what committing in virtual-time order approximates when every thread's
+/// virtual clock advances with its own work). An effect costs `effect_ns` of
+/// server time. Node readiness follows the effect model as in the wave
+/// simulation. Returns the wall time and the server's busy time.
+fn simulate_ordered(g: &Graph, cfg: &WaveConfig) -> (u64, u64) {
+    let n = g.nodes.len();
+    let (preds_done, preds_start, thread_nodes) = wave_predecessors(g);
+    let segs: Vec<Vec<(bool, u64)>> = g.nodes.iter().map(|nd| fine_segments(nd, cfg)).collect();
+    let mut start_at: Vec<Option<u64>> = vec![None; n];
+    let mut done_at: Vec<Option<u64>> = vec![None; n];
+    // Per thread: (index into its node list, segment index, time it is free).
+    let mut state: BTreeMap<i64, (usize, usize, u64)> =
+        thread_nodes.keys().map(|t| (*t, (0, 0, 0))).collect();
+    let mut server_free = 0u64;
+    let mut busy = 0u64;
+    let mut remaining = n;
+    loop {
+        // The thread whose next step can happen earliest. One step is one
+        // segment, so effects reach the server in time order.
+        let mut best: Option<(u64, i64)> = None;
+        for (tid, (ni, si, free)) in &state {
+            let list = &thread_nodes[tid];
+            if *ni >= list.len() {
+                continue;
+            }
+            let node = list[*ni];
+            let mut ready = *free;
+            if *si == 0 {
+                let mut resolved = true;
+                for p in &preds_done[node] {
+                    match done_at[*p] {
+                        Some(t) => ready = ready.max(t),
+                        None => resolved = false,
+                    }
+                }
+                for p in &preds_start[node] {
+                    match start_at[*p] {
+                        Some(t) => ready = ready.max(t),
+                        None => resolved = false,
+                    }
+                }
+                if !resolved {
+                    continue;
+                }
+            }
+            if best.is_none_or(|(b, _)| ready < b) {
+                best = Some((ready, *tid));
+            }
+        }
+        let Some((ready, tid)) = best else {
+            if remaining > 0 {
+                eprintln!("parallelism-profile: ordered simulation stalled with {remaining} nodes left");
+            }
+            break;
+        };
+        let (ni, si, _) = state[&tid];
+        let node = thread_nodes[&tid][ni];
+        let (effect, compute) = segs[node][si];
+        let mut t = ready;
+        if effect {
+            let commit = t.max(server_free);
+            server_free = commit + cfg.effect_ns;
+            busy += cfg.effect_ns;
+            t = commit + cfg.effect_ns;
+            if si == 0 {
+                start_at[node] = Some(commit);
+            }
+        } else if si == 0 {
+            start_at[node] = Some(t);
+        }
+        t += compute;
+        let st = state.get_mut(&tid).unwrap();
+        if si + 1 >= segs[node].len() {
+            done_at[node] = Some(t);
+            remaining -= 1;
+            *st = (ni + 1, 0, t);
+        } else {
+            *st = (ni, si + 1, t);
+        }
+    }
+    (done_at.iter().filter_map(|t| *t).max().unwrap_or(0), busy)
 }
 
 /// Why a node could not start earlier.
@@ -912,6 +1258,83 @@ fn main() -> ExitCode {
             "blame": blame.iter().take(opts.top).map(|(k, c, n)| json!({"edge": k, "ns": c, "nodes": n})).collect::<Vec<_>>(),
         });
     }
+    if opts.waves {
+        let effect_model = schedule(&g, Model::Effect);
+        let traced: usize = g.nodes.iter().map(|n| n.events.len()).sum();
+        let bound = ratio(effect_model.work, effect_model.span);
+        println!();
+        println!(
+            "protocol simulation (effect model: work {} span {} work/span {:.2}; {} traced events)",
+            ms(effect_model.work),
+            ms(effect_model.span),
+            bound,
+            traced
+        );
+        println!("  serial = work + effects x effect cost; speedup = serial / wall; 'of bound' = speedup / work/span");
+        println!("  ordered>= / ordered<= bracket the barrier-free protocol on that many CPUs (best/worst greedy)");
+        println!(
+            "  {:<9} {:>5} {:>6} {:>7} {:>5}  {:>11} {:>11} {:>8} {:>9} {:>8}",
+            "protocol", "width", "effect", "quantum", "fdio", "serial", "wall", "speedup", "effects", "of bound"
+        );
+        let mut rows = Vec::new();
+        for fdio in [false, true] {
+            for effect_us in [0u64, 20, 100] {
+                let mut emit = |protocol: &str, width: String, quantum: Option<u64>, wall: u64, effects: u64, serial: u64, waves: u64, rows: &mut Vec<Value>| {
+                    let speedup = serial as f64 / wall.max(1) as f64;
+                    println!(
+                        "  {:<9} {:>5} {:>4}us {:>7} {:>5}  {:>11} {:>11} {:>8.2} {:>9} {:>7.0}%",
+                        protocol,
+                        width,
+                        effect_us,
+                        quantum.map_or("none".to_string(), |q| format!("{:.1}ms", q as f64 / 1e6)),
+                        if fdio { "yes" } else { "no" },
+                        ms(serial),
+                        ms(wall),
+                        speedup,
+                        effects,
+                        100.0 * speedup / bound
+                    );
+                    rows.push(json!({
+                        "protocol": protocol, "width": width, "effect_us": effect_us,
+                        "quantum_ns": quantum, "fdio_private": fdio, "serial_ns": serial,
+                        "wall_ns": wall, "speedup": speedup, "effects": effects, "waves": waves,
+                    }));
+                };
+                for quantum in [None, Some(5_000_000u64), Some(1_000_000u64), Some(200_000u64)] {
+                    for width in [8usize, 16] {
+                        let cfg = WaveConfig { width, effect_ns: effect_us * 1000, quantum_ns: quantum, fdio_private: fdio };
+                        let r = simulate_waves(&g, &cfg);
+                        let serial = r.compute_ns + r.effects * cfg.effect_ns;
+                        emit("waves", width.to_string(), quantum, r.wall_ns, r.effects, serial, r.waves, &mut rows);
+                    }
+                }
+                let cfg = WaveConfig { width: usize::MAX, effect_ns: effect_us * 1000, quantum_ns: None, fdio_private: fdio };
+                let (wall_inf, busy) = simulate_ordered(&g, &cfg);
+                let effects = busy / cfg.effect_ns.max(1);
+                let effects = if cfg.effect_ns == 0 {
+                    g.nodes.iter().map(|nd| fine_segments(nd, &cfg).iter().filter(|(e, _)| *e).count() as u64).sum()
+                } else {
+                    effects
+                };
+                let serial = effect_model.work + effects * cfg.effect_ns;
+                emit("ordered", "inf".to_string(), None, wall_inf, effects, serial, 0, &mut rows);
+                for width in [8u64, 16] {
+                    // On `width` CPUs: at least the larger of work/width and
+                    // the unbounded-CPU time, at most their sum (Brent).
+                    let low = (effect_model.work / width).max(wall_inf);
+                    let high = effect_model.work / width + wall_inf;
+                    emit("ordered>=", width.to_string(), None, low, effects, serial, 0, &mut rows);
+                    emit("ordered<=", width.to_string(), None, high, effects, serial, 0, &mut rows);
+                }
+            }
+        }
+        summary["protocols"] = json!({
+            "effect_model_work_ns": effect_model.work,
+            "effect_model_span_ns": effect_model.span,
+            "traced_events": traced,
+            "rows": rows,
+        });
+    }
     if let Some(out) = &opts.json_out
         && let Err(e) = std::fs::write(out, serde_json::to_string_pretty(&summary).unwrap() + "\n")
     {
@@ -920,3 +1343,122 @@ fn main() -> ExitCode {
     }
     ExitCode::SUCCESS
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts() -> Options {
+        Options {
+            path: String::new(),
+            run: None,
+            cost_ltime: false,
+            untracked_fs: false,
+            refine: false,
+            ablate: Vec::new(),
+            top: 8,
+            json_out: None,
+            print_path: false,
+            print_threads: false,
+            waves: false,
+        }
+    }
+
+    /// A commit line for `tid` at `turn`, with host CPU `cpu` ms and
+    /// resources `res` (JSON).
+    fn commit(turn: u64, tid: i64, cpu_ms: u64, res: &str) -> String {
+        format!(
+            r#"{{"event":"commit","turn":{turn},"tid":{tid},"pid":{tid},"mm":{{"creator":{tid},"generation":1}},"cpu_ns":{},"ltime_ns":0,"poll":0,"fyi":"","res":{res}}}"#,
+            cpu_ms * 1_000_000
+        )
+    }
+
+    /// Thread 1 forks thread 2; each then computes 100 ms and checks out
+    /// `res2` and `res1` respectively before exiting.
+    fn fork_pair(res1: &str, res2: &str) -> String {
+        [
+            r#"{"event":"start","host_pid":1}"#.to_string(),
+            commit(0, 1, 0, "[]"),
+            commit(1, 1, 0, r#"[[{"ParentContinue":{"parent":1,"child":2}},"W"]]"#),
+            commit(2, 2, 0, "[]"),
+            commit(3, 1, 0, res1),
+            commit(4, 2, 0, res2),
+            commit(5, 1, 100, "[]"),
+            commit(6, 2, 100, "[]"),
+        ]
+        .join("\n")
+    }
+
+    fn project(text: &str, model: Model) -> (u64, u64) {
+        let runs = parse_runs(text, "test").unwrap();
+        let g = build_graph(runs.last().unwrap(), &opts());
+        let s = schedule(&g, model);
+        (s.work, s.span)
+    }
+
+    #[test]
+    fn independent_children_overlap() {
+        let text = fork_pair(r#"[[{"Path":"a"},"W"]]"#, r#"[[{"Path":"b"},"W"]]"#);
+        for model in [Model::Lock, Model::Effect] {
+            let (work, span) = project(&text, model);
+            assert_eq!(work, 200_000_000);
+            assert_eq!(span, 100_000_000);
+        }
+    }
+
+    #[test]
+    fn a_conflicting_checkout_serializes_under_the_lock_model() {
+        let text = fork_pair(r#"[[{"Path":"a"},"W"]]"#, r#"[[{"Path":"a"},"W"]]"#);
+        assert_eq!(project(&text, Model::Lock), (200_000_000, 200_000_000));
+        // Under the effect model only the syscall at the node's start is
+        // ordered; the computation after it overlaps.
+        assert_eq!(project(&text, Model::Effect), (200_000_000, 100_000_000));
+    }
+
+    #[test]
+    fn readers_do_not_conflict() {
+        let text = fork_pair(r#"[[{"Path":"a"},"R"]]"#, r#"[[{"Path":"a"},"R"]]"#);
+        assert_eq!(project(&text, Model::Lock), (200_000_000, 100_000_000));
+    }
+
+    #[test]
+    fn one_thread_projects_one() {
+        let text = [
+            r#"{"event":"start","host_pid":1}"#.to_string(),
+            commit(0, 1, 0, "[]"),
+            commit(1, 1, 50, r#"[[{"Path":"a"},"R"]]"#),
+            commit(2, 1, 120, "[]"),
+        ]
+        .join("\n");
+        let (work, span) = project(&text, Model::Effect);
+        assert_eq!(work, span);
+        assert_eq!(work, 120_000_000);
+    }
+
+    #[test]
+    fn the_last_run_of_an_appended_file_is_the_default() {
+        let text = format!("{}\n{}", fork_pair("[]", "[]"), fork_pair("[]", "[]"));
+        assert_eq!(parse_runs(&text, "test").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn barrier_free_protocol_reaches_the_bound_without_effect_cost() {
+        let text = fork_pair(r#"[[{"Path":"a"},"W"]]"#, r#"[[{"Path":"b"},"W"]]"#);
+        let runs = parse_runs(&text, "test").unwrap();
+        let g = build_graph(runs.last().unwrap(), &opts());
+        let cfg = WaveConfig { width: 8, effect_ns: 0, quantum_ns: None, fdio_private: false };
+        let (wall, _) = simulate_ordered(&g, &cfg);
+        assert_eq!(wall, 100_000_000);
+        // Waves advance each thread one segment per wave, and the child
+        // reaches its long segment one wave after its parent (its birth waits
+        // for the cloning node), so the two 100 ms segments fall in
+        // different waves: the barrier cost this simulation exists to show.
+        assert_eq!(simulate_waves(&g, &cfg).wall_ns, 200_000_000);
+        // With effects costing 1 ms each, the seven committed turns serialize.
+        let cfg = WaveConfig { effect_ns: 1_000_000, ..cfg };
+        let (wall, busy) = simulate_ordered(&g, &cfg);
+        assert!(wall >= 100_000_000 && wall <= 107_000_000, "wall {wall}");
+        assert_eq!(busy, 7_000_000);
+    }
+}
+
