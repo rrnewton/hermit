@@ -2313,8 +2313,14 @@ fi
 # reverie-dbt/ and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml,
 # so the inventory (989), SDK and native inputs, calibrated budget, job width
 # and limits are unchanged from the e7bf2d9b carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 9547c3594d3881dead7d0e7a04ea5f32df7a7745 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 9547c3594d3881dead7d0e7a04ea5f32df7a7745 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 826ada27fcae71e1b00a91fed65cb36aa7529062 (2026-10-19): from
+# 9547c3594d3881dead7d0e7a04ea5f32df7a7745, only native/client.c changes.
+# First-image admission/context changes require a fresh native client/runtime.
+# build.rs, native/CMakeLists.txt and vendor/dynamorio stay byte-identical, so
+# the existing SDK recipe and resource budget carry without a cold SDK build.
+# This is not runtime-correctness or binary/package identity evidence.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 826ada27fcae71e1b00a91fed65cb36aa7529062 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 826ada27fcae71e1b00a91fed65cb36aa7529062 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

@@ -2237,7 +2237,14 @@ fi
 # reverie-dbt/ and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml,
 # so the inventory (989), SDK and native inputs, calibrated budget, job width
 # and limits are unchanged from the e7bf2d9b carry.
-expected_pin=9547c3594d3881dead7d0e7a04ea5f32df7a7745
+# CARRY TO 826ada27fcae71e1b00a91fed65cb36aa7529062 (2026-10-19): from
+# 9547c3594d3881dead7d0e7a04ea5f32df7a7745, only native/client.c changes:
+# fresh-image admission now precedes the first application instruction and
+# supplies its actual PC through the existing context callback. build.rs,
+# native/CMakeLists.txt and vendor/dynamorio are unchanged, so the existing
+# SDK recipe/budget carry remains valid. The native client and Hermit runtime
+# must be rebuilt; this does not carry runtime correctness or package bytes.
+expected_pin=826ada27fcae71e1b00a91fed65cb36aa7529062
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

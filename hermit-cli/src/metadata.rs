@@ -739,7 +739,14 @@ impl RecordVersion {
 // longer issue physical arms/rearms or manufacture skid state. This
 // observable-behavior correction takes a new label even though the event
 // layout is unchanged.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x177);
+// 0x177 -> 0x17a (provisional queue hint, not a wait for 0x178/0x179;
+// choose actual HIGHEST_SHIPPED + 1 and coordinate the number at landing):
+// fresh-image DBT Tool start and postexec now run before the first application
+// instruction with its actual entry PC and live SP. Earlier images admitted
+// those hooks at their first syscall, after guest instructions had executed.
+// The lifecycle timing/context is observable even with an unchanged wire
+// layout, so recordings require a new behavior version.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17a);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -764,7 +771,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x177);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x177;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17a;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
