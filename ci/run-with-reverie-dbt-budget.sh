@@ -2145,7 +2145,15 @@ fi
 # neither is in the DBT dependency closure, whose locked packages are identical.
 # Native SDK recipe/source inputs, inventory 973, budgets and job limits carry
 # unchanged. This is not a claim that the whole workspace lock is unchanged.
-expected_pin=9ded00ff4ab82e48368e0113f65e954d3533bc3f
+# CARRY TO 30553afb2094cc4d4ed8c3fe8b6bcffb74267e23 (2026-10-19): from
+# 9ded00ff4ab82e48368e0113f65e954d3533bc3f. One commit (signals lane, A5 step 3.0a:
+# injected syscalls run under the guest's own mask). It changes
+# reverie-ptrace/src/task.rs, sigtrap_state.rs and its plain-guest fixture and
+# tests only; git diff is empty under reverie-dbt/ and for the root Cargo.toml,
+# Cargo.lock and rust-toolchain.toml, so the inventory (973), SDK and native
+# inputs, calibrated budget, job width and limits are unchanged from the
+# 45615034 carry.
+expected_pin=30553afb2094cc4d4ed8c3fe8b6bcffb74267e23
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
