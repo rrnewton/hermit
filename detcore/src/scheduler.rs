@@ -2004,6 +2004,10 @@ pub struct Scheduler {
     /// `HappensBeforeProgram`. Holds AFTER anchors until their BEFORE anchors
     /// fire, deterministically constructing an authored race ordering.
     happens_before: Option<HbRuntime>,
+
+    /// The measurement-only parallelism profile, present only when
+    /// `HERMIT_PARALLELISM_PROFILE` is set (`crate::parallelism_probe`).
+    pub(crate) parallelism_probe: Option<crate::parallelism_probe::ParallelismProbe>,
 }
 
 type StacktraceEventsIter = Peekable<IntoIter<(u64, Option<SchedEvent>, Option<PathBuf>)>>;
@@ -4024,6 +4028,9 @@ impl Scheduler {
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
             post_fork_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed() ^ 0x706f_7374_666f_726b),
             happens_before: cfg.happens_before.clone().map(HbRuntime::new),
+            parallelism_probe: crate::parallelism_probe::ParallelismProbe::from_env(
+                cfg.backend.tool_shares_guest_descriptor_table,
+            ),
         }
     }
 
@@ -13605,6 +13612,19 @@ impl Scheduler {
             ),
             _ => (false, false, false),
         };
+        if self.parallelism_probe.is_some()
+            && let Some(Ok(rs)) = self
+                .next_turns
+                .get(&dtid)
+                .and_then(|turn| turn.req.try_read())
+        {
+            let mm = self.thread_mm(dtid);
+            let physical = self.procfs_kernel_ids.get(&dtid).copied();
+            let turn = self.turn;
+            if let Some(probe) = self.parallelism_probe.as_mut() {
+                probe.note_commit(turn, dtid, &rs, mm, physical);
+            }
+        }
         self.progress_epoch += 1;
         self.last_commit_at.insert(dtid, self.progress_epoch);
         let previous_grant = self.guest_state_polled_at.remove(&dtid);
