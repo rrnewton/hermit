@@ -92,6 +92,11 @@ pub fn enabled() -> bool {
     writer().is_some()
 }
 
+/// Append an arbitrary event to the profile; a no-op when it is disabled.
+pub fn note(value: serde_json::Value) {
+    line(value);
+}
+
 fn line(value: serde_json::Value) {
     let Some(writer) = writer() else {
         return;

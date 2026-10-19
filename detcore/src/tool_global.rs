@@ -2511,6 +2511,15 @@ impl GlobalState {
             request => request,
         };
         let time_from_guest = guest_time.as_nanos();
+        if crate::scheduler::parallel_order::exit_order()
+            && matches!(request, GlobalRequest::RequestResources(..))
+        {
+            // The thread's own computation and syscalls, excluding clock
+            // advances (`DetTime::advance_to`), for the exit-order experiment.
+            let work =
+                guest_time.user_cpu_time().as_nanos() + guest_time.system_cpu_time().as_nanos();
+            self.sched.lock().unwrap().exit_order_note_work(dtid, work);
+        }
         // Exec transfer messages authenticate both incarnations before ordinary
         // sender-clock accounting. The carried clock still belongs to the former
         // thread until the successful reconnect commits.

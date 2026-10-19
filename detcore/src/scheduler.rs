@@ -13,6 +13,7 @@ pub(crate) mod discarded_at_send;
 #[cfg(test)]
 pub(crate) mod exec_teardown_tests;
 pub(crate) mod itimer_coalesce;
+pub(crate) mod parallel_order;
 pub(crate) mod parked;
 #[cfg(test)]
 mod parked_tests;
@@ -2008,6 +2009,10 @@ pub struct Scheduler {
     /// The measurement-only parallelism profile, present only when
     /// `HERMIT_PARALLELISM_PROFILE` is set (`crate::parallelism_probe`).
     pub(crate) parallelism_probe: Option<crate::parallelism_probe::ParallelismProbe>,
+
+    /// State of the study-branch exit-order experiment
+    /// (`HERMIT_PARALLEL_EXIT_ORDER`, [`parallel_order`]); empty when off.
+    exit_order: parallel_order::ExitOrderState,
 }
 
 type StacktraceEventsIter = Peekable<IntoIter<(u64, Option<SchedEvent>, Option<PathBuf>)>>;
@@ -3788,6 +3793,7 @@ enum ThreadStatus {
 impl Scheduler {
     /// Create a new scheduler based on the configuration.
     pub fn new(cfg: &Config) -> Self {
+        parallel_order::refuse_unsupported_modes(cfg.recordreplay_modes);
         let (replayer, m_vec) = match &cfg.replay_schedule_from {
             Some(path) => {
                 trace!("Scheduler loading trace from path {}", path.display());
@@ -4029,6 +4035,7 @@ impl Scheduler {
             post_fork_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed() ^ 0x706f_7374_666f_726b),
             happens_before: cfg.happens_before.clone().map(HbRuntime::new),
             parallelism_probe: crate::parallelism_probe::ParallelismProbe::from_env(),
+            exit_order: Default::default(),
         }
     }
 
@@ -7441,6 +7448,9 @@ impl Scheduler {
         {
             return Err(SkipTurn);
         }
+        if self.exit_order_release() {
+            return Err(SkipTurn);
+        }
         self.step2c_process_io_blockers()?;
         self.step2e_process_signal_deferred();
         self.step2d_handle_empty_queue(global_time)
@@ -7665,11 +7675,26 @@ impl Scheduler {
                     }
                     _ => false,
                 };
-                remove.then_some(*parent)
+                let rejoins = remove
+                    && child_registered
+                    && self
+                        .next_turns
+                        .get(parent)
+                        .and_then(|turn| turn.req.try_read())
+                        .and_then(|req| req.ok())
+                        .is_some_and(|resources| {
+                            resources.resources.keys().any(|resource| {
+                                matches!(resource, ResourceID::BlockedExternalContinue(_))
+                            })
+                        });
+                remove.then_some((*parent, rejoins))
             })
             .collect();
-        for parent in completed_parents {
+        for (parent, rejoins) in completed_parents {
             self.drop_vfork_barrier(parent);
+            if rejoins {
+                self.vfork_rejoin_readmit(parent);
+            }
         }
 
         // A pending barrier waits for its child's registration, a released one
@@ -12770,6 +12795,13 @@ impl Scheduler {
                     self.parked.exits_awaiting_permit.insert(dettid);
                     return self.skip_turn_blocked(dettid);
                 }
+                if self.exit_order_hold(dettid, *group) {
+                    info!(
+                        "[scheduler] NONCOMMIT turn {}, holding dettid {}'s exit for the virtual-completion exit order",
+                        self.turn, dettid
+                    );
+                    return self.skip_turn_blocked(dettid);
+                }
                 let reserve_mode = match self.reserve_exit_boundary(dettid, *process, *mm, *group) {
                     Ok(mode) => mode,
                     Err(failure) => {
@@ -12794,6 +12826,7 @@ impl Scheduler {
                             .any(|tid| tid != dettid && self.next_turns.contains_key(&tid)))
                 {
                     self.thread_tree.granted_exits.insert(exiting);
+                    self.exit_order_note_granted(exiting);
                     self.note_pid_namespace_end(exiting);
                 }
                 // An exit_group ends every thread of the group, and on a

@@ -46,7 +46,7 @@
 //! taking a turn are not covered by any declared resource; the profile lists
 //! them per node (`segment` lines). `--untracked-fs` makes a node whose
 //! untracked syscalls touch the file system hold the paths they name (read
-//! for lookups; write, plus the parent directory, for mutations), or one
+//! for lookups, write for mutations; directory listings are not keyed), or one
 //! global `FS` resource for a profile that did not record paths; a node that waited for a child
 //! without a turn (WNOHANG) hold its child table, and a node that signalled
 //! without one hold a global `Signals` resource, bracketing that hole.
@@ -115,12 +115,13 @@ struct Options {
     top: usize,
     json_out: Option<String>,
     print_path: bool,
+    print_threads: bool,
 }
 
 fn usage() -> ExitCode {
     eprintln!(
         "usage: parallelism-profile.rs <profile.jsonl> [--run N] [--cost cpu|ltime] \
-         [--untracked-fs] [--refine] [--ablate K]... [--top N] [--json <out>] [--path]"
+         [--untracked-fs] [--refine] [--ablate K]... [--top N] [--json <out>] [--path] [--threads]"
     );
     ExitCode::from(2)
 }
@@ -137,6 +138,7 @@ fn parse_args() -> Result<Options, String> {
         top: 8,
         json_out: None,
         print_path: false,
+        print_threads: false,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -158,6 +160,7 @@ fn parse_args() -> Result<Options, String> {
             }
             "--json" => opts.json_out = Some(args.next().ok_or("--json needs a value")?),
             "--path" => opts.print_path = true,
+            "--threads" => opts.print_threads = true,
             "-h" | "--help" => return Err(String::new()),
             s if s.starts_with('-') => return Err(format!("unknown option {s}")),
             s => {
@@ -510,28 +513,16 @@ fn build_graph(commits: &[Commit], opts: &Options) -> Graph {
         }
         if opts.untracked_fs {
             match &c.fs_paths {
-                // Path-keyed: a lookup reads its path; a mutation writes its
-                // path and its parent directory's entries. A directory
-                // listing's directory is not recorded, so it reads one
-                // shared `Dir:?` key that mutations do not write: that case
-                // stays unbracketed.
+                // Path-keyed: a lookup reads its path and a mutation writes
+                // it. A directory listing's directory is not recorded; it
+                // reads one shared `Dir:?` key nothing writes, so listings
+                // stay unbracketed.
                 Some(paths) => {
                     for (name, path) in paths {
                         let mutates = FS_MUTATE.contains(&name.as_str());
                         let key = format!("Path:{path}");
                         if !ablated("Path", &key) {
                             res.push(("Path".into(), key, if mutates { Perm::W } else { Perm::R }));
-                        }
-                        if mutates {
-                            let parent = match path.rfind('/') {
-                                Some(0) => "/".to_string(),
-                                Some(i) => path[..i].to_string(),
-                                None => ".".to_string(),
-                            };
-                            let key = format!("Dir:{parent}");
-                            if !ablated("Dir", &key) {
-                                res.push(("Dir".into(), key, Perm::W));
-                            }
                         }
                     }
                     if c.untracked.keys().any(|s| s.starts_with("getdents")) && !ablated("Dir", "Dir:?") {
@@ -864,6 +855,25 @@ fn main() -> ExitCode {
                     why,
                     g.nodes[i].label
                 );
+            }
+        }
+        if opts.print_threads {
+            // Per thread: first start, last finish, and the turn of its last
+            // commit, in order of last commit.
+            let mut spans: BTreeMap<i64, (u64, u64, i64)> = BTreeMap::new();
+            for (i, node) in g.nodes.iter().enumerate() {
+                let e = spans.entry(node.tid).or_insert((u64::MAX, 0, -1));
+                e.0 = e.0.min(s.start[i]);
+                e.1 = e.1.max(s.finish[i]);
+                if let Some(t) = node.turn {
+                    e.2 = e.2.max(t);
+                }
+            }
+            let mut rows: Vec<_> = spans.into_iter().collect();
+            rows.sort_by_key(|(_, (_, _, last))| *last);
+            println!("  threads (tid, first start, last finish, last turn):");
+            for (tid, (first, last, turn)) in rows {
+                println!("    {tid:>6} {:>10} {:>10} {turn:>8}", ms(first), ms(last));
             }
         }
         summary[name] = json!({
