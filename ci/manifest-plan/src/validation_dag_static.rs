@@ -2546,7 +2546,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 2103, freshly listed.
     // And the descriptor-table ledger's six procfs::locks units and the
     // fdinfo-refusal unit: 2110, freshly listed.
-    ("test.detcore_unit", 2110),
+    // And parallelism_probe's four units (the default-off parallelism
+    // profile): 2114, freshly listed.
+    ("test.detcore_unit", 2114),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4447,7 +4449,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same eight R2b-2 stage 2 units: 2094, listed.
     // And the same nine procfs::locks units: 2103, freshly listed.
     // And the same seven ledger and fdinfo-refusal units: 2110, freshly listed.
-    ("test.detcore_unit_on_host", 2110),
+    // And the same four parallelism_probe units: 2114, freshly listed.
+    ("test.detcore_unit_on_host", 2114),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
