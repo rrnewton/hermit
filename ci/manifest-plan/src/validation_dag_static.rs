@@ -2567,7 +2567,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the fdinfo procfs-anchor classification unit: 2137, freshly listed.
     // And +4 from 83100c02: 2141.
     // And +1 from 37121ff4: 2142.
-    ("test.detcore_unit", 2142),
+    // And the fifteen vfork-rejoin scheduler units: 2157, listed.
+    ("test.detcore_unit", 2157),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3700,7 +3701,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/4213): 568.
     // And a_run_without_namespaces_is_not_refused_where_user_namespaces_are_denied
     // (https://github.com/rrnewton/hermit/issues/4515): 569, listed.
-    ("test.cli", 569),
+    // And a_vfork_parent_resumes_at_its_childs_exec: 570, listed.
+    ("test.cli", 570),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4167,7 +4169,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fifteen R2b-2 stage 3 CLI tests: 497, listed.
     // And the same five K3b CLI tests: 502.
     // And the same denied-user-namespace test: 503, listed.
-    ("test.cli_on_host", 503),
+    // And the same a_vfork_parent_resumes_at_its_childs_exec: 504.
+    ("test.cli_on_host", 504),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4511,7 +4514,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fdinfo procfs-anchor unit: 2137, freshly listed.
     // And +4 from 83100c02: 2141.
     // And +1 from 37121ff4: 2142.
-    ("test.detcore_unit_on_host", 2142),
+    // And the fifteen vfork-rejoin scheduler units: 2157, listed.
+    ("test.detcore_unit_on_host", 2157),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
