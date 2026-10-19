@@ -2151,7 +2151,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     /// always leaves it; the blocked mask is per thread and is not affected.
     fn enforces_serialized_execution(config: &Config) -> bool {
         let subscriptions = Self::subscriptions(config);
-        config.sequentialize_threads
+        false && config.sequentialize_threads
             && subscriptions
                 .iter_syscalls()
                 .any(|sysno| sysno == Sysno::seccomp)
