@@ -172,6 +172,21 @@ fn without_perf_event_signal(mask: KernelSigset) -> KernelSigset {
     mask & !(1_u64 << bit)
 }
 
+/// What a guest's call returns when the kernel-access probe Detcore injects
+/// before anything of the call happens did not run: a signal stopped the
+/// probe before its `syscall` instruction, the backend's not-run report
+/// (`-ERESTARTSYS`, which neither probe returns itself). The call restarts
+/// once the held signal is delivered (`-ERESTARTNOINTR`), as if the signal
+/// had come before the call: its handler runs under the thread's own mask
+/// and the call then runs. Ending the call with the not-run report instead
+/// returned EINTR, from a wait whose temporary mask the handler never saw
+/// and from calls that never fail with EINTR (`rt_sigprocmask`,
+/// `rt_sigaction`), which no Linux run produces
+/// (https://github.com/rrnewton/hermit/issues/4526).
+fn probe_not_run() -> Error {
+    Errno::ERESTARTNOINTR.into()
+}
+
 /// Read one raw kernel signal mask while preserving the kernel's user-access check.
 ///
 /// `safeptrace::Stopped::read` deliberately uses `PTRACE_PEEKDATA` for reads of
@@ -204,6 +219,7 @@ where
         .with_sigsetsize(KERNEL_SIGSET_SIZE);
     match guest.inject(validation).await {
         Err(Errno::EINVAL) => {}
+        Err(Errno::ERESTARTSYS) => return Err(probe_not_run()),
         Err(errno) => return Err(errno.into()),
         Ok(_) => {
             // Both Linux and the KVM syscall implementation reject an unknown
@@ -480,6 +496,7 @@ where
         .with_sigsetsize(KERNEL_SIGSET_SIZE);
     match guest.inject(validation).await {
         Err(Errno::EINVAL) => {}
+        Err(Errno::ERESTARTSYS) => return Err(probe_not_run()),
         Err(errno) => return Err(errno.into()),
         Ok(_) => return Err(Errno::EIO.into()),
     }

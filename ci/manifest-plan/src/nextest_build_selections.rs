@@ -913,7 +913,8 @@ mod tests {
             // +5): 634.
             // Three more ptrace_delivery_check_* tests (A5 step 3.2b part 2,
             // +3): 637.
-            assert_eq!(population, 637);
+            // Four arrived-first ptrace_delivery_check_* tests (+4): 641.
+            assert_eq!(population, 641);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
