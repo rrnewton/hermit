@@ -23,6 +23,7 @@ mod io;
 pub(crate) mod memory;
 mod misc;
 mod namespace;
+mod restartable_wait;
 pub(crate) use namespace::anonymous_object_devices;
 pub(crate) use namespace::guest_task_procfs;
 pub(crate) use network_trace::received_descriptors;

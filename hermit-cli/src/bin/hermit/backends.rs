@@ -1029,6 +1029,7 @@ impl DbtInvocation {
             drrun.display()
         );
 
+        let runner = hermit::apply_dbt_test_dynamorio_options(runner, &mut environment)?;
         let mut guest = StdCommand::new(program);
         environment.remove(OsStr::new("HERMIT_LOG_FILE"));
         environment.insert(detcore_dbt::DETCONFIG_ENV.into(), config_json.into());

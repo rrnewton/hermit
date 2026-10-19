@@ -2313,8 +2313,21 @@ fi
 # reverie-dbt/ and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml,
 # so the inventory (989), SDK and native inputs, calibrated budget, job width
 # and limits are unchanged from the e7bf2d9b carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 9547c3594d3881dead7d0e7a04ea5f32df7a7745 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 9547c3594d3881dead7d0e7a04ea5f32df7a7745 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# 4483 STEP 1 SDK-BUDGET CARRY WITH NEW NATIVE INPUTS (2026-10-19): advance
+# 9547c3594d3881dead7d0e7a04ea5f32df7a7745 to 612a12a1653b16b5b75669661409894eb87d96ca.
+# One commit (https://github.com/rrnewton/hermit/issues/4483 step 1): the
+# vendored DynamoRIO sources change (synch.c and synch.h, dynamo.c,
+# lib/instrument.c and lib/dr_tools.h, optionsx.h, unix/os.c, os_private.h and
+# signal.c), as do the native client and the reverie-dbt runtime, so the
+# DynamoRIO recipe key changes and a client rebuild is required. build.rs,
+# the root Cargo.toml, Cargo.lock and rust-toolchain.toml are unchanged. Cold
+# DynamoRIO source builds of the new sources measured 12.91-14.00 s with 16
+# jobs (206.51-223.98 job-seconds, build-cache MISS, one devserver, 2026-10-16 to
+# 2026-10-19), within the unchanged 1050 effective-job-second limit, so the
+# budget, job width and limits carry. Three reverie-dbt test files are added,
+# so the inventory goes from 989 to 992.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 612a12a1653b16b5b75669661409894eb87d96ca ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 612a12a1653b16b5b75669661409894eb87d96ca (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

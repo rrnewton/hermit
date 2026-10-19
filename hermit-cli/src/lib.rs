@@ -3830,6 +3830,36 @@ pub fn record_dbt_launched_image(
         .exe = exe;
 }
 
+/// Hermit's environment variable naming extra DynamoRIO options for a DBT run,
+/// for tests that need DynamoRIO itself to act. For example
+/// `-reset_at_nth_thread 3` makes DynamoRIO reset its code cache when the
+/// third thread starts; the reset's synch interrupts a thread in an injected
+/// wait within seconds, where a fork's takes about 50 s
+/// (<https://github.com/rrnewton/hermit/issues/4483>). The value is split on
+/// whitespace and each word goes to `drrun` before the client, through
+/// `DbtRunner::dynamorio_option`. Hermit reads it from its own environment
+/// and never passes it to the guest.
+pub const DBT_TEST_DYNAMORIO_OPTIONS_ENV: &str = "HERMIT_DBT_TEST_DYNAMORIO_OPTIONS";
+
+/// Adds the options [`DBT_TEST_DYNAMORIO_OPTIONS_ENV`] names to `runner`, and
+/// removes the variable from the guest's `environment`.
+#[cfg(feature = "dbt")]
+pub fn apply_dbt_test_dynamorio_options(
+    mut runner: reverie_dbt::DbtRunner,
+    environment: &mut std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>,
+) -> Result<reverie_dbt::DbtRunner, Error> {
+    environment.remove(std::ffi::OsStr::new(DBT_TEST_DYNAMORIO_OPTIONS_ENV));
+    if let Some(value) = std::env::var_os(DBT_TEST_DYNAMORIO_OPTIONS_ENV) {
+        let value = value
+            .into_string()
+            .map_err(|value| anyhow!("{DBT_TEST_DYNAMORIO_OPTIONS_ENV} is not UTF-8: {value:?}"))?;
+        for word in value.split_whitespace() {
+            runner = runner.dynamorio_option(word);
+        }
+    }
+    Ok(runner)
+}
+
 /// Declares, for a DBT run through `drrun`, the image the kernel execs in the
 /// guest's place: DynamoRIO's library (`lib64/release/libdynamorio.so` beside
 /// `drrun`'s `bin64`), which loads the guest itself. So the kernel's `exe`
@@ -3930,6 +3960,7 @@ async fn run_dbt(
 
     let program = command.get_program().to_owned();
     let mut environment = command.get_captured_envs();
+    let runner = apply_dbt_test_dynamorio_options(runner, &mut environment)?;
     environment.insert(detcore_dbt::DETCONFIG_ENV.into(), config_json.into());
     let guest = command.into_std_lossy();
     tracing::info!(
@@ -7911,6 +7942,9 @@ mod tests {
             // a stated capability. e9patch runs on ptrace and has its value.
             "supports_blocked_wait_signal_interruption":
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
+            // DynamoRIO's suspend signal interrupts an injected wait
+            // (https://github.com/rrnewton/hermit/issues/4483).
+            "restarts_backend_interrupted_waits": dbt,
             "delivers_preemption_timer_events":
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "runs_guest_code_between_injections": sabre || in_guest_liteinst,

@@ -61,6 +61,8 @@ use crate::syscalls::helpers::retry_blocking_wait_under_mask;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::helpers::unblocked_by;
 use crate::syscalls::network_trace::received_descriptors;
+use crate::syscalls::restartable_wait::WaitRequest;
+use crate::syscalls::restartable_wait::WaitTimeout;
 use crate::syscalls::signal::STACK_RED_ZONE;
 use crate::syscalls::signal::kernel_installed_signal_mask;
 use crate::syscalls::signal::read_kernel_sigset;
@@ -1149,7 +1151,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A virtual timerfd among the sets is readable exactly when its
             // deadline has passed (`crate::syscalls::timerfd`).
             crate::syscalls::timerfd::publish_expired(guest).await;
-            return Ok(guest.inject(call).await?);
+            return Ok(self.inject_unsleeping_pselect6(guest, call).await?);
         }
 
         // Linux clamps raw fd-set copies to the process fd table's current max_fds.
@@ -1179,6 +1181,28 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 _ => None,
             };
+            let unmasked = sigmask_argument.is_none_or(|argument| argument.sigmask == 0);
+            if self.cfg.backend.restarts_backend_interrupted_waits
+                && (unmasked || snapshot.is_some())
+            {
+                let args = Syscall::Pselect6(call).into_parts().1;
+                return self
+                    .backend_restartable_select_family(
+                        guest,
+                        WaitRequest {
+                            nfds: call.nfds(),
+                            readfds: args.arg1,
+                            writefds: args.arg2,
+                            exceptfds: args.arg3,
+                            timeout: match args.arg4 {
+                                0 => WaitTimeout::None,
+                                address => WaitTimeout::Pselect6(address),
+                            },
+                            temporary_mask: snapshot,
+                        },
+                    )
+                    .await;
+            }
             let Some(mask) = snapshot else {
                 return self
                     .record_or_replay_blocking_with_mask(guest, Syscall::Pselect6(call), None)
@@ -1440,7 +1464,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 break Err(error);
                             }
                         },
-                        None => guest.inject(probe).await,
+                        None => self.inject_unsleeping_pselect6(guest, probe).await,
                     };
                     let result = pselect6_probe_result(raw_result);
                     if result != Ok(0) {
@@ -1646,6 +1670,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Mirror pselect6: keep large fd tables under kernel ownership rather than
         // over-reading the guest bitmap (Linux clamps raw fd-set copies to max_fds).
         if call.nfds() > PSELECT6_INTERNAL_MAX_NFDS {
+            if self.cfg.backend.restarts_backend_interrupted_waits {
+                let args = Syscall::Select(call).into_parts().1;
+                return self
+                    .backend_restartable_select_family(
+                        guest,
+                        WaitRequest {
+                            nfds: call.nfds(),
+                            readfds: args.arg1,
+                            writefds: args.arg2,
+                            exceptfds: args.arg3,
+                            timeout: match args.arg4 {
+                                0 => WaitTimeout::None,
+                                address => WaitTimeout::Select(address),
+                            },
+                            temporary_mask: None,
+                        },
+                    )
+                    .await;
+            }
             return self
                 .record_or_replay_blocking(guest, Syscall::Select(call))
                 .await;

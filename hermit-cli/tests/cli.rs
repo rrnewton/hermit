@@ -216,6 +216,7 @@ static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SELECT_TIMEOUT_NORMALIZATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SELECT_MANY_DESCRIPTORS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TOOL_OUTPUT_PROTECTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "dbt")]
 static CLOCK_RLIMIT_PARITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -28330,6 +28331,134 @@ fn select_timeout_folds_microseconds_into_seconds_as_linux() {
         let output = hermit(&args);
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{args:?}");
+    }
+}
+
+/// `select` and `pselect6` on more than 64 descriptors wait in the kernel. Under
+/// DBT they go through Detcore's restartable path
+/// (https://github.com/rrnewton/hermit/issues/4483): Detcore chooses which
+/// signals end the wait (a caught SIGUSR1 does, with its handler run once; a
+/// default-ignored SIGCHLD does not; a SIGUSR1 ignored when the wait starts
+/// does once another thread installs its handler and sends it, with no data
+/// ever written), validates and normalizes the timeout,
+/// keeps a `STICKY_TIMEOUTS` timeout as it was, and writes the time left back
+/// as Linux does. DBT and ptrace print what the guest prints natively
+/// (`tests/c/select_many_descriptors.c`). The restart itself, on DynamoRIO's
+/// suspend signal during a fork's synch, is
+/// `run_dbt_select_restarts_through_a_fork_synch_as_linux`.
+#[test]
+fn run_dbt_select_on_many_descriptors_matches_linux() {
+    if dbt_unavailable("run_dbt_select_on_many_descriptors_matches_linux") {
+        return;
+    }
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&SELECT_MANY_DESCRIPTORS_GUEST, "select_many_descriptors");
+    let native = native_stdout(guest);
+    assert_eq!(
+        native,
+        "select, data arrives: r=1\n\
+         select, SIGCHLD at its default, then data: r=1\n\
+         select, caught SIGUSR1: r=-1 errno=Interrupted system call\n\
+         SIGUSR1 handled: 1\n\
+         select, SIGUSR1 ignored, then caught and sent during the wait: \
+         r=-1 errno=Interrupted system call\n\
+         SIGUSR1 handled: 2\n\
+         select, 0.3 s timeout: r=0\n\
+         select time left: 0.000000\n\
+         pselect6, 0.3 s timeout: r=0\n\
+         pselect6 time left: 0.000000000\n\
+         select, usec 1300000: r=0\n\
+         select, usec -1: r=-1 errno=Invalid argument\n\
+         sticky select, 0.3 s timeout: r=0\n\
+         sticky select timeout after: 0.300000\n\
+         sticky pselect6, 0.3 s timeout: r=0\n\
+         sticky pselect6 timeout after: 0.300000000\n"
+    );
+    let guest = guest.to_str().unwrap();
+    for backend in ["dbt", "ptrace"] {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            guest,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), native, "{args:?}");
+    }
+}
+
+/// A select on more than 64 descriptors waits in the kernel while another
+/// thread forks. Under DBT, DynamoRIO's fork synch interrupts the wait with its
+/// own signal on every retry, and Detcore restarts it each time inside its
+/// grant (https://github.com/rrnewton/hermit/issues/4483), so the guest sees
+/// what Linux shows: data that arrives after the fork ends the wait (`fork`),
+/// and a STICKY_TIMEOUTS timeout expires on time, before the data, and is left
+/// as written (`fork-sticky`). Without the restart the guest sees
+/// ERESTARTNOHAND (errno 514); without the time-left recompute each restart
+/// re-arms the full sticky timeout and the data wins; writing the time left
+/// back under STICKY_TIMEOUTS changes the timeout the guest reads. The synch
+/// is bounded with DynamoRIO's `-synch_all_threads_max_loops 600` (about 3 s,
+/// where the default 10000 takes about 50 s), passed through
+/// `HERMIT_DBT_TEST_DYNAMORIO_OPTIONS`; Detcore's debug log shows the
+/// restarts happened.
+#[test]
+fn run_dbt_select_restarts_through_a_fork_synch_as_linux() {
+    if dbt_unavailable("run_dbt_select_restarts_through_a_fork_synch_as_linux") {
+        return;
+    }
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&SELECT_MANY_DESCRIPTORS_GUEST, "select_many_descriptors");
+    for (mode, expected) in [
+        ("fork", "select during a fork, then data: r=1\n"),
+        (
+            "fork-sticky",
+            "sticky select during a fork, 2 s timeout: r=0\n\
+             sticky select timeout after: 2.000000\n",
+        ),
+    ] {
+        let native = Command::new("setarch")
+            .arg("-R")
+            .arg(guest)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run the guest natively");
+        assert!(native.status.success(), "{mode} natively: {native:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&native.stdout),
+            expected,
+            "{mode} natively"
+        );
+        let args = [
+            "--log",
+            "debug",
+            "--backend",
+            "dbt",
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            guest.to_str().unwrap(),
+            mode,
+        ];
+        let mut command = hermit_command(&args);
+        command.env(
+            hermit::DBT_TEST_DYNAMORIO_OPTIONS_ENV,
+            "-synch_all_threads_max_loops 600",
+        );
+        let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("pselect6 restarted ")
+                && stderr.contains(" times after the backend's own signal"),
+            "{mode}: the wait was never restarted, so the test did not exercise the restart"
+        );
     }
 }
 
