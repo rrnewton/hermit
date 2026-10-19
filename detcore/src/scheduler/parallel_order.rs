@@ -77,6 +77,10 @@ pub fn exit_order() -> bool {
 /// passed), so its inputs are not yet known to be reproduced by replay.
 /// Refusing beats a divergent replay.
 pub fn refuse_unsupported_modes(recordreplay_modes: bool) {
+    // Experiment only: lets the step-2a replay readmission be measured.
+    if env_on("HERMIT_PARALLEL_EXIT_ORDER_ALLOW_RR") {
+        return;
+    }
     if recordreplay_modes && exit_order() {
         eprintln!(
             "hermit: {EXIT_ORDER_ENV}=1 is not supported under record or replay (study-branch experiment)"
@@ -387,16 +391,31 @@ impl Scheduler {
         if !vfork_rejoin() {
             return;
         }
-        // Replay readmits the parent where the recording logged it: at this
-        // same point, through `step2c_replay_rejoin` later in this pass.
-        if self.rejoin_replay.is_some() {
-            return;
-        }
         let Some(op_id) = self.blocked.external_io_blockers.get(&parent).copied() else {
             return;
         };
-        // Record logs the readmission like any other, so replay follows it.
-        self.log_rejoin(&[(parent, op_id, false)], &[parent]);
+        // Replay readmits the parent where the recording logged it, which is
+        // here: record readmits at step 2a, before anything later in the pass
+        // reads the run queue. The exit order's release does (whether the
+        // parent is queued or working decides a hold), so readmitting it later
+        // in the pass, at step 2c, let replay release and re-hold an exit the
+        // recording kept held, a turn number the recording never spent, and
+        // every logged readmission after it fell one turn early. Any other
+        // entry stays with step 2c, which refuses one that does not match.
+        if let Some(rejoins) = self.rejoin_replay.as_mut() {
+            let point = (self.turn, self.empty_queue_wakes);
+            let due_here = rejoins.front().is_some_and(|next| {
+                next.point() == point && next.calls == [(parent, op_id.sequence)]
+            });
+            if !due_here {
+                return;
+            }
+            rejoins.pop_front();
+            self.rejoin_stalled_since = None;
+        } else {
+            // Record logs the readmission like any other, so replay follows it.
+            self.log_rejoin(&[(parent, op_id, false)], &[parent]);
+        }
         self.blocked.external_io_blockers.remove(&parent);
         self.blocked.replay_log_served.remove(&parent);
         let _ = self.blocked.out_of_scheduler_masks.remove(&parent);
