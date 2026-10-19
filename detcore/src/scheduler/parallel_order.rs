@@ -113,6 +113,70 @@ pub struct ExitOrderState {
     wake_parents: std::collections::BTreeSet<DetPid>,
 }
 
+/// Why the virtual-completion exit order holds an exit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HoldReason {
+    /// H1: the parent is queued and has a sibling's granted exit to reap
+    /// first (one reapable child at a time).
+    ReapFirst,
+    /// H2: the parent is doing work and has not reached this exit's virtual
+    /// time: in a parallel run it would act first.
+    ParentAhead,
+    /// H3: a sibling with a smaller lower bound can still run and may finish
+    /// first.
+    EarlierSibling,
+}
+
+/// The facts an exit-order hold is decided from (see
+/// `Scheduler::exit_order_hold_inputs`).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HoldInputs {
+    /// The exiting process's virtual clock and ID, which orders exits.
+    pub key: (u64, DetPid),
+    /// Whether the process is a vfork child its parent waits on.
+    pub vfork_child: bool,
+    /// The parent's virtual clock.
+    pub parent_clock: u64,
+    /// Whether a thread of the parent is queued to run.
+    pub parent_queued: bool,
+    /// Whether a thread of the parent is queued other than as a backed-off
+    /// poller.
+    pub parent_working: bool,
+    /// Whether a sibling's exit was granted and the parent has not reaped it.
+    pub granted_unreaped_sibling: bool,
+    /// Whether a sibling whose exit is not granted has a smaller
+    /// (lower bound, ID) than `key` and a runnable live subtree.
+    pub earlier_runnable_sibling: bool,
+}
+
+/// Whether, and why, an exit with `inputs` is held.
+///
+/// Liveness (the steps 2-3 proposal, "Step 3 liveness"): every reason waits
+/// for another party that can still act and whose virtual clock is below the
+/// exit's, and lapses once that clock reaches it. A held exit's own clock
+/// does not move, every committed turn raises its thread's clock, and a new
+/// process starts at its creator's clock, so the parties' budget below the
+/// key is finite and every held exit is released.
+pub(super) fn hold_reason(inputs: &HoldInputs) -> Option<HoldReason> {
+    if inputs.vfork_child {
+        return None;
+    }
+    let parent_behind = inputs.parent_clock < inputs.key.0;
+    // The clock guard bounds H1: a parent that keeps working without reaping
+    // has, past this exit's virtual time, both exits to reap in a parallel
+    // run too.
+    if inputs.parent_queued && inputs.granted_unreaped_sibling && parent_behind {
+        return Some(HoldReason::ReapFirst);
+    }
+    if inputs.parent_working && parent_behind {
+        return Some(HoldReason::ParentAhead);
+    }
+    if inputs.earlier_runnable_sibling {
+        return Some(HoldReason::EarlierSibling);
+    }
+    None
+}
+
 impl Scheduler {
     /// Record the logical CPU time `tid` carried with its latest request.
     pub(crate) fn exit_order_note_work(&mut self, tid: DetTid, cpu: u64) {
@@ -172,8 +236,13 @@ impl Scheduler {
                     !self.exit_order.held.contains(&thread)
                         && (self.run_queue.contains_non_polling_tid(thread)
                             // Parked until its deferred SIGCHLD is admitted,
-                            // which happens once no other work can run.
-                            || self.blocked.sigchld_deferred.contains(&thread))
+                            // which happens once no other work can run: it
+                            // counts only then, when it is next to run. While
+                            // other work runs its clock does not move, so
+                            // counting it would make a held exit wait on
+                            // that other work's end (liveness, condition H3).
+                            || (self.blocked.sigchld_deferred.contains(&thread)
+                                && self.run_queue.only_pollers_or_yielders()))
                 })
         {
             return true;
@@ -203,23 +272,17 @@ impl Scheduler {
     }
 
     /// Whether `tid`'s exit must wait for a sibling that may finish earlier in
-    /// virtual time.
+    /// virtual time ([`hold_reason`]).
     fn exit_order_must_wait(&self, tid: DetTid, group: bool) -> bool {
-        let Some(process) = self.exit_order_ending_process(tid, group) else {
-            return false;
-        };
-        let Some(parent) = self.thread_tree.parent_process(&process) else {
-            return false;
-        };
-        // A vfork child's exit releases its blocked parent, and step 3 must
-        // select a registered vfork child: never hold it.
-        if self
-            .vfork_barriers
-            .values()
-            .any(|child| *child == Some(process))
-        {
-            return false;
-        }
+        self.exit_order_hold_inputs(tid, group)
+            .is_some_and(|inputs| hold_reason(&inputs).is_some())
+    }
+
+    /// The facts [`hold_reason`] decides from, for `tid`'s exit; `None` when
+    /// the exit ends no process or the process has no parent.
+    fn exit_order_hold_inputs(&self, tid: DetTid, group: bool) -> Option<HoldInputs> {
+        let process = self.exit_order_ending_process(tid, group)?;
+        let parent = self.thread_tree.parent_process(&process)?;
         let key = (self.exit_order_clock(process), process);
         let siblings: Vec<DetPid> = self
             .thread_tree
@@ -227,41 +290,37 @@ impl Scheduler {
             .into_iter()
             .filter(|sibling| *sibling != process)
             .collect();
-        // One reapable child at a time: while the parent has a sibling whose
-        // exit was granted and that it has not reaped yet, and the parent is
-        // queued to run (so it will get to its wait), wait for that reap.
-        let parent_queued = self.thread_tree.contains(&parent)
-            && self
-                .thread_tree
-                .my_thread_group(&parent)
-                .into_iter()
-                .any(|thread| self.run_queue.contains_tid(thread));
-        if parent_queued
-            && siblings
+        let parent_threads = if self.thread_tree.contains(&parent) {
+            self.thread_tree.my_thread_group(&parent)
+        } else {
+            Vec::new()
+        };
+        Some(HoldInputs {
+            key,
+            // A vfork child's exit releases its blocked parent, and step 3
+            // must select a registered vfork child.
+            vfork_child: self
+                .vfork_barriers
+                .values()
+                .any(|child| *child == Some(process)),
+            parent_clock: self.exit_order_clock(parent),
+            parent_queued: parent_threads
                 .iter()
-                .any(|sibling| self.process_exit_granted(*sibling))
-        {
-            return true;
-        }
-        // The parent is doing work (queued, not as a backed-off poller) and
-        // has not reached this exit's virtual time: in a parallel run it
-        // would act first (start its next job) and only then observe the exit.
-        let parent_working = self.thread_tree.contains(&parent)
-            && self
-                .thread_tree
-                .my_thread_group(&parent)
+                .any(|thread| self.run_queue.contains_tid(*thread)),
+            parent_working: parent_threads
+                .iter()
+                .any(|thread| self.run_queue.contains_non_polling_tid(*thread)),
+            granted_unreaped_sibling: siblings
+                .iter()
+                .any(|sibling| self.process_exit_granted(*sibling)),
+            earlier_runnable_sibling: siblings
                 .into_iter()
-                .any(|thread| self.run_queue.contains_non_polling_tid(thread));
-        if parent_working && self.exit_order_clock(parent) < key.0 {
-            return true;
-        }
-        siblings
-            .into_iter()
-            .filter(|sibling| !self.process_exit_granted(*sibling))
-            .any(|sibling| {
-                (self.exit_order_lower_bound(sibling, 0), sibling) < key
-                    && self.exit_order_subtree_runnable(sibling, 0)
-            })
+                .filter(|sibling| !self.process_exit_granted(*sibling))
+                .any(|sibling| {
+                    (self.exit_order_lower_bound(sibling, 0), sibling) < key
+                        && self.exit_order_subtree_runnable(sibling, 0)
+                }),
+        })
     }
 
     /// Called at an `Exit` request's step 4: hold it if the order requires.
@@ -427,5 +486,241 @@ impl Scheduler {
             parent
         );
         self.readmit_ready_thread(parent);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn pid(raw: i32) -> DetPid {
+        DetPid::from_raw(raw)
+    }
+
+    fn idle(key: u64) -> HoldInputs {
+        HoldInputs {
+            key: (key, pid(3)),
+            vfork_child: false,
+            parent_clock: 0,
+            parent_queued: false,
+            parent_working: false,
+            granted_unreaped_sibling: false,
+            earlier_runnable_sibling: false,
+        }
+    }
+
+    /// Each reason holds on its own, and nothing holds when no other party
+    /// can act: an idle system releases every held exit (no deadlock).
+    #[test]
+    fn each_reason_holds_alone_and_idle_holds_nothing() {
+        assert_eq!(hold_reason(&idle(100)), None);
+        let reap_first = HoldInputs {
+            parent_queued: true,
+            granted_unreaped_sibling: true,
+            ..idle(100)
+        };
+        assert_eq!(hold_reason(&reap_first), Some(HoldReason::ReapFirst));
+        let parent_ahead = HoldInputs {
+            parent_queued: true,
+            parent_working: true,
+            ..idle(100)
+        };
+        assert_eq!(hold_reason(&parent_ahead), Some(HoldReason::ParentAhead));
+        let earlier = HoldInputs {
+            earlier_runnable_sibling: true,
+            ..idle(100)
+        };
+        assert_eq!(hold_reason(&earlier), Some(HoldReason::EarlierSibling));
+        // A backed-off polling parent is queued but not working.
+        let polling = HoldInputs {
+            parent_queued: true,
+            ..idle(100)
+        };
+        assert_eq!(hold_reason(&polling), None);
+    }
+
+    /// A vfork child's exit releases its parent: never held.
+    #[test]
+    fn a_vfork_child_is_never_held() {
+        let all = HoldInputs {
+            vfork_child: true,
+            parent_queued: true,
+            parent_working: true,
+            granted_unreaped_sibling: true,
+            earlier_runnable_sibling: true,
+            ..idle(100)
+        };
+        assert_eq!(hold_reason(&all), None);
+    }
+
+    /// H1 and H2 lapse once the parent's clock reaches the exit's: a parent
+    /// that keeps working without reaping does not hold the exit for ever.
+    #[test]
+    fn the_parent_rules_lapse_at_the_exits_virtual_time() {
+        let working = HoldInputs {
+            parent_queued: true,
+            parent_working: true,
+            granted_unreaped_sibling: true,
+            parent_clock: 99,
+            ..idle(100)
+        };
+        assert_eq!(hold_reason(&working), Some(HoldReason::ReapFirst));
+        let caught_up = HoldInputs {
+            parent_clock: 100,
+            ..working
+        };
+        assert_eq!(hold_reason(&caught_up), None);
+    }
+
+    /// The bound: a parent working from clock c with at least delta per
+    /// committed turn releases an exit with clock k after ceil((k - c) / delta)
+    /// turns.
+    #[test]
+    fn a_working_parent_releases_within_the_bound() {
+        let (key, start, delta) = (1_000u64, 130u64, 7u64);
+        let bound = (key - start).div_ceil(delta);
+        let mut clock = start;
+        let mut turns = 0;
+        while hold_reason(&HoldInputs {
+            parent_queued: true,
+            parent_working: true,
+            parent_clock: clock,
+            ..idle(key)
+        })
+        .is_some()
+        {
+            clock += delta;
+            turns += 1;
+            assert!(turns <= bound, "held past the bound");
+        }
+        assert_eq!(turns, bound);
+    }
+
+    /// H3's termination with a sibling subtree that keeps spawning: each turn
+    /// raises its process's clock by delta, a child starts at its creator's
+    /// clock, a blocked process wakes only when another commits a turn. The
+    /// exit is held while the subtree's largest clock is below the key and
+    /// some process can run; it is always released (the multiset of budgets
+    /// below the key strictly decreases).
+    #[test]
+    fn a_spawning_sibling_subtree_always_releases() {
+        let mut seed: u64 = 0x5eed;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            seed >> 33
+        };
+        for trial in 0..200 {
+            let key = 50 + (trial % 50) as u64;
+            // (clock, runnable)
+            let mut subtree: Vec<(u64, bool)> = vec![(0, true)];
+            let mut steps = 0u64;
+            loop {
+                let largest = subtree.iter().map(|(c, _)| *c).max().unwrap_or(u64::MAX);
+                let runnable: Vec<usize> = (0..subtree.len()).filter(|&i| subtree[i].1).collect();
+                let held = hold_reason(&HoldInputs {
+                    earlier_runnable_sibling: largest < key && !runnable.is_empty(),
+                    ..idle(key)
+                })
+                .is_some();
+                if !held {
+                    assert!(largest >= key || runnable.is_empty());
+                    break;
+                }
+                let actor = runnable[(next() as usize) % runnable.len()];
+                subtree[actor].0 += 1 + next() % 3;
+                for other in subtree.iter_mut() {
+                    if !other.1 && next() % 4 == 0 {
+                        other.1 = true;
+                    }
+                }
+                match next() % 6 {
+                    0 => {
+                        let clock = subtree[actor].0;
+                        subtree.push((clock, true));
+                    }
+                    1 => subtree[actor].1 = false,
+                    2 if subtree.len() > 1 => {
+                        subtree.remove(actor);
+                    }
+                    _ => {}
+                }
+                steps += 1;
+                assert!(steps < 1_000_000, "trial {trial}: no release");
+            }
+        }
+    }
+
+    /// A scheduler with process 1 and its children 2 and 3; 3 is exiting
+    /// with clock 1,000, the others at 0.
+    fn family() -> Scheduler {
+        let mut sched = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw;
+        sched
+            .thread_tree
+            .add_child_with_wait_metadata(tid(1), tid(1), true, false, libc::SIGCHLD);
+        sched
+            .thread_tree
+            .add_child_with_wait_metadata(tid(1), tid(2), true, false, libc::SIGCHLD);
+        sched
+            .thread_tree
+            .add_child_with_wait_metadata(tid(1), tid(3), true, false, libc::SIGCHLD);
+        sched.exit_order.work.insert(tid(3), 1_000);
+        for raw in [1, 2, 3, 9] {
+            sched
+                .priorities
+                .insert(tid(raw), super::super::DEFAULT_PRIORITY);
+        }
+        sched
+    }
+
+    fn reason(sched: &Scheduler) -> Option<HoldReason> {
+        let inputs = sched
+            .exit_order_hold_inputs(DetTid::from_raw(3), true)
+            .expect("3 ends a process with a parent");
+        hold_reason(&inputs)
+    }
+
+    /// Nothing queued: the exit is not held, whatever its key.
+    #[test]
+    fn an_idle_scheduler_holds_no_exit() {
+        assert_eq!(reason(&family()), None);
+    }
+
+    /// A queued sibling with a smaller lower bound holds the exit; the hold
+    /// lapses when its clock passes the exit's.
+    #[test]
+    fn a_runnable_earlier_sibling_holds_until_its_clock_passes() {
+        let mut sched = family();
+        sched.runqueue_push_back(DetTid::from_raw(2));
+        assert_eq!(reason(&sched), Some(HoldReason::EarlierSibling));
+        sched.exit_order.work.insert(DetTid::from_raw(2), 1_001);
+        assert_eq!(reason(&sched), None);
+    }
+
+    /// A sibling parked for its deferred SIGCHLD counts as runnable only when
+    /// nothing else is queued, when it is next to run; while other work runs
+    /// it does not hold the exit.
+    #[test]
+    fn a_deferred_sibling_holds_only_when_it_is_next() {
+        let mut sched = family();
+        sched.blocked.sigchld_deferred.insert(DetTid::from_raw(2));
+        assert_eq!(reason(&sched), Some(HoldReason::EarlierSibling));
+        sched.runqueue_push_back(DetTid::from_raw(9));
+        assert_eq!(reason(&sched), None);
+    }
+
+    /// A queued parent with a granted sibling to reap holds the exit only
+    /// while its clock is below the exit's.
+    #[test]
+    fn a_parent_with_a_child_to_reap_holds_until_its_virtual_time() {
+        let mut sched = family();
+        sched.grant_exit_for_test(pid(2));
+        sched.runqueue_push_back(DetTid::from_raw(1));
+        assert_eq!(reason(&sched), Some(HoldReason::ReapFirst));
+        sched.exit_order.work.insert(DetTid::from_raw(1), 1_000);
+        assert_eq!(reason(&sched), None);
     }
 }
