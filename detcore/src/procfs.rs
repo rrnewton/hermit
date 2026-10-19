@@ -33,6 +33,11 @@ pub(crate) mod ids;
 pub(crate) mod levels;
 pub(crate) mod listing;
 pub(crate) mod locks;
+// The pure half of deciding guest OFD rows of /proc/locks from the kernel at
+// the snapshot, compiled for its tests until the next commit wires it in at
+// the /proc/locks read.
+#[cfg(test)]
+mod locks_scan;
 pub(crate) mod private_maps;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

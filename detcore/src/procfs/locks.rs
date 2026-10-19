@@ -205,7 +205,7 @@ impl HeldLock {
     /// (see the module comment), removed when package K slice K8 replaces
     /// KVM's local `/proc/locks`. Linux never prints that device for a
     /// lockable object.
-    fn on_null_device(&self) -> bool {
+    pub(super) fn on_null_device(&self) -> bool {
         let mut parts = self.object.split(':');
         let number = |part: Option<&str>| part.and_then(|part| u32::from_str_radix(part, 16).ok());
         number(parts.next()) == Some(0) && number(parts.next()) == Some(0)
