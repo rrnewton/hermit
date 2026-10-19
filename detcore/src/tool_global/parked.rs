@@ -206,6 +206,9 @@ where
         // Process publication does not invent an interruption for this site.
         return resource_request(guest, resources).await;
     };
+    // A scheduling point (`ThreadState::note_scheduler_handoff`), as in
+    // `resource_request`, which this site's request bypasses.
+    guest.thread_state_mut().note_scheduler_handoff(false);
     capable_resource_request(
         guest,
         resources,
@@ -234,6 +237,8 @@ where
     let mut resources = Resources::new(state.dettid);
     resources.insert(ResourceID::WaitChild { parent, spec }, Permission::R);
     resources.fyi("wait-child-lifecycle");
+    // A scheduling point, as in `parked_wait_request`.
+    guest.thread_state_mut().note_scheduler_handoff(false);
     capable_resource_request(guest, resources, ControlCapability::ChildWait { site }).await
 }
 
@@ -253,6 +258,8 @@ where
     if resources.poll_attempt > 0
         && let Some(site) = guest.polled_read_signal_site(call)
     {
+        // A scheduling point, as in `parked_wait_request`.
+        guest.thread_state_mut().note_scheduler_handoff(false);
         return capable_resource_request(guest, resources, ControlCapability::PolledRead { site })
             .await;
     }

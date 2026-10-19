@@ -7411,15 +7411,10 @@ where
     // Any turn of its own is a hand-off under `--pipe-wake-latency`: the
     // thread goes back behind the pollers it readied (`crate::pipe_wake`).
     guest.thread_state_mut().pipe_handoff_due = None;
-    // Count consecutive continuations; any other request, a turn in which
-    // other threads may run, starts the count again
-    // (`ThreadState::consecutive_continuations`).
-    let count = &mut guest.thread_state_mut().consecutive_continuations;
-    *count = if r.continues_sigreturn {
-        count.saturating_add(1)
-    } else {
-        0
-    };
+    // A scheduling point of the thread (`ThreadState::note_scheduler_handoff`).
+    guest
+        .thread_state_mut()
+        .note_scheduler_handoff(r.continues_sigreturn);
     if guest.config().sequentialize_threads {
         if let Some(lease) = guest.signal_observation_lease() {
             if let Some(site) = guest.parked_signal_site() {
@@ -7815,6 +7810,12 @@ where
     T: RecordOrReplay,
 {
     assert!(guest.config().sequentialize_threads);
+    // A wait parks the thread until the scheduler grants it again, so it is a
+    // scheduling point; the other actions answer at once
+    // (`ThreadState::note_scheduler_handoff`).
+    if matches!(futex_action, FutexAction::WaitRequest(..)) {
+        guest.thread_state_mut().note_scheduler_handoff(false);
+    }
     let dettid = guest.thread_state().dettid;
     let req = GlobalRequest::FutexAction(dettid, futex_action, *futexid, init_read, mask);
     trace!(
