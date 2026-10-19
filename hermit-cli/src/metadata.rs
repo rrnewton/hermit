@@ -747,7 +747,13 @@ impl RecordVersion {
 // and fstat, the openat2, the entry's fstatfs and fstat, the reads and two
 // closes. A 0x176 or 0x177 recording has no entry fstatfs and would replay
 // out of step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x178);
+// 0x178 -> 0x179 (HIGHEST_SHIPPED + 1 when it lands): a signal delivery that
+// continues the thread's previous handler (no hand-off to the scheduler in
+// between) runs before the other threads under record and replay too
+// (https://github.com/rrnewton/hermit/issues/4505). A recording whose guest
+// is signaled again before a handler returns now has a different schedule,
+// and an older recording would replay out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x179);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -772,7 +778,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x178);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x178;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x179;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
