@@ -2121,7 +2121,14 @@ fi
 # Cargo.lock and rust-toolchain.toml, so the inventory (973), SDK and native
 # inputs, calibrated budget, job width and limits are unchanged from the
 # 45615034 carry.
-expected_pin=50b0e681d2215a73c113e6c2200f589fa66db29f
+# CARRY TO 2a0b2a7991e755588000c00370f022d0abc43062 (2026-10-18): from
+# 50b0e681d2215a73c113e6c2200f589fa66db29f. One commit (signals lane, the SIGTRAP keep without
+# procfs on its hot paths). It changes reverie-ptrace/src/task.rs only; git
+# diff is empty under reverie-dbt/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory (973), SDK and native inputs,
+# calibrated budget, job width and limits are unchanged from the 45615034
+# carry.
+expected_pin=2a0b2a7991e755588000c00370f022d0abc43062
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
