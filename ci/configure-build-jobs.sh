@@ -2230,8 +2230,16 @@ fi
 # git diff is empty under reverie-dbt/ (DBT inventory 973), and the root
 # Cargo.toml, Cargo.lock and rust-toolchain.toml are unchanged. All SDK
 # inputs, calibrated budget, job width and limits are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 63934937463458de93d43ed08038d256ae799c64 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 63934937463458de93d43ed08038d256ae799c64 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 49fe0fb1e8ebabdbaa9eb98fd9d6d00f16b5034e (2026-10-19): from
+# 63934937463458de93d43ed08038d256ae799c64. One commit (signals lane, A5 step 3.0a:
+# injected syscalls run under the guest's own mask on an unshared
+# signal-action table). It changes reverie-ptrace/src/task.rs, sigtrap_state.rs
+# and its plain-guest fixture and tests only; git diff is empty under
+# reverie-dbt/ and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml,
+# so the inventory (973), SDK and native inputs, calibrated budget, job width
+# and limits are unchanged from the 45615034 carry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 49fe0fb1e8ebabdbaa9eb98fd9d6d00f16b5034e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 49fe0fb1e8ebabdbaa9eb98fd9d6d00f16b5034e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
