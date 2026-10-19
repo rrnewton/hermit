@@ -393,6 +393,18 @@ pub enum ResourceID {
 
 /// Permission to a device, which behaves like a predefined "inode".
 /// These correspond to special files under /dev
+/// What an `InternalIOPolling` request waits on, when the study-branch poll
+/// identity experiment names it (`crate::poll_identity`).
+#[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize, Hash)]
+pub enum PollTarget {
+    /// A child wait: the waiting process's children.
+    Children(DetPid),
+    /// The open file descriptions of the descriptors polled.
+    OpenFiles(Vec<detcore_model::fd::OpenFileId>),
+    /// A futex word in an address space.
+    Futex(MmId, u64),
+}
+
 #[allow(clippy::enum_variant_names)]
 #[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize, Hash)]
 pub enum Device {
@@ -581,6 +593,11 @@ pub struct Resources {
     /// (<https://github.com/rrnewton/hermit/issues/4187>).
     #[serde(default)]
     pub(crate) decides_signal_interruption_itself: bool,
+    /// What a polling request waits on, set only by the study-branch poll
+    /// identity experiment (`crate::poll_identity`); a declaration the
+    /// scheduler does not act on. `None` otherwise.
+    #[serde(default)]
+    pub(crate) poll_target: Option<PollTarget>,
 }
 
 impl fmt::Debug for Resources {
@@ -633,6 +650,9 @@ impl fmt::Debug for Resources {
         if self.decides_signal_interruption_itself {
             debug.field("decides_signal_interruption_itself", &true);
         }
+        if let Some(target) = &self.poll_target {
+            debug.field("poll_target", target);
+        }
         debug.finish()
     }
 }
@@ -671,6 +691,7 @@ impl Resources {
             in_guest_sleep_sigalrm: None,
             signal_state_task: None,
             decides_signal_interruption_itself: false,
+            poll_target: None,
         }
     }
 
@@ -709,6 +730,9 @@ impl Resources {
             self.signal_state_task = other.signal_state_task;
         }
         self.decides_signal_interruption_itself |= other.decides_signal_interruption_itself;
+        if self.poll_target.is_none() {
+            self.poll_target = other.poll_target.clone();
+        }
         self.replay_served_from_log |= other.replay_served_from_log;
         self.polls_guest_state_only |= other.polls_guest_state_only;
         self.waits_until_nothing_else_can_run |= other.waits_until_nothing_else_can_run;

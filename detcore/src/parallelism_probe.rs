@@ -195,7 +195,7 @@ pub fn note_syscall(
     proc_tid: i32,
     shown: Option<&str>,
 ) {
-    if !enabled() {
+    if !enabled() && !crate::poll_identity::enabled() {
         return;
     }
     let mut segments = segments().lock().unwrap();
@@ -208,6 +208,14 @@ pub fn note_syscall(
         }
     }
     segment.current_path = path;
+}
+
+/// The syscall `tid` is in, with its first three arguments, as
+/// `note_syscall` last recorded it before the thread's next request.
+pub fn current_syscall(tid: DetTid) -> Option<(&'static str, [u64; 3])> {
+    let segments = segments().lock().unwrap();
+    let (name, args, _) = segments.get(&tid.as_raw())?.current?;
+    Some((name, args))
 }
 
 /// Count a trapped instruction `name` (such as `rdtsc`) that thread `tid`
@@ -369,6 +377,7 @@ impl ParallelismProbe {
             "cpu_ns": cpu_ns,
             "ltime_ns": note.map(|n| n.logical_time.as_nanos()),
             "poll": resources.poll_attempt,
+            "poll_target": resources.poll_target.as_ref().map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null)),
             "fyi": resources.fyi,
             "res": res,
         }));

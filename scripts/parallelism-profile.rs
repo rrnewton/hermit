@@ -51,6 +51,11 @@
 //! without a turn (WNOHANG) hold its child table, and a node that signalled
 //! without one hold a global `Signals` resource, bracketing that hole.
 //!
+//! POLL TARGETS. A profile made with `HERMIT_PARALLEL_POLL_IDENTITY=1`
+//! records each polling request's declared target (`poll_target`); every
+//! interpretation then keys the retry by it (`Children:<pid>`, one `OFD:` key
+//! per open file description, `Futex:`).
+//!
 //! COARSE RESOURCES. An `InternalIOPolling` retry (a pipe read that would
 //! block, a polled wait4) names no object, so as declared every such retry
 //! conflicts with every other. `--refine` maps a wait4/waitid retry to the
@@ -483,6 +488,29 @@ fn build_graph(commits: &[Commit], opts: &Options) -> Graph {
                 // global resource. `--refine` gives a wait4/waitid poll the
                 // caller's child table, and a descriptor poll the object its
                 // descriptor names (for a pipe, its inode).
+                // A request that names its target (the poll identity
+                // experiment) declares it: hold each object it waits on.
+                "InternalIOPolling" if !c.v["poll_target"].is_null() => {
+                    let (variant_name, target) = variant(&c.v["poll_target"]);
+                    match variant_name.as_str() {
+                        "Children" => Some((format!("Children:{}", target), Perm::W)),
+                        "OpenFiles" => {
+                            for file in target.as_array().into_iter().flatten() {
+                                let key = format!(
+                                    "OFD:{}.{}",
+                                    file["creator"].as_i64().unwrap_or(-1),
+                                    file["sequence"].as_u64().unwrap_or(0)
+                                );
+                                if !ablated("OFD", &key) {
+                                    res.push(("OFD".into(), key, Perm::W));
+                                }
+                            }
+                            None
+                        }
+                        "Futex" => Some((format!("Futex:{}", target), Perm::W)),
+                        _ => Some((kind.clone(), Perm::W)),
+                    }
+                }
                 "InternalIOPolling" if opts.refine => {
                     let fyi = c.v["fyi"].as_str().unwrap_or("");
                     let pid = c.v["pid"].as_i64().unwrap_or(tid);

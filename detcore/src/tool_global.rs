@@ -4730,6 +4730,7 @@ impl GlobalState {
                     in_guest_sleep_sigalrm: None,
                     signal_state_task: None,
                     decides_signal_interruption_itself: false,
+                    poll_target: None,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {
@@ -7279,6 +7280,12 @@ where
         }
         let dettid = guest.thread_state().dettid;
         let detpid = guest.thread_state().detpid.expect("detpid unset");
+        if crate::poll_identity::enabled()
+            && r.poll_target.is_none()
+            && r.resources.contains_key(&ResourceID::InternalIOPolling)
+        {
+            r.poll_target = crate::poll_identity::target(guest);
+        }
         crate::parallelism_probe::flush_segment(dettid);
         trace!(
             "[detcore, dtid {}] BLOCKING on resource_request rpc... {:?}",

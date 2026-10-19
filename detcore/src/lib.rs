@@ -67,6 +67,7 @@ pub mod netlink_route;
 pub mod nonwaiting_write;
 pub mod parallelism_probe;
 mod pipe_wake;
+pub mod poll_identity;
 mod procfs;
 mod procfs_inode;
 mod procmaps;
@@ -3501,7 +3502,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 call.display(&guest.memory())
             );
         }
-        if crate::parallelism_probe::enabled() {
+        if crate::parallelism_probe::enabled() || crate::poll_identity::enabled() {
             let args = call.into_parts().1;
             let shown = crate::parallelism_probe::wants_rendering(call.name())
                 .then(|| call.display(&guest.memory()).to_string());

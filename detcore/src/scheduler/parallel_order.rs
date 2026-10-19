@@ -71,15 +71,15 @@ pub fn exit_order() -> bool {
     *ON.get_or_init(|| env_on(EXIT_ORDER_ENV))
 }
 
-/// Exit with a clear message if an experiment is enabled in a mode it does
-/// not support. The vfork rejoin is not supported under `hermit record` or
-/// `hermit replay`: record readmits backgrounded calls through the rejoin log,
-/// and a recording of `make -j4` with the rejoin hung (make in `pselect6`,
-/// the scheduler idle). Refusing beats hanging.
+/// Exit with a clear message if the exit order is enabled under `hermit
+/// record` or `hermit replay`. A recording of GNU hello `make -j8` with it
+/// replayed to a point where a logged readmission never completed (zlib
+/// passed), so its inputs are not yet known to be reproduced by replay.
+/// Refusing beats a divergent replay.
 pub fn refuse_unsupported_modes(recordreplay_modes: bool) {
-    if recordreplay_modes && vfork_rejoin() {
+    if recordreplay_modes && exit_order() {
         eprintln!(
-            "hermit: {VFORK_REJOIN_ENV}=1 is not supported under record or replay (study-branch experiment)"
+            "hermit: {EXIT_ORDER_ENV}=1 is not supported under record or replay (study-branch experiment)"
         );
         std::process::exit(2);
     }
@@ -387,14 +387,26 @@ impl Scheduler {
         if !vfork_rejoin() {
             return;
         }
-        if self.blocked.external_io_blockers.remove(&parent).is_some() {
-            self.blocked.replay_log_served.remove(&parent);
-            let _ = self.blocked.out_of_scheduler_masks.remove(&parent);
-            tracing::info!(
-                "[step2a] deterministic vfork rejoin: readmitting dettid {}",
-                parent
-            );
-            self.readmit_ready_thread(parent);
+        // Replay readmits the parent where the recording logged it: at this
+        // same point, through `step2c_replay_rejoin` later in this pass.
+        if self.rejoin_replay.is_some() {
+            return;
         }
+        let Some(op_id) = self.blocked.external_io_blockers.get(&parent).copied() else {
+            return;
+        };
+        // Record logs the readmission like any other, so replay follows it.
+        self.log_rejoin(&[(parent, op_id, false)], &[parent]);
+        self.blocked.external_io_blockers.remove(&parent);
+        self.blocked.replay_log_served.remove(&parent);
+        let _ = self.blocked.out_of_scheduler_masks.remove(&parent);
+        // The message `step2c_process_io_blockers` logs for a readmission,
+        // which is what replay logs when it follows the rejoin log here.
+        tracing::info!(
+            target: "detcore::scheduler",
+            "[step2] Reschedule formerly backgrounded dtid {:?}",
+            parent
+        );
+        self.readmit_ready_thread(parent);
     }
 }

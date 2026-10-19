@@ -11358,6 +11358,16 @@ impl Scheduler {
                 // Replay readmits each call at the turn the recording logged, not when
                 // it finishes (see `rejoin_log`).
                 if self.rejoin_replay.is_some() {
+                    // As record does below under the vfork-rejoin experiment:
+                    // with nothing to run and no readmission due, a parent
+                    // parked for its deferred SIGCHLD goes to step2e.
+                    if parallel_order::vfork_rejoin()
+                        && self.run_queue.is_empty()
+                        && !self.blocked.sigchld_deferred.is_empty()
+                        && !self.rejoin_due_now()
+                    {
+                        return Ok(());
+                    }
                     return self.step2c_replay_rejoin(&blockers, &ready, requeue_ready);
                 }
 
@@ -11413,6 +11423,16 @@ impl Scheduler {
                 // records the wake count with the turn so replay agrees.
                 // TODO-HUMAN-REVIEW(PR-3908)
                 if self.next_deadline_is_reachable() {
+                    return Ok(());
+                }
+
+                // A parent parked for its deferred SIGCHLD is work: step2e
+                // admits it once nothing else can run, which is now. Spinning
+                // here instead never reached step2e, and hung a recording of
+                // make -jN under the study-branch vfork rejoin: make waited in a
+                // backgrounded pselect6 for the SIGCHLD of a job whose driver
+                // waited for its own deferred SIGCHLD.
+                if parallel_order::vfork_rejoin() && !self.blocked.sigchld_deferred.is_empty() {
                     return Ok(());
                 }
 
