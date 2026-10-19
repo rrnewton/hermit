@@ -2133,7 +2133,15 @@ fi
 # sample above carries under the same CMake/generator/epoch settings. The native
 # client changes and requires a new build receipt. ABI12/80, portable1050 budget,
 # default ratchet572, job width, limits, selectors and clock policy stay unchanged.
-expected_pin=bfe01a465bd53a00eff185f3130e37344938982e
+# CARRY TO 9e11cab435dde363c9f065d172da1754b8c25909 (2026-10-18): from
+# bfe01a465bd53a00eff185f3130e37344938982e. Correct only the README description of local
+# cache-context failure checks; no caller abort/recovery guarantee is claimed.
+# Executable, native, test and build-recipe sources are unchanged. Inventory989,
+# ABI12/80 and the qualified a15e SDK sample carry under the same CMake/generator/
+# epoch settings. Documentation, Git pin and lock metadata change; runtime receipts
+# remain bound to H1d2169da/Rbfe01a46, not this documentation successor. Portable1050,
+# default ratchet572, job width, limits, selectors and clock policy stay unchanged.
+expected_pin=9e11cab435dde363c9f065d172da1754b8c25909
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

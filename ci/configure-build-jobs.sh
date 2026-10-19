@@ -2209,8 +2209,16 @@ fi
 # sample above carries under the same CMake/generator/epoch settings. The native
 # client changes and requires a new build receipt. ABI12/80, portable1050 budget,
 # default ratchet572, job width, limits, selectors and clock policy stay unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bfe01a465bd53a00eff185f3130e37344938982e ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie bfe01a465bd53a00eff185f3130e37344938982e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 9e11cab435dde363c9f065d172da1754b8c25909 (2026-10-18): from
+# bfe01a465bd53a00eff185f3130e37344938982e. Correct only the README description of local
+# cache-context failure checks; no caller abort/recovery guarantee is claimed.
+# Executable, native, test and build-recipe sources are unchanged. Inventory989,
+# ABI12/80 and the qualified a15e SDK sample carry under the same CMake/generator/
+# epoch settings. Documentation, Git pin and lock metadata change; runtime receipts
+# remain bound to H1d2169da/Rbfe01a46, not this documentation successor. Portable1050,
+# default ratchet572, job width, limits, selectors and clock policy stay unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 9e11cab435dde363c9f065d172da1754b8c25909 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 9e11cab435dde363c9f065d172da1754b8c25909 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
