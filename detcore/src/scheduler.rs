@@ -588,6 +588,18 @@ pub struct BlockedPool {
     /// An entry lives exactly as long as the thread's blocking-pool entry.
     pub out_of_scheduler_masks: BTreeMap<DetTid, Option<u64>>,
 
+    /// The `out_of_scheduler_masks` entry of a thread readmitted from a
+    /// blocking pool, kept until its continuation turn is granted. Until then
+    /// the thread is stopped where its call returned, under the mask that call
+    /// ran with: for a call that installs a temporary mask (`pselect6`,
+    /// `ppoll`, `epoll_pwait`, `rt_sigsuspend`) Linux delivers a signal that
+    /// interrupted it under that mask and restores the saved one only at
+    /// `rt_sigreturn` (kernel/signal.c `restore_saved_sigmask_unless`). The
+    /// kernel's own `SigBlk` there differs between record, where the call ran
+    /// in the kernel, and replay, where its result is served, so a decision
+    /// such as the `SIGCHLD` taker reads this record instead.
+    pub continuation_masks: BTreeMap<DetTid, Option<u64>>,
+
     /// Parents parked awaiting deterministic delivery of a host-async `SIGCHLD`.
     ///
     /// When a guest child process exits, the kernel raises `SIGCHLD` on the
@@ -6736,6 +6748,7 @@ impl Scheduler {
         self.blocked.replay_log_served.remove(dtid);
         let _ = self.blocked.rt_sigsuspend_blockers.remove(dtid);
         let _ = self.blocked.out_of_scheduler_masks.remove(dtid);
+        let _ = self.blocked.continuation_masks.remove(dtid);
         let _ = self.background_entry_barriers.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
         self.blocked.sigchld_deferred.remove(dtid);
@@ -7580,7 +7593,7 @@ impl Scheduler {
             let external = self.blocked.external_io_blockers.remove(&dtid);
             self.blocked.replay_log_served.remove(&dtid);
             let sigsuspend = self.blocked.rt_sigsuspend_blockers.remove(&dtid);
-            let _ = self.blocked.out_of_scheduler_masks.remove(&dtid);
+            self.keep_mask_for_continuation(dtid);
             assert!(
                 external.is_some() ^ sigsuspend.is_some(),
                 "ready thread must belong to exactly one blocking pool"
@@ -10825,7 +10838,19 @@ impl Scheduler {
         {
             return Some(Some(!watch.unblocked));
         }
-        self.blocked.out_of_scheduler_masks.get(&thread).copied()
+        self.blocked
+            .out_of_scheduler_masks
+            .get(&thread)
+            .or_else(|| self.blocked.continuation_masks.get(&thread))
+            .copied()
+    }
+
+    /// `dtid` leaves its blocking pool for the run queue: its recorded mask
+    /// stays its mask until its continuation turn (`continuation_masks`).
+    fn keep_mask_for_continuation(&mut self, dtid: DetTid) {
+        if let Some(mask) = self.blocked.out_of_scheduler_masks.remove(&dtid) {
+            self.blocked.continuation_masks.insert(dtid, mask);
+        }
     }
 
     /// `thread`'s current signal mask (`SigBlk`), read from the kernel; `None`
@@ -11322,7 +11347,7 @@ impl Scheduler {
                     let external = scheduler.blocked.external_io_blockers.remove(ready_dtid);
                     scheduler.blocked.replay_log_served.remove(ready_dtid);
                     let sigsuspend = scheduler.blocked.rt_sigsuspend_blockers.remove(ready_dtid);
-                    let _ = scheduler.blocked.out_of_scheduler_masks.remove(ready_dtid);
+                    scheduler.keep_mask_for_continuation(*ready_dtid);
                     assert!(
                         external.is_some() ^ sigsuspend.is_some(),
                         "ready thread must belong to exactly one blocking pool"
@@ -12759,7 +12784,9 @@ impl Scheduler {
             // Thread CONTINUES after completing [potentially] blocking IO.
             ResourceID::BlockedExternalContinue(_) | ResourceID::VforkFailed(_) => {
                 // We leave the thread out of the run-queue.  At the point we put it back
-                // in, this resource request is immediately granted.
+                // in, this resource request is immediately granted. From here
+                // the thread runs again, so its mask is the kernel's.
+                self.blocked.continuation_masks.remove(&dettid);
                 Ok(())
             }
 
@@ -22798,6 +22825,90 @@ mod test {
         assert_eq!(selected, vfork_child);
         scheduler.run_queue.undo_tentative_pop();
         assert!(!scheduler.blocked.sigchld_takers.contains(&target));
+    }
+
+    /// The readmission that broke record/replay of make -jN (minibeads
+    /// dh-ojrf): make (7), a SIGCHLD taker, is backgrounded in a `pselect6`
+    /// whose temporary mask unblocks SIGCHLD (recorded as 0), and a child
+    /// (173) in a `connect`. A coalesced SIGCHLD ends make's call; both calls
+    /// have finished by one step2c, which readmits them together as one
+    /// rejoin entry. Step 3 must choose from the recorded mask, which holds
+    /// until each continuation turn, not from the kernel's `SigBlk`, which in
+    /// replay (the call's result served) still blocks SIGCHLD: make first,
+    /// in record and in replay. The kept mask ends at make's continuation.
+    #[test]
+    fn two_calls_readmitted_together_choose_the_sigchld_taker_by_its_recorded_mask() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let make = DetTid::from_raw(7);
+        let child = DetTid::from_raw(173);
+        let pselect = ExternalOpId::new(make, 1016);
+        let connect = ExternalOpId::new(child, 199);
+        let logged = Rejoin {
+            turn: 12,
+            wakes: 0,
+            calls: vec![(make, 1016), (child, 199)],
+        };
+        for replay in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut scheduler = gated_scheduler();
+            scheduler.recordreplay_modes = true;
+            for (tid, op) in [(make, pselect), (child, connect)] {
+                scheduler.thread_tree.add_child(tid, tid, true);
+                register_known_thread(&mut scheduler, tid);
+                background(&mut scheduler, op, true);
+            }
+            scheduler
+                .blocked
+                .out_of_scheduler_masks
+                .insert(make, Some(0));
+            // make catches SIGCHLD; in replay the kernel's SigBlk still
+            // blocks it.
+            let mut kernel = signal_state(chld, 0);
+            kernel.blocked = chld;
+            scheduler.test_kernel_signal_states.insert(make, kernel);
+            assert!(scheduler.note_group_send(make, Signal::SIGCHLD, false));
+            scheduler.blocked.sigchld_takers.insert(make);
+            scheduler.turn = 12;
+            if replay {
+                replaying(&mut scheduler, std::slice::from_ref(&logged));
+            } else {
+                scheduler.rejoin_writer = Some(RejoinWriter::create(dir.path()).unwrap());
+            }
+
+            assert!(scheduler.step2c_process_io_blockers().is_ok());
+            for tid in [make, child] {
+                assert!(scheduler.run_queue.contains_tid(tid), "replay {replay}");
+            }
+            if replay {
+                assert!(scheduler.rejoin_replay.as_ref().unwrap().is_empty());
+            } else {
+                assert_eq!(
+                    rejoin_log::read(dir.path()).unwrap(),
+                    std::collections::VecDeque::from([logged.clone()])
+                );
+            }
+            assert_eq!(
+                scheduler.blocked.continuation_masks.get(&make),
+                Some(&Some(0))
+            );
+            let (selected, _, _) = scheduler.step3_peek().expect("a thread is runnable");
+            assert_eq!(selected, make, "replay {replay}");
+            scheduler.run_queue.undo_tentative_pop();
+
+            assert!(
+                scheduler
+                    .block_for_one_resource(
+                        make,
+                        &ResourceID::BlockedExternalContinue(pselect),
+                        &Permission::RW,
+                        None,
+                        None,
+                        &Ivar::new(),
+                    )
+                    .is_ok()
+            );
+            assert!(!scheduler.blocked.continuation_masks.contains_key(&make));
+        }
     }
 
     /// A5 step 2b: the first SIGCHLD taker is chosen by the mask its thread
