@@ -108,6 +108,12 @@ pub struct ExitOrderState {
     /// `parked.exits_awaiting_permit`, which gives them the treatment of an
     /// exiting thread elsewhere in the scheduler).
     held: std::collections::BTreeSet<DetTid>,
+    /// The key each held exit was held with. It does not move while the exit
+    /// is held: the other threads of an `exit_group` keep running until it is
+    /// granted, where Linux would already have killed them, and their work
+    /// must not raise the key the hold rules compare against (assumption A3
+    /// of the liveness proof).
+    held_keys: std::collections::HashMap<DetTid, (u64, DetPid)>,
     /// Wait parents of processes whose exit was just granted; their polled
     /// `wait4`/`waitid` is handed the next turn at the next step 2.
     wake_parents: std::collections::BTreeSet<DetPid>,
@@ -283,7 +289,12 @@ impl Scheduler {
     fn exit_order_hold_inputs(&self, tid: DetTid, group: bool) -> Option<HoldInputs> {
         let process = self.exit_order_ending_process(tid, group)?;
         let parent = self.thread_tree.parent_process(&process)?;
-        let key = (self.exit_order_clock(process), process);
+        let key = self
+            .exit_order
+            .held_keys
+            .get(&tid)
+            .copied()
+            .unwrap_or_else(|| (self.exit_order_clock(process), process));
         let siblings: Vec<DetPid> = self
             .thread_tree
             .unreaped_children_of(parent)
@@ -343,9 +354,18 @@ impl Scheduler {
                 "pid": process.as_raw(), "key": self.exit_order_clock(process),
             }));
         }
-        self.exit_order.held.insert(tid);
+        self.exit_order_note_held(tid, group);
         self.parked.exits_awaiting_permit.insert(tid);
         true
+    }
+
+    /// Mark `tid`'s exit held, keeping the key it is held with.
+    fn exit_order_note_held(&mut self, tid: DetTid, group: bool) {
+        if let Some(process) = self.exit_order_ending_process(tid, group) {
+            let key = (self.exit_order_clock(process), process);
+            self.exit_order.held_keys.entry(tid).or_insert(key);
+        }
+        self.exit_order.held.insert(tid);
     }
 
     /// Called when an exit that ends `process` is granted: fold its clock into
@@ -425,6 +445,7 @@ impl Scheduler {
             {
                 // Retired, or re-admitted by another path.
                 self.exit_order.held.remove(&tid);
+                self.exit_order.held_keys.remove(&tid);
                 continue;
             }
             let group = self
@@ -436,6 +457,7 @@ impl Scheduler {
                 .is_some_and(|(group, _, _)| group);
             if !self.exit_order_must_wait(tid, group) {
                 self.exit_order.held.remove(&tid);
+                self.exit_order.held_keys.remove(&tid);
                 self.parked.exits_awaiting_permit.remove(&tid);
                 self.admit_to_run_queue(tid, AdmitIntent::Fixed(AdmitSide::Front));
                 released = true;
@@ -709,6 +731,32 @@ mod tests {
         sched.blocked.sigchld_deferred.insert(DetTid::from_raw(2));
         assert_eq!(reason(&sched), Some(HoldReason::EarlierSibling));
         sched.runqueue_push_back(DetTid::from_raw(9));
+        assert_eq!(reason(&sched), None);
+    }
+
+    /// Rule change 3 (assumption A3 of the liveness proof): an `exit_group`
+    /// held while another thread of its process still runs keeps the key it
+    /// was held with, so that thread's later work does not move it, and the
+    /// hold still lapses once the parent's clock reaches that key.
+    #[test]
+    fn a_held_exit_group_keeps_its_key_while_another_thread_runs() {
+        let mut sched = family();
+        let tid = DetTid::from_raw;
+        sched
+            .thread_tree
+            .add_child_with_wait_metadata(tid(3), tid(4), false, false, libc::SIGCHLD);
+        sched
+            .priorities
+            .insert(tid(4), super::super::DEFAULT_PRIORITY);
+        sched.runqueue_push_back(tid(1));
+        sched.exit_order.work.insert(tid(1), 500);
+        sched.exit_order_note_held(tid(3), true);
+        let key = sched.exit_order_hold_inputs(tid(3), true).unwrap().key;
+        assert_eq!(key, (1_000, pid(3)));
+        sched.exit_order.work.insert(tid(4), 5_000);
+        assert_eq!(sched.exit_order_hold_inputs(tid(3), true).unwrap().key, key);
+        assert_eq!(reason(&sched), Some(HoldReason::ParentAhead));
+        sched.exit_order.work.insert(tid(1), key.0);
         assert_eq!(reason(&sched), None);
     }
 
