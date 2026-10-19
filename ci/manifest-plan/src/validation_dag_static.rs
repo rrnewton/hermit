@@ -4169,7 +4169,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fifteen R2b-2 stage 3 CLI tests: 497, listed.
     // And the same five K3b CLI tests: 502.
     // And the same denied-user-namespace test: 503, listed.
-    ("test.cli_on_host", 503),
+    // And the same a_vfork_parent_resumes_at_its_childs_exec: 504.
+    ("test.cli_on_host", 504),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
