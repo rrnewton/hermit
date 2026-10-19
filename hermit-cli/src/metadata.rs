@@ -919,6 +919,13 @@ impl Metadata {
 }
 
 pub fn record_or_replay_config(data: &Path) -> detcore::Config {
+    record_or_replay_config_with_timer_support(data, record_timer_support())
+}
+
+fn record_or_replay_config_with_timer_support(
+    data: &Path,
+    timer_support: Result<(), String>,
+) -> detcore::Config {
     // NOTE: Record and replay should use the exact same Detcore configuration.
     // Callers add the completed producer namespace's mountinfo order and
     // mount-ID assignment order after this common base is built, so replay
@@ -1092,10 +1099,9 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     }
     .with_backend(|backend| {
         backend.supports_blocked_wait_signal_interruption = true;
-        backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
     });
-    if let Err(reason) = record_timer_support() {
+    if let Err(reason) = timer_support {
         disable_timeslice_without_a_timer(&mut config, &reason);
     }
     config
@@ -1156,6 +1162,29 @@ mod tests {
             no_perf.contains("perf counters are not supported"),
             "{no_perf}"
         );
+        let supported = record_or_replay_config_with_timer_support(
+            Path::new("replay-data"),
+            timer_support_from(true, Ok(())),
+        );
+        assert_eq!(
+            supported.backend.delivers_preemption_timer_events,
+            <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities()
+                .delivers_preemption_timer_events,
+            "record and replay use ptrace's timer mechanism"
+        );
+        assert_eq!(
+            supported.max_timeslice,
+            detcore::Config::default().max_timeslice
+        );
+        assert!(supported.use_preemption_timer());
+        assert!(!supported.chaos);
+        for reason in [no_perf, no_profile] {
+            let unavailable =
+                record_or_replay_config_with_timer_support(Path::new("replay-data"), Err(reason));
+            assert_eq!(unavailable.max_timeslice, None);
+            assert!(!unavailable.use_preemption_timer());
+            assert_eq!(unavailable.backend, supported.backend);
+        }
         let mut config = detcore::Config::default();
         assert!(config.max_timeslice.is_some());
         disable_timeslice_without_a_timer(

@@ -2544,7 +2544,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // units, the drain-filter scheduler unit and the procfs SigBlk unit: 2094, listed.
     // And procfs::locks's nine units (the guest's own /proc/locks rows):
     // 2103, freshly listed.
-    ("test.detcore_unit", 2103),
+    // Four continuous-accounting/timer-capability regressions retain all prior units: 2107.
+    ("test.detcore_unit", 2107),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4441,7 +4442,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (dev-hermit minibeads dh-l1fk): 2086.
     // And the same eight R2b-2 stage 2 units: 2094, listed.
     // And the same nine procfs::locks units: 2103, freshly listed.
-    ("test.detcore_unit_on_host", 2103),
+    // The same four continuous-accounting/timer-capability regressions: 2107.
+    ("test.detcore_unit_on_host", 2107),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -2154,10 +2154,7 @@ impl GlobalState {
         // stays separate from the INFO guest-behavior view.
         summary.preemption = Some(PreemptionSummary {
             max_timeslice_ns: self.cfg.max_timeslice.map(|maximum| maximum.get()),
-            timer_enabled: Some(
-                self.cfg.max_timeslice.is_some()
-                    && self.cfg.backend.delivers_preemption_timer_events,
-            ),
+            timer_enabled: Some(self.cfg.use_preemption_timer()),
         });
         //
         // Real time report:
@@ -10213,6 +10210,7 @@ mod tests {
     mod backend_failure_tests;
     mod exec_identity_tests;
     mod exec_teardown_tests;
+    mod timerless_clock_tests;
     use std::collections::BTreeSet;
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
