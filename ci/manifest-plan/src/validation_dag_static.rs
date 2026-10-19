@@ -2574,7 +2574,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // which did not move this pin; nextest list: 2160.
     // And +1 from 1648d29d: 2161.
     // And two_calls_readmitted_together_choose_the_sigchld_taker_by_its_recorded_mask: 2147.
-    ("test.detcore_unit", 2147),
+    // And the fifteen vfork-rejoin scheduler units, re-landed: 2162.
+    ("test.detcore_unit", 2162),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3717,7 +3718,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And statx_reports_the_classic_and_the_unique_mount_id_as_linux_does and
     // systemd_sysusers_reads_its_configuration_as_natively
     // (https://github.com/rrnewton/hermit/issues/4519): 573, listed.
-    ("test.cli", 572),
+    // And a_vfork_parent_resumes_at_its_childs_exec, re-landed: 573.
+    ("test.cli", 573),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4188,7 +4190,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Minus the vfork rejoin's tests, reverted in this commit.
     // And +1 from a84cd832: 505.
     // And the same two statx mount-ID tests: 507, listed.
-    ("test.cli_on_host", 506),
+    // And a_vfork_parent_resumes_at_its_childs_exec, re-landed: 507.
+    ("test.cli_on_host", 507),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4539,7 +4542,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // which did not move this pin; nextest list: 2160.
     // And +1 from 1648d29d: 2161.
     // And two_calls_readmitted_together_choose_the_sigchld_taker_by_its_recorded_mask: 2147.
-    ("test.detcore_unit_on_host", 2147),
+    // And the fifteen vfork-rejoin scheduler units, re-landed: 2162.
+    ("test.detcore_unit_on_host", 2162),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
