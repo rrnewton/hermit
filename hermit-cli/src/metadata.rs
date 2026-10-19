@@ -763,7 +763,13 @@ impl RecordVersion {
 // broke record/replay of make -jN (minibeads dh-ojrf): a vfork parent is again
 // held until nothing else can run, and the rejoin log entries are gone. A
 // recording made with the rejoin is refused by the exact-match gate.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17b);
+// 0x17b -> 0x17c (HIGHEST_SHIPPED + 1 when it lands): a signal delivery that
+// continues the thread's previous handler (no grant by the scheduler in
+// between) runs before the other threads under record and replay too
+// (https://github.com/rrnewton/hermit/issues/4505). A recording whose guest
+// is signaled again before a handler returns now has a different schedule,
+// and an older recording would replay out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17c);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -788,7 +794,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17b);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17b;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17c;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
