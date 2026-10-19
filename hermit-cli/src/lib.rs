@@ -31,6 +31,7 @@ use hermit_record_format::event;
 use hermit_record_format::event_stream;
 pub mod happens_before;
 pub mod host_input_change;
+mod host_qualification;
 mod id;
 #[cfg(feature = "liteinst")]
 pub mod in_guest_exits;
