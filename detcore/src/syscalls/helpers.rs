@@ -339,6 +339,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrcs = Resources::new(dettid);
             rsrcs.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
             rsrcs.fyi(call.name());
+            // The mask the thread is stopped under here: the call's temporary
+            // mask when a signal ended the call, as the scheduler may decide
+            // from it before this turn (`BlockedPool::continuation_masks`);
+            // otherwise the kernel has restored the thread's own. Decided from
+            // the result, which replay serves as recorded.
+            if temporary_mask_survives(call, &res) {
+                rsrcs.blocked_signal_mask = blocked_signal_mask;
+                rsrcs.blocked_signal_mask_unknown = blocked_signal_mask_unknown;
+            }
             resource_request(guest, rsrcs).await;
         }
         res
@@ -7242,5 +7251,89 @@ mod turn_signal_tests {
             turn_signals_before_discard(&caught_rt, 0, 0, rt, ByDisposition, 0).named,
             rt
         );
+    }
+}
+
+/// Whether `call`, having returned `result`, leaves the thread stopped under
+/// the temporary signal mask the call installed, decided from what the kernel
+/// did, which the raw result tells and replay serves as recorded:
+/// - the call ran and a signal ended it: `-ERESTARTNOHAND` from
+///   `rt_sigsuspend`, `pselect6` or `ppoll`, or the `-EINTR` that
+///   `poll_select_finish` can still turn it into after keeping the mask (a
+///   timeout write-back that faults, or the STICKY_TIMEOUTS personality), and
+///   `-EINTR` from `epoll_pwait` or `epoll_pwait2`. Linux then delivers the
+///   signal under the temporary mask and `rt_sigreturn` restores the saved one
+///   (`restore_saved_sigmask_unless`, fs/select.c, fs/eventpoll.c and
+///   kernel/signal.c at v6.9);
+/// - the call returned normally: Linux restored the saved mask before it
+///   returned;
+/// - for pselect6, ppoll, epoll_pwait and epoll_pwait2 a `-ERESTARTSYS`, which
+///   the host reports when the signal reached the thread before the call ran,
+///   keeps nothing: the kernel never installed the mask, and the recording
+///   holds that result, so replay sees it too.
+///
+/// `rt_sigsuspend` keeps the mask whatever its result. The record/replay layer
+/// does not model it: record injects it live, where a signal arriving first
+/// yields that host-timed `-ERESTARTSYS`, and replay re-injects it with retry,
+/// so a rule on its result would differ between the two (the Claude review of
+/// d1b9404c). Hermit gives the guest `-ERESTARTNOHAND` in that case
+/// (`record_or_replay_rt_sigsuspend`), a call that ran and was interrupted, for
+/// which Linux keeps the mask. That the kernel itself never installed it there
+/// is https://github.com/rrnewton/hermit/issues/4338.
+pub(crate) fn temporary_mask_survives(call: Syscall, result: &Result<i64, Error>) -> bool {
+    let ended_by = |errno: Errno| matches!(result, Err(Error::Errno(error)) if *error == errno);
+    match call {
+        Syscall::RtSigsuspend(_) => true,
+        Syscall::Pselect6(_) | Syscall::Ppoll(_) => {
+            ended_by(Errno::ERESTARTNOHAND) || ended_by(Errno::EINTR)
+        }
+        Syscall::EpollPwait(_) | Syscall::Other(Sysno::epoll_pwait2, _) => ended_by(Errno::EINTR),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod temporary_mask_tests {
+    use super::*;
+
+    /// The temporary mask survives an interrupted pselect6 or ppoll
+    /// (`-ERESTARTNOHAND`, or the `-EINTR` it can become after the kernel kept
+    /// the mask) and an interrupted epoll_pwait or epoll_pwait2 (`-EINTR`); not
+    /// their normal return, a call the signal reached before it ran
+    /// (`-ERESTARTSYS`), or another errno; and every rt_sigsuspend, whose
+    /// `-ERESTARTSYS` is host-timed in record and absent in replay. Never a
+    /// call without a temporary mask.
+    #[test]
+    fn the_temporary_mask_survives_only_a_call_a_signal_ended() {
+        let restart = Err(Error::Errno(Errno::ERESTARTNOHAND));
+        let eintr = Err(Error::Errno(Errno::EINTR));
+        let pselect = Syscall::Pselect6(syscalls::Pselect6::new());
+        let ppoll = Syscall::Ppoll(syscalls::Ppoll::new());
+        let epoll = Syscall::EpollPwait(syscalls::EpollPwait::new());
+        let epoll2 = Syscall::Other(
+            Sysno::epoll_pwait2,
+            reverie::syscalls::SyscallArgs::new(0, 0, 0, 0, 0, 0),
+        );
+        let before_entry = Err(Error::Errno(Errno::ERESTARTSYS));
+        let sigsuspend = Syscall::RtSigsuspend(syscalls::RtSigsuspend::new());
+        let read = Syscall::Read(syscalls::Read::new());
+        let ebadf = Err(Error::Errno(Errno::EBADF));
+        for call in [pselect, ppoll] {
+            assert!(temporary_mask_survives(call, &restart), "{call:?}");
+            assert!(temporary_mask_survives(call, &eintr), "{call:?}");
+            assert!(!temporary_mask_survives(call, &before_entry), "{call:?}");
+            assert!(!temporary_mask_survives(call, &ebadf), "{call:?}");
+            assert!(!temporary_mask_survives(call, &Ok(1)), "{call:?}");
+        }
+        for result in [&restart, &eintr, &before_entry] {
+            assert!(temporary_mask_survives(sigsuspend, result), "{result:?}");
+        }
+        for call in [epoll, epoll2] {
+            assert!(temporary_mask_survives(call, &eintr), "{call:?}");
+            assert!(!temporary_mask_survives(call, &restart), "{call:?}");
+            assert!(!temporary_mask_survives(call, &before_entry), "{call:?}");
+            assert!(!temporary_mask_survives(call, &Ok(0)), "{call:?}");
+        }
+        assert!(!temporary_mask_survives(read, &restart));
     }
 }

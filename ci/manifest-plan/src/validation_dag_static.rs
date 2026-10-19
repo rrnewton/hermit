@@ -2575,7 +2575,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 1648d29d: 2161.
     // And the held-approval and unreported-count units (A5 step 3.2b part
     // 2): 2148, listed.
-    ("test.detcore_unit", 2148),
+    // And two_calls_readmitted_together_choose_the_sigchld_taker_by_its_recorded_mask,
+    // a_kept_continuation_mask_ends_at_vfork_failed_and_at_retirement and
+    // the_temporary_mask_survives_only_a_call_a_signal_ended: 2151.
+    ("test.detcore_unit", 2151),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4542,7 +4545,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // which did not move this pin; nextest list: 2160.
     // And +1 from 1648d29d: 2161.
     // And the same two A5 step 3.2b part 2 units: 2148, listed.
-    ("test.detcore_unit_on_host", 2148),
+    // And two_calls_readmitted_together_choose_the_sigchld_taker_by_its_recorded_mask,
+    // a_kept_continuation_mask_ends_at_vfork_failed_and_at_retirement and
+    // the_temporary_mask_survives_only_a_call_a_signal_ended: 2151.
+    ("test.detcore_unit_on_host", 2151),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
