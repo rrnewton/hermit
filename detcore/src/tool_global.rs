@@ -7380,7 +7380,6 @@ where
         }
         let dettid = guest.thread_state().dettid;
         let detpid = guest.thread_state().detpid.expect("detpid unset");
-        crate::parallelism_probe::flush_segment(dettid, &r);
         trace!(
             "[detcore, dtid {}] BLOCKING on resource_request rpc... {:?}",
             &dettid, r
