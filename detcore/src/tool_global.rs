@@ -4232,6 +4232,12 @@ impl GlobalState {
                 sched.fail_parked(dettid, error);
                 return (SchedulerRpcResult::ThreadExited, None);
             }
+            if sched.parallelism_probe.is_some() {
+                let thread_time = self.global_time.lock().unwrap().threads_time(dettid);
+                if let Some(probe) = sched.parallelism_probe.as_mut() {
+                    probe.note_request(dettid, detpid, thread_time);
+                }
+            }
             sched.request_put(&nextturn.req, rs.clone(), &self.global_time);
             nextturn.resp
         };
@@ -4527,6 +4533,14 @@ impl GlobalState {
                     flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_PARENT)),
                     exit_signal,
                 );
+                if sched.parallelism_probe.is_some() {
+                    let process = sched.thread_tree.process_of(child_dettid);
+                    let wait_parent =
+                        process.and_then(|process| sched.thread_tree.parent_process(&process));
+                    if let Some(probe) = sched.parallelism_probe.as_mut() {
+                        probe.note_spawn(parent_dettid, child_dettid, process, wait_parent);
+                    }
+                }
                 if is_group_leader {
                     sched.forget_previous_process_exit(child_dettid);
                     // The child's exit signal is posted to its parent at a
@@ -7366,6 +7380,7 @@ where
         }
         let dettid = guest.thread_state().dettid;
         let detpid = guest.thread_state().detpid.expect("detpid unset");
+        crate::parallelism_probe::flush_segment(dettid, &r);
         trace!(
             "[detcore, dtid {}] BLOCKING on resource_request rpc... {:?}",
             &dettid, r

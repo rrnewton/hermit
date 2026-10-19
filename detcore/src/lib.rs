@@ -65,6 +65,7 @@ mod memory;
 pub mod native_exec;
 pub mod netlink_route;
 pub mod nonwaiting_write;
+pub mod parallelism_probe;
 mod pipe_wake;
 mod procfs;
 mod procfs_inode;
@@ -2498,6 +2499,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let result = if guest.config().virtualize_time {
             let dettid = guest.thread_state().dettid;
             guest.thread_state_mut().thread_logical_time.add_rdtsc();
+            crate::parallelism_probe::note_event(dettid, "rdtsc");
             info!(
                 "[dtid {}] inbound rdtsc, new logical time: {:?}",
                 dettid,
@@ -3467,6 +3469,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 crate::syscalls::read_thread_signal_state(pid, tid)
             });
         guest.thread_state_mut().claimed_sigchld = claimed;
+        // Before the pre-handler hook, which can take a turn: a turn taken
+        // from here on comes after the previous syscall.
+        if crate::parallelism_probe::enabled() {
+            let a = call.into_parts().1;
+            let args = [a.arg0, a.arg1, a.arg2, a.arg3, a.arg4, a.arg5].map(|arg| arg as u64);
+            let proc_tid = guest.tid().as_raw();
+            let fs =
+                crate::parallelism_probe::fs_targets(call.name(), args, proc_tid, &guest.memory());
+            crate::parallelism_probe::note_syscall(
+                guest.thread_state().dettid,
+                call.name(),
+                args,
+                proc_tid,
+                fs,
+            );
+        }
         self.pre_handler_hook(guest, false, CheckIn::Event).await;
 
         // Linux's restart of an interrupted wait is the thread's very next syscall,
@@ -4819,6 +4837,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // The syscall is finished; a turn the post-hook takes (a timeslice
         // end) is the thread's own and advances global time as usual.
         guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
+        crate::parallelism_probe::complete_syscall(dettid);
         self.post_handler_hook(guest, CheckIn::Event).await;
 
         // Defense-in-depth: unless the backend already owns this guarantee,
