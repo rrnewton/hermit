@@ -1691,7 +1691,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/4213): 1055.
     // And the two namespace-probe units and the degraded-counter warning unit
     // (https://github.com/rrnewton/hermit/issues/4515): 1058, listed.
-    ("test.hermit_unit", 1058),
+    // And metadata::tests::record_and_replay_never_read_sigreturn_reports
+    // (https://github.com/rrnewton/hermit/pull/4510): 1059, listed.
+    ("test.hermit_unit", 1059),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3700,7 +3702,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/4213): 568.
     // And a_run_without_namespaces_is_not_refused_where_user_namespaces_are_denied
     // (https://github.com/rrnewton/hermit/issues/4515): 569, listed.
-    ("test.cli", 569),
+    // And the_4505_signal_guests_get_past_their_handlers_under_record,
+    // the_4505_signal_guests_replay_under_gdb,
+    // a_reader_whose_handler_yields_gets_past_it_at_the_senders_slice_end and
+    // a_handlers_futex_wait_ends_its_delivery_continuation_under_record
+    // (https://github.com/rrnewton/hermit/pull/4510): 573, listed.
+    ("test.cli", 573),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4167,7 +4174,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fifteen R2b-2 stage 3 CLI tests: 497, listed.
     // And the same five K3b CLI tests: 502.
     // And the same denied-user-namespace test: 503, listed.
-    ("test.cli_on_host", 503),
+    // And the same four 4510 tests: 507, listed.
+    ("test.cli_on_host", 507),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4815,7 +4823,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same R2b-2 stage 3 record-version test: 1051, listed.
     // And the same four K3b unit tests: 1055.
     // And the same three units: 1058, listed.
-    ("test.hermit_unit_on_host", 1058),
+    // And the same sigreturn-report pin: 1059, listed.
+    ("test.hermit_unit_on_host", 1059),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

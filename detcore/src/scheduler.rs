@@ -10122,9 +10122,10 @@ impl Scheduler {
         }))
     }
 
-    /// The queued thread whose filed request is a signal delivery it reached
-    /// straight from its own `rt_sigreturn`, in a timeslice that stop did not
-    /// end (`Resources::continues_sigreturn`), if any, in run-queue order.
+    /// The queued thread whose filed request is a signal delivery that
+    /// continues its previous one (`Resources::continues_sigreturn`: no
+    /// scheduling point of the thread in between, in a timeslice that stop
+    /// did not end), if any, in run-queue order.
     /// Step 3 grants it before any other ordinary thread: Linux makes that
     /// delivery on the same return to user space as the `rt_sigreturn`,
     /// before any instruction of the interrupted code runs. Putting it behind
@@ -26689,7 +26690,7 @@ mod test {
         }
     }
 
-    /// A signal delivery a thread reached straight from its own `rt_sigreturn`
+    /// A signal delivery that continues the thread's previous one
     /// (`Resources::continues_sigreturn`), filed through `request_put`, is
     /// selected before a thread queued ahead of it; the same request without
     /// the mark waits its turn (https://github.com/rrnewton/hermit/issues/4505).

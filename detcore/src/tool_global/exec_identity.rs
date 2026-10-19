@@ -230,6 +230,8 @@ where
         return Err(Errno::EOPNOTSUPP);
     }
     if guest.config().sequentialize_threads {
+        // A scheduling point (`ThreadState::note_scheduler_handoff`).
+        guest.thread_state_mut().note_scheduler_handoff(false);
         let (_, response) = send_and_update_time(guest, GlobalRequest::ResumeExec(process)).await;
         let GlobalResponse::ResumeExec(_, duration) = response else {
             unreachable!("exec continuation must receive its typed grant");
