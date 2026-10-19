@@ -31,6 +31,7 @@ use crate::analyze::consts::*;
 use crate::analyze::rundata::RunData;
 use crate::analyze::types::AnalyzeOpts;
 use crate::analyze::types::ExitStatusConstraint;
+use crate::analyze::types::MinimizedReproducer;
 use crate::analyze::types::Report;
 use crate::analyze::types::ReportCriticalEvent;
 use crate::global_opts::GlobalOpts;
@@ -48,6 +49,104 @@ fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
     pr1.preemptions_only();
     pr2.preemptions_only();
     pr1 == pr2
+}
+
+/// Launch a certification run. A Hermit policy refusal (exit 122 from
+/// Hermit, such as a strict replay that diverged) is `Ok(Err(why))`: no
+/// certified reproducer, and never mistaken for the guest exiting 122. Other
+/// failures end the analysis as any trial's do.
+fn launch_for_certification(run: &mut RunData) -> anyhow::Result<Result<(), String>> {
+    match run.launch() {
+        Ok(()) => Ok(Ok(())),
+        Err(error)
+            if error
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some() =>
+        {
+            Ok(Err(format!("{} was refused: {error:#}", run.runname())))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// What one certification replay showed: Hermit's refusal, or whether it
+/// met the criteria, what it printed, and the preemptions it recorded.
+#[derive(Debug, Clone, PartialEq)]
+struct ReplayEvidence {
+    run: String,
+    refusal: Option<String>,
+    matched: bool,
+    stdout: Vec<u8>,
+    preemptions: Option<PreemptionRecord>,
+}
+
+impl ReplayEvidence {
+    /// Launch `run` (which records preemptions) and collect what it showed.
+    fn of(run: &mut RunData) -> anyhow::Result<Self> {
+        let refusal = launch_for_certification(run)?.err();
+        let (matched, stdout, preemptions) = if refusal.is_none() {
+            let mut recorded = PreemptionReader::new(run.preempts_path_out()).load_all();
+            recorded.preemptions_only();
+            (
+                run.is_a_match(),
+                std::fs::read(run.root_path().with_extension("stdout"))?,
+                Some(recorded),
+            )
+        } else {
+            (false, Vec::new(), None)
+        };
+        Ok(ReplayEvidence {
+            run: run.runname().to_owned(),
+            refusal,
+            matched,
+            stdout,
+            preemptions,
+        })
+    }
+}
+
+/// Whether certification holds so far: both lenient replays of the
+/// minimized record ran without a refusal, met the criteria, printed the
+/// same stdout and recorded the same preemptions R'; and, once the strict
+/// replay of R' has run, it too ran without a refusal and met the criteria,
+/// printed that stdout, and recorded R' again (a fixed point). The first
+/// failure is the reason no reproducer is certified
+/// (<https://github.com/rrnewton/hermit/issues/4497>).
+fn certification_verdict(
+    lenient: &[ReplayEvidence; 2],
+    strict: Option<&ReplayEvidence>,
+) -> Result<(), String> {
+    let ran = |evidence: &ReplayEvidence| match (&evidence.refusal, evidence.matched) {
+        (Some(why), _) => Err(format!("{} was refused: {why}", evidence.run)),
+        (None, false) => Err(format!("{} did not meet the criteria", evidence.run)),
+        (None, true) => Ok(()),
+    };
+    let [first, second] = lenient;
+    ran(first)?;
+    ran(second)?;
+    let agree = |other: &ReplayEvidence, fixed_point: bool| {
+        if other.stdout != first.stdout {
+            Err(format!(
+                "{} and {} printed different stdout",
+                first.run, other.run
+            ))
+        } else if other.preemptions != first.preemptions {
+            Err(format!(
+                "{} recorded different preemptions than {}{}",
+                other.run,
+                first.run,
+                if fixed_point { " (no fixed point)" } else { "" }
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    agree(second, false)?;
+    if let Some(strict) = strict {
+        ran(strict)?;
+        agree(strict, true)?;
+    }
+    Ok(())
 }
 
 fn yellow_msg(msg: &str) {
@@ -102,8 +201,10 @@ impl AnalyzeOpts {
         preempts_path: &Path,
         record_sched_path: Option<&Path>,
     ) -> anyhow::Result<(bool, RunOpts)> {
+        // A minimization round's record is edited; the trial explores it.
         let mut run = RunData::new_baseline(self, runname.to_string())?
-            .with_preempts_path_in(preempts_path.to_path_buf());
+            .with_preempts_path_in(preempts_path.to_path_buf())
+            .with_lenient_preemption_replay();
 
         if let Some(path) = record_sched_path {
             run = run.with_schedule_recording_to(path.to_path_buf());
@@ -370,6 +471,161 @@ impl AnalyzeOpts {
             );
         }
         Ok(())
+    }
+
+    /// Certify a reproducer from the minimized record, whether or not
+    /// `--selfcheck` was given (<https://github.com/rrnewton/hermit/issues/4497>).
+    ///
+    /// The minimized record is edited, so a strict replay of it is expected
+    /// to diverge. Instead: replay it leniently twice, recording each run's
+    /// preemptions. Both runs must meet the criteria with the same stdout,
+    /// record the same preemptions R', and (with `--selfcheck` or
+    /// `--verbose`, which keep logs) agree in their logs. Then replay R'
+    /// strictly, recording again: it must not be refused, must meet the
+    /// criteria with the same stdout (and log), and must record R' again, a
+    /// fixed point. R' records a run that happened and replays faithfully: it
+    /// is the certified reproducer. A failed step is reported as no certified
+    /// reproducer, never as the guest's own result; with `--selfcheck`, which
+    /// insists on perfect determinism before proceeding, it ends the analysis.
+    ///
+    /// `launch` runs one certification replay ([`ReplayEvidence::of`] in
+    /// production).
+    fn certify_minimized_reproducer(
+        &self,
+        global: &GlobalOpts,
+        min_run: &mut RunData,
+        launch: &mut dyn FnMut(&mut RunData) -> anyhow::Result<ReplayEvidence>,
+    ) -> anyhow::Result<MinimizedReproducer> {
+        let minimized = min_run.preempts_path_out().to_path_buf();
+        let outcome = self.certify_from(global, min_run, &minimized, launch)?;
+        if self.selfcheck
+            && let Err(why) = &outcome
+        {
+            bail!("--selfcheck requires a certified reproducer of the minimized record: {why}");
+        }
+        match &outcome {
+            Ok(certified) => eprintln!(
+                ":: {} {}",
+                "Certified reproducer (replays strictly to a fixed point):"
+                    .green()
+                    .bold(),
+                certified.display()
+            ),
+            Err(why) => eprintln!(":: {} {}", "No certified reproducer:".red().bold(), why),
+        }
+        let (certified, not_certified_because) = match outcome {
+            Ok(certified) => (Some(certified), None),
+            Err(why) => (None, Some(why)),
+        };
+        Ok(MinimizedReproducer {
+            minimized,
+            certified,
+            not_certified_because,
+        })
+    }
+
+    /// [`Self::certify_minimized_reproducer`]'s steps: the certified record,
+    /// or why there is none. The runs' outcomes are judged by
+    /// [`certification_verdict`]; logs, when kept, are compared after it.
+    fn certify_from(
+        &self,
+        global: &GlobalOpts,
+        min_run: &RunData,
+        minimized: &Path,
+        launch: &mut dyn FnMut(&mut RunData) -> anyhow::Result<ReplayEvidence>,
+    ) -> anyhow::Result<Result<PathBuf, String>> {
+        yellow_msg("[certify] Replaying the minimized record leniently, twice, recording each");
+        let mut runs = Vec::new();
+        let mut evidence = Vec::new();
+        for ix in 1..=2 {
+            let mut run = self.certification_run(
+                &format!("certify_lenient{ix}"),
+                &min_run.runopts,
+                minimized,
+                true,
+            )?;
+            eprintln!("    {}", run.to_repro());
+            evidence.push(launch(&mut run)?);
+            runs.push(run);
+        }
+        let lenient: [ReplayEvidence; 2] = evidence
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("two lenient replays"));
+        if let Err(why) = certification_verdict(&lenient, None) {
+            return Ok(Err(why));
+        }
+        let [mut first, mut second] =
+            <[RunData; 2]>::try_from(runs).unwrap_or_else(|_| unreachable!("two lenient replays"));
+        if let Some(why) =
+            self.logs_differ(global, &mut first, &mut second, "the two lenient replays")?
+        {
+            return Ok(Err(why));
+        }
+
+        yellow_msg("[certify] Replaying their recorded preemptions strictly, recording again");
+        let certified = first.preempts_path_out().to_path_buf();
+        let mut strict =
+            self.certification_run("certify_strict", &min_run.runopts, &certified, false)?;
+        eprintln!("    {}", strict.to_repro());
+        let strict_evidence = launch(&mut strict)?;
+        if let Err(why) = certification_verdict(&lenient, Some(&strict_evidence)) {
+            return Ok(Err(why));
+        }
+        if let Some(why) = self.logs_differ(
+            global,
+            &mut first,
+            &mut strict,
+            "the lenient and strict replays",
+        )? {
+            return Ok(Err(why));
+        }
+        Ok(Ok(certified))
+    }
+
+    /// A certification replay of `preempts`, recording its preemptions, under
+    /// `--replay-preemptions-lenient` if `lenient`. It takes the selected
+    /// run's seeds with the original command's replay policy
+    /// ([`RunData::new_run1_replay`]), so a search-only override such as
+    /// `--imprecise-search`'s imprecise timers does not reach the replays that
+    /// certify determinism; an explicit `--imprecise-timers` still does.
+    fn certification_run(
+        &self,
+        runname: &str,
+        selected: &RunOpts,
+        preempts: &Path,
+        lenient: bool,
+    ) -> anyhow::Result<RunData> {
+        let mut run = RunData::new_run1_replay(self, runname.to_owned(), selected)?
+            .with_preempts_path_in(preempts.to_path_buf())
+            .with_preemption_recording();
+        run.runopts.det_opts.det_config.replay_preemptions_lenient = lenient;
+        Ok(run)
+    }
+
+    /// Why two launched runs that kept logs (`--selfcheck`, `--verbose`)
+    /// logged different executions, compared as `--selfcheck` compares.
+    fn logs_differ(
+        &self,
+        global: &GlobalOpts,
+        one: &mut RunData,
+        other: &mut RunData,
+        which: &str,
+    ) -> anyhow::Result<Option<String>> {
+        if let (Some(one_log), Some(other_log)) =
+            (one.log_path().cloned(), other.log_path().cloned())
+            && one_log.exists()
+            && other_log.exists()
+            && !self
+                .log_diff_preemption_replay(global, &one_log, &other_log)
+                .success()
+        {
+            return Ok(Some(format!(
+                "{which} logged different executions: {} vs {}",
+                one_log.display(),
+                other_log.display()
+            )));
+        }
+        Ok(None)
     }
 
     /// Once we have the target MATCHING run in hand (usually crashing/failing), we need to
@@ -669,6 +925,8 @@ impl AnalyzeOpts {
                     event_index: critical_event_index,
                     stack: stack2,
                 },
+                // Filled in by `main` from the certification.
+                minimized_reproducer: None,
             };
 
             if self.verbose {
@@ -812,7 +1070,18 @@ impl AnalyzeOpts {
         let run1data = self.phase1_establish_target_run()?;
 
         let mut min_run = self.phase2_minimize(global, run1data)?;
-        self.phase3_strict_preempt_replay_check(global, &mut min_run)?;
+        // A minimized record is edited, so it is certified through a recording
+        // of its lenient replay; an unedited target record is checked directly.
+        let minimized_reproducer = if self.minimize {
+            Some(self.certify_minimized_reproducer(
+                global,
+                &mut min_run,
+                &mut ReplayEvidence::of,
+            )?)
+        } else {
+            self.phase3_strict_preempt_replay_check(global, &mut min_run)?;
+            None
+        };
 
         min_run.normalize_preempts_out();
         let normalized_preempts = min_run.preempts_out().clone();
@@ -858,7 +1127,8 @@ impl AnalyzeOpts {
         );
         let crit_sched = self.phase5_bisect_traces(target, baseline)?;
 
-        let report = self.phase6_record_outputs(crit_sched)?;
+        let mut report = self.phase6_record_outputs(crit_sched)?;
+        report.minimized_reproducer = minimized_reproducer;
         if let Some(path) = &self.report_file {
             let txt = serde_json::to_string(&report).unwrap();
             std::fs::write(path, txt).expect("Unable to write report file");
@@ -895,8 +1165,11 @@ impl AnalyzeOpts {
                 "Verify target endpoint preemption record causes criteria to hold and record sched events",
             );
             let runname = "verify_target_endpoint";
+            // The minimized record is edited: replay it as its rounds were.
+            // The schedule this records is the run that actually happened.
             let mut newrun = RunData::new(self, runname.to_string(), last_run.runopts.clone())
                 .with_preempts_path_in(last_run.preempts_path_out().to_path_buf())
+                .with_lenient_preemption_replay()
                 .with_schedule_recording();
             newrun.launch()?;
             eprintln!("    {}", newrun.to_repro());
@@ -918,6 +1191,12 @@ impl AnalyzeOpts {
         // cause the minimal execution change to now no longer match the criteria (most commonly,
         // an execution that now passes).
         let non_matching_preempts = matching_preempts.with_latest_preempt_removed();
+        if non_matching_preempts == *matching_preempts {
+            bail!(
+                "The target criteria hold with no preemptions left to remove, so there is no \
+                 nearby non-matching schedule to bisect against."
+            );
+        }
 
         // Validate the preemption record
         if let Err(e) = non_matching_preempts.validate() {
@@ -930,8 +1209,10 @@ impl AnalyzeOpts {
             );
         }
 
+        // A knockout is an edited record, explored like a minimization round.
         let mut newrun = RunData::new_baseline(self, runname.to_string())?
             .with_preempts_in(non_matching_preempts)
+            .with_lenient_preemption_replay()
             .with_schedule_recording();
 
         // Verify that the new preemption record does in fact now cause a non-matching execution,
@@ -1127,6 +1408,262 @@ mod tests {
         options.prepare(&args.global)?;
         options.tmp_dir = Some(dir.to_path_buf());
         Ok(*options)
+    }
+
+    fn evidence(run: &str, stdout: &str, preemptions: Option<PreemptionRecord>) -> ReplayEvidence {
+        ReplayEvidence {
+            run: run.to_owned(),
+            refusal: None,
+            matched: true,
+            stdout: stdout.as_bytes().to_vec(),
+            preemptions,
+        }
+    }
+
+    fn recorded(times_ns: &[u64]) -> PreemptionRecord {
+        let changes = times_ns
+            .iter()
+            .map(|ns| {
+                (
+                    detcore::types::LogicalTime::from_nanos(*ns),
+                    detcore::DEFAULT_PRIORITY,
+                )
+            })
+            .collect();
+        PreemptionRecord::from_vecs(&std::collections::BTreeMap::from([(
+            detcore::DetTid::from_raw(3),
+            changes,
+        )]))
+    }
+
+    /// Certification holds only when both lenient replays and the strict one
+    /// ran, met the criteria, printed the same stdout and recorded the same
+    /// preemptions; each other outcome is the named reason it fails, a
+    /// refusal included (https://github.com/rrnewton/hermit/issues/4497).
+    #[test]
+    fn certification_holds_only_for_agreeing_replays_and_a_fixed_point() {
+        let r = || Some(recorded(&[0, 1000, 2000]));
+        let lenient = [
+            evidence("certify_lenient1", "out", r()),
+            evidence("certify_lenient2", "out", r()),
+        ];
+        let strict = evidence("certify_strict", "out", r());
+        assert_eq!(certification_verdict(&lenient, None), Ok(()));
+        assert_eq!(certification_verdict(&lenient, Some(&strict)), Ok(()));
+
+        let refused = ReplayEvidence {
+            refusal: Some("preemption replay diverged".to_owned()),
+            matched: false,
+            stdout: Vec::new(),
+            preemptions: None,
+            ..strict.clone()
+        };
+        let unmatched = ReplayEvidence {
+            matched: false,
+            ..strict.clone()
+        };
+        let other_stdout = evidence("certify_strict", "else", r());
+        let moved = evidence("certify_strict", "out", Some(recorded(&[0, 1000, 2500])));
+        for (strict, reason) in [
+            (
+                &refused,
+                "certify_strict was refused: preemption replay diverged",
+            ),
+            (&unmatched, "certify_strict did not meet the criteria"),
+            (
+                &other_stdout,
+                "certify_lenient1 and certify_strict printed different stdout",
+            ),
+            (
+                &moved,
+                "certify_strict recorded different preemptions than certify_lenient1 (no fixed point)",
+            ),
+        ] {
+            assert_eq!(
+                certification_verdict(&lenient, Some(strict)),
+                Err(reason.to_owned())
+            );
+        }
+
+        let disagreeing = [
+            evidence("certify_lenient1", "out", r()),
+            evidence("certify_lenient2", "out", Some(recorded(&[0, 1500]))),
+        ];
+        assert_eq!(
+            certification_verdict(&disagreeing, Some(&strict)),
+            Err("certify_lenient2 recorded different preemptions than certify_lenient1".to_owned())
+        );
+        let second_refused = [
+            evidence("certify_lenient1", "out", r()),
+            ReplayEvidence {
+                run: "certify_lenient2".to_owned(),
+                ..refused.clone()
+            },
+        ];
+        assert_eq!(
+            certification_verdict(&second_refused, None),
+            Err("certify_lenient2 was refused: preemption replay diverged".to_owned())
+        );
+    }
+
+    /// An analysis with `--minimize`, the `analyze_flags` and the `run_args`.
+    fn minimizing_analysis(
+        dir: &Path,
+        analyze_flags: &[&str],
+        run_args: &[&str],
+    ) -> (AnalyzeOpts, GlobalOpts) {
+        let mut argv = vec!["hermit", "analyze", "--minimize"];
+        argv.extend(analyze_flags);
+        argv.push("--");
+        argv.extend(run_args);
+        argv.push("/bin/true");
+        let args = crate::Args::try_parse_from(&argv).unwrap();
+        let crate::Subcommand::Analyze(mut options) = args.command else {
+            panic!("{argv:?} is not analyze")
+        };
+        options.prepare(&args.global).unwrap();
+        options.tmp_dir = Some(dir.to_path_buf());
+        (*options, args.global)
+    }
+
+    /// The certification controller replays the minimized record leniently
+    /// twice and their recording strictly, each with the target run's seeds
+    /// and the original timer policy (not `--imprecise-search`'s; an explicit
+    /// `--imprecise-timers` is kept); it certifies the first lenient
+    /// replay's recording when the verdict holds. When it does not, the
+    /// report says why, and with `--selfcheck` the analysis ends there
+    /// (https://github.com/rrnewton/hermit/issues/4497).
+    #[test]
+    fn certification_replays_under_the_original_policy_and_selfcheck_fails_closed() {
+        for explicit_imprecise_timers in [false, true] {
+            for selfcheck in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut flags = vec!["--search", "--imprecise-search", "--run1-seed=211"];
+                if selfcheck {
+                    flags.push("--selfcheck");
+                }
+                let run_args: &[&str] = if explicit_imprecise_timers {
+                    &["--imprecise-timers"]
+                } else {
+                    &[]
+                };
+                let (options, global) = minimizing_analysis(dir.path(), &flags, run_args);
+                let minimized = dir.path().join("minimized.preempts");
+                std::fs::write(&minimized, recorded(&[0, 1000]).to_string()).unwrap();
+                let mut selected = RunData::new_baseline(&options, "selected".to_owned()).unwrap();
+                let config = &mut selected.runopts.det_opts.det_config;
+                config.seed = 101;
+                config.sched_seed = Some(104);
+                // The override launch_search applies, not a replay option.
+                config.imprecise_timers = true;
+                let mut min_run = RunData::from_minimize_output(
+                    &options,
+                    "minimized".to_owned(),
+                    selected.runopts.clone(),
+                    recorded(&[0, 1000]),
+                    minimized.clone(),
+                    dir.path().join("minimized.log"),
+                );
+
+                for strict_stdout in ["out", "else"] {
+                    let mut launched = Vec::new();
+                    let mut launch = |run: &mut RunData| -> anyhow::Result<ReplayEvidence> {
+                        let config = &run.runopts.det_opts.det_config;
+                        launched.push((
+                            run.runname().to_owned(),
+                            config.replay_preemptions_lenient,
+                            config.imprecise_timers,
+                            config.seed,
+                            config.sched_seed,
+                            config.replay_preemptions_from.clone(),
+                            config.record_preemptions_to.clone(),
+                        ));
+                        let stdout = if run.runname() == "certify_strict" {
+                            strict_stdout
+                        } else {
+                            "out"
+                        };
+                        Ok(evidence(run.runname(), stdout, Some(recorded(&[0, 1000]))))
+                    };
+                    let result =
+                        options.certify_minimized_reproducer(&global, &mut min_run, &mut launch);
+                    let recorded_by_first = launched[0]
+                        .6
+                        .clone()
+                        .expect("the first lenient replay records");
+                    let replayed: Vec<_> = launched
+                        .iter()
+                        .map(
+                            |(name, lenient, imprecise, seed, sched_seed, from, records)| {
+                                assert_eq!(*imprecise, explicit_imprecise_timers, "{name}");
+                                assert_eq!((*seed, *sched_seed), (101, Some(104)), "{name}");
+                                assert!(records.is_some(), "{name}");
+                                (name.as_str(), *lenient, from.clone().unwrap())
+                            },
+                        )
+                        .collect();
+                    assert_eq!(
+                        replayed[..2],
+                        [
+                            ("certify_lenient1", true, minimized.clone()),
+                            ("certify_lenient2", true, minimized.clone()),
+                        ]
+                    );
+                    assert_eq!(replayed[2].0, "certify_strict");
+                    assert!(!replayed[2].1);
+                    assert_eq!(
+                        replayed[2].2, recorded_by_first,
+                        "the strict replay replays the first lenient replay's recording"
+                    );
+                    match (strict_stdout, selfcheck) {
+                        ("out", _) => {
+                            let report = result.unwrap();
+                            assert_eq!(report.certified, Some(recorded_by_first));
+                            assert_eq!(report.not_certified_because, None);
+                        }
+                        (_, false) => {
+                            let report = result.unwrap();
+                            assert_eq!(report.certified, None);
+                            assert_eq!(
+                                report.not_certified_because.as_deref(),
+                                Some(
+                                    "certify_lenient1 and certify_strict printed different stdout"
+                                )
+                            );
+                        }
+                        (_, true) => {
+                            let error = format!("{:#}", result.unwrap_err());
+                            assert!(
+                                error.contains("--selfcheck requires a certified reproducer")
+                                    && error.contains("printed different stdout"),
+                                "{error}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A matching record with no preemption left to knock out has no nearby
+    /// non-matching schedule: the baseline search ends with that error before
+    /// any trial instead of retrying the same record forever
+    /// (https://github.com/rrnewton/hermit/issues/4497).
+    #[test]
+    fn a_record_with_nothing_to_knock_out_ends_the_baseline_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = prepared_analysis(dir.path(), None, None, &[]).unwrap();
+        let empty = PreemptionRecord::from_vecs(&std::collections::BTreeMap::new());
+        let Err(error) =
+            options.save_nearby_non_matching_sched_events("run2_baseline_try001", &empty)
+        else {
+            panic!("a record with nothing to knock out was launched");
+        };
+        assert!(
+            format!("{error:#}").contains("no preemptions left to remove"),
+            "{error:#}"
+        );
+        assert!(!dir.path().join("run2_baseline_try001.stdout").exists());
     }
 
     /// Analyze refuses, before any trial, a `--run1-preemptions` record made

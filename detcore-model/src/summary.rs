@@ -102,6 +102,35 @@ impl TimesliceStats {
 ///
 /// This describes configuration and capability, not whether a hardware timer
 /// is currently armed or any timer event was delivered.
+/// **Preemption replay:** how a `--replay-preemptions-lenient` replay departed
+/// from its record (<https://github.com/rrnewton/hermit/issues/4497>).
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PreemptionReplayDivergences {
+    /// Recorded preemptions that ended at their RCB target after the thread's
+    /// time had passed their recorded time.
+    pub time_skews: u64,
+    /// Recorded preemptions skipped because the thread had already retired
+    /// their RCB target.
+    pub rcb_overruns: u64,
+    /// Recorded preemptions without an RCB target skipped because the
+    /// thread's time had reached them.
+    pub time_lags: u64,
+}
+
+impl PreemptionReplayDivergences {
+    /// Whether the replay followed its record everywhere.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Add another thread's counts.
+    pub fn merge(&mut self, other: &Self) {
+        self.time_skews += other.time_skews;
+        self.rcb_overruns += other.rcb_overruns;
+        self.time_lags += other.time_lags;
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct PreemptionSummary {
     /// Configured maximum in virtual nanoseconds, or `None` when disabled.
@@ -174,6 +203,11 @@ pub struct RunSummary {
     /// output.
     pub per_thread_timeslice: Vec<(DetTid, TimesliceStats)>,
 
+    /// **Preemption replay:** where a lenient replay departed from its record;
+    /// absent when it departed nowhere (a strict replay refuses instead).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preemption_replay_divergences: Option<PreemptionReplayDivergences>,
+
     /// Configured maximum and timer mechanism from the shared Detcore config.
     /// Absent for older summaries or producers that did not record it; a present
     /// object with a null maximum explicitly records a disabled maximum. Timer
@@ -243,6 +277,7 @@ impl RunSummary {
             threads_descrip,
             timeslice_stats,
             per_thread_timeslice,
+            preemption_replay_divergences,
             preemption,
             dispatch_stats: _,
         } = self;
@@ -278,6 +313,14 @@ impl RunSummary {
         }
         if let Some(txt) = reprio_description {
             write!(f, "{}", txt)?;
+        }
+        if let Some(divergences) = preemption_replay_divergences {
+            writeln!(
+                f,
+                "Preemption replay departed from the record (lenient, not a faithful replay): \
+                 {} time skew(s), {} RCB overrun(s), {} time lag(s)",
+                divergences.time_skews, divergences.rcb_overruns, divergences.time_lags
+            )?;
         }
 
         writeln!(

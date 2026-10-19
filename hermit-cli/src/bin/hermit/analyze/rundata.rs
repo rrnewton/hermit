@@ -60,6 +60,11 @@ pub struct RunData {
 }
 
 impl RunData {
+    /// The run's name, which names its files in the workspace.
+    pub fn runname(&self) -> &str {
+        &self.runname
+    }
+
     pub fn root_path(&self) -> PathBuf {
         let tmp_dir = self.analyze_opts.tmp_dir.as_ref().unwrap();
         tmp_dir.join(&self.runname)
@@ -252,6 +257,18 @@ impl RunData {
         }
 
         self.is_a_match = Some(self.analyze_opts.output_matches(&output));
+        if self.runopts.det_opts.det_config.replay_preemptions_lenient
+            && let Some(divergences) = self.replay_divergences()?
+        {
+            eprintln!(
+                ":: {} departed from its preemption record (lenient replay): {} time skew(s), \
+                 {} RCB overrun(s), {} time lag(s)",
+                self.runname,
+                divergences.time_skews,
+                divergences.rcb_overruns,
+                divergences.time_lags
+            );
+        }
 
         if self.analyze_opts.verbose {
             println!(
@@ -518,6 +535,36 @@ impl RunData {
             .expect("write of preempts file to succeed");
         self.in_mem_preempts_in = Some(pr);
         self.with_preempts_path_in(path)
+    }
+
+    /// Replay the input preemptions under `--replay-preemptions-lenient`: an
+    /// edited record (a minimization round, a knockout) is explored rather
+    /// than refused where this run departs from it, and the departures are
+    /// counted in the run's summary ([`Self::replay_divergences`])
+    /// (<https://github.com/rrnewton/hermit/issues/4497>).
+    pub fn with_lenient_preemption_replay(mut self) -> Self {
+        self.runopts.det_opts.det_config.replay_preemptions_lenient = true;
+        self
+    }
+
+    /// Where this launched run's lenient preemption replay departed from its
+    /// record, read from its summary; `None` when it departed nowhere.
+    pub fn replay_divergences(
+        &self,
+    ) -> anyhow::Result<Option<detcore_model::summary::PreemptionReplayDivergences>> {
+        let path = self
+            .runopts
+            .summary_json
+            .as_ref()
+            .context("an analyze run writes a summary")?;
+        let summary: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(path)
+                .with_context(|| format!("reading the run summary {}", path.display()))?,
+        )?;
+        match summary.get("preemption_replay_divergences") {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(counts) => Ok(Some(serde_json::from_value(counts.clone())?)),
+        }
     }
 
     pub fn with_preemption_recording(self) -> Self {

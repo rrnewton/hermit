@@ -5790,6 +5790,29 @@ impl RunOpts {
         self.det_opts.det_config.epoch.to_rfc3339()
     }
 
+    /// A replayed preemption or schedule record that Detcore could not load
+    /// (unreadable, malformed, or failing `PreemptionRecord::validate`, as an
+    /// edited record can) is refused here, by name, before anything is
+    /// launched, instead of panicking in the container
+    /// (<https://github.com/rrnewton/hermit/issues/4497>).
+    fn refuse_invalid_replayed_record(&self) -> Result<(), Error> {
+        if self.namespace_only {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        for path in [
+            &config.replay_preemptions_from,
+            &config.replay_schedule_from,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            detcore::preemptions::read_valid_preemption_record(path)
+                .map_err(|why| Error::new(super::container::PolicyRefusal).context(why))?;
+        }
+        Ok(())
+    }
+
     /// Start a replay from the virtual-time epoch its recording was made under.
     ///
     /// A preemption record stores absolute logical times, i.e. offsets from the
@@ -6621,6 +6644,7 @@ impl RunOpts {
         // Right after validation, which may have turned the preemption timer
         // off, and still before stdin is read or anything is launched.
         self.refuse_happens_before_without_preemption()?;
+        self.refuse_invalid_replayed_record()?;
         self.adopt_replayed_schedule_epoch()?;
         // After the replayed epoch is adopted, which makes an omitted epoch
         // explicit, and still before stdin is read or anything is launched.

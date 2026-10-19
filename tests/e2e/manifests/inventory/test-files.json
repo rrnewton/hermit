@@ -1597,6 +1597,18 @@
       "why": "tests/c/preadv2_flags.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "cargo-integration-test-fixture",
+      "path": "tests/c/preemption_replay_fork_order.c",
+      "runner": "cargo test -p hermit --test cli",
+      "why": "tests/c/preemption_replay_fork_order.c is compiled and exercised by hermit-cli/tests/cli.rs (PMU hosts, privileged-test.pmu_cli_cases): the parent prints P and the child C at once, so the output order shows which thread the scheduler ran first; a hand-written preemption record whose child's first recorded preemption has passed must, under --replay-preemptions-lenient, start the child at the surviving priority, giving the same order as the record without that entry (https://github.com/rrnewton/hermit/issues/4497)"
+    },
+    {
+      "disposition": "cargo-integration-test-fixture",
+      "path": "tests/c/preemption_replay_pingpong.c",
+      "runner": "cargo test -p hermit --test cli",
+      "why": "tests/c/preemption_replay_pingpong.c is compiled and exercised by hermit-cli/tests/cli.rs (PMU hosts, privileged-test.pmu_cli_cases): two threads pass a turn through a condition variable, so a --chaos recording carries dozens of RCB-anchored preemption points per thread; the test edits the recording and shows that a strict replay refuses a time skew and a time lag by kind with exit 122 instead of panicking, and that --replay-preemptions-lenient finishes the same edits with the guest's output and counts each divergence (https://github.com/rrnewton/hermit/issues/4497)"
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/print_memaddrs.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (blocking CI)",

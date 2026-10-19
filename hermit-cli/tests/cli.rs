@@ -234,6 +234,8 @@ static TIMER_RT_SIGNAL_PENDING_OBSERVED_GUEST: OnceLock<PathBuf> = OnceLock::new
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PREEMPTION_REPLAY_PINGPONG_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PREEMPTION_REPLAY_FORK_ORDER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_AFTER_WNOHANG_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_SHARED_MASK_REWRITE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -2685,6 +2687,56 @@ fn replay_epoch_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "replay-epoch probe compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn preemption_replay_fork_order_guest() -> &'static Path {
+    PREEMPTION_REPLAY_FORK_ORDER_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("preemption-replay-fork-order");
+        fs::create_dir_all(&build_root).expect("failed to create the fork-order build directory");
+        let guest = build_root.join("preemption_replay_fork_order");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/preemption_replay_fork_order.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the fork-order guest");
+        assert!(
+            output.status.success(),
+            "fork-order guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn preemption_replay_pingpong_guest() -> &'static Path {
+    PREEMPTION_REPLAY_PINGPONG_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("preemption-replay-pingpong");
+        fs::create_dir_all(&build_root).expect("failed to create the pingpong build directory");
+        let guest = build_root.join("preemption_replay_pingpong");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-pthread", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/preemption_replay_pingpong.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the pingpong guest");
+        assert!(
+            output.status.success(),
+            "pingpong guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -15240,6 +15292,468 @@ fn run_ptrace_nonleader_exec_displaces_runnable_leader() {
     nonleader_exec::run_runnable_leader();
 }
 
+/// <https://github.com/rrnewton/hermit/issues/4497>: a replayed record that
+/// Detcore could not load -- here an edited one whose RCB targets fall -- is
+/// refused before the guest starts, naming the record and what is wrong, with
+/// the policy-refusal exit, for preemption and schedule replay alike. It used
+/// to panic inside the container (exit 125).
+#[test]
+fn run_refuses_an_invalid_replayed_record_before_the_guest_starts() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let record = directory.path().join("falling-targets.json");
+    fs::write(
+        &record,
+        r#"{"per_thread": {"3": {"final_prio": 2920, "prio_changes": [[1000, 2920], [2000, 3288]],
+            "preemption_rcbs": [20, 10]}}, "global": []}"#,
+    )
+    .unwrap();
+    for option in ["--replay-preemptions-from", "--replay-schedule-from"] {
+        let replay = format!("{option}={}", record.display());
+        let args = [
+            "run",
+            "--base-env=minimal",
+            &replay,
+            "--",
+            "/bin/echo",
+            "guest ran",
+        ];
+        let output = hermit_test::hermit_output(
+            "invalid replayed record",
+            hermit_command(&args).stdin(Stdio::null()),
+        );
+        let text = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{args:?}: {text}"
+        );
+        assert!(
+            text.contains(&format!(
+                "invalid preemption record {}: preemption RCB targets failed to increase for thread 3",
+                record.display()
+            )),
+            "{text}"
+        );
+        assert!(
+            text.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+            "{text}"
+        );
+        assert!(!text.contains("panicked"), "{text}");
+        assert!(
+            output.stdout.is_empty(),
+            "the guest ran: {}",
+            stdout(&output)
+        );
+    }
+}
+
+/// Runs of the preemption-replay pingpong guest under `--chaos` with a
+/// PMU-backed `--max-timeslice`, in one directory, for the edited-record
+/// cases of <https://github.com/rrnewton/hermit/issues/4497>.
+struct PingpongReplay {
+    directory: tempfile::TempDir,
+    guest: &'static str,
+}
+
+impl PingpongReplay {
+    fn new() -> Self {
+        PingpongReplay {
+            directory: tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap(),
+            guest: preemption_replay_pingpong_guest().to_str().unwrap(),
+        }
+    }
+
+    fn path(&self, name: &str) -> PathBuf {
+        self.directory.path().join(format!("{name}.json"))
+    }
+
+    /// One run with `options`; its output and the summary's
+    /// `preemption_replay_divergences` (`Null` when absent; `None` without a
+    /// summary).
+    fn run(&self, name: &str, options: &[String]) -> (Output, Option<serde_json::Value>) {
+        let summary = self.path(&format!("{name}.summary"));
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let mut args = vec![
+            "run",
+            "--base-env=minimal",
+            "--chaos",
+            "--max-timeslice=100000",
+            "--seed=3",
+            "--epoch=2026-01-01T00:00:00Z",
+            &summary_arg,
+        ];
+        args.extend(options.iter().map(String::as_str));
+        args.extend(["--", self.guest]);
+        let output = hermit_test::hermit_output(
+            name,
+            hermit_command(&args)
+                .env_remove("HERMIT_EPOCH")
+                .stdin(Stdio::null()),
+        );
+        let divergences = fs::read_to_string(&summary).ok().map(|text| {
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+                ["preemption_replay_divergences"]
+                .clone()
+        });
+        (output, divergences)
+    }
+
+    fn replay(record: &Path) -> String {
+        format!("--replay-preemptions-from={}", record.display())
+    }
+
+    fn recording(record: &Path) -> String {
+        format!("--record-preemptions-to={}", record.display())
+    }
+
+    fn lenient() -> String {
+        "--replay-preemptions-lenient".to_owned()
+    }
+
+    fn read(record: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(record).unwrap()).unwrap()
+    }
+
+    /// Record the guest; the run, its record, and the record's path. The
+    /// premise: a thread with enough RCB-anchored preemptions to edit.
+    fn record(&self) -> (Output, serde_json::Value, PathBuf) {
+        let original = self.path("original");
+        let (recorded, _) = self.run("record", &[Self::recording(&original)]);
+        assert_success(&recorded, &["record"]);
+        let record = Self::read(&original);
+        let (_, history) = Self::busiest_thread(&record);
+        let count = history["prio_changes"].as_array().unwrap().len();
+        assert!(count >= 8, "too few preemptions to edit: {record}");
+        assert_eq!(
+            history["preemption_rcbs"].as_array().unwrap().len(),
+            count,
+            "the recording has no RCB targets: {record}"
+        );
+        (recorded, record, original)
+    }
+
+    fn busiest_thread(record: &serde_json::Value) -> (String, serde_json::Value) {
+        let (tid, history) = record["per_thread"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .max_by_key(|(_, history)| history["prio_changes"].as_array().unwrap().len())
+            .unwrap();
+        (tid.clone(), history.clone())
+    }
+
+    /// `record` with the busiest thread's middle preemption moved to a
+    /// nanosecond after the one before it and the next to two nanoseconds
+    /// after -- the thread's clock has passed both by then -- and, with
+    /// `strip_targets`, every RCB target removed. Its path and the thread.
+    fn edit(&self, record: &serde_json::Value, strip_targets: bool) -> (PathBuf, String) {
+        let (tid, _) = Self::busiest_thread(record);
+        let mut edited = record.clone();
+        let changes = edited["per_thread"][&tid]["prio_changes"]
+            .as_array_mut()
+            .unwrap();
+        let middle = changes.len() / 2;
+        let before = changes[middle - 1][0].as_u64().unwrap();
+        changes[middle][0] = (before + 1).into();
+        changes[middle + 1][0] = (before + 2).into();
+        if strip_targets {
+            for history in edited["per_thread"].as_object_mut().unwrap().values_mut() {
+                history["preemption_rcbs"] = serde_json::json!([]);
+            }
+        }
+        let path = self.path(if strip_targets { "lag" } else { "skew" });
+        fs::write(&path, edited.to_string()).unwrap();
+        (path, tid)
+    }
+
+    /// A strict replay of `record` is refused by `kind` for `tid`, with the
+    /// policy-refusal exit and no panic; the refusal line.
+    fn refused(&self, record: &Path, kind: &str, tid: &str) -> String {
+        let (output, _) = self.run(&format!("strict {kind}"), &[Self::replay(record)]);
+        let text = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{kind}: {text}"
+        );
+        assert!(
+            text.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+            "{text}"
+        );
+        assert!(!text.contains("panicked"), "{text}");
+        assert!(
+            output.stdout.is_empty() || !stdout(&output).contains("done"),
+            "{text}"
+        );
+        text.lines()
+            .find(|line| {
+                line.starts_with(&format!(
+                    "hermit: preemption replay diverged \
+                     (cause=preemption-replay-diverged kind={kind}): thread {tid} "
+                ))
+            })
+            .unwrap_or_else(|| panic!("no {kind} refusal for thread {tid}: {text}"))
+            .to_owned()
+    }
+
+    /// A lenient replay of `record` finishes with the recorded output and a
+    /// nonzero `counter` in its summary.
+    fn followed(&self, record: &Path, recorded: &Output, counter: &str) {
+        let (output, divergences) = self.run(
+            &format!("lenient {counter}"),
+            &[Self::replay(record), Self::lenient()],
+        );
+        assert_success(&output, &["lenient", counter]);
+        assert_eq!(stdout(&output), stdout(recorded), "{counter}");
+        let divergences = divergences.expect("a summary");
+        assert!(
+            divergences[counter].as_u64().unwrap() > 0,
+            "{counter}: {divergences}"
+        );
+    }
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4497>: the unedited record
+/// replays strictly and leniently with the recorded output and no
+/// divergence, both replays record the same preemptions, with the original's
+/// RCB targets and priorities, and that record replays to itself. (A
+/// replay's clock at a recorded RCB target need not equal the recording
+/// run's, so re-recorded times can differ from the original's.)
+///
+/// PMU SUBJECT: chaos preemption points come from the PMU timer. test.cli and
+/// test.cli_on_host skip it by exact name; privileged-test.pmu_cli_cases runs
+/// it.
+#[test]
+fn unedited_preemption_records_replay_identically_strict_and_lenient() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let replays = PingpongReplay::new();
+    let (recorded, record, original) = replays.record();
+    let mut rerecorded = Vec::new();
+    for (mode, mut options) in [
+        ("strict", vec![]),
+        ("lenient", vec![PingpongReplay::lenient()]),
+    ] {
+        let again = replays.path(&format!("unedited-{mode}"));
+        options.extend([
+            PingpongReplay::replay(&original),
+            PingpongReplay::recording(&again),
+        ]);
+        let (output, divergences) = replays.run(&format!("unedited {mode}"), &options);
+        assert_success(&output, &["unedited", mode]);
+        assert_eq!(stdout(&output), stdout(&recorded), "{mode}");
+        assert_eq!(divergences, Some(serde_json::Value::Null), "{mode}");
+        let again = PingpongReplay::read(&again);
+        for (tid, history) in record["per_thread"].as_object().unwrap() {
+            let replayed = &again["per_thread"][tid];
+            assert_eq!(
+                replayed["preemption_rcbs"], history["preemption_rcbs"],
+                "{mode} {tid}"
+            );
+            let priorities = |history: &serde_json::Value| -> Vec<serde_json::Value> {
+                history["prio_changes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|change| change[1].clone())
+                    .collect()
+            };
+            assert_eq!(priorities(replayed), priorities(history), "{mode} {tid}");
+        }
+        rerecorded.push(again["per_thread"].clone());
+    }
+    assert_eq!(
+        rerecorded[0], rerecorded[1],
+        "strict and lenient replays recorded different preemptions"
+    );
+    let fixed_point = replays.path("fixed-point");
+    let (output, _) = replays.run(
+        "fixed point",
+        &[
+            PingpongReplay::replay(&replays.path("unedited-strict")),
+            PingpongReplay::recording(&fixed_point),
+        ],
+    );
+    assert_success(&output, &["fixed point"]);
+    assert_eq!(
+        PingpongReplay::read(&fixed_point)["per_thread"],
+        rerecorded[0]
+    );
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4497>: a record whose
+/// preemptions a thread's clock has passed while their RCB targets are still
+/// ahead (an edited record) ends a strict replay with the policy-refusal exit
+/// and `kind=time-skew` -- it used to panic in Detcore (exit 125) -- the same
+/// refusal both times, and `--replay-preemptions-lenient` finishes it with the
+/// guest's output, counting the skew.
+///
+/// PMU SUBJECT: as `unedited_preemption_records_replay_identically_strict_and_lenient`.
+#[test]
+fn an_edited_record_with_a_time_skew_is_refused_or_followed_leniently() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let replays = PingpongReplay::new();
+    let (recorded, record, _) = replays.record();
+    let (edited, tid) = replays.edit(&record, false);
+    let first = replays.refused(&edited, "time-skew", &tid);
+    assert_eq!(replays.refused(&edited, "time-skew", &tid), first);
+    replays.followed(&edited, &recorded, "time_skews");
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4497>: a record that gives two
+/// adjacent preemptions of a thread one RCB target (an edit; a zero-RCB slice)
+/// replays, strictly and leniently, while recording its preemptions: the
+/// replay ends both slices at one instant and records both change points at
+/// one time, where the recorder used to assert. The record it makes loads
+/// and replays strictly with the same output.
+///
+/// PMU SUBJECT: as `unedited_preemption_records_replay_identically_strict_and_lenient`.
+#[test]
+fn a_record_with_equal_adjacent_rcb_targets_replays_while_recording() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let replays = PingpongReplay::new();
+    let (recorded, record, _) = replays.record();
+    let (tid, _) = PingpongReplay::busiest_thread(&record);
+    let mut edited = record.clone();
+    let targets = edited["per_thread"][&tid]["preemption_rcbs"]
+        .as_array_mut()
+        .unwrap();
+    let middle = targets.len() / 2;
+    targets[middle] = targets[middle - 1].clone();
+    let edited_path = replays.path("equal-targets");
+    fs::write(&edited_path, edited.to_string()).unwrap();
+    for (mode, mut options) in [
+        ("strict", vec![]),
+        ("lenient", vec![PingpongReplay::lenient()]),
+    ] {
+        let again = replays.path(&format!("equal-targets-{mode}"));
+        options.extend([
+            PingpongReplay::replay(&edited_path),
+            PingpongReplay::recording(&again),
+        ]);
+        let (output, _) = replays.run(&format!("equal targets {mode}"), &options);
+        assert_success(&output, &["equal targets", mode]);
+        assert!(!stderr(&output).contains("panicked"), "{}", stderr(&output));
+        assert_eq!(stdout(&output), stdout(&recorded), "{mode}");
+        let (output, _) = replays.run(
+            &format!("equal targets {mode} rerecorded"),
+            &[PingpongReplay::replay(&again)],
+        );
+        assert_success(&output, &["equal targets rerecorded", mode]);
+        assert_eq!(stdout(&output), stdout(&recorded), "{mode}");
+    }
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4497>: a lenient replay that
+/// skips a new thread's first recorded preemption starts the thread at the
+/// surviving entry's priority, published through the scheduler before the
+/// thread runs. The forked child's first entry (priority 100, recorded 5 ns
+/// after the epoch) has passed by the time it starts, and its next has
+/// priority 9000, below the parent's 5000: the lenient replay prints P
+/// first, as a strict replay of the record without the passed entry does.
+/// It used to keep the child at 100 and print C first. A strict replay of
+/// the edited record refuses it as a time lag.
+///
+/// PMU SUBJECT: the replay needs the PMU timer for --max-timeslice. test.cli
+/// and test.cli_on_host skip it by exact name; privileged-test.pmu_cli_cases
+/// runs it.
+#[test]
+fn a_lenient_skip_at_thread_start_starts_the_thread_at_the_surviving_priority() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = preemption_replay_fork_order_guest().to_str().unwrap();
+    let epoch_ns: u64 = 1_767_225_600_000_000_000;
+    let write_record = |name: &str, child_changes: serde_json::Value| {
+        let path = directory.path().join(format!("{name}.json"));
+        let record = serde_json::json!({
+            "epoch": "2026-01-01T00:00:00Z",
+            "per_thread": {
+                "3": {"final_prio": 5000, "prio_changes": []},
+                "5": {"final_prio": 9000, "prio_changes": child_changes},
+            },
+            "global": [],
+        });
+        fs::write(&path, record.to_string()).unwrap();
+        path
+    };
+    let folded = write_record(
+        "folded",
+        serde_json::json!([[epoch_ns + 5, 100], [epoch_ns + 1_000_000_000, 9000]]),
+    );
+    let control = write_record(
+        "control",
+        serde_json::json!([[epoch_ns + 1_000_000_000, 9000]]),
+    );
+    let run = |name: &str, record: &Path, lenient: bool| {
+        let summary = directory.path().join(format!("{name}.summary.json"));
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let replay = format!("--replay-preemptions-from={}", record.display());
+        let mut args = vec![
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--max-timeslice=100000000",
+            "--target-timeslice=100000000",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--seed=0",
+            &summary_arg,
+            &replay,
+        ];
+        if lenient {
+            args.push("--replay-preemptions-lenient");
+        }
+        args.extend(["--", guest]);
+        let output = hermit_test::hermit_output(
+            name,
+            hermit_command(&args)
+                .env_remove("HERMIT_EPOCH")
+                .stdin(Stdio::null()),
+        );
+        let summary = fs::read_to_string(&summary)
+            .ok()
+            .map(|text| serde_json::from_str::<serde_json::Value>(&text).unwrap());
+        (output, summary)
+    };
+
+    let (control_run, _) = run("control strict", &control, false);
+    assert_success(&control_run, &["control strict"]);
+    assert_eq!(stdout(&control_run), "P\nC\n");
+
+    let (refused, _) = run("folded strict", &folded, false);
+    let text = stderr(&refused);
+    assert_eq!(
+        refused.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "hermit: preemption replay diverged (cause=preemption-replay-diverged kind=time-lag): thread 5 "
+        ),
+        "{text}"
+    );
+
+    let (lenient, summary) = run("folded lenient", &folded, true);
+    assert_success(&lenient, &["folded lenient"]);
+    assert_eq!(stdout(&lenient), stdout(&control_run));
+    let divergences = &summary.expect("a summary")["preemption_replay_divergences"];
+    assert_eq!(divergences["time_lags"], 1, "{divergences}");
+}
+
+/// <https://github.com/rrnewton/hermit/issues/4497>: the same edit on a record
+/// without RCB targets ends a strict replay with `kind=time-lag`, and a
+/// lenient replay finishes it, counting the lags.
+///
+/// PMU SUBJECT: as `unedited_preemption_records_replay_identically_strict_and_lenient`.
+#[test]
+fn an_edited_time_only_record_with_a_lag_is_refused_or_followed_leniently() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let replays = PingpongReplay::new();
+    let (recorded, record, _) = replays.record();
+    let (edited, tid) = replays.edit(&record, true);
+    replays.refused(&edited, "time-lag", &tid);
+    replays.followed(&edited, &recorded, "time_lags");
+}
+
 /// The panic of <https://github.com/rrnewton/hermit/issues/3413>, end to end.
 ///
 /// A `--chaos` recording carries per-thread preemption points: timeslice ends
@@ -15320,7 +15834,7 @@ fn run_chaos_preemption_replay_reuses_the_recorded_epoch() {
     );
     let replay_stderr = stderr(&replayed);
     assert!(
-        !replay_stderr.contains("Cannot set end of timeslice"),
+        !replay_stderr.contains("preemption replay diverged"),
         "{replay_stderr}"
     );
     assert_success(&replayed, &replay_args);

@@ -117,6 +117,18 @@ cpp_binary(
 )
 
 cpp_binary(
+    name = "preemption_replay_fork_order",
+    srcs = ["preemption_replay_fork_order.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_binary(
+    name = "preemption_replay_pingpong",
+    srcs = ["preemption_replay_pingpong.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_binary(
     name = "replay_epoch_probe",
     srcs = ["replay_epoch_probe.c"],
     labels = ["autodeps2_generated"],

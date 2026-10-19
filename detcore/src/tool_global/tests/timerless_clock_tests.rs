@@ -195,7 +195,7 @@ fn rcb_accounting_progresses_without_an_implicit_preemption_timer() {
             thread.detpid = Some(TID);
             // This is the actual shared slice initialization, not an invented
             // deadline inserted just to satisfy the accounting assertion.
-            thread.next_timeslice(&config);
+            thread.next_timeslice(&config).unwrap();
             let cpu_owner = Arc::clone(&thread.process_cpu_time);
             let floor_owner = Arc::clone(&thread.guest_clock);
             let floor_before = serde_json::to_value(&*floor_owner.lock().unwrap()).unwrap();
@@ -337,7 +337,7 @@ fn interleaved_clock_observations_preserve_deadlines_and_timer_capability() {
             let mut thread = tool.init_thread_state(Tid::from_raw(TID.as_raw()), None);
             thread.detpid = Some(TID);
             let initial_clock = thread.thread_logical_time.as_nanos();
-            thread.next_timeslice(&config);
+            thread.next_timeslice(&config).unwrap();
             let deadline = initial_clock + LogicalTime::from_nanos(200_000_000);
             assert_eq!(thread.end_of_timeslice, Some(deadline));
             assert_eq!(thread.max_timeslice_end, Some(deadline));
@@ -456,7 +456,7 @@ fn interleaved_clock_observations_preserve_deadlines_and_timer_capability() {
             // A larger target must not escape that configured ceiling.
             config.target_timeslice = std::num::NonZeroU64::new(400_000_000);
             let mut capped = tool.init_thread_state(Tid::from_raw(TID.as_raw()), None);
-            capped.next_timeslice(&config);
+            capped.next_timeslice(&config).unwrap();
             assert_eq!(capped.end_of_timeslice, Some(deadline));
             assert_eq!(capped.max_timeslice_end, Some(deadline));
 
@@ -470,7 +470,7 @@ fn interleaved_clock_observations_preserve_deadlines_and_timer_capability() {
             boundary_config.target_timeslice_syscalls_only = true;
             let mut boundary = ThreadState::new(TID, &boundary_config, ());
             let initial = boundary.thread_logical_time.as_nanos();
-            boundary.next_timeslice(&boundary_config);
+            boundary.next_timeslice(&boundary_config).unwrap();
             for (delta, total, target_expired, trap_ends) in [
                 (99, 99, false, false),
                 (1, 100, true, false),
@@ -513,7 +513,7 @@ fn dropped_signal_rearms_only_an_available_timer_without_accounting() {
             let tool: Detcore = Detcore::new(Tid::from_raw(TID.as_raw()), &config);
             let mut thread = tool.init_thread_state(Tid::from_raw(TID.as_raw()), None);
             thread.detpid = Some(TID);
-            thread.next_timeslice(&config);
+            thread.next_timeslice(&config).unwrap();
             thread.committed_clock_value = 1_000;
             // In the timerless row this is deliberately synthetic stale state:
             // it makes the capability guard observable, not an actual arm.

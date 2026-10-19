@@ -279,6 +279,26 @@ pub struct Report {
     pub critical_event1: ReportCriticalEvent,
     /// The runtime context for the other identified critical event.
     pub critical_event2: ReportCriticalEvent,
+
+    /// With `--minimize`: the minimized preemption record and whether a
+    /// reproducer was certified from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimized_reproducer: Option<MinimizedReproducer>,
+}
+
+/// What `--minimize` produced. The minimized record is an edited record: it
+/// meets the criteria under lenient preemption replay, which may depart from
+/// it. The certified record is a recording of such a run that replays
+/// strictly to a fixed point and meets the criteria
+/// (<https://github.com/rrnewton/hermit/issues/4497>).
+#[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
+pub struct MinimizedReproducer {
+    /// The minimized preemption record.
+    pub minimized: PathBuf,
+    /// The certified reproducer, when certification succeeded.
+    pub certified: Option<PathBuf>,
+    /// Why no reproducer was certified, when it failed.
+    pub not_certified_because: Option<String>,
 }
 
 /// Runtime context for a critical event included in the analyze report.
