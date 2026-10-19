@@ -14,8 +14,8 @@ libc = "0.2.186"
 hermit-test-workdir = { version = "0.4.0", path = "../../../common/test-workdir" }
 detcore = { package = "hermit-detcore", version = "0.4.0", path = "../.." }
 pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features = false }
-reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "9ded00ff4ab82e48368e0113f65e954d3533bc3f" }
-reverie-ptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "9ded00ff4ab82e48368e0113f65e954d3533bc3f" }
+reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "7f89076ab5dfe1a89a68ffb46ee7ca9d1d90016d" }
+reverie-ptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "7f89076ab5dfe1a89a68ffb46ee7ca9d1d90016d" }
 test-allocator = { version = "0.4.0", path = "../../../common/test-allocator" }
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }
 tracing = { version = "0.1.41", features = ["attributes", "valuable"] }
