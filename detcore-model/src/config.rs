@@ -2135,6 +2135,10 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 ///   exec, the `gettimeofday` repair runs on every backend through its
 ///   `time(2)` probe and `Guest::storable_memory_ranges`, and the user
 ///   address limit is each guest's own `Guest::user_address_limit` report);
+/// - `backend_requires_thread_directed_process_signals` also supplies
+///   `promotes_open_files_before_native_lifecycle` and
+///   `restarts_backend_interrupted_waits`, newer than the form, which only
+///   DBT, the one backend that requires those signals, has;
 /// - every other key supplies the one capability of the same meaning.
 ///
 /// This inverts [`to_legacy_backend_json`] for every capability value the keys
@@ -2396,6 +2400,12 @@ impl LegacyBackendKeys {
         // and alone requires thread-directed process signals (DBT's runtime
         // also states it from any source, `assert_dbt_execution_model`).
         backend.promotes_open_files_before_native_lifecycle =
+            self.backend_requires_thread_directed_process_signals;
+        // A legacy encoding predates this key too. DBT, the form's only
+        // reader, is also the one backend whose own signal interrupts the
+        // waits it injects (https://github.com/rrnewton/hermit/issues/4483),
+        // so it is read back the same way.
+        backend.restarts_backend_interrupted_waits =
             self.backend_requires_thread_directed_process_signals;
         // Added after the legacy form froze. Each was a `Config` field with no
         // legacy key that read back as false, and each is false for DBT, the
@@ -3073,6 +3083,9 @@ mod tests {
         // bit, which only DBT, the form's only reader, sets.
         backend.promotes_open_files_before_native_lifecycle =
             backend.requires_thread_directed_process_signals;
+        // So does restarting the backend's own interrupted waits.
+        backend.restarts_backend_interrupted_waits =
+            backend.requires_thread_directed_process_signals;
         backend.internal_pipe_turns_are_host_timed = backend.tool_shares_guest_descriptor_table;
         backend.loopback_pollers_yield_to_peers = backend.tool_shares_guest_descriptor_table;
         backend
@@ -3416,6 +3429,7 @@ mod tests {
                 "backend_requires_thread_directed_process_signals" => {
                     expected.requires_thread_directed_process_signals = true;
                     expected.promotes_open_files_before_native_lifecycle = true;
+                    expected.restarts_backend_interrupted_waits = true;
                 }
                 "backend_is_kvm" => {
                     expected.provides_process_signal_control = true;

@@ -7911,6 +7911,9 @@ mod tests {
             // a stated capability. e9patch runs on ptrace and has its value.
             "supports_blocked_wait_signal_interruption":
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
+            // DynamoRIO's suspend signal interrupts an injected wait
+            // (https://github.com/rrnewton/hermit/issues/4483).
+            "restarts_backend_interrupted_waits": dbt,
             "delivers_preemption_timer_events":
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "runs_guest_code_between_injections": sabre || in_guest_liteinst,

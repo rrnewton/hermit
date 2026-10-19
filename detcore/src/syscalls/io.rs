@@ -61,6 +61,8 @@ use crate::syscalls::helpers::retry_blocking_wait_under_mask;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::helpers::unblocked_by;
 use crate::syscalls::network_trace::received_descriptors;
+use crate::syscalls::restartable_wait::WaitRequest;
+use crate::syscalls::restartable_wait::WaitTimeout;
 use crate::syscalls::signal::STACK_RED_ZONE;
 use crate::syscalls::signal::kernel_installed_signal_mask;
 use crate::syscalls::signal::read_kernel_sigset;
@@ -612,14 +614,27 @@ pub(super) fn ppoll_timeout_duration(timeout: Timespec) -> Result<Duration, Errn
     Ok(Duration::new(seconds, nanoseconds))
 }
 
+/// `select`'s timeout as Linux reads it. In Linux v7.1 `kern_select`
+/// (`fs/select.c`) first refuses a negative `tv_sec` or `tv_usec` with
+/// `EINVAL`, then passes `tv_sec + tv_usec / USEC_PER_SEC` seconds and
+/// `(tv_usec % USEC_PER_SEC) * NSEC_PER_USEC` nanoseconds to
+/// `poll_select_set_timeout`, which refuses only what `timespec64_valid`
+/// (`include/linux/time64.h`) refuses: so microseconds of a second or more
+/// fold into the seconds. (v6.12 has no separate sign check, so there a
+/// mixed-sign timeval such as `{2, -1000000}` normalizes to 1 s; v7.1 added
+/// the check because the signed sum could wrap a negative timeout into a
+/// valid one. This follows v7.1, the measured host behaviour.) A sum that
+/// would overflow the signed seconds is `EINVAL` here.
 pub(super) fn select_timeout_duration(timeout: libc::timeval) -> Result<Duration, Errno> {
-    let seconds = u64::try_from(timeout.tv_sec).map_err(|_| Errno::EINVAL)?;
-    let microseconds = u64::try_from(timeout.tv_usec).map_err(|_| Errno::EINVAL)?;
-    // Linux rejects select timeouts whose microsecond field is out of range.
-    if microseconds >= 1_000_000 {
+    if timeout.tv_sec < 0 || timeout.tv_usec < 0 {
         return Err(Errno::EINVAL);
     }
-    Ok(Duration::new(seconds, (microseconds * 1_000) as u32))
+    let seconds = timeout
+        .tv_sec
+        .checked_add(timeout.tv_usec / 1_000_000)
+        .ok_or(Errno::EINVAL)?;
+    let nanoseconds = (timeout.tv_usec % 1_000_000) * 1_000;
+    Ok(Duration::new(seconds as u64, nanoseconds as u32))
 }
 
 fn timespec_from_duration(duration: Duration) -> Timespec {
@@ -1136,7 +1151,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A virtual timerfd among the sets is readable exactly when its
             // deadline has passed (`crate::syscalls::timerfd`).
             crate::syscalls::timerfd::publish_expired(guest).await;
-            return Ok(guest.inject(call).await?);
+            return Ok(self.inject_unsleeping_pselect6(guest, call).await?);
         }
 
         // Linux clamps raw fd-set copies to the process fd table's current max_fds.
@@ -1166,6 +1181,28 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 _ => None,
             };
+            let unmasked = sigmask_argument.is_none_or(|argument| argument.sigmask == 0);
+            if self.cfg.backend.restarts_backend_interrupted_waits
+                && (unmasked || snapshot.is_some())
+            {
+                let args = Syscall::Pselect6(call).into_parts().1;
+                return self
+                    .backend_restartable_select_family(
+                        guest,
+                        WaitRequest {
+                            nfds: call.nfds(),
+                            readfds: args.arg1,
+                            writefds: args.arg2,
+                            exceptfds: args.arg3,
+                            timeout: match args.arg4 {
+                                0 => WaitTimeout::None,
+                                address => WaitTimeout::Pselect6(address),
+                            },
+                            temporary_mask: snapshot,
+                        },
+                    )
+                    .await;
+            }
             let Some(mask) = snapshot else {
                 return self
                     .record_or_replay_blocking_with_mask(guest, Syscall::Pselect6(call), None)
@@ -1427,7 +1464,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 break Err(error);
                             }
                         },
-                        None => guest.inject(probe).await,
+                        None => self.inject_unsleeping_pselect6(guest, probe).await,
                     };
                     let result = pselect6_probe_result(raw_result);
                     if result != Ok(0) {
@@ -1633,6 +1670,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Mirror pselect6: keep large fd tables under kernel ownership rather than
         // over-reading the guest bitmap (Linux clamps raw fd-set copies to max_fds).
         if call.nfds() > PSELECT6_INTERNAL_MAX_NFDS {
+            if self.cfg.backend.restarts_backend_interrupted_waits {
+                let args = Syscall::Select(call).into_parts().1;
+                return self
+                    .backend_restartable_select_family(
+                        guest,
+                        WaitRequest {
+                            nfds: call.nfds(),
+                            readfds: args.arg1,
+                            writefds: args.arg2,
+                            exceptfds: args.arg3,
+                            timeout: match args.arg4 {
+                                0 => WaitTimeout::None,
+                                address => WaitTimeout::Select(address),
+                            },
+                            temporary_mask: None,
+                        },
+                    )
+                    .await;
+            }
             return self
                 .record_or_replay_blocking(guest, Syscall::Select(call))
                 .await;
@@ -3814,6 +3870,40 @@ mod tests {
             Err(Errno::EINVAL)
         );
         assert_eq!(pselect6_probe_result(Err(Errno::EINTR)), Err(Errno::EINTR));
+    }
+
+    #[test]
+    fn select_timeout_folds_whole_seconds_out_of_microseconds() {
+        let timeval = |tv_sec, tv_usec| libc::timeval { tv_sec, tv_usec };
+        assert_eq!(
+            select_timeout_duration(timeval(0, 1_500_000)),
+            Ok(Duration::new(1, 500_000_000))
+        );
+        assert_eq!(
+            select_timeout_duration(timeval(2, 3_000_001)),
+            Ok(Duration::new(5, 1_000))
+        );
+        assert_eq!(
+            select_timeout_duration(timeval(0, 999_999)),
+            Ok(Duration::new(0, 999_999_000))
+        );
+        assert_eq!(select_timeout_duration(timeval(0, -1)), Err(Errno::EINVAL));
+        assert_eq!(select_timeout_duration(timeval(-1, 0)), Err(Errno::EINVAL));
+        // v7.1 refuses a negative field before normalizing, so neither mixed
+        // sign is read as the 1 s it would sum to.
+        assert_eq!(
+            select_timeout_duration(timeval(2, -1_000_000)),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(
+            select_timeout_duration(timeval(-1, 2_000_000)),
+            Err(Errno::EINVAL)
+        );
+        assert_eq!(select_timeout_duration(timeval(1, -1)), Err(Errno::EINVAL));
+        assert_eq!(
+            select_timeout_duration(timeval(libc::time_t::MAX, 1_000_000)),
+            Err(Errno::EINVAL)
+        );
     }
 
     #[test]

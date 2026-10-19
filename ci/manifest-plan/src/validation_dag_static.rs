@@ -3700,7 +3700,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/issues/4213): 568.
     // And a_run_without_namespaces_is_not_refused_where_user_namespaces_are_denied
     // (https://github.com/rrnewton/hermit/issues/4515): 569, listed.
-    ("test.cli", 569),
+    // And select_timeout_folds_microseconds_into_seconds_as_linux: 570.
+    // And run_dbt_select_on_many_descriptors_matches_linux
+    // (https://github.com/rrnewton/hermit/issues/4483): 571.
+    ("test.cli", 571),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4167,7 +4170,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fifteen R2b-2 stage 3 CLI tests: 497, listed.
     // And the same five K3b CLI tests: 502.
     // And the same denied-user-namespace test: 503, listed.
-    ("test.cli_on_host", 503),
+    // And select_timeout_folds_microseconds_into_seconds_as_linux: 504.
+    // And run_dbt_select_on_many_descriptors_matches_linux: 505.
+    ("test.cli_on_host", 505),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
