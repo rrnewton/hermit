@@ -1135,189 +1135,42 @@ pub(crate) fn may_write_process_memory(flags: OFlag, descriptor: Option<(&Path, 
         })
 }
 
-/// The guest call after which [`Detcore::refresh_description_locks`] reads a
-/// descriptor's locks.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LockCall {
-    /// `F_OFD_SETLK` or `F_OFD_SETLKW`.
-    Fcntl,
-    /// `flock`.
-    Flock,
-    /// `pidfd_getfd`, which adds a slot.
-    PidfdGetfd,
-    /// `recvmsg` with `SCM_RIGHTS`, which adds a slot.
-    Recvmsg,
+/// The page [`Detcore::scan_ofd_locks`] stages its calls in, and its layout:
+/// the path, `openat2`'s `struct open_how`, the `fstatfs`/`fstat` buffer, the
+/// fdinfo read buffer, then (a second page) the `getdents64` buffer.
+const SCAN_PAGES: usize = 2 * 4096;
+const SCAN_PATH: usize = 0;
+const SCAN_HOW: usize = 64;
+const SCAN_HOW_SIZE: usize = 24;
+const SCAN_STAT: usize = 128;
+const SCAN_READ: usize = 512;
+const SCAN_READ_END: usize = 4096;
+const SCAN_DIRENTS: usize = 4096;
+const _: () = assert!(SCAN_HOW + SCAN_HOW_SIZE <= SCAN_STAT);
+const _: () = assert!(SCAN_STAT + std::mem::size_of::<libc::stat>() <= SCAN_READ);
+const _: () = assert!(SCAN_STAT + std::mem::size_of::<libc::statfs>() <= SCAN_READ);
+const _: () = assert!(SCAN_DIRENTS + 4096 <= SCAN_PAGES);
+/// `openat2`'s resolution for every scan entry: no step out of the procfs
+/// anchor and no mount crossed.
+const SCAN_RESOLVE: u64 = libc::RESOLVE_NO_XDEV | libc::RESOLVE_BENEATH;
+/// Where a `/proc/locks` scan reads: its staging `page`, its procfs
+/// `anchor` descriptor and that procfs's `device`, and the inodes the guest
+/// locked, the only ones whose fdinfo it reads.
+#[derive(Clone, Copy)]
+struct ScanAt<'a> {
+    page: usize,
+    anchor: RawFd,
+    device: u64,
+    locked: &'a crate::procfs::locks_scan::InodeSet,
 }
 
-impl LockCall {
-    /// The call's name, as a refusal names it.
-    fn name(self) -> &'static str {
-        match self {
-            Self::Fcntl => "fcntl",
-            Self::Flock => "flock",
-            Self::PidfdGetfd => "pidfd_getfd",
-            Self::Recvmsg => "recvmsg",
-        }
-    }
-
-    /// Whether the call can take or release a lock.
-    fn changes_locks(self) -> bool {
-        matches!(self, Self::Fcntl | Self::Flock)
-    }
-}
-
-/// The inode number an fdinfo names (its `ino:` line), as `/proc/locks`
-/// prints the last field of a lock's object.
-fn fdinfo_inode(fdinfo: &[u8]) -> Option<String> {
-    String::from_utf8_lossy(fdinfo)
-        .lines()
-        .find_map(|line| line.strip_prefix("ino:"))
-        .map(|inode| inode.trim().to_string())
-        .filter(|inode| !inode.is_empty() && inode.bytes().all(|byte| byte.is_ascii_digit()))
-}
-
-/// The fdinfo page [`Detcore::read_own_fdinfo`] stages its calls in, and its
-/// layout: the path, `openat2`'s `struct open_how`, the `fstatfs`/`fstat`
-/// buffer, then the read buffer.
-const FDINFO_PAGE: usize = 4096;
-const FDINFO_PATH: usize = 0;
-const FDINFO_HOW: usize = 64;
-const FDINFO_HOW_SIZE: usize = 24;
-const FDINFO_STAT: usize = 128;
-const FDINFO_READ: usize = 512;
-const _: () = assert!(FDINFO_HOW + FDINFO_HOW_SIZE <= FDINFO_STAT);
-const _: () = assert!(FDINFO_STAT + std::mem::size_of::<libc::stat>() <= FDINFO_READ);
-const _: () = assert!(FDINFO_STAT + std::mem::size_of::<libc::statfs>() <= FDINFO_READ);
-/// `openat2`'s resolution for the fdinfo entry: no step out of the anchor
-/// and no mount crossed.
-const FDINFO_RESOLVE: u64 = libc::RESOLVE_NO_XDEV | libc::RESOLVE_BENEATH;
-
-/// What [`Detcore::read_own_fdinfo`] found.
-pub(crate) enum FdinfoRead {
-    /// The fdinfo's text, from an entry proved to be on the guest's procfs.
-    Contents(Vec<u8>),
-    /// A step failed for a reason that says nothing about the description's
-    /// locks: they are unknown (`procfs::locks::LockLedger::note_unknown`).
-    Unknown(String),
-    /// The guest's `/proc` could not be proved to be procfs, or a step failed
-    /// for a cause the guest's own view or the backend decides
-    /// ([`fdinfo_failure_hides`]): the description contributes no lock, which
-    /// can hide the guest's row but never admits a host's.
-    Untrackable(String),
-}
-
-impl FdinfoRead {
-    /// The inode number the fdinfo names, if it was read.
-    fn inode(&self) -> Option<String> {
-        match self {
-            Self::Contents(contents) => fdinfo_inode(contents),
-            Self::Unknown(_) | Self::Untrackable(_) => None,
-        }
-    }
-}
-
-/// Why [`Detcore::read_staged_fdinfo`] did not read an fdinfo.
-enum FdinfoFailure {
-    /// A step (`open`, `fstatfs`, `fstat`, `read`) failed with an errno.
-    Failed(&'static str, Errno),
-    /// The guest's `/proc` was shown not to be procfs, for this reason.
-    NotProcfs(&'static str),
-}
-
-/// Whether an fdinfo step that failed with `errno` shows the description
-/// is untrackable: a cause the guest's own filesystem view or the backend
-/// decides, the same in every run of the same program (no `/proc` or an
-/// entry missing, ENOENT or ENOTDIR; a symlink loop, ELOOP; an entry outside
-/// the anchor or across a mount, EXDEV; a backend that refuses the call,
-/// EINVAL, as KVM refuses an `O_PATH` open of its `/proc`). Every other
-/// errno, ambient or resource state that can differ between runs, leaves the
-/// locks unknown, so a later `/proc/locks` read refuses rather than shows a
-/// row that depends on host state: a full descriptor table, EMFILE; a full
-/// host file table, ENFILE; no memory, ENOMEM; an interruption, EINTR; an I/O
-/// error, EIO; EAGAIN; a kernel without `openat2`, ENOSYS; a permission
-/// refusal, EACCES or EPERM, which a host security module keyed by the host
-/// process can give as well as the guest's own seccomp filter; anything
-/// unlisted.
-fn fdinfo_failure_hides(errno: Errno) -> bool {
-    matches!(
-        errno,
-        Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP | Errno::EXDEV | Errno::EINVAL
-    )
-}
-
-/// Why Detcore does not know which locks the description descriptor `fd`
-/// names holds after the guest's `call` through it: `step` (the open or a
-/// read of its fdinfo) failed with `errno`. A failure says nothing about
-/// which locks it holds (`Detcore::read_own_fdinfo`); a later `/proc/locks`
-/// read refuses with this reason (`procfs::locks::LockLedger::unknown`).
-fn fdinfo_refusal(call: &str, fd: RawFd, step: &str, errno: Errno) -> String {
-    format!(
-        "after {call} on fd {fd}, Detcore could not {step} that descriptor's fdinfo \
-         ({errno}), so it does not know which locks the description holds"
-    )
-}
-
-#[cfg(test)]
-mod fdinfo_refusal_tests {
-    use super::*;
-
-    /// A guest at its descriptor limit gets EMFILE from Detcore's fdinfo
-    /// open after a lock call that needed no new descriptor; a later
-    /// `/proc/locks` read stops the run with that named, naming the call,
-    /// rather than taking the description to hold nothing. hermit-cli's
-    /// `a_full_descriptor_table_refuses_the_next_proc_locks_read` runs that
-    /// end to end; this pins the reason's wording.
-    #[test]
-    fn a_failed_fdinfo_read_is_a_named_refusal_not_an_empty_one() {
-        let reason = fdinfo_refusal("recvmsg", 7, "open", Errno::EMFILE);
-        assert!(reason.contains("after recvmsg on fd 7"), "{reason}");
-        assert!(
-            reason.contains("could not open that descriptor's fdinfo"),
-            "{reason}"
-        );
-        assert!(reason.contains("EMFILE"), "{reason}");
-        assert!(fdinfo_refusal("flock", 7, "read", Errno::EIO).contains("could not read that"));
-    }
-
-    /// A failure the guest's filesystem view or the backend decides hides
-    /// the description; ambient or resource state, and anything unlisted,
-    /// leaves its locks unknown (and a later `/proc/locks` read refused).
-    #[test]
-    fn only_a_guest_or_backend_decided_failure_hides_the_description() {
-        for errno in [
-            Errno::ENOENT,
-            Errno::ENOTDIR,
-            Errno::ELOOP,
-            Errno::EXDEV,
-            Errno::EINVAL,
-        ] {
-            assert!(fdinfo_failure_hides(errno), "{errno}");
-        }
-        for errno in [
-            Errno::EACCES,
-            Errno::EPERM,
-            Errno::EMFILE,
-            Errno::ENFILE,
-            Errno::ENOMEM,
-            Errno::EINTR,
-            Errno::EIO,
-            Errno::EAGAIN,
-            Errno::ENOSYS,
-            Errno::EBADF,
-        ] {
-            assert!(!fdinfo_failure_hides(errno), "{errno}");
-        }
-    }
-
-    #[test]
-    fn an_fdinfo_names_its_inode_as_proc_locks_prints_it() {
-        let fdinfo = b"pos:\t0\nflags:\t0100002\nmnt_id:\t31\nino:\t1234\n\
-            lock:\t1: OFDLCK ADVISORY READ -1 00:18:1234 0 0\n";
-        assert_eq!(fdinfo_inode(fdinfo).as_deref(), Some("1234"));
-        assert_eq!(fdinfo_inode(b"pos:\t0\n"), None);
-        assert_eq!(fdinfo_inode(b"ino:\tx\n"), None);
-    }
-}
+/// m(L) for each OFD lock L the `/proc/locks` scan found guest descriptions
+/// holding, or why the snapshot cannot be decided.
+type LockScanOutcome = Result<BTreeMap<crate::procfs::locks::HeldLock, usize>, String>;
+/// `kcmp`'s comparison kinds (`linux/kcmp.h`): one open file description
+/// behind two descriptors, and one descriptor table behind two tasks.
+const KCMP_FILE: usize = 0;
+const KCMP_FILES: usize = 2;
 
 /// Writes back the guest bytes that a pre-call lookup buffer (utimensat's, or
 /// the removal lookup's) covered.
@@ -4630,14 +4483,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             return refusal;
         }
         let channel_end = self.pipe_channel_end(guest, fd);
-        let lock_tracked = self.lock_tracked_descriptions(guest, fd..=fd);
         let res = self.record_or_replay(guest, call).await;
         let fd_was_released = !matches!(res, Err(Errno::EBADF) | Err(Errno::ERESTARTSYS));
         if fd_was_released {
             if let Some(open_file_id) = guest.thread_state_mut().remove_fd(fd) {
                 self.release_port_for_open_file(guest, open_file_id).await;
             }
-            self.report_lock_references(guest, lock_tracked).await;
             if let Ok(fd) = u32::try_from(fd) {
                 crate::tool_global::descriptors_replaced(guest, fd, fd).await;
             }
@@ -4679,18 +4530,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let channel_ends = self.pipe_channel_ends_in(guest, first, last);
-        let lock_tracked = match (i32::try_from(first), i32::try_from(last)) {
-            (Ok(first), Ok(last)) => self.lock_tracked_descriptions(guest, first..=last),
-            (Ok(first), Err(_)) => self.lock_tracked_descriptions(guest, first..=RawFd::MAX),
-            _ => Vec::new(),
-        };
         let result = self.record_or_replay(guest, call).await;
         if result.is_ok() {
             let released = guest.thread_state_mut().remove_fd_range(first, last);
             for open_file_id in released {
                 self.release_port_for_open_file(guest, open_file_id).await;
             }
-            self.report_lock_references(guest, lock_tracked).await;
             crate::tool_global::descriptors_replaced(guest, first, last).await;
             for end in channel_ends {
                 self.note_channel_end_closed(guest, Some(end)).await;
@@ -4785,14 +4630,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Flock,
     ) -> Result<i64, Error> {
-        // A flock belongs to its open file description. Whatever the call
-        // did (took, converted, released, or, refused, dropped a lock in a
-        // non-atomic conversion), the description's own fdinfo now says which
-        // locks it holds (`procfs::locks`).
+        // The guest locked this file itself: an OFD row of `/proc/locks` on
+        // its inode may count (`procfs::locks_scan::GuestLockedInodes`).
         let fd = call.fd();
+        let unlock = call.operation() & libc::LOCK_UN != 0;
         let result = self.flock_through_the_kernel(guest, call).await;
-        self.refresh_description_locks(guest, fd, LockCall::Flock)
-            .await?;
+        if result.is_ok() && !unlock {
+            self.note_locked_inode(guest, fd, "flock").await?;
+        }
         result
     }
 
@@ -5869,27 +5714,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         // `/proc/locks` keeps the guest's own rows only: an OFD lock has no
         // owning task, so Linux shows every process's OFD locks from every
-        // PID namespace (`procfs::locks`). Decided before the sanitizer
-        // numbers identities, so a dropped row shifts no remaining id. The
-        // capture above and this decision are two steps of one turn: with
-        // sequentialized threads no other guest thread's lock call (and its
-        // fdinfo record) runs between them. Parallel execution would need
-        // them taken as one.
+        // PID namespace (`procfs::locks`). Decided from the kernel's state
+        // now (`procfs::locks_scan`), before the sanitizer numbers
+        // identities, so a dropped row shifts no remaining id. The capture
+        // above and the scan are steps of one turn: with sequentialized
+        // threads no other guest thread changes a table or a lock between
+        // them. Parallel execution would need them taken while no other guest
+        // runs.
         let lock_rows_kept = if guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_lists_locks())?
         {
             match crate::procfs::locks::lock_rows(&contents) {
-                Some(rows) => match crate::tool_global::guest_lock_rows(guest, rows).await {
-                    Ok(kept) => Some(kept),
-                    Err(reason) => {
-                        let reason = format!(
-                            "/proc/locks: {reason}; that description's rows cannot be told \
-                             from another process's"
-                        );
-                        self.refuse_lock_bookkeeping(guest, reason).await
-                    }
-                },
+                Some(rows) => Some(
+                    self.guest_lock_rows_from_kernel(guest, call.fd(), &rows)
+                        .await?,
+                ),
                 // Rows that do not parse: the sanitizer refuses the snapshot.
                 None => None,
             }
@@ -8904,12 +8744,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             F_DUPFD(_) | F_DUPFD_CLOEXEC(_) => {
                 let newfd = self.record_or_replay(guest, call).await? as RawFd;
-                let lock_tracked = self.lock_tracked_descriptions(guest, newfd..=newfd);
                 let replaced = guest.thread_state_mut().dup_fd(fd, newfd, o_cloexec)?;
                 if let Some(open_file_id) = replaced {
                     self.release_port_for_open_file(guest, open_file_id).await;
                 }
-                self.report_lock_references(guest, lock_tracked).await;
                 Ok(newfd as i64)
             }
             F_SETFD(flags) => {
@@ -8958,13 +8796,28 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             // An OFD lock belongs to its open file description, and Linux
             // shows it in `/proc/locks` from every PID namespace, the host's
-            // included, as owner -1. After each call, the description's own
-            // fdinfo says which locks it holds (`procfs::locks`); the lock
-            // itself is the kernel's, as for POSIX locks.
-            F_OFD_SETLK(_) | F_OFD_SETLKW(_) => {
+            // included, as owner -1. Which rows are the guest's is decided
+            // from the kernel at the `/proc/locks` read
+            // (`procfs::locks_scan`); here the guest only names the file it
+            // locked, so an OFD row on its inode may count. The lock itself
+            // is the kernel's, as for POSIX locks.
+            F_OFD_SETLK(lock) | F_OFD_SETLKW(lock) => {
                 let result = self.record_or_replay(guest, call).await?;
-                self.refresh_description_locks(guest, fd, LockCall::Fcntl)
-                    .await?;
+                // DBT refuses a copied vfork while this may hold an OFD lock.
+                let _ = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_may_hold_ofd_lock());
+                // An unlock names no inode: the guest took no lock on it. An
+                // argument Detcore cannot read back (a write-only page) is
+                // taken for a lock; the description is still one opened
+                // inside the container, or nothing is named.
+                let unlock = lock
+                    .and_then(|lock| guest.memory().read_value(lock).ok())
+                    .is_some_and(|lock: libc::flock| lock.l_type == libc::F_UNLCK as i16);
+                if !unlock {
+                    self.note_locked_inode(guest, fd, "fcntl(F_OFD_SETLK)")
+                        .await?;
+                }
                 Ok(result)
             }
             _ => {
@@ -8977,201 +8830,150 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// Record which OFD and flock locks the open file description `fd` names
-    /// holds now, after a call through it that may have changed them
-    /// (`procfs::locks`), from the `lock:` lines of its fdinfo, which name
-    /// exactly that description's locks with the device `/proc/locks`
-    /// prints. A descriptor Detcore keeps no model of is left out.
+    /// Name the inode of descriptor `fd`'s file among those the guest locked
+    /// (`procfs::locks_scan::InodeSet`), after a successful lock (not an
+    /// unlock) through it by `call`: an OFD row of `/proc/locks` counts only
+    /// on such an inode. Only a description opened inside the container
+    /// names one: a lock through a description inherited at launch, or one
+    /// Detcore keeps no model of or found with unknown provenance (received,
+    /// rediscovered after an exec), names none, since the host may share it.
+    /// The inode comes from an `fstat` through the recorder
+    /// ([`Self::recorded_fstat`]), so a replay names the recording's inode. A
+    /// description already named is not named again.
     ///
-    /// The fdinfo is read only through an anchor proved to be procfs, by a
-    /// sequence of calls through the recorder ([`Self::read_own_fdinfo`]):
-    /// the `/proc/locks` rows a replay filters are the recording's, and
-    /// replay takes no real lock, so the locks they are matched against must
-    /// be the recording's too. A recording therefore holds, after each such
-    /// call, the anchor's `openat`, `fstatfs` and `fstat`, the entry's
-    /// `openat2`, `fstatfs` and `fstat`, the reads and two `close`s
-    /// (hermit-cli's `RECORD_VERSION` names the change).
-    ///
-    /// The guest's `call` is never affected. A read that fails for a cause
-    /// the guest's own filesystem view or the backend decides (no `/proc`,
-    /// not procfs, an entry outside it or across a mount, a backend's
-    /// refusal) makes the description untrackable: it contributes no lock. A
-    /// read that fails for ambient or resource state (a full descriptor table
-    /// or file table, no memory, an interruption, an I/O error, a kernel
-    /// without `openat2`, a permission refusal) leaves its locks unknown, and
-    /// a later `/proc/locks` read
-    /// refuses while a guest table references the description
-    /// (`procfs::locks::LockLedger::unknown`).
-    ///
-    /// A lock or unlock through a descriptor whose description the ledger
-    /// may know under another identity (one Detcore keeps no model of, such
-    /// as a descriptor received over `SCM_RIGHTS` on ptrace, or one an
-    /// in-guest backend registered on reception) can leave that other
-    /// identity's entry stale, so no lock on that file's inode number counts
-    /// from then on (`procfs::locks::LockLedger::alias_inode`): hidden, never
-    /// a host's row admitted. If that descriptor's fdinfo cannot be read for
-    /// ambient or resource state, every later `/proc/locks` read refuses
-    /// instead ([`Self::note_alias`]).
-    pub(crate) async fn refresh_description_locks<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        fd: RawFd,
-        call: LockCall,
-    ) -> Result<(), Error> {
-        let model = guest.thread_state().with_detfd(fd, |detfd| {
-            detfd.set_lock_tracked();
-            if call == LockCall::Recvmsg {
-                detfd.set_received_for_locks();
-            }
-            if call == LockCall::Fcntl {
-                detfd.set_may_hold_ofd_lock();
-            }
-            (detfd.open_file_id(), detfd.is_received_for_locks())
-        });
-        let Ok((open_file, received)) = model else {
-            if call.changes_locks() {
-                let fdinfo = self.read_own_fdinfo(guest, fd, call.name()).await?;
-                Self::note_alias(guest, &fdinfo).await;
-            }
-            return Ok(());
-        };
-        let fdinfo = self.read_own_fdinfo(guest, fd, call.name()).await?;
-        if received && call.changes_locks() {
-            Self::note_alias(guest, &fdinfo).await;
-        }
-        let held = matches!(&fdinfo, FdinfoRead::Contents(_));
-        let locks = match fdinfo {
-            FdinfoRead::Contents(contents) => {
-                Ok(crate::procfs::locks::held_locks_in_fdinfo(&contents))
-            }
-            FdinfoRead::Unknown(reason) => Err(reason),
-            // Hidden, never admitted: the description contributes no lock
-            // until a later read through a proved procfs.
-            FdinfoRead::Untrackable(reason) => {
-                info!("[detcore] /proc/locks: {reason}; its locks are not shown");
-                Ok(Vec::new())
-            }
-        };
-        if !held
-            || locks
-                .as_ref()
-                .is_ok_and(|locks| locks.iter().any(|lock| lock.class == "OFDLCK"))
-        {
-            let _ = guest
-                .thread_state()
-                .with_detfd(fd, |detfd| detfd.set_may_hold_ofd_lock());
-        }
-        let slots = guest.thread_state().slots_naming(open_file);
-        crate::tool_global::note_description_locks(guest, open_file, locks, slots).await;
-        Ok(())
-    }
-
-    /// After a lock or unlock through a descriptor whose description the
-    /// ledger may know under another identity: no lock on its inode number
-    /// counts from now on (`procfs::locks::LockLedger::alias_inode`). If its
-    /// fdinfo could not be read for ambient or resource state, which
-    /// identities it changed is unknown, and every later `/proc/locks`
-    /// snapshot is refused by name (`procfs::locks::LockLedger::refuse`); if
-    /// the guest's `/proc` could not be proved to be procfs, no lock counts
-    /// at all (an inode of `None`), which only hides.
-    async fn note_alias<G: Guest<Self>>(guest: &mut G, fdinfo: &FdinfoRead) {
-        match fdinfo {
-            FdinfoRead::Unknown(reason) => {
-                crate::tool_global::note_lock_ledger_refused(guest, reason.clone()).await;
-            }
-            FdinfoRead::Contents(_) | FdinfoRead::Untrackable(_) => {
-                crate::tool_global::note_aliased_inode(guest, fdinfo.inode()).await;
-            }
-        }
-    }
-
-    /// The descriptions named by the slots `fds` of this thread's table
-    /// whose locks `procfs::locks::LockLedger` follows, taken before a close
-    /// or replacement of those slots.
-    fn lock_tracked_descriptions<G: Guest<Self>>(
-        &self,
-        guest: &G,
-        fds: std::ops::RangeInclusive<RawFd>,
-    ) -> Vec<OpenFileId> {
-        let thread = guest.thread_state();
-        let candidates = if fds.start() == fds.end() {
-            vec![*fds.start()]
-        } else {
-            thread
-                .open_fds()
-                .into_iter()
-                .filter(|fd| fds.contains(fd))
-                .collect()
-        };
-        let mut tracked = candidates
-            .into_iter()
-            .filter_map(|fd| {
-                thread
-                    .with_detfd(fd, |detfd| {
-                        detfd.is_lock_tracked().then(|| detfd.open_file_id())
-                    })
-                    .ok()
-                    .flatten()
-            })
-            .collect::<Vec<_>>();
-        tracked.sort();
-        tracked.dedup();
-        tracked
-    }
-
-    /// After a close or replacement of slots that named `descriptions`,
-    /// report how many slots of this thread's table still name each
-    /// (`procfs::locks::LockLedger::release`).
-    async fn report_lock_references<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        descriptions: Vec<OpenFileId>,
-    ) {
-        for open_file in descriptions {
-            let remaining = guest.thread_state().slots_naming(open_file);
-            crate::tool_global::note_table_released(guest, open_file, remaining).await;
-        }
-    }
-
-    /// The text of `/proc/thread-self/fdinfo/<fd>`, read through the guest's
-    /// procfs only, by a recorded sequence staged in a private page mapped for
-    /// this call and unmapped before it returns ([`Self::read_staged_fdinfo`]).
-    ///
-    /// The guest chooses its own root, so a path alone proves nothing: under a
-    /// `chroot` its `/proc` can be any tree, with any text where an fdinfo is
-    /// expected, and lock lines that matched a host's lock would admit the
-    /// host's `/proc/locks` row. So the read starts from an anchor, the
-    /// guest's `/proc`, which must be procfs (`fstatfs`), opens the entry
-    /// below it with `openat2`'s `RESOLVE_BENEATH | RESOLVE_NO_XDEV` (no step
-    /// out of the anchor, no mount crossed, so nothing bound over an entry),
-    /// and requires the entry itself on procfs and on the anchor's device
-    /// (`fstatfs` and `fstat` of both). Every step goes through the
-    /// recorder, so record and replay decide alike. The read holds two
-    /// descriptors at once, the anchor and the entry. These checks rely on
-    /// the serialized schedule, under which no other guest thread runs
-    /// between the calls; with concurrent threads the entry check narrows a
-    /// `dup2` race on the descriptor numbers but does not close it
-    /// ([`Self::read_opened_entry`]).
-    ///
-    /// No page for a guest that mapped its whole address space away, and a
-    /// failed step whose errno is ambient or resource state
-    /// ([`fdinfo_failure_hides`] is false), leave the description's locks
-    /// unknown ([`FdinfoRead::Unknown`], whose reason names the guest's
-    /// `call`, [`fdinfo_refusal`]). Every other outcome that gives no proved
-    /// fdinfo (no `/proc`, not procfs, an entry outside it or across a
-    /// mount, a device mismatch, a guest-decided or backend-decided errno)
-    /// makes the description untrackable ([`FdinfoRead::Untrackable`]).
-    async fn read_own_fdinfo<G: Guest<Self>>(
+    /// A failed `fstat` whose cause the guest's view or the backend decides
+    /// hides the row, named; any other cause (ambient, resource or
+    /// host-policy state, or no scratch for the buffer) records a run-wide
+    /// refusal that every later `/proc/locks` read reports by name, since the
+    /// guest's row could not be told from a host's.
+    async fn note_locked_inode<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
         call: &str,
-    ) -> Result<FdinfoRead, Error> {
+    ) -> Result<(), Error> {
+        match guest
+            .thread_state()
+            .with_detfd(fd, |detfd| (detfd.locked_inode_noted(), detfd.is_foreign()))
+        {
+            Ok((true, _)) => return Ok(()),
+            Ok((false, false)) => {}
+            Ok((false, true)) | Err(_) => {
+                info!(
+                    "[detcore] /proc/locks: {call} on fd {fd} went through a description not \
+                     opened inside the container; OFD rows on its file are not shown"
+                );
+                return Ok(());
+            }
+        }
+        self.note_foreign_descriptions(guest).await?;
+        match self.recorded_fstat(guest, fd).await? {
+            Ok(stat) => {
+                crate::tool_global::note_locked_inode(guest, stat.st_ino).await;
+                let _ = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_locked_inode_noted());
+            }
+            Err(Some(errno)) if crate::procfs::locks_scan::errno_hides(errno) => info!(
+                "[detcore] /proc/locks: the fstat of fd {fd} after {call} failed with \
+                 {errno:?}; OFD rows on its file are not shown"
+            ),
+            Err(failure) => {
+                let cause = failure.map_or_else(
+                    || "no scratch memory for its buffer".to_string(),
+                    |errno| format!("it failed with {errno:?}"),
+                );
+                let reason = format!(
+                    "after {call} on fd {fd}, Detcore could not read the file's inode ({cause}); \
+                     that cause is ambient, resource or host-policy state, so the guest's OFD \
+                     rows cannot be told from another process's"
+                );
+                info!("[detcore] /proc/locks: {reason}");
+                crate::tool_global::note_lock_scan_refusal(guest, reason).await;
+            }
+        }
+        Ok(())
+    }
+
+    /// Name the file inode of every description inherited at launch in this
+    /// thread's table not yet named among the foreign ones
+    /// (`procfs::locks_scan::InodeSet`): the launcher holds such a
+    /// description and may lock through it, so no OFD row on its file counts.
+    /// (A description received from outside the container is named at its
+    /// reception.)
+    /// Done at each lock call that names a guest-locked inode, and at each
+    /// `/proc/locks` read, for the caller's own table, by an `fstat` through
+    /// the recorder; a description is named once. A failure that does not
+    /// hide records a run-wide refusal.
+    async fn note_foreign_descriptions<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Error> {
+        let foreign = guest
+            .thread_state()
+            .open_fds()
+            .into_iter()
+            .filter(|fd| {
+                guest
+                    .thread_state()
+                    .with_detfd(*fd, |detfd| detfd.foreign_inode_unnoted())
+                    .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
+        for fd in foreign {
+            match self.recorded_fstat(guest, fd).await? {
+                Ok(stat) => {
+                    crate::tool_global::note_foreign_inode(guest, stat.st_ino).await;
+                    let _ = guest
+                        .thread_state()
+                        .with_detfd(fd, |detfd| detfd.set_foreign_inode_noted());
+                }
+                Err(Some(errno)) if crate::procfs::locks_scan::errno_hides(errno) => {}
+                Err(failure) => {
+                    let cause = failure.map_or_else(
+                        || "no scratch memory for its buffer".to_string(),
+                        |errno| format!("it failed with {errno:?}"),
+                    );
+                    let reason = format!(
+                        "Detcore could not read the inode of descriptor {fd}, inherited at launch \
+                         ({cause}), so a host process's lock through it cannot be told from the \
+                         guest's"
+                    );
+                    crate::tool_global::note_lock_scan_refusal(guest, reason).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// `fstat(fd)` through the recorder, its buffer staged in the guest stack
+    /// scratch, or, where that cannot hold it, in a transient private page
+    /// unmapped before the guest resumes. `Err(Some(errno))` when the call
+    /// failed, `Err(None)` when no scratch could be had.
+    pub(crate) async fn recorded_fstat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<Result<libc::stat, Option<Errno>>, Error> {
+        {
+            let mut stack = guest.stack().await;
+            let statptr: StatPtr = StatPtr(stack.reserve());
+            // Kept until the buffer is read: a Tool-owned scratch arena (DBT,
+            // SaBRe) is freed when the guard drops.
+            if let Ok(_stack_guard) = stack.commit() {
+                let stat = self
+                    .record_or_replay(
+                        guest,
+                        syscalls::Fstat::new().with_fd(fd).with_stat(Some(statptr)),
+                    )
+                    .await
+                    .and_then(|_| statptr.read(&guest.memory()));
+                return Ok(stat.map_err(Some));
+            }
+        }
+        let len = std::mem::size_of::<libc::stat>();
         let mapped = guest
             .inject_with_retry(Syscall::Mmap(
                 syscalls::Mmap::new()
                     .with_addr(None)
-                    .with_len(FDINFO_PAGE)
+                    .with_len(len)
                     .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
                     .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
                     .with_fd(-1)
@@ -9183,69 +8985,200 @@ impl<T: RecordOrReplay> Detcore<T> {
             .and_then(|mapped| usize::try_from(mapped).ok())
             .filter(|page| *page != 0)
         else {
-            return Ok(FdinfoRead::Unknown(format!(
-                "after {call} on fd {fd}, Detcore could not map the page it reads that \
-                 descriptor's fdinfo through ({mapped:?}), so it does not know which locks \
-                 the description holds"
-            )));
+            return Ok(Err(None));
         };
-        let result = self.read_staged_fdinfo(guest, page, fd).await;
+        let statptr = StatPtr(AddrMut::from_raw(page).ok_or(Errno::EFAULT)?);
+        let stat = self
+            .record_or_replay(
+                guest,
+                syscalls::Fstat::new().with_fd(fd).with_stat(Some(statptr)),
+            )
+            .await
+            .and_then(|_| statptr.read(&guest.memory()));
         if let Err(errno) = guest
             .inject_with_retry(Syscall::Munmap(
                 syscalls::Munmap::new()
                     .with_addr(Addr::from_raw(page))
-                    .with_len(FDINFO_PAGE),
+                    .with_len(len),
             ))
             .await
         {
-            warn!(
-                "[detcore] could not unmap the transient fdinfo page: {}",
-                errno
-            );
+            warn!("[detcore] could not unmap the transient fstat page: {errno}");
         }
-        Ok(match result? {
-            Ok(contents) => FdinfoRead::Contents(contents),
-            // Ambient or resource state says nothing about the locks.
-            Err(FdinfoFailure::Failed(step, errno)) if !fdinfo_failure_hides(errno) => {
-                FdinfoRead::Unknown(fdinfo_refusal(call, fd, step, errno))
-            }
-            Err(FdinfoFailure::Failed(step, errno)) => FdinfoRead::Untrackable(format!(
-                "after {call} on fd {fd}, the guest's /proc did not give a procfs fdinfo \
-                 ({step}: {errno})"
-            )),
-            Err(FdinfoFailure::NotProcfs(why)) => FdinfoRead::Untrackable(format!(
-                "after {call} on fd {fd}, the guest's /proc did not give a procfs fdinfo \
-                 ({why})"
-            )),
-        })
+        Ok(stat.map_err(Some))
     }
 
-    /// Stop the run, by name, with the policy-refusal exit, because Detcore
-    /// cannot tell a `/proc/locks` snapshot's guest rows from a host's while a
-    /// description whose locks it could not read is referenced
-    /// (`procfs::locks::LockLedger::unknown`).
-    async fn refuse_lock_bookkeeping<G: Guest<Self>>(&self, guest: &mut G, reason: String) -> ! {
-        error!("[detcore] {reason}");
-        crate::tool_global::report_policy_refusal(guest, reason).await;
-        crate::tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+    /// Which rows of the `/proc/locks` snapshot `rows`, read through the
+    /// guest's descriptor `locks_fd`, the guest owns
+    /// (`procfs::locks_scan::keep_rows`): rows a guest process owns by its
+    /// positive pid, the KVM `00:00` exemption, and at most m(L) of each OFD
+    /// lock L's `OFDLCK -1` rows, where m(L) is how many distinct guest open
+    /// file descriptions the kernel says hold L now ([`Self::scan_ofd_locks`]).
+    ///
+    /// Whether to scan is decided from guest state only: not until the guest
+    /// itself has locked a file (`procfs::locks_scan::scan_needed`). While the
+    /// schedule is not quiescent (a vfork child, or a descriptor reception,
+    /// may run outside it), every OFD row is hidden. A run-wide refusal (a
+    /// lock call whose inode could not be read) refuses every read by name.
+    /// Runs in the reader's turn, after the raw capture and before the
+    /// sanitizer numbers identities: with sequentialized threads no other
+    /// guest thread changes a table or a lock in between.
+    async fn guest_lock_rows_from_kernel<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        locks_fd: RawFd,
+        rows: &[crate::procfs::locks::LockRowFacts],
+    ) -> Result<Vec<bool>, Error> {
+        use crate::procfs::locks_scan;
+        let owners = rows
+            .iter()
+            .filter(|row| row.owner > 0)
+            .map(|row| row.owner)
+            .collect();
+        self.note_foreign_descriptions(guest).await?;
+        let plan = crate::tool_global::lock_scan_plan(guest, owners).await;
+        if let Some(reason) = &plan.refusal {
+            self.refuse_lock_scan(guest, format!("/proc/locks: {reason}"))
+                .await
+        }
+        let multiplicity = if !locks_scan::scan_needed(&plan.locked_inodes) {
+            BTreeMap::new()
+        } else if !plan.quiescent {
+            info!(
+                "[detcore] /proc/locks: a vfork child or a descriptor reception may run outside \
+                 the schedule, so no OFD row is shown"
+            );
+            BTreeMap::new()
+        } else {
+            self.scan_ofd_locks(guest, locks_fd, rows, &plan).await?
+        };
+        let guest_owners = plan.guest_owners.iter().copied().collect::<BTreeSet<_>>();
+        Ok(locks_scan::keep_rows(
+            rows,
+            |owner| guest_owners.contains(&owner),
+            &multiplicity,
+        ))
+    }
+
+    /// m(L) for each OFD lock L that some live guest descriptor table holds,
+    /// asked of the kernel by a recorded sequence staged in a private mapping
+    /// made for this read and unmapped before it returns
+    /// ([`Self::scan_in_pages`]). Every answer goes through the recorder, so a
+    /// replay decides from the recording's answers.
+    ///
+    /// A table, descriptor or thread that cannot be read for a reason the
+    /// guest's own filesystem view or the backend decides is left out with an
+    /// INFO line, which can only hide a guest row
+    /// (`procfs::locks_scan::errno_hides`). A failure caused by ambient,
+    /// resource or host-policy state (a full descriptor table, no memory, a
+    /// permission refusal, ...), a procfs not proved to number tasks as the
+    /// container's PID namespace does, or a scan descriptor that cannot be
+    /// closed would let host state decide whether a guest row shows, so the
+    /// read refuses the run by name instead.
+    async fn scan_ofd_locks<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        locks_fd: RawFd,
+        rows: &[crate::procfs::locks::LockRowFacts],
+        plan: &crate::procfs::locks_scan::ScanPlan,
+    ) -> Result<BTreeMap<crate::procfs::locks::HeldLock, usize>, Error> {
+        let mapped = guest
+            .inject_with_retry(Syscall::Mmap(
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(SCAN_PAGES)
+                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                    .with_fd(-1)
+                    .with_offset(0),
+            ))
+            .await;
+        let Some(page) = mapped
+            .ok()
+            .and_then(|mapped| usize::try_from(mapped).ok())
+            .filter(|page| *page != 0)
+        else {
+            let reason = format!(
+                "/proc/locks: Detcore could not map the pages it reads the guest's descriptor \
+                 tables through ({mapped:?}), so the snapshot's OFD rows cannot be told from \
+                 another process's"
+            );
+            self.refuse_lock_scan(guest, reason).await
+        };
+        let result = self.scan_in_pages(guest, page, locks_fd, rows, plan).await;
+        if let Err(errno) = guest
+            .inject_with_retry(Syscall::Munmap(
+                syscalls::Munmap::new()
+                    .with_addr(Addr::from_raw(page))
+                    .with_len(SCAN_PAGES),
+            ))
             .await
+        {
+            warn!("[detcore] could not unmap the /proc/locks scan pages: {errno}");
+        }
+        match result? {
+            Ok(multiplicity) => Ok(multiplicity),
+            Err(reason) => self.refuse_lock_scan(guest, reason).await,
+        }
     }
 
-    /// [`Self::read_own_fdinfo`]'s recorded sequence, in the mapped `page`
-    /// (layout: the path at [`FDINFO_PATH`], `openat2`'s `struct open_how` at
-    /// [`FDINFO_HOW`], `fstatfs` and `fstat` buffers at [`FDINFO_STAT`], the
-    /// read buffer from [`FDINFO_READ`]): open the anchor, prove it procfs,
-    /// open the entry beneath it on its mount, compare devices, read, and
-    /// close both descriptors.
-    async fn read_staged_fdinfo<G: Guest<Self>>(
+    /// Close the scan's descriptor `fd` through the recorder. A failed close
+    /// is named in `failures`: a descriptor the scan leaves open would be
+    /// listed, and read, by the next scan of the reader's table, so the read
+    /// refuses instead.
+    async fn close_scan_descriptor<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        what: &str,
+        failures: &mut Vec<String>,
+    ) {
+        if let Err(errno) = self
+            .record_or_replay(guest, syscalls::Close::new().with_fd(fd))
+            .await
+        {
+            failures.push(format!(
+                "/proc/locks: closing the scan's {what} (fd {fd}) failed with {errno:?}, so a \
+                 later scan could read it as the guest's"
+            ));
+        }
+    }
+
+    /// [`Self::scan_ofd_locks`] in the mapped `page`s: prove the guest's
+    /// `/proc` is the procfs instance `/proc/locks` was read from and numbers
+    /// tasks as the container's PID namespace does, read every target table
+    /// beneath it, then count descriptions. `Ok(Err)` names why the snapshot
+    /// cannot be decided.
+    async fn scan_in_pages<G: Guest<Self>>(
         &self,
         guest: &mut G,
         page: usize,
-        fd: RawFd,
-    ) -> Result<Result<Vec<u8>, FdinfoFailure>, Error> {
+        locks_fd: RawFd,
+        rows: &[crate::procfs::locks::LockRowFacts],
+        plan: &crate::procfs::locks_scan::ScanPlan,
+    ) -> Result<LockScanOutcome, Error> {
+        use crate::procfs::locks_scan::Unreadable;
+        let whole = |reason: Unreadable| -> Result<LockScanOutcome, Error> {
+            if reason.hides() {
+                info!(
+                    "[detcore] /proc/locks: the guest's descriptor tables cannot be read \
+                     ({reason}), so no OFD row is shown"
+                );
+                Ok(Ok(BTreeMap::new()))
+            } else {
+                Ok(Err(format!(
+                    "/proc/locks: the guest's descriptor tables cannot be read ({reason}), so \
+                     the snapshot's OFD rows cannot be told from another process's"
+                )))
+            }
+        };
+        let locks_device = match self.recorded_procfs_device(guest, page, locks_fd).await? {
+            Ok(device) => device,
+            Err(reason) => return whole(reason),
+        };
         let path_ptr =
-            PathPtr::from_ptr((page + FDINFO_PATH) as *const libc::c_char).ok_or(Errno::EFAULT)?;
-        self.write_fdinfo_path(guest, page, "/proc")?;
+            PathPtr::from_ptr((page + SCAN_PATH) as *const libc::c_char).ok_or(Errno::EFAULT)?;
+        self.write_scan_path(guest, page, "/proc")?;
         let anchor = syscalls::Openat::new()
             .with_dirfd(libc::AT_FDCWD)
             .with_path(Some(path_ptr))
@@ -9253,130 +9186,520 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_mode(None);
         let anchor = match self.record_or_replay(guest, Syscall::Openat(anchor)).await {
             Ok(anchor) => anchor as RawFd,
-            Err(errno) => return Ok(Err(FdinfoFailure::Failed("open", errno))),
+            Err(errno) => {
+                return whole(Unreadable::Failed {
+                    call: "open of /proc",
+                    errno,
+                });
+            }
         };
-        let result = self.read_beneath_anchor(guest, page, anchor, fd).await;
-        if let Err(errno) = self
-            .record_or_replay(guest, syscalls::Close::new().with_fd(anchor))
-            .await
-        {
-            trace!("[detcore] closing the fdinfo anchor failed: {errno}");
+        let mut failures = Vec::new();
+        let result = match self.recorded_procfs_device(guest, page, anchor).await? {
+            Ok(device) if device == locks_device => {
+                match self
+                    .prove_containers_procfs(guest, page, anchor, plan.reader, &mut failures)
+                    .await?
+                {
+                    Ok(()) => {
+                        let at = ScanAt {
+                            page,
+                            anchor,
+                            device,
+                            locked: &plan.locked_inodes,
+                        };
+                        self.scan_beneath_anchor(guest, at, rows, plan, &mut failures)
+                            .await
+                    }
+                    Err(reason) => whole(reason),
+                }
+            }
+            Ok(_) => whole(Unreadable::WrongDevice),
+            Err(reason) => whole(reason),
+        };
+        self.close_scan_descriptor(guest, anchor, "/proc anchor", &mut failures)
+            .await;
+        match failures.into_iter().next() {
+            Some(failure) => Ok(Err(failure)),
+            None => result,
         }
-        result
     }
 
-    /// [`Self::read_staged_fdinfo`] once its `anchor` is open.
-    async fn read_beneath_anchor<G: Guest<Self>>(
+    /// Prove the procfs `anchor` names the reader's own process by the
+    /// number the container's PID namespace gives it: `<anchor>/<pid>` and
+    /// `<anchor>/self`, each opened beneath it, are one directory (equal
+    /// `st_dev` and `st_ino`). A procfs of another PID namespace (an ancestor
+    /// one bind-mounted into the guest's view) numbers tasks otherwise, and
+    /// its `<pid>` names another task or none, so every other target path the
+    /// scan builds from container numbers would name other tasks' tables.
+    /// Unproved, the read refuses by name; it does not hide.
+    async fn prove_containers_procfs<G: Guest<Self>>(
         &self,
         guest: &mut G,
         page: usize,
         anchor: RawFd,
-        fd: RawFd,
-    ) -> Result<Result<Vec<u8>, FdinfoFailure>, Error> {
-        let anchor_device = match self.recorded_procfs_device(guest, page, anchor).await? {
-            Ok(device) => device,
-            Err(failure) => return Ok(Err(failure)),
+        reader: Option<crate::procfs::locks_scan::TaskIds>,
+        failures: &mut Vec<String>,
+    ) -> Result<Result<(), crate::procfs::locks_scan::Unreadable>, Error> {
+        use crate::procfs::locks_scan::Unreadable;
+        let Some(reader) = reader else {
+            return Ok(Err(Unreadable::NotTheContainersProcfs));
         };
-        self.write_fdinfo_path(guest, page, &format!("thread-self/fdinfo/{fd}"))?;
+        let flags = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+        let mut identities = Vec::new();
+        for name in [reader.kernel.to_string(), "self".to_string()] {
+            let identity = match self
+                .recorded_openat2(guest, page, anchor, &name, flags)
+                .await?
+            {
+                Ok(opened) => {
+                    let identity = self
+                        .recorded_identity(guest, page, opened)
+                        .await?
+                        .map_err(|errno| ("fstat of the procfs proof directory", errno));
+                    self.close_scan_descriptor(guest, opened, "procfs proof directory", failures)
+                        .await;
+                    identity
+                }
+                Err(errno) => Err(("openat2 of the procfs proof directory", errno)),
+            };
+            identities.push(identity);
+        }
+        Ok(crate::procfs::locks_scan::procfs_numbers_the_reader(
+            identities[0],
+            identities[1],
+        ))
+    }
+
+    /// `(st_dev, st_ino)` of `fd`, by an `fstat` through the recorder into the
+    /// scan page, or the call's error.
+    async fn recorded_identity<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        page: usize,
+        fd: RawFd,
+    ) -> Result<Result<(u64, u64), Errno>, Error> {
+        let stat = page + SCAN_STAT;
+        if let Err(errno) = self
+            .record_or_replay(
+                guest,
+                Syscall::from_raw(
+                    Sysno::fstat,
+                    procfs_levels::raw_args([fd as usize, stat, 0, 0, 0, 0]),
+                ),
+            )
+            .await
+        {
+            return Ok(Err(errno));
+        }
+        // `st_dev` and then `st_ino` open `struct stat`.
+        Ok(Ok((
+            self.read_scan_word(guest, stat)?,
+            self.read_scan_word(guest, stat + 8)?,
+        )))
+    }
+
+    /// [`Self::scan_in_pages`] once its procfs anchor is open and proved.
+    async fn scan_beneath_anchor<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        at: ScanAt<'_>,
+        rows: &[crate::procfs::locks::LockRowFacts],
+        plan: &crate::procfs::locks_scan::ScanPlan,
+        failures: &mut Vec<String>,
+    ) -> Result<LockScanOutcome, Error> {
+        use crate::procfs::locks_scan;
+        use crate::procfs::locks_scan::ScanTarget;
+        use crate::procfs::locks_scan::Unreadable;
+        let mut selection =
+            locks_scan::TargetSelection::new(plan.processes.clone(), plan.container_pidns);
+        while let Some((representative, thread)) = selection.question() {
+            let answer = self
+                .recorded_kcmp(
+                    guest,
+                    representative.kernel,
+                    thread.kernel,
+                    KCMP_FILES,
+                    0,
+                    0,
+                )
+                .await
+                .map_err(|errno| Unreadable::Failed {
+                    call: "kcmp(KCMP_FILES)",
+                    errno,
+                });
+            selection.answer(answer);
+        }
+        let (targets, mut hidden) = selection.finish();
+        // The reader's own table holds the scan's descriptors: its own
+        // thread's when it has a table of its own, else its process's.
+        let reader_thread = guest.thread_state().dettid.as_raw();
+        let reader_process = guest.thread_state().detpid.map(|pid| pid.as_raw());
+        let own = targets
+            .iter()
+            .position(|target| {
+                matches!(target, ScanTarget::Thread { thread, .. } if thread.guest == reader_thread)
+            })
+            .or_else(|| {
+                targets.iter().position(|target| {
+                    matches!(target, ScanTarget::Process(process)
+                        if Some(process.guest) == reader_process)
+                })
+            });
+        let mut scans = Vec::with_capacity(targets.len());
+        for (index, target) in targets.iter().enumerate() {
+            let scan = self
+                .scan_table(guest, at, target, own == Some(index), failures)
+                .await?;
+            scans.push((*target, scan));
+        }
+        if let Some(failure) = failures.first() {
+            return Ok(Err(failure.clone()));
+        }
+        let found = locks_scan::candidates(&scans, &plan.locked_inodes, &plan.foreign_inodes);
+        hidden.extend(found.hidden);
+        if let Some(unknown) = hidden.iter().find(|hidden| !hidden.reason.hides()) {
+            return Ok(Err(format!(
+                "{unknown}; that cause is ambient, resource or host-policy state, so the \
+                 snapshot's OFD rows cannot be told from another process's"
+            )));
+        }
+        for hidden in &hidden {
+            info!("[detcore] {hidden}");
+        }
+        let raw = locks_scan::raw_ofd_counts(rows);
+        let mut multiplicity = BTreeMap::new();
+        for (lock, candidates) in found.by_lock {
+            let mut count = locks_scan::Multiplicity::new(candidates, plan.container_pidns);
+            while let Some((left, right)) = count.question() {
+                let answer = self
+                    .recorded_kcmp(
+                        guest,
+                        left.task.kernel,
+                        right.task.kernel,
+                        KCMP_FILE,
+                        left.fd,
+                        right.fd,
+                    )
+                    .await;
+                if let Err(errno) = answer
+                    && !locks_scan::errno_hides(errno)
+                {
+                    return Ok(Err(format!(
+                        "/proc/locks: kcmp(KCMP_FILE) of descriptor {} of task {} with descriptor \
+                         {} of task {} failed with {errno:?}; that cause is ambient, resource or \
+                         host-policy state, so the snapshot's OFD rows cannot be told from \
+                         another process's",
+                        left.fd, left.task.guest, right.fd, right.task.guest
+                    )));
+                }
+                count.answer(answer);
+            }
+            let rows_of_lock = raw.get(&lock).copied().unwrap_or(0);
+            multiplicity.insert(lock, count.count(rows_of_lock).unwrap_or(1));
+        }
+        Ok(Ok(multiplicity))
+    }
+
+    /// `kcmp(left, right, kind, left_index, right_index)` through the
+    /// recorder, injected in the reader's thread, which names tasks by the
+    /// container's PID namespace.
+    async fn recorded_kcmp<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        left: i32,
+        right: i32,
+        kind: usize,
+        left_index: i32,
+        right_index: i32,
+    ) -> Result<i64, Errno> {
+        self.record_or_replay(
+            guest,
+            Syscall::from_raw(
+                Sysno::kcmp,
+                procfs_levels::raw_args([
+                    left as usize,
+                    right as usize,
+                    kind,
+                    left_index as usize,
+                    right_index as usize,
+                    0,
+                ]),
+            ),
+        )
+        .await
+    }
+
+    /// What reading one `target` table beneath the procfs `anchor` gave: open
+    /// its `fd` directory with `openat2`'s `RESOLVE_BENEATH | RESOLVE_NO_XDEV`,
+    /// prove it procfs on the anchor's `device`, list it, read each
+    /// descriptor's file inode with one `newfstatat` through its magic link,
+    /// and read the fdinfo only of a descriptor whose inode the guest locked
+    /// (`locked`): no other can hold a lock that counts. In the reader's own
+    /// table (`own`) the scan's descriptors and the backend's own are left
+    /// out.
+    async fn scan_table<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        at: ScanAt<'_>,
+        target: &crate::procfs::locks_scan::ScanTarget,
+        own: bool,
+        failures: &mut Vec<String>,
+    ) -> Result<crate::procfs::locks_scan::TableScan, Error> {
+        use crate::procfs::locks_scan::TableScan;
+        use crate::procfs::locks_scan::Unreadable;
+        let directory = match self
+            .recorded_openat2(
+                guest,
+                at.page,
+                at.anchor,
+                &target.fd_directory(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+            .await?
+        {
+            Ok(directory) => directory,
+            Err(errno) => {
+                return Ok(TableScan::Unreadable(Unreadable::Failed {
+                    call: "openat2 of the fd directory",
+                    errno,
+                }));
+            }
+        };
+        let result = self
+            .scan_opened_table(guest, at, directory, target, own, failures)
+            .await;
+        self.close_scan_descriptor(guest, directory, "fd directory", failures)
+            .await;
+        result
+    }
+
+    /// [`Self::scan_table`] once its `fd` `directory` is open.
+    async fn scan_opened_table<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        at: ScanAt<'_>,
+        directory: RawFd,
+        target: &crate::procfs::locks_scan::ScanTarget,
+        own: bool,
+        failures: &mut Vec<String>,
+    ) -> Result<crate::procfs::locks_scan::TableScan, Error> {
+        use crate::procfs::locks_scan::TableScan;
+        use crate::procfs::locks_scan::Unreadable;
+        let page = at.page;
+        match self.recorded_procfs_device(guest, page, directory).await? {
+            Ok(found) if found == at.device => {}
+            Ok(_) => return Ok(TableScan::Unreadable(Unreadable::WrongDevice)),
+            Err(reason) => return Ok(TableScan::Unreadable(reason)),
+        }
+        let mut fds = Vec::new();
+        let dirents = AddrMut::<u8>::from_raw(page + SCAN_DIRENTS).ok_or(Errno::EFAULT)?;
+        loop {
+            let listed = self
+                .record_or_replay(
+                    guest,
+                    Syscall::from_raw(
+                        Sysno::getdents64,
+                        procfs_levels::raw_args([
+                            directory as usize,
+                            page + SCAN_DIRENTS,
+                            SCAN_PAGES - SCAN_DIRENTS,
+                            0,
+                            0,
+                            0,
+                        ]),
+                    ),
+                )
+                .await;
+            let length = match listed {
+                Ok(0) => break,
+                Ok(length) => length as usize,
+                Err(errno) => {
+                    return Ok(TableScan::Unreadable(Unreadable::Failed {
+                        call: "getdents64",
+                        errno,
+                    }));
+                }
+            };
+            let mut batch = vec![0; length];
+            read_guest_exact(&guest.memory(), dirents, &mut batch)?;
+            match crate::procfs::locks_scan::fdinfo_directory_fds(&batch) {
+                Some(listed) => fds.extend(listed),
+                None => return Ok(TableScan::Unreadable(Unreadable::Unlisted)),
+            }
+        }
+        let mut descriptors = Vec::new();
+        for fd in fds {
+            if own && (fd == at.anchor || fd == directory || guest.is_runtime_owned_fd(fd)) {
+                continue;
+            }
+            match self.recorded_link_inode(guest, page, directory, fd).await? {
+                Ok(inode) if at.locked.has(inode) => {}
+                Ok(_) => continue,
+                Err(errno) => {
+                    descriptors.push((
+                        fd,
+                        Err(Unreadable::Failed {
+                            call: "newfstatat of a descriptor link",
+                            errno,
+                        }),
+                    ));
+                    continue;
+                }
+            }
+            let fdinfo = self
+                .read_scanned_fdinfo(guest, at, target, fd, failures)
+                .await?;
+            descriptors.push((fd, fdinfo));
+        }
+        Ok(TableScan::Read(descriptors))
+    }
+
+    /// The inode of the file descriptor `fd` names, by one `newfstatat`
+    /// through the recorder of `<fd directory>/<fd>`, which follows the
+    /// descriptor's magic link to the file itself.
+    async fn recorded_link_inode<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        page: usize,
+        directory: RawFd,
+        fd: RawFd,
+    ) -> Result<Result<u64, Errno>, Error> {
+        self.write_scan_path(guest, page, &fd.to_string())?;
+        let stat = page + SCAN_STAT;
+        match self
+            .record_or_replay(
+                guest,
+                Syscall::from_raw(
+                    Sysno::newfstatat,
+                    procfs_levels::raw_args([directory as usize, page + SCAN_PATH, stat, 0, 0, 0]),
+                ),
+            )
+            .await
+        {
+            // `st_ino` follows `st_dev` in `struct stat`.
+            Ok(_) => Ok(Ok(self.read_scan_word(guest, stat + 8)?)),
+            Err(errno) => Ok(Err(errno)),
+        }
+    }
+
+    /// The fdinfo text of descriptor `fd` of `target`, opened beneath the
+    /// procfs `anchor`, once the entry too is shown to be procfs on the
+    /// anchor's `device`.
+    async fn read_scanned_fdinfo<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        at: ScanAt<'_>,
+        target: &crate::procfs::locks_scan::ScanTarget,
+        fd: RawFd,
+        failures: &mut Vec<String>,
+    ) -> Result<Result<Vec<u8>, crate::procfs::locks_scan::Unreadable>, Error> {
+        use crate::procfs::locks_scan::Unreadable;
+        let page = at.page;
+        let entry = match self
+            .recorded_openat2(
+                guest,
+                page,
+                at.anchor,
+                &target.fdinfo_entry(fd),
+                libc::O_RDONLY | libc::O_CLOEXEC,
+            )
+            .await?
+        {
+            Ok(entry) => entry,
+            Err(errno) => {
+                return Ok(Err(Unreadable::Failed {
+                    call: "openat2 of an fdinfo entry",
+                    errno,
+                }));
+            }
+        };
+        let result = match self.recorded_procfs_device(guest, page, entry).await? {
+            Ok(found) if found == at.device => {
+                let scratch = AddrMut::<u8>::from_raw(page + SCAN_READ).ok_or(Errno::EFAULT)?;
+                match self
+                    .drain_procfs(
+                        guest,
+                        syscalls::Read::new().with_fd(entry),
+                        scratch,
+                        SCAN_READ_END - SCAN_READ,
+                    )
+                    .await
+                {
+                    Ok(contents) => Ok(Ok(contents)),
+                    Err(Error::Errno(errno)) => Ok(Err(Unreadable::Failed {
+                        call: "read of an fdinfo entry",
+                        errno,
+                    })),
+                    Err(error) => Err(error),
+                }
+            }
+            Ok(_) => Ok(Err(Unreadable::WrongDevice)),
+            Err(reason) => Ok(Err(reason)),
+        };
+        self.close_scan_descriptor(guest, entry, "fdinfo entry", failures)
+            .await;
+        result
+    }
+
+    /// `openat2(dirfd, path, flags, RESOLVE_BENEATH | RESOLVE_NO_XDEV)`
+    /// through the recorder, with the path and `struct open_how` staged in
+    /// the scan page.
+    async fn recorded_openat2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        page: usize,
+        dirfd: RawFd,
+        path: &str,
+        flags: libc::c_int,
+    ) -> Result<Result<RawFd, Errno>, Error> {
+        self.write_scan_path(guest, page, path)?;
         // struct open_how { u64 flags; u64 mode; u64 resolve; }
-        let how = (libc::O_RDONLY | libc::O_CLOEXEC) as u64;
-        let mut open_how = [0u8; FDINFO_HOW_SIZE];
-        open_how[..8].copy_from_slice(&how.to_ne_bytes());
-        open_how[16..].copy_from_slice(&FDINFO_RESOLVE.to_ne_bytes());
-        let how_ptr = AddrMut::<u8>::from_raw(page + FDINFO_HOW).ok_or(Errno::EFAULT)?;
+        let mut open_how = [0u8; SCAN_HOW_SIZE];
+        open_how[..8].copy_from_slice(&(flags as u64).to_ne_bytes());
+        open_how[16..].copy_from_slice(&SCAN_RESOLVE.to_ne_bytes());
+        let how_ptr = AddrMut::<u8>::from_raw(page + SCAN_HOW).ok_or(Errno::EFAULT)?;
         guest.memory().write_exact(how_ptr, &open_how)?;
-        let opened = match self
+        Ok(self
             .record_or_replay(
                 guest,
                 Syscall::from_raw(
                     Sysno::openat2,
                     procfs_levels::raw_args([
-                        anchor as usize,
-                        page + FDINFO_PATH,
-                        page + FDINFO_HOW,
-                        FDINFO_HOW_SIZE,
+                        dirfd as usize,
+                        page + SCAN_PATH,
+                        page + SCAN_HOW,
+                        SCAN_HOW_SIZE,
                         0,
                         0,
                     ]),
                 ),
             )
             .await
-        {
-            Ok(opened) => opened as RawFd,
-            // The entry is outside the anchor or across a mount.
-            Err(Errno::EXDEV) => {
-                return Ok(Err(FdinfoFailure::NotProcfs(
-                    "the entry is outside /proc or across a mount",
-                )));
-            }
-            Err(errno) => return Ok(Err(FdinfoFailure::Failed("open", errno))),
-        };
-        // Closed on every path, the error ones included.
-        let result = self
-            .read_opened_entry(guest, page, opened, anchor_device)
-            .await;
-        if let Err(errno) = self
-            .record_or_replay(guest, syscalls::Close::new().with_fd(opened))
-            .await
-        {
-            trace!("[detcore] closing fdinfo failed: {errno}");
-        }
-        result
+            .map(|fd| fd as RawFd))
     }
 
-    /// The text of the `opened` fdinfo entry, once it too is shown to be on
-    /// procfs and on the anchor's device. The checks run on the entry's own
-    /// descriptor, so a sibling thread that replaces the anchor's descriptor
-    /// number between calls (`dup2` of a fake directory) cannot pass them.
-    ///
-    /// The defence relies on Detcore's serialized schedule: no other guest
-    /// thread runs between these injected calls. Under
-    /// `--no-sequentialize-threads` a sibling could still `dup2` onto the
-    /// entry's own descriptor number between its checks and the read; the
-    /// entry check narrows that race but does not close it.
-    async fn read_opened_entry<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        page: usize,
-        opened: RawFd,
-        anchor_device: u64,
-    ) -> Result<Result<Vec<u8>, FdinfoFailure>, Error> {
-        match self.recorded_procfs_device(guest, page, opened).await? {
-            Ok(device) if device == anchor_device => {}
-            Ok(_) => {
-                return Ok(Err(FdinfoFailure::NotProcfs(
-                    "the entry is not on /proc's device",
-                )));
-            }
-            Err(failure) => return Ok(Err(failure)),
-        }
-        let scratch = AddrMut::<u8>::from_raw(page + FDINFO_READ).ok_or(Errno::EFAULT)?;
-        match self
-            .drain_procfs(
-                guest,
-                syscalls::Read::new().with_fd(opened),
-                scratch,
-                FDINFO_PAGE - FDINFO_READ,
-            )
+    /// Stop the run, by name, with the policy-refusal exit, because a
+    /// `/proc/locks` snapshot's OFD rows cannot be told from a host's: a step
+    /// of the kernel scan failed for ambient, resource or host-policy state.
+    async fn refuse_lock_scan<G: Guest<Self>>(&self, guest: &mut G, reason: String) -> ! {
+        error!("[detcore] {reason}");
+        crate::tool_global::report_policy_refusal(guest, reason).await;
+        crate::tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
             .await
-        {
-            Ok(contents) => Ok(Ok(contents)),
-            Err(Error::Errno(errno)) => Ok(Err(FdinfoFailure::Failed("read", errno))),
-            Err(error) => Err(error),
-        }
     }
 
     /// The device of the descriptor `fd`, once `fstatfs` shows it is on
-    /// procfs, both through the recorder into the stat buffer of the fdinfo
+    /// procfs, both through the recorder into the stat buffer of the scan
     /// page. A failed call keeps its errno, for the common classification
-    /// ([`fdinfo_failure_hides`]).
+    /// (`procfs::locks_scan::errno_hides`).
     async fn recorded_procfs_device<G: Guest<Self>>(
         &self,
         guest: &mut G,
         page: usize,
         fd: RawFd,
-    ) -> Result<Result<u64, FdinfoFailure>, Error> {
-        let stat = page + FDINFO_STAT;
+    ) -> Result<Result<u64, crate::procfs::locks_scan::Unreadable>, Error> {
+        use crate::procfs::locks_scan::Unreadable;
+        let stat = page + SCAN_STAT;
         if let Err(errno) = self
             .record_or_replay(
                 guest,
@@ -9387,11 +9710,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await
         {
-            return Ok(Err(FdinfoFailure::Failed("fstatfs", errno)));
+            return Ok(Err(Unreadable::Failed {
+                call: "fstatfs",
+                errno,
+            }));
         }
         // `f_type` is the first field of `struct statfs`.
-        if self.read_fdinfo_word(guest, stat)? != libc::PROC_SUPER_MAGIC as u64 {
-            return Ok(Err(FdinfoFailure::NotProcfs("not procfs")));
+        if self.read_scan_word(guest, stat)? != libc::PROC_SUPER_MAGIC as u64 {
+            return Ok(Err(Unreadable::NotProcfs));
         }
         if let Err(errno) = self
             .record_or_replay(
@@ -9403,24 +9729,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await
         {
-            return Ok(Err(FdinfoFailure::Failed("fstat", errno)));
+            return Ok(Err(Unreadable::Failed {
+                call: "fstat",
+                errno,
+            }));
         }
         // `st_dev` is the first field of `struct stat`.
-        Ok(Ok(self.read_fdinfo_word(guest, stat)?))
+        Ok(Ok(self.read_scan_word(guest, stat)?))
     }
 
-    /// Write `path`, NUL-terminated, at the fdinfo page's path slot.
-    fn write_fdinfo_path<G: Guest<Self>>(
+    /// Write `path`, NUL-terminated, at the scan page's path slot.
+    fn write_scan_path<G: Guest<Self>>(
         &self,
         guest: &mut G,
         page: usize,
         path: &str,
     ) -> Result<(), Error> {
         assert!(
-            path.len() < FDINFO_HOW - FDINFO_PATH,
-            "fdinfo path {path:?} outgrew its room"
+            path.len() < SCAN_HOW - SCAN_PATH,
+            "scan path {path:?} outgrew its room"
         );
-        let start = AddrMut::<u8>::from_raw(page + FDINFO_PATH).ok_or(Errno::EFAULT)?;
+        let start = AddrMut::<u8>::from_raw(page + SCAN_PATH).ok_or(Errno::EFAULT)?;
         let mut bytes = path.as_bytes().to_vec();
         bytes.push(0);
         guest.memory().write_exact(start, &bytes)?;
@@ -9428,11 +9757,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// The first 8 bytes at `address`, a native-endian `u64`.
-    fn read_fdinfo_word<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        address: usize,
-    ) -> Result<u64, Error> {
+    fn read_scan_word<G: Guest<Self>>(&self, guest: &mut G, address: usize) -> Result<u64, Error> {
         let mut word = [0u8; 8];
         let start = Addr::<u8>::from_raw(address).ok_or(Errno::EFAULT)?;
         guest.memory().read_exact(start, &mut word)?;
@@ -9928,14 +10253,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Errno> {
         let old_fd = call.oldfd();
         let new_fd = self.record_or_replay(guest, call).await? as RawFd;
-        let lock_tracked = self.lock_tracked_descriptions(guest, new_fd..=new_fd);
         let replaced = guest
             .thread_state_mut()
             .dup_fd(old_fd, new_fd, OFlag::empty())?;
         if let Some(open_file_id) = replaced {
             self.release_port_for_open_file(guest, open_file_id).await;
         }
-        self.report_lock_references(guest, lock_tracked).await;
         Ok(new_fd as i64)
     }
 
@@ -9966,18 +10289,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             crate::tool_global::descriptors_replaced(guest, new_fd, new_fd).await;
         }
-        let lock_tracked = if old_fd == new_fd {
-            Vec::new()
-        } else {
-            self.lock_tracked_descriptions(guest, new_fd..=new_fd)
-        };
         let replaced = self
-            .dup_fd_after_replacement(guest, old_fd, new_fd, OFlag::empty(), lock_tracked.clone())
+            .dup_fd_after_replacement(guest, old_fd, new_fd, OFlag::empty())
             .await?;
         if let Some(open_file_id) = replaced {
             self.release_port_for_open_file(guest, open_file_id).await;
         }
-        self.report_lock_references(guest, lock_tracked).await;
         self.note_channel_end_closed(guest, closed_end).await;
         Ok(res)
     }
@@ -9986,16 +10303,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `old_fd`'s description in slot `new_fd`. If Detcore keeps no model of
     /// `old_fd` (one received over `SCM_RIGHTS` on ptrace), the update fails,
     /// but the kernel replaced the slot all the same: its old description is
-    /// dropped from the model and `lock_tracked` (what the slot named) is
-    /// reported to `procfs::locks::LockLedger`, so no stale entry can admit
-    /// a host's identical `/proc/locks` row. The error is returned as before.
+    /// dropped from the model. The error is returned as before.
     async fn dup_fd_after_replacement<G: Guest<Self>>(
         &self,
         guest: &mut G,
         old_fd: RawFd,
         new_fd: RawFd,
         flags: OFlag,
-        lock_tracked: Vec<OpenFileId>,
     ) -> Result<Option<OpenFileId>, Error> {
         match guest.thread_state_mut().dup_fd(old_fd, new_fd, flags) {
             Ok(replaced) => Ok(replaced),
@@ -10005,7 +10319,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if let Some(open_file_id) = displaced {
                         self.release_port_for_open_file(guest, open_file_id).await;
                     }
-                    self.report_lock_references(guest, lock_tracked).await;
                 }
                 Err(errno.into())
             }
@@ -10055,14 +10368,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Ok(new_fd) = u32::try_from(new_fd) {
             crate::tool_global::descriptors_replaced(guest, new_fd, new_fd).await;
         }
-        let lock_tracked = self.lock_tracked_descriptions(guest, new_fd..=new_fd);
         let replaced = self
-            .dup_fd_after_replacement(guest, old_fd, new_fd, flags, lock_tracked.clone())
+            .dup_fd_after_replacement(guest, old_fd, new_fd, flags)
             .await?;
         if let Some(open_file_id) = replaced {
             self.release_port_for_open_file(guest, open_file_id).await;
         }
-        self.report_lock_references(guest, lock_tracked).await;
         self.note_channel_end_closed(guest, closed_end).await;
         Ok(res)
     }
@@ -11772,10 +12083,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(open_file_id) = replaced {
             self.release_port_for_open_file(guest, open_file_id).await;
         }
-        // This process now holds the description too, with any OFD or flock
-        // lock it holds (`procfs::locks`).
-        self.refresh_description_locks(guest, fd, LockCall::PidfdGetfd)
-            .await?;
+        // The description came from elsewhere, with a lock history Detcore
+        // did not observe (DBT's copied-vfork guard reads this).
+        guest.thread_state().note_received_descriptions();
         Ok(fd as i64)
     }
 

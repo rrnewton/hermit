@@ -1797,6 +1797,11 @@ pub struct Scheduler {
     /// a signalfd (`Resources::reads_signalfd`). An entry counts only while
     /// that op is still the thread's `external_io_blockers` entry.
     background_signalfd_reads: BTreeMap<DetTid, ExternalOpId>,
+    /// Threads whose background call (`BlockingExternalIO`, the op named) is
+    /// a `recvmsg` or `recvmmsg` (`Resources::receives_descriptors`), which
+    /// can install a received descriptor outside the schedule. An entry counts
+    /// only while that op is still the thread's `external_io_blockers` entry.
+    background_descriptor_receives: BTreeMap<DetTid, ExternalOpId>,
     /// Under record and replay, every thread's background read
     /// (`Resources::read_fd`, `BackgroundRead`): its op, descriptor table and
     /// number, and what that descriptor reads (`BackgroundReadSignals`),
@@ -4009,6 +4014,7 @@ impl Scheduler {
             sending_parent_death: false,
             signalfd_masks: Default::default(),
             background_signalfd_reads: Default::default(),
+            background_descriptor_receives: Default::default(),
             background_reads: Default::default(),
             handler_restore_unblocked: Default::default(),
             background_call_processes: Default::default(),
@@ -9021,6 +9027,101 @@ impl Scheduler {
             .collect()
     }
 
+    /// What a `/proc/locks` read in `reader`'s turn needs from the schedule
+    /// (`procfs::locks_scan`):
+    /// - every live guest process (listed by `/proc`, `procfs_listing`, and
+    ///   not exited, `process_is_alive`) with its live non-leader threads, by
+    ///   the guest's numbers and the kernel's (`procfs_ids`); a task with no
+    ///   kernel number is left out, which can only hide;
+    /// - whether the schedule is quiescent for descriptor tables and locks:
+    ///   false while a vfork parent runs outside the schedule
+    ///   (`external_io_blockers` holds it and its barrier stands), since a
+    ///   backend may run the child's calls where Detcore does not see them
+    ///   (DBT's copied vfork), and while a `recvmsg` or `recvmmsg` runs
+    ///   outside the schedule (`background_descriptor_receives`), since it
+    ///   can install a received descriptor at a host-timed moment. Lock calls
+    ///   do not run outside the schedule: `F_OFD_SETLKW` is injected in its
+    ///   own turn and `flock` is probed with `LOCK_NB`;
+    /// - whether `reader` is in the container's PID namespace, where the
+    ///   kernel numbers `kcmp` takes are the ones listed here;
+    /// - `reader`'s process, by both numbers.
+    pub(crate) fn lock_scan_plan(
+        &self,
+        reader: DetTid,
+    ) -> (
+        Vec<crate::procfs::locks_scan::LiveProcess>,
+        bool,
+        bool,
+        Option<crate::procfs::locks_scan::TaskIds>,
+    ) {
+        use crate::procfs::locks_scan::LiveProcess;
+        use crate::procfs::locks_scan::TaskIds;
+        let mut processes = Vec::new();
+        for leader in self.procfs_listing(None).processes {
+            let leader_id = DetPid::from_raw(leader);
+            if !self.process_is_alive(leader_id) {
+                continue;
+            }
+            let mut threads: Vec<i32> = self
+                .thread_tree
+                .my_thread_group(&leader_id)
+                .into_iter()
+                .filter(|tid| *tid != leader_id && self.next_turns.contains_key(tid))
+                .map(|tid| tid.as_raw())
+                .collect();
+            threads.sort_unstable();
+            let mut ids = vec![leader];
+            ids.extend(&threads);
+            let kernel = self.procfs_ids(true, &ids);
+            let Some(Some(leader_kernel)) = kernel.first().copied() else {
+                continue;
+            };
+            processes.push(LiveProcess {
+                leader: TaskIds {
+                    guest: leader,
+                    kernel: leader_kernel,
+                },
+                leader_live: self.next_turns.contains_key(&leader_id),
+                threads: threads
+                    .iter()
+                    .zip(&kernel[1..])
+                    .filter_map(|(guest, kernel)| {
+                        kernel.map(|kernel| TaskIds {
+                            guest: *guest,
+                            kernel,
+                        })
+                    })
+                    .collect(),
+            });
+        }
+        let quiescent = !self
+            .blocked
+            .external_io_blockers
+            .iter()
+            .any(|(thread, op)| {
+                self.vfork_barriers.contains_key(thread)
+                    || self.background_descriptor_receives.get(thread) == Some(op)
+            });
+        let container_pidns = self
+            .thread_tree
+            .pid_namespaces
+            .namespace_of(reader)
+            .is_none()
+            && self
+                .thread_tree
+                .thread_to_leader
+                .get(&reader)
+                .is_some_and(|leader| self.thread_tree.pid_ns_depth(*leader) == 0);
+        let reader_process = self.thread_tree.thread_to_leader.get(&reader).copied();
+        let reader = reader_process.and_then(|leader| {
+            processes
+                .iter()
+                .find(|process| process.leader.guest == leader.as_raw())
+                .map(|process| process.leader)
+        });
+        (processes, quiescent, container_pidns, reader)
+    }
+
     /// Return scheduler-owned lifecycle state for an exact child-process wait.
     ///
     /// This deliberately models direct parentage and process liveness rather
@@ -12651,6 +12752,13 @@ impl Scheduler {
                             self.background_signalfd_reads.insert(dettid, *op);
                         } else {
                             self.background_signalfd_reads.remove(&dettid);
+                        }
+                        if rs.receives_descriptors
+                            && self.blocked.external_io_blockers.get(&dettid) == Some(op)
+                        {
+                            self.background_descriptor_receives.insert(dettid, *op);
+                        } else {
+                            self.background_descriptor_receives.remove(&dettid);
                         }
                         // Judged as the call is granted. Other threads' turns may
                         // run before the call enters the kernel; the ones that

@@ -547,22 +547,33 @@ struct OpenFileDescription {
     /// descriptor whose channel Detcore does not know.
     #[serde(default)]
     channel: Option<crate::pipe_wake::ChannelEnd>,
-    /// True once Detcore read this description's OFD and flock locks from its
-    /// fdinfo after a call through it (`Detcore::refresh_description_locks`):
-    /// from then on, each table's last close or replacement of it is reported
-    /// to `procfs::locks::LockLedger`. Shared by every alias, as the
-    /// description is. Not printed, so descriptions log as before.
+    /// True once the global state holds the inode of this description's
+    /// file among those the guest locked
+    /// (`procfs::locks_scan::GuestLockedInodes`), so a later lock call
+    /// through it need not name it again. A cache: shared by every alias, as
+    /// the description is. Not printed, so descriptions log as before.
     #[serde(default)]
-    lock_tracked: bool,
-    /// True once this description was registered on reception over
-    /// `SCM_RIGHTS` (`Detcore::refresh_description_locks`): the sender's
-    /// entry in `procfs::locks::LockLedger` may name the same kernel
-    /// description under another identity. Not printed.
+    locked_inode_noted: bool,
+    /// True for a description not opened inside the container as Detcore saw
+    /// it: inherited at launch (stdio), or discovered with unknown provenance
+    /// (received, or carried over an exec that rediscovers descriptors). A
+    /// lock through it names no inode the guest locked
+    /// (`procfs::locks_scan::InodeSet`), since the host may share it. Not
+    /// printed.
     #[serde(default)]
-    received_for_locks: bool,
+    foreign: bool,
+    /// True for a description inherited at launch (stdio): the launcher, a
+    /// host process, holds it too and can lock through it, so its file inode
+    /// is named among the foreign ones (`procfs::locks_scan::InodeSet`). Not
+    /// printed.
+    #[serde(default)]
+    launch_inherited: bool,
+    /// True once the global state holds this launch-inherited description's
+    /// file inode among the foreign ones. Not printed.
+    #[serde(default)]
+    foreign_inode_noted: bool,
     /// True once this description may hold an OFD lock: an `F_OFD_SETLK` or
-    /// `F_OFD_SETLKW` went through it, its fdinfo showed one, or its fdinfo
-    /// could not be read. DBT refuses a copied `vfork` child, which would run
+    /// `F_OFD_SETLKW` went through it. DBT refuses a copied `vfork` child, which would run
     /// its lock calls natively, while one does. Not printed.
     #[serde(default)]
     may_hold_ofd_lock: bool,
@@ -843,8 +854,10 @@ impl DetFd {
                 flock_mode_ever_known: true,
                 timerfd: None,
                 channel: None,
-                lock_tracked: false,
-                received_for_locks: false,
+                locked_inode_noted: false,
+                foreign: false,
+                launch_inherited: false,
+                foreign_inode_noted: false,
                 may_hold_ofd_lock: false,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
@@ -1763,27 +1776,47 @@ impl DetFd {
         self.with_description(|d| d.accept_in_turn_eligible)
     }
 
-    /// Mark this open file description's locks as followed by
-    /// `procfs::locks::LockLedger`. Permanent.
-    pub(crate) fn set_lock_tracked(&self) {
-        self.with_description(|d| d.lock_tracked = true);
+    /// Mark this description as not opened inside the container (inherited
+    /// at launch, or of unknown provenance). Permanent.
+    pub(crate) fn mark_foreign(&self) {
+        self.with_description(|d| d.foreign = true);
     }
 
-    /// Whether `procfs::locks::LockLedger` follows this description's locks.
-    pub(crate) fn is_lock_tracked(&self) -> bool {
-        self.with_description(|d| d.lock_tracked)
+    /// Whether this description was not opened inside the container.
+    pub(crate) fn is_foreign(&self) -> bool {
+        self.with_description(|d| d.foreign)
     }
 
-    /// Mark this description as registered on reception over `SCM_RIGHTS`.
+    /// Mark this description as inherited at launch: foreign, and shared with
+    /// the launcher. Permanent.
+    pub(crate) fn mark_launch_inherited(&self) {
+        self.with_description(|d| {
+            d.foreign = true;
+            d.launch_inherited = true;
+        });
+    }
+
+    /// Whether this description is inherited at launch and its inode not yet
+    /// named among the foreign ones.
+    pub(crate) fn foreign_inode_unnoted(&self) -> bool {
+        self.with_description(|d| d.launch_inherited && !d.foreign_inode_noted)
+    }
+
+    /// Mark this launch-inherited description's inode as named. Permanent.
+    pub(crate) fn set_foreign_inode_noted(&self) {
+        self.with_description(|d| d.foreign_inode_noted = true);
+    }
+
+    /// Mark this description's inode as named among those the guest locked.
     /// Permanent.
-    pub(crate) fn set_received_for_locks(&self) {
-        self.with_description(|d| d.received_for_locks = true);
+    pub(crate) fn set_locked_inode_noted(&self) {
+        self.with_description(|d| d.locked_inode_noted = true);
     }
 
-    /// Whether this description was registered on reception over
-    /// `SCM_RIGHTS`.
-    pub(crate) fn is_received_for_locks(&self) -> bool {
-        self.with_description(|d| d.received_for_locks)
+    /// Whether this description's inode is named among those the guest
+    /// locked.
+    pub(crate) fn locked_inode_noted(&self) -> bool {
+        self.with_description(|d| d.locked_inode_noted)
     }
 
     /// Mark this description as one that may hold an OFD lock. Permanent.

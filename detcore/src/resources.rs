@@ -497,6 +497,13 @@ pub struct Resources {
     /// signalfd sets nothing. `false` for every other request.
     #[serde(default)]
     pub(crate) reads_signalfd: bool,
+    /// A `BlockingExternalIO` request's `recvmsg` or `recvmmsg`: run outside
+    /// the schedule, it can install a descriptor received over `SCM_RIGHTS`
+    /// in the caller's table at a host-timed moment, so a `/proc/locks` scan
+    /// is not quiescent meanwhile (`Scheduler::lock_scan_plan`). `false` for
+    /// every other request.
+    #[serde(default)]
+    pub(crate) receives_descriptors: bool,
     /// The descriptor a `BlockingExternalIO` request's `read`, `readv` or
     /// `preadv2` reads, whatever it is, with the identity of the descriptor
     /// table it is in; `None` for every other request. Under
@@ -687,6 +694,7 @@ impl Resources {
             blocked_signal_mask_unknown: false,
             replay_served_from_log: false,
             reads_signalfd: false,
+            receives_descriptors: false,
             read_fd: None,
             polls_guest_state_only: false,
             waits_until_nothing_else_can_run: false,

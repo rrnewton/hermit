@@ -59,6 +59,7 @@ use crate::syscalls::helpers::refuse_held_signal_loss;
 use crate::syscalls::helpers::result_after_restore;
 use crate::syscalls::helpers::retry_blocking_wait_under_mask;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::helpers::syscall_targets_internal_fd;
 use crate::syscalls::helpers::unblocked_by;
 use crate::syscalls::network_trace::received_descriptors;
 use crate::syscalls::signal::STACK_RED_ZONE;
@@ -3326,10 +3327,95 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(timestamp)
     }
 
+    /// After a successful `recvmsg` or `recvmmsg` on `socket` whose control
+    /// buffers are at `controls` (address and length): if a descriptor came
+    /// over `SCM_RIGHTS`, this table received a description whose lock
+    /// history Detcore did not observe (`ThreadState::note_received_descriptions`,
+    /// which DBT's copied-vfork guard reads). A description received from
+    /// outside the container (a socket that is not a guest-internal one) is
+    /// one a host process may lock through, so its file's inode is named
+    /// foreign (`procfs::locks_scan::InodeSet`), read by an `fstat` through
+    /// the recorder. If that `fstat` fails for a cause that does not hide,
+    /// every later `/proc/locks` read refuses by name.
+    async fn note_received_descriptors<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        socket: RawFd,
+        controls: &[(usize, usize)],
+    ) -> Result<(), Error> {
+        let mut received = Vec::new();
+        for (address, length) in controls {
+            let Some(address) = AddrMut::<u8>::from_raw(*address) else {
+                continue;
+            };
+            let mut bytes = vec![0; *length];
+            if guest.memory().read_exact(address, &mut bytes).is_ok() {
+                received.extend(received_descriptors(&bytes));
+            }
+        }
+        if received.is_empty() {
+            return Ok(());
+        }
+        guest.thread_state().note_received_descriptions();
+        let external = !syscall_targets_internal_fd(
+            guest,
+            syscalls::Recvmsg::new().with_sockfd(socket).into(),
+        );
+        if !external {
+            return Ok(());
+        }
+        for fd in received {
+            match self.recorded_fstat(guest, fd).await? {
+                Ok(stat) => crate::tool_global::note_foreign_inode(guest, stat.st_ino).await,
+                Err(Some(errno)) if crate::procfs::locks_scan::errno_hides(errno) => {}
+                Err(failure) => {
+                    let cause = failure.map_or_else(
+                        || "no scratch memory for its buffer".to_string(),
+                        |errno| format!("it failed with {errno:?}"),
+                    );
+                    let reason = format!(
+                        "Detcore could not read the inode of descriptor {fd}, received from \
+                         outside the container ({cause}), so a host process's lock through it \
+                         cannot be told from the guest's"
+                    );
+                    crate::tool_global::note_lock_scan_refusal(guest, reason).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-901)
-    /// Receive one message and replace host socket timestamps with logical time.
+    /// Receive one message and replace host socket timestamps with logical
+    /// time, then note any descriptor it received
+    /// (`Detcore::note_received_descriptors`).
     pub async fn handle_recvmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Recvmsg,
+    ) -> Result<i64, Error> {
+        let controls = call
+            .msg()
+            .and_then(|message| guest.memory().read_value(message).ok())
+            .filter(|message: &libc::msghdr| {
+                !message.msg_control.is_null() && message.msg_controllen != 0
+            })
+            .map(|message| {
+                vec![(
+                    message.msg_control as usize,
+                    message.msg_controllen.min(MAX_CONTROL_BYTES),
+                )]
+            })
+            .unwrap_or_default();
+        let result = self.receive_message(guest, call).await?;
+        self.note_received_descriptors(guest, call.sockfd(), &controls)
+            .await?;
+        Ok(result)
+    }
+
+    /// [`Self::handle_recvmsg`] before descriptors are noted.
+    async fn receive_message<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Recvmsg,
@@ -3372,16 +3458,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         let now = self.observe_socket_receive(guest, call.sockfd()).await?;
         let mut control = vec![0; control_len];
         guest.memory().read_exact(control_address, &mut control)?;
-        // A descriptor received over `SCM_RIGHTS` that Detcore models (an
-        // in-guest backend discovers it as it is used) joins this process's
-        // table in `procfs::locks::LockLedger` with whatever OFD or flock
-        // locks its description holds. One Detcore keeps no model of (ptrace)
-        // is left out, so its locks are hidden once no modelled table names
-        // the description (a named residual).
-        for fd in received_descriptors(&control) {
-            self.refresh_description_locks(guest, fd, super::files::LockCall::Recvmsg)
-                .await?;
-        }
         if socket_timestamp_messages(&control).is_empty() {
             return Ok(result);
         }
@@ -3677,6 +3753,47 @@ impl<T: RecordOrReplay> Detcore<T> {
     // TODO-HUMAN-REVIEW(PR-901)
     /// Receive a message batch and replace every host socket timestamp with logical time.
     pub async fn handle_recvmmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Recvmmsg,
+    ) -> Result<i64, Error> {
+        let mut controls = Vec::new();
+        if let Some(messages_address) = call.mmsg()
+            && call.vlen() <= libc::UIO_MAXIOV as u32
+        {
+            // SAFETY: `mmsghdr` is a plain C record; an all-zero value is a
+            // valid staging value that `read_values` overwrites.
+            let mut messages: Vec<libc::mmsghdr> = (0..call.vlen())
+                .map(|_| unsafe { std::mem::zeroed() })
+                .collect();
+            if guest
+                .memory()
+                .read_values(messages_address.into(), &mut messages)
+                .is_ok()
+            {
+                controls = messages
+                    .iter()
+                    .filter(|message| {
+                        !message.msg_hdr.msg_control.is_null()
+                            && message.msg_hdr.msg_controllen != 0
+                    })
+                    .map(|message| {
+                        (
+                            message.msg_hdr.msg_control as usize,
+                            message.msg_hdr.msg_controllen.min(MAX_CONTROL_BYTES),
+                        )
+                    })
+                    .collect();
+            }
+        }
+        let result = self.receive_messages(guest, call).await?;
+        self.note_received_descriptors(guest, call.fd(), &controls)
+            .await?;
+        Ok(result)
+    }
+
+    /// [`Self::handle_recvmmsg`] before descriptors are noted.
+    async fn receive_messages<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Recvmmsg,

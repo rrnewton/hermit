@@ -112,6 +112,39 @@ pub struct LiveProcess {
     pub threads: Vec<TaskIds>,
 }
 
+/// What a `/proc/locks` read needs from the schedule, decided under the
+/// scheduler lock in the reader's turn (`Scheduler::lock_scan_plan`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanPlan {
+    /// The positive owners of the snapshot's rows that name a guest process,
+    /// as `/proc/locks` prints them.
+    pub guest_owners: Vec<i64>,
+    /// Every live guest process and its live non-leader threads.
+    pub processes: Vec<LiveProcess>,
+    /// False while a task may change a descriptor table or a lock where
+    /// Detcore does not see it (a vfork child a backend runs natively): every
+    /// OFD row is then hidden.
+    pub quiescent: bool,
+    /// Whether the reader is in the container's PID namespace, whose numbers
+    /// `kcmp` then takes. Outside it, no kcmp is asked: private-table threads
+    /// are not scanned and m(L) is capped at 1.
+    pub container_pidns: bool,
+    /// The inodes the guest locked through descriptions opened inside the
+    /// container.
+    pub locked_inodes: InodeSet,
+    /// The inodes a description inherited at launch or received from outside
+    /// the container is open on: no OFD lock on them counts.
+    pub foreign_inodes: InodeSet,
+    /// The reader's process, by both numbers, for the proof that the procfs
+    /// the scan reads numbers tasks as the container's PID namespace does.
+    pub reader: Option<TaskIds>,
+    /// Why no `/proc/locks` snapshot can be decided for the rest of the run:
+    /// a lock call whose inode could not be read for ambient, resource or
+    /// host-policy state, so its row could not be told from a host's. Set
+    /// once, by its first reason.
+    pub refusal: Option<String>,
+}
+
 /// A descriptor table the scan reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScanTarget {

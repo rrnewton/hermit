@@ -909,7 +909,9 @@ mod tests {
             // step 3.0a, +5): 623.
             // Its six ptrace_sigsegv_state_kept_* tests (A5 step 3.0b, +6):
             // 629.
-            assert_eq!(population, 629);
+            // And proc_locks_determinism's kcmp record/replay negative
+            // control and its five round-1 tests (+6): 635.
+            assert_eq!(population, 635);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

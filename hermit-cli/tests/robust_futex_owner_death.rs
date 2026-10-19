@@ -1579,13 +1579,14 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // 0x176 the fdinfo read through an anchor proved to be procfs,
     // 0x177 truthful timer capability and physical-arm separation, reserved
     // as 0x175 and taken at land as HIGHEST_SHIPPED + 1,
-    // 0x178 the procfs anchor's entry rechecked as procfs, and
-    // 0x179 a vfork parent resumed at its child's exec or exit, and
-    // 0x17a first-instruction DBT lifecycle admission),
+    // 0x178 the procfs anchor's entry rechecked as procfs,
+    // 0x179 a vfork parent resumed at its child's exec or exit,
+    // 0x17a first-instruction DBT lifecycle admission, and
+    // 0x17b /proc/locks OFD rows decided by a kernel scan at the read),
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x17a,
+        metadata["version"], 0x17b,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);

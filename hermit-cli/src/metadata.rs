@@ -759,7 +759,23 @@ impl RecordVersion {
 // admitted those hooks at their first syscall, after guest instructions had
 // executed. The lifecycle timing/context is observable even with an unchanged
 // wire layout, so recordings require a new behavior version.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17a);
+// 0x17a -> 0x17b (provisional; 0x179 and 0x17a were taken first): Detcore decides
+// which /proc/locks OFD rows are the guest's from the kernel at the read. A
+// lock call through a description opened in the container records one fstat
+// of its descriptor (the inode the guest locked) where it recorded the
+// anchored fdinfo read; a description received from outside, and the first
+// lock call or read in a process holding a launch-inherited description,
+// record an fstat of each. Once the guest has locked a file, each
+// /proc/locks read records the scan: fstatfs and fstat of the reader's
+// /proc/locks descriptor; the /proc anchor's openat, fstatfs and fstat; the
+// PID-namespace proof's two openat2, fstats and closes; for each target
+// table an openat2 of its fd directory, its fstatfs, fstat, getdents64
+// batches and close, a newfstatat per descriptor, and for a descriptor on a
+// guest-locked inode an openat2 of its fdinfo entry, its fstatfs, fstat,
+// reads and close; kcmp(KCMP_FILES) to choose the target threads and
+// kcmp(KCMP_FILE) to count descriptions; and the anchor's close. An older
+// recording would replay out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17b);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -784,7 +800,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17a);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17a;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17b;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

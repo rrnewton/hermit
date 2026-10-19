@@ -93,6 +93,13 @@ pub struct FileMetadata {
     /// field had while only random devices were promoted.)
     #[serde(default, rename = "has_promoted_random_files")]
     has_promoted_shared_files: bool,
+    /// This table received a description from elsewhere (`SCM_RIGHTS`,
+    /// `pidfd_getfd`), whose lock history Detcore did not observe: it may
+    /// hold an OFD lock or a flock. Sticky, and kept across fork and exec, so
+    /// DBT refuses a copied `vfork` child, which would run its lock calls
+    /// natively, conservatively ([`Self::has_unsafe_vfork_ofd_state`]).
+    #[serde(default)]
+    received_descriptions: bool,
     /// Track what file handles actually point to (e.g. after dup2).
     /// This includes both the identifying resource (usually inode) and the deterministic file handle.
     /// Deserialization restores aliasing (`crate::fd::intern_open_files`).
@@ -789,6 +796,7 @@ impl FileMetadata {
             next_open_file_sequence: 0,
             next_socket_open_file_sequence: 0,
             has_promoted_shared_files: false,
+            received_descriptions: false,
             file_handles: HashMap::new(),
             accept_waits: Vec::new(),
             next_accept_wait: 0,
@@ -898,15 +906,18 @@ impl FileMetadata {
     /// side still has a claim about. A description Detcore never observed
     /// carries no claim, so there is nothing about it that can go stale.
     fn has_unsafe_vfork_flock_state(&self) -> bool {
-        self.file_handles.values().any(|detfd| {
-            matches!(detfd.known_flock_mode(), Some(Some(_))) || detfd.flock_mode_may_be_stale()
-        })
+        self.received_descriptions
+            || self.file_handles.values().any(|detfd| {
+                matches!(detfd.known_flock_mode(), Some(Some(_))) || detfd.flock_mode_may_be_stale()
+            })
     }
 
     fn has_unsafe_vfork_ofd_state(&self) -> bool {
-        self.file_handles
-            .values()
-            .any(|detfd| detfd.may_hold_ofd_lock())
+        self.received_descriptions
+            || self
+                .file_handles
+                .values()
+                .any(|detfd| detfd.may_hold_ofd_lock())
     }
 
     fn forget_flock_modes(&self) {
@@ -930,6 +941,7 @@ impl FileMetadata {
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
             has_promoted_shared_files: self.has_promoted_shared_files,
+            received_descriptions: self.received_descriptions,
             file_handles: self.file_handles.clone(),
             accept_waits: Vec::new(),
             next_accept_wait: 0,
@@ -944,6 +956,7 @@ impl FileMetadata {
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
             has_promoted_shared_files: self.has_promoted_shared_files,
+            received_descriptions: self.received_descriptions,
             file_handles: self
                 .file_handles
                 .iter()
@@ -1381,6 +1394,10 @@ impl FileMetadata {
         stdin.mark_flock_mode_unobserved();
         stdout.mark_flock_mode_unobserved();
         stderr.mark_flock_mode_unobserved();
+        // Inherited at launch: the launcher holds the same descriptions.
+        stdin.mark_launch_inherited();
+        stdout.mark_launch_inherited();
+        stderr.mark_launch_inherited();
 
         self.add_detfd(stdin);
         self.add_detfd(stdout);
@@ -1422,7 +1439,12 @@ impl FileMetadata {
         self.add_fd(owner, fd, flags, ty, Some(raw_stat.into()))?;
         // This newly discovered description predates our observation. Its
         // kernel lock may be held, but no cached lock claim existed to go stale.
-        self.with_detfd(fd, |detfd| detfd.mark_flock_mode_unobserved())?;
+        self.with_detfd(fd, |detfd| {
+            detfd.mark_flock_mode_unobserved();
+            // Its provenance (inherited at launch, received, or carried over
+            // an exec that rediscovers descriptors) is unknown here.
+            detfd.mark_foreign();
+        })?;
         // A placeholder for a procfs file Detcore renders, which the backend
         // rediscovers after `exec`: the file again, at the position the old
         // image left and with the snapshot it took, as a backend that keeps
@@ -5212,6 +5234,7 @@ impl<T> ThreadState<T> {
             blocked_signal_mask_unknown: false,
             replay_served_from_log: false,
             reads_signalfd: false,
+            receives_descriptors: false,
             read_fd: None,
             polls_guest_state_only: false,
             waits_until_nothing_else_can_run: false,
@@ -5546,10 +5569,11 @@ impl<T> ThreadState<T> {
         self.metadata().has_unsafe_vfork_flock_state()
     }
 
-    /// Whether a description in this table may hold an OFD lock. A copied
-    /// `vfork` child (DBT) runs its lock calls natively, so the
-    /// `procfs::locks::LockLedger` entry of such a description could go stale
-    /// and admit a host's identical `/proc/locks` row.
+    /// Whether a description in this table may hold an OFD lock: one an
+    /// `F_OFD_SETLK*` went through, or any once the table received a
+    /// description from elsewhere. A copied `vfork` child (DBT) runs its lock
+    /// calls natively, where Detcore does not see them, so DBT refuses such a
+    /// vfork.
     pub fn has_unsafe_vfork_ofd_state(&self) -> bool {
         self.metadata().has_unsafe_vfork_ofd_state()
     }
@@ -5571,29 +5595,10 @@ impl<T> ThreadState<T> {
         self.metadata().remove_fd_range(first, last)
     }
 
-    /// How many slots of this thread's table name the open file description
-    /// `open_file` (`procfs::locks::LockLedger`).
-    pub(crate) fn slots_naming(&self, open_file: OpenFileId) -> u32 {
-        let count = self
-            .metadata()
-            .file_handles
-            .values()
-            .filter(|detfd| detfd.open_file_id() == open_file)
-            .count();
-        u32::try_from(count).unwrap_or(u32::MAX)
-    }
-
-    /// The descriptions in this thread's table whose locks
-    /// `procfs::locks::LockLedger` follows, each with how many slots name it,
-    /// in description order.
-    pub(crate) fn lock_tracked_slots(&self) -> Vec<(OpenFileId, u32)> {
-        let mut slots: BTreeMap<OpenFileId, u32> = BTreeMap::new();
-        for detfd in self.metadata().file_handles.values() {
-            if detfd.is_lock_tracked() {
-                *slots.entry(detfd.open_file_id()).or_default() += 1;
-            }
-        }
-        slots.into_iter().collect()
+    /// Record that this thread's table received a description from elsewhere
+    /// (`SCM_RIGHTS`, `pidfd_getfd`) (`FileMetadata::received_descriptions`).
+    pub(crate) fn note_received_descriptions(&self) {
+        self.metadata().received_descriptions = true;
     }
 
     /// The descriptors Detcore's table holds for this thread, in order.

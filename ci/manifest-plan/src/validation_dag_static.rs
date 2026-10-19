@@ -2572,9 +2572,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +3 from d9351f50 (select tv_usec) and 14da9861 (race-probe hold),
     // which did not move this pin; nextest list: 2160.
     // And +1 from 1648d29d: 2161.
-    // And the 16 procfs::locks_scan units of the /proc/locks kernel scan,
-    // compiled for their tests: 2177, freshly listed.
-    ("test.detcore_unit", 2177),
+    // And the /proc/locks kernel scan: the ledger's 14 procfs::locks units
+    // and the 3 fdinfo-refusal units go, the 16 procfs::locks_scan units
+    // come: 2160, freshly listed.
+    ("test.detcore_unit", 2160),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2891,7 +2892,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // without a /proc/locks read; the next read refuses), its pre-ledger
     // version-gate test and its vfork-after-OFD-lock test: 276, listed.
     // And its fake-/proc-under-chroot test: 277, listed.
-    ("test.hermit_integration_2", 277),
+    // And its kcmp record/replay negative control and five round-1 tests
+    // (the host-independent scan decision, the bound /proc, the received
+    // description's vfork refusal, the launch-inherited description, the
+    // unreadable seed): 283, listed.
+    ("test.hermit_integration_2", 283),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -4529,8 +4534,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +3 from d9351f50 (select tv_usec) and 14da9861 (race-probe hold),
     // which did not move this pin; nextest list: 2160.
     // And +1 from 1648d29d: 2161.
-    // And the same 16 procfs::locks_scan units: 2177, freshly listed.
-    ("test.detcore_unit_on_host", 2177),
+    // And the same /proc/locks kernel scan change: 2160, freshly listed.
+    ("test.detcore_unit_on_host", 2160),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4621,7 +4626,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // step 3.0a), listed: 623.
     // And its six ptrace_sigsegv_state_kept_* tests (A5 step 3.0b), listed:
     // 629.
-    ("test.hermit_integration_on_host", 629),
+    // And proc_locks_determinism's kcmp record/replay negative control and
+    // its five round-1 tests: 635.
+    ("test.hermit_integration_on_host", 635),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
