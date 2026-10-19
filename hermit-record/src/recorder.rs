@@ -725,6 +725,14 @@ impl Tool for Recorder {
             Syscall::Other(Sysno::pidfd_getfd, _) => {
                 self.handle_fd_table_mutation(guest, syscall).await
             }
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(minibeads dh-mpvv): kcmp answers with a scalar
+            // and writes no memory, so its result alone is recorded, and
+            // replay returns it instead of asking the replay host's kernel.
+            // Detcore refuses a guest's own kcmp with EPERM before this tool
+            // sees it, so only a kcmp Detcore injects through
+            // `record_or_replay` reaches this arm.
+            Syscall::Kcmp(_) => self.handle_simple(guest, syscall).await,
             unsupported => return Ok(guest.inject(unsupported).await?),
         }?)
     }

@@ -732,6 +732,12 @@ impl Tool for Replayer {
             // Reverie. Replay must materialize its real OFD alias and validate
             // both successful fd allocation and failure errno.
             Syscall::Other(Sysno::pidfd_getfd, _) => self.handle_pidfd_getfd(guest, syscall).await,
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(minibeads dh-mpvv): the recorded kcmp answer
+            // is returned; the call is not run, so the replay host's kernel
+            // (where kcmp may be missing or denied, and where the compared
+            // tasks and descriptors are other objects) is never asked.
+            Syscall::Kcmp(_) => self.handle_simple(guest, syscall).await,
             unsupported => return Ok(guest.inject_with_retry(unsupported).await?),
         }?)
     }
