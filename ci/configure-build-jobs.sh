@@ -2313,8 +2313,16 @@ fi
 # reverie-dbt/ and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml,
 # so the inventory (989), SDK and native inputs, calibrated budget, job width
 # and limits are unchanged from the e7bf2d9b carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 9547c3594d3881dead7d0e7a04ea5f32df7a7745 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 9547c3594d3881dead7d0e7a04ea5f32df7a7745 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO de21652fd25d6575ad6ac9dd1e6d2ff283eb3aa8 (2026-10-19): from
+# 9547c3594d3881dead7d0e7a04ea5f32df7a7745. One commit (signals lane, A5 step 3.0b:
+# the SIGSEGV state a trapped rdtsc or cpuid resets is put back). It changes
+# reverie-ptrace/src/task.rs, lib.rs, the new segv_state.rs, and its plain-guest
+# fixture and tests only; git diff is empty under reverie-dbt/ and for the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml, so the inventory (989), SDK and
+# native inputs, calibrated budget, job width and limits are unchanged from the
+# 9547c359 carry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != de21652fd25d6575ad6ac9dd1e6d2ff283eb3aa8 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie de21652fd25d6575ad6ac9dd1e6d2ff283eb3aa8 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
