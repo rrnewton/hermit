@@ -61,6 +61,11 @@ use crate::types::OpenFileId;
 use crate::types::SchedEvent;
 use crate::types::SyscallPhase;
 
+/// Prepares a blocking call to run again after a backend's own signal
+/// interrupted it (`Detcore::record_or_replay_blocking_restarting`).
+pub(super) type RestartBlockingCall<'a, G> =
+    &'a mut (dyn FnMut(&mut G) -> Result<(), Error> + Send);
+
 impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#2373)
@@ -193,6 +198,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             None,
             true,
             after_grant,
+            None,
         )
         .await
     }
@@ -249,12 +255,43 @@ impl<T: RecordOrReplay> Detcore<T> {
             blocked_signal_mask,
             blocked_signal_mask_unknown,
             |_| {},
+            None,
+        )
+        .await
+    }
+
+    /// `record_or_replay_blocking_with_mask` for a call that a backend's own
+    /// signal can interrupt (`restarts_backend_interrupted_waits`): while the
+    /// call returns `ERESTARTNOHAND`, `restart` updates what the call reads and
+    /// the call runs again, inside the same grant
+    /// (`syscalls::restartable_wait`).
+    pub(super) async fn record_or_replay_blocking_restarting<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        blocked_signal_mask: Option<u64>,
+        restart: RestartBlockingCall<'_, G>,
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid;
+        let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
+        self.record_or_replay_blocking_resource_then(
+            guest,
+            call,
+            ResourceID::BlockingExternalIO(op_id),
+            blocked_signal_mask,
+            false,
+            |_| {},
+            Some(restart),
         )
         .await
     }
 
     /// `record_or_replay_blocking_resource`, running `after_grant` between the
-    /// grant and the call.
+    /// grant and the call, and restarting the call with `restart` while it
+    /// returns `ERESTARTNOHAND`.
+    // The two hooks and the two mask arguments are independent inputs of one
+    // grant; bundling them would only move the count into a struct literal.
+    #[allow(clippy::too_many_arguments)]
     async fn record_or_replay_blocking_resource_then<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -263,6 +300,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         blocked_signal_mask: Option<u64>,
         blocked_signal_mask_unknown: bool,
         after_grant: impl FnOnce(&mut G),
+        restart: Option<RestartBlockingCall<'_, G>>,
     ) -> Result<i64, Error> {
         // A host wait on descriptors that may include a timerfd on virtual
         // time would never see it readable (`crate::syscalls::timerfd`).
@@ -329,9 +367,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             "Guest proceeding to execute potentially blocking call {}...",
             call.name()
         );
-        let res = self
+        let mut res = self
             .record_or_replay_preserving_tool_errors(guest, call)
             .await;
+        if let Some(restart) = restart {
+            // The backend's own signal interrupted the call and no guest
+            // handler ran, so Linux would restart it. It restarts here, inside
+            // this grant, so the thread goes on waiting instead of rejoining the
+            // schedule once per interruption.
+            while matches!(res, Err(Error::Errno(Errno::ERESTARTNOHAND))) {
+                if let Err(error) = restart(guest) {
+                    res = Err(error);
+                    break;
+                }
+                res = self
+                    .record_or_replay_preserving_tool_errors(guest, call)
+                    .await;
+            }
+        }
         crate::race_probe::delay(crate::race_probe::BG_POST_CALL).await;
         // N.B. BlockingExternalIO is a "oneshot" resource, so no need to release
         // explicitly here:

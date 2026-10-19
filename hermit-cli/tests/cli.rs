@@ -216,6 +216,7 @@ static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SELECT_TIMEOUT_NORMALIZATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SELECT_MANY_DESCRIPTORS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TOOL_OUTPUT_PROTECTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "dbt")]
 static CLOCK_RLIMIT_PARITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -28330,6 +28331,59 @@ fn select_timeout_folds_microseconds_into_seconds_as_linux() {
         let output = hermit(&args);
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{args:?}");
+    }
+}
+
+/// `select` and `pselect6` on more than 64 descriptors wait in the kernel. Under
+/// DBT they go through Detcore's restartable path
+/// (https://github.com/rrnewton/hermit/issues/4483): Detcore chooses which
+/// signals end the wait (a caught SIGUSR1 does, with its handler run once; a
+/// default-ignored SIGCHLD does not), validates and normalizes the timeout,
+/// keeps a `STICKY_TIMEOUTS` timeout as it was, and writes the time left back
+/// as Linux does. DBT and ptrace print what the guest prints natively
+/// (`tests/c/select_many_descriptors.c`). The restart itself, on DynamoRIO's
+/// suspend signal during a fork's synch, needs a fork that still takes about
+/// 50 s (step 2 bounds it); Reverie's live tests and the 4483 evidence cover
+/// it.
+#[test]
+fn run_dbt_select_on_many_descriptors_matches_linux() {
+    if dbt_unavailable("run_dbt_select_on_many_descriptors_matches_linux") {
+        return;
+    }
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&SELECT_MANY_DESCRIPTORS_GUEST, "select_many_descriptors");
+    let native = native_stdout(guest);
+    assert_eq!(
+        native,
+        "select, data arrives: r=1\n\
+         select, SIGCHLD at its default, then data: r=1\n\
+         select, caught SIGUSR1: r=-1 errno=Interrupted system call\n\
+         SIGUSR1 handled: 1\n\
+         select, 0.3 s timeout: r=0\n\
+         select time left: 0.000000\n\
+         pselect6, 0.3 s timeout: r=0\n\
+         pselect6 time left: 0.000000000\n\
+         select, usec 1300000: r=0\n\
+         select, usec -1: r=-1 errno=Invalid argument\n\
+         sticky select, 0.3 s timeout: r=0\n\
+         sticky select timeout after: 0.300000\n\
+         sticky pselect6, 0.3 s timeout: r=0\n\
+         sticky pselect6 timeout after: 0.300000000\n"
+    );
+    let guest = guest.to_str().unwrap();
+    for backend in ["dbt", "ptrace"] {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--",
+            guest,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), native, "{args:?}");
     }
 }
 

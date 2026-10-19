@@ -504,12 +504,16 @@ fn initial_dbt_config(
 /// And this runtime promotes shared open-file descriptions before every
 /// native fork, process-copying clone or exec it performs (see
 /// [`requires_native_lifecycle`]'s caller), whatever the configuration says,
-/// so a configuration from any source states that it does.
+/// so a configuration from any source states that it does. Likewise its
+/// DynamoRIO reports an injected wait that its own signal interrupted as
+/// `ERESTARTNOHAND` (https://github.com/rrnewton/hermit/issues/4483), which
+/// Detcore must restart rather than return to the guest.
 fn assert_dbt_execution_model(config: &mut Config) {
     config.max_timeslice = None;
     config.sequentialize_threads = true;
     config.backend.supports_parked_write_signal_interruption = false;
     config.backend.promotes_open_files_before_native_lifecycle = true;
+    config.backend.restarts_backend_interrupted_waits = true;
 }
 
 // TODO-HUMAN-REVIEW(PR-587): Confirm DynamoRIO-native process lifecycle boundaries.
@@ -3407,10 +3411,12 @@ mod tests {
             assert!(!backend.requires_thread_directed_process_signals);
             // An unprepared configuration's capabilities: ptrace's, with the
             // facts only a host sets for its backend left off, and the
-            // promotion this runtime performs whatever the source says.
+            // promotion and the wait restart this runtime performs whatever
+            // the source says.
             let mut expected = Config::default().backend;
             expected.supports_parked_write_signal_interruption = false;
             expected.promotes_open_files_before_native_lifecycle = true;
+            expected.restarts_backend_interrupted_waits = true;
             assert_eq!(backend, expected);
             assert_ne!(backend, backend_capabilities());
             assert_eq!(config.max_timeslice, None);
