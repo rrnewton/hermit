@@ -1590,3 +1590,142 @@ fn ptrace_delivery_check_gives_up_a_forced_signal_the_copy_ignores() {
         ],
     );
 }
+
+static STATE_KEPT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+
+/// tests/c/signal_state_kept.c, built once: SIGTRAP's state as each thread
+/// sees it, across pthread_create and a joined thread.
+fn state_kept_guest() -> &'static Path {
+    STATE_KEPT_GUEST
+        .get_or_init(|| {
+            let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .expect("hermit-cli should be inside the repository");
+            let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+                .join(format!("signal-state-kept-{}", std::process::id()));
+            fs::create_dir_all(&build_root)
+                .expect("failed to create signal state kept build directory");
+            let binary = build_root.join("signal_state_kept");
+            let mut command = Command::new("cc");
+            command
+                .args([
+                    "-O0",
+                    "-g",
+                    "-D_GNU_SOURCE",
+                    "-std=c11",
+                    "-Wall",
+                    "-Wextra",
+                    "-Werror",
+                    "-pthread",
+                ])
+                .arg(repository.join("tests/c/signal_state_kept.c"))
+                .arg("-o")
+                .arg(&binary);
+            command_output(command, "signal state kept guest compilation");
+            binary
+        })
+        .as_path()
+}
+
+/// Runs the state-kept guest with SIGTRAP in `state`, natively and on ptrace
+/// under `--strict --verify --verify-strict`, and requires the same output.
+/// The guest reads SIGTRAP's action, its `rt_sigprocmask` bit and its procfs
+/// status bits before, in and after a joined thread. Under ptrace, Reverie's
+/// single-steps end with a forced SIGTRAP, which resets a blocked or ignored
+/// SIGTRAP, and glibc's pthread_create blocks every signal around the clone
+/// with a call Detcore injects; Reverie keeps the guest's SIGTRAP across both,
+/// and runs each injected call under the guest's own mask, so its read of
+/// procfs `SigBlk` holds a blocked SIGTRAP as natively
+/// (<https://github.com/rrnewton/hermit/issues/4485>).
+fn assert_state_kept(state: &str) {
+    assert_state_kept_as(state, |native| native.to_owned());
+}
+
+/// SIGTRAP's bit in a signal mask.
+const SIGTRAP_MASK_BIT: u64 = 1 << (libc::SIGTRAP - 1);
+
+/// [`assert_state_kept`], with Hermit's output required to equal
+/// `expected(native)` instead of the native output itself.
+fn assert_state_kept_as(state: &str, expected: impl Fn(&str) -> String) {
+    let _guard = hermit_signal_lock();
+    let mut native = Command::new(state_kept_guest());
+    native.arg(state);
+    let native = command_output(native, &format!("native signal_state_kept {state}"));
+    let native = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert!(native.ends_with("done\n"), "native run: {native}");
+
+    let mut hermit = Command::new(hermit_test::hermit_binary());
+    hermit.args(["run", "--strict", "--verify", "--verify-strict", "--"]);
+    hermit.arg(state_kept_guest()).arg(state);
+    let output = command_output(
+        hermit,
+        &format!("signal_state_kept {state} under --verify-strict"),
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected(&native),
+        "state {state}, native output:\n{native}"
+    );
+}
+
+/// The native output with SIGTRAP's bit cleared from each line's procfs
+/// `SigBlk` fields, and nothing else changed. The guest prints the whole
+/// mask with C's `%#llx`, which writes zero as `0`.
+fn without_sigtrap_in_sigblk(native: &str) -> String {
+    native
+        .lines()
+        .map(|line| {
+            let fields: Vec<String> = line
+                .split(' ')
+                .map(|field| {
+                    if field == "SigBlk=1" {
+                        "SigBlk=0".to_owned()
+                    } else if let Some(hex) = field.strip_prefix("SigBlk-all=") {
+                        let all = u64::from_str_radix(hex.trim_start_matches("0x"), 16)
+                            .expect("a hex SigBlk")
+                            & !SIGTRAP_MASK_BIT;
+                        if all == 0 {
+                            "SigBlk-all=0".to_owned()
+                        } else {
+                            format!("SigBlk-all={all:#x}")
+                        }
+                    } else {
+                        field.to_owned()
+                    }
+                })
+                .collect();
+            fields.join(" ") + "\n"
+        })
+        .collect()
+}
+
+#[test]
+fn ptrace_signal_state_kept_for_an_ignored_sigtrap() {
+    assert_state_kept("ign");
+}
+
+#[test]
+fn ptrace_signal_state_kept_for_an_ignored_blocked_sigtrap() {
+    assert_state_kept("ign-blocked");
+}
+
+#[test]
+fn ptrace_signal_state_kept_for_a_caught_sigtrap() {
+    assert_state_kept("handler");
+}
+
+/// Pinned limit: a caught SIGTRAP that the guest blocks keeps Reverie's step
+/// shield, so that a step's trap never resets its handler, and an injected
+/// call stepped on the private page (the guest's procfs reads, here) still
+/// sees SIGTRAP unblocked. The action, its flags and mask, the
+/// `rt_sigprocmask` bit, `SigIgn` and `SigCgt` match the native run; only
+/// SIGTRAP's bit in `SigBlk` differs.
+#[test]
+fn ptrace_signal_state_kept_for_a_caught_blocked_sigtrap_but_its_sigblk_bit() {
+    assert_state_kept_as("handler-blocked", without_sigtrap_in_sigblk);
+}
+
+#[test]
+fn ptrace_signal_state_kept_for_a_default_blocked_sigtrap() {
+    assert_state_kept("dfl-blocked");
+}
