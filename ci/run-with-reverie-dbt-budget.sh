@@ -2353,7 +2353,13 @@ fi
 # reverie-core (tool.rs, guest.rs and signal.rs only). No DBT, SDK or native
 # input changes; calibrated budgets, jobs, limits and inventory989 are
 # unchanged.
-expected_pin=90329dd5be334d5e486891656e2652a8af3934b2
+# CARRY TO 1bfd7dc9528cfe2650a13ad8dac81d4c86830f8c (2026-10-20): from
+# 90329dd5be334d5e486891656e2652a8af3934b2. The one commit changes safeptrace (the wait-owner proof
+# cache) and reverie-process (launch_window::child_generation and a clone
+# test); no file under reverie-dbt, the root Cargo.toml, third-party or
+# rust-toolchain.toml changes, so the budget inputs are unchanged. Carry, not
+# recalibration: no new timing sample or >=5-sample replacement claim is made.
+expected_pin=1bfd7dc9528cfe2650a13ad8dac81d4c86830f8c
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
