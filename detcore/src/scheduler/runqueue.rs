@@ -1097,6 +1097,37 @@ mod tests {
         );
     }
 
+    /// Assumption A2 of the step 3 liveness proof (dev-hermit
+    /// ai_docs/2026-10-19-parallelism-steps-2-3-proposal.md): a fully backed-off
+    /// poller, as a parent polling `wait4(WNOHANG)` is, is selected within
+    /// `POLLING_UPGRADE_INTERVAL` pushes, though an ordinary thread is requeued
+    /// after every one of its turns. Without a deadline nothing else restores
+    /// it; the poll upgrade bounds how long it waits behind other work.
+    #[test]
+    fn a_backed_off_poller_is_selected_within_the_upgrade_interval() {
+        let poller = DetTid::from_raw(1);
+        let spinner = DetTid::from_raw(2);
+        let mut queue = RunQueue::new(SchedHeuristic::None, 0, 0.0);
+        queue.push_poller(poller, DEFAULT_PRIORITY, 30);
+        queue.push_back(spinner, DEFAULT_PRIORITY);
+        let mut turns = 0;
+        loop {
+            let selected = queue.tentative_pop_next().expect("two threads are queued");
+            queue.commit_tentative_pop();
+            turns += 1;
+            if selected == poller {
+                break;
+            }
+            assert_eq!(selected, spinner);
+            assert!(
+                turns <= POLLING_UPGRADE_INTERVAL,
+                "the poller waited past the upgrade interval"
+            );
+            queue.push_back(spinner, DEFAULT_PRIORITY);
+        }
+        assert!(turns > 1, "the backed-off poller ran only after other work");
+    }
+
     /// A poller whose normal priority is the last band is still a poller
     /// after a poll upgrade, which has nowhere to move it, and so is one its
     /// deadline restored there. With `POLLING_UPGRADE_INTERVAL` such pollers

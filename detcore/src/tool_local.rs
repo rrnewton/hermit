@@ -5224,6 +5224,7 @@ impl<T> ThreadState<T> {
             decides_signal_interruption_itself: false,
             continues_sigreturn: false,
             private_sigchld_decides: false,
+            polls_children: None,
         }
     }
 

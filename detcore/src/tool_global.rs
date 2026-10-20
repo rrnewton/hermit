@@ -2514,6 +2514,15 @@ impl GlobalState {
             request => request,
         };
         let time_from_guest = guest_time.as_nanos();
+        if crate::scheduler::exit_order::exit_order()
+            && matches!(request, GlobalRequest::RequestResources(..))
+        {
+            // The thread's own computation and syscalls, excluding clock
+            // advances (`DetTime::advance_to`), for the study-branch exit order.
+            let work =
+                guest_time.user_cpu_time().as_nanos() + guest_time.system_cpu_time().as_nanos();
+            self.sched.lock().unwrap().exit_order_note_work(dtid, work);
+        }
         // Exec transfer messages authenticate both incarnations before ordinary
         // sender-clock accounting. The carried clock still belongs to the former
         // thread until the successful reconnect commits.
@@ -4825,6 +4834,7 @@ impl GlobalState {
                     decides_signal_interruption_itself: false,
                     continues_sigreturn: false,
                     private_sigchld_decides: false,
+                    polls_children: None,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {

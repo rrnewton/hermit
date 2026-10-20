@@ -3834,6 +3834,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         validate_wait4_arguments(call.pid(), call.options())?;
 
         let parent = guest.thread_state().detpid.expect("detpid unset");
+        rsrc.polls_children = Some(parent);
         // A nested caller names its children by its own namespace's pids
         // (https://github.com/rrnewton/hermit/issues/4090). Its process-group
         // ids are not translated yet, nor are emulated waits.
@@ -4158,6 +4159,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut rsrc = Resources::new(dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("waitid");
+        rsrc.polls_children = guest.thread_state().detpid;
 
         let event_options = libc::WEXITED | libc::WSTOPPED | libc::WCONTINUED;
         let allowed_options = event_options

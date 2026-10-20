@@ -601,6 +601,12 @@ pub struct Resources {
     /// interruption itself) included.
     #[serde(default)]
     pub(crate) private_sigchld_decides: bool,
+    /// The process whose children this request polls for: a `wait4` or
+    /// `waitid` retry (`InternalIOPolling`). A typed marker the study-branch
+    /// exit order reads, instead of the request's `fyi` text, to hand a
+    /// polling parent the turn after a child's exit is granted.
+    #[serde(default)]
+    pub(crate) polls_children: Option<DetPid>,
 }
 
 impl fmt::Debug for Resources {
@@ -699,6 +705,7 @@ impl Resources {
             decides_signal_interruption_itself: false,
             continues_sigreturn: false,
             private_sigchld_decides: false,
+            polls_children: None,
         }
     }
 

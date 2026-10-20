@@ -12,6 +12,8 @@ pub(crate) mod child_exit_sigchld;
 pub(crate) mod discarded_at_send;
 #[cfg(test)]
 pub(crate) mod exec_teardown_tests;
+pub(crate) mod exit_order;
+mod exit_order_log;
 pub(crate) mod itimer_coalesce;
 pub(crate) mod parked;
 #[cfg(test)]
@@ -1551,6 +1553,10 @@ pub struct Scheduler {
     /// is therefore granted at the very next turn, before any other thread
     /// runs (`hold_turn_for_group_exit`).
     group_exit_decider: Option<DetTid>,
+
+    /// State of the study-branch virtual-completion exit order
+    /// (`HERMIT_PARALLEL_EXIT_ORDER`, [`exit_order`]); empty when off.
+    exit_order: exit_order::ExitOrderState,
     /// `hermit record`: where `step2c_process_io_blockers` logs each
     /// readmission of a backgrounded call (see `rejoin_log`).
     rejoin_writer: Option<RejoinWriter>,
@@ -3954,6 +3960,7 @@ impl Scheduler {
             sigkill_fence_refusal: None,
             sigkill_fence_valve: Self::SIGKILL_FENCE_VALVE,
             group_exit_decider: None,
+            exit_order: exit_order::ExitOrderState::new(cfg),
             rejoin_writer: match &cfg.replay_data {
                 Some(dir) if cfg.recordreplay_modes && !cfg.replaying => {
                     Some(RejoinWriter::create(dir).unwrap_or_else(|err| {
@@ -7487,6 +7494,9 @@ impl Scheduler {
             || self.control_barrier()
             || !self.blocked.signaled_background.is_empty()
         {
+            return Err(SkipTurn);
+        }
+        if self.exit_order_release() {
             return Err(SkipTurn);
         }
         self.step2c_process_io_blockers()?;
@@ -13014,6 +13024,13 @@ impl Scheduler {
                     self.parked.exits_awaiting_permit.insert(dettid);
                     return self.skip_turn_blocked(dettid);
                 }
+                if self.exit_order_hold(dettid, *group) {
+                    info!(
+                        "[scheduler] NONCOMMIT turn {}, holding dettid {}'s exit for the virtual-completion exit order",
+                        self.turn, dettid
+                    );
+                    return self.skip_turn_blocked(dettid);
+                }
                 let reserve_mode = match self.reserve_exit_boundary(dettid, *process, *mm, *group) {
                     Ok(mode) => mode,
                     Err(failure) => {
@@ -13039,6 +13056,7 @@ impl Scheduler {
                 {
                     self.thread_tree.granted_exits.insert(exiting);
                     self.note_pid_namespace_end(exiting);
+                    self.exit_order_note_granted(exiting);
                 }
                 // An exit_group ends every thread of the group, and on a
                 // backend that reports exits before the kernel runs them each
