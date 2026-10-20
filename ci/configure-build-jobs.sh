@@ -2429,8 +2429,17 @@ fi
 # reverie-core (tool.rs, guest.rs and signal.rs only). No DBT, SDK or native
 # input changes; calibrated budgets, jobs, limits and inventory989 are
 # unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 90329dd5be334d5e486891656e2652a8af3934b2 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 90329dd5be334d5e486891656e2652a8af3934b2 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 1f4c2d2a8aeffe377ad6fcfd4380603190b4cdfc (2026-10-20): from
+# 90329dd5be334d5e486891656e2652a8af3934b2. One commit (kvm lane, LinuxEmu
+# shrink D2: the executor's copies of Detcore's statfs canonicalization, host
+# stat/statx timestamp fixing and UNAME26 release rewrite are deleted; the
+# host forwards stay). It changes reverie-kvm/src, reverie-kvm/tests and
+# reverie-kvm-core/src only; git diff is empty under reverie-dbt/ and for the
+# root Cargo.toml, Cargo.lock and rust-toolchain.toml, so the inventory (989),
+# SDK and native inputs, calibrated budget, job width and limits are unchanged
+# from the 90329dd5 entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 1f4c2d2a8aeffe377ad6fcfd4380603190b4cdfc ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 1f4c2d2a8aeffe377ad6fcfd4380603190b4cdfc (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

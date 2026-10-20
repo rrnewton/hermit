@@ -2620,7 +2620,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (an_injected_tool_decided_call_ends_the_run,
     // only_a_tool_decided_refusal_is_an_internal_failure): 2220.
     // And ten two-phase signal-delivery units (signal_announcement_tests): 2230.
-    ("test.detcore_unit", 2230),
+    // And the statfs canonicalization unit of the LinuxEmu D2 pin
+    // (canonicalize_statfs_buf_caps_free_counts_and_zeroes_the_fsid): 2231.
+    ("test.detcore_unit", 2231),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4634,7 +4636,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same thirty-five scheduler::work_span units: 2218, listed.
     // And the two tool-decided tripwire units of the LinuxEmu D1 pin: 2220.
     // And ten two-phase signal-delivery units (signal_announcement_tests): 2230.
-    ("test.detcore_unit_on_host", 2230),
+    // And the same statfs canonicalization unit of the LinuxEmu D2 pin: 2231.
+    ("test.detcore_unit_on_host", 2231),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
