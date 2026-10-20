@@ -2434,8 +2434,12 @@ fi
 # (tool.rs, guest.rs and tests/signal_bridge.rs only). No DBT, SDK or native
 # input changes; calibrated budgets, jobs, limits and inventory989 are
 # unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bc460a72fc2dea0cc04c03e238d67094aeba4e31 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie bc460a72fc2dea0cc04c03e238d67094aeba4e31 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# REBASE TO 0b10a27dbee3e9547a8d1e501365d719aeed1060 (2026-10-20): the incoming change adds four
+# BackendCapabilities fields in reverie-core (capabilities.rs only). No DBT,
+# SDK or native input changes; calibrated budgets, jobs, limits and
+# inventory989 are unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0b10a27dbee3e9547a8d1e501365d719aeed1060 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0b10a27dbee3e9547a8d1e501365d719aeed1060 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
