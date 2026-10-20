@@ -2591,7 +2591,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the four vfork flock-guard narrowing units (three in tool_local,
     // one in fd) and the flock owner-rule unit in procfs::locks: 2174,
     // listed.
-    ("test.detcore_unit", 2174),
+    // And two AfterFrame binding units (signal_shadow): 2176.
+    ("test.detcore_unit", 2176),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2945,7 +2946,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a fifth, for pselect6: 304.
     // And arrived-first epoll_pwait2 and zero-timeout ppoll tests
     // (https://github.com/rrnewton/hermit/issues/4526), listed: 306.
-    ("test.hermit_integration_3", 306),
+    // And a fault at a handler's first instruction (A5 step 3.2b part 4): 307.
+    // And two chained deliveries at rt_sigreturn's exit: 309.
+    ("test.hermit_integration_3", 309),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4591,7 +4594,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from e1446c0a: 2169.
     // And the same four vfork flock-guard narrowing units and flock
     // owner-rule unit: 2174, listed.
-    ("test.detcore_unit_on_host", 2174),
+    // And the same two AfterFrame binding units: 2176.
+    ("test.detcore_unit_on_host", 2176),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4692,7 +4696,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // proc_locks_determinism's copied-child OFD unlock and stale-flock-record
     // tests: 650, listed.
     // And +2 from 7b5d1ef2: 652.
-    ("test.hermit_integration_on_host", 652),
+    // And +1 for a fault at a handler's first instruction: 653.
+    // And +2 for two chained deliveries at rt_sigreturn's exit: 655.
+    ("test.hermit_integration_on_host", 655),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
