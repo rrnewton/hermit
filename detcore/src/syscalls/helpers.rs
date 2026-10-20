@@ -228,6 +228,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // the kernel never installed its temporary mask, and the handler runs
         // under the thread's pre-call mask, still a host-timed difference when
         // the two masks differ (https://github.com/rrnewton/hermit/issues/4338).
+        // Whether the kernel ran the call, before that normalization hides it
+        // (`signal_shadow::kernel_ran_the_wait`). A replay runs no call.
+        if !self.cfg.replaying {
+            let ran = !matches!(result, Err(Error::Errno(Errno::ERESTARTSYS)));
+            super::signal_shadow::note_wait_ran(guest, ran);
+        }
         match result {
             Err(Error::Errno(Errno::ERESTARTSYS)) => Err(Errno::ERESTARTNOHAND.into()),
             other => other,
