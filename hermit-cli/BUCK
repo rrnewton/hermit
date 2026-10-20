@@ -15,7 +15,7 @@ hermit_build_env = {
     "CARGO_PKG_VERSION": "0.4.1",
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "39bc362bbaad7a6eae5598654c644eab5122900d",
+    "HERMIT_REVERIE_PIN": "8aa96b0d556eac66ab8556b1c40aac7413964482",
 }
 
 # The shadow release entrypoint supplies these values from Git/Cargo metadata

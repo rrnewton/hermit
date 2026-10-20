@@ -2393,8 +2393,12 @@ fi
 # host-adapter tuple on the API13 replay above. The incoming a778f36c reader
 # correction is preserved; native/SDK inputs and inventory989 stay unchanged.
 # No new budget calibration or runtime identity is inferred from this replay.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 39bc362bbaad7a6eae5598654c644eab5122900d ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 39bc362bbaad7a6eae5598654c644eab5122900d (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# REBASE TO 8aa96b0d556eac66ab8556b1c40aac7413964482 (2026-10-20): the incoming change adds three
+# defaulted Tool hooks and SignalAnnouncement in reverie-core (tool.rs and
+# signal.rs only). No DBT, SDK or native input changes; calibrated budgets,
+# jobs, limits and inventory989 are unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 8aa96b0d556eac66ab8556b1c40aac7413964482 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 8aa96b0d556eac66ab8556b1c40aac7413964482 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
