@@ -2531,7 +2531,24 @@ impl GlobalState {
             }
             request => request,
         };
+        let (work_span, request) = match request {
+            GlobalRequest::WithWorkSpan(payload, request) => (Some(*payload), *request),
+            request => (None, request),
+        };
         let time_from_guest = guest_time.as_nanos();
+        if self.cfg.work_span_report.is_some()
+            && matches!(request, GlobalRequest::RequestResources(..))
+        {
+            // The thread's own computation and syscalls, excluding clock
+            // advances (`DetTime::advance_to`), and what it gathered, for
+            // `--work-span-report`.
+            let work =
+                guest_time.user_cpu_time().as_nanos() + guest_time.system_cpu_time().as_nanos();
+            self.sched
+                .lock()
+                .unwrap()
+                .work_span_note_request(dtid, work, work_span.as_ref());
+        }
         // Exec transfer messages authenticate both incarnations before ordinary
         // sender-clock accounting. The carried clock still belongs to the former
         // thread until the successful reconnect commits.
@@ -2902,6 +2919,9 @@ impl GlobalState {
             }
             GlobalRequest::WithForwardedCount(..) => {
                 unreachable!("a counted request is unwrapped on arrival")
+            }
+            GlobalRequest::WithWorkSpan(..) => {
+                unreachable!("a work/span envelope is unwrapped on arrival")
             }
             GlobalRequest::ResumeExec(process) => {
                 let mut resources = Resources::new(dtid);
@@ -4570,6 +4590,7 @@ impl GlobalState {
                     flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_PARENT)),
                     exit_signal,
                 );
+                sched.work_span_note_spawn(parent_dettid, child_dettid);
                 if is_group_leader {
                     sched.forget_previous_process_exit(child_dettid);
                     // The child's exit signal is posted to its parent at a
@@ -6334,6 +6355,15 @@ pub enum GlobalRequest {
     /// may know under another identity, whose fdinfo could not be read for
     /// this reason (`procfs::locks::LockLedger::refuse`). Appended last.
     LockLedgerRefused(String),
+    /// `request`, a resource request, sent with what `--work-span-report`
+    /// gathered since the thread's previous one
+    /// (`scheduler::work_span::WorkSpanPayload`) and unwrapped on arrival. Sent
+    /// only with the report on, so a run without it sends the same requests,
+    /// byte for byte. Appended last.
+    WithWorkSpan(
+        Box<crate::scheduler::work_span::WorkSpanPayload>,
+        Box<GlobalRequest>,
+    ),
 }
 
 /// Responses from the global object
@@ -7394,7 +7424,9 @@ fn request_continues_sigreturn(request: &GlobalRequest) -> bool {
 
 fn resumes_from_grant(request: &GlobalRequest) -> bool {
     match request {
-        GlobalRequest::WithForwardedCount(_, request) => resumes_from_grant(request),
+        GlobalRequest::WithForwardedCount(_, request) | GlobalRequest::WithWorkSpan(_, request) => {
+            resumes_from_grant(request)
+        }
         GlobalRequest::RequestResources(..)
         | GlobalRequest::ParkedRequest(..)
         | GlobalRequest::ResumeParkedRequest { .. }
@@ -7475,8 +7507,25 @@ where
             "[detcore, dtid {}] BLOCKING on resource_request rpc... {:?}",
             &dettid, r
         );
-        let resp =
-            send_and_update_time(guest, GlobalRequest::RequestResources(r.clone(), detpid)).await;
+        // `--work-span-report`'s pipe events and request facts ride on this
+        // request in an envelope; without it, the request is sent unchanged.
+        let work_span = {
+            let on = guest.config().work_span_report.is_some();
+            let state = guest.thread_state_mut();
+            crate::scheduler::work_span::payload_for(
+                on,
+                &r,
+                &mut state.work_span_events,
+                &mut state.work_span_polled,
+                &mut state.work_span_polls_children,
+            )
+        };
+        let request = GlobalRequest::RequestResources(r.clone(), detpid);
+        let request = match work_span {
+            Some(payload) => GlobalRequest::WithWorkSpan(Box::new(payload), Box::new(request)),
+            None => request,
+        };
+        let resp = send_and_update_time(guest, request).await;
         match resp.1 {
             GlobalResponse::RequestResources(x) => {
                 trace!(

@@ -250,6 +250,38 @@ impl<T: crate::record_or_replay::RecordOrReplay> crate::Detcore<T> {
             .collect()
     }
 
+    /// For `--work-span-report`: gather a read or write of a pipe or FIFO
+    /// that moved bytes, or a read that returned its end of file, to send with
+    /// this thread's next resource request
+    /// (`crate::scheduler::work_span::channel_event_for`). The channel is the
+    /// host (device, inode) behind the descriptor, where the tool can see the
+    /// guest's descriptors (`fifo_peer::fifo_of`). Reads host state only;
+    /// nothing the guest or the scheduler's decisions see changes.
+    pub(crate) fn gather_channel_event<G: reverie::Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &reverie::syscalls::Syscall,
+        res: &Result<i64, reverie::Error>,
+    ) {
+        let polled = std::mem::take(&mut guest.thread_state_mut().work_span_polled);
+        let physical_tid = guest.thread_state().physical_tid;
+        let tid = guest.tid().as_raw();
+        let event = crate::scheduler::work_span::channel_event_for(
+            self.cfg.work_span_report.is_some(),
+            call,
+            res,
+            polled,
+            |fd| crate::fifo_peer::fifo_of(&self.cfg.backend, physical_tid, tid, fd),
+            || {
+                let time = &guest.thread_state().thread_logical_time;
+                time.user_cpu_time().as_nanos() + time.system_cpu_time().as_nanos()
+            },
+        );
+        if let Some(event) = event {
+            guest.thread_state_mut().work_span_events.push(event);
+        }
+    }
+
     /// This thread closed `end` (explicitly: `close`, `close_range`, or a
     /// `dup2` or `dup3` over it): ready what that closing gives the other
     /// side. An implicit close at exit or exec readies nothing.
