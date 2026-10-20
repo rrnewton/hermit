@@ -1319,16 +1319,35 @@ where
     };
     let compared = !(reserved() | forced());
     let same = |a: KernelSigset, b: KernelSigset| a & compared == b & compared;
+    let exact = |a: KernelSigset, b: KernelSigset| a & !reserved() == b & !reserved();
+    // With the forced signals left out, a wait's mask and the mask to restore
+    // that differ only in forced signals cannot be told apart, so only an
+    // exact match then says which one the kernel holds.
+    let ambiguous = matches!((wait_mask, saved), (Some(wait), Some(saved)) if same(wait, saved) && !exact(wait, saved));
+    let holds = |kernel: KernelSigset, mask: KernelSigset| {
+        if ambiguous {
+            exact(kernel, mask)
+        } else {
+            same(kernel, mask)
+        }
+    };
     // A temporary-mask restore no handler took has happened if the kernel
     // already shows the restored mask (the wait returned to the guest).
     if let Some(saved) = saved
-        && same(kernel.blocked, saved)
+        && holds(kernel.blocked, saved)
     {
         shadow.thread.settle();
     }
+    // The same for the wait's mask against the copy's current one: when they
+    // differ only in forced signals, the kernel holding the copy's mask
+    // exactly means the wait never installed its own (the signal came first),
+    // and holding the wait's means it did. Asked with the forced signals left
+    // out, the thread's own mask matched the wait's, and the kernel's was
+    // taken for a forced delivery's clear, which gave the copy up.
     if let Some(wait_mask) = wait_mask
-        && same(kernel.blocked, wait_mask)
-        && !same(shadow.thread.blocked, wait_mask)
+        && !exact(shadow.thread.blocked, wait_mask)
+        && (exact(kernel.blocked, wait_mask)
+            || (holds(kernel.blocked, wait_mask) && !exact(kernel.blocked, shadow.thread.blocked)))
     {
         shadow.thread.interrupted_under_temporary_mask(wait_mask);
     }
@@ -2438,6 +2457,52 @@ mod tests {
                 vec![USR1 | USR2],
                 "the frame saves the thread's own mask either way"
             );
+        }
+    }
+
+    /// The same when the wait's mask and the thread's own differ only in
+    /// signals Linux can force-deliver (SIGILL and SIGFPE here): the copy
+    /// follows the mask the kernel holds, and is not taken for a forced
+    /// delivery's clear and given up.
+    #[test]
+    fn a_delivery_inside_a_wait_whose_mask_differs_only_in_forced_signals_keeps_the_copy() {
+        let kernel = Kernel::default();
+        let _seam = kernel.install();
+        let action = KernelSigaction {
+            handler: 0x4000,
+            flags: (libc::SA_SIGINFO | 0x0400_0000) as u64,
+            restorer: 0x7000,
+            mask: 0,
+        };
+        let int = 1 << (libc::SIGINT - 1);
+        let own = sigbit(libc::SIGILL) | sigbit(libc::SIGFPE);
+        assert_eq!(own & forced(), own);
+        for kernel_ran_the_wait in [true, false] {
+            let mut guest = seeded(&kernel, own);
+            kernel.set(own, 0, int);
+            record_rt_sigaction(&mut guest, libc::SIGINT, Some(action), None, &Ok(0));
+            // rt_sigsuspend(&{}).
+            at_syscall_entry(&mut guest);
+            note_wait_mask(&mut guest, 0);
+            kernel.set(if kernel_ran_the_wait { 0 } else { own }, 0, int);
+            record_delivery(&mut guest, libc::SIGINT);
+            let shadow = guest
+                .thread
+                .signal_shadow
+                .as_ref()
+                .unwrap_or_else(|| panic!("copy given up ({kernel_ran_the_wait})"));
+            let expected = if kernel_ran_the_wait { 0 } else { own };
+            assert_eq!(
+                shadow.thread.blocked,
+                expected | int,
+                "{kernel_ran_the_wait}"
+            );
+            assert_eq!(
+                shadow.thread.activations,
+                vec![own],
+                "the frame saves the thread's own mask either way"
+            );
+            assert!(!guest.thread.signal_shadow_lost);
         }
     }
 
