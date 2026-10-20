@@ -2317,7 +2317,11 @@ fi
 # host-adapter tuple on the API13 replay above. The incoming a778f36c reader
 # correction is preserved; native/SDK inputs and inventory989 stay unchanged.
 # No new budget calibration or runtime identity is inferred from this replay.
-expected_pin=39bc362bbaad7a6eae5598654c644eab5122900d
+# REBASE TO 0720fb95e8b8c8d4f89306521aeca713d4aff0c4 (2026-10-20): the incoming change adds three
+# defaulted Tool hooks and SignalAnnouncement in reverie-core (tool.rs and
+# signal.rs only). No DBT, SDK or native input changes; calibrated budgets,
+# jobs, limits and inventory989 are unchanged.
+expected_pin=0720fb95e8b8c8d4f89306521aeca713d4aff0c4
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

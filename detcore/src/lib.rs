@@ -85,6 +85,8 @@ mod syscall_time;
 mod syscalls;
 #[cfg(test)]
 mod test_pages;
+#[cfg(test)]
+mod signal_announcement_tests;
 mod tool_global;
 mod tool_local;
 pub mod util;
@@ -1063,11 +1065,31 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// for a realtime signal): the signal takes its turn in the schedule
     /// before it is delivered. Returns the signal to deliver, or `None` to
     /// suppress it.
+    /// A signal-delivery stop: the delivery of `signal` the backend reports
+    /// once, after the kernel dequeued it (the ptrace backend's stop). It runs
+    /// the stop's three parts in order: what the dequeue settles
+    /// ([`Self::inbound_dequeued`]), the delivery's turn
+    /// ([`Self::inbound_turn`]), and what the granted delivery settles
+    /// ([`Self::inbound_delivered`]). A backend that announces a delivery
+    /// before the kernel dequeues it runs the turn first and the rest at its
+    /// commit (`Tool::announce_signal_event`, `Tool::commit_signal_event`).
     async fn handle_inbound_signal<G: Guest<Self>>(
         &self,
         guest: &mut G,
         signal: SigWrapper,
     ) -> Result<Option<SigWrapper>, Errno> {
+        let stop = self.inbound_stop(guest);
+        let Some(timer_entry) = self.inbound_dequeued(guest, signal).await? else {
+            return Ok(None);
+        };
+        let turn = self.inbound_turn(guest, signal, stop).await;
+        self.inbound_delivered(guest, signal, turn, timer_entry)
+            .await
+    }
+
+    /// What a delivery knows before anything of it can hand the thread to
+    /// the scheduler.
+    fn inbound_stop<G: Guest<Self>>(&self, guest: &mut G) -> tool_local::InboundStop {
         // Whether this stop comes before any scheduling point of the thread
         // since its previous handler's delivery was granted, or right after a
         // reported `rt_sigreturn` where reports are read
@@ -1078,255 +1100,294 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (a slice end, a schedule-replay trace, any other hand-off) means
         // other threads may have run, so the delivery continues nothing.
         let grants_at_stop = guest.thread_state().scheduler_grants;
+        tool_local::InboundStop {
+            reported,
+            grants_at_stop,
+        }
+    }
+
+    /// What the kernel's dequeue of `signal` settles before the delivery's
+    /// turn: an operator's SIGINT, the `ITIMER_REAL` re-arm, a duplicate
+    /// child-exit `SIGCHLD`, a stale POSIX timer entry. `None` when the
+    /// delivery is dropped; otherwise whether it is a POSIX timer's entry.
+    async fn inbound_dequeued<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: SigWrapper,
+    ) -> Result<Option<bool>, Errno> {
         if signal.signal() == Some(Signal::SIGINT) && self.cfg.sigint_instakill {
             warn!("Fatal: Exiting hermit container immediately upon SIGINT");
             // ⚠️ NOT A REFUSAL. The operator interrupted the run; hermit examined
             // nothing and decided nothing. Reporting `128 + SIGINT` is what every
             // other tool reports for this, and it keeps 122 meaning one thing.
             unrecoverable_shutdown(guest, detcore_model::HERMIT_SIGINT_DEATH_EXIT).await
-        } else {
-            if signal.signal() == Some(Signal::SIGALRM) {
-                self.normalize_reported_itimer_real(guest).await;
-            }
-            if signal.signal() == Some(Signal::SIGCHLD)
-                && self.cfg.backend.reports_kernel_child_exit_signals
-                && !self.child_exit_sigchld_delivers(guest).await
-            {
-                // A claimed copy that is dropped has no delivery to place, but
-                // the claim may have held this duplicate while the claimed copy
-                // is still pending (`syscalls::signal::claim_still_pending`).
-                let (pid, tid) = (guest.pid(), guest.tid());
-                let claimed = crate::syscalls::claim_still_pending(
-                    guest.thread_state().claimed_sigchld,
-                    || crate::syscalls::read_thread_signal_state(pid, tid),
-                );
-                guest.thread_state_mut().claimed_sigchld = claimed;
-                self.keep_timer_across_dropped_signal(guest);
-                return Ok(None);
-            }
-            // The test-only claim fault drops the claimed copy here, as the
-            // ledger drops a duplicate above (`syscalls::signal::take_claim_fault`).
-            if signal.signal() == Some(Signal::SIGCHLD)
-                && guest.thread_state().claimed_sigchld
-                && crate::syscalls::take_claim_fault(crate::syscalls::ClaimFault::DropClaimed)
-            {
-                warn!(
-                    "[dtid {}] claim fault hook: dropped the claimed SIGCHLD",
-                    guest.thread_state().dettid
-                );
-                guest.thread_state_mut().claimed_sigchld = false;
-                self.keep_timer_across_dropped_signal(guest);
-                return Ok(None);
-            }
-            // A POSIX timer's entry: delivered with its own siginfo, or, if its
-            // timer was set again since it was queued, skipped as Linux skips
-            // it inside the dequeue, with no turn
-            // (<https://github.com/rrnewton/hermit/issues/4262>).
-            let mut timer_entry = false;
-            let stop_time = guest.thread_state().thread_logical_time.as_nanos();
-            if scheduler::discarded_at_send::records(&self.cfg) && (1..32).contains(&signal.raw()) {
-                use scheduler::discarded_at_send::DiscardedSignalAnswer;
-                use scheduler::discarded_at_send::DiscardedSignalControl;
-                use scheduler::posix_timer_coalesce::DeliveryAnswer;
-                let control = DiscardedSignalControl::Dequeue {
-                    signal: signal.raw(),
-                    at: stop_time,
-                };
-                let answer = tool_global::discarded_signal(guest, control).await;
-                timer_entry = answer == DiscardedSignalAnswer::Delivery(DeliveryAnswer::TimerEntry);
-                match answer {
-                    DiscardedSignalAnswer::Delivery(DeliveryAnswer::Suppress) => {
-                        info!(
-                            "[dtid {}] signal {} is a stale POSIX timer entry; skipped",
-                            guest.thread_state().dettid,
-                            signal
-                        );
-                        self.keep_timer_across_dropped_signal(guest);
-                        return Ok(None);
-                    }
-                    DiscardedSignalAnswer::Delivery(DeliveryAnswer::Rewrite(info)) => {
-                        if let Err(errno) = guest.set_signal_info(info.to_user()) {
-                            warn!(
-                                "[dtid {}] signal {} keeps its physical siginfo: {}",
-                                guest.thread_state().dettid,
-                                signal,
-                                errno
-                            );
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            // The kernel dequeued `signal` before this stop: a hold for it ends
-            // here, and this stop's hooks may end the slice
-            // (`own_signal_turn_hold`).
-            if guest.thread_state().own_signal_turn_hold == Some(signal.raw()) {
-                guest.thread_state_mut().own_signal_turn_hold = None;
-            }
-            let timeslice = guest.thread_state().stats.timeslice_count;
-            self.pre_handler_hook(guest, false, CheckIn::Event).await;
-            // The delivery continues the thread's turn only while the slice
-            // its previous delivery ran in is still open. A stop that ends the
-            // slice is Linux's TIF_NEED_RESCHED case: other threads run
-            // (`schedule()`) before this one resumes and delivers, so the
-            // delivery waits its place behind them instead of being taken
-            // right after the yield. And at most
-            // `MAX_SIGRETURN_CONTINUATIONS` in a row
-            // (`consecutive_continuations`): in every mode, that cap is what
-            // stops a handler that raises its own signal from holding the
-            // CPU for ever.
-            let slice_open = guest.thread_state().stats.timeslice_count == timeslice;
-
-            // For `hermit run --verify`: a guest that faulted on an illegal
-            // instruction may have run code that made syscalls Detcore never
-            // saw, so the run reports `/`, the ancestor of every path, and
-            // names no host input change. A false alarm only withholds a name.
-            // The case this was written for no longer reaches here: on ptrace,
-            // a syscall issued from the untraced stub of Reverie's private page
-            // is followed by a `ud2`, and Reverie now ends the run at that
-            // SIGILL (`UntracedStubSyscall`, a policy refusal) before any Tool
-            // sees it. A stub syscall that never returns to the `ud2` (execve,
-            // exit, rt_sigreturn) raises no SIGILL at all
-            // (https://github.com/rrnewton/reverie/issues/1064). This stays as
-            // the conservative answer for any other illegal instruction. A
-            // guest that first rewrites or replaces the page's code is reported
-            // when it does so (`record_untraced_code_change`).
-            if signal.signal() == Some(Signal::SIGILL) && self.cfg.record_host_inputs {
-                tool_global::record_host_mutation(guest, String::from("/")).await;
-            }
-
-            let dettid = guest.thread_state().dettid;
-            let mycount = guest.thread_state().stats.signal_count;
-            info!(
-                "[dtid {}] handling inbound signal (#{}) {}",
-                dettid, mycount, signal
+        }
+        if signal.signal() == Some(Signal::SIGALRM) {
+            self.normalize_reported_itimer_real(guest).await;
+        }
+        if signal.signal() == Some(Signal::SIGCHLD)
+            && self.cfg.backend.reports_kernel_child_exit_signals
+            && !self.child_exit_sigchld_delivers(guest).await
+        {
+            // A claimed copy that is dropped has no delivery to place, but
+            // the claim may have held this duplicate while the claimed copy
+            // is still pending (`syscalls::signal::claim_still_pending`).
+            let (pid, tid) = (guest.pid(), guest.tid());
+            let claimed =
+                crate::syscalls::claim_still_pending(guest.thread_state().claimed_sigchld, || {
+                    crate::syscalls::read_thread_signal_state(pid, tid)
+                });
+            guest.thread_state_mut().claimed_sigchld = claimed;
+            self.keep_timer_across_dropped_signal(guest);
+            return Ok(None);
+        }
+        // The test-only claim fault drops the claimed copy here, as the
+        // ledger drops a duplicate above (`syscalls::signal::take_claim_fault`).
+        if signal.signal() == Some(Signal::SIGCHLD)
+            && guest.thread_state().claimed_sigchld
+            && crate::syscalls::take_claim_fault(crate::syscalls::ClaimFault::DropClaimed)
+        {
+            warn!(
+                "[dtid {}] claim fault hook: dropped the claimed SIGCHLD",
+                guest.thread_state().dettid
             );
-            guest.thread_state_mut().stats.count_signal();
-            let time = &guest.thread_state().thread_logical_time;
-            let nanos = time.as_nanos();
-
-            if self.cfg.sequentialize_threads && self.cfg.should_trace_schedevent() {
-                trace_schedevent(
-                    guest,
-                    SchedEvent {
-                        dettid,
-                        op: Op::SignalReceived(signal),
-                        count: 1,
-                        start_rip: None,
-                        end_rip: None,
-                        end_time: Some(nanos),
-                    },
-                    true,
-                )
-                .await;
-            }
-
-            // The delivery of a `SIGCHLD` this thread claimed is placed, so its
-            // turn is not deferred behind runnable work
-            // (`ThreadState::claimed_sigchld`).
-            if signal.signal() == Some(Signal::SIGCHLD)
-                && std::mem::take(&mut guest.thread_state_mut().claimed_sigchld)
-            {
-                tool_global::child_exit_sigchld(
-                    guest,
-                    scheduler::child_exit_sigchld::ChildExitSigchldControl::ClaimedDelivery,
-                )
-                .await;
-            }
-            // Read-write marks this as the delivery itself, which the
-            // scheduler's write-only wakes of a signaled sleeper are not
-            // (`Scheduler::thread_timer_copies`).
-            let mut request = guest
-                .thread_state_mut()
-                .mk_request(ResourceID::InboundSignal(signal), Permission::RW);
-            // Decided here, after every await of this stop that can hand the
-            // thread to the scheduler (the hooks above, the trace), from the
-            // window as it stands now.
-            request.continues_sigreturn = (guest.thread_state().delivered_since_request
-                || reported)
-                && guest.thread_state().scheduler_grants == grants_at_stop
-                && guest.thread_state().consecutive_continuations
-                    < crate::tool_local::MAX_SIGRETURN_CONTINUATIONS
-                && signal.signal() != Some(Signal::SIGCHLD)
-                && slice_open;
-            resource_request(guest, request).await;
-            // The delivery is granted; if it runs a handler, a stop that
-            // comes before the thread files another request continues it.
-            if delivery_runs_handler(guest, signal.raw()) {
-                guest.thread_state_mut().delivered_since_request = true;
-            }
-            // Under `--pipe-wake-latency`, a delivery that ends the process
-            // dooms its threads at this committed turn, before their
-            // host-timed removal (`scheduler::pipe_wake`).
-            if self.cfg.pipe_wake_latency_in_effect().is_some()
-                && match crate::syscalls::signal_shadow::copied_dispositions_for(
-                    guest,
-                    signal.raw(),
-                ) {
-                    Some(copied) => crate::syscalls::default_action_ends_process(
-                        copied.ignored,
-                        copied.caught,
-                        signal.raw(),
-                    ),
-                    None => crate::syscalls::read_kernel_signal_state(guest.pid(), guest.tid())
-                        .is_ok_and(|state| state.default_action_ends_process(signal.raw())),
-                }
-            {
-                tool_global::record_fatal_signal(guest).await;
-            }
-            // A timer entry's siginfo, with its overrun counted now that the
-            // delivery's turn is granted, where the handler's time begins.
-            if timer_entry {
-                use scheduler::discarded_at_send::DiscardedSignalAnswer;
-                use scheduler::posix_timer_coalesce::DeliveryAnswer;
-                let control = scheduler::discarded_at_send::DiscardedSignalControl::DeliveryInfo {
-                    signal: signal.raw(),
-                    at: guest.thread_state().thread_logical_time.as_nanos(),
-                };
-                if let DiscardedSignalAnswer::Delivery(DeliveryAnswer::Rewrite(info)) =
-                    tool_global::discarded_signal(guest, control).await
-                    && let Err(errno) = guest.set_signal_info(info.to_user())
-                {
-                    warn!(
-                        "[dtid {}] signal {} keeps its physical siginfo: {}",
+            guest.thread_state_mut().claimed_sigchld = false;
+            self.keep_timer_across_dropped_signal(guest);
+            return Ok(None);
+        }
+        // A POSIX timer's entry: delivered with its own siginfo, or, if its
+        // timer was set again since it was queued, skipped as Linux skips
+        // it inside the dequeue, with no turn
+        // (<https://github.com/rrnewton/hermit/issues/4262>).
+        let mut timer_entry = false;
+        let stop_time = guest.thread_state().thread_logical_time.as_nanos();
+        if scheduler::discarded_at_send::records(&self.cfg) && (1..32).contains(&signal.raw()) {
+            use scheduler::discarded_at_send::DiscardedSignalAnswer;
+            use scheduler::discarded_at_send::DiscardedSignalControl;
+            use scheduler::posix_timer_coalesce::DeliveryAnswer;
+            let control = DiscardedSignalControl::Dequeue {
+                signal: signal.raw(),
+                at: stop_time,
+            };
+            let answer = tool_global::discarded_signal(guest, control).await;
+            timer_entry = answer == DiscardedSignalAnswer::Delivery(DeliveryAnswer::TimerEntry);
+            match answer {
+                DiscardedSignalAnswer::Delivery(DeliveryAnswer::Suppress) => {
+                    info!(
+                        "[dtid {}] signal {} is a stale POSIX timer entry; skipped",
                         guest.thread_state().dettid,
-                        signal,
-                        errno
+                        signal
                     );
+                    self.keep_timer_across_dropped_signal(guest);
+                    return Ok(None);
                 }
+                DiscardedSignalAnswer::Delivery(DeliveryAnswer::Rewrite(info)) => {
+                    if let Err(errno) = guest.set_signal_info(info.to_user()) {
+                        warn!(
+                            "[dtid {}] signal {} keeps its physical siginfo: {}",
+                            guest.thread_state().dettid,
+                            signal,
+                            errno
+                        );
+                    }
+                }
+                _ => {}
             }
-            if self
-                .end_thread_group_before_fatal_delivery(guest, signal)
-                .await
-            {
-                // As an exit_group does after its grant, file nothing more:
-                // the group's turns are held until it has ended, which needs
-                // this thread to die (Claude review of
-                // https://github.com/rrnewton/hermit/pull/4387, finding 4).
-                info!(
-                    "[dtid {}] finish delivering signal (#{}) {}",
-                    dettid, mycount, signal
-                );
-                return Ok(Some(signal));
-            }
-            // A delivered signal may be caught, ignored, or terminate the
-            // thread group. Reading the lists is harmless; the collected
-            // wakes remain inert unless the ptrace exit callback later reports
-            // that this exact signal caused physical exit.
-            self.stage_thread_group_robust_list_wakes(
+        }
+        Ok(Some(timer_entry))
+    }
+
+    /// The delivery's turn: its hooks, its count and trace, and its
+    /// `InboundSignal` request.
+    async fn inbound_turn<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: SigWrapper,
+        stop: tool_local::InboundStop,
+    ) -> tool_local::InboundTurn {
+        let tool_local::InboundStop {
+            reported,
+            grants_at_stop,
+        } = stop;
+        // The kernel dequeued `signal` before this stop: a hold for it ends
+        // here, and this stop's hooks may end the slice
+        // (`own_signal_turn_hold`).
+        if guest.thread_state().own_signal_turn_hold == Some(signal.raw()) {
+            guest.thread_state_mut().own_signal_turn_hold = None;
+        }
+        let timeslice = guest.thread_state().stats.timeslice_count;
+        self.pre_handler_hook(guest, false, CheckIn::Event).await;
+        // The delivery continues the thread's turn only while the slice
+        // its previous delivery ran in is still open. A stop that ends the
+        // slice is Linux's TIF_NEED_RESCHED case: other threads run
+        // (`schedule()`) before this one resumes and delivers, so the
+        // delivery waits its place behind them instead of being taken
+        // right after the yield. And at most
+        // `MAX_SIGRETURN_CONTINUATIONS` in a row
+        // (`consecutive_continuations`): in every mode, that cap is what
+        // stops a handler that raises its own signal from holding the
+        // CPU for ever.
+        let slice_open = guest.thread_state().stats.timeslice_count == timeslice;
+
+        // For `hermit run --verify`: a guest that faulted on an illegal
+        // instruction may have run code that made syscalls Detcore never
+        // saw, so the run reports `/`, the ancestor of every path, and
+        // names no host input change. A false alarm only withholds a name.
+        // The case this was written for no longer reaches here: on ptrace,
+        // a syscall issued from the untraced stub of Reverie's private page
+        // is followed by a `ud2`, and Reverie now ends the run at that
+        // SIGILL (`UntracedStubSyscall`, a policy refusal) before any Tool
+        // sees it. A stub syscall that never returns to the `ud2` (execve,
+        // exit, rt_sigreturn) raises no SIGILL at all
+        // (https://github.com/rrnewton/reverie/issues/1064). This stays as
+        // the conservative answer for any other illegal instruction. A
+        // guest that first rewrites or replaces the page's code is reported
+        // when it does so (`record_untraced_code_change`).
+        if signal.signal() == Some(Signal::SIGILL) && self.cfg.record_host_inputs {
+            tool_global::record_host_mutation(guest, String::from("/")).await;
+        }
+
+        let dettid = guest.thread_state().dettid;
+        let mycount = guest.thread_state().stats.signal_count;
+        info!(
+            "[dtid {}] handling inbound signal (#{}) {}",
+            dettid, mycount, signal
+        );
+        guest.thread_state_mut().stats.count_signal();
+        let time = &guest.thread_state().thread_logical_time;
+        let nanos = time.as_nanos();
+
+        if self.cfg.sequentialize_threads && self.cfg.should_trace_schedevent() {
+            trace_schedevent(
                 guest,
-                tool_local::RobustListExit::Signal(signal.raw()),
+                SchedEvent {
+                    dettid,
+                    op: Op::SignalReceived(signal),
+                    count: 1,
+                    start_rip: None,
+                    end_rip: None,
+                    end_time: Some(nanos),
+                },
+                true,
             )
             .await;
+        }
+
+        // The delivery of a `SIGCHLD` this thread claimed is placed, so its
+        // turn is not deferred behind runnable work
+        // (`ThreadState::claimed_sigchld`).
+        if signal.signal() == Some(Signal::SIGCHLD)
+            && std::mem::take(&mut guest.thread_state_mut().claimed_sigchld)
+        {
+            tool_global::child_exit_sigchld(
+                guest,
+                scheduler::child_exit_sigchld::ChildExitSigchldControl::ClaimedDelivery,
+            )
+            .await;
+        }
+        // Read-write marks this as the delivery itself, which the
+        // scheduler's write-only wakes of a signaled sleeper are not
+        // (`Scheduler::thread_timer_copies`).
+        let mut request = guest
+            .thread_state_mut()
+            .mk_request(ResourceID::InboundSignal(signal), Permission::RW);
+        // Decided here, after every await of this stop that can hand the
+        // thread to the scheduler (the hooks above, the trace), from the
+        // window as it stands now.
+        request.continues_sigreturn = (guest.thread_state().delivered_since_request || reported)
+            && guest.thread_state().scheduler_grants == grants_at_stop
+            && guest.thread_state().consecutive_continuations
+                < crate::tool_local::MAX_SIGRETURN_CONTINUATIONS
+            && signal.signal() != Some(Signal::SIGCHLD)
+            && slice_open;
+        resource_request(guest, request).await;
+        // The delivery is granted; if it runs a handler, a stop that
+        // comes before the thread files another request continues it.
+        if delivery_runs_handler(guest, signal.raw()) {
+            guest.thread_state_mut().delivered_since_request = true;
+        }
+        tool_local::InboundTurn { dettid, mycount }
+    }
+
+    /// What the granted delivery of `signal` settles: a fatal delivery's
+    /// group exit, a timer entry's siginfo, robust-list wakes, the handler's
+    /// restore mask, and the post-handler hook.
+    async fn inbound_delivered<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: SigWrapper,
+        turn: tool_local::InboundTurn,
+        timer_entry: bool,
+    ) -> Result<Option<SigWrapper>, Errno> {
+        let tool_local::InboundTurn { dettid, mycount } = turn;
+        // Under `--pipe-wake-latency`, a delivery that ends the process
+        // dooms its threads at this committed turn, before their
+        // host-timed removal (`scheduler::pipe_wake`).
+        if self.cfg.pipe_wake_latency_in_effect().is_some()
+            && match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal.raw()) {
+                Some(copied) => crate::syscalls::default_action_ends_process(
+                    copied.ignored,
+                    copied.caught,
+                    signal.raw(),
+                ),
+                None => crate::syscalls::read_kernel_signal_state(guest.pid(), guest.tid())
+                    .is_ok_and(|state| state.default_action_ends_process(signal.raw())),
+            }
+        {
+            tool_global::record_fatal_signal(guest).await;
+        }
+        // A timer entry's siginfo, with its overrun counted now that the
+        // delivery's turn is granted, where the handler's time begins.
+        if timer_entry {
+            use scheduler::discarded_at_send::DiscardedSignalAnswer;
+            use scheduler::posix_timer_coalesce::DeliveryAnswer;
+            let control = scheduler::discarded_at_send::DiscardedSignalControl::DeliveryInfo {
+                signal: signal.raw(),
+                at: guest.thread_state().thread_logical_time.as_nanos(),
+            };
+            if let DiscardedSignalAnswer::Delivery(DeliveryAnswer::Rewrite(info)) =
+                tool_global::discarded_signal(guest, control).await
+                && let Err(errno) = guest.set_signal_info(info.to_user())
+            {
+                warn!(
+                    "[dtid {}] signal {} keeps its physical siginfo: {}",
+                    guest.thread_state().dettid,
+                    signal,
+                    errno
+                );
+            }
+        }
+        if self
+            .end_thread_group_before_fatal_delivery(guest, signal)
+            .await
+        {
+            // As an exit_group does after its grant, file nothing more:
+            // the group's turns are held until it has ended, which needs
+            // this thread to die (Claude review of
+            // https://github.com/rrnewton/hermit/pull/4387, finding 4).
             info!(
                 "[dtid {}] finish delivering signal (#{}) {}",
                 dettid, mycount, signal
             );
-            self.record_handler_restore_mask(guest, signal).await;
-
-            self.post_handler_hook(guest, CheckIn::Event).await;
-            Ok(Some(signal))
+            return Ok(Some(signal));
         }
+        // A delivered signal may be caught, ignored, or terminate the
+        // thread group. Reading the lists is harmless; the collected
+        // wakes remain inert unless the ptrace exit callback later reports
+        // that this exact signal caused physical exit.
+        self.stage_thread_group_robust_list_wakes(
+            guest,
+            tool_local::RobustListExit::Signal(signal.raw()),
+        )
+        .await;
+        info!(
+            "[dtid {}] finish delivering signal (#{}) {}",
+            dettid, mycount, signal
+        );
+        self.record_handler_restore_mask(guest, signal).await;
+
+        self.post_handler_hook(guest, CheckIn::Event).await;
+        Ok(Some(signal))
     }
 
     /// Take back the POSIX timer copies a successful exec flushes
@@ -2726,6 +2787,98 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         Ok(delivered.map(|signal| signal.raw()))
     }
 
+    /// The first half of a delivery a backend announces before the kernel
+    /// dequeues it (an in-guest backend's prediction at a return to guest
+    /// code): the delivery's turn (`inbound_turn`) and nothing that assumes
+    /// the dequeue, which waits for the commit. What the turn leaves is kept
+    /// under the announcement's token (`ThreadState::signal_announcements`).
+    async fn announce_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: i32,
+    ) -> Result<reverie::SignalAnnouncement, Errno> {
+        let stop = self.inbound_stop(guest);
+        let turn = self.inbound_turn(guest, SigWrapper(signal), stop).await;
+        let state = guest.thread_state_mut();
+        let token = state.next_signal_announcement;
+        state.next_signal_announcement = token.wrapping_add(1);
+        state
+            .signal_announcements
+            .push(tool_local::SignalAnnouncementState {
+                token,
+                signal,
+                turn,
+            });
+        Ok(reverie::SignalAnnouncement::new(signal, token))
+    }
+
+    /// The second half of an announced delivery, once the backend's final
+    /// read confirmed it: what the dequeue settles (`inbound_dequeued`), what
+    /// the granted delivery settles (`inbound_delivered`), and the delivery's
+    /// record, as `handle_signal_event` and `handle_raw_signal_event` end. An
+    /// announcement this thread does not hold is `EINVAL`. The commit must
+    /// not wait for a turn: none of its parts files a request in a
+    /// configuration whose backend announces (no timeslice end, no pipe
+    /// hand-off), and a grant taken during it is reported.
+    async fn commit_signal_event<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        announcement: reverie::SignalAnnouncement,
+    ) -> Result<Option<i32>, Errno> {
+        let Some(index) = guest
+            .thread_state()
+            .signal_announcements
+            .iter()
+            .position(|held| {
+                held.token == announcement.token() && held.signal == announcement.signal()
+            })
+        else {
+            return Err(Errno::EINVAL);
+        };
+        let held = guest.thread_state_mut().signal_announcements.remove(index);
+        let grants = guest.thread_state().scheduler_grants;
+        let signal = SigWrapper(held.signal);
+        let delivered = match self.inbound_dequeued(guest, signal).await? {
+            None => None,
+            Some(timer_entry) => {
+                self.inbound_delivered(guest, signal, held.turn, timer_entry)
+                    .await?
+            }
+        };
+        if Signal::try_from(held.signal).is_ok()
+            && scheduler::discarded_at_send::records(&self.cfg)
+            && let Some(control) =
+                consumed_signal_control(guest.pid(), guest.tid(), held.signal, delivered.is_some())
+        {
+            tool_global::discarded_signal(guest, control).await;
+        }
+        if delivered.is_some() {
+            crate::syscalls::signal_shadow::check_and_record_delivery(guest, held.signal).await;
+        }
+        if guest.thread_state().scheduler_grants != grants {
+            warn!(
+                "[dtid {}] the commit of announced signal {} waited for a turn; \
+                 the backend's final read no longer holds",
+                guest.thread_state().dettid,
+                held.signal
+            );
+        }
+        Ok(delivered.map(|signal| signal.raw()))
+    }
+
+    /// An announced delivery that does not happen at the backend's return:
+    /// its turn stays taken, and the signal, still pending, is announced
+    /// again at a later return.
+    fn withdraw_signal_event(
+        &self,
+        thread_state: &mut Self::ThreadState,
+        announcement: reverie::SignalAnnouncement,
+    ) {
+        thread_state
+            .signal_announcements
+            .retain(|held| held.token != announcement.token());
+    }
+
     /// A `SIGCHLD` the backend passes on without reporting it is dropped when
     /// it is the kernel's copy of a child-exit notification the scheduler
     /// sends itself (`scheduler::child_exit_sigchld`). A copy the scheduler
@@ -3119,6 +3272,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     own_signal_turn_hold: None,
                     delivered_since_request: false,
                     returned_from_sigreturn: false,
+                    // A child starts with no announcement: its parent
+                    // settles its own before it returns from the clone.
+                    signal_announcements: Vec::new(),
+                    next_signal_announcement: 0,
                     consecutive_continuations: 0,
                     scheduler_grants: 0,
 

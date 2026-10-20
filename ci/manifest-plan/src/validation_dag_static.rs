@@ -2616,7 +2616,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a forced-only wait-mask unit (signal_shadow): 2183.
     // And the thirty-five scheduler::work_span units (--work-span-report):
     // 2218, listed.
-    ("test.detcore_unit", 2218),
+    // And three two-phase signal-delivery units (signal_announcement_tests): 2221.
+    ("test.detcore_unit", 2221),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4628,7 +4629,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +2 from c5eb858a: 2182.
     // And the same forced-only wait-mask unit: 2183.
     // And the same thirty-five scheduler::work_span units: 2218, listed.
-    ("test.detcore_unit_on_host", 2218),
+    // And three two-phase signal-delivery units (signal_announcement_tests): 2221.
+    ("test.detcore_unit_on_host", 2221),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
