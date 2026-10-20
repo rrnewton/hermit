@@ -12545,7 +12545,7 @@ mod tests {
             sequentialize_threads: true,
             ..Config::default()
         }
-        .with_backend(|backend| backend.supports_blocked_wait_signal_interruption = true);
+        .with_backend(|backend| detcore_model::config::set_kernel_signal_facts(backend, true));
         let state = GlobalState::initialize(&config, false);
         let leader = DetTid::from_raw(17);
         let process = DetPid::from_raw(17);
@@ -12741,7 +12741,7 @@ mod tests {
             sequentialize_threads: true,
             ..Config::default()
         }
-        .with_backend(|backend| backend.supports_blocked_wait_signal_interruption = true);
+        .with_backend(|backend| detcore_model::config::set_kernel_signal_facts(backend, true));
         let state = GlobalState::initialize(&config, false);
         let leader = DetTid::from_raw(17);
         let process = DetPid::from_raw(17);
