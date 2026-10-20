@@ -1,4 +1,5 @@
 [package]
+license-file = "../LICENSE"
 # Third-party backend source trees are never part of the crates.io artifact.
 exclude = ["**/vendor/dynamorio/**", "**/vendor/e9patch/**", "**/vendor/sabre/**", "**/vendor/SaBRe/**", "**/third-party/dynamorio/**", "**/third-party/e9patch/**", "**/third-party/sabre/**"]
 name = "hermit-resources"

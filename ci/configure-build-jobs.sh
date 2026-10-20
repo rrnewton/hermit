@@ -2341,12 +2341,12 @@ fi
 # under reverie-dbt/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so the inventory (989), SDK and native inputs,
 # calibrated budget, job width and limits are unchanged from the 905b53db carry.
-# CARRY TO 72e8be9a5bf8b567c7f9cd4a3188faadbc91d9d9 (0.5.0 release):
+# CARRY TO 7fc6cb89d1cf626caae57bd17b138406491e7fb2 (0.5.0 release):
 # Only package metadata and release notes changed. reverie-dbt/build.rs and
 # reverie-dbt/vendor/dynamorio are byte-identical to 5041073ee5; preserve the
 # measured build budget without changing its clamp or threshold.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 72e8be9a5bf8b567c7f9cd4a3188faadbc91d9d9 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 72e8be9a5bf8b567c7f9cd4a3188faadbc91d9d9 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 7fc6cb89d1cf626caae57bd17b138406491e7fb2 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 7fc6cb89d1cf626caae57bd17b138406491e7fb2 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
