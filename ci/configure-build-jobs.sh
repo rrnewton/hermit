@@ -2341,8 +2341,16 @@ fi
 # under reverie-dbt/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so the inventory (989), SDK and native inputs,
 # calibrated budget, job width and limits are unchanged from the 905b53db carry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 5041073ee5204c976aa3fdba76b16035bbf7ef76 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 5041073ee5204c976aa3fdba76b16035bbf7ef76 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 36e8f9854a33f4be662441e72e84584dafbef50a (2026-10-20): from
+# 5041073ee5204c976aa3fdba76b16035bbf7ef76. One documentation-only commit
+# (signals lane, A5 step 3.2b part 4: how a Tool binds AfterFrame). It changes
+# doc comments in reverie/src/signal_delivery.rs, reverie/src/tool.rs and
+# reverie-ptrace/src/task.rs only; git diff is empty under reverie-dbt/ and
+# for the root Cargo.toml, Cargo.lock and rust-toolchain.toml, so the
+# inventory (989), SDK and native inputs, calibrated budget, job width and
+# limits are unchanged from the 5041073e carry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 36e8f9854a33f4be662441e72e84584dafbef50a ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 36e8f9854a33f4be662441e72e84584dafbef50a (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

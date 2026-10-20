@@ -2265,7 +2265,15 @@ fi
 # under reverie-dbt/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so the inventory (989), SDK and native inputs,
 # calibrated budget, job width and limits are unchanged from the 905b53db carry.
-expected_pin=5041073ee5204c976aa3fdba76b16035bbf7ef76
+# CARRY TO 36e8f9854a33f4be662441e72e84584dafbef50a (2026-10-20): from
+# 5041073ee5204c976aa3fdba76b16035bbf7ef76. One documentation-only commit
+# (signals lane, A5 step 3.2b part 4: how a Tool binds AfterFrame). It changes
+# doc comments in reverie/src/signal_delivery.rs, reverie/src/tool.rs and
+# reverie-ptrace/src/task.rs only; git diff is empty under reverie-dbt/ and
+# for the root Cargo.toml, Cargo.lock and rust-toolchain.toml, so the
+# inventory (989), SDK and native inputs, calibrated budget, job width and
+# limits are unchanged from the 5041073e carry.
+expected_pin=36e8f9854a33f4be662441e72e84584dafbef50a
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
