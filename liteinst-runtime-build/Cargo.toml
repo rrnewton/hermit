@@ -18,7 +18,7 @@ allocator-fixture = []
 # Native-exec artifact construction is outside the 0.5.0 release scope.
 
 [build-dependencies]
-reverie-liteinst-artifact = { version = "0.5.0", git = "https://github.com/rrnewton/reverie.git", rev = "edad7ff63ffa11d7866f261a0f508f3e6b79e827", default-features = false }
+reverie-liteinst-artifact = { version = "0.5.0", git = "https://github.com/rrnewton/reverie.git", rev = "ee9fbe258e39ca90983b840285f684e1bea1762c", default-features = false }
 serde_json = "1.0.151"
 
 

@@ -14,7 +14,7 @@ bincode = { version = "2", features = ["serde"] }
 detcore = { package = "hermit-detcore", version = "0.5.0", path = "../detcore" }
 goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
 libc = "0.2.186"
-reverie = { package = "reverie-core", version = "0.5.0", git = "https://github.com/rrnewton/reverie.git", rev = "edad7ff63ffa11d7866f261a0f508f3e6b79e827" }
+reverie = { package = "reverie-core", version = "0.5.0", git = "https://github.com/rrnewton/reverie.git", rev = "ee9fbe258e39ca90983b840285f684e1bea1762c" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 tempfile = "3.27.0"
