@@ -295,7 +295,7 @@ impl Scheduler {
 
     /// The process `tid`'s exit would end, if it ends one: an `exit_group`,
     /// or the exit of its process's last live thread.
-    fn exit_order_ending_process(&self, tid: DetTid, group: bool) -> Option<DetPid> {
+    pub(super) fn exit_order_ending_process(&self, tid: DetTid, group: bool) -> Option<DetPid> {
         let process = self.registered_process(tid)?;
         let last = group
             || !self

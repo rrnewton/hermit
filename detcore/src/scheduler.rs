@@ -33,6 +33,7 @@ pub(crate) mod signal_control;
 pub(crate) mod signal_lists;
 mod sleep_signal;
 pub mod timed_waiters;
+pub(crate) mod work_span;
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -1557,6 +1558,9 @@ pub struct Scheduler {
     /// State of the study-branch virtual-completion exit order
     /// (`HERMIT_PARALLEL_EXIT_ORDER`, [`exit_order`]); empty when off.
     exit_order: exit_order::ExitOrderState,
+    /// Work and span of the schedule (`HERMIT_WORK_SPAN`, [`work_span`]);
+    /// empty when off.
+    work_span: work_span::WorkSpanState,
     /// `hermit record`: where `step2c_process_io_blockers` logs each
     /// readmission of a backgrounded call (see `rejoin_log`).
     rejoin_writer: Option<RejoinWriter>,
@@ -3008,6 +3012,7 @@ async fn sched_loop_inner(
                     drop(sched);
                     exit_on_scheduler_refusal(&refusal);
                 }
+                sched.write_work_span_report();
                 if let Some(observer) = &observer {
                     observer("run queue empty; scheduler completed");
                 }
@@ -3969,6 +3974,7 @@ impl Scheduler {
             sigkill_fence_valve: Self::SIGKILL_FENCE_VALVE,
             group_exit_decider: None,
             exit_order: exit_order::ExitOrderState::new(cfg),
+            work_span: work_span::WorkSpanState::new(),
             rejoin_writer: match &cfg.replay_data {
                 Some(dir) if cfg.recordreplay_modes && !cfg.replaying => {
                     Some(RejoinWriter::create(dir).unwrap_or_else(|err| {
@@ -12683,6 +12689,7 @@ impl Scheduler {
                 .push_poller(dettid, self.get_priority(dettid), rs.poll_attempt);
             // Before the count reset below hides that this is a retry.
             self.note_sigalrm_polling_wait(dettid, rs);
+            self.work_span_note_wait(dettid, rs.resources.keys().next());
             trace!(
                 "[dtid {}] after deprioritizing polling request, run queue: {:?}",
                 dettid, &self.run_queue
@@ -12703,6 +12710,9 @@ impl Scheduler {
                         rs.blocked_signal_mask,
                         resp,
                     );
+                    if blocked.is_err() {
+                        self.work_span_note_wait(dettid, Some(rid));
+                    }
                     if rs.replay_served_from_log
                         && matches!(rid, ResourceID::BlockingExternalIO(_))
                         && self.blocked.external_io_blockers.contains_key(&dettid)
@@ -13900,6 +13910,14 @@ impl Scheduler {
             ),
             _ => (false, false, false),
         };
+        if self.work_span.enabled {
+            let request = self
+                .next_turns
+                .get(&dtid)
+                .and_then(|turn| turn.req.try_read())
+                .and_then(Result::ok);
+            self.work_span_commit(dtid, request.as_ref());
+        }
         self.progress_epoch += 1;
         self.last_commit_at.insert(dtid, self.progress_epoch);
         let previous_grant = self.guest_state_polled_at.remove(&dtid);

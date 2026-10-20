@@ -2514,14 +2514,18 @@ impl GlobalState {
             request => request,
         };
         let time_from_guest = guest_time.as_nanos();
-        if crate::scheduler::exit_order::exit_order()
+        if (crate::scheduler::exit_order::exit_order()
+            || crate::scheduler::work_span::work_span_path().is_some())
             && matches!(request, GlobalRequest::RequestResources(..))
         {
             // The thread's own computation and syscalls, excluding clock
-            // advances (`DetTime::advance_to`), for the study-branch exit order.
+            // advances (`DetTime::advance_to`), for the study-branch exit order
+            // and work/span report.
             let work =
                 guest_time.user_cpu_time().as_nanos() + guest_time.system_cpu_time().as_nanos();
-            self.sched.lock().unwrap().exit_order_note_work(dtid, work);
+            let mut sched = self.sched.lock().unwrap();
+            sched.exit_order_note_work(dtid, work);
+            sched.work_span_note_cpu(dtid, work);
         }
         // Exec transfer messages authenticate both incarnations before ordinary
         // sender-clock accounting. The carried clock still belongs to the former
@@ -4558,6 +4562,7 @@ impl GlobalState {
                     flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_PARENT)),
                     exit_signal,
                 );
+                sched.work_span_note_spawn(parent_dettid, child_dettid);
                 if is_group_leader {
                     sched.forget_previous_process_exit(child_dettid);
                     // The child's exit signal is posted to its parent at a
