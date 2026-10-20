@@ -4141,6 +4141,11 @@ pub struct ThreadState<T> {
     /// `None` with the option unset.
     #[serde(default)]
     pub(crate) pipe_handoff_due: Option<LogicalTime>,
+    /// For `--work-span-report`: what the tool gathered since this thread's
+    /// previous grant-awaiting request (`scheduler::work_span::gather`).
+    /// Untouched without it, or on a backend whose tool runs in the guest.
+    #[serde(default)]
+    pub(crate) work_span: crate::scheduler::work_span::WorkSpanThread,
     /// A signal this thread sent to its own multi-threaded process, which it
     /// must dequeue before another thread runs: until its own delivery stop
     /// for that signal no timeslice of it ends, at the target, at the PMU
@@ -4956,6 +4961,7 @@ impl<T> ThreadState<T> {
             in_uncharged_bootstrap_syscall: false,
             yield_after_futex_wake: false,
             pipe_handoff_due: None,
+            work_span: Default::default(),
             own_signal_turn_hold: None,
             delivered_since_request: false,
             returned_from_sigreturn: false,

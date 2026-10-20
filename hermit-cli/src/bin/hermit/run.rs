@@ -3997,6 +3997,40 @@ fn futex_wake_yields_parses_round_trips_and_is_refused_where_inert() {
 /// not select by priority (the same predicate the scheduler uses), and with
 /// the DBT backend (https://github.com/rrnewton/hermit/issues/4380).
 #[test]
+fn work_span_report_is_refused_where_there_are_no_turns() {
+    let mut accepted = run_opts_for(&["hermit", "run", "--work-span-report=/var/ws.json", "prog"]);
+    accepted.validate_args_with_perf_support(true).unwrap();
+    for (argv, expected) in [
+        (
+            vec![
+                "hermit",
+                "run",
+                "--no-sequentialize-threads",
+                "--work-span-report=/tmp/ws.json",
+                "prog",
+            ],
+            "--no-sequentialize-threads",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--strace-only",
+                "--work-span-report=/tmp/ws.json",
+                "prog",
+            ],
+            "--strace-only",
+        ),
+    ] {
+        let error = run_opts_for(&argv)
+            .validate_args_with_perf_support(true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{argv:?}: {error}");
+    }
+}
+
+#[test]
 fn pipe_wake_latency_parses_round_trips_and_is_refused_where_inert() {
     for value in ["0", "3000000"] {
         let flag = format!("--pipe-wake-latency={value}");
@@ -6989,6 +7023,29 @@ impl RunOpts {
                 );
             }
         }
+        // `--work-span-report` reads the scheduler's commits; a launch that
+        // has none would write a report of nothing, so it is refused.
+        if let Some(report) = &config.work_span_report {
+            let report = report.display();
+            if self.namespace_only {
+                anyhow::bail!(
+                    "--work-span-report={report} needs Detcore's scheduler; --namespace-only \
+                     (--lite) runs the guest natively, without it"
+                );
+            }
+            if self.strace_only {
+                anyhow::bail!(
+                    "--work-span-report={report} reads the turns of sequentialized threads; \
+                     --strace-only turns sequentialization off"
+                );
+            }
+            if !config.sequentialize_threads {
+                anyhow::bail!(
+                    "--work-span-report={report} reads the turns of sequentialized threads; it \
+                     cannot be combined with --no-sequentialize-threads"
+                );
+            }
+        }
         if config.scheduler_turn_cost.is_some() && backend == Backend::Dbt {
             anyhow::bail!(
                 "the dbt backend cannot apply --scheduler-turn-cost: its runtime reads a frozen \
@@ -7895,7 +7952,23 @@ impl RunOpts {
     /// earlier). `--no-namespace` has no private mounts, and `--image` (a
     /// prototype) replaces the whole root, which this mapping does not model.
     fn validate_summary_json_visibility(&self) -> Result<(), Error> {
-        let Some(path) = self.summary_json.as_deref() else {
+        self.validate_output_visibility("--summary-json", "summary", self.summary_json.as_deref())?;
+        self.validate_output_visibility(
+            "--work-span-report",
+            "report",
+            self.det_opts.det_config.work_span_report.as_deref(),
+        )
+    }
+
+    /// Refuse an output file the run writes from inside its container
+    /// (`flag`'s `what`) at a path the container hides.
+    fn validate_output_visibility(
+        &self,
+        flag: &str,
+        what: &str,
+        path: Option<&Path>,
+    ) -> Result<(), Error> {
+        let Some(path) = path else {
             return Ok(());
         };
         if self.no_namespace
@@ -7931,7 +8004,7 @@ impl RunOpts {
                 )
             };
             anyhow::bail!(
-                "--summary-json {} is not visible inside the run container: {cause}. The summary \
+                "{flag} {} is not visible inside the run container: {cause}. The {what} \
                  is written from inside the container, so it would be lost. {remedy}",
                 path.display()
             );

@@ -2531,7 +2531,25 @@ impl GlobalState {
             }
             request => request,
         };
+        let (work_span, request) = match request {
+            GlobalRequest::WithWorkSpan(payload, request) => (Some(*payload), *request),
+            request => (None, request),
+        };
         let time_from_guest = guest_time.as_nanos();
+        // The thread's own computation and syscalls, excluding clock advances
+        // (`DetTime::advance_to`), and what it gathered, for
+        // `--work-span-report`.
+        let work_span_cpu = self.cfg.work_span_report.is_some().then(|| {
+            guest_time.user_cpu_time().as_nanos() + guest_time.system_cpu_time().as_nanos()
+        });
+        if let Some(cpu) = work_span_cpu {
+            self.sched.lock().unwrap().work_span_note_arrival(
+                dtid,
+                cpu,
+                matches!(request, GlobalRequest::RequestResources(..)),
+                work_span.as_ref(),
+            );
+        }
         // Exec transfer messages authenticate both incarnations before ordinary
         // sender-clock accounting. The carried clock still belongs to the former
         // thread until the successful reconnect commits.
@@ -2902,6 +2920,9 @@ impl GlobalState {
             }
             GlobalRequest::WithForwardedCount(..) => {
                 unreachable!("a counted request is unwrapped on arrival")
+            }
+            GlobalRequest::WithWorkSpan(..) => {
+                unreachable!("a work/span envelope is unwrapped on arrival")
             }
             GlobalRequest::ResumeExec(process) => {
                 let mut resources = Resources::new(dtid);
@@ -3875,11 +3896,15 @@ impl GlobalState {
                     sched.has_child_wait_target(parent, selector),
                 ))
             }
-            GlobalRequest::ConsumeChildWait(parent, child) => R::ConsumeChildWait(
-                self.lock_rpc_scheduler(false)
-                    .await
-                    .consume_child_wait(parent, child),
-            ),
+            GlobalRequest::ConsumeChildWait(parent, child) => R::ConsumeChildWait({
+                let mut sched = self.lock_rpc_scheduler(false).await;
+                if let Some(cpu) = work_span_cpu
+                    && sched.thread_tree.parent_process(&child) == Some(parent)
+                {
+                    sched.work_span_note_reap(dtid, cpu, parent, child);
+                }
+                sched.consume_child_wait(parent, child)
+            }),
             GlobalRequest::ProcessGroup(process) => R::ProcessGroup(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -4570,6 +4595,7 @@ impl GlobalState {
                     flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_PARENT)),
                     exit_signal,
                 );
+                sched.work_span_note_spawn(parent_dettid, child_dettid);
                 if is_group_leader {
                     sched.forget_previous_process_exit(child_dettid);
                     // The child's exit signal is posted to its parent at a
@@ -6334,6 +6360,15 @@ pub enum GlobalRequest {
     /// may know under another identity, whose fdinfo could not be read for
     /// this reason (`procfs::locks::LockLedger::refuse`). Appended last.
     LockLedgerRefused(String),
+    /// `request`, a resource request, sent with what `--work-span-report`
+    /// gathered since the thread's previous one
+    /// (`scheduler::work_span::WorkSpanPayload`) and unwrapped on arrival. Sent
+    /// only with the report on, so a run without it sends the same requests,
+    /// byte for byte. Appended last.
+    WithWorkSpan(
+        Box<crate::scheduler::work_span::WorkSpanPayload>,
+        Box<GlobalRequest>,
+    ),
 }
 
 /// Responses from the global object
@@ -7138,6 +7173,21 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    send_with_work_span(guest, request, None).await
+}
+
+/// [`send_and_update_time`], with `--work-span-report`'s payload for a
+/// resource request (`work_span::payload_for`). The envelope is put on only
+/// after every classification of `request` here, so none of them can see it.
+async fn send_with_work_span<G, T>(
+    guest: &mut G,
+    request: GlobalRequest,
+    work_span: Option<crate::scheduler::work_span::WorkSpanPayload>,
+) -> (Option<LogicalTime>, GlobalResponse)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
     // The successful exec callback must bind a surviving worker to its new
     // backend TID before issuing ordinary replacement-image requests. In
     // particular, a missed reconnect must not turn ThreadExited into exit(0).
@@ -7158,6 +7208,24 @@ where
     let mytime = guest.thread_state().thread_logical_time.clone();
     let mm = guest.thread_state().mm_id;
     let continues_sigreturn = request_continues_sigreturn(&request);
+    // Any other request that may let another thread commit first, and an
+    // exec's preparation, carry `--work-span-report`'s pending events, so
+    // that they reach the scheduler before that commit or the image goes
+    // (`work_span::flush_for`).
+    let work_span = work_span.or_else(|| {
+        (resumes_from_grant(&request) || matches!(request, GlobalRequest::PrepareExec(..)))
+            .then(|| {
+                crate::scheduler::work_span::flush_for(
+                    crate::scheduler::work_span::gathers(guest.config()),
+                    &mut guest.thread_state_mut().work_span,
+                )
+            })
+            .flatten()
+    });
+    let request = match work_span {
+        Some(payload) => GlobalRequest::WithWorkSpan(Box::new(payload), Box::new(request)),
+        None => request,
+    };
     let mut resp = guest.send_rpc((mytime, mm, counted_request(request))).await;
     // A grant while the request was pending is a hand-off to the scheduler,
     // the one place every hand-off is noted (`ThreadState::note_scheduler_handoff`).
@@ -7385,7 +7453,9 @@ async fn wait_for_process_exit(pidfd: std::os::fd::OwnedFd, valve: Duration) -> 
 /// one (`Resources::continues_sigreturn`), as an ordinary or a parked request.
 fn request_continues_sigreturn(request: &GlobalRequest) -> bool {
     match request {
-        GlobalRequest::WithForwardedCount(_, request) => request_continues_sigreturn(request),
+        GlobalRequest::WithForwardedCount(_, request) | GlobalRequest::WithWorkSpan(_, request) => {
+            request_continues_sigreturn(request)
+        }
         GlobalRequest::RequestResources(resources, _)
         | GlobalRequest::ParkedRequest(resources, ..) => resources.continues_sigreturn,
         _ => false,
@@ -7394,7 +7464,9 @@ fn request_continues_sigreturn(request: &GlobalRequest) -> bool {
 
 fn resumes_from_grant(request: &GlobalRequest) -> bool {
     match request {
-        GlobalRequest::WithForwardedCount(_, request) => resumes_from_grant(request),
+        GlobalRequest::WithForwardedCount(_, request) | GlobalRequest::WithWorkSpan(_, request) => {
+            resumes_from_grant(request)
+        }
         GlobalRequest::RequestResources(..)
         | GlobalRequest::ParkedRequest(..)
         | GlobalRequest::ResumeParkedRequest { .. }
@@ -7475,8 +7547,15 @@ where
             "[detcore, dtid {}] BLOCKING on resource_request rpc... {:?}",
             &dettid, r
         );
-        let resp =
-            send_and_update_time(guest, GlobalRequest::RequestResources(r.clone(), detpid)).await;
+        // `--work-span-report`'s pipe events and request facts ride on this
+        // request in an envelope; without it, the request is sent unchanged.
+        let work_span = crate::scheduler::work_span::payload_for(
+            crate::scheduler::work_span::gathers(guest.config()),
+            r.resources.contains_key(&ResourceID::InternalIOPolling),
+            &mut guest.thread_state_mut().work_span,
+        );
+        let request = GlobalRequest::RequestResources(r.clone(), detpid);
+        let resp = send_with_work_span(guest, request, work_span).await;
         match resp.1 {
             GlobalResponse::RequestResources(x) => {
                 trace!(
@@ -9667,6 +9746,24 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// A signal-handler continuation is classified as one through every
+    /// envelope, `--work-span-report`'s included: the envelope must never
+    /// reset the continuation count that limits them
+    /// (`ThreadState::consecutive_continuations`).
+    #[test]
+    fn a_continuation_is_classified_through_every_envelope() {
+        use super::GlobalRequest;
+        let mut continuation = crate::resources::Resources::new(super::DetTid::from_raw(3));
+        continuation.continues_sigreturn = true;
+        let leaf = GlobalRequest::RequestResources(continuation, super::DetPid::from_raw(3));
+        let work_span = GlobalRequest::WithWorkSpan(Box::default(), Box::new(leaf.clone()));
+        let counted = GlobalRequest::WithForwardedCount(1, Box::new(work_span.clone()));
+        for request in [&leaf, &work_span, &counted] {
+            assert!(super::request_continues_sigreturn(request), "{request:?}");
+            assert!(super::resumes_from_grant(request), "{request:?}");
+        }
+    }
+
     /// `response` as `receive_rpc` returns it after a turn was granted
     /// (`GlobalResponse::Granted`).
     fn granted(response: super::GlobalResponse) -> super::GlobalResponse {

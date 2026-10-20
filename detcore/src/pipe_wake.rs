@@ -250,6 +250,61 @@ impl<T: crate::record_or_replay::RecordOrReplay> crate::Detcore<T> {
             .collect()
     }
 
+    /// For `--work-span-report`: gather what this call's result gives the
+    /// report (`crate::scheduler::work_span::gather`), to send with this
+    /// thread's next grant-awaiting request. A descriptor is classified by
+    /// the file type behind its `/proc` link: an anonymous pipe by its host
+    /// (device, inode), a socket, named FIFO or anonymous inode as untracked,
+    /// anything else as not observed. Reads host state only; nothing the guest
+    /// or the scheduler's decisions see changes.
+    pub(crate) fn gather_channel_event<G: reverie::Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &reverie::syscalls::Syscall,
+        res: &Result<i64, reverie::Error>,
+    ) {
+        use std::os::unix::fs::FileTypeExt;
+        use std::os::unix::fs::MetadataExt;
+
+        use crate::scheduler::work_span::DescriptorClass;
+        let physical_tid = guest.thread_state().physical_tid;
+        let tid = guest.tid().as_raw();
+        let visible =
+            crate::fifo_peer::guest_descriptors_are_visible(&self.cfg.backend, physical_tid);
+        let time = guest.thread_state().thread_logical_time.clone();
+        let pipefs = crate::scheduler::work_span::pipefs_device();
+        crate::scheduler::work_span::gather(
+            crate::scheduler::work_span::gathers(&self.cfg),
+            call,
+            res,
+            &mut guest.thread_state_mut().work_span,
+            |fd| {
+                if !visible {
+                    return None;
+                }
+                let meta = std::fs::metadata(format!("/proc/{tid}/fd/{fd}")).ok()?;
+                let kind = meta.file_type();
+                if kind.is_fifo() {
+                    Some(if Some(meta.dev()) == pipefs {
+                        DescriptorClass::Pipe((meta.dev(), meta.ino()))
+                    } else {
+                        DescriptorClass::Untracked
+                    })
+                } else if kind.is_file()
+                    || kind.is_dir()
+                    || kind.is_char_device()
+                    || kind.is_block_device()
+                {
+                    None
+                } else {
+                    // A socket, or an anonymous inode (eventfd, signalfd).
+                    Some(DescriptorClass::Untracked)
+                }
+            },
+            || time.user_cpu_time().as_nanos() + time.system_cpu_time().as_nanos(),
+        );
+    }
+
     /// This thread closed `end` (explicitly: `close`, `close_range`, or a
     /// `dup2` or `dup3` over it): ready what that closing gives the other
     /// side. An implicit close at exit or exec readies nothing.
