@@ -1,7 +1,9 @@
 [package]
+# Third-party backend source trees are never part of the crates.io artifact.
+exclude = ["**/vendor/dynamorio/**", "**/vendor/e9patch/**", "**/vendor/sabre/**", "**/vendor/SaBRe/**", "**/third-party/dynamorio/**", "**/third-party/e9patch/**", "**/third-party/sabre/**"]
 name = "hermit-resources"
 description = "Resource accounting and limit types for the Hermit deterministic execution engine."
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 readme = "README.md"
 homepage = "https://hermetic-infra.org"

@@ -24,9 +24,11 @@
 # ===========================================================================
 
 [package]
+# Third-party backend source trees are never part of the crates.io artifact.
+exclude = ["**/vendor/dynamorio/**", "**/vendor/e9patch/**", "**/vendor/sabre/**", "**/vendor/SaBRe/**", "**/third-party/dynamorio/**", "**/third-party/e9patch/**", "**/third-party/sabre/**"]
 name = "hermit-detcore"
 description = "Detcore: the deterministic scheduler and syscall determinization core of the Hermit execution engine."
-version = "0.4.1"
+version = "0.5.0"
 edition = "2024"
 readme = "README.md"
 homepage = "https://hermetic-infra.org"
@@ -59,7 +61,7 @@ bincode = { version = "2", features = ["serde"] }
 bitflags = { version = "2.13.1", features = ["serde"], default-features = false }
 chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-features = false }
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
-detcore-model = { version = "0.4.1", path = "../detcore-model" }
+detcore-model = { version = "0.5.0", path = "../detcore-model" }
 futures = { version = "0.3.31", features = ["async-await", "compat"] }
 hex = { version = "0.4.3", features = ["alloc"] }
 libc = "0.2.186"
@@ -74,7 +76,7 @@ raw-cpuid = "10.7.0"
 regex = "1.13.1"
 # Abstract Reverie interface ONLY. Never add a concrete backend here (see the
 # BACKEND-ABSTRACTION COMMANDMENT at the top of this file).
-reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "5041073ee5204c976aa3fdba76b16035bbf7ef76" }
+reverie = { package = "reverie-core", version = "0.5.0", git = "https://github.com/rrnewton/reverie.git", rev = "72e8be9a5bf8b567c7f9cd4a3188faadbc91d9d9" }
 ruzstd = "0.9.0"
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }

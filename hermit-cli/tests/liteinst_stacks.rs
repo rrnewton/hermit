@@ -211,7 +211,7 @@ fn qualify(
                     manifest,
                     Some(source.clone()),
                     format!(
-                        "git+https://github.com/rrnewton/reverie.git?rev={pin}#reverie-liteinst-preload@0.4.1"
+                        "git+https://github.com/rrnewton/reverie.git?rev={pin}#reverie-liteinst-preload@0.5.0"
                     ),
                     artifact::STANDALONE_ROOT,
                 )

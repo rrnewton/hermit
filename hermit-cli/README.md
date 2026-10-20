@@ -28,7 +28,7 @@ Install the C compiler/linker and native development libraries before Cargo:
 ```sh
 sudo apt-get update
 sudo apt-get install -y build-essential pkg-config libunwind-dev liblzma-dev
-cargo +stable install hermit-run --version 0.4.1 --locked
+cargo +stable install hermit-run --version 0.5.0 --locked
 hermit --version
 hermit run -- /bin/echo hello
 ```
@@ -36,6 +36,8 @@ hermit run -- /bin/echo hello
 No extra LZMA linker flags or nightly Rust are required. On other distributions,
 install the equivalent C toolchain, pkg-config, libunwind and LZMA development
 packages. The installer also provides `hermit-dap` and `verification-report`.
+The registry package builds the Rust library and executables; `libhermit.so`
+is a separate `hermit-cdylib` source build.
 
 The default installation includes **ptrace and KVM**. SaBRe support, e9patch
 preprocessing and LiteInst are off by default and require their explicit Cargo
