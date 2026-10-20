@@ -232,7 +232,8 @@ pub struct WorkSpanState {
     cpu_committed: HashMap<DetTid, u64>,
     /// Each thread's latest commit time.
     finish: HashMap<DetTid, Bounds>,
-    /// A child thread's start: its creator's latest commit when it was created.
+    /// A child thread's start: where its creator had reached at the clone
+    /// (`Scheduler::work_span_note_spawn`).
     spawned: HashMap<DetTid, Bounds>,
     /// Per thread, the reaps met inside its current segment.
     segment: HashMap<DetTid, Segment>,
@@ -431,13 +432,23 @@ impl Scheduler {
     /// wait: from here on the thread follows what other threads do, although
     /// it stays in the run queue until the scheduler skips it.
     ///
-    /// Requests that arrive at host-timed moments raise no one and change
-    /// nothing another thread reads, so that the report is a function of
-    /// commit order. A thread whose latest commit sent its call outside the
-    /// schedule keeps its latest sample to itself until its continuation
-    /// commits, at a scheduled point; the continuation's request is its last
-    /// before that commit. An exec transfer, whose clock is the former
-    /// thread's, keeps nothing.
+    /// Only a thread inside its own segment, between a commit and its next
+    /// request, sends requests at scheduled moments. Every other request
+    /// arrives at a host-timed moment, so it raises no one and changes
+    /// nothing another thread reads, and the report stays a function of
+    /// commit order:
+    /// - a child's `StartNewThread`, which can arrive after other threads
+    ///   have taken turns, sets the baseline and nothing else (its creator's
+    ///   own request raised the waiters as far as the clone);
+    /// - a thread whose latest commit sent its call outside the schedule
+    ///   keeps its latest sample to itself until its continuation commits, at
+    ///   a scheduled point (the continuation's request is its last before
+    ///   that commit);
+    /// - a thread whose `Exit` has committed (`committed_exits`), whose
+    ///   deregistration and robust-list wakes follow at host-timed moments,
+    ///   keeps nothing: it does no more work, and no one waits on it;
+    /// - an exec transfer, whose clock is the former thread's, keeps nothing;
+    /// - a thread the scheduler does not know keeps nothing.
     pub(crate) fn work_span_note_arrival(&mut self, tid: DetTid, cpu: u64, arrival: Arrival<'_>) {
         if !self.work_span.enabled || matches!(arrival, Arrival::ExecTransfer) {
             return;
@@ -453,9 +464,11 @@ impl Scheduler {
             state.threads += 1;
             state.cpu_committed.insert(tid, cpu);
         }
-        if !known {
+        if !known || matches!(arrival, Arrival::StartsThread) || self.committed_exits.contains(&tid)
+        {
             return;
         }
+        let state = &mut self.work_span;
         if matches!(state.waiting.get(&tid), Some((_, WaitKind::Outside))) {
             state.cpu_outside.insert(tid, cpu);
             return;
@@ -559,10 +572,12 @@ impl Scheduler {
         raise(&mut segment.hi, hi);
     }
 
-    /// `child` was created by `creator`, whose clock the registration's own
-    /// request has just sampled: the child starts where the creator had
-    /// reached at the clone, which a clone without a turn of its own puts
-    /// after the creator's latest commit.
+    /// `child` was created by `creator`: the child starts where the creator
+    /// had reached at the clone. A clone without a turn of its own is
+    /// registered by the creator's own request, which has just sampled its
+    /// clock. A vfork's registration comes from the child, and its parent is
+    /// outside the schedule from its `BlockingVfork` commit, immediately
+    /// before the clone, so the parent's latest sample is that commit's.
     pub(crate) fn work_span_note_spawn(&mut self, creator: DetTid, child: DetTid) {
         let state = &mut self.work_span;
         if !state.enabled {
@@ -1257,6 +1272,63 @@ mod tests {
         commit(&mut sched, 1, 950, Some((resume, Permission::RW)));
         assert_eq!(finish(&sched, 1), (950, 950));
         assert!(sched.work_span.cpu_outside.is_empty());
+    }
+
+    /// A registered child's `StartNewThread` can arrive after other threads
+    /// have taken turns: it sets the baseline and raises no one.
+    #[test]
+    fn a_childs_late_start_raises_no_one() {
+        let mut sched = family();
+        commit(&mut sched, 1, 0, None);
+        commit(&mut sched, 1, 5_000, None);
+        sched.work_span_note_spawn(tid(1), tid(2));
+        let futex = FutexID::private(MmId::initial(tid(1)), 0x40);
+        commit(&mut sched, 3, 0, None);
+        sched.sleep_futex_waiter(&tid(3), futex, None, u32::MAX, None);
+        commit(&mut sched, 1, 5_100, None);
+        let before = sched.work_span.waiting[&tid(3)].0;
+        sched.work_span_note_arrival(tid(2), 5_000, Arrival::StartsThread);
+        assert_eq!(sched.work_span.waiting[&tid(3)].0, before);
+        assert_eq!(sched.work_span.cpu_committed[&tid(2)], 5_000);
+        assert!(!sched.work_span.cpu_now.contains_key(&tid(2)));
+    }
+
+    /// A thread's requests after its `Exit` commits (its deregistration, its
+    /// robust-list wakes) arrive at host-timed moments: they keep nothing.
+    #[test]
+    fn requests_after_an_exit_keep_nothing() {
+        let mut sched = family();
+        sched.work_span_note_spawn(tid(1), tid(2));
+        commit(&mut sched, 1, 0, None);
+        commit(&mut sched, 2, 0, None);
+        commit(&mut sched, 2, 10_000, exit(2));
+        sched.committed_exits.insert(tid(2));
+        let futex = FutexID::private(MmId::initial(tid(1)), 0x40);
+        sched.sleep_futex_waiter(&tid(1), futex, None, u32::MAX, None);
+        commit(&mut sched, 3, 0, None);
+        let before = sched.work_span.waiting[&tid(1)].0;
+        sched.work_span_note_arrival(tid(2), 10_500, Arrival::Other);
+        assert_eq!(sched.work_span.waiting[&tid(1)].0, before);
+        assert_eq!(sched.work_span.cpu_now[&tid(2)], 10_000);
+    }
+
+    /// A vfork: the parent is outside the schedule from its `BlockingVfork`
+    /// commit, the registration comes from the child, and the child starts at
+    /// that commit.
+    #[test]
+    fn a_vfork_child_starts_at_its_parents_vfork_commit() {
+        let mut sched = family();
+        commit(&mut sched, 1, 0, None);
+        let vfork = ResourceID::BlockingVfork(crate::resources::ExternalOpId::new(tid(1), 1));
+        commit(&mut sched, 1, 3_000, Some((vfork, Permission::RW)));
+        sched.next_turns.remove(&tid(2));
+        sched.work_span_note_arrival(tid(2), 3_000, Arrival::Other);
+        register(&mut sched, 2);
+        sched.work_span_note_spawn(tid(1), tid(2));
+        sched.work_span_note_arrival(tid(2), 3_000, Arrival::StartsThread);
+        sched.work_span_commit(tid(2), Some(&request(2, None)));
+        commit(&mut sched, 2, 3_400, None);
+        assert_eq!(finish(&sched, 2), (3_400, 3_400));
     }
 
     /// An exec transfer's clock is the former thread's: it keeps nothing.

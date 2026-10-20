@@ -770,9 +770,10 @@ pub struct Config {
     /// lower span over the scheduler's certain happens-before edges (program order, spawn, a
     /// child's exit to the wait that reaps it, conflicting resources), and an upper span that
     /// also orders a thread that waited after everything other threads did meanwhile. The
-    /// report lists the dependencies it does not model (what a wait waited for, so the lower
-    /// span can be optimistic; and data passed without a wait, through channels, shared memory,
-    /// signals, files or devices). An observer: no scheduling decision reads it, so the schedule
+    /// report lists the dependencies it does not model: what a wait waited for and who sent a
+    /// signal, so the lower span can be optimistic; and what passes without a wait (data, an end
+    /// of file or a peer's close found on a channel, a pending signal taken by `sigtimedwait`,
+    /// shared memory, files and devices), which neither span orders. An observer: no scheduling decision reads it, so the schedule
     /// and the guest's results are those of a run without it, except that Hermit's own command
     /// line, which a guest can read as PID 1's, shows the option. Needs sequentialized threads
     /// and the ptrace backend. Unset (the default), nothing is gathered.
