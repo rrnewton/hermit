@@ -191,7 +191,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         chaos_epoch_length_ns: 0,
     }
     .with_backend(|backend| {
-        backend.supports_blocked_wait_signal_interruption = false;
+        detcore::set_kernel_signal_facts(backend, false);
         backend.runs_guest_code_between_injections = false;
     })
 });
@@ -293,7 +293,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         chaos_epoch_length_ns: 0,
     }
     .with_backend(|backend| {
-        backend.supports_blocked_wait_signal_interruption = false;
+        detcore::set_kernel_signal_facts(backend, false);
         backend.runs_guest_code_between_injections = false;
     })
 });
@@ -395,7 +395,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         chaos_epoch_length_ns: 0,
     }
     .with_backend(|backend| {
-        backend.supports_blocked_wait_signal_interruption = false;
+        detcore::set_kernel_signal_facts(backend, false);
         backend.runs_guest_code_between_injections = false;
     })
 });
