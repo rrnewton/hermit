@@ -19,6 +19,7 @@ use std::sync::MutexGuard;
 use std::time::Duration;
 
 use detcore_model::pedigree::Pedigree;
+use detcore_model::summary::PreemptionReplayDivergences;
 use detcore_model::summary::TimesliceStats;
 use nix::fcntl::OFlag;
 use nix::sys::stat;
@@ -3522,6 +3523,10 @@ pub struct ThreadStats {
     /// the `--replay-preemptions-from` log.
     pub last_recorded_slice: Option<u64>,
 
+    /// Where a lenient preemption replay departed from this thread's record
+    /// (`follow_recorded_slice`).
+    pub preemption_replay: PreemptionReplayDivergences,
+
     /// Distribution (min/max/sum/count) of completed timeslice durations for this
     /// thread, in virtual nanoseconds. A slice's duration is the delta of
     /// `thread_logical_time` between two consecutive `next_timeslice` resets.
@@ -6083,8 +6088,12 @@ impl<T> ThreadState<T> {
     /// - Sets `max_timeslice_end` when PMU-backed preemption is enabled.
     /// - Resets the statistics for the timeslice.
     ///
-    /// Returns: an optional new priority.
-    pub fn next_timeslice(&mut self, cfg: &Config) -> Option<Priority> {
+    /// Returns: an optional new priority, or why a replayed preemption record
+    /// cannot be followed.
+    pub fn next_timeslice(
+        &mut self,
+        cfg: &Config,
+    ) -> Result<Option<Priority>, PreemptionReplayDivergence> {
         let logical_timeslice = cfg.target_timeslice.or(cfg.max_timeslice);
         if let Some(timeout_ns) = logical_timeslice {
             let current_ns = self.thread_logical_time.as_nanos();
@@ -6148,11 +6157,28 @@ impl<T> ThreadState<T> {
             let replay_controls_deadline =
                 self.preemption_points.is_some() || cfg.replay_schedule_from.is_some();
 
+            // One RCB of logical time at this slice's rate, as
+            // `post_handler_hook` computes it.
+            let replay_epsilon = Duration::from_nanos(
+                (NANOS_PER_RCB
+                    * cfg.clock_multiplier.unwrap_or(1.0)
+                    * self.rcb_time_multiplier().as_f64())
+                .ceil() as u64,
+            );
             // Preemption-point replay from recorded --chaos configuration.
             if let Some(thi) = &mut self.preemption_points {
                 if self.stats.last_recorded_slice.is_none() {
                     // We have not tapped out the recording yet.
-                    if let Some((end_time, prio, replay_rcb_end)) = thi.next_with_rcbs() {
+                    let at = RecordedSliceCheck {
+                        dettid: self.dettid,
+                        current: current_ns,
+                        current_rcbs: self.committed_clock_value,
+                        epsilon: replay_epsilon,
+                        lenient: cfg.replay_preemptions_lenient,
+                    };
+                    let followed =
+                        follow_recorded_slice(thi, &at, &mut self.stats.preemption_replay)?;
+                    if let Some((end_time, prio, replay_rcb_end)) = followed {
                         debug!(
                             "[dtid {}] next timeslice (T{}), set by recording to {:?} (current {}), priority {}",
                             self.dettid,
@@ -6161,32 +6187,6 @@ impl<T> ThreadState<T> {
                             current_ns,
                             prio
                         );
-                        let current_rcbs = self.committed_clock_value;
-                        if let Some(target_rcbs) = replay_rcb_end
-                            && target_rcbs < current_rcbs
-                        {
-                            panic!(
-                                "Cannot set RCB end of timeslice to {} for thread {}, when current RCB count is already {}.",
-                                target_rcbs, self.dettid, current_rcbs
-                            )
-                        }
-                        let exact_deadline_is_now =
-                            replay_rcb_end.is_some_and(|target| target == current_rcbs);
-                        if end_time <= current_ns && !exact_deadline_is_now {
-                            // Records that store their epoch are reconciled with
-                            // this run's epoch before any guest starts (see
-                            // `adopt_replayed_schedule_epoch` in hermit-cli), so
-                            // reaching this with such a record means the replay
-                            // really diverged. A record without an epoch cannot
-                            // be checked up front; say what usually causes it.
-                            panic!(
-                                "Cannot set end of timeslice to {} for thread {}, when current thread logical time is already {}. \
-                                 The replayed preemption record's timeslice ends are absolute virtual times; if it was \
-                                 recorded under a different virtual-time epoch, replay it with that --epoch \
-                                 (https://github.com/rrnewton/hermit/issues/3413).",
-                                end_time, self.dettid, current_ns
-                            )
-                        }
                         self.end_of_timeslice = Some(end_time);
                         self.replay_rcb_end = replay_rcb_end;
                         result = Some(prio);
@@ -6324,14 +6324,14 @@ impl<T> ThreadState<T> {
             self.last_rcb_timer = None;
             self.last_rcb_timer_is_max = false;
             self.reset_timeslice_stats(current_ns);
-            result
+            Ok(result)
         } else {
             self.end_of_timeslice = None;
             self.replay_rcb_end = None;
             self.max_timeslice_end = None;
             self.last_rcb_timer = None;
             self.last_rcb_timer_is_max = false;
-            None
+            Ok(None)
         }
     }
 
@@ -6362,6 +6362,200 @@ impl<T> ThreadState<T> {
     /// guarantee determinism!
     pub fn guest_past_first_execve(&self) -> bool {
         self.past_global_first_execve
+    }
+}
+
+/// Where a thread stands when it takes its next recorded slice
+/// ([`follow_recorded_slice`]).
+struct RecordedSliceCheck {
+    dettid: DetTid,
+    /// The thread's logical time.
+    current: LogicalTime,
+    /// The thread's committed RCB count.
+    current_rcbs: u64,
+    /// One RCB of logical time at the slice's rate.
+    epsilon: Duration,
+    /// `--replay-preemptions-lenient`.
+    lenient: bool,
+}
+
+/// The next recorded slice `(end, priority, RCB target)` a preemption replay
+/// follows, or `None` once `history` is exhausted.
+///
+/// A strict replay refuses an entry the thread is already past: by RCB count
+/// (`RcbOverrun`), by time while its RCB target is still ahead (`TimeSkew`),
+/// or, without a target, by time to within one RCB (`TimeLag`). An entry whose
+/// target is the current count ends the slice now, as recorded.
+///
+/// A lenient replay follows a time skew, since the RCB target alone ends the
+/// slice (`ThreadState::timeslice_expired`), and skips every entry the thread
+/// is past, counting each in `counts`: one check-in consumes them all, and the
+/// slice ends at the first entry still ahead, with that entry's priority. Once
+/// a call has skipped an entry, one whose target is the current count is past
+/// too, so skipping never yields an empty slice (two change points at one
+/// time). Each call consumes at least one entry, so a diverged replay cannot
+/// stall here (<https://github.com/rrnewton/hermit/issues/4497>).
+fn follow_recorded_slice(
+    history: &mut ThreadHistoryIterator,
+    at: &RecordedSliceCheck,
+    counts: &mut PreemptionReplayDivergences,
+) -> Result<Option<(LogicalTime, Priority, Option<u64>)>, PreemptionReplayDivergence> {
+    let mut skipped = false;
+    while let Some((end_time, prio, target)) = history.next_with_rcbs() {
+        let divergence = match target {
+            Some(target_rcbs)
+                if target_rcbs < at.current_rcbs || (skipped && target_rcbs == at.current_rcbs) =>
+            {
+                Some(PreemptionReplayDivergence::RcbOverrun {
+                    dettid: at.dettid,
+                    target_rcbs,
+                    current_rcbs: at.current_rcbs,
+                })
+            }
+            // Adjacent slices at one RCB count are recorded whenever time
+            // moved without a branch; a faithful replay reaches them so.
+            Some(target_rcbs) if target_rcbs == at.current_rcbs => None,
+            Some(target_rcbs) if end_time <= at.current => {
+                Some(PreemptionReplayDivergence::TimeSkew {
+                    dettid: at.dettid,
+                    end_time,
+                    current: at.current,
+                    target_rcbs,
+                    current_rcbs: at.current_rcbs,
+                })
+            }
+            Some(_) => None,
+            // Without a target the slice ends by time, and the PMU arming
+            // treats an end less than one RCB ahead as already passed
+            // (`post_handler_hook`), so that window is passed too.
+            None => (end_time < at.current + at.epsilon).then_some(
+                PreemptionReplayDivergence::TimeLag {
+                    dettid: at.dettid,
+                    end_time,
+                    current: at.current,
+                },
+            ),
+        };
+        match divergence {
+            None => return Ok(Some((end_time, prio, target))),
+            Some(divergence) if !at.lenient => return Err(divergence),
+            Some(PreemptionReplayDivergence::TimeSkew { .. }) => {
+                counts.time_skews += 1;
+                return Ok(Some((end_time, prio, target)));
+            }
+            Some(PreemptionReplayDivergence::RcbOverrun { .. }) => counts.rcb_overruns += 1,
+            Some(PreemptionReplayDivergence::TimeLag { .. }) => counts.time_lags += 1,
+        }
+        skipped = true;
+    }
+    Ok(None)
+}
+
+/// Why a thread's next timeslice cannot follow the replayed
+/// `--replay-preemptions-from` record: the replay has diverged from the
+/// recorded run, and the run ends with the policy-refusal exit instead of
+/// guessing (<https://github.com/rrnewton/hermit/issues/4497>).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreemptionReplayDivergence {
+    /// The thread has retired more RCBs than its next recorded preemption's
+    /// target.
+    RcbOverrun {
+        /// The thread.
+        dettid: DetTid,
+        /// The recorded preemption's RCB target.
+        target_rcbs: u64,
+        /// The thread's committed RCB count.
+        current_rcbs: u64,
+    },
+    /// The thread's next recorded preemption has an RCB target still ahead,
+    /// but its recorded time is at or behind the thread's time: before
+    /// reaching that count the thread did work the recorded run did not
+    /// (syscalls, retries, RDTSCs).
+    TimeSkew {
+        /// The thread.
+        dettid: DetTid,
+        /// The recorded end of the thread's next timeslice.
+        end_time: LogicalTime,
+        /// The thread's logical time.
+        current: LogicalTime,
+        /// The recorded preemption's RCB target.
+        target_rcbs: u64,
+        /// The thread's committed RCB count.
+        current_rcbs: u64,
+    },
+    /// A record without RCB targets puts the thread's next preemption less
+    /// than one RCB's time ahead of the thread's time, or behind it.
+    TimeLag {
+        /// The thread.
+        dettid: DetTid,
+        /// The recorded end of the thread's next timeslice.
+        end_time: LogicalTime,
+        /// The thread's logical time.
+        current: LogicalTime,
+    },
+}
+
+impl PreemptionReplayDivergence {
+    /// The `kind=` the refusal names.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::RcbOverrun { .. } => "rcb-overrun",
+            Self::TimeSkew { .. } => "time-skew",
+            Self::TimeLag { .. } => "time-lag",
+        }
+    }
+}
+
+impl std::fmt::Display for PreemptionReplayDivergence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "preemption replay diverged (cause=preemption-replay-diverged kind={}): ",
+            self.kind()
+        )?;
+        match self {
+            Self::RcbOverrun {
+                dettid,
+                target_rcbs,
+                current_rcbs,
+            } => write!(
+                f,
+                "thread {dettid} has retired {current_rcbs} RCBs, past its next recorded \
+                 preemption at RCB {target_rcbs}"
+            )?,
+            Self::TimeSkew {
+                dettid,
+                end_time,
+                current,
+                target_rcbs,
+                current_rcbs,
+            } => write!(
+                f,
+                "thread {dettid} is at virtual time {current} with {current_rcbs} RCBs, past its \
+                 next recorded preemption at {end_time}, whose RCB target {target_rcbs} is still \
+                 ahead"
+            )?,
+            // Records that store their epoch are reconciled with this run's
+            // epoch before any guest starts (`adopt_replayed_schedule_epoch` in
+            // hermit-cli); a record without one cannot be checked up front.
+            Self::TimeLag {
+                dettid,
+                end_time,
+                current,
+            } => write!(
+                f,
+                "thread {dettid} is at virtual time {current}, at or past its next recorded \
+                 preemption at {end_time} (the record has no RCB targets). If the record stores \
+                 no epoch and was recorded under a different one, replay it with that --epoch \
+                 (https://github.com/rrnewton/hermit/issues/3413)"
+            )?,
+        }
+        write!(
+            f,
+            ". If this record was edited, replay it with --replay-preemptions-lenient; if it \
+             was not, this is a Hermit determinism bug: please report it \
+             (https://github.com/rrnewton/hermit/issues)."
+        )
     }
 }
 
@@ -7051,7 +7245,7 @@ mod timeslice_tests {
             ..Default::default()
         };
         let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
         let now = state.thread_logical_time.as_nanos();
         let end = state.end_of_timeslice.unwrap();
         assert_eq!(end, now + Duration::from_nanos(200_000_000));
@@ -7092,7 +7286,7 @@ mod timeslice_tests {
             ..Default::default()
         };
         let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
         let now = state.thread_logical_time.as_nanos();
         let turn = Duration::from_nanos(500_000);
         state.cap_timeslice_at_deadline(Duration::from_nanos(1_000), 1.0, turn, false);
@@ -7112,7 +7306,7 @@ mod timeslice_tests {
             ..Default::default()
         };
         let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
         let end = state.end_of_timeslice;
         state.cap_timeslice_at_deadline(Duration::from_nanos(5_000), 1.0, Duration::ZERO, true);
         assert_eq!(state.end_of_timeslice, end);
@@ -7131,7 +7325,7 @@ mod timeslice_tests {
             ..Default::default()
         };
         let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
         let first = state.take_pending_chaos_epochs().pop().unwrap();
         assert_eq!(first.epoch, 0);
         assert_eq!(state.chaos_epoch, 0);
@@ -7139,7 +7333,7 @@ mod timeslice_tests {
         state
             .thread_logical_time
             .add_rcbs_with_multiplier(10_000, first.factor);
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
         assert_eq!(state.chaos_epoch, 0);
         assert_eq!(state.chaos_slowdown_factor, first.factor);
         assert!(state.take_pending_chaos_epochs().is_empty());
@@ -7159,7 +7353,7 @@ mod timeslice_tests {
         };
         let tid = DetPid::from_raw(5);
         let mut state = ThreadState::new(tid, &config, ());
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
         let first = state.pending_chaos_epochs[0];
 
         state
@@ -7169,7 +7363,7 @@ mod timeslice_tests {
             state.thread_logical_time.without_starting().as_nanos() / config.chaos_epoch_length_ns;
         assert!(expected_epoch > 0);
 
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
         let transitions = state.take_pending_chaos_epochs();
         assert_eq!(transitions.len(), 2);
         assert_eq!(transitions[0], first);
@@ -7208,7 +7402,7 @@ mod timeslice_tests {
                 .into_iter(),
         );
 
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
 
         assert!(state.chaos_slowdown_active);
         assert_eq!(state.chaos_epoch, transition.epoch);
@@ -7246,7 +7440,7 @@ mod timeslice_tests {
             .with_chaos_epochs(vec![first, second]);
         state.preemption_points = Some(history.into_iter());
 
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
         assert_eq!(state.chaos_slowdown_factor, first.factor);
         assert_eq!(
             state.end_of_timeslice,
@@ -7260,7 +7454,7 @@ mod timeslice_tests {
             .add_rcbs_with_multiplier(4, first.factor);
         state.committed_clock_value = 4;
         assert!(state.timeslice_expired());
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
 
         assert_eq!(
             state.thread_logical_time.as_nanos(),
@@ -7293,14 +7487,439 @@ mod timeslice_tests {
             .with_preemption_rcbs(vec![4, 4]);
         state.preemption_points = Some(history.into_iter());
 
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
         state.thread_logical_time.add_rcbs(4);
         state.committed_clock_value = 4;
         assert!(state.timeslice_expired());
 
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
         assert_eq!(state.replay_rcb_end, Some(4));
         assert!(state.timeslice_expired());
+    }
+
+    /// A thread replaying `history` that ran `rcbs` RCBs (10 ns each) and
+    /// `extra_ns` of syscall time into its first recorded slice, about to take
+    /// its second.
+    fn replay_at_second_slice(
+        history: ThreadHistory,
+        rcbs: u64,
+        extra_ns: u64,
+    ) -> (ThreadState<()>, Config) {
+        replay_at_second_slice_with(history, rcbs, extra_ns, false)
+    }
+
+    /// [`replay_at_second_slice`], under `--replay-preemptions-lenient` if
+    /// `lenient`.
+    fn replay_at_second_slice_with(
+        history: ThreadHistory,
+        rcbs: u64,
+        extra_ns: u64,
+        lenient: bool,
+    ) -> (ThreadState<()>, Config) {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            replay_preemptions_lenient: lenient,
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        state.preemption_points = Some(history.into_iter());
+        state.next_timeslice(&config).unwrap();
+        state.thread_logical_time.add_rcbs(rcbs);
+        if extra_ns > 0 {
+            state.thread_logical_time.add_syscall_with_cost(extra_ns);
+        }
+        state.committed_clock_value = rcbs;
+        (state, config)
+    }
+
+    fn two_slices(start: LogicalTime, ends_ns: [u64; 2]) -> ThreadHistory {
+        ThreadHistory::new().with_prio_changes(
+            ends_ns
+                .iter()
+                .map(|end| (start + Duration::from_nanos(*end), DEFAULT_PRIORITY))
+                .collect(),
+        )
+    }
+
+    fn replay_start() -> LogicalTime {
+        ThreadState::new(DetPid::from_raw(5), &Config::default(), ())
+            .thread_logical_time
+            .as_nanos()
+    }
+
+    /// Both causes, and what to do about each, are in every refusal.
+    fn assert_names_both_causes(divergence: &PreemptionReplayDivergence) {
+        let message = divergence.to_string();
+        assert!(
+            message.starts_with(&format!(
+                "preemption replay diverged (cause=preemption-replay-diverged kind={}): ",
+                divergence.kind()
+            )),
+            "{message}"
+        );
+        assert!(
+            message
+                .contains("If this record was edited, replay it with --replay-preemptions-lenient")
+                && message.contains("this is a Hermit determinism bug: please report it"),
+            "{message}"
+        );
+    }
+
+    /// <https://github.com/rrnewton/hermit/issues/4497>: a thread whose clock
+    /// passed its next recorded end, at or before it, while that preemption's
+    /// RCB target is still ahead did work the recorded run did not: a typed
+    /// time skew, not a panic. A recorded end one nanosecond ahead is followed.
+    #[test]
+    fn an_anchored_end_the_thread_has_passed_is_a_time_skew() {
+        let start = replay_start();
+        let anchored = |end| two_slices(start, [20, end]).with_preemption_rcbs(vec![2, 9]);
+        for (rcbs, extra_ns) in [(2, 500), (4, 0)] {
+            let (mut state, config) = replay_at_second_slice(anchored(40), rcbs, extra_ns);
+            let current = state.thread_logical_time.as_nanos();
+            assert!(current >= start + Duration::from_nanos(40), "{current}");
+            let divergence = state.next_timeslice(&config).unwrap_err();
+            assert_eq!(
+                divergence,
+                PreemptionReplayDivergence::TimeSkew {
+                    dettid: state.dettid,
+                    end_time: start + Duration::from_nanos(40),
+                    current,
+                    target_rcbs: 9,
+                    current_rcbs: rcbs,
+                }
+            );
+            assert_eq!(divergence.kind(), "time-skew");
+            assert_names_both_causes(&divergence);
+        }
+
+        let (mut state, config) = replay_at_second_slice(anchored(41), 4, 0);
+        assert_eq!(state.next_timeslice(&config), Ok(Some(DEFAULT_PRIORITY)));
+        assert_eq!(state.replay_rcb_end, Some(9));
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(start + Duration::from_nanos(41))
+        );
+    }
+
+    /// A slice whose RCB target is the current count ends now, as recorded,
+    /// however far the clock moved: adjacent slices at one count are recorded
+    /// whenever time moves without a branch, and a faithful replay reaches
+    /// them so.
+    #[test]
+    fn an_rcb_target_already_reached_is_followed_whatever_the_time() {
+        let start = replay_start();
+        let (mut state, config) = replay_at_second_slice(
+            two_slices(start, [20, 30]).with_preemption_rcbs(vec![2, 2]),
+            2,
+            500,
+        );
+        assert!(state.thread_logical_time.as_nanos() > start + Duration::from_nanos(30));
+        assert_eq!(state.next_timeslice(&config), Ok(Some(DEFAULT_PRIORITY)));
+        assert_eq!(state.replay_rcb_end, Some(2));
+        assert!(state.timeslice_expired());
+    }
+
+    /// A thread past its next recorded RCB target cannot follow the record:
+    /// a typed overrun, not a panic. Reaching the target exactly is not past
+    /// it.
+    #[test]
+    fn an_rcb_overrun_is_a_typed_divergence() {
+        let start = replay_start();
+        let anchored = || two_slices(start, [20, 60]).with_preemption_rcbs(vec![2, 5]);
+        let (mut state, config) = replay_at_second_slice(anchored(), 6, 0);
+        let divergence = state.next_timeslice(&config).unwrap_err();
+        assert_eq!(
+            divergence,
+            PreemptionReplayDivergence::RcbOverrun {
+                dettid: state.dettid,
+                target_rcbs: 5,
+                current_rcbs: 6,
+            }
+        );
+        assert_eq!(divergence.kind(), "rcb-overrun");
+        assert_names_both_causes(&divergence);
+        let message = divergence.to_string();
+        assert!(
+            message.contains(&format!(
+                "thread {} has retired 6 RCBs, past its next recorded preemption at RCB 5",
+                state.dettid
+            )),
+            "{message}"
+        );
+
+        let (mut state, config) = replay_at_second_slice(anchored(), 5, 0);
+        assert_eq!(state.next_timeslice(&config), Ok(Some(DEFAULT_PRIORITY)));
+        assert!(state.timeslice_expired());
+    }
+
+    /// A record without RCB targets whose next end is less than one RCB's time
+    /// (10 ns here) ahead of the thread, or behind it, cannot be followed: the
+    /// PMU arming would take that end as already passed. A typed time lag
+    /// naming both times and the epoch remedy; an end one RCB ahead is
+    /// followed.
+    #[test]
+    fn a_time_only_end_within_one_rcb_is_a_typed_time_lag() {
+        let start = replay_start();
+        // The thread is at 30 ns after three RCBs.
+        for end in [25, 30, 31, 39] {
+            let (mut state, config) = replay_at_second_slice(two_slices(start, [20, end]), 3, 0);
+            let current = state.thread_logical_time.as_nanos();
+            assert_eq!(current, start + Duration::from_nanos(30));
+            let divergence = state.next_timeslice(&config).unwrap_err();
+            assert_eq!(
+                divergence,
+                PreemptionReplayDivergence::TimeLag {
+                    dettid: state.dettid,
+                    end_time: start + Duration::from_nanos(end),
+                    current,
+                },
+                "end {end}"
+            );
+            assert_eq!(divergence.kind(), "time-lag");
+            assert_names_both_causes(&divergence);
+            assert!(divergence.to_string().contains("--epoch"), "{divergence}");
+        }
+
+        let (mut state, config) = replay_at_second_slice(two_slices(start, [20, 40]), 3, 0);
+        assert_eq!(state.next_timeslice(&config), Ok(Some(DEFAULT_PRIORITY)));
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(start + Duration::from_nanos(40))
+        );
+    }
+
+    /// The window is one RCB at the slice's own rate: under a 2x chaos
+    /// slowdown an end 15 ns ahead is less than one RCB (20 ns) ahead.
+    #[test]
+    fn the_time_lag_window_scales_with_the_slowdown() {
+        let start = replay_start();
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let slowed = ChaosEpochTransition {
+            logical_time: start,
+            epoch: 0,
+            factor: RcbTimeMultiplier::from_f64(2.0),
+        };
+        let history = |end| two_slices(start, [20, end]).with_chaos_epochs(vec![slowed]);
+        let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        state.preemption_points = Some(history(35).into_iter());
+        state.next_timeslice(&config).unwrap();
+        state
+            .thread_logical_time
+            .add_rcbs_with_multiplier(1, slowed.factor);
+        state.committed_clock_value = 1;
+        assert_eq!(
+            state.thread_logical_time.as_nanos(),
+            start + Duration::from_nanos(20)
+        );
+        assert!(matches!(
+            state.next_timeslice(&config),
+            Err(PreemptionReplayDivergence::TimeLag { .. })
+        ));
+
+        let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        state.preemption_points = Some(history(40).into_iter());
+        state.next_timeslice(&config).unwrap();
+        state
+            .thread_logical_time
+            .add_rcbs_with_multiplier(1, slowed.factor);
+        state.committed_clock_value = 1;
+        assert_eq!(state.next_timeslice(&config), Ok(Some(DEFAULT_PRIORITY)));
+    }
+
+    /// Anchored entries at `ends_ns` (after the start) with `rcbs` targets,
+    /// each with its own priority, so a test can tell which one a slice took.
+    fn anchored(start: LogicalTime, entries: &[(u64, u64)]) -> ThreadHistory {
+        ThreadHistory::new()
+            .with_prio_changes(
+                entries
+                    .iter()
+                    .enumerate()
+                    .map(|(ix, (end, _))| {
+                        (
+                            start + Duration::from_nanos(*end),
+                            DEFAULT_PRIORITY + ix as Priority,
+                        )
+                    })
+                    .collect(),
+            )
+            .with_preemption_rcbs(entries.iter().map(|(_, rcbs)| *rcbs).collect())
+    }
+
+    /// Lenient replay follows a time skew: the slice ends at the recorded RCB
+    /// target, and the skew is counted.
+    #[test]
+    fn lenient_replay_follows_a_time_skew_and_counts_it() {
+        let start = replay_start();
+        let (mut state, config) =
+            replay_at_second_slice_with(anchored(start, &[(20, 2), (40, 9)]), 4, 500, true);
+        assert_eq!(
+            state.next_timeslice(&config),
+            Ok(Some(DEFAULT_PRIORITY + 1))
+        );
+        assert_eq!(state.replay_rcb_end, Some(9));
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(start + Duration::from_nanos(40))
+        );
+        assert!(!state.timeslice_expired());
+        assert_eq!(
+            state.stats.preemption_replay,
+            PreemptionReplayDivergences {
+                time_skews: 1,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// Lenient replay skips, in one check-in, every recorded preemption whose
+    /// RCB target the thread has passed -- and, once it has skipped one, the
+    /// one at the current count -- and ends the slice at the first still
+    /// ahead, with that entry's priority.
+    #[test]
+    fn lenient_replay_skips_every_passed_rcb_target_in_one_check_in() {
+        let start = replay_start();
+        for (entries, skipped) in [
+            (vec![(20, 2), (40, 5), (60, 6), (80, 12)], 2),
+            (vec![(20, 2), (40, 5), (60, 7), (80, 12)], 2),
+            (vec![(20, 2), (40, 5), (80, 12)], 1),
+        ] {
+            let (mut state, config) =
+                replay_at_second_slice_with(anchored(start, &entries), 7, 0, true);
+            let last = entries.len() - 1;
+            assert_eq!(
+                state.next_timeslice(&config),
+                Ok(Some(DEFAULT_PRIORITY + last as Priority)),
+                "{entries:?}"
+            );
+            assert_eq!(state.replay_rcb_end, Some(12), "{entries:?}");
+            assert_eq!(
+                state.end_of_timeslice,
+                Some(start + Duration::from_nanos(80))
+            );
+            assert_eq!(
+                state.stats.preemption_replay,
+                PreemptionReplayDivergences {
+                    rcb_overruns: skipped,
+                    ..Default::default()
+                },
+                "{entries:?}"
+            );
+        }
+    }
+
+    /// Without a skip, an entry whose target is the current count is followed
+    /// as recorded in lenient replay too, and nothing is counted.
+    #[test]
+    fn lenient_replay_follows_an_rcb_target_already_reached() {
+        let start = replay_start();
+        let (mut state, config) =
+            replay_at_second_slice_with(anchored(start, &[(20, 2), (30, 2)]), 2, 500, true);
+        assert_eq!(
+            state.next_timeslice(&config),
+            Ok(Some(DEFAULT_PRIORITY + 1))
+        );
+        assert!(state.timeslice_expired());
+        assert!(state.stats.preemption_replay.is_empty());
+    }
+
+    /// Lenient replay of a record without RCB targets skips every entry less
+    /// than one RCB ahead of the thread and ends the slice at the first one
+    /// beyond.
+    #[test]
+    fn lenient_replay_skips_time_only_entries_within_one_rcb() {
+        let start = replay_start();
+        let history = ThreadHistory::new().with_prio_changes(
+            [20u64, 25, 39, 40]
+                .iter()
+                .enumerate()
+                .map(|(ix, end)| {
+                    (
+                        start + Duration::from_nanos(*end),
+                        DEFAULT_PRIORITY + ix as Priority,
+                    )
+                })
+                .collect(),
+        );
+        let (mut state, config) = replay_at_second_slice_with(history, 3, 0, true);
+        assert_eq!(
+            state.next_timeslice(&config),
+            Ok(Some(DEFAULT_PRIORITY + 3))
+        );
+        assert_eq!(state.replay_rcb_end, None);
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(start + Duration::from_nanos(40))
+        );
+        assert_eq!(
+            state.stats.preemption_replay,
+            PreemptionReplayDivergences {
+                time_lags: 2,
+                ..Default::default()
+            }
+        );
+    }
+
+    /// A lenient replay that skips the record's last entries goes on with the
+    /// record's final priority, as a replay past its last preemption does.
+    #[test]
+    fn lenient_replay_that_skips_the_rest_takes_the_final_slice() {
+        let start = replay_start();
+        let mut history = anchored(start, &[(20, 2), (40, 5), (60, 6)]);
+        history.final_prio = DEFAULT_PRIORITY + 9;
+        let (mut state, config) = replay_at_second_slice_with(history, 7, 0, true);
+        assert_eq!(
+            state.next_timeslice(&config),
+            Ok(Some(DEFAULT_PRIORITY + 9))
+        );
+        assert_eq!(state.stats.last_recorded_slice, Some(1));
+        assert_eq!(state.replay_rcb_end, None);
+        assert_eq!(state.stats.preemption_replay.rcb_overruns, 2);
+    }
+
+    /// The same record and thread state give the same strict refusal and the
+    /// same lenient slice: the decision reads nothing else.
+    #[test]
+    fn replay_decisions_depend_only_on_the_record_and_the_threads_counters() {
+        let start = replay_start();
+        let decide = |lenient| {
+            let (mut state, config) = replay_at_second_slice_with(
+                anchored(start, &[(20, 2), (40, 5), (80, 12)]),
+                7,
+                0,
+                lenient,
+            );
+            (
+                state.next_timeslice(&config),
+                state.end_of_timeslice,
+                state.stats.preemption_replay,
+            )
+        };
+        assert_eq!(decide(false), decide(false));
+        assert!(decide(false).0.is_err());
+        assert_eq!(decide(true), decide(true));
+    }
+
+    /// A new thread whose first recorded preemption is already passed is
+    /// refused at its first slice (`Detcore::handle_thread_start`).
+    #[test]
+    fn a_first_recorded_preemption_already_passed_is_refused() {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let start = replay_start();
+        let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        state.preemption_points = Some(two_slices(start, [5, 40]).into_iter());
+        assert!(matches!(
+            state.next_timeslice(&config),
+            Err(PreemptionReplayDivergence::TimeLag { .. })
+        ));
     }
 
     #[test]
@@ -7313,7 +7932,7 @@ mod timeslice_tests {
         let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
         let now = state.thread_logical_time.as_nanos();
 
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
 
         assert_eq!(
             state.end_of_timeslice,
@@ -7335,7 +7954,7 @@ mod timeslice_tests {
         let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
         let now = state.thread_logical_time.as_nanos();
 
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
 
         assert_eq!(
             state.end_of_timeslice,
@@ -7354,7 +7973,7 @@ mod timeslice_tests {
         let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
         let now = state.thread_logical_time.as_nanos();
 
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
 
         let max_end = now + Duration::from_nanos(20_000);
         assert_eq!(state.end_of_timeslice, Some(max_end));
@@ -7375,7 +7994,7 @@ mod timeslice_tests {
         let configured_max = now + Duration::from_nanos(100_000);
         let minimum_progress = now + Duration::from_nanos(11);
 
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
 
         assert_eq!(state.max_timeslice_end, state.end_of_timeslice);
         assert!(state.max_timeslice_end.unwrap() <= configured_max);
@@ -7393,7 +8012,7 @@ mod timeslice_tests {
         let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
         let now = state.thread_logical_time.as_nanos();
 
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
 
         let expected = now + Duration::from_nanos(100_000);
         assert_eq!(state.end_of_timeslice, Some(expected));
@@ -7410,7 +8029,7 @@ mod timeslice_tests {
         state.preemption_points = Some(ThreadHistory::new().into_iter());
         let now = state.thread_logical_time.as_nanos();
 
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
 
         let bounded_end = Some(now + Duration::from_nanos(100_000));
         assert_eq!(state.end_of_timeslice, bounded_end);
@@ -7434,14 +8053,14 @@ mod timeslice_tests {
             .with_preemption_rcbs(vec![5_000]);
         state.preemption_points = Some(history.into_iter());
 
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
         assert_eq!(state.end_of_timeslice, Some(recorded_end));
         state.cap_timeslice_at_deadline(Duration::from_nanos(1_000), 1.0, Duration::ZERO, false);
         assert_eq!(state.end_of_timeslice, Some(recorded_end));
 
         let mut exhausted = ThreadState::new(DetPid::from_raw(3), &config, ());
         exhausted.preemption_points = Some(ThreadHistory::new().into_iter());
-        exhausted.next_timeslice(&config);
+        exhausted.next_timeslice(&config).unwrap();
         exhausted.cap_timeslice_at_deadline(
             Duration::from_nanos(1_000),
             1.0,
@@ -7477,7 +8096,7 @@ mod timeslice_tests {
             ..Default::default()
         };
         let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
 
         // Past the target: a syscall would end the slice, an rdtsc must not.
         state.thread_logical_time.add_rcbs(500);
@@ -7498,7 +8117,7 @@ mod timeslice_tests {
         };
         assert!(!config.target_timeslice_syscalls_only);
         let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
         state.thread_logical_time.add_rcbs(99);
         assert!(!state.instruction_trap_ends_timeslice(&config));
         state.thread_logical_time.add_rcbs(1);
@@ -7516,7 +8135,7 @@ mod timeslice_tests {
             ..Default::default()
         };
         let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
-        state.next_timeslice(&config);
+        state.next_timeslice(&config).unwrap();
         assert_eq!(state.max_timeslice_end, None);
 
         // 1,000 ns is 100 RCBs at the default 10 ns per RCB.
@@ -7536,7 +8155,7 @@ mod timeslice_tests {
             ..Default::default()
         };
         let mut state = ThreadState::new(DetPid::from_raw(1), &untargeted, ());
-        state.next_timeslice(&untargeted);
+        state.next_timeslice(&untargeted).unwrap();
         state.thread_logical_time.add_rcbs(1_999);
         assert_eq!(
             state.instruction_trap_ends_timeslice(&untargeted),
@@ -7552,7 +8171,7 @@ mod timeslice_tests {
             ..Default::default()
         };
         let mut state = ThreadState::new(DetPid::from_raw(1), &targeted, ());
-        state.next_timeslice(&targeted);
+        state.next_timeslice(&targeted).unwrap();
         state.preemption_points = Some(ThreadHistory::new().into_iter());
         state.thread_logical_time.add_rcbs(500);
         assert!(state.timeslice_expired());

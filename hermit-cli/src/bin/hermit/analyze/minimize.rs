@@ -27,15 +27,16 @@ use rand::RngExt as _;
 use rand::SeedableRng;
 use rand_pcg::Pcg64Mcg;
 
+use crate::analyze::consts::LOG_EXT;
 use crate::analyze::types::AnalyzeOpts;
 use crate::global_opts::GlobalOpts;
 
 /// Sanity check that a series of preemptions don't include duplicates and are monotonically increasing.
-fn sanity_preempts(vec: &[(LogicalTime, Priority)]) -> anyhow::Result<()> {
+fn sanity_preempts(vec: &[(LogicalTime, Priority, Option<u64>)]) -> anyhow::Result<()> {
     let mut set = BTreeSet::new();
 
     let mut time_last = None;
-    for (ns, prio) in vec {
+    for (ns, prio, _) in vec {
         if let Some(last) = time_last
             && *ns <= last
         {
@@ -99,7 +100,9 @@ impl AnalyzeOpts {
         let mut remaining_unknown: BTreeMap<DetTid, _> = BTreeMap::new();
         let mut init_intervention_count = 0;
         for (dtid, history) in init_schedule.extract_all() {
-            let vec = history.as_vec();
+            // Each preemption keeps its recorded RCB target, so a round's record
+            // stays RCB-anchored (https://github.com/rrnewton/hermit/issues/4497).
+            let vec = history.as_vec_with_rcbs();
             sanity_preempts(&vec)?;
             init_intervention_count += vec.len();
             remaining_unknown.insert(dtid, vec);
@@ -123,8 +126,10 @@ impl AnalyzeOpts {
         }
 
         // The ones we know for sure are critical.
-        let mut critical_preempts: BTreeMap<DetTid, BTreeSet<(LogicalTime, Priority)>> =
-            BTreeMap::new();
+        let mut critical_preempts: BTreeMap<
+            DetTid,
+            BTreeSet<(LogicalTime, Priority, Option<u64>)>,
+        > = BTreeMap::new();
 
         // We take threads out of consideration if they have no interventions:
         let all_threads = pr.all_threads();
@@ -241,7 +246,12 @@ impl AnalyzeOpts {
                             }
                             Ok(())
                         })?;
-                    self.stamp_trial_record(PreemptionRecord::from_vecs(&btmap))
+                    // The source record's epoch and chaos slowdown transitions
+                    // come along, so the round replays under the same clock.
+                    self.stamp_trial_record(
+                        PreemptionRecord::from_vecs_with_rcbs(&btmap)
+                            .with_replay_context_of(&init_schedule),
+                    )
                 };
                 if let Err(e) = pr_new.validate() {
                     bail!(
@@ -303,16 +313,40 @@ impl AnalyzeOpts {
                             let preempts = remaining_unknown.get_mut(&selected_tid).unwrap();
                             preempts.append(&mut cut);
                         }
+                        // A cut that took the thread's last unknown
+                        // preemptions took the thread off the worklist; the
+                        // restored ones still need deciding.
+                        if !remaining_threads.contains(&selected_tid) {
+                            remaining_threads.push(selected_tid);
+                        }
                         continue;
                     }
                 }
             }
         }
-        Ok((
-            last_matching_attempt.expect("at least one run to match the criteria"),
-            last_matching_pr_file.expect("at least one run to match the criteria"),
-            last_matching_log.expect("at least one run to match the criteria"),
-        ))
+        match (
+            last_matching_attempt,
+            last_matching_pr_file,
+            last_matching_log,
+        ) {
+            (Some(record), Some(file), Some(log)) => Ok((record, file, log)),
+            // No trial met the criteria, so every preemption was critical:
+            // the minimized record is the source record, whose target run
+            // wrote its log beside it.
+            _ => {
+                eprintln!(
+                    ":: {}",
+                    "No minimization trial met the criteria: every preemption is critical."
+                        .yellow()
+                        .bold()
+                );
+                Ok((
+                    init_schedule,
+                    preempts_path.to_path_buf(),
+                    preempts_path.with_extension(LOG_EXT),
+                ))
+            }
+        }
     }
 }
 
@@ -378,5 +412,169 @@ mod tests {
                 "minimization ran more trials after trial {failing_trial} failed"
             );
         }
+    }
+
+    /// Every round's record keeps the source record's RCB target for each
+    /// preemption it keeps, and the source's epoch, so a minimization replay
+    /// stays RCB-anchored and on the source's clock. Before, rounds were
+    /// rebuilt time-only and without the epoch
+    /// (https://github.com/rrnewton/hermit/issues/4497).
+    #[test]
+    fn minimize_rounds_keep_rcb_targets_and_the_epoch() {
+        let workspace = tempfile::tempdir().unwrap();
+        let preempts_path = workspace.path().join("target.preempts");
+        let tid = DetTid::from_raw(3);
+        let epoch = "2026-01-01T00:00:00Z";
+        let mut writer = detcore::preemptions::PreemptionWriter::new(None);
+        writer.register_thread(tid, FIRST_PRIORITY);
+        let rcbs_at = |k: u64| k * 10;
+        for k in 1..=8u64 {
+            writer.insert_reprioritization(
+                tid,
+                LogicalTime::from_nanos(k * 1000),
+                rcbs_at(k),
+                FIRST_PRIORITY + k as Priority - 1,
+                FIRST_PRIORITY + k as Priority,
+            );
+        }
+        let mut record: serde_json::Value = serde_json::from_str(&writer.into_string()).unwrap();
+        record["epoch"] = serde_json::Value::from(epoch);
+        std::fs::write(&preempts_path, record.to_string()).unwrap();
+        let options =
+            AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
+                .unwrap();
+        let mut rounds = 0;
+        options
+            .minimize_with(&preempts_path, |_runname, trial_preempts| {
+                rounds += 1;
+                let text = std::fs::read_to_string(trial_preempts).unwrap();
+                let round: PreemptionRecord = serde_json::from_str(&text).unwrap();
+                let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(json["epoch"], epoch, "round {rounds}: {text}");
+                let entries = &round.as_vecs_with_rcbs()[&tid];
+                for (time, _prio, rcbs) in entries.iter().skip(1) {
+                    assert_eq!(
+                        *rcbs,
+                        Some(rcbs_at(time.as_nanos() / 1000)),
+                        "round {rounds}: the preemption at {time} lost its RCB target: {text}"
+                    );
+                }
+                Ok(true)
+            })
+            .unwrap();
+        assert!(rounds > 0);
+    }
+
+    /// Rounds that drop a critical preemption fail, so the minimizer puts it
+    /// back: every round record, including those with critical preemptions
+    /// restored, validates and keeps each preemption's own RCB target, and
+    /// the minimized record keeps exactly the critical preemptions, anchored
+    /// (https://github.com/rrnewton/hermit/issues/4497).
+    #[test]
+    fn critical_preemptions_put_back_keep_their_rcb_targets() {
+        let workspace = tempfile::tempdir().unwrap();
+        let preempts_path = workspace.path().join("target.preempts");
+        let tid = DetTid::from_raw(3);
+        let mut writer = detcore::preemptions::PreemptionWriter::new(None);
+        writer.register_thread(tid, FIRST_PRIORITY);
+        let rcbs_at = |k: u64| k * 10;
+        for k in 1..=8u64 {
+            writer.insert_reprioritization(
+                tid,
+                LogicalTime::from_nanos(k * 1000),
+                rcbs_at(k),
+                FIRST_PRIORITY + k as Priority - 1,
+                FIRST_PRIORITY + k as Priority,
+            );
+        }
+        std::fs::write(&preempts_path, writer.into_string()).unwrap();
+        let options =
+            AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
+                .unwrap();
+        let critical = [3000u64, 6000];
+        // Each change point's time and RCB target; a change point without a
+        // target fails here.
+        let anchored_changes = |record: &PreemptionRecord| -> Vec<(u64, u64)> {
+            record.as_vecs_with_rcbs()[&tid]
+                .iter()
+                .skip(1)
+                .map(|(time, _prio, rcbs)| (time.as_nanos(), rcbs.expect("an RCB target")))
+                .collect()
+        };
+        let (mut failed, mut restored) = (0, 0);
+        let mut dropped = std::collections::BTreeSet::new();
+        let (minimized, _, _) = options
+            .minimize_with(&preempts_path, |runname, trial_preempts| {
+                let text = std::fs::read_to_string(trial_preempts).unwrap();
+                let round: PreemptionRecord = serde_json::from_str(&text).unwrap();
+                round.validate().unwrap();
+                let changes = anchored_changes(&round);
+                for (time, rcbs) in &changes {
+                    assert_eq!(*rcbs, rcbs_at(time / 1000), "{runname}: {text}");
+                }
+                let times: Vec<u64> = changes.iter().map(|(time, _)| *time).collect();
+                for time in critical {
+                    if !times.contains(&time) {
+                        dropped.insert(time);
+                    } else if dropped.contains(&time) {
+                        restored += 1;
+                    }
+                }
+                let matches = critical.iter().all(|time| times.contains(time));
+                if !matches {
+                    failed += 1;
+                }
+                Ok(matches)
+            })
+            .unwrap();
+        assert!(
+            failed > 0 && restored > 0,
+            "failed {failed}, restored {restored}"
+        );
+        minimized.validate().unwrap();
+        // Every other preemption was decided and dropped, including ones a
+        // failed cut of a thread's last entries put back.
+        assert_eq!(anchored_changes(&minimized), vec![(3000, 30), (6000, 60)]);
+    }
+
+    /// When no trial meets the criteria, every preemption is critical and the
+    /// minimized record is the source record, with the target run's log
+    /// beside it; this used to panic on the missing matching trial.
+    #[test]
+    fn a_minimization_with_no_matching_trial_returns_the_source_record() {
+        let workspace = tempfile::tempdir().unwrap();
+        let preempts_path = workspace.path().join("target.preempts");
+        let tid = DetTid::from_raw(3);
+        let mut writer = detcore::preemptions::PreemptionWriter::new(None);
+        writer.register_thread(tid, FIRST_PRIORITY);
+        for k in 1..=5u64 {
+            writer.insert_reprioritization(
+                tid,
+                LogicalTime::from_nanos(k * 1000),
+                k * 10,
+                FIRST_PRIORITY + k as Priority - 1,
+                FIRST_PRIORITY + k as Priority,
+            );
+        }
+        std::fs::write(&preempts_path, writer.into_string()).unwrap();
+        let options =
+            AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
+                .unwrap();
+        let mut trials = 0;
+        let (minimized, file, log) = options
+            .minimize_with(&preempts_path, |_runname, _trial| {
+                trials += 1;
+                Ok(false)
+            })
+            .unwrap();
+        assert!(trials > 0);
+        assert_eq!(file, preempts_path);
+        assert_eq!(log, workspace.path().join("target.log"));
+        assert_eq!(
+            minimized.as_vecs_with_rcbs(),
+            PreemptionReader::new(&preempts_path)
+                .load_all()
+                .as_vecs_with_rcbs()
+        );
     }
 }

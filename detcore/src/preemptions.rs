@@ -31,6 +31,11 @@ use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::SchedEvent;
 
+/// One entry of a thread's preemption history in vector form: the end of a
+/// timeslice, the priority until then, and the RCB count it ends at, when
+/// recorded ([`ThreadHistory::as_vec_with_rcbs`]).
+pub type AnchoredEntry = (LogicalTime, Priority, Option<u64>);
+
 /// A record of all the preemptions and other scheduling events that occur during execution.
 #[derive(PartialEq, Default, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
 pub struct PreemptionRecord {
@@ -197,6 +202,33 @@ impl PreemptionRecord {
     /// Convert from a flat vector representation (Time,Priority_AFTER_Time) into the internal representation.
     /// The very first timeslice should have a zero timestamp, but it is ignored if nonzero.
     pub fn from_vecs(bt: &BTreeMap<DetTid, Vec<(LogicalTime, Priority)>>) -> Self {
+        let anchored = bt
+            .iter()
+            .map(|(tid, vec)| {
+                let vec = vec
+                    .iter()
+                    .map(|(time, prio)| (*time, *prio, None))
+                    .collect();
+                (*tid, vec)
+            })
+            .collect();
+        Self::from_vecs_with_rcbs(&anchored)
+    }
+
+    /// [`Self::as_vecs`] with each preemption's recorded RCB target
+    /// ([`ThreadHistory::as_vec_with_rcbs`]).
+    pub fn as_vecs_with_rcbs(&self) -> BTreeMap<DetTid, Vec<AnchoredEntry>> {
+        self.per_thread
+            .iter()
+            .map(|(tid, th)| (*tid, th.as_vec_with_rcbs()))
+            .collect()
+    }
+
+    /// [`Self::from_vecs`] with each preemption's RCB target: a thread whose
+    /// every preemption (all entries but the first) has one keeps them as its
+    /// `preemption_rcbs`; a thread with any entry missing one has none, as a
+    /// time-only record.
+    pub fn from_vecs_with_rcbs(bt: &BTreeMap<DetTid, Vec<AnchoredEntry>>) -> Self {
         let mut bt2 = BTreeMap::new();
         for (tid, vec) in bt {
             let th = if vec.is_empty() {
@@ -209,14 +241,16 @@ impl PreemptionRecord {
             } else {
                 // We could insist on this invariant, but it's a little more flexible not to:
                 // assert!(vec.get(0).unwrap().per_thread.is_zero());
-                let (_final_end, final_prio) = vec.last().unwrap();
+                let (_final_end, final_prio, _) = vec.last().unwrap();
                 let final_prio = *final_prio;
 
                 let mut prio_changes = Vec::new();
+                let mut rcbs = Vec::new();
                 let mut it = vec.iter().peekable();
-                while let Some((_this_ns, this_p)) = it.next() {
-                    if let Some((next_ns, _next_p)) = it.peek() {
+                while let Some((_this_ns, this_p, _)) = it.next() {
+                    if let Some((next_ns, _next_p, next_rcbs)) = it.peek() {
                         prio_changes.push((*next_ns, *this_p));
+                        rcbs.push(*next_rcbs);
                     } else {
                         // Don't need the last one, because we've already used it's
                         // timestamp, and retrieved final_prio.
@@ -228,7 +262,10 @@ impl PreemptionRecord {
                 ThreadHistory {
                     final_prio,
                     prio_changes,
-                    preemption_rcbs: Vec::new(),
+                    preemption_rcbs: rcbs
+                        .into_iter()
+                        .collect::<Option<Vec<u64>>>()
+                        .unwrap_or_default(),
                     chaos_epochs: Vec::new(),
                 }
             };
@@ -241,6 +278,25 @@ impl PreemptionRecord {
             pipe_wake_latency: None,
             signal_state_copy: None,
         }
+    }
+
+    /// This record with what a replay of `source`'s run needs besides its
+    /// preemptions: `source`'s epoch, the chaos slowdown transitions of each
+    /// thread both records have, and its pipe-wake latency and signal-state
+    /// setting. A record rebuilt from some of `source`'s preemptions (as
+    /// `hermit analyze --minimize` rebuilds each round's) then replays under
+    /// the same clock and slowdowns as `source`
+    /// (<https://github.com/rrnewton/hermit/issues/4497>).
+    pub fn with_replay_context_of(mut self, source: &PreemptionRecord) -> Self {
+        self.epoch = source.epoch;
+        self.pipe_wake_latency = source.pipe_wake_latency;
+        self.signal_state_copy = source.signal_state_copy;
+        for (tid, history) in &mut self.per_thread {
+            if let Some(original) = source.per_thread.get(tid) {
+                history.chaos_epochs = original.chaos_epochs.clone();
+            }
+        }
+        self
     }
 
     /// Extracts the inner global events.
@@ -287,7 +343,12 @@ impl PreemptionRecord {
                                 count, tid, history.final_prio
                             ));
                         }
-                        if *ns <= last {
+                        // Adjacent zero-RCB slices may share a time when they
+                        // share an RCB target (`insert_reprioritization`).
+                        let zero_rcb_slice = *ns == last
+                            && history.preemption_rcbs.len() == history.prio_changes.len()
+                            && history.preemption_rcbs[count] == history.preemption_rcbs[count - 1];
+                        if *ns < last || (*ns == last && !zero_rcb_slice) {
                             return Err(format!(
                                 "Timestamps failed to monotonically increase ({}), in series:\n {:?}",
                                 ns, history.prio_changes
@@ -523,6 +584,22 @@ impl ThreadHistory {
         vec
     }
 
+    /// [`Self::as_vec`] with each entry's recorded RCB target: `None` for the
+    /// first entry, which is no preemption, and for every entry of a
+    /// time-only history.
+    pub fn as_vec_with_rcbs(&self) -> Vec<AnchoredEntry> {
+        self.as_vec()
+            .into_iter()
+            .enumerate()
+            .map(|(ix, (time, prio))| {
+                let rcbs = ix
+                    .checked_sub(1)
+                    .and_then(|change| self.preemption_rcbs.get(change).copied());
+                (time, prio, rcbs)
+            })
+            .collect()
+    }
+
     /// Return the priority of the initial timeslice after the thread starts running.
     pub fn initial_priority(&self) -> Priority {
         if let Some((_ns, pr)) = self.prio_changes.first() {
@@ -592,7 +669,7 @@ impl ThreadHistoryIterator {
     // TODO-HUMAN-REVIEW(PR-1151)
     /// Return the next recorded logical boundary and its exact RCB target when
     /// the artifact was produced by a version that records one.
-    pub fn next_with_rcbs(&mut self) -> Option<(LogicalTime, Priority, Option<u64>)> {
+    pub fn next_with_rcbs(&mut self) -> Option<AnchoredEntry> {
         let ix = self.ix;
         self.next().map(|(time, priority)| {
             (
@@ -721,6 +798,103 @@ mod tests {
         }
     }
 
+    /// A recorded thread history with an RCB target per preemption, as
+    /// `--record-preemptions-to` writes it.
+    fn anchored_history() -> ThreadHistory {
+        let t = LogicalTime::from_nanos;
+        ThreadHistory {
+            final_prio: FIRST_PRIORITY + 4,
+            prio_changes: vec![
+                (t(1000), FIRST_PRIORITY + 1),
+                (t(2000), FIRST_PRIORITY + 2),
+                (t(3000), FIRST_PRIORITY + 3),
+            ],
+            preemption_rcbs: vec![10, 20, 30],
+            chaos_epochs: vec![ChaosEpochTransition {
+                logical_time: t(1500),
+                epoch: 1,
+                factor: RcbTimeMultiplier::from_f64(2.0),
+            }],
+        }
+    }
+
+    /// The vector form `hermit analyze --minimize` edits keeps each
+    /// preemption's RCB target: a round trip gives the history back, and
+    /// dropping a preemption keeps the others' targets aligned with their
+    /// times (https://github.com/rrnewton/hermit/issues/4497).
+    #[test]
+    fn rcb_targets_survive_the_vector_form_and_a_dropped_preemption() {
+        let tid = DetTid::from_raw(3);
+        let history = anchored_history();
+        let vec = history.as_vec_with_rcbs();
+        assert_eq!(vec[0].2, None, "the first entry is no preemption");
+        assert_eq!(
+            vec.iter().map(|entry| entry.2).collect::<Vec<_>>(),
+            [None, Some(10), Some(20), Some(30)]
+        );
+        let back = PreemptionRecord::from_vecs_with_rcbs(&BTreeMap::from([(tid, vec.clone())]));
+        let rebuilt = back.extract_all().remove(&tid).unwrap();
+        assert_eq!(rebuilt.prio_changes, history.prio_changes);
+        assert_eq!(rebuilt.preemption_rcbs, history.preemption_rcbs);
+        assert_eq!(rebuilt.final_prio, history.final_prio);
+        let mut edited = vec;
+        edited.remove(2);
+        let dropped = PreemptionRecord::from_vecs_with_rcbs(&BTreeMap::from([(tid, edited)]));
+        dropped.validate().unwrap();
+        let dropped = dropped.extract_all().remove(&tid).unwrap();
+        assert_eq!(
+            dropped.prio_changes,
+            [
+                (LogicalTime::from_nanos(1000), FIRST_PRIORITY + 1),
+                (LogicalTime::from_nanos(3000), FIRST_PRIORITY + 2),
+            ]
+        );
+        assert_eq!(dropped.preemption_rcbs, [10, 30]);
+    }
+
+    /// A thread with any preemption lacking an RCB target is rebuilt time-only,
+    /// as `validate` requires all or none; the time-only `from_vecs` is
+    /// unchanged.
+    #[test]
+    fn a_partial_set_of_rcb_targets_rebuilds_a_time_only_thread() {
+        let tid = DetTid::from_raw(3);
+        let mut vec = anchored_history().as_vec_with_rcbs();
+        vec[2].2 = None;
+        let record = PreemptionRecord::from_vecs_with_rcbs(&BTreeMap::from([(tid, vec)]));
+        record.validate().unwrap();
+        assert!(record.extract_all()[&tid].preemption_rcbs.is_empty());
+        let time_only =
+            PreemptionRecord::from_vecs(&BTreeMap::from([(tid, anchored_history().as_vec())]));
+        assert!(time_only.extract_all()[&tid].preemption_rcbs.is_empty());
+        assert_eq!(
+            time_only.extract_all()[&tid].prio_changes,
+            anchored_history().prio_changes
+        );
+    }
+
+    /// A record rebuilt from some of a source's preemptions takes the source's
+    /// epoch and each shared thread's chaos slowdown transitions, so it
+    /// replays under the source's clock and slowdowns.
+    #[test]
+    fn a_rebuilt_record_takes_the_sources_epoch_and_chaos_epochs() {
+        let tid = DetTid::from_raw(3);
+        let epoch = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut source = PreemptionRecord::from_sched_events(Vec::new());
+        source.per_thread.insert(tid, anchored_history());
+        source.epoch = Some(epoch);
+        let rebuilt = PreemptionRecord::from_vecs_with_rcbs(&source.as_vecs_with_rcbs())
+            .with_replay_context_of(&source);
+        assert_eq!(rebuilt.epoch(), Some(epoch));
+        assert_eq!(
+            rebuilt.extract_all()[&tid].chaos_epochs,
+            anchored_history().chaos_epochs
+        );
+        assert_eq!(rebuilt.extract_all()[&tid], anchored_history());
+        rebuilt.validate().unwrap();
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
@@ -764,6 +938,70 @@ mod tests {
             Some(second)
         );
         assert_eq!(history.advance_chaos_epoch(LogicalTime::MAX), None);
+    }
+
+    /// <https://github.com/rrnewton/hermit/issues/4497>: a replay ends
+    /// adjacent zero-RCB slices at one instant, so recording it writes two
+    /// change points at one time with one RCB count, in order; the record
+    /// validates and reads back with both. The same time with another count,
+    /// or an earlier time, is still a writer bug and still asserts.
+    #[test]
+    fn a_zero_rcb_slice_records_two_change_points_at_one_time() {
+        let tid = DetTid::from_raw(3);
+        let at = LogicalTime::from_nanos;
+        let mut writer = PreemptionWriter::new(None);
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_reprioritization(tid, at(100), 7, DEFAULT_PRIORITY, 200);
+        writer.insert_reprioritization(tid, at(100), 7, 200, 300);
+        writer.insert_reprioritization(tid, at(150), 9, 300, 400);
+        let decoded: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(
+            decoded.as_vecs_with_rcbs()[&tid][1..],
+            [
+                (at(100), 200, Some(7)),
+                (at(100), 300, Some(7)),
+                (at(150), 400, Some(9)),
+            ]
+        );
+
+        for (time, rcbs) in [(100, 8), (99, 7)] {
+            let attempt = std::panic::catch_unwind(|| {
+                let mut writer = PreemptionWriter::new(None);
+                writer.register_thread(tid, DEFAULT_PRIORITY);
+                writer.insert_reprioritization(tid, at(100), 7, DEFAULT_PRIORITY, 200);
+                writer.insert_reprioritization(tid, at(time), rcbs, 200, 300);
+                writer.into_string()
+            });
+            assert!(attempt.is_err(), "time {time}, RCB {rcbs}");
+        }
+    }
+
+    /// A record may repeat a time only between entries with one RCB target.
+    #[test]
+    fn a_record_repeats_a_time_only_at_one_rcb_target() {
+        let tid = DetTid::from_raw(3);
+        let at = LogicalTime::from_nanos;
+        let history = |rcbs: Vec<u64>| {
+            ThreadHistory::new()
+                .with_prio_changes(vec![
+                    (at(100), DEFAULT_PRIORITY),
+                    (at(100), DEFAULT_PRIORITY),
+                ])
+                .with_preemption_rcbs(rcbs)
+        };
+        let record = |history: ThreadHistory| PreemptionRecord {
+            per_thread: BTreeMap::from([(tid, history)]),
+            ..Default::default()
+        };
+        record(history(vec![7, 7])).validate().unwrap();
+        for rcbs in [vec![7, 8], vec![]] {
+            let error = record(history(rcbs.clone())).validate().unwrap_err();
+            assert!(
+                error.contains("failed to monotonically increase"),
+                "{rcbs:?}: {error}"
+            );
+        }
     }
 
     /// <https://github.com/rrnewton/hermit/issues/3411>: the epoch a record was
@@ -1159,8 +1397,17 @@ impl PreemptionWriter {
         });
         assert_eq!(history.final_prio, prior_prio);
 
+        // Change points that no branch separated share their time as well as
+        // their RCB count: a replay ends adjacent zero-RCB slices at one
+        // instant, and recording that replay records both, in order
+        // (https://github.com/rrnewton/hermit/issues/4497).
         if let Some((last, _prio)) = history.prio_changes.last() {
-            assert!(&time > last);
+            let zero_rcb_slice = &time == last && history.preemption_rcbs.last() == Some(&rcbs);
+            assert!(
+                &time > last || zero_rcb_slice,
+                "thread {tid}: change point at {time} (RCB {rcbs}) is not after the previous one at {last} (RCB {:?})",
+                history.preemption_rcbs.last()
+            );
         }
         history.prio_changes.push((time, prior_prio));
         history.preemption_rcbs.push(rcbs);
@@ -1256,22 +1503,22 @@ pub fn read_trace(path: &Path) -> Vec<SchedEvent> {
 
 // TODO: we should implement streaming and not read this all at once.
 fn read_preemption_record(path: &Path) -> PreemptionRecord {
+    read_valid_preemption_record(path).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Read a preemption record file and check it as a replay loads it
+/// ([`PreemptionRecord::validate`]), reporting an unreadable, malformed or
+/// invalid file as an error instead of panicking: the CLI checks a replayed
+/// record before any guest starts, and an edited record can fail
+/// (<https://github.com/rrnewton/hermit/issues/4497>).
+pub fn read_valid_preemption_record(path: &Path) -> Result<PreemptionRecord, String> {
     let string = std::fs::read_to_string(path)
-        .unwrap_or_else(|e| panic!("Error reading file {:?}:\n {}", path, e));
-    let pr: PreemptionRecord = serde_json::from_str(&string).unwrap_or_else(|e| {
-        panic!(
-            "Error parsing PreemptionRecord from JSON: {}\nJSON contents:\n{}",
-            e, string
-        )
-    });
-    if let Err(e) = pr.validate() {
-        panic!(
-            "Invalid PreemptionRecord when loading from path {}. Error:\n {}",
-            path.display(),
-            e
-        );
-    }
-    pr
+        .map_err(|e| format!("cannot read preemption record {}: {}", path.display(), e))?;
+    let pr: PreemptionRecord = serde_json::from_str(&string)
+        .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
+    pr.validate()
+        .map_err(|e| format!("invalid preemption record {}: {}", path.display(), e))?;
+    Ok(pr)
 }
 
 /// Read only the virtual-time epoch stored in a preemption record file.

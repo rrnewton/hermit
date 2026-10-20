@@ -59,6 +59,7 @@ fn deregistration(tid: DetTid, mm: MmId, count: u64) -> ThreadDeregistration {
         mm,
         thread_start_entered: true,
         timeslice_stats: stats,
+        preemption_replay: Default::default(),
         syscall_count: count,
         chaos_epochs: Vec::new(),
     }

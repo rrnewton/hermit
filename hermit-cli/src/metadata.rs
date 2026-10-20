@@ -1180,6 +1180,7 @@ fn record_or_replay_config_with_timer_support(
         record_preemptions_to: None,
         replay_preemptions_from: None,
         replay_schedule_from: None,
+        replay_preemptions_lenient: false,
         replay_exhausted_panic: false,
         die_on_desync: true,
         stacktrace_event: Vec::new(),

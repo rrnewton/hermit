@@ -950,6 +950,13 @@ mod tests {
             &["--replay-preemptions-from=/tmp/r.json"],
         ),
         (
+            "replay-preemptions-lenient",
+            &[
+                "--replay-preemptions-from=/tmp/r.json",
+                "--replay-preemptions-lenient",
+            ],
+        ),
+        (
             "replay-schedule-from",
             &["--replay-schedule-from=/tmp/s.json"],
         ),

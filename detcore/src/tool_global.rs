@@ -47,6 +47,7 @@ use detcore_model::network_engine::NetworkRequest;
 use detcore_model::network_trace::NetworkTraceMode;
 use detcore_model::network_trace::NetworkTraceV2;
 use detcore_model::procfs::mount_ids_are_ordered_subset;
+use detcore_model::summary::PreemptionReplayDivergences;
 use detcore_model::summary::PreemptionSummary;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
@@ -5063,6 +5064,7 @@ impl GlobalState {
             mm,
             thread_start_entered: _,
             timeslice_stats,
+            preemption_replay,
             syscall_count,
             chaos_epochs,
         } = deregistration;
@@ -5092,6 +5094,9 @@ impl GlobalState {
             }
         }
         sched.record_timeslice_stats(dettid, timeslice_stats);
+        sched
+            .preemption_replay_divergences
+            .merge(&preemption_replay);
         sched.record_syscall_count(dettid, syscall_count);
         // A SIGKILL victim is retired at its sender's turn, not here
         // (`scheduler::sigkill_retirement`): its receipt is accounted above
@@ -5661,6 +5666,8 @@ pub struct ThreadDeregistration {
     /// delayed initialization and the parent's scheduler registration RPC.
     pub(crate) thread_start_entered: bool,
     pub(crate) timeslice_stats: TimesliceStats,
+    /// `ThreadStats::preemption_replay` at exit.
+    pub(crate) preemption_replay: PreemptionReplayDivergences,
     pub(crate) syscall_count: u64,
     pub(crate) chaos_epochs: Vec<ChaosEpochTransition>,
 }
@@ -10841,6 +10848,7 @@ mod tests {
                     mm,
                     thread_start_entered: true,
                     timeslice_stats: TimesliceStats::default(),
+                    preemption_replay: Default::default(),
                     syscall_count: 0,
                     chaos_epochs: Vec::new(),
                 },
@@ -12282,6 +12290,7 @@ mod tests {
                         min_ns: 10,
                         max_ns: 10,
                     },
+                    preemption_replay: Default::default(),
                     syscall_count: 3,
                     chaos_epochs: Vec::new(),
                 };
@@ -12406,6 +12415,7 @@ mod tests {
                                 min_ns: 10,
                                 max_ns: 10,
                             },
+                            preemption_replay: Default::default(),
                             syscall_count: 3,
                             chaos_epochs: Vec::new(),
                         }),
@@ -14000,6 +14010,7 @@ mod tests {
                     detpid,
                     mm: MmId::initial(detpid),
                     timeslice_stats: TimesliceStats::default(),
+                    preemption_replay: Default::default(),
                     syscall_count: 0,
                     chaos_epochs: Vec::new(),
                 },
@@ -14158,6 +14169,7 @@ mod tests {
                         detpid,
                         mm: old_mm,
                         timeslice_stats: TimesliceStats::default(),
+                        preemption_replay: Default::default(),
                         syscall_count: 0,
                         chaos_epochs: Vec::new(),
                     }),
@@ -15246,6 +15258,7 @@ mod tests {
                     detpid,
                     mm: MmId::initial(detpid),
                     timeslice_stats: TimesliceStats::default(),
+                    preemption_replay: Default::default(),
                     syscall_count: 0,
                     chaos_epochs: Vec::new(),
                 },
@@ -15272,6 +15285,7 @@ mod tests {
                     detpid,
                     mm: MmId::initial(detpid).for_exec(detpid),
                     timeslice_stats: TimesliceStats::default(),
+                    preemption_replay: Default::default(),
                     syscall_count: 0,
                     chaos_epochs: Vec::new(),
                 },
@@ -15586,6 +15600,7 @@ mod tests {
                         detpid,
                         mm: MmId::initial(detpid),
                         timeslice_stats: final_stats,
+                        preemption_replay: Default::default(),
                         syscall_count: 17,
                         chaos_epochs: Vec::new(),
                     }),
@@ -15620,6 +15635,7 @@ mod tests {
                         detpid,
                         mm: MmId::initial(detpid),
                         timeslice_stats: final_stats,
+                        preemption_replay: Default::default(),
                         syscall_count: 99,
                         chaos_epochs: Vec::new(),
                     }),
