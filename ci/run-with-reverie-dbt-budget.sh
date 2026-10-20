@@ -2358,7 +2358,11 @@ fi
 # (tool.rs, guest.rs and tests/signal_bridge.rs only). No DBT, SDK or native
 # input changes; calibrated budgets, jobs, limits and inventory989 are
 # unchanged.
-expected_pin=bc460a72fc2dea0cc04c03e238d67094aeba4e31
+# REBASE TO 063b2e07ac2ec60425df3ad5746ac08ef244ed3d (2026-10-20): the incoming change adds four
+# BackendCapabilities fields in reverie-core (capabilities.rs only). No DBT,
+# SDK or native input changes; calibrated budgets, jobs, limits and
+# inventory989 are unchanged.
+expected_pin=063b2e07ac2ec60425df3ad5746ac08ef244ed3d
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
