@@ -1684,6 +1684,64 @@ pub struct Selection {
     /// Every run type's cells, ignoring `labels`: a census of the cells in
     /// the manifest (the metadata export), not a run of one run type.
     pub all_run_types: bool,
+    /// A disabled verify cell probed for parity runs on ptrace's inputs
+    /// (`with_parity_inputs`), so its log can be compared with ptrace's.
+    pub parity_inputs: bool,
+}
+
+/// The in-guest backends refuse a preemption timer: every verify cell of
+/// theirs that the manifests enable runs with this flag.
+const IN_GUEST_PARITY_HERMIT_ARGS: &[&str] = &["--max-timeslice=disabled"];
+
+/// `test` with its disabled verify cell on `backend` given ptrace's inputs, for
+/// a parity probe (`test-harness run --probe-disabled --parity-inputs`, which
+/// `ci/compat-envelope/pressure-test.rs run --parity-all` uses): ptrace's
+/// guest arguments where the manifest names none for `backend` (the selection
+/// also gives it ptrace's wall and CPU timeouts), and on liteinst and in-guest-trap the
+/// `--max-timeslice=disabled` every enabled cell of theirs carries. A parity
+/// comparison needs the same guest arguments on both sides, and an in-guest
+/// probe without the flag is only a refusal. Nothing the manifest declares for
+/// `backend` is replaced, and an enabled cell is never touched.
+fn with_parity_inputs(test: &TestRecipe, backend: &str) -> TestRecipe {
+    let mut test = test.clone();
+    let Some(verify) = test.modes.get_mut("verify") else {
+        return test;
+    };
+    if verify
+        .backends_enabled
+        .iter()
+        .any(|enabled| enabled == backend)
+        || !verify
+            .backends_enabled
+            .iter()
+            .any(|enabled| enabled == "ptrace")
+    {
+        return test;
+    }
+    if let Some(args) = verify.guest_args.get("ptrace").cloned() {
+        verify.guest_args.entry(backend.to_string()).or_insert(args);
+    }
+    if matches!(backend, "liteinst" | "in-guest-trap") && !verify.hermit_args.contains_key(backend)
+    {
+        verify.hermit_args.insert(
+            backend.to_string(),
+            IN_GUEST_PARITY_HERMIT_ARGS
+                .iter()
+                .map(|arg| arg.to_string())
+                .collect(),
+        );
+        let reason = "In-guest LiteInst refuses a preemption timer; a parity probe runs this \
+                      backend as every enabled cell of it runs"
+            .to_string();
+        match &mut verify.hermit_args_reason {
+            None => verify.hermit_args_reason = Some(HermitArgsReason::Shared(reason)),
+            Some(HermitArgsReason::PerBackend(reasons)) => {
+                reasons.entry(backend.to_string()).or_insert(reason);
+            }
+            Some(HermitArgsReason::Shared(_)) => {}
+        }
+    }
+    test
 }
 
 #[derive(Clone, Debug)]
@@ -2270,19 +2328,39 @@ impl ManifestSet {
                     if !population_accepts(population, ci.selected(&backend), enabled) {
                         continue;
                     }
+                    let probed = (selection.parity_inputs && !enabled && mode == "verify")
+                        .then(|| with_parity_inputs(test, &backend));
+                    let cell_test = probed.as_ref().unwrap_or(test);
+                    let recipe = probed
+                        .as_ref()
+                        .and_then(|probed| probed.modes.get(mode.as_str()))
+                        .unwrap_or(recipe);
+                    // A parity probe without its own timeouts takes ptrace's.
+                    let timeout_backend =
+                        if probed.is_some() && !recipe.timeout_seconds.contains_key(&backend) {
+                            "ptrace"
+                        } else {
+                            backend.as_str()
+                        };
+                    let cpu_timeout_backend =
+                        if probed.is_some() && !recipe.cpu_timeout_seconds.contains_key(&backend) {
+                            "ptrace"
+                        } else {
+                            backend.as_str()
+                        };
                     let timeout_seconds = resolve_timeout_seconds(
                         *bucket_timeout_seconds,
                         None,
-                        recipe.timeout_seconds.get(&backend).copied(),
+                        recipe.timeout_seconds.get(timeout_backend).copied(),
                     );
                     let cpu_timeout_seconds = recipe
                         .cpu_timeout_seconds
-                        .get(&backend)
+                        .get(cpu_timeout_backend)
                         .copied()
                         .unwrap_or(*default_cpu_timeout_seconds);
                     cells.push(SelectedCell {
                         category: category.clone(),
-                        test: test.clone(),
+                        test: cell_test.clone(),
                         id: CellId {
                             test: id.clone(),
                             mode: mode.clone(),
@@ -13177,6 +13255,71 @@ esac
             "an unselected backend must not inherit a selected sibling's arguments"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_parity_probe_runs_a_disabled_verify_cell_on_ptraces_inputs() {
+        let mut test = recipe(true);
+        let mode = test.modes.get_mut("verify").unwrap();
+        mode.guest_args
+            .insert("ptrace".into(), vec!["53".into(), "5".into()]);
+        mode.guest_args.insert("kvm".into(), vec!["kvm-own".into()]);
+        mode.timeout_seconds.insert("ptrace".into(), 91);
+        mode.cpu_timeout_seconds.insert("ptrace".into(), 32);
+        mode.slow_reason
+            .insert("ptrace".into(), "the ptrace workload is slow".into());
+        validate_mode("fixture/test", "verify", mode, 60).unwrap();
+        let set = ManifestSet {
+            documents: Vec::new(),
+            tests: BTreeMap::from([(
+                test.id.clone(),
+                ("fixture".into(), 60, DEFAULT_TEST_CPU_TIMEOUT_SECONDS, test),
+            )]),
+        };
+        let probe = |backend: &str, parity_inputs: bool| {
+            let cells = set
+                .select(&Selection {
+                    population: Some(Population::Disabled),
+                    test: Some("fixture/test".into()),
+                    mode: Some("verify".into()),
+                    backend: Some(backend.into()),
+                    parity_inputs,
+                    ..Selection::default()
+                })
+                .unwrap();
+            assert_eq!(cells.len(), 1);
+            cells.into_iter().next().unwrap()
+        };
+        let liteinst = probe("liteinst", true);
+        assert!(!liteinst.enabled);
+        assert_eq!(cell_guest_args(&liteinst, "liteinst"), ["53", "5"]);
+        assert_eq!(
+            (liteinst.timeout_seconds, liteinst.cpu_timeout_seconds),
+            (91, 32)
+        );
+        let verify = &liteinst.test.modes["verify"];
+        assert_eq!(
+            cell_hermit_args(verify, "liteinst"),
+            ["--max-timeslice=disabled"]
+        );
+        assert!(
+            verify
+                .hermit_args_reason
+                .as_ref()
+                .and_then(|reason| reason.for_backend("liteinst"))
+                .is_some()
+        );
+        validate_mode("fixture/test", "verify", verify, 60).unwrap();
+        // A backend's own declared arguments are kept, and only the in-guest
+        // backends get the timeslice flag.
+        let kvm = probe("kvm", true);
+        assert_eq!(cell_guest_args(&kvm, "kvm"), ["kvm-own"]);
+        assert!(cell_hermit_args(&kvm.test.modes["verify"], "kvm").is_empty());
+        // Without --parity-inputs a probe is exactly the manifest's.
+        let plain = probe("liteinst", false);
+        assert!(cell_guest_args(&plain, "liteinst").is_empty());
+        assert!(cell_hermit_args(&plain.test.modes["verify"], "liteinst").is_empty());
+        assert_eq!(plain.timeout_seconds, 60);
     }
 
     #[test]
