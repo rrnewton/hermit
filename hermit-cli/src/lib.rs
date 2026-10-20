@@ -1615,7 +1615,11 @@ fn liteinst_unavailable_reason() -> Option<String> {
 // `third-party-backends` enables for every validation build.
 #[cfg(not(feature = "liteinst"))]
 fn liteinst_unavailable_reason() -> Option<String> {
-    Some("this build was compiled without the liteinst backend: the `liteinst` feature is not enabled; rebuild with `--features liteinst` (or `--features third-party-backends`). This says nothing about whether LiteInst works on this machine -- it has not been checked".to_owned())
+    Some(if option_env!("CARGO_PKG_NAME") == Some("hermit-run") {
+        "the liteinst backend is not included in this registry release; its source-development implementation is on https://github.com/rrnewton/hermit/tree/main. This release has no `liteinst` Cargo feature, and `third-party-backends` does not include LiteInst. LiteInst availability on this machine has not been checked".to_owned()
+    } else {
+        "this build was compiled without the liteinst backend: the `liteinst` feature is not enabled; rebuild with `--features liteinst` (or `--features third-party-backends`). This says nothing about whether LiteInst works on this machine -- it has not been checked".to_owned()
+    })
 }
 
 #[cfg(feature = "liteinst")]

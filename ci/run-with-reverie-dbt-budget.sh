@@ -2265,11 +2265,11 @@ fi
 # under reverie-dbt/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so the inventory (989), SDK and native inputs,
 # calibrated budget, job width and limits are unchanged from the 905b53db carry.
-# CARRY TO 7fc6cb89d1cf626caae57bd17b138406491e7fb2 (0.5.0 release):
+# CARRY TO edad7ff63ffa11d7866f261a0f508f3e6b79e827 (0.5.0 release):
 # Only package metadata and release notes changed. reverie-dbt/build.rs and
 # reverie-dbt/vendor/dynamorio are byte-identical to 5041073ee5; preserve the
 # measured build budget without changing its clamp or threshold.
-expected_pin=7fc6cb89d1cf626caae57bd17b138406491e7fb2
+expected_pin=edad7ff63ffa11d7866f261a0f508f3e6b79e827
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

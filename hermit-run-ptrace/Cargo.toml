@@ -11,5 +11,5 @@ repository = "https://github.com/facebookexperimental/hermit"
 
 [dependencies]
 detcore = { package = "hermit-detcore", version = "0.5.0", path = "../detcore" }
-reverie = { package = "reverie-core", version = "0.5.0", git = "https://github.com/rrnewton/reverie.git", rev = "7fc6cb89d1cf626caae57bd17b138406491e7fb2" }
-reverie-ptrace = { version = "0.5.0", git = "https://github.com/rrnewton/reverie.git", rev = "7fc6cb89d1cf626caae57bd17b138406491e7fb2" }
+reverie = { package = "reverie-core", version = "0.5.0", git = "https://github.com/rrnewton/reverie.git", rev = "edad7ff63ffa11d7866f261a0f508f3e6b79e827" }
+reverie-ptrace = { version = "0.5.0", git = "https://github.com/rrnewton/reverie.git", rev = "edad7ff63ffa11d7866f261a0f508f3e6b79e827" }

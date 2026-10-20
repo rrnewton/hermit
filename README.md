@@ -132,6 +132,11 @@ its epoch and records it, so it can be rerun. See the
 
 ### Execution Backends
 
+The 0.5.0 registry release includes ptrace/KVM and optional SaBRe/e9patch
+Rust glue. LiteInst, in-guest-trap, native-exec and DBT are outside that release.
+The source-development build recipes below describe the development `main`
+branch; they cannot enable those excluded capabilities in the release tag.
+
 A *backend* is the low-level mechanism Hermit uses to observe and control a
 running guest — how it intercepts the program's system calls and CPU events.
 Different backends make different trade-offs in speed, host requirements, and

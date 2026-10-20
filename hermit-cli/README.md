@@ -39,11 +39,12 @@ packages. The installer also provides `hermit-dap` and `verification-report`.
 The registry package builds the Rust library and executables; `libhermit.so`
 is a separate `hermit-cdylib` source build.
 
-The default installation includes **ptrace and KVM**. SaBRe support, e9patch
-preprocessing and LiteInst are off by default and require their explicit Cargo
-features plus separately supplied runtime artifacts. DBT is available through
-[source builds](https://github.com/rrnewton/hermit), rather than this registry
-release. KVM requires read/write access to `/dev/kvm`, compatible CPU features
+The default installation includes **ptrace and KVM**. Optional SaBRe support
+and e9patch preprocessing require explicit Cargo features and separately
+supplied runtime artifacts. LiteInst, in-guest-trap, native-exec and DBT are
+**not available in the 0.5.0 registry release**, including with
+`--all-features`; their source-development implementations remain on
+[main](https://github.com/rrnewton/hermit/tree/main). KVM requires read/write access to `/dev/kvm`, compatible CPU features
 and performance counters; ptrace is the default execution path.
 
 ### Ubuntu AppArmor and user namespaces
