@@ -3004,6 +3004,10 @@ async fn sched_loop_inner(
                     drop(sched);
                     exit_on_scheduler_refusal(&refusal);
                 }
+                if let Some(refusal) = sched.unreplayed_exit_order() {
+                    drop(sched);
+                    exit_on_scheduler_refusal(&refusal);
+                }
                 if let Some(observer) = &observer {
                     observer("run queue empty; scheduler completed");
                 }
@@ -3460,6 +3464,10 @@ async fn do_ordinary_turn_blocking(
             exit_on_scheduler_refusal(&refusal);
         }
         if let Some(refusal) = sched.rejoin_refusal.take() {
+            drop(sched);
+            exit_on_scheduler_refusal(&refusal);
+        }
+        if let Some(refusal) = sched.exit_order.refusal.take() {
             drop(sched);
             exit_on_scheduler_refusal(&refusal);
         }

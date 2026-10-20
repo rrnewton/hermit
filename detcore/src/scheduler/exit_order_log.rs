@@ -59,6 +59,14 @@ impl ExitOrderEvent {
             ExitOrderEvent::Release => "release",
         }
     }
+
+    /// The decision in a refusal message: "held" or "released".
+    pub(crate) fn past_tense(self) -> &'static str {
+        match self {
+            ExitOrderEvent::Hold => "held",
+            ExitOrderEvent::Release => "released",
+        }
+    }
 }
 
 /// One logged decision.
@@ -133,6 +141,24 @@ impl ExitOrderWriter {
     /// Append one decision with a single write.
     pub(crate) fn append(&mut self, entry: ExitOrderEntry) -> io::Result<()> {
         self.file.write_all(entry.to_line().as_bytes())
+    }
+}
+
+/// Replay could not follow the exit-order log, so it would hold or release an
+/// exit at a point the recording did not; the scheduler loop ends the run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExitOrderRefusal {
+    pub(crate) reason: String,
+}
+
+impl std::fmt::Display for ExitOrderRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "hermit replay refused to continue: {}, so an exit would be held or released at a \
+             different point than in the recording",
+            self.reason
+        )
     }
 }
 

@@ -38,8 +38,8 @@ use super::Scheduler;
 use super::exit_order_log;
 use super::exit_order_log::ExitOrderEntry;
 use super::exit_order_log::ExitOrderEvent;
+use super::exit_order_log::ExitOrderRefusal;
 use super::exit_order_log::ExitOrderWriter;
-use super::rejoin_log::RejoinRefusal;
 use crate::config::Config;
 use crate::types::DetPid;
 use crate::types::DetTid;
@@ -68,7 +68,7 @@ pub(super) fn open_log(
         return (None, None);
     };
     let refuse =
-        |reason: String| -> ! { super::exit_on_scheduler_refusal(&RejoinRefusal { reason }) };
+        |reason: String| -> ! { super::exit_on_scheduler_refusal(&ExitOrderRefusal { reason }) };
     if !cfg.replaying {
         if !exit_order() {
             return (None, None);
@@ -130,6 +130,9 @@ pub struct ExitOrderState {
     pub(super) log_writer: Option<ExitOrderWriter>,
     /// `hermit replay`: the recording's holds and releases still to apply.
     pub(super) log_replay: Option<VecDeque<ExitOrderEntry>>,
+    /// Set when replay passes a logged point; the scheduler loop ends the run
+    /// with it (`exit_on_scheduler_refusal`).
+    pub(super) refusal: Option<ExitOrderRefusal>,
 }
 
 impl ExitOrderState {
@@ -390,18 +393,18 @@ impl Scheduler {
             && front.point() < point
         {
             let reason = format!(
-                "the recording's exit order {:?}ed thread {} at turn {} after {} timer wakes, \
+                "the recording's exit order {} thread {} at turn {} after {} timer wakes, \
                  and replay reached turn {} after {} first",
-                front.event,
+                front.event.past_tense(),
                 front.tid.as_raw(),
                 front.turn,
                 front.wakes,
                 self.turn,
                 self.empty_queue_wakes
             );
-            if self.rejoin_refusal.is_none() {
+            if self.exit_order.refusal.is_none() {
                 tracing::error!("[exit order] {reason}");
-                self.rejoin_refusal = Some(RejoinRefusal { reason });
+                self.exit_order.refusal = Some(ExitOrderRefusal { reason });
             }
             return Some(Vec::new());
         }
@@ -414,6 +417,25 @@ impl Scheduler {
             entries.pop_front();
         }
         Some(due)
+    }
+
+    /// Replay: the refusal for a run that ends with logged holds or releases
+    /// it never reached, as `unreplayed_rejoins` is for readmissions. A hold
+    /// the recording made and replay did not would otherwise pass unnoticed.
+    pub(super) fn unreplayed_exit_order(&self) -> Option<ExitOrderRefusal> {
+        let entries = self.exit_order.log_replay.as_ref()?;
+        let next = entries.front()?;
+        Some(ExitOrderRefusal {
+            reason: format!(
+                "the run ended at turn {} with {} logged exit-order decisions not replayed, the \
+                 first: thread {} {} at turn {}",
+                self.turn,
+                entries.len(),
+                next.tid.as_raw(),
+                next.event.past_tense(),
+                next.turn
+            ),
+        })
     }
 
     /// Record: log `event` for `tid` at this point.
@@ -877,7 +899,32 @@ mod tests {
         sched.turn = 11;
         assert!(sched.exit_order_release(), "released as logged");
         assert!(sched.exit_order.log_replay.as_ref().unwrap().is_empty());
-        assert!(sched.rejoin_refusal.is_none());
+        assert!(sched.exit_order.refusal.is_none());
+        assert_eq!(sched.unreplayed_exit_order(), None);
+    }
+
+    /// A run that ends before a logged hold or release is refused; record and
+    /// a fully replayed log are not.
+    #[test]
+    fn replay_refuses_to_end_with_unreplayed_decisions() {
+        let mut sched = holding_family();
+        assert_eq!(sched.unreplayed_exit_order(), None, "not replaying");
+        sched.exit_order.log_replay = Some(VecDeque::new());
+        assert_eq!(sched.unreplayed_exit_order(), None, "log fully replayed");
+        sched.exit_order.log_replay = Some(VecDeque::from([
+            entry(7, ExitOrderEvent::Hold, 3),
+            entry(11, ExitOrderEvent::Release, 3),
+        ]));
+        sched.turn = 5;
+        let refusal = sched.unreplayed_exit_order().expect("no refusal");
+        assert!(
+            refusal.reason.contains(
+                "ended at turn 5 with 2 logged exit-order decisions not replayed, the first: \
+                 thread 3 held at turn 7"
+            ),
+            "{}",
+            refusal.reason
+        );
     }
 
     /// Replay refuses a logged hold it has passed instead of diverging.
@@ -887,7 +934,14 @@ mod tests {
         sched.exit_order.log_replay = Some(VecDeque::from([entry(7, ExitOrderEvent::Hold, 3)]));
         sched.turn = 8;
         assert!(!sched.exit_order_hold(DetTid::from_raw(3), true));
-        assert!(sched.rejoin_refusal.is_some());
+        let refusal = sched.exit_order.refusal.as_ref().expect("no refusal");
+        assert!(
+            refusal
+                .reason
+                .contains("exit order held thread 3 at turn 7 after 0 timer wakes"),
+            "{}",
+            refusal.reason
+        );
     }
 
     /// The parent handed the turn after a child's exit is granted is found by
