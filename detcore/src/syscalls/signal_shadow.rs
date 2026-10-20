@@ -750,6 +750,13 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    // A two-phase commit's test sees the record made, and can grant a turn
+    // inside it (`signal_announcement_tests`).
+    #[cfg(test)]
+    {
+        crate::signal_announcement_tests::note_phase("recorded");
+        crate::signal_announcement_tests::grant_during_record_if_asked(guest.thread_state_mut());
+    }
     let had_copy = guest.thread_state().signal_shadow.is_some();
     // At a delivery stop the kernel has not installed the handler mask yet.
     take_unreported(guest);

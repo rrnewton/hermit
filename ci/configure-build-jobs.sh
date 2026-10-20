@@ -2429,8 +2429,12 @@ fi
 # reverie-core (tool.rs, guest.rs and signal.rs only). No DBT, SDK or native
 # input changes; calibrated budgets, jobs, limits and inventory989 are
 # unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 90329dd5be334d5e486891656e2652a8af3934b2 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 90329dd5be334d5e486891656e2652a8af3934b2 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# REBASE TO ccaf4fd5a5bdb74e3842109a4962b75361fa7ba9 (2026-10-20): the incoming change rewords the
+# two-phase signal hooks' contract and adds a unit test in reverie-core
+# (tool.rs and guest.rs only). No DBT, SDK or native input changes;
+# calibrated budgets, jobs, limits and inventory989 are unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ccaf4fd5a5bdb74e3842109a4962b75361fa7ba9 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ccaf4fd5a5bdb74e3842109a4962b75361fa7ba9 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

@@ -2929,7 +2929,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     /// timer entry) exist only in configurations it refuses. A signal outside
     /// 1 to 64 is `EINVAL`. A configuration in which the commit could not
     /// keep the protocol, or a thread holding a claimed `SIGCHLD`, is refused
-    /// here, before any turn, with `EOPNOTSUPP` (`two_phase_refusal`).
+    /// here, before any turn, with `EPROTONOSUPPORT` (`two_phase_refusal`):
+    /// Detcore has opted in, and `EOPNOTSUPP` is left to mean that a Tool has
+    /// not (Reverie's contract, step 4).
     async fn announce_signal_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2951,7 +2953,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 signal,
                 reason
             );
-            return Err(Errno::EOPNOTSUPP);
+            return Err(Errno::EPROTONOSUPPORT);
         }
         let stop = self.inbound_stop(guest);
         let turn = self
@@ -2984,9 +2986,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     /// It must not wait for a turn. The announcement refused every
     /// configuration in which one of its parts files a scheduler request; if
     /// the thread was granted a turn all the same, the backend's final read
-    /// no longer holds, so the commit fails closed with `EDEADLK`, after
-    /// `inbound_delivered`'s effects but before the record. Any `Err` ends
-    /// the run.
+    /// no longer holds, so the commit fails closed with `EDEADLK`. It checks
+    /// twice: after `inbound_delivered`'s effects but before the record, and
+    /// again after the record, when the delivery is recorded and approved.
+    /// Any `Err` ends the run.
     async fn commit_signal_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3030,8 +3033,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             return Err(Errno::EDEADLK);
         }
         crate::syscalls::signal_shadow::check_and_record_delivery(guest, held.signal).await;
-        #[cfg(test)]
-        Self::note_test_phase("recorded");
         if guest.thread_state().scheduler_grants != grants {
             warn!(
                 "[dtid {}] recording announced signal {} was granted a turn",
