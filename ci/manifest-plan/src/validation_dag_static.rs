@@ -1127,7 +1127,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And four CPUID subscription/host-admission/plan-routing regressions: 1782.
     // And +1 from d1870efe (runner.rs: a Buck skid-overshoot retry unit), which did
     // not move this pin: 1_783.
-    ("test.regular_crates", 1_783),
+    // And the detcore-model work-span-report config test: 1_784, listed.
+    ("test.regular_crates", 1_784),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2589,7 +2590,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the four vfork flock-guard narrowing units (three in tool_local,
     // one in fd) and the flock owner-rule unit in procfs::locks: 2174,
     // listed.
-    ("test.detcore_unit", 2174),
+    // And the fifteen scheduler::work_span units (--work-span-report): 2189,
+    // listed.
+    ("test.detcore_unit", 2189),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4577,7 +4580,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from e1446c0a: 2169.
     // And the same four vfork flock-guard narrowing units and flock
     // owner-rule unit: 2174, listed.
-    ("test.detcore_unit_on_host", 2174),
+    // And the same fifteen scheduler::work_span units: 2189, listed.
+    ("test.detcore_unit_on_host", 2189),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5067,7 +5071,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same detcore-model fatal-delivery-check test: 1764.
     // And the same four CPUID requirement regressions: 1768.
     // And +1, the same d1870efe runner unit as the local node: 1_769.
-    ("test.regular_crates_on_host", 1_769),
+    // And the same detcore-model work-span-report config test: 1_770.
+    ("test.regular_crates_on_host", 1_770),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

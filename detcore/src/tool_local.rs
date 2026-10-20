@@ -4141,6 +4141,18 @@ pub struct ThreadState<T> {
     /// `None` with the option unset.
     #[serde(default)]
     pub(crate) pipe_handoff_due: Option<LogicalTime>,
+    /// For `--work-span-report`: the pipe events since this thread's previous
+    /// resource request, sent with the next one. Always empty without it.
+    #[serde(default)]
+    pub(crate) work_span_events: Vec<crate::scheduler::work_span::ChannelEvent>,
+    /// For the same report: the current call polled (it made an
+    /// `InternalIOPolling` request), so its result is the polled one.
+    #[serde(default)]
+    pub(crate) work_span_polled: bool,
+    /// For the same report: the process whose children the current call
+    /// polls for (a `wait4` or `waitid`), sent with its next request.
+    #[serde(default)]
+    pub(crate) work_span_polls_children: Option<DetPid>,
     /// A signal this thread sent to its own multi-threaded process, which it
     /// must dequeue before another thread runs: until its own delivery stop
     /// for that signal no timeslice of it ends, at the target, at the PMU
@@ -4872,6 +4884,9 @@ impl<T> ThreadState<T> {
             in_uncharged_bootstrap_syscall: false,
             yield_after_futex_wake: false,
             pipe_handoff_due: None,
+            work_span_events: Vec::new(),
+            work_span_polled: false,
+            work_span_polls_children: None,
             own_signal_turn_hold: None,
             returned_from_sigreturn: false,
             consecutive_continuations: 0,
