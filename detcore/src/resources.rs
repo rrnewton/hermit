@@ -607,6 +607,16 @@ pub struct Resources {
     /// polling parent the turn after a child's exit is granted.
     #[serde(default)]
     pub(crate) polls_children: Option<DetPid>,
+    /// The pipe events this thread gathered since its previous request, for
+    /// the study-branch work/span report (`HERMIT_WORK_SPAN`); always empty
+    /// with the report off.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) channel_events: Vec<crate::scheduler::work_span::ChannelEvent>,
+    /// For the same report: a poll the current call makes again, because
+    /// its previous polled attempt found nothing ready. Always false with the
+    /// report off.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) repolls: bool,
 }
 
 impl fmt::Debug for Resources {
@@ -706,6 +716,8 @@ impl Resources {
             continues_sigreturn: false,
             private_sigchld_decides: false,
             polls_children: None,
+            channel_events: Vec::new(),
+            repolls: false,
         }
     }
 

@@ -250,6 +250,49 @@ impl<T: crate::record_or_replay::RecordOrReplay> crate::Detcore<T> {
             .collect()
     }
 
+    /// For the study-branch work/span report (`HERMIT_WORK_SPAN`): gather a
+    /// read or write of a pipe or FIFO that moved bytes, or a read that
+    /// returned its end of file, to send with this thread's next resource
+    /// request (`crate::scheduler::work_span::ChannelEvent`). The channel is
+    /// the host (device, inode) behind the descriptor, where the tool can see
+    /// the guest's descriptors (`fifo_peer::fifo_of`). Reads host state only;
+    /// nothing the guest or the scheduler's decisions see changes.
+    pub(crate) fn gather_channel_event<G: reverie::Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &reverie::syscalls::Syscall,
+        res: &Result<i64, reverie::Error>,
+    ) {
+        let polled = std::mem::take(&mut guest.thread_state_mut().work_span_polled);
+        let (Ok(moved), Some((fd, readies))) = (res, progress_of(call)) else {
+            return;
+        };
+        let read = readies == Wants::Space;
+        if *moved < 0 || (*moved == 0 && !read) {
+            return;
+        }
+        let Some(channel) = crate::fifo_peer::fifo_of(
+            &self.cfg.backend,
+            guest.thread_state().physical_tid,
+            guest.tid().as_raw(),
+            fd,
+        ) else {
+            return;
+        };
+        let time = &guest.thread_state().thread_logical_time;
+        let cpu = time.user_cpu_time().as_nanos() + time.system_cpu_time().as_nanos();
+        guest
+            .thread_state_mut()
+            .work_span_events
+            .push(crate::scheduler::work_span::ChannelEvent {
+                channel,
+                bytes: *moved as u64,
+                read,
+                polled,
+                cpu,
+            });
+    }
+
     /// This thread closed `end` (explicitly: `close`, `close_range`, or a
     /// `dup2` or `dup3` over it): ready what that closing gives the other
     /// side. An implicit close at exit or exec readies nothing.

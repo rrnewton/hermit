@@ -2526,6 +2526,9 @@ impl GlobalState {
             let mut sched = self.sched.lock().unwrap();
             sched.exit_order_note_work(dtid, work);
             sched.work_span_note_cpu(dtid, work);
+            if let GlobalRequest::RequestResources(rs, _) = &request {
+                sched.work_span_note_events(dtid, work, &rs.channel_events);
+            }
         }
         // Exec transfer messages authenticate both incarnations before ordinary
         // sender-clock accounting. The carried clock still belongs to the former
@@ -4840,6 +4843,8 @@ impl GlobalState {
                     continues_sigreturn: false,
                     private_sigchld_decides: false,
                     polls_children: None,
+                    channel_events: Vec::new(),
+                    repolls: false,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {
@@ -7426,6 +7431,15 @@ where
     // Any turn of its own is a hand-off under `--pipe-wake-latency`: the
     // thread goes back behind the pollers it readied (`crate::pipe_wake`).
     guest.thread_state_mut().pipe_handoff_due = None;
+    // The study-branch work/span report's pipe events ride on this request,
+    // and a poll marks the current call's result as the polled one.
+    if crate::scheduler::work_span::work_span_path().is_some() {
+        if r.resources.contains_key(&ResourceID::InternalIOPolling) {
+            r.repolls = guest.thread_state().work_span_polled;
+            guest.thread_state_mut().work_span_polled = true;
+        }
+        r.channel_events = std::mem::take(&mut guest.thread_state_mut().work_span_events);
+    }
     // Count consecutive continuations; any other request, a turn in which
     // other threads may run, starts the count again
     // (`ThreadState::consecutive_continuations`).

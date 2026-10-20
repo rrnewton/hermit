@@ -12689,7 +12689,7 @@ impl Scheduler {
                 .push_poller(dettid, self.get_priority(dettid), rs.poll_attempt);
             // Before the count reset below hides that this is a retry.
             self.note_sigalrm_polling_wait(dettid, rs);
-            self.work_span_note_wait(dettid, rs.resources.keys().next());
+            self.work_span_note_wait(dettid, rs);
             trace!(
                 "[dtid {}] after deprioritizing polling request, run queue: {:?}",
                 dettid, &self.run_queue
@@ -12711,7 +12711,7 @@ impl Scheduler {
                         resp,
                     );
                     if blocked.is_err() {
-                        self.work_span_note_wait(dettid, Some(rid));
+                        self.work_span_note_wait(dettid, rs);
                     }
                     if rs.replay_served_from_log
                         && matches!(rid, ResourceID::BlockingExternalIO(_))

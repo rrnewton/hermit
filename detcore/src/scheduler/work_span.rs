@@ -35,16 +35,33 @@
 //!   guest-visible state (`conflict_key`, an exhaustive match);
 //! - waiting: only in the upper bound, below.
 //!
+//! - pipes: a read of a pipe or FIFO, from the write that supplied its last
+//!   byte (`ChannelEvent`, counted through the channel as a byte stream);
+//!
+//! A child wait needs no other edge: what it waits for is the exit it reaps.
+//! In the upper bound, a polled call explained by its result takes no waiting
+//! edge: a read by the write that supplied it, a write that waited for room by
+//! the channel's latest read, and a call a `SIGCHLD` ended (its delivery is
+//! the next commit) by the parent's latest child exit. A `SIGCHLD` delivery is
+//! likewise ordered after the parent's latest child exit instead of after
+//! everything. An end-of-file read keeps its waiting edge: the closes that
+//! give it are not gathered. A polled attempt that found nothing ready and
+//! polls again (`Resources::repolls`) observed no one and takes no edge.
+//!
 //! Detcore's resources do not name pipes, futex words or the files a
-//! background call reads, so a thread that waits on another can lack the edge
-//! that would order it. Two spans bound the true one:
+//! background call reads. Pipe events are gathered for this report alone: at
+//! a read or write's exit the tool stats the descriptor's `/proc` link, and a
+//! FIFO's host (device, inode) names the channel (host numbers, used only as
+//! keys). The events ride on the thread's next resource request. A thread
+//! that waits on another can still lack the edge that would order it. Two spans bound the true one:
 //!
 //! - `span_lo` uses only the edges above, so it can only be too short.
 //! - `span_hi` adds, for a thread that waited (its request blocked or polled,
 //!   or its call ran outside the schedule), an edge from every commit made
-//!   while it waited: whatever it waited for is among them. Sleeps, exits
-//!   held by the exit order, yields and other scheduler-only waits are not
-//!   waits on another thread (`waits_on_others`).
+//!   while it waited: whatever it waited for is among them. Child waits,
+//!   sleeps, exits held by the exit order, yields and other scheduler-only
+//!   waits take no such edge (`wait_kind`). The report counts which kind of
+//!   wait fixed each such commit (`binding_waited`).
 //!
 //! The scheduler-only `ResourceID`s (the global poller token, the futex token,
 //! exit permits, vfork barriers, background-call tokens, priority points) are
@@ -53,9 +70,12 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
+use serde::Deserialize;
 use serde::Serialize;
 
 use super::Scheduler;
@@ -113,6 +133,61 @@ pub(crate) enum EdgeKind {
     Resource,
     /// A commit made while the thread waited (upper bound only).
     Waited,
+    /// The write that supplied the last byte a pipe read returned.
+    Pipe,
+    /// The parent's latest child exit, for a `SIGCHLD` delivery (upper bound
+    /// only).
+    ChildSignal,
+}
+
+/// A read or write that moved bytes through a pipe or FIFO, or a read that
+/// returned its end of file, gathered by the tool for this report.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ChannelEvent {
+    /// The host channel's (device, inode): a key within this run only.
+    pub(crate) channel: (u64, u64),
+    /// Bytes moved; 0 for an end of file.
+    pub(crate) bytes: u64,
+    /// A read, rather than a write.
+    pub(crate) read: bool,
+    /// The result of a call that polled for it (`InternalIOPolling`).
+    pub(crate) polled: bool,
+    /// The thread's guest CPU time at the call's exit.
+    pub(crate) cpu: u64,
+}
+
+/// One channel's byte stream.
+#[derive(Debug, Default)]
+struct Channel {
+    /// Bytes written and read so far.
+    written: u64,
+    read: u64,
+    /// Writes not yet wholly read: the stream offset each ends at, and when.
+    writes: VecDeque<(u64, Bounds)>,
+    /// The latest read's time.
+    last_read: Option<Bounds>,
+}
+
+/// What a thread that waited waited for (`wait_kind`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WaitKind {
+    /// A polled descriptor (`ResourceID::InternalIOPolling` without a child
+    /// wait): a pipe, FIFO, socket or other descriptor read or written.
+    IoPoll,
+    /// A futex wait.
+    Futex,
+    /// A call that ran outside the schedule (a background call, a vfork
+    /// parent, an `rt_sigsuspend`).
+    Outside,
+    /// A signal to deliver, or a `waitid` waiting for one.
+    Signal,
+    /// A `SIGCHLD` to deliver.
+    ChildSignal,
+    /// Guest-visible state another thread holds (`conflict_key`).
+    Resource,
+    /// A vfork parent waiting for its child to exec or exit.
+    VforkParent,
 }
 
 /// Accesses to one resource.
@@ -137,8 +212,8 @@ pub struct WorkSpanState {
     /// A child thread's start: its creator's latest commit when it was created.
     spawned: HashMap<DetTid, Bounds>,
     /// Threads waiting on others, with the largest commit time since they
-    /// began to wait.
-    waiting: HashMap<DetTid, u64>,
+    /// began to wait and what they wait for.
+    waiting: HashMap<DetTid, (u64, WaitKind)>,
     resources: HashMap<ResourceID, Access>,
     /// Per parent process, its exited and not yet reaped children with their
     /// exit commit times.
@@ -149,6 +224,25 @@ pub struct WorkSpanState {
     /// How often each kind of edge fixed a commit's time, per bound.
     binding_lo: BTreeMap<EdgeKind, u64>,
     binding_hi: BTreeMap<EdgeKind, u64>,
+    /// Of the upper bound's `Waited` bindings, how many each kind of wait made.
+    binding_waited: BTreeMap<WaitKind, u64>,
+    channels: HashMap<(u64, u64), Channel>,
+    /// Per thread, the pipe edge its next commit takes (the supplying write's
+    /// time plus the thread's work since its read).
+    pipe_pred: HashMap<DetTid, Bounds>,
+    /// Per thread, the upper bound's edge for a polled write that waited for
+    /// room: the channel's latest read, plus the thread's work since.
+    space_pred: HashMap<DetTid, u64>,
+    /// Threads whose latest polled call was a read a pipe edge explains.
+    poll_explained: HashSet<DetTid>,
+    /// Per thread, the waiting edge of a polled commit, applied at its next
+    /// commit unless the polled call turns out to be an explained read.
+    deferred_poll: HashMap<DetTid, u64>,
+    /// Per parent process, its latest child exit.
+    latest_child_exit: HashMap<DetPid, Bounds>,
+    /// Pipe reads matched to their write, and reads that could not be.
+    pipe_reads_matched: u64,
+    pipe_reads_unmatched: u64,
 }
 
 impl WorkSpanState {
@@ -175,6 +269,9 @@ pub(crate) struct WorkSpanReport {
     pub(crate) threads: usize,
     pub(crate) binding_lo: BTreeMap<EdgeKind, u64>,
     pub(crate) binding_hi: BTreeMap<EdgeKind, u64>,
+    pub(crate) binding_waited: BTreeMap<WaitKind, u64>,
+    pub(crate) pipe_reads_matched: u64,
+    pub(crate) pipe_reads_unmatched: u64,
 }
 
 /// The key a resource conflicts under, or `None` for a scheduler-only
@@ -212,9 +309,15 @@ fn conflict_key(resource: &ResourceID) -> Option<&ResourceID> {
     }
 }
 
-/// Whether a request that waits for `resource` waits on another thread.
-/// Exhaustive for the same reason as `conflict_key`.
-fn waits_on_others(resource: &ResourceID) -> bool {
+/// What a request that waits (blocked or polled) waits for, or `None` when it
+/// takes no waiting edge: a child wait, whose dependency is the exit it reaps
+/// (the reap edge), and scheduler-only waits such as a sleep, a held exit or
+/// a yield. Exhaustive, so that a new variant has to be classified.
+fn wait_kind(request: &Resources) -> Option<WaitKind> {
+    if request.polls_children.is_some() {
+        return None;
+    }
+    let resource = request.resources.keys().next()?;
     match resource {
         ResourceID::FileContents(_)
         | ResourceID::FileMetadata(_)
@@ -222,19 +325,21 @@ fn waits_on_others(resource: &ResourceID) -> bool {
         | ResourceID::MemAddrSpace(_)
         | ResourceID::Path(_)
         | ResourceID::PathsTransitive(_)
-        | ResourceID::Device(_)
-        | ResourceID::ParentContinue { .. }
-        | ResourceID::InternalIOPolling
-        | ResourceID::FutexWait
-        | ResourceID::BlockingExternalIO(_)
+        | ResourceID::Device(_) => Some(WaitKind::Resource),
+        ResourceID::InternalIOPolling => Some(WaitKind::IoPoll),
+        ResourceID::FutexWait => Some(WaitKind::Futex),
+        ResourceID::BlockingExternalIO(_)
         | ResourceID::BlockingVfork(_)
         | ResourceID::BlockedExternalContinue(_)
-        | ResourceID::WaitChild { .. }
+        | ResourceID::BlockingRtSigsuspend(_) => Some(WaitKind::Outside),
+        ResourceID::InboundSignal(signal) if signal.raw() == libc::SIGCHLD => {
+            Some(WaitKind::ChildSignal)
+        }
+        ResourceID::InboundSignal(_) | ResourceID::WaitidSignals(_) => Some(WaitKind::Signal),
+        ResourceID::ParentContinue { .. } => Some(WaitKind::VforkParent),
+        ResourceID::WaitChild { .. }
         | ResourceID::WaitPhysicalChild(_)
-        | ResourceID::InboundSignal(_)
-        | ResourceID::WaitidSignals(_)
-        | ResourceID::BlockingRtSigsuspend(_) => true,
-        ResourceID::Exit { .. }
+        | ResourceID::Exit { .. }
         | ResourceID::SleepUntil(_)
         | ResourceID::TraceReplay
         | ResourceID::VforkFailed(_)
@@ -243,7 +348,7 @@ fn waits_on_others(resource: &ResourceID) -> bool {
         | ResourceID::HappensBeforeCheckpoint(_)
         | ResourceID::HappensBeforeSyscallCheckpoint { .. }
         | ResourceID::HappensBeforePosthookInterrupted { .. }
-        | ResourceID::InGuestFatalAlarm => false,
+        | ResourceID::InGuestFatalAlarm => None,
     }
 }
 
@@ -288,11 +393,87 @@ impl Scheduler {
         state.waiting.remove(&child);
     }
 
-    /// `tid`'s request for `resource` waits (it blocked or polls).
-    pub(super) fn work_span_note_wait(&mut self, tid: DetTid, resource: Option<&ResourceID>) {
+    /// The pipe events `tid` gathered since its previous request, which
+    /// carries guest CPU time `cpu`. Each is timed within the thread's current
+    /// segment; a write enters its channel's stream, and a read takes the
+    /// edge from the write that supplied its last byte for the thread's next
+    /// commit. Called as the request arrives, before any later commit: a
+    /// writer's events arrive with its next request, before the scheduler can
+    /// let a reader run.
+    pub(crate) fn work_span_note_events(&mut self, tid: DetTid, cpu: u64, events: &[ChannelEvent]) {
         let state = &mut self.work_span;
-        if state.enabled && resource.is_none_or(waits_on_others) {
-            state.waiting.entry(tid).or_insert(0);
+        if !state.enabled || events.is_empty() {
+            return;
+        }
+        let base = state
+            .finish
+            .get(&tid)
+            .or_else(|| state.spawned.get(&tid))
+            .copied()
+            .unwrap_or_default();
+        let committed = state.cpu_committed.get(&tid).copied().unwrap_or(cpu);
+        for event in events {
+            let at = base.plus(event.cpu.saturating_sub(committed));
+            let channel = state.channels.entry(event.channel).or_default();
+            if !event.read {
+                channel.written += event.bytes;
+                channel.writes.push_back((channel.written, at));
+                // A polled write waited for room, which a read made: no later
+                // than the latest read seen, all of which came before.
+                if event.polled
+                    && let Some(read) = channel.last_read
+                {
+                    let after = read.hi + cpu.saturating_sub(event.cpu);
+                    let pred = state.space_pred.entry(tid).or_default();
+                    *pred = (*pred).max(after);
+                    state.poll_explained.insert(tid);
+                }
+                continue;
+            }
+            if event.bytes > 0 {
+                channel.last_read = Some(channel.last_read.unwrap_or_default().max(at));
+            }
+            if event.bytes == 0 {
+                // An end of file: the closes that gave it are not gathered.
+                continue;
+            }
+            let last = channel.read + event.bytes;
+            channel.read = last;
+            if last > channel.written {
+                // A write this report did not see: start the stream again.
+                channel.written = last;
+                channel.writes.clear();
+                state.pipe_reads_unmatched += 1;
+                continue;
+            }
+            while channel.writes.front().is_some_and(|(end, _)| *end < last) {
+                channel.writes.pop_front();
+            }
+            let (end, written) = *channel
+                .writes
+                .front()
+                .expect("a write ends at or past `last`");
+            if end == last {
+                channel.writes.pop_front();
+            }
+            let after = written.plus(cpu.saturating_sub(event.cpu));
+            let pred = state.pipe_pred.entry(tid).or_default();
+            *pred = pred.max(after);
+            if event.polled {
+                state.poll_explained.insert(tid);
+            }
+            state.pipe_reads_matched += 1;
+        }
+    }
+
+    /// `tid`'s request `request` waits (it blocked or polls).
+    pub(super) fn work_span_note_wait(&mut self, tid: DetTid, request: &Resources) {
+        let state = &mut self.work_span;
+        if !state.enabled {
+            return;
+        }
+        if let Some(kind) = wait_kind(request) {
+            state.waiting.entry(tid).or_insert((0, kind));
         }
     }
 
@@ -326,6 +507,7 @@ impl Scheduler {
                     })
             })
         });
+        let process = self.thread_tree.process_of(tid);
         let state = &mut self.work_span;
         let cpu = state.cpu_now.get(&tid).copied().unwrap_or(0);
         let weight = cpu.saturating_sub(*state.cpu_committed.entry(tid).or_insert(cpu));
@@ -342,8 +524,54 @@ impl Scheduler {
         let mut lo = (ready.lo, first_kind);
         let mut hi = (ready.hi, first_kind);
 
-        if let Some(waited) = state.waiting.remove(&tid) {
-            bind(&mut hi, waited, EdgeKind::Waited);
+        // Which kind of wait a `Waited` binding of this commit came from.
+        let mut waited_kind = None;
+        let explained = state.poll_explained.remove(&tid);
+        // A polled call ended by a `SIGCHLD`, whose delivery is this commit:
+        // a child's exit readied it.
+        let child_signal = request.is_some_and(|request| {
+            request.resources.keys().any(|resource| {
+                matches!(resource, ResourceID::InboundSignal(signal) if signal.raw() == libc::SIGCHLD)
+            })
+        });
+        // A poll the call makes again: its previous attempt, granted at the
+        // previous commit, found nothing ready, so observed no one.
+        let repolls = request.is_some_and(|request| request.repolls);
+        if let Some(deferred) = state.deferred_poll.remove(&tid)
+            && !explained
+            && !repolls
+        {
+            if child_signal {
+                if let Some(exit) = process.and_then(|p| state.latest_child_exit.get(&p)) {
+                    bind(&mut hi, exit.hi, EdgeKind::ChildSignal);
+                }
+            } else if deferred + weight > hi.0 {
+                hi = (deferred + weight, EdgeKind::Waited);
+                waited_kind = Some(WaitKind::IoPoll);
+            }
+        }
+        if let Some(pred) = state.space_pred.remove(&tid) {
+            bind(&mut hi, pred, EdgeKind::Pipe);
+        }
+        if let Some(pred) = state.pipe_pred.remove(&tid) {
+            bind(&mut lo, pred.lo, EdgeKind::Pipe);
+            bind(&mut hi, pred.hi, EdgeKind::Pipe);
+        }
+        match state.waiting.remove(&tid) {
+            Some((time, WaitKind::IoPoll)) => {
+                // The polled call runs after this commit; its result decides.
+                state.deferred_poll.insert(tid, time);
+            }
+            Some((_, WaitKind::ChildSignal)) => {
+                if let Some(exit) = process.and_then(|p| state.latest_child_exit.get(&p)) {
+                    bind(&mut hi, exit.hi, EdgeKind::ChildSignal);
+                }
+            }
+            Some((time, kind)) if time > hi.0 => {
+                hi = (time, EdgeKind::Waited);
+                waited_kind = Some(kind);
+            }
+            Some(_) | None => {}
         }
         if let Some(parent) = reaps_for
             && let Some(children) = state.exited.get_mut(&parent)
@@ -377,6 +605,11 @@ impl Scheduler {
         let commit = Bounds { lo: lo.0, hi: hi.0 };
         *state.binding_lo.entry(lo.1).or_default() += 1;
         *state.binding_hi.entry(hi.1).or_default() += 1;
+        if hi.1 == EdgeKind::Waited
+            && let Some(kind) = waited_kind
+        {
+            *state.binding_waited.entry(kind).or_default() += 1;
+        }
         for (key, permission) in conflicts {
             let access = state.resources.entry(key.clone()).or_default();
             match permission {
@@ -391,11 +624,11 @@ impl Scheduler {
         state.work += weight;
         state.span = state.span.max(commit);
         state.commits += 1;
-        for waited in state.waiting.values_mut() {
+        for (waited, _) in state.waiting.values_mut() {
             *waited = (*waited).max(commit.hi);
         }
         if request.is_some_and(|request| request.resources.keys().any(goes_outside)) {
-            state.waiting.insert(tid, 0);
+            state.waiting.insert(tid, (0, WaitKind::Outside));
         }
         if let Some((process, parent)) = ends {
             state
@@ -403,6 +636,8 @@ impl Scheduler {
                 .entry(parent)
                 .or_default()
                 .insert(process, commit);
+            let latest = state.latest_child_exit.entry(parent).or_default();
+            *latest = latest.max(commit);
         }
     }
 
@@ -429,6 +664,9 @@ impl Scheduler {
             threads: state.cpu_committed.len(),
             binding_lo: state.binding_lo.clone(),
             binding_hi: state.binding_hi.clone(),
+            binding_waited: state.binding_waited.clone(),
+            pipe_reads_matched: state.pipe_reads_matched,
+            pipe_reads_unmatched: state.pipe_reads_unmatched,
         })
     }
 
@@ -454,6 +692,7 @@ mod tests {
     use crate::resources::Device;
     use crate::types::LogicalTime;
     use crate::types::MmId;
+    use crate::types::SigWrapper;
 
     fn tid(raw: i32) -> DetTid {
         DetTid::from_raw(raw)
@@ -612,7 +851,10 @@ mod tests {
         sched.work_span_note_spawn(tid(1), tid(2));
         commit(&mut sched, 1, 0, None);
         commit(&mut sched, 2, 0, None);
-        sched.work_span_note_wait(tid(1), Some(&ResourceID::FutexWait));
+        sched.work_span_note_wait(
+            tid(1),
+            &request(1, Some((ResourceID::FutexWait, Permission::RW))),
+        );
         commit(&mut sched, 2, 900, None);
         commit(
             &mut sched,
@@ -622,14 +864,187 @@ mod tests {
         );
         assert_eq!(finish(&sched, 1), (5, 900));
 
-        sched.work_span_note_wait(
-            tid(1),
-            Some(&ResourceID::SleepUntil(LogicalTime::from_nanos(1))),
-        );
+        let sleep = ResourceID::SleepUntil(LogicalTime::from_nanos(1));
+        sched.work_span_note_wait(tid(1), &request(1, Some((sleep, Permission::R))));
         commit(&mut sched, 2, 2_000, None);
         commit(&mut sched, 1, 10, None);
         assert_eq!(finish(&sched, 1), (10, 905), "a sleep waits on no one");
         assert_eq!(report(&sched), (2_010, 2_000, 2_000));
+    }
+
+    /// A child wait is satisfied by the exit it reaps: what else ran while it
+    /// waited does not order it, in either bound.
+    #[test]
+    fn a_child_wait_takes_only_its_reap_edge() {
+        let mut sched = family();
+        commit(&mut sched, 1, 0, None);
+        sched.work_span_note_spawn(tid(1), tid(2));
+        sched.work_span_note_spawn(tid(1), tid(3));
+        let mut wait = request(1, Some((ResourceID::InternalIOPolling, Permission::W)));
+        wait.polls_children = Some(DetPid::from_raw(1));
+        sched.work_span_note_wait(tid(1), &wait);
+        commit(&mut sched, 2, 0, None);
+        commit(&mut sched, 2, 100, exit(2));
+        commit(&mut sched, 3, 0, None);
+        commit(&mut sched, 3, 5_000, None);
+        sched.work_span_commit(tid(1), Some(&wait));
+        assert_eq!(
+            finish(&sched, 1),
+            (100, 100),
+            "child 3's work does not order it"
+        );
+        assert!(sched.work_span.binding_waited.is_empty());
+    }
+
+    fn event(bytes: u64, read: bool, polled: bool, cpu: u64) -> ChannelEvent {
+        ChannelEvent {
+            channel: (7, 42),
+            bytes,
+            read,
+            polled,
+            cpu,
+        }
+    }
+
+    /// A pipe read takes the edge from the write that supplied its last
+    /// byte, timed within both threads' segments.
+    #[test]
+    fn a_pipe_read_follows_the_write_that_supplied_it() {
+        let mut sched = family();
+        sched.work_span_note_spawn(tid(1), tid(2));
+        commit(&mut sched, 1, 0, None);
+        commit(&mut sched, 2, 0, None);
+        // Thread 2 writes 3 bytes at 300 and 2 more at 700, then requests at 1,000.
+        sched.work_span_note_cpu(tid(2), 1_000);
+        sched.work_span_note_events(
+            tid(2),
+            1_000,
+            &[event(3, false, false, 300), event(2, false, false, 700)],
+        );
+        sched.work_span_commit(tid(2), Some(&request(2, None)));
+        // Thread 1 reads 4 bytes at its 10 (the 4th byte is the second write's,
+        // at 700), then works to 50 before its request.
+        sched.work_span_note_cpu(tid(1), 50);
+        sched.work_span_note_events(tid(1), 50, &[event(4, true, false, 10)]);
+        sched.work_span_commit(tid(1), Some(&request(1, None)));
+        assert_eq!(finish(&sched, 1), (740, 740));
+        assert_eq!(sched.work_span.pipe_reads_matched, 1);
+        // A read past every write seen is not matched, and takes no edge.
+        sched.work_span_note_cpu(tid(1), 60);
+        sched.work_span_note_events(tid(1), 60, &[event(9, true, false, 55)]);
+        sched.work_span_commit(tid(1), Some(&request(1, None)));
+        assert_eq!(finish(&sched, 1), (750, 750));
+        assert_eq!(sched.work_span.pipe_reads_unmatched, 1);
+    }
+
+    /// A polled read explained by a pipe edge takes no waiting edge in the
+    /// upper bound; a polled call that is not one keeps it.
+    #[test]
+    fn an_explained_poll_drops_its_waiting_edge() {
+        let poll = || request(1, Some((ResourceID::InternalIOPolling, Permission::W)));
+        for explained in [true, false] {
+            let mut sched = family();
+            sched.work_span_note_spawn(tid(1), tid(2));
+            sched.work_span_note_spawn(tid(1), tid(3));
+            for thread in [1, 2, 3] {
+                commit(&mut sched, thread, 0, None);
+            }
+            sched.work_span_note_wait(tid(1), &poll());
+            sched.work_span_note_cpu(tid(2), 100);
+            if explained {
+                sched.work_span_note_events(tid(2), 100, &[event(1, false, false, 100)]);
+            }
+            sched.work_span_commit(tid(2), Some(&request(2, None)));
+            commit(&mut sched, 3, 5_000, None);
+            // The polled retry's grant, then the read's result on the next request.
+            sched.work_span_commit(tid(1), Some(&poll()));
+            sched.work_span_note_cpu(tid(1), 20);
+            if explained {
+                sched.work_span_note_events(tid(1), 20, &[event(1, true, true, 1)]);
+            }
+            sched.work_span_commit(tid(1), Some(&request(1, None)));
+            let expected = if explained { (119, 119) } else { (20, 5_020) };
+            assert_eq!(finish(&sched, 1), expected, "explained: {explained}");
+        }
+
+        // An attempt that found nothing and polls again takes no edge.
+        let mut sched = family();
+        sched.work_span_note_spawn(tid(1), tid(2));
+        commit(&mut sched, 1, 0, None);
+        commit(&mut sched, 2, 0, None);
+        sched.work_span_note_wait(tid(1), &poll());
+        commit(&mut sched, 2, 5_000, None);
+        sched.work_span_commit(tid(1), Some(&poll()));
+        let mut again = poll();
+        again.repolls = true;
+        sched.work_span_note_cpu(tid(1), 20);
+        sched.work_span_commit(tid(1), Some(&again));
+        assert_eq!(finish(&sched, 1), (20, 20));
+    }
+
+    /// A polled write that waited for room follows the channel's latest
+    /// read in the upper bound, not everything that ran meanwhile; a polled
+    /// call that a `SIGCHLD` ended follows the latest child exit.
+    #[test]
+    fn a_full_pipe_write_and_an_interrupted_poll_are_explained() {
+        let poll = |thread| request(thread, Some((ResourceID::InternalIOPolling, Permission::W)));
+        let mut sched = family();
+        sched.work_span_note_spawn(tid(1), tid(2));
+        sched.work_span_note_spawn(tid(1), tid(3));
+        for thread in [1, 2, 3] {
+            commit(&mut sched, thread, 0, None);
+        }
+        // Thread 2 waits to write into a full pipe; thread 1 reads at 200.
+        sched.work_span_note_wait(tid(2), &poll(2));
+        sched.work_span_note_events(tid(1), 0, &[event(4, false, false, 0)]);
+        sched.work_span_note_cpu(tid(1), 200);
+        sched.work_span_note_events(tid(1), 200, &[event(4, true, false, 200)]);
+        sched.work_span_commit(tid(1), Some(&request(1, None)));
+        commit(&mut sched, 3, 5_000, None);
+        sched.work_span_commit(tid(2), Some(&poll(2)));
+        sched.work_span_note_cpu(tid(2), 30);
+        sched.work_span_note_events(tid(2), 30, &[event(1, false, true, 10)]);
+        sched.work_span_commit(tid(2), Some(&request(2, None)));
+        assert_eq!(finish(&sched, 2), (30, 220));
+
+        // Thread 3 exits at 5,100; thread 1's poll is ended by the SIGCHLD.
+        commit(&mut sched, 3, 5_100, exit(3));
+        sched.work_span_note_wait(tid(1), &poll(1));
+        commit(&mut sched, 2, 9_000, None);
+        sched.work_span_commit(tid(1), Some(&poll(1)));
+        let delivery = request(
+            1,
+            Some((
+                ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD)),
+                Permission::RW,
+            )),
+        );
+        sched.work_span_commit(tid(1), Some(&delivery));
+        assert_eq!(finish(&sched, 1), (200, 5_100), "not 9,000");
+    }
+
+    /// A `SIGCHLD` delivery is ordered after the parent's latest child exit
+    /// in the upper bound, not after everything that ran meanwhile.
+    #[test]
+    fn a_sigchld_delivery_follows_the_latest_child_exit() {
+        let mut sched = family();
+        commit(&mut sched, 1, 0, None);
+        sched.work_span_note_spawn(tid(1), tid(2));
+        sched.work_span_note_spawn(tid(1), tid(3));
+        let delivery = request(
+            1,
+            Some((
+                ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD)),
+                Permission::RW,
+            )),
+        );
+        sched.work_span_note_wait(tid(1), &delivery);
+        commit(&mut sched, 2, 0, None);
+        commit(&mut sched, 2, 300, exit(2));
+        commit(&mut sched, 3, 0, None);
+        commit(&mut sched, 3, 9_000, None);
+        sched.work_span_commit(tid(1), Some(&delivery));
+        assert_eq!(finish(&sched, 1), (0, 300));
     }
 
     /// Off by default: nothing is tracked and there is no report.
