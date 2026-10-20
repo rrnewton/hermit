@@ -2398,6 +2398,14 @@ where
     let mut turn_wait = checks_at_turn
         .then(|| KernelSignalWait::new(guest, 0, false, call.signal_interrupt_errno()));
     let mut published = PublishedWaitMask::default();
+    // PROTOTYPE 3c: on in-guest the kernel's mask for this thread is the
+    // runtime's while it polls; publish the guest's, which the scheduler uses
+    // instead (`Scheduler::under_published_mask`) to decide which signal ends
+    // the poll.
+    let proto_mask = guest.prototype_saved_guest_mask();
+    if proto_mask.is_some() {
+        crate::tool_global::set_saved_guest_sigmask(guest, proto_mask).await;
+    }
 
     let result: Result<i64, Error> = loop {
         let resumed = match call.into() {
@@ -2546,6 +2554,10 @@ where
             break res;
         }
     };
+    // PROTOTYPE 3c: the poll is over; withdraw the published guest mask.
+    if proto_mask.is_some() {
+        crate::tool_global::set_saved_guest_sigmask(guest, None).await;
+    }
 
     // The single exit: the guest's mask goes back before the result is
     // returned. A mask `block_in_place` installed goes back through
