@@ -884,7 +884,7 @@ pub(super) fn is_native_exec_control(mut request: &super::GlobalRequest) -> bool
     use super::GlobalRequest as Q;
     loop {
         match request {
-            Q::WithForwardedCount(_, inner) => request = inner,
+            Q::WithForwardedCount(_, inner) | Q::WithWorkSpan(_, inner) => request = inner,
             Q::PrepareNativeExec(_)
             | Q::SealNativeExecStats { .. }
             | Q::IssueNativeExec { .. }

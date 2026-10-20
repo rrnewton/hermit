@@ -3114,6 +3114,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     in_uncharged_bootstrap_syscall: false,
                     yield_after_futex_wake: false,
                     pipe_handoff_due: None,
+                    work_span_events: Vec::new(),
+                    work_span_polled: false,
+                    work_span_polls_children: None,
                     own_signal_turn_hold: None,
                     delivered_since_request: false,
                     returned_from_sigreturn: false,
@@ -4882,6 +4885,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 crate::fifo_peer::forget_guest_made(fifo);
             }
             self.note_guest_made_fifo(guest, &call).await;
+        }
+        // `--work-span-report`'s pipe events (`scheduler::work_span`).
+        if self.cfg.work_span_report.is_some() {
+            self.gather_channel_event(guest, &call, &res);
         }
         // A read or write that moved bytes through a pipe or FIFO readies the
         // threads polling its other direction (`--pipe-wake-latency`).
