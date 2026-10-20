@@ -722,7 +722,7 @@ fn prepared_selected_cpu_allowances(
 /// The only overrides a regular configuration may carry, as (filter,
 /// test-group) pairs. Each group only lowers how many of its tests run at once.
 const REGULAR_GROUP_OVERRIDES: [(&str, &str); 1] = [(
-    "package(=hermit) & binary(=cli) & (test(=record_classifies_a_gdbserver_replay_stage_container_child_failure) | test(=every_record_container_site_classifies_a_child_fault_by_name))",
+    "package(=hermit-run) & binary(=cli) & (test(=record_classifies_a_gdbserver_replay_stage_container_child_failure) | test(=every_record_container_site_classifies_a_child_fault_by_name))",
     "cli-gdbserver-port",
 )];
 
