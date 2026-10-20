@@ -189,19 +189,11 @@ fn without_perf_event_signal(mask: KernelSigset) -> KernelSigset {
 /// Only for a call's first injection. A probe after an earlier injection
 /// keeps the not-run report, since a restart would repeat that injection
 /// (pselect6's mask read after its wrapper validation and its observation of
-/// a pending real-time timer expiration, for example). Some first injections
-/// still keep it, because whether they come first depends on an earlier
-/// phase that usually injects nothing
-/// (https://github.com/rrnewton/hermit/issues/4526):
-/// - raw epoll_pwait and epoll_pwait2: the mask read inside
-///   `observe_under_temporary_mask`, which swallows any error, and the mask
-///   reads after it when the observation injected nothing;
-/// - a zero-timeout ppoll's mask read (`prepare_ppoll_probe(.., false)`):
-///   in run mode it follows `publish_expired`, which usually injects
-///   nothing; under record and replay only a scheduler request comes first,
-///   so there it is always the first injection, and still unmapped;
-/// - record/replay pselect6's entry read (`entry_pselect6_temporary_mask`),
-///   which swallows any error.
+/// a pending real-time timer expiration, for example). Where an earlier
+/// phase injects only sometimes, the caller says whether it did: epoll_pwait
+/// and epoll_pwait2's observation (`observe_under_temporary_mask`), and a
+/// zero-timeout ppoll's publication of virtual timerfd expirations
+/// (https://github.com/rrnewton/hermit/issues/4526).
 pub(crate) fn restart_if_first_probe_not_run<V>(result: Result<V, Error>) -> Result<V, Error> {
     match result {
         Err(Error::Errno(Errno::ERESTARTSYS)) => Err(Errno::ERESTARTNOINTR.into()),
