@@ -148,6 +148,15 @@ case $runner in
         echo "validate-node: HERMIT_VALIDATE_E2E_RUNNER is '${runner}', not buck-local or buck-hybrid; run scripts/validate.rs --e2e-runner buck-local|buck-hybrid --buck2 PATH" >&2
         exit 2 ;;
 esac
+# This host's buck2 runs with buck2_resource_control on (~/.buckconfig.d), which puts the
+# daemon, and every local cell action it runs, in a systemd scope of its own
+# (buck2.slice/buck2_daemon.<project>.*): outside this node's cgroup and outside the run's
+# scope. None of the run's limits then applied to the local cells (its CPU quota, the CPU
+# placement that keeps Hermit off the PMU-bound CPUs, its memory cap, RuntimeMaxSec), and
+# their CPU was invisible to the node: in the full validation of c4de94bb, e2e.buck_cells'
+# cgroup recorded 30 s of CPU over its 297 s while 2,223 cells ran. Off, the daemon stays in
+# the cgroup of the node that starts it.
+buck_args+=(-c buck2_resource_control.status=off)
 buck2=${HERMIT_VALIDATE_BUCK2:-}
 if [[ $buck2 != /* || ! -f $buck2 || ! -x $buck2 ]]; then
     echo "validate-node: HERMIT_VALIDATE_BUCK2 is '${buck2}', not an absolute path to an executable file; pass scripts/validate.rs --buck2 PATH" >&2
