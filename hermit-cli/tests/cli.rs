@@ -5839,6 +5839,7 @@ fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
         "/proc/self/limits",
         "/proc/self/attr",
         "/proc/self/oom_score_adj",
+        "/proc/self/loginuid",
         "/proc/thread-self/wchan",
     ];
     let standard_only = [
