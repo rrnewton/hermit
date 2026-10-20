@@ -779,7 +779,13 @@ impl RecordVersion {
 // first (https://github.com/rrnewton/hermit/issues/4526), where the call failed
 // with the probe's -ERESTARTSYS. A recording made before this holds that EINTR
 // and would replay out of step.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17e);
+// 0x17e -> 0x17f (HIGHEST_SHIPPED + 1 when it lands): a signal delivery that
+// continues the thread's previous handler (no resumption by the scheduler in
+// between) runs before the other threads under record and replay too
+// (https://github.com/rrnewton/hermit/issues/4505). A recording whose guest
+// is signaled again before a handler returns now has a different schedule,
+// and an older recording would replay out of step.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17f);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -804,7 +810,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x17e);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17e;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x17f;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1375,6 +1381,22 @@ mod tests {
         assert!(config.panic_on_unsupported_syscalls);
         assert!(config.exit_on_unsupported_syscall);
         assert!(!config.shutdown_on_unsupported_syscall);
+    }
+
+    /// A recording, its autopilot replay and its gdb-served replay take the
+    /// same signal continuations only if none of them reads the backend's
+    /// `rt_sigreturn` reports, which a gdbserver turns off
+    /// (https://github.com/rrnewton/hermit/pull/4510).
+    #[test]
+    fn record_and_replay_never_read_sigreturn_reports() {
+        let record = record_or_replay_config(Path::new("replay-data"));
+        let mut replay = record.clone();
+        replay.replaying = true;
+        let mut gdb_replay = replay.clone();
+        gdb_replay.gdbserver = true;
+        for (name, config) in [("record", record), ("replay", replay), ("gdb", gdb_replay)] {
+            assert!(!detcore::observes_sigreturns(&config), "{name}");
+        }
     }
 
     /// Record mode never hands the turn to a readied pipe poller, whatever
