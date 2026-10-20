@@ -2532,6 +2532,19 @@ impl GlobalState {
             request => request,
         };
         let time_from_guest = guest_time.as_nanos();
+        // The thread's own computation and syscalls, excluding clock advances
+        // (`DetTime::advance_to`), for `--work-span-report`.
+        let work_span_cpu = self.cfg.work_span_report.is_some().then(|| {
+            guest_time.user_cpu_time().as_nanos() + guest_time.system_cpu_time().as_nanos()
+        });
+        if let Some(cpu) = work_span_cpu {
+            let starts_thread =
+                matches!(&request, GlobalRequest::StartNewThread(child, ..) if *child == dtid);
+            self.sched
+                .lock()
+                .unwrap()
+                .work_span_note_arrival(dtid, cpu, starts_thread);
+        }
         // Exec transfer messages authenticate both incarnations before ordinary
         // sender-clock accounting. The carried clock still belongs to the former
         // thread until the successful reconnect commits.
@@ -3875,11 +3888,15 @@ impl GlobalState {
                     sched.has_child_wait_target(parent, selector),
                 ))
             }
-            GlobalRequest::ConsumeChildWait(parent, child) => R::ConsumeChildWait(
-                self.lock_rpc_scheduler(false)
-                    .await
-                    .consume_child_wait(parent, child),
-            ),
+            GlobalRequest::ConsumeChildWait(parent, child) => R::ConsumeChildWait({
+                let mut sched = self.lock_rpc_scheduler(false).await;
+                if let Some(cpu) = work_span_cpu
+                    && sched.thread_tree.parent_process(&child) == Some(parent)
+                {
+                    sched.work_span_note_reap(dtid, cpu, parent, child);
+                }
+                sched.consume_child_wait(parent, child)
+            }),
             GlobalRequest::ProcessGroup(process) => R::ProcessGroup(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -4570,6 +4587,7 @@ impl GlobalState {
                     flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_PARENT)),
                     exit_signal,
                 );
+                sched.work_span_note_spawn(parent_dettid, child_dettid);
                 if is_group_leader {
                     sched.forget_previous_process_exit(child_dettid);
                     // The child's exit signal is posted to its parent at a
