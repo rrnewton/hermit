@@ -2353,7 +2353,12 @@ fi
 # reverie-core (tool.rs, guest.rs and signal.rs only). No DBT, SDK or native
 # input changes; calibrated budgets, jobs, limits and inventory989 are
 # unchanged.
-expected_pin=90329dd5be334d5e486891656e2652a8af3934b2
+# REBASE TO bc460a72fc2dea0cc04c03e238d67094aeba4e31 (2026-10-20): the incoming change rewords the
+# two-phase signal hooks' contract and adds a test in reverie-core
+# (tool.rs, guest.rs and tests/signal_bridge.rs only). No DBT, SDK or native
+# input changes; calibrated budgets, jobs, limits and inventory989 are
+# unchanged.
+expected_pin=bc460a72fc2dea0cc04c03e238d67094aeba4e31
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
