@@ -161,11 +161,17 @@ impl std::fmt::Display for UnfencedSigkill {
 
 /// Whether a backend lets the scheduler retire a SIGKILL's victims at the
 /// kill turn: ptrace, where the scheduler's record decides waits and each
-/// victim's death reaches it as a deregistration. Backends that cancel killed
-/// threads' RPCs, need thread-directed process signals, or report process
-/// exits on their own keep their existing paths.
+/// victim's death reaches it as a deregistration. Backends that emulate child
+/// waits (KVM, whose executor owns and refuses the send), need
+/// thread-directed process signals, or report process exits on their own keep
+/// their existing paths.
+///
+/// It does not read `needs_killed_thread_rpc_cancellation`, which selects the
+/// killed-thread lifecycle model (A5 design 18.14): on every backend constant
+/// where that field held and no other term did (KVM), `emulates_child_waits`
+/// holds, so the answer is unchanged.
 pub(crate) fn retires_sigkill_at_the_kill_turn(backend: &reverie::BackendCapabilities) -> bool {
-    !(backend.needs_killed_thread_rpc_cancellation
+    !(backend.emulates_child_waits
         || backend.requires_thread_directed_process_signals
         || backend.process_exits_complete_asynchronously
         || backend.reports_physical_process_exits)
@@ -685,6 +691,37 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The kill-turn predicate reads `emulates_child_waits` where it read
+    /// `needs_killed_thread_rpc_cancellation`: on every backend constant the
+    /// answer is the old expression's (A5 design 18.14).
+    #[test]
+    fn kill_turn_retirement_is_unchanged_on_every_backend_constant() {
+        for (name, backend) in [
+            ("ptrace", reverie::BackendCapabilities::PTRACE),
+            ("e9patch", reverie::BackendCapabilities::E9PATCH),
+            ("liteinst", reverie::BackendCapabilities::LITEINST_IN_GUEST),
+            ("sabre", reverie::BackendCapabilities::SABRE),
+            ("dbt", reverie::BackendCapabilities::DBT),
+            ("kvm", reverie::BackendCapabilities::KVM),
+            (
+                "unprepared",
+                detcore_model::config::DEFAULT_BACKEND_CAPABILITIES,
+            ),
+        ] {
+            let old = !(backend.needs_killed_thread_rpc_cancellation
+                || backend.requires_thread_directed_process_signals
+                || backend.process_exits_complete_asynchronously
+                || backend.reports_physical_process_exits);
+            assert_eq!(retires_sigkill_at_the_kill_turn(&backend), old, "{name}");
+        }
+        assert!(retires_sigkill_at_the_kill_turn(
+            &reverie::BackendCapabilities::PTRACE
+        ));
+        assert!(!retires_sigkill_at_the_kill_turn(
+            &reverie::BackendCapabilities::KVM
+        ));
+    }
     use crate::config::Config;
 
     /// root 1 with children 2 (the sender) and 3 (the target, two threads: 3

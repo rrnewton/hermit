@@ -2425,7 +2425,15 @@ fi
 # third-party/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so inventory 999, SDK and native inputs, calibrated
 # budget, job width and limits carry unchanged from the e3634c51 entry.
-expected_pin=39f2f875709bc0830d16b3b53f8060c5fdb716d0
+# CARRY TO cc80f480f9ae3c3b15854356e60f5d5b1c291239 (2026-10-21): from
+# 39f2f875709bc0830d16b3b53f8060c5fdb716d0. One commit (signals lane: document
+# that needs_killed_thread_rpc_cancellation selects Detcore's killed-thread
+# lifecycle model). It changes a doc comment in reverie/src/capabilities.rs
+# only; git diff is empty under reverie-dbt/ and third-party/ and for the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml, so inventory 999, SDK and
+# native inputs, calibrated budget, job width and limits carry unchanged from
+# the 39f2f875 entry.
+expected_pin=cc80f480f9ae3c3b15854356e60f5d5b1c291239
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
