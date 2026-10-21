@@ -11088,6 +11088,13 @@
           "category": "c-programs",
           "test": "c-programs/writev-determinism",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/writev-determinism",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -56939,6 +56946,13 @@
           "test": "c-programs/wait-on-child",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/writev-determinism",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
