@@ -989,7 +989,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-detcore"
-version = "0.5.0"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1110,7 +1110,7 @@ dependencies = [
 
 [[package]]
 name = "hermit-replay"
-version = "0.5.0"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "hermit-detcore",
