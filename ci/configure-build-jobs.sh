@@ -2501,8 +2501,15 @@ fi
 # third-party/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so inventory 999, SDK and native inputs, calibrated
 # budget, job width and limits carry unchanged from the e3634c51 entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 39f2f875709bc0830d16b3b53f8060c5fdb716d0 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 39f2f875709bc0830d16b3b53f8060c5fdb716d0 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 9a79e92db96f8a9202ceeb75c20e724c0c004b19 (2026-10-21): from
+# 39f2f875709bc0830d16b3b53f8060c5fdb716d0. One commit (safeptrace: prove the managed wait owner once
+# per poll). It changes safeptrace/src/notifier.rs, managed_native_tests.rs and
+# the new host_proof_tests.rs only; git diff is empty under reverie-dbt/ and
+# third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so inventory 999, SDK and native inputs, calibrated
+# budget, job width and limits carry unchanged from the e3634c51 entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 9a79e92db96f8a9202ceeb75c20e724c0c004b19 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 9a79e92db96f8a9202ceeb75c20e724c0c004b19 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
