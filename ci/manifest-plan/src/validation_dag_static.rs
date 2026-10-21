@@ -1716,7 +1716,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Add the first-image loader controls; retain main's full selection.
     // And run::signal_at_is_refused_where_it_would_not_reach_the_guest
     // (review of https://github.com/rrnewton/hermit/pull/4532): 1070, listed.
-    ("test.hermit_unit", 1070),
+    // And metadata::tests::record_version_rejects_path_classified_random_device_streams
+    // (the LinuxEmu D3a record version): 1071, listed.
+    ("test.hermit_unit", 1071),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2639,7 +2641,18 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the cpufreq boost constant unit of the LinuxEmu D4a pin
     // (cpufreq_boost_is_off_on_every_policy): 2257.
     // And a two-phase check-time grant unit: 2258.
-    ("test.detcore_unit", 2258),
+    // And the two random-device classification units of the LinuxEmu D3a pin
+    // (random_devices_are_character_devices_one_eight_and_one_nine,
+    // discovery_classifies_random_devices_by_device_number): 2260.
+    // And the seven classification-fstat and cleanup units of the same pin
+    // (classification_retries_an_interrupted_fstat,
+    // classification_fstat_errors_and_regular_files,
+    // classification_falls_back_to_a_transient_page,
+    // classification_without_any_buffer_is_a_scratch_failure,
+    // unclassified_close_retries_only_a_close_that_never_ran,
+    // unclassified_close_that_ran_is_not_repeated,
+    // unclassified_close_refused_ends_the_run): 2267.
+    ("test.detcore_unit", 2267),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4669,7 +4682,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same statfs canonicalization unit of the LinuxEmu D2 pin: 2256.
     // And the same cpufreq boost constant unit of the LinuxEmu D4a pin: 2257.
     // And a two-phase check-time grant unit: 2258.
-    ("test.detcore_unit_on_host", 2258),
+    // And the same two random-device classification units of the LinuxEmu D3a
+    // pin: 2260.
+    // And the same seven classification-fstat and cleanup units: 2267.
+    ("test.detcore_unit_on_host", 2267),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -4995,7 +5011,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Host CPUID profile coverage: https://github.com/rrnewton/hermit/issues/4534.
     // Add the first-image loader controls; retain main's full selection.
     // And the same --signal-at refusal test: 1070, listed.
-    ("test.hermit_unit_on_host", 1070),
+    // And the same D3a record-version unit: 1071, listed.
+    ("test.hermit_unit_on_host", 1071),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
