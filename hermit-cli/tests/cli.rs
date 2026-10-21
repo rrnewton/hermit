@@ -210,6 +210,8 @@ static RECEIVED_DIRECTORY_OPENAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DIRECTORY_SWAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STATX_MOUNT_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_AT_TURN_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static POLL_EXTERNAL_FIFO_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static POLL_EXTERNAL_FIFO_HANDSHAKE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STATX_UNIQUE_MOUNT_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_HANDLER_TURN_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PROCFS_LINKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -8332,6 +8334,167 @@ fn signal_at_snapshot_controller_counts_only_a_completed_snapshot() {
                 );
             }
         }
+    }
+}
+
+/// Runs `poll_external_fifo FIFO timeout` under `hermit run --strict` while
+/// this process, outside the container, holds the FIFO open read-write and
+/// silent past the guest's three timeouts. Returns the guest's stdout after
+/// its ready line: its clock at each timeout.
+fn poll_a_silent_outside_fifo(name: &str) -> String {
+    let guest = compiled_c_guest(&POLL_EXTERNAL_FIFO_GUEST, "poll_external_fifo");
+    let dir = process_build_root(name);
+    fs::create_dir_all(&dir).expect("create the FIFO's directory");
+    let fifo = dir.join("fifo");
+    let _ = fs::remove_file(&fifo);
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo failed");
+    // Read-write, so a writer exists before the guest opens the FIFO.
+    let writer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .expect("open the FIFO read-write");
+    let args = [
+        "run",
+        "--strict",
+        "--",
+        guest.to_str().unwrap(),
+        fifo.to_str().unwrap(),
+        "timeout",
+    ];
+    let output = hermit_command(&args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run hermit");
+    drop(writer);
+    assert_success(&output, &args);
+    let out = stdout(&output);
+    out.strip_prefix("ready\n").unwrap_or(&out).to_string()
+}
+
+/// Starts a thread that writes `fifo` as an outside process answering
+/// `poll_external_fifo_handshake`: for each line 0 to `lines - 1`, it waits for
+/// the guest's `dir/ready-<line>`, removes it, sleeps `delay(line)` and writes
+/// the line, and starts again at line 0 for a next run, until `stop` is set.
+fn answer_an_outside_fifo(
+    fifo: &Path,
+    dir: &Path,
+    lines: usize,
+    delay: impl Fn(usize) -> Duration + Send + 'static,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<()> {
+    // Read-write, so a writer exists before the guest opens the FIFO.
+    let mut writer = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fifo)
+        .expect("open the FIFO read-write");
+    let dir = dir.to_path_buf();
+    std::thread::spawn(move || {
+        'runs: loop {
+            for line in 0..lines {
+                let ready = dir.join(format!("ready-{line}"));
+                while fs::remove_file(&ready).is_err() {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break 'runs;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(delay(line));
+                writeln!(writer, "line {line}").expect("write the FIFO");
+            }
+        }
+    })
+}
+
+/// Runs `poll_external_fifo_handshake` under `hermit run` with `extra` options
+/// while this process answers each of its requests for a line after
+/// `delay(line)`. Returns Hermit's output.
+fn run_an_answered_outside_fifo(
+    name: &str,
+    extra: &[&str],
+    lines: usize,
+    delay: impl Fn(usize) -> Duration + Send + 'static,
+) -> Output {
+    let guest = compiled_c_guest(
+        &POLL_EXTERNAL_FIFO_HANDSHAKE_GUEST,
+        "poll_external_fifo_handshake",
+    );
+    let dir = process_build_root(name);
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).expect("create the FIFO's directory");
+    let fifo = dir.join("fifo");
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo failed");
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let answering = answer_an_outside_fifo(&fifo, &dir, lines, delay, Arc::clone(&stop));
+    let count = lines.to_string();
+    let mut args = vec!["run", "--strict"];
+    args.extend_from_slice(extra);
+    args.extend([
+        "--",
+        guest.to_str().unwrap(),
+        fifo.to_str().unwrap(),
+        dir.to_str().unwrap(),
+        count.as_str(),
+    ]);
+    let output = hermit_command(&args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("run hermit");
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    answering.join().expect("the FIFO writer panicked");
+    assert_success(&output, &args);
+    output
+}
+
+/// A guest that waits for lines from a FIFO a process outside the container
+/// writes sees the same clock whatever that process's timing. The writer
+/// answers each of the guest's requests only after the guest asked, so the
+/// guest always waits and sees the same bytes; only how long it waited
+/// differs, 50 ms or 300 ms a line. Each retry of a poll that nothing has
+/// moved since its last charge adds no virtual time, so the wait is not
+/// visible. Before, every retry added a scheduler charge, so the clock grew
+/// with host waiting time: about 9.5 virtual seconds per second waited.
+#[test]
+fn polling_an_outside_fifo_sees_the_same_clock_whatever_the_writer_timing() {
+    let test = "polling_an_outside_fifo_sees_the_same_clock_whatever_the_writer_timing";
+    let short = stdout(&run_an_answered_outside_fifo(test, &[], 3, |_| {
+        Duration::from_millis(50)
+    }));
+    let long = stdout(&run_an_answered_outside_fifo(test, &[], 3, |_| {
+        Duration::from_millis(300)
+    }));
+    assert_eq!(short.lines().count(), 3, "{short}");
+    assert_eq!(
+        short, long,
+        "the guest's clock followed the writer's timing"
+    );
+}
+
+/// A poll with a finite timeout on a FIFO that a silent outside process holds
+/// open still times out, at its virtual deadline, the same in every run:
+/// with only the spinning poller left, the scheduler waits in host time up to
+/// the timeout for the outside process, then moves virtual time to the
+/// deadline.
+#[test]
+fn polling_a_silent_outside_fifo_times_out_at_the_virtual_deadline() {
+    let test = "polling_a_silent_outside_fifo_times_out_at_the_virtual_deadline";
+    let first = poll_a_silent_outside_fifo(test);
+    let second = poll_a_silent_outside_fifo(test);
+    assert_eq!(first, second);
+    let elapsed: Vec<i64> = first
+        .lines()
+        .map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            assert_eq!(fields[..3], ["poll", fields[1], "0"], "{line}");
+            fields[3].parse().unwrap()
+        })
+        .collect();
+    assert_eq!(elapsed.len(), 3, "{first}");
+    let mut previous = 0;
+    for ns in elapsed {
+        assert!(ns - previous >= 300_000_000, "{first}");
+        previous = ns;
     }
 }
 
