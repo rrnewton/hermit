@@ -2501,8 +2501,16 @@ fi
 # third-party/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so inventory 999, SDK and native inputs, calibrated
 # budget, job width and limits carry unchanged from the e3634c51 entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 39f2f875709bc0830d16b3b53f8060c5fdb716d0 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 39f2f875709bc0830d16b3b53f8060c5fdb716d0 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO ab6ca4d7684b6ba64689a5940daca6753c846b1a (2026-10-21): from
+# 39f2f875709bc0830d16b3b53f8060c5fdb716d0. One commit (signals lane: document
+# that needs_killed_thread_rpc_cancellation selects Detcore's killed-thread
+# lifecycle model). It changes a doc comment in reverie/src/capabilities.rs
+# only; git diff is empty under reverie-dbt/ and third-party/ and for the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml, so inventory 999, SDK and
+# native inputs, calibrated budget, job width and limits carry unchanged from
+# the 39f2f875 entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ab6ca4d7684b6ba64689a5940daca6753c846b1a ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ab6ca4d7684b6ba64689a5940daca6753c846b1a (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

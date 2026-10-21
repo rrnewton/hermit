@@ -1223,7 +1223,6 @@ fn record_or_replay_config_with_timer_support(
         fuzz_seed: None,
     }
     .with_backend(|backend| {
-        backend.supports_blocked_wait_signal_interruption = true;
         backend.runs_guest_code_between_injections = false;
     });
     if let Err(reason) = timer_support {
