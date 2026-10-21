@@ -67,6 +67,7 @@ static EXIT_REAPING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static UNSCHEDULED_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SELF_SIGNAL_DEATH_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RESERVED_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static HOST_TIMED_PRODUCER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DUP_ALIAS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOSE_RANGE_PORT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static IOV_OVERWRITTEN_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -3723,6 +3724,574 @@ fn liteinst_in_guest_reserved_group_sends_stay_refused_by_name() {
                 !stderr.contains("HERMIT_RESERVED_SIGNAL"),
                 "{backend} {mode}: {stderr}"
             );
+        }
+    }
+}
+
+/// The operations `host_timed_producer_probe fcntl` (`tests/c`) makes that
+/// complete a host-timed signal producer, each of which both in-guest backends
+/// refuse with EPERM and a WARN (A5 step 3c slice 0b, D28), with the call the
+/// WARN names. Every other line of the probe prints Linux's answer on every
+/// backend.
+const PRODUCER_REFUSALS: [(&str, &str); 13] = [
+    ("F_SETOWN(pid) on a socket", "fcntl(F_SETOWN)"),
+    (
+        "F_SETOWN_EX(F_OWNER_PID, pid) on a socket",
+        "fcntl(F_SETOWN_EX)",
+    ),
+    (
+        "F_SETOWN_EX(F_OWNER_TID, tid) on a socket",
+        "fcntl(F_SETOWN_EX)",
+    ),
+    (
+        "F_SETOWN_EX(F_OWNER_PGRP, pgrp) on a socket",
+        "fcntl(F_SETOWN_EX)",
+    ),
+    ("ioctl(FIOSETOWN, pid) on a socket", "ioctl(FIOSETOWN)"),
+    ("ioctl(SIOCSPGRP, pid) on a socket", "ioctl(SIOCSPGRP)"),
+    ("F_SETOWN(pid) on an O_ASYNC pipe", "fcntl(F_SETOWN)"),
+    (
+        "F_SETOWN_EX(F_OWNER_PID, pid) on an O_ASYNC pipe",
+        "fcntl(F_SETOWN_EX)",
+    ),
+    ("F_SETFL(O_ASYNC) on an owned pipe", "fcntl(F_SETFL)"),
+    ("ioctl(FIOASYNC, 1) on an owned pipe", "ioctl(FIOASYNC)"),
+    ("F_SETLEASE(F_RDLCK) on a file", "fcntl(F_SETLEASE)"),
+    ("F_SETLEASE(F_WRLCK) on a file", "fcntl(F_SETLEASE)"),
+    ("F_NOTIFY(DN_MODIFY) on a directory", "fcntl(F_NOTIFY)"),
+];
+
+/// The parent-death signals `host_timed_producer_probe pdeathsig-arm` arms
+/// that both in-guest backends refuse at arming (D28a): ones Detcore cannot
+/// hold (SIGSTOP, SIGALRM, realtime signals). SIGUSR1, SIGUSR2 and 0 are held,
+/// SIGKILL keeps the kernel's path and 65 is the kernel's EINVAL.
+const PDEATHSIG_REFUSALS: [i32; 4] = [libc::SIGSTOP, libc::SIGALRM, 34, 64];
+
+/// Runs `host_timed_producer_probe` natively in `mode`, from a fresh
+/// directory, and returns what it prints: Linux's answers on this host.
+fn native_producer_probe(mode: &str) -> String {
+    let guest = c_guest(&HOST_TIMED_PRODUCER_GUEST, "host_timed_producer_probe");
+    let cwd = process_build_root("host-timed-producer-native").join(mode);
+    fs::create_dir_all(&cwd).expect("failed to create the native working directory");
+    let native = Command::new(guest)
+        .arg(mode)
+        .current_dir(&cwd)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run the guest natively");
+    assert!(native.status.success(), "native {mode}: {native:?}");
+    String::from_utf8(native.stdout).expect("the probe prints ASCII")
+}
+
+/// One run of `host_timed_producer_probe` (`tests/c`) under `backend`, at log
+/// level `info`, with `extra` run options and `setup` applied to the Hermit
+/// command (its `pre_exec`, for what the launch inherits).
+fn run_producer_probe(
+    backend: &str,
+    extra: &[&str],
+    mode: &str,
+    setup: impl FnOnce(&mut Command),
+) -> Output {
+    let guest = c_guest(&HOST_TIMED_PRODUCER_GUEST, "host_timed_producer_probe");
+    let mut command = Command::new(hermit_binary());
+    command
+        .args(["--log=info", "--backend", backend, "run"])
+        .args([
+            "--max-timeslice=disabled",
+            "--strict",
+            "--base-env=minimal",
+            "--mount=type=tmpfs,target=/test",
+            "--workdir=/test",
+        ])
+        .args(extra)
+        .arg("--")
+        .arg(guest)
+        .arg(mode)
+        .stdin(Stdio::null());
+    setup(&mut command);
+    super::hermit_test::hermit_output("hermit run", &mut command)
+}
+
+/// Runs `mode` of `host_timed_producer_probe` under `backend` plainly, which
+/// prints Detcore's WARNs on stderr, and under `--verify --verify-strict`.
+/// Both must succeed, print `expected` and record no determinism loss, and
+/// the verify run must establish bitwise parity. Returns the plain run's
+/// stderr.
+fn assert_producer_probe_runs(backend: &str, mode: &str, expected: &str) -> String {
+    let output = run_producer_probe(backend, &[], mode, |_| {});
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        output.status.success(),
+        "{backend} {mode}: status={:?}\nstdout={stdout}\nstderr={stderr}",
+        output.status
+    );
+    assert_eq!(stdout, expected, "{backend} {mode}: {stderr}");
+    assert!(
+        !stderr.contains("determinism loss"),
+        "{backend} {mode}: {stderr}"
+    );
+    let verified = run_producer_probe(backend, &["--verify", "--verify-strict"], mode, |_| {});
+    let verified_stdout = String::from_utf8_lossy(&verified.stdout);
+    let verified_stderr = String::from_utf8_lossy(&verified.stderr);
+    assert!(
+        verified.status.success(),
+        "{backend} {mode} --verify: status={:?}\nstdout={verified_stdout}\nstderr={verified_stderr}",
+        verified.status
+    );
+    assert_eq!(
+        verified_stdout, expected,
+        "{backend} {mode} --verify: {verified_stderr}"
+    );
+    assert!(
+        verified_stderr.contains("Determinism verified")
+            && verified_stderr.contains("bitwise parity established"),
+        "{backend} {mode} --verify: {verified_stderr}"
+    );
+    stderr
+}
+
+/// `native` with each line whose operation is in `refused` answered
+/// `rc=-1 errno=EPERM`, and each line in `after` answered with its given
+/// result instead (the consequence of an earlier refusal).
+fn with_refusals(native: &str, refused: &[&str], after: &[(&str, &str)]) -> String {
+    native
+        .lines()
+        .map(|line| {
+            let (what, answer) = line.split_once(": ").unwrap_or((line, ""));
+            let answer = if refused.contains(&what) {
+                "rc=-1 errno=EPERM"
+            } else if let Some((_, result)) = after.iter().find(|(name, _)| *name == what) {
+                result
+            } else {
+                answer
+            };
+            format!("{what}: {answer}\n")
+        })
+        .collect()
+}
+
+/// A5 step 3c slice 0b, D28 (design sections 16.30 and 18.16.5,
+/// <https://github.com/rrnewton/hermit/issues/4485>): both in-guest backends
+/// refuse, with EPERM and a WARN naming the call and the descriptor, exactly
+/// the operations of the F_SETOWN family that complete a host-timed signal
+/// producer: an owner for a socket (by F_SETOWN, every F_SETOWN_EX type,
+/// FIOSETOWN, SIOCSPGRP) or for an O_ASYNC pipe, O_ASYNC for an owned pipe
+/// (F_SETFL, FIOASYNC), a read or write lease, and a directory notification.
+/// Every other operation of the probe keeps Linux's answer: F_SETSIG alone, an
+/// owner for a plain pipe (read back), O_ASYNC with no owner, every disarm,
+/// FIOSETOWN and SIOCSPGRP on a pipe (ENOTTY), and the descriptor answers
+/// Linux gives before it arms anything (EBADF for a closed or O_PATH
+/// descriptor, ENOTDIR for F_NOTIFY on a file, EINVAL for a lease on a pipe).
+/// The two lease disarms that follow a refused lease find no lease (EAGAIN).
+/// The same guest under ptrace prints exactly what it prints natively and
+/// Hermit warns of nothing. Every run verifies bitwise.
+#[test]
+fn liteinst_in_guest_host_timed_producer_completions_are_refused() {
+    let _guard = hermit_run_guard();
+    let native = native_producer_probe("fcntl");
+    let refused: Vec<&str> = PRODUCER_REFUSALS.iter().map(|(what, _)| *what).collect();
+    for (what, _) in PRODUCER_REFUSALS {
+        assert!(
+            native.contains(&format!("{what}: rc=0 errno=0\n")),
+            "native: {what}\n{native}"
+        );
+    }
+    let in_guest = with_refusals(
+        &native,
+        &refused,
+        &[
+            ("F_SETLEASE(F_UNLCK) on a file", "rc=-1 errno=EAGAIN"),
+            ("F_SETLEASE(F_UNLCK) after it", "rc=-1 errno=EAGAIN"),
+        ],
+    );
+    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+        if backend == "ptrace" {
+            let stderr = assert_producer_probe_runs(backend, "fcntl", &native);
+            assert!(
+                !stderr.contains("HERMIT_HOST_TIMED_PRODUCER_REFUSED"),
+                "{backend}: {stderr}"
+            );
+            continue;
+        }
+        let stderr = assert_producer_probe_runs(backend, "fcntl", &in_guest);
+        assert_eq!(
+            stderr
+                .matches("HERMIT_HOST_TIMED_PRODUCER_REFUSED ")
+                .count(),
+            PRODUCER_REFUSALS.len(),
+            "{backend}: {stderr}"
+        );
+        for call in [
+            "fcntl(F_SETOWN)",
+            "fcntl(F_SETOWN_EX)",
+            "ioctl(FIOSETOWN)",
+            "ioctl(SIOCSPGRP)",
+            "fcntl(F_SETFL)",
+            "ioctl(FIOASYNC)",
+            "fcntl(F_SETLEASE)",
+            "fcntl(F_NOTIFY)",
+        ] {
+            let times = PRODUCER_REFUSALS
+                .iter()
+                .filter(|(_, named)| *named == call)
+                .count();
+            let warning = format!("HERMIT_HOST_TIMED_PRODUCER_REFUSED call={call} fd=");
+            assert_eq!(
+                stderr.matches(&warning).count(),
+                times,
+                "{backend}: {warning}\n{stderr}"
+            );
+        }
+    }
+}
+
+/// D28a: on both in-guest backends Detcore holds a parent-death signal it can
+/// send itself, as on ptrace: SIGUSR1 and SIGUSR2 read back, 0 disarms, and
+/// SIGKILL keeps the kernel's path (read back too). A signal Detcore cannot
+/// hold (SIGSTOP, SIGALRM, realtime 34 and 64) is refused with EPERM and a
+/// WARN naming it, and nothing is armed; 65 is the kernel's EINVAL. The same
+/// guest under ptrace prints what it prints natively. Every run verifies
+/// bitwise.
+#[test]
+fn liteinst_in_guest_parent_death_signals_are_held_or_refused_at_arming() {
+    let _guard = hermit_run_guard();
+    let native = native_producer_probe("pdeathsig-arm");
+    // Each refused value's line, and the read-back after it, which finds 0.
+    let mut in_guest = String::new();
+    let mut refused_before = false;
+    for line in native.lines() {
+        let refused = PDEATHSIG_REFUSALS
+            .iter()
+            .any(|signal| line.starts_with(&format!("PR_SET_PDEATHSIG({signal}): ")));
+        if refused {
+            in_guest.push_str(&line.replace("rc=0 errno=0", "rc=-1 errno=EPERM"));
+        } else if refused_before {
+            assert!(line.starts_with("PR_GET_PDEATHSIG: "), "{line}");
+            in_guest.push_str("PR_GET_PDEATHSIG: rc=0 armed=0");
+        } else {
+            in_guest.push_str(line);
+        }
+        in_guest.push('\n');
+        refused_before = refused;
+    }
+    assert_ne!(in_guest, native);
+    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+        if backend == "ptrace" {
+            let stderr = assert_producer_probe_runs(backend, "pdeathsig-arm", &native);
+            assert!(
+                !stderr.contains("HERMIT_HOST_TIMED_PRODUCER_REFUSED"),
+                "{backend}: {stderr}"
+            );
+            continue;
+        }
+        let stderr = assert_producer_probe_runs(backend, "pdeathsig-arm", &in_guest);
+        assert_eq!(
+            stderr
+                .matches("HERMIT_HOST_TIMED_PRODUCER_REFUSED ")
+                .count(),
+            PDEATHSIG_REFUSALS.len(),
+            "{backend}: {stderr}"
+        );
+        for signal in PDEATHSIG_REFUSALS {
+            let warning = format!(
+                "HERMIT_HOST_TIMED_PRODUCER_REFUSED call=prctl(PR_SET_PDEATHSIG) signum={signal} "
+            );
+            assert_eq!(
+                stderr.matches(&warning).count(),
+                1,
+                "{backend}: {warning}\n{stderr}"
+            );
+        }
+    }
+}
+
+/// D28a: a child holding SIGUSR1 as its parent-death signal while its parent
+/// exits. On Linux, and under ptrace, where Detcore sends the signal at the
+/// parent's Exit grant, the child dies with it and the run ends with the
+/// parent's status. On both in-guest backends Detcore holds the signal but
+/// cannot send it yet, so the run ends with the named stopping refusal
+/// `pdeathsig-would-fire` (the policy-refusal status) at that grant, naming
+/// the thread, the signal and the child. A SIGKILL parent-death signal is
+/// unchanged (`liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification`).
+#[test]
+fn liteinst_in_guest_a_held_parent_death_signal_that_would_fire_ends_the_run_by_name() {
+    let _guard = hermit_run_guard();
+    let native = native_producer_probe("pdeathsig-fire");
+    assert_eq!(native, "child armed; parent exits\n");
+    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+        let output = run_producer_probe(backend, &[], "pdeathsig-fire", |_| {});
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(stdout, native, "{backend}: {stderr}");
+        if backend == "ptrace" {
+            assert!(
+                output.status.success(),
+                "{backend}: status={:?}\n{stderr}",
+                output.status
+            );
+            assert!(
+                !stderr.contains("pdeathsig-would-fire"),
+                "{backend}: {stderr}"
+            );
+            continue;
+        }
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "{backend}: status={:?}\n{stderr}",
+            output.status
+        );
+        assert!(
+            stderr.contains(
+                "hermit refused to continue the run (pdeathsig-would-fire): thread 3 left at its \
+                 Exit grant, which fires the parent-death signal 10 (SIGUSR1) that process 5 \
+                 armed"
+            ),
+            "{backend}: {stderr}"
+        );
+    }
+}
+
+/// A change to the CPU-time limit is EPERM under Hermit on every backend (the
+/// limit Detcore reports is virtual and unlimited); on both in-guest backends
+/// each refusal now also prints a WARN naming the call (`setrlimit`, and
+/// `prlimit64`, which the C library's `setrlimit` uses). A read and a no-op
+/// change succeed. ptrace prints the same lines with no WARN. Every run
+/// verifies bitwise.
+#[test]
+fn liteinst_in_guest_cpu_limit_changes_are_refused_with_a_warning() {
+    let _guard = hermit_run_guard();
+    let expected = "setrlimit(RLIMIT_CPU, 10/10): rc=-1 errno=EPERM\n\
+        SYS_setrlimit(RLIMIT_CPU, 8/10): rc=-1 errno=EPERM\n\
+        prlimit64(0, RLIMIT_CPU, 5/10): rc=-1 errno=EPERM\n\
+        getrlimit(RLIMIT_CPU): rc=0 errno=0\n\
+        setrlimit(RLIMIT_CPU, unchanged): rc=0 errno=0\n";
+    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+        let stderr = assert_producer_probe_runs(backend, "rlimit-cpu", expected);
+        let (setrlimit, prlimit) = if backend == "ptrace" { (0, 0) } else { (1, 2) };
+        assert_eq!(
+            stderr
+                .matches("HERMIT_HOST_TIMED_PRODUCER_REFUSED call=setrlimit(RLIMIT_CPU) ")
+                .count(),
+            setrlimit,
+            "{backend}: {stderr}"
+        );
+        assert_eq!(
+            stderr
+                .matches("HERMIT_HOST_TIMED_PRODUCER_REFUSED call=prlimit64(RLIMIT_CPU) ")
+                .count(),
+            prlimit,
+            "{backend}: {stderr}"
+        );
+    }
+}
+
+/// Sets this process's `RLIMIT_CPU` to `soft`/`hard`, in a `pre_exec`.
+fn set_cpu_limit(command: &mut Command, soft: libc::rlim_t, hard: libc::rlim_t) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: setrlimit is async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            let limit = libc::rlimit {
+                rlim_cur: soft,
+                rlim_max: hard,
+            };
+            if libc::setrlimit(libc::RLIMIT_CPU, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })
+    };
+}
+
+/// D25: a launcher with a finite soft `RLIMIT_CPU` under an unlimited hard
+/// one. On both in-guest backends Hermit sets the guest's physical limit to
+/// unlimited (the value Detcore reports) before launch and logs the old and
+/// the new value; the guest runs. A finite hard limit, which Hermit cannot
+/// raise, refuses the run by name before launch. ptrace is unchanged: it
+/// logs nothing and runs both.
+#[test]
+fn liteinst_in_guest_launch_raises_a_soft_cpu_limit_and_refuses_a_hard_one() {
+    let _guard = hermit_run_guard();
+    let logged = "HERMIT_IN_GUEST_RLIMIT_CPU: the guest's physical RLIMIT_CPU was soft 3600s \
+                  hard unlimited; Hermit sets it to soft unlimited hard unlimited as the guest \
+                  starts";
+    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+        let output = run_producer_probe(backend, &[], "noop", |command| {
+            set_cpu_limit(command, 3600, libc::RLIM_INFINITY)
+        });
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{backend} soft: status={:?}\n{stderr}",
+            output.status
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "ran\n",
+            "{backend}"
+        );
+        assert_eq!(
+            stderr.matches(logged).count(),
+            usize::from(backend != "ptrace"),
+            "{backend} soft: {stderr}"
+        );
+
+        let output = run_producer_probe(backend, &[], "noop", |command| {
+            set_cpu_limit(command, 3600, 3600)
+        });
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if backend == "ptrace" {
+            assert!(
+                output.status.success(),
+                "{backend} hard: status={:?}\n{stderr}",
+                output.status
+            );
+            assert!(!stderr.contains("RLIMIT_CPU"), "{backend} hard: {stderr}");
+            continue;
+        }
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+            "{backend} hard: status={:?}\n{stderr}",
+            output.status
+        );
+        assert!(
+            stderr.contains(&format!("--backend={backend} (in-guest LiteInst"))
+                && stderr.contains(
+                    "refuses this run: the guest would inherit a finite physical RLIMIT_CPU \
+                     (soft 3600s, hard 3600s)"
+                ),
+            "{backend} hard: {stderr}"
+        );
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "", "{backend}");
+    }
+}
+
+/// How `liteinst_in_guest_launch_refuses_an_inherited_signal_producer` hands
+/// the launch its standard input. Hermit's command line closes every other
+/// descriptor it inherits on entry (`retire_inherited_descriptors`), so its
+/// standard descriptors are the only ones a guest can inherit through it.
+#[derive(Clone, Copy, Debug)]
+enum InheritedProducer {
+    /// A pipe's read end with O_ASYNC, owned by the launch's own process
+    /// group.
+    AsyncGroupOwner,
+    /// The same, owned by the launch's own process, which the guest's PID
+    /// namespace cannot see and which is no guest process.
+    AsyncProcessOwner,
+    /// A file holding a read lease.
+    Lease,
+}
+
+/// Gives the Hermit `command` a standard input set up as `producer` (in a
+/// `pre_exec`, after the command's own redirections, for the Hermit process
+/// alone); `file` is the lease's.
+fn inherit_producer(command: &mut Command, producer: InheritedProducer, file: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::process::CommandExt;
+    let path = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+    // SAFETY: pipe, open, dup2, close, setpgid, getpid and fcntl are
+    // async-signal-safe; `path` was built before the fork.
+    unsafe {
+        command.pre_exec(move || {
+            let check = |rc: libc::c_int| {
+                if rc < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    Ok(rc)
+                }
+            };
+            match producer {
+                InheritedProducer::Lease => {
+                    let fd = check(libc::open(path.as_ptr(), libc::O_RDONLY))?;
+                    check(libc::dup2(fd, 0))?;
+                    libc::close(fd);
+                    check(libc::fcntl(0, libc::F_SETLEASE, libc::F_RDLCK))?;
+                }
+                InheritedProducer::AsyncGroupOwner | InheritedProducer::AsyncProcessOwner => {
+                    let mut fds = [0; 2];
+                    check(libc::pipe(fds.as_mut_ptr()))?;
+                    check(libc::dup2(fds[0], 0))?;
+                    // The write end goes first, before O_ASYNC is set, so no
+                    // SIGIO is ever sent for this pipe.
+                    libc::close(fds[0]);
+                    libc::close(fds[1]);
+                    let owner = if matches!(producer, InheritedProducer::AsyncGroupOwner) {
+                        check(libc::setpgid(0, 0))?;
+                        -libc::getpid()
+                    } else {
+                        libc::getpid()
+                    };
+                    check(libc::fcntl(0, libc::F_SETOWN, owner))?;
+                    let flags = check(libc::fcntl(0, libc::F_GETFL))?;
+                    check(libc::fcntl(0, libc::F_SETFL, flags | libc::O_ASYNC))?;
+                }
+            }
+            Ok(())
+        })
+    };
+}
+
+/// D25: an inherited descriptor that is already a host-timed signal producer
+/// refuses an in-guest launch by name before the guest runs, naming the
+/// descriptor (standard input here, the one a plain run passes on): one with
+/// O_ASYNC and an owner process group, and one holding a lease. One with O_ASYNC whose owner is the launching process itself is
+/// admitted: that process is outside the guest's PID namespace (it reads back
+/// as no owner there) and is no guest process, so its SIGIO can never reach
+/// the guest. ptrace is unchanged and runs all three.
+#[test]
+fn liteinst_in_guest_launch_refuses_an_inherited_signal_producer() {
+    let _guard = hermit_run_guard();
+    let directory = process_build_root("host-timed-producer-inherited");
+    fs::create_dir_all(&directory).expect("failed to create the lease directory");
+    let file = directory.join("leased");
+    fs::write(&file, b"leased\n").expect("failed to create the leased file");
+    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+        for (producer, refusal) in [
+            (
+                InheritedProducer::AsyncGroupOwner,
+                Some("it has O_ASYNC and an owner"),
+            ),
+            (InheritedProducer::Lease, Some("it holds a lease")),
+            (InheritedProducer::AsyncProcessOwner, None),
+        ] {
+            let output = run_producer_probe(backend, &[], "noop", |command| {
+                inherit_producer(command, producer, &file)
+            });
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            match refusal {
+                Some(refusal) if backend != "ptrace" => {
+                    assert_eq!(
+                        output.status.code(),
+                        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+                        "{backend} {producer:?}: status={:?}\n{stderr}",
+                        output.status
+                    );
+                    assert!(
+                        stderr.contains(
+                            "refuses this run: the guest would inherit descriptor 0, which is \
+                             already a signal producer: "
+                        ) && stderr.contains(refusal),
+                        "{backend} {producer:?}: {stderr}"
+                    );
+                    assert_eq!(stdout, "", "{backend} {producer:?}");
+                }
+                _ => {
+                    assert!(
+                        output.status.success(),
+                        "{backend} {producer:?}: status={:?}\n{stderr}",
+                        output.status
+                    );
+                    assert_eq!(stdout, "ran\n", "{backend} {producer:?}: {stderr}");
+                    assert!(
+                        !stderr.contains("signal producer"),
+                        "{backend} {producer:?}: {stderr}"
+                    );
+                }
+            }
         }
     }
 }
