@@ -2084,6 +2084,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Kill,
     ) -> Result<i64, Error> {
+        // A group send (pid 0 or below) is not a target here: the paths below
+        // refuse it (`refuse_group_signal`) unless it is a SIGKILL.
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::kill,
+                call.sig(),
+                ReservedSendTarget::Process(call.pid()),
+            )
+            .await
+        {
+            return refused;
+        }
         self.record_orphaned_group_signals(guest, call.sig()).await;
         // A thread below the container's PID namespace names pids of its own
         // namespace, where none of Hermit's tasks is visible
@@ -2864,6 +2877,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Tgkill,
     ) -> Result<i64, Error> {
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::tgkill,
+                call.sig(),
+                ReservedSendTarget::Thread {
+                    tgid: Some(call.tgid()),
+                    tid: call.tid(),
+                },
+            )
+            .await
+        {
+            return refused;
+        }
         self.record_orphaned_group_signals(guest, call.sig()).await;
         // A nested caller names its own namespace's ids; Detcore's model uses
         // the tasks they name, and the forwarded call keeps them
@@ -2974,6 +3001,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Tkill,
     ) -> Result<i64, Error> {
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::tkill,
+                call.sig(),
+                ReservedSendTarget::Thread {
+                    tgid: None,
+                    tid: call.tid(),
+                },
+            )
+            .await
+        {
+            return refused;
+        }
         self.record_orphaned_group_signals(guest, call.sig()).await;
         // A nested caller names its own namespace's tid
         // (https://github.com/rrnewton/hermit/issues/4155).
@@ -3229,6 +3270,130 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Refuse, with EPERM and a WARN, a send of one of the in-guest runtime's
+    /// reserved signals (`Config::in_guest_reserved_signals`) to a process
+    /// other than the caller's own. `None` leaves the call to its handler's
+    /// ordinary path, unchanged. A5 step 3c, design section 16.30: such a
+    /// signal would run the target's runtime handler on a thread that does not
+    /// hold the scheduler's turn.
+    ///
+    /// Each send handler calls this first, beside its other opening checks, so
+    /// every later path (record and replay, a nested caller's own-init
+    /// forward) is covered. It decides from the configured set, the signal
+    /// number and Detcore's process identities alone:
+    /// - a signal outside the set takes the ordinary path, before any request
+    ///   is made, so with the set empty (every backend but the in-guest ones'
+    ///   default route) nothing at all changes; signal 0 is never in it;
+    /// - a target in the caller's own process takes the ordinary path, as
+    ///   does a target Detcore cannot name (no such process or thread, a
+    ///   pid of a nested namespace it cannot translate, a non-positive id),
+    ///   which keeps the kernel's or the handler's answer (ESRCH, EINVAL...);
+    /// - group sends (`kill(0)`, `kill(-pgid)`, `kill(-1)`, and
+    ///   `pidfd_send_signal`'s process-group scope) are not passed here: their
+    ///   handlers refuse every non-SIGKILL group send first
+    ///   (`refuse_group_signal`), a stopping refusal or ENOSYS by policy, and
+    ///   SIGKILL is never reserved.
+    pub(crate) async fn refuse_reserved_signal_send<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        signal: i32,
+        target: ReservedSendTarget,
+    ) -> Option<Result<i64, Error>> {
+        if !guest.config().reserves_in_guest_signal(signal.into()) {
+            return None;
+        }
+        let own = self.detpid;
+        let caller = guest.thread_state().dettid;
+        let (process, group) = match target {
+            ReservedSendTarget::Resolved(process) => (process, None),
+            ReservedSendTarget::Process(pid) => {
+                if pid <= 0 {
+                    return None;
+                }
+                let named = self.reserved_send_task(guest, pid).await?;
+                if reserved_send_names_own(own, caller, named, None) {
+                    return None;
+                }
+                (signal_target_process(guest, named).await, None)
+            }
+            ReservedSendTarget::Thread { tgid, tid } => {
+                if tid <= 0 || tgid.is_some_and(|tgid| tgid <= 0) {
+                    return None;
+                }
+                let thread = self.reserved_send_task(guest, tid).await?;
+                let group = match tgid {
+                    Some(tgid) => Some(self.reserved_send_task(guest, tgid).await?),
+                    None => None,
+                };
+                if reserved_send_names_own(own, caller, thread, group) {
+                    return None;
+                }
+                (registered_process_of(guest, thread).await, group)
+            }
+        };
+        if !reserved_send_refuses(own, process, group) {
+            return None;
+        }
+        let process = process?;
+        tracing::warn!(
+            "{}",
+            crate::refused_signal_controls::reserved_signal_send_refused_warning(
+                sysno.name(),
+                signal,
+                caller.as_raw(),
+                process.as_raw(),
+            )
+        );
+        Some(Err(Errno::EPERM.into()))
+    }
+
+    /// The task a reserved send's `id` names (`refuse_reserved_signal_send`):
+    /// the id itself for a caller in the container's PID namespace, and for a
+    /// caller in a nested one the task its namespace's `id` is. `None` when
+    /// Detcore cannot name one, which leaves the call to its ordinary path.
+    async fn reserved_send_task<G: Guest<Self>>(&self, guest: &mut G, id: i32) -> Option<DetTid> {
+        if !guest.thread_state().nested_pid_namespace {
+            return Some(DetTid::from_raw(id));
+        }
+        if guest
+            .config()
+            .backend
+            .requires_thread_directed_process_signals
+        {
+            return None;
+        }
+        match crate::tool_global::guest_pid(guest, id).await {
+            GuestPidAnswer::Task { task, .. } => Some(task),
+            GuestPidAnswer::NoSuchPid | GuestPidAnswer::Untranslatable(_) => None,
+        }
+    }
+
+    /// Refuse, with EPERM and a WARN, an arming of one of the in-guest
+    /// runtime's reserved signals (`Config::in_guest_reserved_signals`) as a
+    /// notification signal, whatever the target: the kernel would send it at
+    /// a moment host timing decides (A5 step 3c, design section 16.30). `call`
+    /// names the call and its operation. A disarm (signal 0) is never
+    /// reserved, and with the set empty nothing changes.
+    pub(crate) fn refuse_reserved_signal_arming<G: Guest<Self>>(
+        guest: &mut G,
+        call: &str,
+        signal: i64,
+    ) -> Result<(), Error> {
+        if !guest.config().reserves_in_guest_signal(signal) {
+            return Ok(());
+        }
+        tracing::warn!(
+            "{}",
+            crate::refused_signal_controls::reserved_signal_arming_refused_warning(
+                call,
+                signal as i32,
+                guest.thread_state().dettid.as_raw(),
+            )
+        );
+        Err(Errno::EPERM.into())
+    }
+
     /// Refuse by name a guest's `SIGCHLD` that carries the scheduler's own-copy
     /// mark (`SI_QUEUE` with `OWN_SIGCHLD_MARK`), which a receiver in a nested
     /// PID namespace would take for the scheduler's copy
@@ -3280,6 +3445,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Sysno::rt_tgsigqueueinfo,
                 call.sig(),
                 call.siginfo().map(AddrMut::cast),
+            )
+            .await
+        {
+            return refused;
+        }
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::rt_tgsigqueueinfo,
+                call.sig(),
+                ReservedSendTarget::Thread {
+                    tgid: Some(call.tgid()),
+                    tid: call.tid(),
+                },
             )
             .await
         {
@@ -3418,6 +3597,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Sysno::rt_sigqueueinfo,
                 call.sig(),
                 call.siginfo().map(AddrMut::cast),
+            )
+            .await
+        {
+            return refused;
+        }
+        // Linux names no group here: a non-positive pid is ESRCH.
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::rt_sigqueueinfo,
+                call.sig(),
+                ReservedSendTarget::Process(call.tgid()),
             )
             .await
         {
@@ -4690,6 +4881,48 @@ pub(crate) fn own_process_signal_refusal(
     None
 }
 
+/// What a send names, as `Detcore::refuse_reserved_signal_send` reads it.
+pub(crate) enum ReservedSendTarget {
+    /// The process a positive pid names (`kill`, `rt_sigqueueinfo`): any of
+    /// its live threads' ids names it, as in Linux's `kill_pid_info`. Not a
+    /// group: a non-positive pid takes the ordinary path.
+    Process(libc::pid_t),
+    /// A thread (`tkill`), and for `tgkill` and `rt_tgsigqueueinfo` the
+    /// thread group the call says it is in.
+    Thread {
+        tgid: Option<libc::pid_t>,
+        tid: libc::pid_t,
+    },
+    /// A process the handler has already resolved (`pidfd_send_signal`'s
+    /// descriptor), or `None` for one it could not.
+    Resolved(Option<DetPid>),
+}
+
+/// Whether a reserved send (`Detcore::refuse_reserved_signal_send`) names the
+/// caller's own process by its ids alone, before any lookup: `named` is the
+/// caller's thread or its process's id, or `group`, the thread group a
+/// `tgkill` or `rt_tgsigqueueinfo` names, is the caller's process. Such a send
+/// keeps its ordinary path; a `group` that does not hold `named` is the
+/// kernel's ESRCH there.
+fn reserved_send_names_own(
+    own: DetPid,
+    caller: DetTid,
+    named: DetTid,
+    group: Option<DetPid>,
+) -> bool {
+    named == caller || named == own || group == Some(own)
+}
+
+/// Whether a reserved send is refused, given `process`, the process its
+/// target is in (`None` when Detcore names none: no such process or thread,
+/// which keeps the call's ordinary answer), and `group`, the thread group a
+/// `tgkill` or `rt_tgsigqueueinfo` names: only a process other than the
+/// caller's own (`own`), and for a named group only when the thread is in it
+/// (otherwise Linux answers ESRCH, `do_send_specific`).
+fn reserved_send_refuses(own: DetPid, process: Option<DetPid>, group: Option<DetPid>) -> bool {
+    process.is_some_and(|process| process != own && group.is_none_or(|group| group == process))
+}
+
 /// How a process-directed signal the calling thread sends goes on
 /// (`Detcore::own_process_signal`).
 /// What a positive pid the calling thread names refers to
@@ -4883,6 +5116,40 @@ mod tests {
             );
         }
         assert!(matches!(restart(Ok(7)), Ok(7)));
+    }
+
+    /// A reserved send names the caller's own process by its ids when it names
+    /// the calling thread, the process's id, or the process as the thread
+    /// group; any other id needs a lookup (A5 step 3c slice 0a).
+    #[test]
+    fn a_reserved_send_to_the_callers_own_process_is_decided_by_its_ids() {
+        let own = DetPid::from_raw(3);
+        let caller = DetTid::from_raw(4);
+        let other = DetPid::from_raw(5);
+        assert!(reserved_send_names_own(own, caller, caller, None));
+        assert!(reserved_send_names_own(own, caller, own, None));
+        // tgkill(own, other): the group is the caller's; the kernel answers.
+        assert!(reserved_send_names_own(own, caller, other, Some(own)));
+        assert!(!reserved_send_names_own(own, caller, other, None));
+        assert!(!reserved_send_names_own(own, caller, other, Some(other)));
+    }
+
+    /// Only a send whose target is in a known process other than the caller's
+    /// is refused: never the caller's own process, never a target Detcore
+    /// names no process for, and never a thread outside the group the call
+    /// names (Linux's ESRCH).
+    #[test]
+    fn a_reserved_send_is_refused_only_to_another_known_process() {
+        let own = DetPid::from_raw(3);
+        let other = DetPid::from_raw(5);
+        let third = DetPid::from_raw(6);
+        assert!(reserved_send_refuses(own, Some(other), None));
+        assert!(reserved_send_refuses(own, Some(other), Some(other)));
+        assert!(!reserved_send_refuses(own, Some(own), None));
+        assert!(!reserved_send_refuses(own, Some(own), Some(own)));
+        assert!(!reserved_send_refuses(own, None, None));
+        assert!(!reserved_send_refuses(own, None, Some(other)));
+        assert!(!reserved_send_refuses(own, Some(other), Some(third)));
     }
 
     use super::*;

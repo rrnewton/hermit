@@ -31,6 +31,11 @@
 //! kernel ends a process on SIGBUS, SIGFPE or SIGILL), because neither path
 //! reaches Detcore; a thread's exit hook does not run on those deaths either,
 //! so it is not used.
+//!
+//! The texts of Detcore's own refusals of the in-guest runtime's reserved
+//! signals (`Config::in_guest_reserved_signals`: a send to another process,
+//! or an arming) live here too. Detcore decides those itself, at the call,
+//! and prints each through its guest WARN path (`crate::guest_log`).
 
 use std::sync::OnceLock;
 
@@ -98,6 +103,45 @@ pub(crate) fn alternate_stack_refused_warning() -> String {
         .to_string()
 }
 
+/// The WARN for a send of a reserved in-guest signal
+/// (`Config::in_guest_reserved_signals`) from the caller's process to
+/// another, which Detcore refused with EPERM: `call` is the system call,
+/// `sender` the calling thread and `target` the process it named. Printed for
+/// every refused send, through Detcore's guest WARN path
+/// (`crate::guest_log`), not once per run: each names its own target.
+pub(crate) fn reserved_signal_send_refused_warning(
+    call: &str,
+    signum: i32,
+    sender: i32,
+    target: i32,
+) -> String {
+    let name = signal_name(signum);
+    format!(
+        "HERMIT_RESERVED_SIGNAL_SEND_REFUSED signum={signum} ({name}) call={call} sender={sender} \
+         target=process {target}: received EPERM and nothing was sent. The in-guest runtime keeps \
+         {name} for itself, and a {name} from another process would run the runtime's handler in \
+         process {target} outside the schedule. A named refusal, not Linux's behaviour \
+         (A5 step 3c, https://github.com/rrnewton/hermit/issues/4485)."
+    )
+}
+
+/// The WARN for an arming of a reserved in-guest signal as a notification
+/// signal (`fcntl(F_SETSIG)`, `timer_create`, `prctl(PR_SET_PDEATHSIG)`),
+/// which Detcore refused with EPERM: `call` names the call and its operation.
+pub(crate) fn reserved_signal_arming_refused_warning(
+    call: &str,
+    signum: i32,
+    caller: i32,
+) -> String {
+    let name = signal_name(signum);
+    format!(
+        "HERMIT_RESERVED_SIGNAL_ARMING_REFUSED signum={signum} ({name}) call={call} \
+         caller={caller}: received EPERM and nothing was armed. The in-guest runtime keeps {name} \
+         for itself, and the kernel would send it at a moment host timing decides. A named \
+         refusal, not Linux's behaviour (A5 step 3c, https://github.com/rrnewton/hermit/issues/4485)."
+    )
+}
+
 /// `signum`'s name: `SIGUSR1`, or, for a realtime signal, its kernel number
 /// (C libraries reserve different numbers of them, so `SIGRTMIN+n` would
 /// depend on the guest's).
@@ -127,6 +171,36 @@ mod tests {
             );
         }
         assert!(handler_refused_warning(36).contains("(realtime signal 36)"));
+
+        let send = reserved_signal_send_refused_warning("tgkill", libc::SIGSYS, 4, 5);
+        assert!(
+            send.starts_with(
+                "HERMIT_RESERVED_SIGNAL_SEND_REFUSED signum=31 (SIGSYS) call=tgkill sender=4 \
+                 target=process 5: received EPERM"
+            ),
+            "{send}"
+        );
+        let arming = reserved_signal_arming_refused_warning("fcntl(F_SETSIG)", libc::SIGSEGV, 4);
+        assert!(
+            arming.starts_with(
+                "HERMIT_RESERVED_SIGNAL_ARMING_REFUSED signum=11 (SIGSEGV) \
+                 call=fcntl(F_SETSIG) caller=4: received EPERM"
+            ),
+            "{arming}"
+        );
+        for text in [&send, &arming] {
+            assert!(
+                text.contains("A named refusal, not Linux's behaviour"),
+                "{text}"
+            );
+            assert!(
+                text.contains("https://github.com/rrnewton/hermit/issues/4485"),
+                "{text}"
+            );
+            for backend in ["liteinst", "LiteInst", "in-guest-trap", "sabre", "SaBRe"] {
+                assert!(!text.contains(backend), "{text}");
+            }
+        }
         // No backend is named: the text is the same wherever it is printed.
         for text in [usr1, stack] {
             for backend in ["liteinst", "LiteInst", "in-guest-trap", "sabre", "SaBRe"] {

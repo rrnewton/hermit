@@ -8962,6 +8962,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Fcntl,
     ) -> Result<i64, Error> {
         let fd = call.fd();
+        // A reserved in-guest signal as the descriptor's I/O signal; 0, the
+        // default SIGIO, is never reserved. Like the owner screen below, it
+        // comes first, so a refused call has no other effect.
+        if let F_SETSIG(signal) = call.cmd() {
+            Self::refuse_reserved_signal_arming(guest, "fcntl(F_SETSIG)", signal.into())?;
+        }
         // Before anything else, so a refused call has no other effect.
         let (call, _owner_copy) = self.screen_fcntl_owner(guest, call).await?;
         // The owner of an asynchronous-I/O descriptor may be any process or
@@ -11537,10 +11543,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .refuse_unserviceable_operation(guest, Sysno::pidfd_send_signal, Errno::ENOSYS)
                 .await;
         }
-        let process = match named {
-            Some(named) => Some(signal_target_process(guest, named).await.unwrap_or(named)),
+        // The process `named` is in, `None` when it names neither a thread
+        // group nor a live thread.
+        let target_process = match named {
+            Some(named) => signal_target_process(guest, named).await,
             None => None,
         };
+        let process = named.map(|named| target_process.unwrap_or(named));
+        // A reserved in-guest signal to another process is refused here, after
+        // the group scope's refusal above and before any path below forwards
+        // the call; an unresolved or gone target keeps its ordinary answer.
+        if let Some(refused) = self
+            .refuse_reserved_signal_send(
+                guest,
+                Sysno::pidfd_send_signal,
+                signal,
+                crate::syscalls::signal::ReservedSendTarget::Resolved(target_process),
+            )
+            .await
+        {
+            return refused;
+        }
         // A nested caller's signal to its own PID namespace's init is dropped
         // by the kernel unless the init catches it, SIGKILL always
         // (`Detcore::own_namespace_init_drops`): forward it unchanged, with
