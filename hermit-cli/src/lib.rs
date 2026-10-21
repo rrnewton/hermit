@@ -1203,6 +1203,212 @@ pub fn in_guest_reserved_signals(config: &DetConfig, backend: Backend) -> u64 {
     reserved
 }
 
+/// Whether Detcore refuses host-timed signal producers in a run of `backend`
+/// (`detcore::Config::in_guest_refuses_host_timed_producers`, A5 step 3c
+/// slice 0b): on Hermit's default in-guest route, for both in-guest backends,
+/// and never on another backend. The in-guest loader route never calls this,
+/// so the setting stays off there: today's behaviour (D13(a), D26).
+pub const fn in_guest_refuses_host_timed_producers(backend: Backend) -> bool {
+    backend.is_in_guest_liteinst()
+}
+
+/// `RLIMIT_CPU`'s value as Hermit's log and refusal print it: `unlimited`, or
+/// a number of seconds.
+#[cfg(feature = "liteinst")]
+fn rlimit_seconds(value: libc::rlim_t) -> String {
+    if value == libc::RLIM_INFINITY {
+        "unlimited".to_owned()
+    } else {
+        format!("{value}s")
+    }
+}
+
+/// What an in-guest launch does with the physical `RLIMIT_CPU` the guest
+/// would inherit, `limit` (D25 of A5 step 3c): nothing when it is already
+/// unlimited, the value Detcore reports (`syscalls/sysinfo.rs`); otherwise
+/// both limits raised to unlimited, where a finite soft limit alone needs no
+/// privilege and a finite hard one needs `can_raise_hard`
+/// ([`can_raise_hard_limits`]); and a refusal, with its reason, for a finite
+/// hard limit Hermit cannot raise. A finite limit would make the kernel send
+/// SIGXCPU at the soft limit and SIGKILL at the hard one, at moments host CPU
+/// time decides.
+#[cfg(feature = "liteinst")]
+fn rlimit_cpu_launch_plan(
+    limit: libc::rlimit,
+    can_raise_hard: bool,
+) -> Result<Option<libc::rlimit>, String> {
+    if limit.rlim_max != libc::RLIM_INFINITY && !can_raise_hard {
+        return Err(format!(
+            "the guest would inherit a finite physical RLIMIT_CPU (soft {}, hard {}), and Hermit \
+             cannot raise the hard limit, so the kernel would send SIGXCPU or SIGKILL at a moment \
+             host CPU time decides; run Hermit with an unlimited hard CPU-time limit \
+             (A5 step 3c, D25, https://github.com/rrnewton/hermit/issues/4485)",
+            rlimit_seconds(limit.rlim_cur),
+            rlimit_seconds(limit.rlim_max),
+        ));
+    }
+    let unlimited = libc::rlimit {
+        rlim_cur: libc::RLIM_INFINITY,
+        rlim_max: libc::RLIM_INFINITY,
+    };
+    Ok(
+        (limit.rlim_cur != unlimited.rlim_cur || limit.rlim_max != unlimited.rlim_max)
+            .then_some(unlimited),
+    )
+}
+
+/// Whether this process may raise a hard resource limit: `do_prlimit`
+/// (`kernel/sys.c`) requires `CAP_SYS_RESOURCE` in the initial user namespace
+/// (`capable`), so it must be in that namespace (`/proc/self/uid_map` maps
+/// every id to itself) with the capability effective (`/proc/self/status`).
+/// A container's user namespace, where Hermit runs a guest, never may.
+#[cfg(feature = "liteinst")]
+fn can_raise_hard_limits() -> bool {
+    const CAP_SYS_RESOURCE: u32 = 24;
+    let initial_namespace = std::fs::read_to_string("/proc/self/uid_map")
+        .is_ok_and(|map| map.split_whitespace().collect::<Vec<_>>() == ["0", "0", "4294967295"]);
+    let effective = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| {
+            let line = status.lines().find(|line| line.starts_with("CapEff:"))?;
+            u64::from_str_radix(line["CapEff:".len()..].trim(), 16).ok()
+        })
+        .unwrap_or(0);
+    initial_namespace && effective & (1 << CAP_SYS_RESOURCE) != 0
+}
+
+/// Why descriptor `fd`, which the guest would inherit, cannot be inherited by
+/// an in-guest guest: it is already a complete host-timed signal producer
+/// (`state`, D25 of A5 step 3c), or holds a lease (`lease`). `None` when it is
+/// neither.
+#[cfg(feature = "liteinst")]
+fn inherited_producer_refusal(
+    fd: std::os::fd::RawFd,
+    state: detcore::host_timed_producers::ProducerState,
+    lease: bool,
+) -> Option<String> {
+    let what = if lease {
+        "it holds a lease, whose owner Linux sends SIGIO when another process opens the file"
+    } else if state.is_complete() && state.o_async {
+        "it has O_ASYNC and an owner, which Linux sends SIGIO when it becomes ready"
+    } else if state.is_complete() {
+        "it is a socket with an owner, which Linux sends SIGURG when out-of-band data arrives"
+    } else {
+        return None;
+    };
+    Some(format!(
+        "the guest would inherit descriptor {fd}, which is already a signal producer: {what}, at \
+         a moment host timing decides; close it, or clear its owner and O_ASYNC, before running \
+         Hermit (A5 step 3c, D25, https://github.com/rrnewton/hermit/issues/4485)"
+    ))
+}
+
+/// The first descriptor of this process that the guest would inherit (one
+/// without close-on-exec: Reverie's spawner closes nothing else) and that is
+/// already a host-timed signal producer, with why. Through `hermit run` these
+/// are the standard descriptors alone, since the command line closes every
+/// other descriptor it inherits on entry (`retire_inherited_descriptors`); a
+/// library caller may pass more
+/// ([`inherited_producer_refusal`]), read from the host
+/// (`detcore::host_timed_producers::host_descriptor_state`). A descriptor
+/// that cannot be read is refused too, rather than inherited unchecked. A
+/// directory notification cannot be read back, so is not found. This process
+/// runs in the container's PID namespace, where an owner outside it reads as
+/// pid 0: such a process or thread is never a guest process, and an owner
+/// process group is counted whatever its pid
+/// (`detcore::host_timed_producers::names_an_owner`). Hermit's own standard
+/// descriptors are checked even where the guest receives a pipe in their
+/// place, which can only refuse more.
+#[cfg(feature = "liteinst")]
+fn inherited_signal_producer() -> Result<Option<String>, Error> {
+    let mut fds: Vec<std::os::fd::RawFd> = std::fs::read_dir("/proc/self/fd")?
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    fds.sort_unstable();
+    for fd in fds {
+        // SAFETY: F_GETFD reads a descriptor flag and writes no memory.
+        let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        // A closed one (the directory listing's own) or one the guest does
+        // not inherit.
+        if fd_flags < 0 || fd_flags & libc::FD_CLOEXEC != 0 {
+            continue;
+        }
+        match detcore::host_timed_producers::host_descriptor_state(fd) {
+            Ok((state, lease)) => {
+                if let Some(reason) = inherited_producer_refusal(fd, state, lease) {
+                    return Ok(Some(reason));
+                }
+            }
+            Err(nix::errno::Errno::EBADF) => {}
+            Err(errno) => {
+                return Ok(Some(format!(
+                    "the guest would inherit descriptor {fd}, whose signal owner and flags cannot \
+                     be read ({errno}), so Hermit cannot tell whether it is a signal producer \
+                     (A5 step 3c, D25, https://github.com/rrnewton/hermit/issues/4485)"
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Before an in-guest launch on the default route, the producer state the
+/// guest would inherit (D25 of A5 step 3c, design section 16.32): refuses the
+/// run by name for an inherited descriptor that is already a host-timed
+/// signal producer ([`inherited_signal_producer`]) or a finite hard
+/// `RLIMIT_CPU` it cannot raise, and otherwise sets the guest's physical
+/// `RLIMIT_CPU` to unlimited, as the guest starts
+/// ([`rlimit_cpu_launch_plan`]), logging the old and the new value. Nothing for a backend that does not refuse
+/// host-timed producers.
+#[cfg(feature = "liteinst")]
+fn neutralize_inherited_signal_producers(
+    command: &mut Command,
+    backend: Backend,
+) -> Result<(), Error> {
+    if !in_guest_refuses_host_timed_producers(backend) {
+        return Ok(());
+    }
+    if let Some(reason) = inherited_signal_producer()? {
+        return Err(Error::new(LiteinstInGuestRefusal::for_backend(
+            backend, reason,
+        )));
+    }
+    // SAFETY: getrlimit writes only `limit`.
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    nix::errno::Errno::result(unsafe { libc::getrlimit(libc::RLIMIT_CPU, &mut limit) })?;
+    match rlimit_cpu_launch_plan(limit, can_raise_hard_limits()) {
+        Err(reason) => Err(Error::new(LiteinstInGuestRefusal::for_backend(
+            backend, reason,
+        ))),
+        Ok(None) => {
+            tracing::debug!(
+                "HERMIT_IN_GUEST_RLIMIT_CPU: the guest's physical RLIMIT_CPU is already unlimited \
+                 (A5 step 3c, D25)"
+            );
+            Ok(())
+        }
+        Ok(Some(raised)) => {
+            tracing::info!(
+                "HERMIT_IN_GUEST_RLIMIT_CPU: the guest's physical RLIMIT_CPU was soft {} hard {}; \
+                 Hermit sets it to soft {} hard {} as the guest starts, the value Detcore reports, \
+                 so the kernel never sends SIGXCPU at a moment host CPU time decides \
+                 (A5 step 3c, D25)",
+                rlimit_seconds(limit.rlim_cur),
+                rlimit_seconds(limit.rlim_max),
+                rlimit_seconds(raised.rlim_cur),
+                rlimit_seconds(raised.rlim_max),
+            );
+            // SAFETY: setrlimit is async-signal-safe and allocates nothing.
+            unsafe {
+                command.pre_exec(move || {
+                    reverie::Errno::result(libc::setrlimit(libc::RLIMIT_CPU, &raised)).map(drop)
+                });
+            }
+            Ok(())
+        }
+    }
+}
+
 /// Why an `in-guest-trap` run cannot start with the guest environment of
 /// `command`: the environment (explicit or inherited) sets
 /// `REVERIE_LITEINST_SITE_PATCHING` to a value other than the one Hermit
@@ -4236,6 +4442,9 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // so whatever a caller's configuration carried, every backend and every
     // other route starts from the empty set (A5 step 3c, D13(a)).
     config.in_guest_reserved_signals = 0;
+    // So is the refusal of host-timed signal producers
+    // (`in_guest_refuses_host_timed_producers`, A5 step 3c slice 0b).
+    config.in_guest_refuses_host_timed_producers = false;
     config
 }
 
@@ -4537,6 +4746,7 @@ async fn dispatch_backend(
             let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
             let mut command = command;
             refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
+            neutralize_inherited_signal_producers(&mut command, backend)?;
             let (launch, _detlog_descriptor) =
                 in_guest_liteinst_launch(&mut command, &in_guest_detlog_forward_policy())?;
             let tool_data = launch.encode();
@@ -4547,6 +4757,8 @@ async fn dispatch_backend(
                 .is_some()
                 .then(|| in_guest_detlog_forward_policy().encode());
             config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
+            config.in_guest_refuses_host_timed_producers =
+                in_guest_refuses_host_timed_producers(backend);
             // Last, from the configuration every Tool image receives.
             config.in_guest_reserved_signals = in_guest_reserved_signals(&config, backend);
             let preload = liteinst_tool_runtime_library_path()?;
@@ -4852,6 +5064,7 @@ async fn dispatch_output_backend(
             command.stdin(output_backend_stdin()?);
             let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
             refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
+            neutralize_inherited_signal_producers(&mut command, backend)?;
             let (launch, _detlog_descriptor) =
                 in_guest_liteinst_launch(&mut command, &in_guest_detlog_forward_policy())?;
             let tool_data = launch.encode();
@@ -4862,6 +5075,8 @@ async fn dispatch_output_backend(
                 .is_some()
                 .then(|| in_guest_detlog_forward_policy().encode());
             config.in_guest_site_patching_off = in_guest_site_patching_off(backend);
+            config.in_guest_refuses_host_timed_producers =
+                in_guest_refuses_host_timed_producers(backend);
             // Last, from the configuration every Tool image receives.
             config.in_guest_reserved_signals = in_guest_reserved_signals(&config, backend);
             let preload = liteinst_tool_runtime_library_path()?;
@@ -6922,6 +7137,110 @@ mod tests {
         assert_eq!(loader.in_guest_reserved_signals, 0);
         assert!(loader.in_guest_site_patching_off);
         assert_eq!(loader.backend, backend_capabilities(Backend::InGuestTrap));
+    }
+
+    /// A configuration that already asks for the refusal of host-timed signal
+    /// producers (a public, serialized field) never keeps it through Hermit's
+    /// preparation: every backend's preparation and the loader route's (the
+    /// exec-stop, native-exec and mapped-first-admission launchers, and the
+    /// native-exec verify route) turn it off. Only the default in-guest route
+    /// turns it on afterwards, from the backend alone: both in-guest backends
+    /// and no other (A5 step 3c slice 0b).
+    #[test]
+    fn a_poisoned_producer_refusal_never_survives_preparation() {
+        let poisoned = DetConfig {
+            in_guest_refuses_host_timed_producers: true,
+            ..DetConfig::default()
+        };
+        for backend in Backend::ALL {
+            let prepared = prepare_backend_config(poisoned.clone(), backend);
+            assert!(
+                !prepared.in_guest_refuses_host_timed_producers,
+                "{backend:?}"
+            );
+            assert_eq!(
+                in_guest_refuses_host_timed_producers(backend),
+                matches!(backend, Backend::Liteinst | Backend::InGuestTrap),
+                "{backend:?}"
+            );
+        }
+        let loader = prepare_in_guest_loader_route_config(poisoned);
+        assert!(!loader.in_guest_refuses_host_timed_producers);
+        assert!(loader.in_guest_site_patching_off);
+    }
+
+    /// D25: an unlimited physical RLIMIT_CPU is left alone; a finite soft
+    /// limit under an unlimited hard one is raised to unlimited; a finite hard
+    /// limit is raised too where Hermit may raise it, and otherwise refuses
+    /// the run, naming both values. A container's user namespace never may.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn an_in_guest_launch_clears_a_soft_cpu_limit_and_refuses_a_hard_one() {
+        let limit = |rlim_cur, rlim_max| libc::rlimit { rlim_cur, rlim_max };
+        let unlimited = limit(libc::RLIM_INFINITY, libc::RLIM_INFINITY);
+        for can_raise_hard in [false, true] {
+            assert_eq!(rlimit_cpu_launch_plan(unlimited, can_raise_hard), Ok(None));
+            assert_eq!(
+                rlimit_cpu_launch_plan(limit(3600, libc::RLIM_INFINITY), can_raise_hard),
+                Ok(Some(unlimited))
+            );
+        }
+        for finite in [limit(3600, 7200), limit(7200, 7200)] {
+            assert_eq!(
+                rlimit_cpu_launch_plan(finite, true),
+                Ok(Some(unlimited)),
+                "{}",
+                finite.rlim_cur
+            );
+            let reason = rlimit_cpu_launch_plan(finite, false).unwrap_err();
+            assert!(
+                reason.contains(&format!(
+                    "finite physical RLIMIT_CPU (soft {}s, hard 7200s)",
+                    finite.rlim_cur
+                )),
+                "{reason}"
+            );
+            assert!(reason.contains("D25"), "{reason}");
+        }
+    }
+
+    /// D25: an inherited descriptor that is already a producer (O_ASYNC with
+    /// an owner, a socket with an owner, a lease) refuses the run, naming the
+    /// descriptor; one with only an owner, only O_ASYNC, or an unowned socket
+    /// does not.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn an_inherited_signal_producer_is_refused_by_descriptor() {
+        use detcore::host_timed_producers::ProducerState;
+        let state = |o_async, owner, socket| ProducerState {
+            o_async,
+            owner,
+            socket,
+        };
+        for (producer, lease, what) in [
+            (state(true, true, false), false, "O_ASYNC and an owner"),
+            (state(false, true, true), false, "a socket with an owner"),
+            (state(false, false, false), true, "holds a lease"),
+        ] {
+            let reason = inherited_producer_refusal(7, producer, lease).unwrap();
+            assert!(
+                reason.starts_with("the guest would inherit descriptor 7, "),
+                "{reason}"
+            );
+            assert!(reason.contains(what), "{reason}");
+        }
+        for state in [
+            state(false, true, false),
+            state(true, false, false),
+            state(false, false, true),
+            state(true, false, true),
+        ] {
+            assert_eq!(
+                inherited_producer_refusal(7, state, false),
+                None,
+                "{state:?}"
+            );
+        }
     }
 
     /// Hermit's default in-guest route reserves SIGSYS always, SIGSEGV while
