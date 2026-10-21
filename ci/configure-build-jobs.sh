@@ -2485,8 +2485,14 @@ fi
 # rust-toolchain.toml, so inventory 997, SDK and native inputs, calibrated
 # budget, job width and limits carry unchanged from the 87c88c0d entry.
 
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 94f126befc69990655a48c41b070f1d252609dd6 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 94f126befc69990655a48c41b070f1d252609dd6 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 4e9e048136a653435df04539a445aa0f4c23c23d (2026-10-21): from
+# 94f126befc69990655a48c41b070f1d252609dd6. The one commit changes safeptrace only (the wait-owner
+# proof cache and its tests); no file under reverie-dbt, the root Cargo.toml,
+# third-party or rust-toolchain.toml changes, so the budget inputs are
+# unchanged. Carry, not recalibration: no new timing sample or >=5-sample
+# replacement claim is made.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 4e9e048136a653435df04539a445aa0f4c23c23d ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 4e9e048136a653435df04539a445aa0f4c23c23d (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
