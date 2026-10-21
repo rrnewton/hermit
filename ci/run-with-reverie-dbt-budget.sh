@@ -2425,7 +2425,14 @@ fi
 # third-party/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so inventory 999, SDK and native inputs, calibrated
 # budget, job width and limits carry unchanged from the e3634c51 entry.
-expected_pin=39f2f875709bc0830d16b3b53f8060c5fdb716d0
+# CARRY TO f698cc229f7dc2bbcc46c2d30bf84673ba8077fc (2026-10-21): from
+# 39f2f875709bc0830d16b3b53f8060c5fdb716d0. One commit (safeptrace: prove the managed wait owner once
+# per poll). It changes safeptrace/src/notifier.rs, managed_native_tests.rs and
+# the new host_proof_tests.rs only; git diff is empty under reverie-dbt/ and
+# third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so inventory 999, SDK and native inputs, calibrated
+# budget, job width and limits carry unchanged from the e3634c51 entry.
+expected_pin=f698cc229f7dc2bbcc46c2d30bf84673ba8077fc
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
