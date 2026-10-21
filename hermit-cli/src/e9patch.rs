@@ -488,20 +488,12 @@ fn prepare_in_impl(
     let temporary_binary = temporary.path().join("guest");
     let matcher = offset_matcher(&result.map.sites);
     let output = Command::new(&e9tool.binary)
-        .arg("--backend")
-        .arg(&e9patch_backend.binary)
-        .arg("--seed=1")
-        .arg("--option=--tactic-B0=false")
-        // TODO-HUMAN-REVIEW(PR-676): Review the correctness-first e9tool
-        // optimizer selection required by combined syscall/RDTSC Go rewrites.
-        .arg("-O0")
-        .arg("-M")
-        .arg(&matcher)
-        .arg("-P")
-        .arg("before empty")
-        .arg(&snapshot.binary)
-        .arg("-o")
-        .arg(&temporary_binary)
+        .args(e9tool_arguments(
+            &e9patch_backend.binary,
+            &matcher,
+            &snapshot.binary,
+            &temporary_binary,
+        ))
         .output()
         .with_context(|| format!("failed to execute e9tool {}", e9tool.original.display()))?;
 
@@ -1134,6 +1126,39 @@ fn is_executable_file(path: &Path) -> bool {
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
+/// The e9tool command line for one rewrite.
+///
+/// The ptrace backend's capabilities claim that every guest `rt_sigreturn` is
+/// reported (`BackendCapabilities::reports_sigreturns`), and an e9patch run is
+/// a ptrace run. That holds only because of this command line (A5 design
+/// 18.11): `before empty` keeps each original `syscall` in its trampoline, so
+/// the call still reaches the seccomp stop, and B0, the one tactic that
+/// changes signal flow, is off (and refused below). A test pins it; changing
+/// it means revisiting that claim.
+fn e9tool_arguments(
+    e9patch_backend: &Path,
+    matcher: &str,
+    input: &Path,
+    output: &Path,
+) -> Vec<std::ffi::OsString> {
+    vec![
+        "--backend".into(),
+        e9patch_backend.into(),
+        "--seed=1".into(),
+        "--option=--tactic-B0=false".into(),
+        // TODO-HUMAN-REVIEW(PR-676): Review the correctness-first e9tool
+        // optimizer selection required by combined syscall/RDTSC Go rewrites.
+        "-O0".into(),
+        "-M".into(),
+        matcher.into(),
+        "-P".into(),
+        "before empty".into(),
+        input.into(),
+        "-o".into(),
+        output.into(),
+    ]
+}
+
 fn offset_matcher(sites: &[InstructionSite]) -> String {
     let mut matcher = String::new();
     for (index, site) in sites.iter().enumerate() {
@@ -1231,6 +1256,38 @@ mod publication_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rewrite keeps each original instruction (`before empty`) and turns
+    /// B0 off, which is what lets an e9patch run claim ptrace's
+    /// `reports_sigreturns` (A5 design 18.11). A change here must revisit
+    /// that claim, not only this list.
+    #[test]
+    fn e9tool_command_keeps_original_instructions_and_disables_b0() {
+        let arguments = e9tool_arguments(
+            Path::new("/opt/e9patch"),
+            "offset == 0x10",
+            Path::new("/in/guest"),
+            Path::new("/out/guest"),
+        );
+        let expected: Vec<std::ffi::OsString> = [
+            "--backend",
+            "/opt/e9patch",
+            "--seed=1",
+            "--option=--tactic-B0=false",
+            "-O0",
+            "-M",
+            "offset == 0x10",
+            "-P",
+            "before empty",
+            "/in/guest",
+            "-o",
+            "/out/guest",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+        assert_eq!(arguments, expected);
+    }
 
     fn site(offset: u64) -> InstructionSite {
         InstructionSite {
