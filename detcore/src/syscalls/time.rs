@@ -1039,6 +1039,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             (Some(libc::SIGALRM), None, None)
         };
+        // A reserved in-guest signal as the timer's notification signal, for
+        // each notification that delivers one (`SIGEV_SIGNAL`, `SIGEV_THREAD`,
+        // `SIGEV_THREAD_ID`), after Linux's EINVAL checks above. With no
+        // `sigevent` the signal is SIGALRM, which is never reserved.
+        if let Some(signo) = signo {
+            Self::refuse_reserved_signal_arming(guest, "timer_create", signo.into())?;
+        }
         // `None` for a real-time signal (32 to 64): see `handle_timer_settime`.
         let signal = signo.and_then(|signo| Signal::try_from(signo).ok());
         if signal == Some(Signal::SIGALRM) {
