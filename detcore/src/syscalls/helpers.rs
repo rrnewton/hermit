@@ -2399,7 +2399,15 @@ where
         .then(|| KernelSignalWait::new(guest, 0, false, call.signal_interrupt_errno()));
     let mut published = PublishedWaitMask::default();
 
+    let mut attempts: u64 = 0;
     let result: Result<i64, Error> = loop {
+        // Race probes (docs/RACE_PROBES.md): a retry of a call an outside
+        // process decides may run late; how many retries happen before that
+        // process acts is host timing this path already depends on.
+        if attempts > 0 && !rsrc.polls_guest_state_only {
+            crate::race_probe::delay(crate::race_probe::EXT_POLL_RETRY).await;
+        }
+        attempts += 1;
         let resumed = match call.into() {
             Syscall::Read(read) if maybe_timeout.is_none() && maybe_stackguard.is_none() => {
                 crate::tool_global::polled_read_request(guest, read, rsrc.clone()).await

@@ -60,10 +60,35 @@ Hermit removes all three from the guest's environment, as it does for its own
 | `fifo_staging_mapped` | async wait | `detcore/src/syscalls/files.rs`, `open_waited_on_fifo`, after the staging page's `mmap` returns and before the path is written | a host process that kills the task in this wait leaves the page mapped and empty, as a kill during the `mmap` does |
 | `fifo_staging_reclaim` | async wait | `detcore/src/syscalls/files.rs`, `unmap_orphaned_staging_pages`, before a task unmaps a staging page that a killed task left | a host process that kills this task too leaves the page to the next task of the address space |
 | `procfs_spelling_resolved` | async wait | `detcore/src/syscalls/files.rs`, `handle_openat`, after Detcore names the directory a relative lookup starts from and before the kernel's open | without sequentialized threads, another guest thread can replace that directory's descriptor before the kernel uses it |
+| `ext_poll_retry` | async wait | `detcore/src/syscalls/helpers.rs`, `retry_nonblocking_syscall_helper`, before each retry of a call whose readiness an outside process decides (`Resources::polls_guest_state_only` unset) | the retry runs late, so the number of retries before the outside process acts changes |
 
 The waits are `tokio::time::sleep`. They delay only the task that owns the call;
 the scheduler keeps running. A blocking sleep at these points would stall the
 scheduler as well and hide the race.
+
+## Perturbing one run of `--verify`
+
+`hermit run --verify --verify-perturb=SPEC [--verify-perturb-seed=SEED]` turns the
+probes on in the second run only, with `SPEC` in the `HERMIT_RACE_PROBE` syntax. The
+first run is unperturbed; the second prints `race_probe: installed SPEC seed=SEED` on
+stderr. A guest whose result depends on host timing at one of the points then
+diverges, and the usual comparison reports the first difference. Without a seed one
+is drawn from the host clock.
+
+Use the default comparison (or `--verify-strict` only where no call an outside
+process decides is retried): `--verify-strict` compares every INFO record, including
+the records of each polling retry, whose number is host timing by design, so it
+reports a difference for any guest that waits on an outside process, perturbed or
+not.
+
+The test `verify_perturb_keeps_a_poller_on_an_outside_fifo_deterministic` in
+`hermit-cli/tests/cli.rs` is the worked example: a guest waits for lines that the test
+writes into a FIFO, from outside the container, 100 ms after each request. With
+`--verify-perturb=ext_poll_retry=1-5` the second run retries its poll fewer times.
+Before polling retries stopped charging virtual time
+(https://github.com/rrnewton/hermit/pull/4557), the guest's clock carried the
+difference and the comparison failed (`line 0 89169740` against `88169740`); with that
+change both runs print the same clocks.
 
 ## Why an outcome under a probe is a real outcome
 

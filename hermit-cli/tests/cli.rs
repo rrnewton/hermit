@@ -8498,6 +8498,38 @@ fn polling_a_silent_outside_fifo_times_out_at_the_virtual_deadline() {
     }
 }
 
+/// `hermit run --verify --verify-perturb` turns a host-timing leak into a
+/// failing comparison. The outside writer answers each request after the
+/// same 100 ms in both runs; only the second run is perturbed, its retries of
+/// the poll delayed 1 to 5 ms each by the `ext_poll_retry` race probe. So the
+/// two runs retry a different number of times while the guest sees the same
+/// bytes. Before polling retries stopped charging virtual time, each retry
+/// did, the guest's clock differed between the runs and this comparison
+/// failed.
+#[test]
+fn verify_perturb_keeps_a_poller_on_an_outside_fifo_deterministic() {
+    let output = run_an_answered_outside_fifo(
+        "verify_perturb_keeps_a_poller_on_an_outside_fifo_deterministic",
+        // Not --verify-strict: its comparison of every INFO record includes the
+        // records of each retry, whose number is host timing by design. The
+        // default comparison covers DETLOG and committed turns other than
+        // those retries, and stdout byte for byte, where the guest prints its
+        // clock.
+        &[
+            "--verify",
+            "--verify-perturb=ext_poll_retry=1-5",
+            "--verify-perturb-seed=7",
+        ],
+        3,
+        |_| Duration::from_millis(100),
+    );
+    assert!(
+        stderr(&output).contains("race_probe: installed ext_poll_retry=1-5 seed=7"),
+        "the second run was not perturbed:\n{}",
+        stderr(&output)
+    );
+}
+
 /// Under `--no-namespace`, a mount holding the guest's working directory is
 /// shown, and a host mount that is neither a base mountpoint nor a launch
 /// mount stays hidden: a file on it reports, in fdinfo `mnt_id`, the row of
