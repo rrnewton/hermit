@@ -249,7 +249,10 @@ constructor still uses its caller's stack.
 The in-guest runtime cannot deliver Detcore's preemption timer yet, so Hermit
 refuses a LiteInst run unless `--max-timeslice=disabled` is given. It also
 refuses `--verify`, because the in-guest Tool does not forward its records to
-Hermit yet, and `--timeout`, `--skid-margin` and `--gdbserver`. It refuses guest programs it cannot monitor: statically linked,
+Hermit yet, and `--timeout`, `--skid-margin` and `--gdbserver`. It refuses a
+run whose threads are not sequentialized (`--no-sequentialize-threads`,
+`--strace-only`), as `--backend=dbt` does: the in-guest signal design needs
+Detcore's scheduler to run one guest thread at a time. It refuses guest programs it cannot monitor: statically linked,
 set-user-ID or non-x86-64 programs, programs with a `DT_PREINIT_ARRAY`, and
 anything other than a regular file. A guest may `fork`, and `vfork` runs as a
 copying fork; creating a thread and `exec` are not supported yet.

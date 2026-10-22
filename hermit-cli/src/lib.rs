@@ -1110,6 +1110,8 @@ impl std::error::Error for LiteinstInGuestRefusal {}
 /// - For `in-guest-trap`, a guest environment that sets
 ///   `REVERIE_LITEINST_SITE_PATCHING` to anything but `0`
 ///   ([`in_guest_trap_site_patching_conflict`]).
+/// - Threads that are not sequentialized (`--no-sequentialize-threads`,
+///   `--strace-only`; [`in_guest_unsequentialized_refusal`]).
 ///
 /// This runs where the guest is spawned (inside the container for the CLI),
 /// so it resolves the program in the filesystem the guest sees. It pins the
@@ -1125,6 +1127,8 @@ fn refuse_in_guest_liteinst_run(
 ) -> Result<(), Error> {
     let reason = if let Some(conflict) = in_guest_trap_site_patching_conflict(command, backend) {
         Some(conflict)
+    } else if let Some(refusal) = in_guest_unsequentialized_refusal(config, backend) {
+        Some(refusal.to_owned())
     } else if config.max_timeslice.is_some() {
         Some(
             "it cannot deliver Detcore's preemption timer yet (the in-guest Tool host refuses \
@@ -1220,6 +1224,39 @@ pub fn in_guest_reserved_signals(config: &DetConfig, backend: Backend) -> u64 {
 /// so the setting stays off there: today's behaviour (D13(a), D26).
 pub const fn in_guest_refuses_host_timed_producers(backend: Backend) -> bool {
     backend.is_in_guest_liteinst()
+}
+
+/// Why Hermit's default in-guest route refuses a run of `backend` configured
+/// by `config` whose threads are not sequentialized
+/// (`--no-sequentialize-threads`, or `--strace-only`, which turns
+/// sequentialization off), or `None` when it does not (A5 step 3c slice 0g).
+///
+/// The in-guest signal design rests on one premise (design 16.2, "premise
+/// P"): at most one guest thread runs guest code at any time, the turn holder,
+/// and every other thread waits inside its runtime until its next grant. Only
+/// Detcore's scheduler makes that true: without sequentialization
+/// `resource_request` grants nothing, so a fork child runs from its first
+/// instruction beside its parent, sleeps and waits go to the kernel as they
+/// are, and no call is a scheduled point. So the run is refused at launch, by
+/// name, as `--backend=dbt` refuses it, rather than only once the guest
+/// catches a signal: the refusal then depends on the command line alone.
+///
+/// `Some` on both in-guest backends ([`Backend::is_in_guest_liteinst`]) and
+/// `None` on every other backend. The in-guest loader route (the exec-stop,
+/// native-exec and mapped-first-admission launchers) never calls this, so it
+/// keeps today's behaviour (D13(a), D26).
+pub fn in_guest_unsequentialized_refusal(
+    config: &DetConfig,
+    backend: Backend,
+) -> Option<&'static str> {
+    (backend.is_in_guest_liteinst() && !config.sequentialize_threads).then_some(
+        "threads are not sequentialized (--no-sequentialize-threads, or --strace-only, which \
+         turns sequentialization off; for a library caller, Config::sequentialize_threads is \
+         false), and the in-guest runtime's signal handling needs Detcore's scheduler to run \
+         one guest thread at a time (https://github.com/rrnewton/hermit/issues/4485); remove \
+         --no-sequentialize-threads (or --strace-only), or set Config::sequentialize_threads, \
+         to run under this backend",
+    )
 }
 
 /// `RLIMIT_CPU`'s value as Hermit's log and refusal print it: `unlimited`, or
@@ -7496,6 +7533,99 @@ mod tests {
         assert!(loader.in_guest_site_patching_off);
     }
 
+    /// Threads that are not sequentialized are refused, by name, for a run of
+    /// either in-guest backend on Hermit's default route, and for no other
+    /// backend: ptrace, DBT (which refuses them itself, in `run_dbt`), KVM
+    /// and SaBRe get no answer from this check. A sequentialized run is never
+    /// refused for it. No preparation changes the setting, the loader route's
+    /// included, so what the default route checks is what the caller asked
+    /// for; the loader route never calls the check (A5 step 3c slice 0g).
+    #[test]
+    fn only_the_default_in_guest_route_refuses_unsequentialized_threads() {
+        for sequentialize_threads in [false, true] {
+            let config = DetConfig {
+                sequentialize_threads,
+                ..DetConfig::default()
+            };
+            for backend in Backend::ALL {
+                let prepared = prepare_backend_config(config.clone(), backend);
+                assert_eq!(
+                    prepared.sequentialize_threads, sequentialize_threads,
+                    "{backend:?}"
+                );
+                let refusal = in_guest_unsequentialized_refusal(&prepared, backend);
+                assert_eq!(
+                    refusal.is_some(),
+                    backend.is_in_guest_liteinst() && !sequentialize_threads,
+                    "{backend:?} sequentialized={sequentialize_threads}"
+                );
+                if let Some(refusal) = refusal {
+                    assert!(
+                        refusal.starts_with("threads are not sequentialized"),
+                        "{refusal}"
+                    );
+                    assert!(refusal.contains("--strace-only"), "{refusal}");
+                    assert!(
+                        refusal.contains("Config::sequentialize_threads"),
+                        "a library caller must see what to set: {refusal}"
+                    );
+                }
+            }
+            let loader = prepare_in_guest_loader_route_config(config);
+            assert_eq!(loader.sequentialize_threads, sequentialize_threads);
+        }
+    }
+
+    /// The launch check of both in-guest backends ends an unsequentialized
+    /// run with the typed in-guest refusal (exit 122 at the CLI), naming the
+    /// backend and the reason, after the site-patching conflict, which still
+    /// stops the run first and leaves the guest's value untouched.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn an_unsequentialized_in_guest_run_is_refused_at_launch_by_name() {
+        let unsequentialized = DetConfig {
+            sequentialize_threads: false,
+            ..DetConfig::default()
+        };
+        for (backend, runtime) in [
+            (Backend::Liteinst, "in-guest LiteInst"),
+            (Backend::InGuestTrap, "in-guest LiteInst, site patching off"),
+        ] {
+            let mut command = Command::new("/bin/true");
+            command.env_remove(reverie_liteinst::SITE_PATCHING_ENV);
+            let error =
+                refuse_in_guest_liteinst_run(&mut command, &unsequentialized, backend).unwrap_err();
+            let refusal = error
+                .downcast_ref::<LiteinstInGuestRefusal>()
+                .expect("a typed in-guest refusal, which the CLI reports as exit 122");
+            assert_eq!(
+                refusal.to_string(),
+                format!(
+                    "--backend={} ({runtime}) refuses this run: {}",
+                    backend.as_str(),
+                    in_guest_unsequentialized_refusal(&unsequentialized, backend).unwrap()
+                ),
+            );
+        }
+        let mut conflict = Command::new("/bin/true");
+        conflict.env(reverie_liteinst::SITE_PATCHING_ENV, "1");
+        let error =
+            refuse_in_guest_liteinst_run(&mut conflict, &unsequentialized, Backend::InGuestTrap)
+                .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("refuses this run: the guest environment sets"),
+            "{error:#}"
+        );
+        assert_eq!(
+            conflict
+                .get_env(reverie_liteinst::SITE_PATCHING_ENV)
+                .as_deref(),
+            Some(OsStr::new("1"))
+        );
+    }
+
     /// D25: the guest's check logs the limit it found, unchanged when
     /// already unlimited and raised otherwise, and a limit it could not raise
     /// refuses the run, naming both values and the errno.
@@ -9301,6 +9431,7 @@ mod tests {
         // this test checks.
         let config = super::DetConfig {
             max_timeslice: None,
+            sequentialize_threads: true,
             ..super::DetConfig::default()
         };
         let mut command = super::Command::new("/bin/echo");
