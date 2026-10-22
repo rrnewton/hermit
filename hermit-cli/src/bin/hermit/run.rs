@@ -8855,6 +8855,18 @@ impl RunOpts {
         Ok(value)
     }
 
+    /// Whether this run's scheduler runs as the init of the guest's PID
+    /// namespace, which `launch_in_container` creates unless `--no-namespace`
+    /// ([`hermit::GuestPidNamespace`]). Only the work that
+    /// `launch_in_container` runs may pass it on.
+    fn guest_pid_namespace(&self) -> hermit::GuestPidNamespace {
+        if self.no_namespace {
+            hermit::GuestPidNamespace::NotOwned
+        } else {
+            hermit::GuestPidNamespace::OwnedByLauncher
+        }
+    }
+
     fn warn_no_namespace(&self) {
         if self.no_namespace {
             // Not `eprintln!`, which panics when stderr's reader has gone
@@ -10875,24 +10887,27 @@ impl RunOpts {
 
         let timeout = self.run_timeout();
         let summary_json = self.summary_json.clone();
+        let namespace = self.guest_pid_namespace();
         let result = if capture_output {
-            let out = hermit::run_with_output_backend_timeout(
+            let out = hermit::run_with_output_backend_timeout_and_namespace(
                 command,
                 config,
                 self.summary,
                 &summary_json,
                 backend,
                 timeout,
+                namespace,
             )?;
             (out.status, Some(out))
         } else {
-            let status = hermit::run_with_backend_timeout(
+            let status = hermit::run_with_backend_timeout_and_namespace(
                 command,
                 config,
                 self.summary,
                 &summary_json,
                 backend,
                 timeout,
+                namespace,
             )?;
             (status, None)
         };
@@ -11017,6 +11032,7 @@ impl RunOpts {
             &self.summary_json,
             self.runtime_backend(),
             None,
+            self.guest_pid_namespace(),
         );
         if forwarding.is_some() {
             // Records sent after the guest's last request, then close the socket.
