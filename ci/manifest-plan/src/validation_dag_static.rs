@@ -2718,7 +2718,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (IR-13): 2326, listed.
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // 75 boundary, lifecycle, admission and finalization tests; actual libtest list: 2401.
-    ("test.detcore_unit", 2401),
+    // And the three syscall_hot_path_tests units (forwarding without a record
+    // tool matches NoopTool, a custom record tool without an impl still
+    // answers forwarded calls, and the hot-path future size bounds) and
+    // scheduler::replayer::tests::a_hard_desync_names_the_fields_that_differ: 2405, listed.
+    ("test.detcore_unit", 2405),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4806,7 +4810,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twelve slice 3c.1a units: 2326, listed.
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // The same 75 shared Detcore tests; no hosted exclusions changed.
-    ("test.detcore_unit_on_host", 2401),
+    // And the same three syscall_hot_path_tests units and the replayer's
+    // hard-desync field unit: 2405, listed.
+    ("test.detcore_unit_on_host", 2405),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
