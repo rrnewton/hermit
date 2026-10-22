@@ -711,6 +711,29 @@ pub struct Resources {
     /// interruption itself) included.
     #[serde(default)]
     pub(crate) private_sigchld_decides: bool,
+    /// The guest's signal mask as this request publishes it, under the
+    /// in-guest delivery gate (`Config::in_guest_signal_delivery`; A5 step
+    /// 3c.1b, design 18.16.1 section 6,
+    /// <https://github.com/rrnewton/hermit/issues/4485>): the mask Linux's
+    /// `blocked` holds for the thread while it is stopped at this request,
+    /// where the kernel's `SigBlk` may be the in-guest runtime's own. For a
+    /// call that sleeps under a temporary mask (`blocked_signal_mask`) it is
+    /// that mask; otherwise it is the backend's record of the guest's mask
+    /// (`Guest::resume_signal_mask`), with signal phase 1's virtual SIGALRM
+    /// bit in a process that handles SIGALRM. Filled by
+    /// `tool_global::publish_request_guest_mask` just before the request is
+    /// sent, and recorded by the scheduler into `saved_guest_sigmasks`
+    /// (`Scheduler::record_request_guest_mask`).
+    ///
+    /// `None` with the gate off (every run today), on a request that does not
+    /// pass through that function, when the backend keeps no guest mask apart
+    /// (every backend before step 3c.1e), and when the call's temporary mask
+    /// could not be read (`blocked_signal_mask_unknown`). `None` publishes
+    /// nothing: the scheduler keeps whatever it held. Appended last and
+    /// `#[serde(default)]`, with no `skip_serializing_if`: `Resources`
+    /// travels in bincode RPCs, which decode by position.
+    #[serde(default)]
+    pub(crate) guest_signal_mask: Option<u64>,
 }
 
 impl fmt::Debug for Resources {
@@ -769,6 +792,9 @@ impl fmt::Debug for Resources {
         if self.private_sigchld_decides {
             debug.field("private_sigchld_decides", &true);
         }
+        if let Some(mask) = self.guest_signal_mask {
+            debug.field("guest_signal_mask", &mask);
+        }
         debug.finish()
     }
 }
@@ -809,6 +835,7 @@ impl Resources {
             decides_signal_interruption_itself: false,
             continues_sigreturn: false,
             private_sigchld_decides: false,
+            guest_signal_mask: None,
         }
     }
 
@@ -843,6 +870,12 @@ impl Resources {
             (Some(_), None) => {}
         }
         self.blocked_signal_mask_unknown |= other.blocked_signal_mask_unknown;
+        // Both parts are the same thread's, stopped at the same request.
+        match (self.guest_signal_mask, other.guest_signal_mask) {
+            (None, mask) => self.guest_signal_mask = mask,
+            (Some(left), Some(right)) => assert_eq!(left, right),
+            (Some(_), None) => {}
+        }
         if self.signal_state_task.is_none() {
             self.signal_state_task = other.signal_state_task;
         }

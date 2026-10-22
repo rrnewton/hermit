@@ -6311,12 +6311,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         // under a private blocking mask, which that thread published to the
         // scheduler; the kernel's `SigBlk` is Detcore's mask (Codex review of
         // R2b-2 stage 2, P2; https://github.com/rrnewton/hermit/issues/4273).
-        // Masks are published only where the scheduler models signal targets.
+        // Masks are published only where the scheduler models signal targets,
+        // and under the in-guest delivery gate, where each request publishes
+        // the guest's mask (A5 step 3c.1b) and the kernel's may be the in-guest
+        // runtime's (`publishes_guest_masks`). With nothing published for the
+        // thread, the kernel's `SigBlk` is reported, as before.
         let mask_thread = guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.procfs_status_mask_thread(&contents)
         })?;
         let published_sigblk = match mask_thread {
-            Some(thread) if crate::scheduler::discarded_at_send::records(guest.config()) => {
+            Some(thread) if crate::syscalls::helpers::publishes_guest_masks(guest.config()) => {
                 crate::tool_global::published_guest_sigmask(guest, DetTid::from_raw(thread)).await
             }
             _ => None,

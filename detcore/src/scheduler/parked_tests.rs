@@ -1237,7 +1237,7 @@ fn an_exit_waits_for_a_sibling_permit_and_is_admitted_at_its_release() {
         mm: peer_mm,
     };
     assert!(
-        s.block_for_one_resource(peer, &exit, &Permission::RW, None, None, &Ivar::new())
+        s.block_for_one_resource(peer, &exit, &Permission::RW, None, None, None, &Ivar::new())
             .is_err(),
         "the waiting exit skips its turn"
     );
@@ -1297,7 +1297,7 @@ fn a_waiting_exit_is_admitted_only_by_its_own_process_permit() {
             mm,
         };
         assert!(
-            s.block_for_one_resource(peer, &exit, &Permission::RW, None, None, &Ivar::new())
+            s.block_for_one_resource(peer, &exit, &Permission::RW, None, None, None, &Ivar::new())
                 .is_err()
         );
     }
@@ -1350,7 +1350,7 @@ fn a_process_signal_passes_by_an_exiting_leader() {
         mm: leader_mm,
     };
     assert!(
-        s.block_for_one_resource(leader, &exit, &Permission::RW, None, None, &Ivar::new())
+        s.block_for_one_resource(leader, &exit, &Permission::RW, None, None, None, &Ivar::new())
             .is_err()
     );
     assert!(s.parked.exits_awaiting_permit.contains(&leader));
@@ -3008,6 +3008,7 @@ fn controlled_exit_mode_never_enqueues_legacy_timed_sigchld() {
             &Permission::RW,
             None,
             None,
+            None,
             &response,
         )
         .is_ok()
@@ -3034,6 +3035,7 @@ fn controlled_exit_mode_never_enqueues_legacy_timed_sigchld() {
                     mm: child_mm,
                 },
                 &Permission::RW,
+                None,
                 None,
                 None,
                 &Ivar::new(),
@@ -3080,6 +3082,7 @@ fn a_raw_exit_of_the_last_thread_registers_the_child_exit_timer() {
                     mm,
                 },
                 &Permission::RW,
+                None,
                 None,
                 None,
                 &Ivar::new(),
@@ -3169,6 +3172,7 @@ fn selected_exit_reservation_failure_closes_tentative_pop_exactly_once() {
                 mm: child_mm,
             },
             &Permission::RW,
+            None,
             None,
             None,
             &response,
@@ -4693,7 +4697,7 @@ fn a_pause_admitted_with_a_due_sigalrm_returns_in_its_own_turn() {
     assert_eq!(s.run_queue.tentative_pop_tid(tid), Some(tid));
     let pause = ResourceID::SleepUntil(LogicalTime::INDEFINITE);
     assert!(
-        s.block_for_one_resource(tid, &pause, &Permission::W, None, None, &Ivar::new())
+        s.block_for_one_resource(tid, &pause, &Permission::W, None, None, None, &Ivar::new())
             .is_ok(),
         "granted in its own selected turn"
     );
