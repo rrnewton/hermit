@@ -391,6 +391,90 @@ pub enum ResourceID {
     InGuestFatalAlarm,
 }
 
+impl ResourceID {
+    /// Whether a granted request for this resource makes its thread's call a
+    /// kernel-run blocking call: the call runs outside the schedule, in the
+    /// kernel, where it may sleep for as long as the kernel decides, while
+    /// the scheduler commits other threads' turns. The thread rejoins with a
+    /// [`ResourceID::BlockedExternalContinue`] request (a failed vfork with
+    /// [`ResourceID::VforkFailed`]), filed at a moment host timing chooses.
+    /// So, in committed state, the call is running from the grant of this
+    /// resource until the grant of that request.
+    ///
+    /// This is the published list of kernel-run blocking calls of the A5
+    /// signal-delivery design (dev-hermit
+    /// `ai_docs/2026-10-16-a5-signal-delivery-design.md`, 16.11). Step 3c.1
+    /// refuses by name a caught or default-fatal signal that a committed send
+    /// makes pending for a thread in one of them, because the in-guest
+    /// runtime's mask keeps the signal pending where Linux would interrupt
+    /// the call. The request names the call: its `fyi` is the syscall's name,
+    /// or `clone_vfork`.
+    ///
+    /// A call that may block inside its own turn is not one. The scheduler
+    /// commits no other turn until that thread files its next request, so no
+    /// committed send and no expiry can make a signal pending for it
+    /// meanwhile.
+    ///
+    /// Which calls file these requests is decided by their handlers, from
+    /// Detcore's descriptor model and configuration. In a sequentialized
+    /// `hermit run`, the only configuration of the in-guest backends (record
+    /// and replay run on ptrace), they are:
+    /// - `rt_sigsuspend`, always, except on a backend whose `rt_sigsuspend`
+    ///   never sleeps (`rt_sigsuspend_never_sleeps`, KVM);
+    /// - `vfork`, and `clone` or `clone3` with `CLONE_VFORK` (the in-guest
+    ///   runtime refuses those two before they run);
+    /// - `read` and `readv` of an inherited external input;
+    /// - `read`, `recvfrom`, `recvmsg`, `recvmmsg`, `sendto`, `sendmsg`,
+    ///   `sendmmsg`, `connect`, `accept` and `accept4` on a descriptor that is
+    ///   blocking both logically and physically, or that Detcore cannot
+    ///   classify (`execute_nonblockable_fd_syscall`). Detcore makes the
+    ///   sockets, pipes and eventfds it creates physically nonblocking, and
+    ///   its timerfds while time is virtual, so these are, for example,
+    ///   inotify and signalfd descriptors and sockets Detcore did not create;
+    /// - `select` and `pselect6` with `nfds` above 64;
+    /// - `futex`, and `restart_syscall` resuming a futex wait, under
+    ///   `--debug-futex-mode=external`.
+    ///
+    /// `write`, `writev` and `readv` on a physically blocking descriptor
+    /// (for `readv`, one that is not an inherited input), and a masked
+    /// `epoll_pwait` or `epoll_pwait2` on a backend without
+    /// `supports_blocked_wait_signal_interruption`, run in the turn instead.
+    ///
+    /// Exhaustive, so that a new variant has to be classified.
+    pub(crate) fn is_kernel_run_blocking(&self) -> bool {
+        match self {
+            ResourceID::BlockingExternalIO(_)
+            | ResourceID::BlockingVfork(_)
+            | ResourceID::BlockingRtSigsuspend(_) => true,
+            ResourceID::FileContents(_)
+            | ResourceID::FileMetadata(_)
+            | ResourceID::DirectoryContents(_)
+            | ResourceID::MemAddrSpace(_)
+            | ResourceID::Path(_)
+            | ResourceID::PathsTransitive(_)
+            | ResourceID::Device(_)
+            | ResourceID::Exit { .. }
+            | ResourceID::ParentContinue { .. }
+            | ResourceID::SleepUntil(_)
+            | ResourceID::InternalIOPolling
+            | ResourceID::TraceReplay
+            | ResourceID::FutexWait
+            | ResourceID::VforkFailed(_)
+            | ResourceID::BlockedExternalContinue(_)
+            | ResourceID::PriorityChangePoint(..)
+            | ResourceID::WaitChild { .. }
+            | ResourceID::WaitPhysicalChild(_)
+            | ResourceID::InboundSignal(_)
+            | ResourceID::WaitidSignals(_)
+            | ResourceID::SchedYield
+            | ResourceID::HappensBeforeCheckpoint(_)
+            | ResourceID::HappensBeforeSyscallCheckpoint { .. }
+            | ResourceID::HappensBeforePosthookInterrupted { .. }
+            | ResourceID::InGuestFatalAlarm => false,
+        }
+    }
+}
+
 /// Permission to a device, which behaves like a predefined "inode".
 /// These correspond to special files under /dev
 #[allow(clippy::enum_variant_names)]
@@ -874,6 +958,98 @@ impl Permission {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ChildWaitExitClass;
+    use crate::types::ChildWaitSelector;
+
+    /// Pins the published list of kernel-run blocking calls (A5 design
+    /// 16.11, `ResourceID::is_kernel_run_blocking`) against one value of
+    /// every variant, so that a change to the list changes this table. A new
+    /// variant does not compile until `is_kernel_run_blocking` classifies it.
+    #[test]
+    fn the_kernel_run_blocking_calls_are_the_three_outside_the_schedule() {
+        let tid = DetTid::from_raw(1);
+        let pid = DetPid::from_raw(1);
+        let op = ExternalOpId::new(tid, 7);
+        let every_variant = [
+            (ResourceID::FileContents(DetInode::mint(1)), false),
+            (ResourceID::FileMetadata(DetInode::mint(1)), false),
+            (ResourceID::DirectoryContents(DetInode::mint(1)), false),
+            (ResourceID::MemAddrSpace(pid), false),
+            (ResourceID::Path(PathBuf::from("/a")), false),
+            (ResourceID::PathsTransitive(PathBuf::from("/a")), false),
+            (ResourceID::Device(Device::ContainerStdin), false),
+            (
+                ResourceID::Exit {
+                    group: true,
+                    process: pid,
+                    mm: MmId::initial(tid),
+                },
+                false,
+            ),
+            (
+                ResourceID::ParentContinue {
+                    parent: tid,
+                    child: DetTid::from_raw(2),
+                },
+                false,
+            ),
+            (ResourceID::SleepUntil(LogicalTime::from_nanos(1)), false),
+            (ResourceID::InternalIOPolling, false),
+            (ResourceID::TraceReplay, false),
+            (ResourceID::FutexWait, false),
+            (ResourceID::BlockingExternalIO(op), true),
+            (ResourceID::BlockingVfork(op), true),
+            (ResourceID::VforkFailed(op), false),
+            (ResourceID::BlockedExternalContinue(op), false),
+            (
+                ResourceID::PriorityChangePoint(1, LogicalTime::from_nanos(1), 1, Vec::new()),
+                false,
+            ),
+            (
+                ResourceID::WaitChild {
+                    parent: pid,
+                    spec: ChildWaitSpec {
+                        selector: ChildWaitSelector::Any,
+                        owner: None,
+                        exit_class: ChildWaitExitClass::Sigchld,
+                    },
+                },
+                false,
+            ),
+            (ResourceID::WaitPhysicalChild(pid), false),
+            (ResourceID::InboundSignal(SigWrapper(libc::SIGUSR1)), false),
+            (
+                ResourceID::WaitidSignals(vec![SigWrapper(libc::SIGUSR1)]),
+                false,
+            ),
+            (ResourceID::SchedYield, false),
+            (ResourceID::HappensBeforeCheckpoint(1), false),
+            (
+                ResourceID::HappensBeforeSyscallCheckpoint {
+                    count: 1,
+                    anchors: Vec::new(),
+                },
+                false,
+            ),
+            (
+                ResourceID::HappensBeforePosthookInterrupted {
+                    count: 1,
+                    anchors: Vec::new(),
+                    code: "ERESTARTSYS".to_owned(),
+                },
+                false,
+            ),
+            (ResourceID::BlockingRtSigsuspend(op), true),
+            (ResourceID::InGuestFatalAlarm, false),
+        ];
+        for (resource, kernel_run) in &every_variant {
+            assert_eq!(
+                resource.is_kernel_run_blocking(),
+                *kernel_run,
+                "{resource:?}"
+            );
+        }
+    }
 
     #[test]
     fn control_tokens_do_not_alias_unrelated_operations() {
