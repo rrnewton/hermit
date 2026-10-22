@@ -1222,6 +1222,61 @@ pub const fn in_guest_refuses_host_timed_producers(backend: Backend) -> bool {
     backend.is_in_guest_liteinst()
 }
 
+/// Whether the launcher runs a run's scheduler as the init of a PID namespace
+/// it created for the guest (A5 step 3c.1, D51 and D52). Where it does, the
+/// scheduler's exit makes the kernel kill every guest process, so a refusal
+/// that exits it (`GlobalRequest::StoppingRefusal`) leaves no guest process
+/// running; the in-guest delivery gate requires that
+/// ([`in_guest_signal_delivery_gate`]).
+///
+/// Never part of `DetConfig`, so a caller's configuration cannot assert it:
+/// it reaches the gate as a launch parameter, after the configuration is
+/// prepared. Every public entry point launches with
+/// [`GuestPidNamespace::NotOwned`]; only `hermit run`'s container launch
+/// passes [`GuestPidNamespace::OwnedByLauncher`], and only when it created
+/// the namespace (not under `--no-namespace`).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GuestPidNamespace {
+    /// No PID namespace the launcher owns: every library caller, and `hermit
+    /// run --no-namespace`.
+    #[default]
+    NotOwned,
+    /// `hermit run`'s container launch: the scheduler is the init of the
+    /// guest's PID namespace.
+    OwnedByLauncher,
+}
+
+/// Whether the pinned in-guest runtime delivers the guest's signals itself
+/// under the gate (its runtime mask, final-read loop and predicted deaths,
+/// A5 step 3c.1e). Not yet: until the flip (3c.1f), the gate stays off on
+/// every route, whatever [`in_guest_signal_delivery_gate`] answers.
+#[cfg(feature = "liteinst")]
+const IN_GUEST_RUNTIME_DELIVERS_SIGNALS: bool = false;
+
+/// The in-guest delivery gate (`detcore::Config::in_guest_signal_delivery`,
+/// D35 of the A5 step 3c design) for a run of `backend` on Hermit's default
+/// in-guest route, from its final prepared configuration and the launcher's
+/// PID-namespace ownership: an in-guest backend, site patching off,
+/// sequentialized threads, no configuration in which the two-phase delivery
+/// protocol cannot be kept (`detcore::two_phase_refusal`: a timeslice, a
+/// recorded or replayed schedule, an in-effect pipe hand-off, and the rows no
+/// in-guest backend reaches), and a scheduler that owns the guest's PID
+/// namespace. The in-guest loader route never asks (D26, D43): its
+/// configuration keeps the gate off.
+#[doc(hidden)]
+pub fn in_guest_signal_delivery_gate(
+    config: &DetConfig,
+    backend: Backend,
+    namespace: GuestPidNamespace,
+) -> bool {
+    backend.is_in_guest_liteinst()
+        && config.in_guest_site_patching_off
+        && config.sequentialize_threads
+        && detcore::two_phase_refusal(config).is_none()
+        && namespace == GuestPidNamespace::OwnedByLauncher
+}
+
 /// `RLIMIT_CPU`'s value as Hermit's log and refusal print it: `unlimited`, or
 /// a number of seconds.
 #[cfg(feature = "liteinst")]
@@ -4660,6 +4715,31 @@ pub fn run_with_backend_timeout(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<ExitStatus, Error> {
+    run_with_backend_timeout_and_namespace(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout,
+        GuestPidNamespace::NotOwned,
+    )
+}
+
+/// [`run_with_backend_timeout`] for a launcher that tells whether it runs the
+/// scheduler as the init of the guest's PID namespace ([`GuestPidNamespace`]):
+/// `hermit run`'s container launch. Every public entry point passes
+/// [`GuestPidNamespace::NotOwned`].
+#[doc(hidden)]
+pub fn run_with_backend_timeout_and_namespace(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+    namespace: GuestPidNamespace,
+) -> Result<ExitStatus, Error> {
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
         let command = tracer_thread::SendCommand::new(command);
@@ -4674,6 +4754,7 @@ pub fn run_with_backend_timeout(
                 &summary_path,
                 backend,
                 Some(control),
+                namespace,
             )
             .await;
             report.finish(result)
@@ -4691,6 +4772,7 @@ pub fn run_with_backend_timeout(
         print_summary_to_json_file,
         backend,
         timeout,
+        namespace,
     );
     skid_overshoot_report.finish(result)
 }
@@ -4748,6 +4830,10 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // So is the refusal of host-timed signal producers
     // (`in_guest_refuses_host_timed_producers`, A5 step 3c slice 0b).
     config.in_guest_refuses_host_timed_producers = false;
+    // And the in-guest delivery gate, which only the default route's launch
+    // sets, from the launch's PID-namespace ownership
+    // (`in_guest_signal_delivery_gate`, A5 step 3c.1, D35 and D52).
+    config.in_guest_signal_delivery = false;
     config
 }
 
@@ -4963,6 +5049,7 @@ async fn run_with_backend_inner(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
     timeout: Option<Duration>,
+    namespace: GuestPidNamespace,
 ) -> Result<ExitStatus, Error> {
     refuse_in_guest_liteinst_timeout(backend, timeout)?;
     // Keep the large backend future off the container supervisor's stack
@@ -4975,6 +5062,7 @@ async fn run_with_backend_inner(
         print_summary_to_json_file,
         backend,
         None,
+        namespace,
     ));
     with_run_deadline(timeout, guest).await
 }
@@ -5006,6 +5094,7 @@ async fn dispatch_backend(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
     control: Option<std::rc::Rc<ptrace_completion::Control>>,
+    namespace: GuestPidNamespace,
 ) -> Result<ExitStatus, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
@@ -5066,6 +5155,11 @@ async fn dispatch_backend(
                 in_guest_refuses_host_timed_producers(backend);
             // Last, from the configuration every Tool image receives.
             config.in_guest_reserved_signals = in_guest_reserved_signals(&config, backend);
+            // The delivery gate, from the final configuration and this
+            // launch's PID-namespace ownership; off until the runtime takes
+            // it (A5 step 3c.1, D35, D52).
+            config.in_guest_signal_delivery = IN_GUEST_RUNTIME_DELIVERS_SIGNALS
+                && in_guest_signal_delivery_gate(&config, backend, namespace);
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
             let (exit_status, mut global_state, dispatch_stats, process_reports) =
@@ -5131,6 +5225,7 @@ async fn dispatch_backend(
         }
         #[cfg(not(feature = "liteinst"))]
         {
+            let _ = namespace;
             backend.ensure_available()?;
             unreachable!("LiteInst availability must fail when the feature is disabled");
         }
@@ -5213,6 +5308,31 @@ pub fn run_with_output_backend_timeout(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<Output, Error> {
+    run_with_output_backend_timeout_and_namespace(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout,
+        GuestPidNamespace::NotOwned,
+    )
+}
+
+/// [`run_with_output_backend_timeout`] for a launcher that tells whether it
+/// runs the scheduler as the init of the guest's PID namespace
+/// ([`GuestPidNamespace`]): `hermit run`'s container launch. Every public
+/// entry point passes [`GuestPidNamespace::NotOwned`].
+#[doc(hidden)]
+pub fn run_with_output_backend_timeout_and_namespace(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+    namespace: GuestPidNamespace,
+) -> Result<Output, Error> {
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
         let command = tracer_thread::SendCommand::new(command);
@@ -5228,6 +5348,7 @@ pub fn run_with_output_backend_timeout(
                 &summary_path,
                 backend,
                 Some(control),
+                namespace,
             ))
             .await;
             report.finish(result)
@@ -5240,6 +5361,7 @@ pub fn run_with_output_backend_timeout(
         print_summary_to_json_file,
         backend,
         timeout,
+        namespace,
     )?;
     if skid_overshoots > 0 {
         return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
@@ -5259,6 +5381,7 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
     timeout: Option<Duration>,
+    namespace: GuestPidNamespace,
 ) -> Result<(Output, u64), Error> {
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
@@ -5273,6 +5396,7 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
                 &summary_path,
                 backend,
                 Some(control),
+                namespace,
             ))
             .await;
             report.finish_with_count(result)
@@ -5293,6 +5417,7 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
         print_summary_to_json_file,
         backend,
         timeout,
+        namespace,
     );
     skid_overshoot_report.finish_with_count(result)
 }
@@ -5305,6 +5430,7 @@ async fn run_with_output_backend_inner(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
     timeout: Option<Duration>,
+    namespace: GuestPidNamespace,
 ) -> Result<Output, Error> {
     refuse_in_guest_liteinst_timeout(backend, timeout)?;
     // Keep the backend state off the caller's stack before Tokio and the
@@ -5316,6 +5442,7 @@ async fn run_with_output_backend_inner(
         print_summary_to_json_file,
         backend,
         None,
+        namespace,
     ));
     match timeout {
         None => guest.await,
@@ -5333,6 +5460,7 @@ async fn dispatch_output_backend(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
     control: Option<std::rc::Rc<ptrace_completion::Control>>,
+    namespace: GuestPidNamespace,
 ) -> Result<Output, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
@@ -5396,6 +5524,11 @@ async fn dispatch_output_backend(
                 in_guest_refuses_host_timed_producers(backend);
             // Last, from the configuration every Tool image receives.
             config.in_guest_reserved_signals = in_guest_reserved_signals(&config, backend);
+            // The delivery gate, from the final configuration and this
+            // launch's PID-namespace ownership; off until the runtime takes
+            // it (A5 step 3c.1, D35, D52).
+            config.in_guest_signal_delivery = IN_GUEST_RUNTIME_DELIVERS_SIGNALS
+                && in_guest_signal_delivery_gate(&config, backend, namespace);
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
             let (output, mut global_state, dispatch_stats, process_reports) =
@@ -5462,6 +5595,7 @@ async fn dispatch_output_backend(
         }
         #[cfg(not(feature = "liteinst"))]
         {
+            let _ = namespace;
             backend.ensure_available()?;
             unreachable!("LiteInst availability must fail when the feature is disabled");
         }
@@ -7496,6 +7630,133 @@ mod tests {
         assert!(loader.in_guest_site_patching_off);
     }
 
+    /// A configuration that every condition of the in-guest delivery gate
+    /// holds for, on `backend`, as the default route's launch leaves it
+    /// before it sets the gate: prepared, with site patching off.
+    fn gate_ready(backend: Backend) -> DetConfig {
+        let mut config = prepare_backend_config(
+            DetConfig {
+                sequentialize_threads: true,
+                max_timeslice: None,
+                ..DetConfig::default()
+            },
+            backend,
+        );
+        config.in_guest_site_patching_off = true;
+        config
+    }
+
+    /// A configuration that already turns the in-guest delivery gate on (a
+    /// public, serialized field) never keeps it through Hermit's
+    /// preparation: every backend's preparation and the loader route's (the
+    /// exec-stop, native-exec and mapped-first-admission launchers, and the
+    /// native-exec verify route) turn it off, also where every other
+    /// condition holds (A5 step 3c.1, D35, D43, D52). Only the default
+    /// route's launch sets it afterwards. Mutation it catches: the reset in
+    /// `prepare_backend_config` removed.
+    #[test]
+    fn a_poisoned_signal_delivery_gate_never_survives_preparation() {
+        let poisoned = DetConfig {
+            in_guest_signal_delivery: true,
+            sequentialize_threads: true,
+            max_timeslice: None,
+            in_guest_site_patching_off: true,
+            ..DetConfig::default()
+        };
+        for backend in Backend::ALL {
+            let prepared = prepare_backend_config(poisoned.clone(), backend);
+            assert!(!prepared.in_guest_signal_delivery, "{backend:?}");
+        }
+        let loader = prepare_in_guest_loader_route_config(poisoned);
+        assert!(!loader.in_guest_signal_delivery);
+        assert!(loader.in_guest_site_patching_off);
+        assert_eq!(loader.backend, backend_capabilities(Backend::InGuestTrap));
+    }
+
+    /// D35's gate holds only for an in-guest backend with site patching off,
+    /// sequentialized threads, none of the configurations in which Detcore
+    /// cannot keep the two-phase protocol (D33: each one alone turns the gate
+    /// off), and a launcher that owns the guest's PID namespace (D51).
+    #[test]
+    fn the_signal_delivery_gate_needs_every_condition() {
+        let owned = GuestPidNamespace::OwnedByLauncher;
+        for backend in Backend::ALL {
+            let ready = gate_ready(backend);
+            assert_eq!(
+                in_guest_signal_delivery_gate(&ready, backend, owned),
+                backend.is_in_guest_liteinst(),
+                "{backend:?}"
+            );
+        }
+        for backend in [Backend::Liteinst, Backend::InGuestTrap] {
+            let ready = gate_ready(backend);
+            assert!(detcore::two_phase_refusal(&ready).is_none(), "{backend:?}");
+            let off = |change: &dyn Fn(&mut DetConfig)| {
+                let mut config = ready.clone();
+                change(&mut config);
+                !in_guest_signal_delivery_gate(&config, backend, owned)
+            };
+            assert!(
+                off(&|c| c.in_guest_site_patching_off = false),
+                "{backend:?}"
+            );
+            assert!(off(&|c| c.sequentialize_threads = false), "{backend:?}");
+            // D33's flags, each refused by `two_phase_refusal`.
+            assert!(
+                off(&|c| c.target_timeslice = std::num::NonZeroU64::new(1_000)),
+                "{backend:?}"
+            );
+            assert!(
+                off(&|c| c.max_timeslice = std::num::NonZeroU64::new(1_000)),
+                "{backend:?}"
+            );
+            assert!(off(&|c| c.record_preemptions = true), "{backend:?}");
+            assert!(
+                off(&|c| c.replay_schedule_from = Some(PathBuf::from("schedule.json"))),
+                "{backend:?}"
+            );
+            let mut pipe = ready.clone();
+            pipe.pipe_wake_latency = Some(1_000);
+            assert!(pipe.pipe_wake_latency_in_effect().is_some());
+            assert!(
+                !in_guest_signal_delivery_gate(&pipe, backend, owned),
+                "{backend:?}"
+            );
+            // D51: no PID namespace the launcher owns.
+            assert!(
+                !in_guest_signal_delivery_gate(&ready, backend, GuestPidNamespace::NotOwned),
+                "{backend:?}"
+            );
+        }
+    }
+
+    /// D52: what every public entry point launches with
+    /// (`GuestPidNamespace::default()`, which they pass) keeps the gate off
+    /// on every backend, however ready the configuration; and until the
+    /// in-guest runtime takes the gate (3c.1f), no launch sets it at all.
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn no_public_launch_and_no_3c1a_launch_turns_the_gate_on() {
+        assert_eq!(GuestPidNamespace::default(), GuestPidNamespace::NotOwned);
+        for backend in Backend::ALL {
+            let ready = gate_ready(backend);
+            assert!(
+                !in_guest_signal_delivery_gate(&ready, backend, GuestPidNamespace::default()),
+                "{backend:?}"
+            );
+            for namespace in [
+                GuestPidNamespace::NotOwned,
+                GuestPidNamespace::OwnedByLauncher,
+            ] {
+                assert!(
+                    !(IN_GUEST_RUNTIME_DELIVERS_SIGNALS
+                        && in_guest_signal_delivery_gate(&ready, backend, namespace)),
+                    "{backend:?} {namespace:?}"
+                );
+            }
+        }
+    }
+
     /// D25: the guest's check logs the limit it found, unchanged when
     /// already unlimited and raised otherwise, and a limit it could not raise
     /// refuses the run, naming both values and the errno.
@@ -8341,6 +8602,7 @@ mod tests {
             &None,
             Backend::Sabre,
             None,
+            super::GuestPidNamespace::NotOwned,
         )
         .await
         .unwrap_err();
@@ -8356,6 +8618,7 @@ mod tests {
             &None,
             Backend::Sabre,
             None,
+            super::GuestPidNamespace::NotOwned,
         )
         .await
         .unwrap_err();
