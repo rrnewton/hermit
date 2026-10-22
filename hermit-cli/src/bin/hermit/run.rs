@@ -1481,6 +1481,23 @@ pub struct RunOpts {
     #[clap(long, requires = "verification")]
     verify_strict: bool,
 
+    /// With --verify, perturb the host timing of the SECOND run only, at Hermit's
+    /// race-probe points (docs/RACE_PROBES.md), written in the HERMIT_RACE_PROBE
+    /// syntax: for example `ext_poll_retry=0-5,bg_pre_call=0-20,bg_post_call=0-20`.
+    /// Each point only moves host timing Hermit already treats as nondeterministic
+    /// (a backgrounded call starting or rejoining late, a retry of a poll on a
+    /// descriptor an outside process decides running late), so a run that is
+    /// deterministic stays so, and a guest whose result depends on host timing
+    /// diverges and the comparison names the first difference. Use it with
+    /// --verify-strict.
+    #[clap(long, requires = "verification", value_name = "SPEC")]
+    verify_perturb: Option<String>,
+
+    /// The seed of --verify-perturb's choices. Without it a seed is drawn from the
+    /// host clock; either way the second run prints it on stderr.
+    #[clap(long, requires = "verify_perturb", value_name = "SEED")]
+    verify_perturb_seed: Option<u64>,
+
     /// If --verify is specified, indicates what guest exit status is required for
     /// hermit to consider the verification successful.  Both runs must satisfy this criteria,
     /// and hermit does not perform the second run if the first does not.
@@ -9946,6 +9963,19 @@ impl RunOpts {
         let mut options = self.clone();
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
+        // --verify-perturb: turn the race probes on in the second run's container
+        // process only, before its guest starts.
+        let perturb = match _run {
+            VerificationRun::Run2 => self.verify_perturb.clone().map(|spec| {
+                let seed = self.verify_perturb_seed.unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_nanos() as u64)
+                });
+                (spec, seed)
+            }),
+            VerificationRun::Run1 => None,
+        };
         let resources = format!(
             "verification log{}{} descriptors",
             if network_trace.is_some() {
@@ -9964,6 +9994,10 @@ impl RunOpts {
             &resources,
             None,
             move |(log, _, forwarded), identity, native| {
+                if let Some((spec, seed)) = &perturb {
+                    detcore::race_probe::install(spec, *seed)
+                        .map_err(|error| anyhow::anyhow!("--verify-perturb: {error}"))?;
+                }
                 options.run_verify_in_container(log, forwarded, &global, identity, native)
             },
         )

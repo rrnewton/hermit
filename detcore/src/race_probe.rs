@@ -72,15 +72,21 @@ pub(crate) const FIFO_STAGING_RECLAIM: &str = "fifo_staging_reclaim";
 /// threads another guest thread can replace that directory's descriptor in
 /// between, as host timing alone can let it.
 pub(crate) const PROCFS_SPELLING_RESOLVED: &str = "procfs_spelling_resolved";
+/// An async wait before a nonblocking retry of a call whose readiness a
+/// process outside the container decides (`Resources::polls_guest_state_only`
+/// unset): the retry runs late, as if Hermit's host thread were slow to run,
+/// so the number of retries before the outside process acts changes.
+pub(crate) const EXT_POLL_RETRY: &str = "ext_poll_retry";
 
 /// Every probe point, for validating a configuration.
-const POINTS: [&str; 6] = [
+const POINTS: [&str; 7] = [
     BG_PRE_CALL,
     BG_POST_CALL,
     BG_HARVEST_SKIP,
     FIFO_STAGING_MAPPED,
     FIFO_STAGING_RECLAIM,
     PROCFS_SPELLING_RESOLVED,
+    EXT_POLL_RETRY,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -236,8 +242,26 @@ impl Probes {
     }
 }
 
+static PROBES: OnceLock<Option<Probes>> = OnceLock::new();
+
+/// Turn probes on in this process with `config` (the `HERMIT_RACE_PROBE`
+/// syntax) and `seed`, as if the variables had been set, for a caller that
+/// perturbs one run and not another: `hermit run --verify --verify-perturb`
+/// installs them in its second run's container process only. Fails when no
+/// item of `config` is valid, or when this process has already decided
+/// whether probes are on (any point was visited, or `install` ran).
+pub fn install(config: &str, seed: u64) -> Result<(), String> {
+    let hold_dir = std::env::var(RACE_PROBE_HOLD_DIR_ENV).ok();
+    let probes = Probes::from_settings(Some(config), Some(&seed.to_string()), hold_dir.as_deref())
+        .ok_or_else(|| format!("no valid race-probe item in {config:?}"))?;
+    PROBES
+        .set(Some(probes))
+        .map_err(|_| "race probes were already configured in this process".to_string())?;
+    eprintln!("race_probe: installed {config} seed={seed}");
+    Ok(())
+}
+
 fn probes() -> Option<&'static Probes> {
-    static PROBES: OnceLock<Option<Probes>> = OnceLock::new();
     PROBES
         .get_or_init(|| {
             let config = std::env::var(RACE_PROBE_ENV).ok()?;
