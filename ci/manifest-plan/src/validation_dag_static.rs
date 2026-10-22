@@ -1748,7 +1748,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // to ..._follow_the_backend_the_subscription_and_site_patching and adds
     // tests::the_default_route_reserves_sigtrap_only_with_site_patching_on:
     // 1083, listed.
-    ("test.hermit_unit", 1083),
+    // And tests::only_the_default_in_guest_route_refuses_unsequentialized_threads
+    // and tests::an_unsequentialized_in_guest_run_is_refused_at_launch_by_name
+    // (A5 step 3c slice 0g): 1085, listed.
+    ("test.hermit_unit", 1085),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3893,7 +3896,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (A5 step 3c slice 0b): 599, listed.
     // And liteinst_in_guest_programs::liteinst_in_guest_patching_off_by_environment_still_reserves_sigtrap
     // (A5 step 3c slice 0c): 600, listed.
-    ("test.cli", 600),
+    // And liteinst_in_guest_programs::in_guest_runs_refuse_unsequentialized_threads_by_name
+    // (A5 step 3c slice 0g), refused before the in-guest runtime starts, so
+    // test.cli_on_host selects it too: 601, listed.
+    ("test.cli", 601),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4381,7 +4387,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in-guest host-timed producer tests (slice 0b) and the in-guest SIGTRAP
     // test (slice 0c) need CPUID faulting and join the hosted exclusions:
     // unchanged at 520.
-    ("test.cli_on_host", 520),
+    // And the in-guest unsequentialized-run refusal test (slice 0g), which
+    // is refused before the in-guest runtime starts and needs no CPUID
+    // faulting: 521.
+    ("test.cli_on_host", 521),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5111,7 +5120,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two slice 0a reserved-signal tests: 1077, listed.
     // And the same five host-timed producer units (slice 0b): 1082, listed.
     // And the same slice 0c default-route SIGTRAP unit: 1083, listed.
-    ("test.hermit_unit_on_host", 1083),
+    // And the same two slice 0g unsequentialized-run refusal units: 1085, listed.
+    ("test.hermit_unit_on_host", 1085),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

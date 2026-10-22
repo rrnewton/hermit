@@ -2675,6 +2675,68 @@ fn in_guest_trap_sets_site_patching_off_and_refuses_a_caller_who_turns_it_on() {
     assert!(stderr.contains("select --backend=liteinst"), "{stderr}");
 }
 
+/// A run whose threads are not sequentialized, by `--no-sequentialize-threads`
+/// or by `--strace-only`, is refused before the guest starts on both in-guest
+/// backends, as Hermit's named policy refusal (exit 122), naming the backend
+/// and the reason (A5 step 3c slice 0g: the in-guest signal design needs
+/// Detcore's scheduler to run one guest thread at a time). Before, both ran
+/// with every process unscheduled. The same command on ptrace still runs.
+#[test]
+fn in_guest_runs_refuse_unsequentialized_threads_by_name() {
+    let _guard = hermit_run_guard();
+    let run = |backend: &str, relaxation: &str| {
+        super::hermit_test::hermit_output(
+            "hermit run",
+            Command::new(hermit_binary())
+                .args(["--log=error", "--backend", backend, "run"])
+                .args([
+                    "--max-timeslice=disabled",
+                    "--epoch=2026-01-01T00:00:00Z",
+                    "--base-env=minimal",
+                    relaxation,
+                ])
+                // A shell builtin: no exec, and bash is one of the pinned
+                // root's declared guest programs.
+                .args(["--", "/usr/bin/bash", "-c", "printf 'ran\\n'"])
+                .env_remove("REVERIE_LITEINST_SITE_PATCHING")
+                .stdin(Stdio::null()),
+        )
+    };
+    for relaxation in ["--no-sequentialize-threads", "--strace-only"] {
+        for (backend, runtime) in [
+            ("liteinst", "in-guest LiteInst"),
+            ("in-guest-trap", "in-guest LiteInst, site patching off"),
+        ] {
+            let refused = run(backend, relaxation);
+            let stderr = String::from_utf8_lossy(&refused.stderr);
+            assert_eq!(
+                refused.status.code(),
+                Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+                "{backend} {relaxation}: stderr={stderr}"
+            );
+            assert!(
+                refused.stdout.is_empty(),
+                "{backend} {relaxation}: the guest ran: {refused:?}"
+            );
+            assert!(
+                stderr.contains(&format!(
+                    "--backend={backend} ({runtime}) refuses this run: threads are not \
+                     sequentialized (--no-sequentialize-threads, or --strace-only,"
+                )),
+                "{backend} {relaxation}: {stderr}"
+            );
+        }
+        let ptrace = run("ptrace", relaxation);
+        assert!(
+            ptrace.status.success(),
+            "ptrace {relaxation}: status={:?}\nstderr={}",
+            ptrace.status,
+            String::from_utf8_lossy(&ptrace.stderr),
+        );
+        assert_eq!(String::from_utf8_lossy(&ptrace.stdout), "ran\n");
+    }
+}
+
 /// The program of `hermit-cli/tests/fixtures/in_guest_trap_constructor_main.c`,
 /// linked against the shared library of
 /// `in_guest_trap_constructor_lib.c`, whose constructor changes the in-guest
@@ -4846,6 +4908,7 @@ fn liteinst_in_guest_library_launch_refuses_a_configured_producer() {
                     };
                     let config = hermit::DetConfig {
                         max_timeslice: None,
+                        sequentialize_threads: true,
                         ..Default::default()
                     };
                     let result = hermit::run_with_backend(command, config, false, &None, backend)
@@ -4945,6 +5008,7 @@ fn liteinst_in_guest_library_launch_checks_what_a_caller_callback_leaves() {
                     }
                     let config = hermit::DetConfig {
                         max_timeslice: None,
+                        sequentialize_threads: true,
                         ..Default::default()
                     };
                     let result = tracing::subscriber::with_default(subscriber, || {
