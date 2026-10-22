@@ -338,7 +338,8 @@ pub struct Config {
     ///
     /// The host sets it, not a flag, when it prepares an in-guest run on the
     /// default route: SIGSYS, SIGSEGV while the runtime subscribes
-    /// instructions, and SIGTRAP while LiteInst's guard router is installed.
+    /// instructions, and SIGTRAP while LiteInst's guard router is installed,
+    /// which is site patching on (never with `in_guest_site_patching_off`).
     /// Every other backend, and the in-guest loader route, leave it empty.
     /// Every Tool image receives it in the configuration handshake, which
     /// guest code cannot change. Like `in_guest_site_patching_off`, it has no
