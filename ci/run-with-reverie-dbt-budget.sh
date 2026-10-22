@@ -2451,7 +2451,16 @@ fi
 # Cargo.toml, Cargo.lock and rust-toolchain.toml, so inventory 999, SDK and
 # native inputs, calibrated budget, job width and limits carry unchanged from
 # the a214eb85 entry.
-expected_pin=7d2bee961a11dad2f6ddc0e3fa95f2f4bf8de44d
+# CARRY TO 299bd6600b87011b3bb26086f5e378c9bcc8ae93 (2026-10-22): from
+# 7d2bee961a11dad2f6ddc0e3fa95f2f4bf8de44d. One commit (signals lane,
+# A5 step 3c.1a: the in-guest delivery contract, Tool::exit_for_predicted_death,
+# the in_guest_signal_delivery predicate, Guest::resume_signal_mask and
+# predict_deliveries). It changes reverie/src and reverie/tests only; git
+# diff is empty under reverie-dbt/ and third-party/ and for the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml, so inventory 999, SDK and
+# native inputs, calibrated budget, job width and limits carry unchanged from
+# the 7d2bee96 entry.
+expected_pin=299bd6600b87011b3bb26086f5e378c9bcc8ae93
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
