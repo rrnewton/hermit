@@ -2518,8 +2518,17 @@ fi
 # reverie-dbt/ and third-party/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so inventory 999, SDK and native inputs, calibrated
 # budget, job width and limits carry unchanged from the b8c60f12 entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a214eb855d71dff243903c0a5f6867183e7a7a86 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a214eb855d71dff243903c0a5f6867183e7a7a86 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO c43a19c868caf5e10332d55488f88a5882fa4a6e (2026-10-22): from
+# a214eb855d71dff243903c0a5f6867183e7a7a86. One commit (signals lane,
+# A5 step 3c slice 0c: reverie-liteinst installs its SIGTRAP guard router
+# only with site patching on). It changes reverie-liteinst/src and
+# reverie-liteinst/tests only; git
+# diff is empty under reverie-dbt/ and third-party/ and for the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml, so inventory 999, SDK and
+# native inputs, calibrated budget, job width and limits carry unchanged from
+# the a214eb85 entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c43a19c868caf5e10332d55488f88a5882fa4a6e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c43a19c868caf5e10332d55488f88a5882fa4a6e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
