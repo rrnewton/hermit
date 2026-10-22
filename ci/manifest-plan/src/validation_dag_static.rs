@@ -1743,7 +1743,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Round 3 renames two of them
     // (an_in_guest_launch_logs_the_cpu_limit_it_found_and_refuses_one_it_cannot_raise,
     // the_launch_audit_reports_what_the_guest_check_found): 1082, listed.
-    ("test.hermit_unit", 1082),
+    // Slice 0c renames
+    // tests::in_guest_reserved_signals_follow_the_backend_and_the_subscription
+    // to ..._follow_the_backend_the_subscription_and_site_patching and adds
+    // tests::the_default_route_reserves_sigtrap_only_with_site_patching_on:
+    // 1083, run with the pin enforced.
+    ("test.hermit_unit", 1083),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5100,7 +5105,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two slice 0a reserved-signal tests: 1077, listed.
     // And the same four host-timed producer units (slice 0b): 1081, listed.
     // And the same descriptor-scan unit (slice 0b round 2): 1082, listed.
-    ("test.hermit_unit_on_host", 1082),
+    // And the same slice 0c default-route SIGTRAP unit: 1083.
+    ("test.hermit_unit_on_host", 1083),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
