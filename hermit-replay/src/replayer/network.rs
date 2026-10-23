@@ -470,7 +470,7 @@ impl Replayer {
         let event = next_event!(guest, Recvmsg)?;
         let cloexec = syscall.flags() & libc::MSG_CMSG_CLOEXEC != 0;
         for fd in scm_rights_fds(&event.control) {
-            self.reserve_replay_fd(guest, fd, cloexec).await;
+            self.reserve_received_stand_in(guest, fd, cloexec).await;
         }
 
         let message_address = syscall.msg().ok_or(Errno::EFAULT)?;

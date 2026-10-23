@@ -3350,7 +3350,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b): 218.
     // And https://github.com/rrnewton/hermit/issues/4262: record_exec_discards_posix_timer_copies_as_on_linux and
     // record_replay_posix_timer_rows_replay_but_diverge_from_linux: 220.
-    ("test.record_replay", 220),
+    // And record_replay_registers_descriptors_received_over_scm_rights: 221.
+    // And record_replay_receives_descriptors_over_a_guests_own_unix_listener: 222.
+    // And record_replay_keeps_eventfds_received_over_scm_rights_coherent: 223.
+    ("test.record_replay", 223),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
