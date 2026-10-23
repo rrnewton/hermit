@@ -1155,7 +1155,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (A5 step 3c.1a, the delivery gate's field): 1816, listed.
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // 19 boundary/config model tests, two verifier tests, and five restored replay cases.
-    ("test.regular_crates", 1842),
+    // And detcore-model's
+    // collections::replay_cursor::tests::drop_discards_the_head_and_keeps_the_rest
+    // (a replay resync drops the events it skips): 1843, listed.
+    ("test.regular_crates", 1843),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2800,7 +2803,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unit, rendered_procfs's write-open and mode unit, its write-open
     // refusal unit and its `..` alias walk unit, and tool_global's four
     // comm_alias_open_tests through handle_openat): 2527, listed.
-    ("test.detcore_unit", 2527),
+    // And replayer::tests::an_observed_rip_the_trace_lacks_is_not_a_hard_desync,
+    // replayer::tests::a_blocked_syscall_retry_is_recognized_only_for_its_thread
+    // and scheduler::test::a_replayed_retry_is_not_backed_off_as_a_poller (a
+    // schedule replay follows its recording through a multithreaded program):
+    // 2530, listed.
+    ("test.detcore_unit", 2530),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4918,7 +4926,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/4582: 2500.
     // And the same fifteen D4c-1 units: 2515, listed.
     // And the same twelve A+ units: 2527, listed.
-    ("test.detcore_unit_on_host", 2527),
+    // And the same three schedule-replay units: 2530, listed.
+    ("test.detcore_unit_on_host", 2530),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5452,7 +5461,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two in_guest_signal_delivery config tests: 1802, listed.
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // The same 26 tests; all existing hosted exclusions remain unchanged.
-    ("test.regular_crates_on_host", 1828),
+    // And the same replay-cursor drop test: 1829, listed.
+    ("test.regular_crates_on_host", 1829),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

@@ -13575,8 +13575,19 @@ impl Scheduler {
             // Requeue the thread as a poller
             let popped = self.run_queue.commit_tentative_pop();
             assert_eq!(dettid, popped);
-            self.run_queue
-                .push_poller(dettid, self.get_priority(dettid), rs.poll_attempt);
+            let priority = self.get_priority(dettid);
+            if self
+                .replayer
+                .as_ref()
+                .is_some_and(|replayer| replayer.next_is_retry_by(dettid))
+            {
+                // The replayed schedule's next event is this retry. A poll backoff
+                // would hand the turn to another thread and leave the schedule.
+                self.run_queue.push_back(dettid, priority);
+            } else {
+                self.run_queue
+                    .push_poller(dettid, priority, rs.poll_attempt);
+            }
             // Before the count reset below hides that this is a retry.
             self.note_sigalrm_polling_wait(dettid, rs);
             self.work_span_note_wait(dettid, rs);
@@ -22264,6 +22275,48 @@ mod test {
             },
         );
         (global_time, deadline)
+    }
+
+    /// A polling thread's retry keeps its turn when the replayed schedule's
+    /// next event is that retry: it is queued as an ordinary runnable thread
+    /// rather than backed off as a poller, which would hand another thread the
+    /// turn the recording gave it. When the schedule names another thread
+    /// next, the retry is backed off as before.
+    #[test]
+    fn a_replayed_retry_is_not_backed_off_as_a_poller() {
+        let poller = DetTid::from_raw(3);
+        let other = DetTid::from_raw(5);
+        for (next, backed_off) in [(poller, false), (other, true)] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            register_known_thread(&mut scheduler, poller);
+            scheduler
+                .priorities
+                .insert(poller, runqueue::FIRST_PRIORITY + 2);
+            scheduler.runqueue_push_back(poller);
+            scheduler.replayer = Some(replayer::Replayer::new(vec![SchedEvent::syscall(
+                next,
+                Sysno::recvfrom,
+                SyscallPhase::Posthook,
+            )]));
+            let mut request = Resources::new(poller);
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            request.poll_attempt = 1;
+            let turn = scheduler.next_turns.get(&poller).unwrap();
+            turn.req.put(Ok(request.clone()));
+            let response = turn.resp.clone();
+            assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(poller));
+            assert!(
+                scheduler
+                    .step4_resource_block(poller, &request, &response)
+                    .is_err(),
+                "a retry that has not been remade runnable grants no turn"
+            );
+            assert_eq!(
+                !scheduler.run_queue.contains_non_polling_tid(poller),
+                backed_off,
+                "the schedule's next event is dtid {next}"
+            );
+        }
     }
 
     /// With a backgrounded call unfinished and nothing queued, record wakes a
