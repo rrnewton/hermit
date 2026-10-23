@@ -447,6 +447,8 @@ use goblin::elf::header;
 use goblin::elf::section_header;
 pub use id::Id;
 use metadata::Metadata;
+pub use metadata::RecordOptions;
+pub use metadata::RecordedSchedule;
 pub use ptrace_completion::HermitCleanupStage;
 pub use ptrace_completion::HermitCleanupUnconfirmed;
 pub use ptrace_completion::HermitPtraceFailure;
@@ -5557,8 +5559,6 @@ impl HermitData {
                 MountProvenance::default(),
                 None,
                 None,
-                None,
-                detcore_model::cpu_profile::CpuProfile::default(),
                 control,
             )
             .await?;
@@ -5593,8 +5593,6 @@ impl HermitData {
                 },
                 Some(mount_ids),
                 None,
-                None,
-                detcore_model::cpu_profile::CpuProfile::default(),
                 control,
             )
             .await?;
@@ -6063,8 +6061,6 @@ pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
             MountProvenance::default(),
             None,
             None,
-            None,
-            detcore_model::cpu_profile::CpuProfile::default(),
             control,
         )
         .await
@@ -6072,9 +6068,9 @@ pub fn record_to(command: Command, dir: &Path) -> Result<ExitStatus, Error> {
 }
 
 /// Records with producer-owned mountinfo provenance. The directory-lifetime
-/// obligation is the same as [`record_to`]. `local_networking` and
-/// `proc_level` are stored in the recording's `metadata.json`, and a replay
-/// uses that network and that `/proc` level.
+/// obligation is the same as [`record_to`]. `options` are stored in the
+/// recording's `metadata.json`, and a replay uses the same network, `/proc`
+/// level, CPU profile and schedule.
 ///
 /// The ptrace session runs on a tracer thread, so the calling thread needs no
 /// particular stack; see [`run`].
@@ -6082,9 +6078,7 @@ pub fn record_to_with_mountinfo(
     command: Command,
     dir: &Path,
     mountinfo: MountProvenance,
-    local_networking: bool,
-    proc_level: detcore_model::config::ProcLevel,
-    cpu_profile: detcore_model::cpu_profile::CpuProfile,
+    options: RecordOptions,
 ) -> Result<ExitStatus, Error> {
     let dir = dir.to_owned();
     let command = tracer_thread::SendCommand::new(command);
@@ -6106,9 +6100,7 @@ pub fn record_to_with_mountinfo(
             &dir,
             mountinfo,
             Some(mount_ids),
-            Some(local_networking),
-            Some(proc_level),
-            cpu_profile,
+            Some(options),
             control,
         )
         .await
@@ -6117,31 +6109,20 @@ pub fn record_to_with_mountinfo(
 
 // Private plumbing: Record::spawn_with_mountinfo's parameters plus the
 // ptrace completion control.
-#[allow(clippy::too_many_arguments)]
 async fn record_to_async(
     command: Command,
     dir: &Path,
     mountinfo: MountProvenance,
     mountinfo_mount_ids: Option<Vec<u64>>,
-    local_networking: Option<bool>,
-    proc_level: Option<detcore_model::config::ProcLevel>,
-    cpu_profile: detcore_model::cpu_profile::CpuProfile,
+    options: Option<RecordOptions>,
     control: std::rc::Rc<ptrace_completion::Control>,
 ) -> Result<ExitStatus, Error> {
     let report = SkidOvershootReport::begin(true);
     let result = async {
-        Record::spawn_with_mountinfo(
-            command,
-            dir,
-            mountinfo,
-            mountinfo_mount_ids,
-            local_networking,
-            proc_level,
-            cpu_profile,
-        )
-        .await?
-        .wait(control)
-        .await
+        Record::spawn_with_mountinfo(command, dir, mountinfo, mountinfo_mount_ids, options)
+            .await?
+            .wait(control)
+            .await
     }
     .await;
     report.finish(result)
@@ -6163,8 +6144,6 @@ pub fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error>
             MountProvenance::default(),
             None,
             None,
-            None,
-            detcore_model::cpu_profile::CpuProfile::default(),
             control,
         )
         .await
@@ -6172,7 +6151,7 @@ pub fn record_with_output(command: Command, dir: &Path) -> Result<Output, Error>
 }
 
 /// Records with captured output and exact mountinfo provenance.
-/// `local_networking` and `proc_level` are as for [`record_to_with_mountinfo`].
+/// `options` are as for [`record_to_with_mountinfo`].
 ///
 /// The ptrace session runs on a tracer thread, so the calling thread needs no
 /// particular stack; see [`run`].
@@ -6180,9 +6159,7 @@ pub fn record_with_output_with_mountinfo(
     command: Command,
     dir: &Path,
     mountinfo: MountProvenance,
-    local_networking: bool,
-    proc_level: detcore_model::config::ProcLevel,
-    cpu_profile: detcore_model::cpu_profile::CpuProfile,
+    options: RecordOptions,
 ) -> Result<Output, Error> {
     let dir = dir.to_owned();
     let command = tracer_thread::SendCommand::new(command);
@@ -6204,9 +6181,7 @@ pub fn record_with_output_with_mountinfo(
             &dir,
             mountinfo,
             Some(mount_ids),
-            Some(local_networking),
-            Some(proc_level),
-            cpu_profile,
+            Some(options),
             control,
         )
         .await
@@ -6215,15 +6190,12 @@ pub fn record_with_output_with_mountinfo(
 
 // Private plumbing: Record::spawn_with_mountinfo's parameters plus the
 // ptrace completion control.
-#[allow(clippy::too_many_arguments)]
 async fn record_with_output_async(
     mut command: Command,
     dir: &Path,
     mountinfo: MountProvenance,
     mountinfo_mount_ids: Option<Vec<u64>>,
-    local_networking: Option<bool>,
-    proc_level: Option<detcore_model::config::ProcLevel>,
-    cpu_profile: detcore_model::cpu_profile::CpuProfile,
+    options: Option<RecordOptions>,
     control: std::rc::Rc<ptrace_completion::Control>,
 ) -> Result<Output, Error> {
     let report = SkidOvershootReport::begin(true);
@@ -6231,18 +6203,10 @@ async fn record_with_output_async(
     command.stdout(Stdio::piped());
     command.stderr(Stdio::piped());
     let result = async {
-        Record::spawn_with_mountinfo(
-            command,
-            dir,
-            mountinfo,
-            mountinfo_mount_ids,
-            local_networking,
-            proc_level,
-            cpu_profile,
-        )
-        .await?
-        .wait_with_output(control)
-        .await
+        Record::spawn_with_mountinfo(command, dir, mountinfo, mountinfo_mount_ids, options)
+            .await?
+            .wait_with_output(control)
+            .await
     }
     .await;
     report.finish(result)

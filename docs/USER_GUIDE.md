@@ -618,6 +618,22 @@ hermit log-diff --verify-json report.json rec rep
 `rec/recording` holds the recording. Give both commands the same options; the
 comparison writes the report `record start --verify --verify-json` writes.
 
+To record a racy failure, record under chaos scheduling and try seeds until one
+fails, then replay that recording under GDB:
+
+```bash
+for seed in $(seq 1 64); do
+  hermit record start --chaos --seed="$seed" -- PROGRAM || break
+done
+hermit replay
+```
+
+The recording stores its schedule, and replay follows it. `--seed` (also
+spelled `--sched-seed`, as for `hermit run`) seeds only the scheduler; the
+guest's random numbers are recorded. Recording runs under a different
+configuration from `hermit run`, so a seed that fails under
+`hermit run --chaos` does not necessarily fail under `hermit record`.
+
 Replay depends on the captured data and compatible Hermit behavior. Keep the
 recording directory intact and prefer the same Hermit revision for recording
 and replay.

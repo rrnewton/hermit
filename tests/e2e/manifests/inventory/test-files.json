@@ -1940,6 +1940,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_chaos_race.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_chaos_race.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload, whose output is the interleaving of four threads that append to a shared buffer, and checks that recordings made under hermit record start --chaos with several seeds record more than one interleaving and that each replay prints its recording's."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/record_replay_cleartid_admission.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_cleartid_admission.c is owned by hermit-cli/tests/record_replay.rs: record_replay_keeps_the_order_of_a_cleartid_join_wake_beside_an_admission compiles it and runs it under record start --strict --verify --verify-strict, requiring the order in which a clear-TID join wake and a waitpid admission resume to replay as recorded (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b). It stays a fixture because it needs a record/replay command that a generic manifest does not express."
