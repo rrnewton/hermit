@@ -338,6 +338,21 @@ impl Guest<Detcore> for TurnGuest {
     }
 }
 
+/// Make `guest` the test's own thread, for a test whose `tid()` must name a
+/// real thread: a refused send's unreadable `siginfo` is classified from the
+/// caller's `/proc/<tid>/smaps` (`refused_send_siginfo`), and the harness's
+/// default `THREAD` (31) is whatever task has that id on the host or in the
+/// validation container, so a null or unmapped `siginfo` gave EFAULT on one
+/// host and the named refusal in the pinned root.
+fn use_real_test_thread(guest: &mut TurnGuest) {
+    // SAFETY: gettid has no preconditions.
+    let own = unsafe { libc::gettid() };
+    guest.host_tid = Some(own);
+    // An ordinary RPC asserts that the backend tid is the thread's dettid
+    // (`send_and_update_time`).
+    guest.thread.dettid = DetTid::from_raw(own);
+}
+
 /// An in-guest thread with the delivery gate `gate`, whose backend records
 /// the guest's own mask as `own_mask`.
 fn turn_guest(gate: bool, own_mask: Option<u64>) -> TurnGuest {
@@ -1746,6 +1761,7 @@ async fn under_the_gate_every_send_handler_refuses_a_sigstop() {
         let log = WarnLog::default();
         let _subscriber = tracing::subscriber::set_default(log.clone());
         let mut guest = turn_guest(true, Some(0));
+        use_real_test_thread(&mut guest);
         let tool = tool(&guest);
         let result = match handler {
             "kill" => {
@@ -1922,6 +1938,7 @@ async fn under_the_gate_a_queued_stop_signal_send_keeps_the_kernel_s_earlier_err
             let log = WarnLog::default();
             let _subscriber = tracing::subscriber::set_default(log.clone());
             let mut guest = turn_guest(true, Some(0));
+            use_real_test_thread(&mut guest);
             let tool = tool(&guest);
             let info = AddrMut::from_raw(address);
             let result = if handler == "rt_sigqueueinfo" {
@@ -2005,6 +2022,7 @@ async fn under_the_gate_a_queued_stop_signal_send_keeps_the_kernel_s_earlier_err
         let log = WarnLog::default();
         let _subscriber = tracing::subscriber::set_default(log.clone());
         let mut guest = turn_guest(true, Some(0));
+        use_real_test_thread(&mut guest);
         let tool = tool(&guest);
         let result = tool
             .refuse_stop_signal_send(
@@ -2066,6 +2084,7 @@ async fn under_the_gate_a_send_to_a_kernel_run_call_keeps_the_kernel_s_earlier_e
     };
     let blocked_peer = || {
         let mut guest = turn_guest(true, Some(0));
+        use_real_test_thread(&mut guest);
         guest.kernel_run = Some(external);
         guest
     };
