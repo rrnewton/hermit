@@ -219,6 +219,25 @@ pub(super) const ACCEPT_SLOT_REFUSAL: &str = "replay refused: an accepted connec
 /// 32-bit initial value; a guest eventfd created with this value, or counted
 /// up to it, in a diverged slot would read as a stand-in.
 const ACCEPT_STAND_IN_COUNT: u32 = 0x3880_acc7;
+/// The initial count of the eventfd that stands in for a descriptor an
+/// `SCM_RIGHTS` receive installed. Detcore replaces it with a live duplicate
+/// when the recording found the received file already in the receiver's
+/// table (`Detcore::install_live_alias`); one that remains names a file this
+/// process held nowhere else, which replay does not have. Replay serves every
+/// operation on it from the log, eventfd reads and writes included, which it
+/// otherwise applies in the kernel (`holds_received_stand_in`), so the count
+/// never changes and marks exactly the remaining stand-ins and their
+/// duplicates, as `ACCEPT_STAND_IN_COUNT` marks accepted connections'.
+pub(super) const RECEIVED_STAND_IN_COUNT: u32 = 0x5c3d_f0d5;
+
+/// Whether `fd` in the table of thread `tid` holds the stand-in for a received
+/// descriptor (`RECEIVED_STAND_IN_COUNT`).
+pub(super) fn holds_received_stand_in(tid: Pid, fd: libc::c_int) -> bool {
+    std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", tid.as_raw()))
+        .ok()
+        .and_then(|fdinfo| parse_eventfd_count(&fdinfo))
+        == Some(u64::from(RECEIVED_STAND_IN_COUNT))
+}
 
 /// The `eventfd-count` line of an fdinfo file, present for eventfds. Linux
 /// prints the count in hexadecimal.
@@ -698,6 +717,11 @@ impl Tool for Replayer {
             // got EPERM, so the recorded answer stands
             // (https://github.com/rrnewton/hermit/issues/31).
             Syscall::EpollCtl(_) => self.handle_epoll_ctl(guest, syscall).await,
+            // Detcore's probe of a descriptor received over SCM_RIGHTS. Replay
+            // holds placeholders where the recording held the received open
+            // files, so a live kcmp would compare different files; the
+            // recorded answer stands.
+            Syscall::Kcmp(_) => self.handle_simple(guest, syscall).await,
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-3871): Replay does not recreate a connection's
@@ -1463,6 +1487,23 @@ impl Replayer {
         cloexec: bool,
     ) {
         if let Err(placeholder) = self.try_reserve_replay_fd(guest, fd, cloexec, 0).await {
+            panic!("{}", slot_divergence_message(guest.tid(), fd, placeholder));
+        }
+    }
+
+    /// Installs the stand-in for a descriptor an `SCM_RIGHTS` receive put in
+    /// slot `fd` (`RECEIVED_STAND_IN_COUNT`), which must be the lowest free
+    /// descriptor.
+    pub(super) async fn reserve_received_stand_in<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+        cloexec: bool,
+    ) {
+        if let Err(placeholder) = self
+            .try_reserve_replay_fd(guest, fd, cloexec, RECEIVED_STAND_IN_COUNT)
+            .await
+        {
             panic!("{}", slot_divergence_message(guest.tid(), fd, placeholder));
         }
     }

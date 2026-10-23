@@ -837,7 +837,16 @@ impl RecordVersion {
 // --chaos --seed=N`), and replay follows it. An older reader would replay a
 // chaos recording under the default schedule and fall out of step, so it is
 // refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x187);
+// 0x187 -> 0x188 (HIGHEST_SHIPPED + 1 at this base; the lander re-checks it
+// at land): under record and replay Detcore registers each descriptor an
+// SCM_RIGHTS receive installs, probing it through the recording (fstat,
+// fstatfs, kcmp(KCMP_FILE) against the table's descriptors, F_GETFL), and kcmp
+// records a Return event. A received or connected socket whose peer is a guest
+// adds getsockopt(SO_ACCEPTCONN, SO_PEERCRED) probes and an F_SETFL that makes
+// it nonblocking, and is then internal: a blocking call on it records every
+// nonblocking attempt in the caller's turn instead of one call outside the
+// turn. An older recording has none of these events, so it is refused.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x188);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -862,7 +871,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x187);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x187;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x188;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

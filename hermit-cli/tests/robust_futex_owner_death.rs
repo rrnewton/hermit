@@ -1594,11 +1594,13 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // 0x184 projects those private intervals from complete Smaps sections,
     // 0x185 random devices are classified by device number,
     // 0x186 projects coherent NUMA rows with authenticated private ownership,
-    // and 0x187 chaos recordings store their schedule),
+    // 0x187 chaos recordings store their schedule,
+    // and 0x188 descriptors received over SCM_RIGHTS are registered through the
+    // recording, with sockets whose peer is a guest polled in the turn),
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x187,
+        metadata["version"], 0x188,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);

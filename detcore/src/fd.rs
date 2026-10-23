@@ -579,6 +579,11 @@ struct OpenFileDescription {
     /// `syscall_targets_internal_fd`.
     #[serde(default)]
     socketpair_endpoint: bool,
+    /// True when record/replay found that this socket's peer is a guest of
+    /// this container, so only guest progress can end a wait on it, as for a
+    /// socketpair endpoint. See `Detcore::classify_socket_peer`.
+    #[serde(default)]
+    guest_peer: bool,
     /// True when `accept(2)` or `accept4(2)` returned this socket. Record and
     /// replay keep such a connection only in the log, and replay stands in an
     /// eventfd for it. See `is_accepted_connection`.
@@ -744,6 +749,7 @@ impl std::fmt::Debug for OpenFileDescription {
         debug.field("network_lowat", &self.network_lowat);
         debug.field("network_socket", &self.network_socket);
         debug.field("socketpair_endpoint", &self.socketpair_endpoint);
+        debug.field("guest_peer", &self.guest_peer);
         debug.field("accepted_connection", &self.accepted_connection);
         debug.field("accept_in_turn_eligible", &self.accept_in_turn_eligible);
         debug.field("read_shutdown_requested", &self.read_shutdown_requested);
@@ -1014,6 +1020,7 @@ impl DetFd {
                 network_lowat: None,
                 network_socket: NetworkSocketKind::NotInet,
                 socketpair_endpoint: false,
+                guest_peer: false,
                 accepted_connection: false,
                 accept_in_turn_eligible: false,
                 read_shutdown_requested: false,
@@ -2220,6 +2227,22 @@ impl DetFd {
         self.with_description(|d| d.socketpair_endpoint)
     }
 
+    /// Mark this socket as one whose peer is a guest of this container. Like
+    /// `set_socketpair_endpoint` it applies to the open file description, so
+    /// dup, fork and `SCM_RIGHTS` aliases are covered too.
+    pub(crate) fn set_guest_peer(&self) {
+        self.with_description(|d| d.guest_peer = true);
+    }
+
+    /// Whether only guests of this container hold the other end of this
+    /// socket: a `socketpair(2)` endpoint, or a socket whose peer record/replay
+    /// found to be a guest. Detcore keeps such a socket physically nonblocking
+    /// and polls a blocking call on it in the caller's turn, as for a pipe
+    /// (`syscall_targets_internal_fd`).
+    pub(crate) fn is_internal_socket(&self) -> bool {
+        self.with_description(|d| d.socketpair_endpoint || d.guest_peer)
+    }
+
     /// Mark this open file as a connection returned by `accept(2)` or
     /// `accept4(2)`. It applies to the open file description, so dup and fork
     /// aliases are covered too.
@@ -2686,6 +2709,14 @@ mod tests {
             !duplicate.is_loopback_peer(),
             "reconnects through one alias must clear loopback state for every alias"
         );
+
+        assert!(!original.is_internal_socket());
+        duplicate.set_guest_peer();
+        assert!(
+            original.is_internal_socket(),
+            "a guest peer belongs to the open file, so every alias must see it"
+        );
+        assert!(!original.is_socketpair_endpoint());
     }
 
     /// `flock(2)` locks belong to the open file description, so every `dup`

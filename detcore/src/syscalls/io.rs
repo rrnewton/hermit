@@ -44,6 +44,7 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
+use crate::syscalls::files::SocketRole;
 use crate::syscalls::helpers::KernelSignalWait;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::PublishedWaitMask;
@@ -3543,6 +3544,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .thread_state()
                     .with_detfd(fd, |detfd| detfd.set_loopback_peer(loopback_peer));
             }
+        }
+        if matches!(result, Ok(0)) {
+            self.classify_socket_peer(guest, fd, SocketRole::Connected)
+                .await;
         }
 
         result
