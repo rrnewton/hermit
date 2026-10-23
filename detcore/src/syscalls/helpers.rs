@@ -3274,6 +3274,26 @@ where
     })
 }
 
+/// A5 step 3c.1d (IR-7): `I` (`ignored_signals::pending_ignored`) at a
+/// temporary-mask call's entry, in its own turn before its first scheduler
+/// request, for [`temporary_mask_check`]'s first check, which may come after
+/// other threads' turns. One `/proc` read; with the gate off, nothing is read
+/// and this is 0.
+pub(crate) fn temporary_mask_entry<T, G>(guest: &G) -> Result<KernelSigset, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if !guest.config().in_guest_signal_delivery {
+        return Ok(0);
+    }
+    let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+    Ok(crate::ignored_signals::pending_ignored(
+        &state,
+        guest.config().in_guest_reserved_signals,
+    ))
+}
+
 /// The `sa_flags` of `signal`'s current action, as the guest set it, read in
 /// this thread's turn with a query `rt_sigaction` (the in-guest runtime
 /// answers it from the guest's action, phase 1's virtual SIGALRM included):
