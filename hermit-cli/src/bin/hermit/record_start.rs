@@ -251,6 +251,20 @@ pub struct StartOpts {
     )]
     proc: detcore_model::config::ProcLevel,
 
+    /// Schedule guest threads in chaos mode, as `hermit run --chaos` does. The
+    /// recording stores the schedule and its replays follow it, so a failure
+    /// that one seed provokes can be replayed under a debugger. Recording runs
+    /// under its own configuration (`--strict` describes how it differs from
+    /// `hermit run`), so a seed does not produce the interleaving it produces
+    /// under `hermit run --chaos`.
+    #[clap(long)]
+    chaos: bool,
+
+    /// Seed for `--chaos` scheduling (default 0). It seeds only the scheduler:
+    /// the guest's random numbers are recorded.
+    #[clap(long, alias = "sched-seed", value_name = "uint64", requires = "chaos")]
+    seed: Option<u64>,
+
     /// Set the working directory for both recording and replay after mounts apply.
     #[clap(long, value_name = "path")]
     workdir: Option<String>,
@@ -463,6 +477,22 @@ impl StartOpts {
         !self.verify && !self.gdbex.is_empty()
     }
 
+    /// What the recording stores for its replays to honor.
+    fn record_options(&self) -> hermit::RecordOptions {
+        hermit::RecordOptions {
+            local_networking: self.network() == NetworkingMode::Local,
+            proc_level: self.proc,
+            cpu_profile: self.cpu_profile,
+            schedule: if self.chaos {
+                hermit::RecordedSchedule::Chaos {
+                    seed: self.seed.unwrap_or_default(),
+                }
+            } else {
+                hermit::RecordedSchedule::Default
+            },
+        }
+    }
+
     /// The network the recording (and an immediate replay of it) runs in.
     fn network(&self) -> NetworkingMode {
         self.network.unwrap_or(if self.replays_under_gdb() {
@@ -582,8 +612,7 @@ impl StartOpts {
             self.refuse_strict_with_inexact_branch_counter(global)?;
             let hermit = HermitData::from(self.data_dir.as_ref());
             let record_timeout = self.record_timeout();
-            let local_networking = self.network() == NetworkingMode::Local;
-            let proc_level = self.proc;
+            let record_options = self.record_options();
 
             let (mut container, identity_guard) = self.recording_container(global)?;
 
@@ -615,18 +644,14 @@ impl StartOpts {
                                 command,
                                 data.path(),
                                 mountinfo,
-                                local_networking,
-                                proc_level,
-                                options.cpu_profile,
+                                record_options,
                             )
                         }),
                         None => hermit::record_to_with_mountinfo(
                             command,
                             data.path(),
                             mountinfo,
-                            local_networking,
-                            proc_level,
-                            options.cpu_profile,
+                            record_options,
                         ),
                     }
                 },
@@ -697,8 +722,7 @@ impl StartOpts {
             temp_data_dir.path().display()
         );
         let record_timeout = self.record_timeout();
-        let local_networking = self.network() == NetworkingMode::Local;
-        let proc_level = self.proc;
+        let record_options = self.record_options();
         let options = self.clone();
         let record_global = global1.clone();
         let (recording, (temp_data_dir, _record_identity, log1, log2)) =
@@ -720,18 +744,14 @@ impl StartOpts {
                                 command,
                                 data.path(),
                                 mountinfo,
-                                local_networking,
-                                proc_level,
-                                options.cpu_profile,
+                                record_options,
                             )
                         }),
                         None => hermit::record_with_output_with_mountinfo(
                             command,
                             data.path(),
                             mountinfo,
-                            local_networking,
-                            proc_level,
-                            options.cpu_profile,
+                            record_options,
                         ),
                     }
                 },
@@ -855,8 +875,7 @@ impl StartOpts {
         let (mut container, identity_guard) = self.recording_container(global)?;
         eprintln!(":: {}", "Recording...".yellow().bold());
         let record_timeout = self.record_timeout();
-        let local_networking = self.network() == NetworkingMode::Local;
-        let proc_level = self.proc;
+        let record_options = self.record_options();
         let options = self.clone();
         let record_global = global.clone();
         let data = data.to_owned();
@@ -882,18 +901,14 @@ impl StartOpts {
                             command,
                             &data,
                             mountinfo,
-                            local_networking,
-                            proc_level,
-                            options.cpu_profile,
+                            record_options,
                         )
                     }),
                     None => hermit::record_with_output_with_mountinfo(
                         command,
                         &data,
                         mountinfo,
-                        local_networking,
-                        proc_level,
-                        options.cpu_profile,
+                        record_options,
                     ),
                 }
             },
@@ -937,8 +952,7 @@ impl StartOpts {
 
         let temp_data_dir = tempfile::tempdir()?;
         let record_timeout = self.record_timeout();
-        let local_networking = self.network() == NetworkingMode::Local;
-        let proc_level = self.proc;
+        let record_options = self.record_options();
         let options = self.clone();
         let record_global = global.clone();
         let resources = format!(
@@ -963,18 +977,14 @@ impl StartOpts {
                             command,
                             data.path(),
                             mountinfo,
-                            local_networking,
-                            proc_level,
-                            options.cpu_profile,
+                            record_options,
                         )
                     }),
                     None => hermit::record_to_with_mountinfo(
                         command,
                         data.path(),
                         mountinfo,
-                        local_networking,
-                        proc_level,
-                        options.cpu_profile,
+                        record_options,
                     ),
                 }
             },
@@ -1281,6 +1291,8 @@ mod tests {
             mount: Vec::new(),
             network: None,
             proc: Default::default(),
+            chaos: false,
+            seed: None,
             workdir: None,
             data_dir: None,
             record_timeout: None,
@@ -1489,6 +1501,39 @@ mod tests {
         );
     }
 
+    /// `--chaos` records a chaos schedule, seeded with 0 unless `--seed` (or
+    /// its `hermit run` spelling `--sched-seed`) names another; `--seed` alone
+    /// is refused, since it would record the default schedule.
+    #[test]
+    fn record_chaos_flags_choose_the_recorded_schedule() {
+        #[derive(clap::Parser)]
+        struct Cli {
+            #[clap(flatten)]
+            start: StartOpts,
+        }
+        let parse = |args: &[&str]| {
+            <Cli as clap::Parser>::try_parse_from(args)
+                .map(|cli| cli.start.record_options().schedule)
+        };
+        assert_eq!(
+            parse(&["start", "/bin/true"]).unwrap(),
+            hermit::RecordedSchedule::Default
+        );
+        assert_eq!(
+            parse(&["start", "--chaos", "/bin/true"]).unwrap(),
+            hermit::RecordedSchedule::Chaos { seed: 0 }
+        );
+        assert_eq!(
+            parse(&["start", "--chaos", "--seed", "16", "/bin/true"]).unwrap(),
+            hermit::RecordedSchedule::Chaos { seed: 16 }
+        );
+        assert_eq!(
+            parse(&["start", "--chaos", "--sched-seed=3", "/bin/true"]).unwrap(),
+            hermit::RecordedSchedule::Chaos { seed: 3 }
+        );
+        assert!(parse(&["start", "--seed", "16", "/bin/true"]).is_err());
+    }
+
     #[test]
     fn a_gdb_checked_recording_refuses_local_networking() {
         #[derive(clap::Parser)]
@@ -1634,6 +1679,8 @@ mod tests {
             mount: Vec::new(),
             network: None,
             proc: Default::default(),
+            chaos: false,
+            seed: None,
             workdir: None,
             data_dir: None,
             record_timeout: None,
