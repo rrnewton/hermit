@@ -1762,7 +1762,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Eight terminal-finalization custody and classification tests.
     // And container::tests::identity_hardening_freezes_the_dynamic_linker_cache
     // (the frozen /etc/ld.so.cache, Hermit c10c2882): 1096.
-    ("test.hermit_unit", 1096),
+    // And record start --chaos: record_start::tests::record_chaos_flags_choose_the_recorded_schedule,
+    // tests::a_chaos_schedule_reaches_the_record_replay_configuration and
+    // metadata::tests::a_recorded_schedule_round_trips_through_metadata_json: 1099.
+    ("test.hermit_unit", 1099),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3330,7 +3333,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b): 218.
     // And https://github.com/rrnewton/hermit/issues/4262: record_exec_discards_posix_timer_copies_as_on_linux and
     // record_replay_posix_timer_rows_replay_but_diverge_from_linux: 220.
-    ("test.record_replay", 220),
+    // And record_chaos_schedule_replays_under_its_seed: 221.
+    ("test.record_replay", 221),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -5238,7 +5242,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // The same eight finalization tests, with the existing selection unchanged.
     // And the frozen ld.so.cache container test (Hermit c10c2882): 1096.
-    ("test.hermit_unit_on_host", 1096),
+    // And the same three record start --chaos tests: 1099.
+    ("test.hermit_unit_on_host", 1099),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
