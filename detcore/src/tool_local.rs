@@ -6187,6 +6187,19 @@ impl<T> ThreadState<T> {
         self.metadata().unaccounted_receipts = true;
     }
 
+    /// Every descriptor in this thread's table in ascending order, with the raw
+    /// inode cached for it, if any.
+    pub(crate) fn fds_with_raw_inodes(&self) -> Vec<(RawFd, Option<u64>)> {
+        let mut fds: Vec<_> = self
+            .metadata()
+            .file_handles
+            .iter()
+            .map(|(&fd, detfd)| (fd, detfd.stat().map(|stat| stat.inode)))
+            .collect();
+        fds.sort_unstable_by_key(|&(fd, _)| fd);
+        fds
+    }
+
     /// Identity of this thread's descriptor table.
     pub(crate) fn files_id(&self) -> detcore_model::fd::FilesId {
         self.metadata().files_id

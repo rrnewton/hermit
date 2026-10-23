@@ -21,6 +21,7 @@ mod procfs_caller_buffer;
 mod procfs_inode;
 mod raw_clone;
 mod readdir_order;
+mod scm_rights;
 mod subreaper;
 mod tight_stack_openat;
 mod tight_stack_received_inotify;
