@@ -271,6 +271,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         blocked_signal_mask_unknown: bool,
         after_grant: impl FnOnce(&mut G),
     ) -> Result<i64, Error> {
+        // D41 (A5 step 3c.1c): the first statement of every background
+        // external call and `rt_sigsuspend`, the two kernel-run families
+        // filed here, before anything below refuses, files or runs it.
+        if let Some(refused) = kernel_run_entry_refusal(guest)? {
+            return Err(refused);
+        }
         // A host wait on descriptors that may include a timerfd on virtual
         // time would never see it readable (`crate::syscalls::timerfd`).
         crate::syscalls::timerfd::refuse_host_wait_for(guest, call);
@@ -3029,6 +3035,36 @@ where
         guest.thread_state_mut().wait_signal_end = Some(end);
     }
     Ok(end.is_some())
+}
+
+/// A5 step 3c.1c, design D41 (amending 16.26), with IR-5 and IR-14: under the
+/// in-guest delivery gate, a default-fatal signal already deliverable when a
+/// kernel-run call begins (`ResourceID::is_kernel_run_blocking`: a background
+/// external call, `rt_sigsuspend`, `vfork`) is one Linux would have delivered
+/// before the call, ending the process. So the call is not run: its handler
+/// calls this as its first statement, before any guest-visible effect, and
+/// returns the error this gives, `ERESTARTNOINTR` with the D40 flag `Fatal`
+/// recorded, which the restart checkpoint turns into `-EINTR` (the death path
+/// of step 3c.1e follows at the return). A caught signal at entry, or none,
+/// keeps today's path (`None`): the call runs. With the gate off, `None`.
+pub(crate) fn kernel_run_entry_refusal<T, G>(guest: &mut G) -> Result<Option<Error>, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    match gated_wait_end(guest, None)? {
+        Some(end @ crate::wait_signal_end::WaitSignalEnd::Fatal(_)) => {
+            tracing::info!(
+                "[dtid {}] under the in-guest delivery gate, {:?} is deliverable at a kernel-run \
+                 call's entry: the call is not run",
+                guest.thread_state().dettid,
+                end
+            );
+            guest.thread_state_mut().wait_signal_end = Some(end);
+            Ok(Some(Errno::ERESTARTNOINTR.into()))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// The `sa_flags` of `signal`'s current action, as the guest set it, read in
