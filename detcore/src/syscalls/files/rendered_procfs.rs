@@ -3114,12 +3114,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         sysno: Sysno,
         args: &reverie::syscalls::SyscallArgs,
     ) -> Option<Result<i64, Errno>> {
-        let fd = match sysno {
-            Sysno::write | Sysno::writev | Sysno::ftruncate | Sysno::fallocate => args.arg0,
-            Sysno::pwritev2 if args.arg3 as i64 == -1 => args.arg0,
-            Sysno::sendfile => args.arg0,
-            Sysno::splice => args.arg2,
-            _ => return None,
+        let fd = match written_descriptor_position(sysno)? {
+            // Only `pwritev2` at the file position writes as `writev` does.
+            _ if sysno == Sysno::pwritev2 && args.arg3 as i64 != -1 => return None,
+            0 => args.arg0,
+            _ => args.arg2,
         } as RawFd;
         let status = guest
             .thread_state()
@@ -3406,10 +3405,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: &Syscall,
     ) -> Result<(), Error> {
-        if !placeholders_exist() || !self.renders_procfs(guest) {
+        let (sysno, args) = call.into_parts();
+        // The number first: it takes no lock, and most calls name no
+        // descriptor (`descriptor_arguments` would name none).
+        if !names_a_descriptor(sysno) || !placeholders_exist() || !self.renders_procfs(guest) {
             return Ok(());
         }
-        let (sysno, args) = call.into_parts();
         for fd in descriptor_arguments(&guest.memory(), sysno, &args) {
             if fd < 0 || guest.thread_state().with_detfd(fd, |_| ()).is_ok() {
                 continue;
@@ -3758,21 +3759,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Some(answer);
         }
-        let fd = match sysno {
-            Sysno::pwrite64
-            | Sysno::pwritev
-            | Sysno::pwritev2
-            | Sysno::fsync
-            | Sysno::fdatasync
-            | Sysno::fchmod
-            | Sysno::fgetxattr
-            | Sysno::flistxattr
-            | Sysno::fsetxattr
-            | Sysno::fremovexattr
-            | Sysno::ioctl
-            | Sysno::fcntl => args.arg0 as i32,
-            _ => return None,
-        };
+        if !operates_on_descriptor(sysno) {
+            return None;
+        }
+        let fd = args.arg0 as i32;
         let (path, status_flags) = guest
             .thread_state()
             .with_detfd(fd, |detfd| {
@@ -4139,6 +4129,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(None);
         }
         let (sysno, args) = call.into_parts();
+        let Some(kind) = path_call_kind(sysno) else {
+            return Ok(None);
+        };
         let [a0, a1, a2, a3, a4] =
             [args.arg0, args.arg1, args.arg2, args.arg3, args.arg4].map(|arg| arg as u64);
         let at = libc::AT_FDCWD as u64;
@@ -4147,10 +4140,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // before the descriptor is looked up (both times omitted), or refused
         // first (unknown flags).
         let mut decided_before_descriptor = false;
-        let (dirfd, path, flags, request, name) = match sysno {
+        let (dirfd, path, flags, request, name) = match kind {
             // Linux declares mode and flags `int`: it ignores the upper bits
             // of the raw registers.
-            Sysno::access => (
+            PathCall::Access => (
                 at,
                 a0,
                 0,
@@ -4160,7 +4153,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 0,
             ),
-            Sysno::faccessat => (
+            PathCall::Faccessat => (
                 a0,
                 a1,
                 0,
@@ -4170,7 +4163,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 0,
             ),
-            Sysno::faccessat2 => (
+            PathCall::Faccessat2 => (
                 a0,
                 a1,
                 u64::from(a3 as u32),
@@ -4180,11 +4173,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 0,
             ),
-            Sysno::getxattr => (at, a0, 0, PathRequest::GetXattr, a1),
-            Sysno::lgetxattr => (at, a0, nofollow(), PathRequest::GetXattr, a1),
-            Sysno::listxattr => (at, a0, 0, PathRequest::ListXattr, 0),
-            Sysno::llistxattr => (at, a0, nofollow(), PathRequest::ListXattr, 0),
-            Sysno::setxattr | Sysno::lsetxattr => (
+            PathCall::Getxattr => (at, a0, 0, PathRequest::GetXattr, a1),
+            PathCall::Lgetxattr => (at, a0, nofollow(), PathRequest::GetXattr, a1),
+            PathCall::Listxattr => (at, a0, 0, PathRequest::ListXattr, 0),
+            PathCall::Llistxattr => (at, a0, nofollow(), PathRequest::ListXattr, 0),
+            PathCall::Setxattr => (
                 at,
                 a0,
                 if sysno == Sysno::lsetxattr {
@@ -4200,7 +4193,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 a1,
             ),
-            Sysno::removexattr | Sysno::lremovexattr => (
+            PathCall::Removexattr => (
                 at,
                 a0,
                 if sysno == Sysno::lremovexattr {
@@ -4215,13 +4208,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 a1,
             ),
-            Sysno::chmod => (at, a0, 0, PathRequest::Chmod { flags: 0 }, 0),
-            Sysno::fchmodat => (a0, a1, 0, PathRequest::Chmod { flags: 0 }, 0),
-            Sysno::fchmodat2 => (a0, a1, a3, PathRequest::Chmod { flags: a3 }, 0),
+            PathCall::Chmod => (at, a0, 0, PathRequest::Chmod { flags: 0 }, 0),
+            PathCall::Fchmodat => (a0, a1, 0, PathRequest::Chmod { flags: 0 }, 0),
+            PathCall::Fchmodat2 => (a0, a1, a3, PathRequest::Chmod { flags: a3 }, 0),
             // Ownership changes keep Detcore's policy for every file
             // (`handle_ownership_change_noop`).
-            Sysno::truncate => (at, a0, 0, PathRequest::Truncate { length: a1 as i64 }, 0),
-            Sysno::utimensat => {
+            PathCall::Truncate => (at, a0, 0, PathRequest::Truncate { length: a1 as i64 }, 0),
+            PathCall::Utimensat => {
                 // Unreadable times are the kernel's EFAULT to report.
                 let Ok(times) = read_pair::<libc::timespec, _>(&guest.memory(), a2) else {
                     return Ok(None);
@@ -4270,14 +4263,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     0,
                 )
             }
-            Sysno::utime => (
+            PathCall::Utime => (
                 at,
                 a0,
                 0,
                 legacy_times_request(&guest.memory(), a1, false),
                 0,
             ),
-            Sysno::utimes => (
+            PathCall::Utimes => (
                 at,
                 a0,
                 0,
@@ -4285,8 +4278,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 0,
             ),
             // `futimesat` is ENOSYS under Detcore for every file.
-            Sysno::chdir => (at, a0, 0, PathRequest::Chdir, 0),
-            _ => return Ok(None),
+            PathCall::Chdir => (at, a0, 0, PathRequest::Chdir, 0),
         };
         // Linux refuses invalid access arguments before it looks up the path
         // or the descriptor, for every file; leave that order to the backend.
@@ -4522,7 +4514,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 /// transfers an open file, and the directory descriptor of a path call whose
 /// path is empty or NULL, which names that descriptor itself. Not `close`,
 /// which needs no model of what it closes.
-fn descriptor_arguments<M: MemoryAccess>(
+pub(super) fn descriptor_arguments<M: MemoryAccess>(
     memory: &M,
     sysno: Sysno,
     args: &reverie::syscalls::SyscallArgs,
@@ -4535,8 +4527,37 @@ fn descriptor_arguments<M: MemoryAccess>(
                 .is_ok_and(|path: std::path::PathBuf| path.as_os_str().is_empty()),
         }
     };
-    let fd = |raw: usize| raw as i32 as RawFd;
-    match sysno {
+    let values = [
+        args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
+    ];
+    let fd = |position: usize| values[position] as i32 as RawFd;
+    match descriptor_positions(sysno) {
+        Some(DescriptorPositions::Always(positions)) => {
+            positions.iter().map(|&position| fd(position)).collect()
+        }
+        Some(DescriptorPositions::WhenPathNamesItself { dirfd, path })
+            if names_itself(values[path]) =>
+        {
+            vec![fd(dirfd)]
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Where a call's descriptor arguments ([`descriptor_arguments`]) are.
+#[derive(Clone, Copy, Debug)]
+enum DescriptorPositions {
+    /// The descriptors at these argument positions, always.
+    Always(&'static [usize]),
+    /// The directory descriptor at `dirfd`, when the path at `path` is empty
+    /// or NULL and so names that descriptor itself.
+    WhenPathNamesItself { dirfd: usize, path: usize },
+}
+
+/// The argument positions of the descriptors a call numbered `sysno` may
+/// name ([`descriptor_arguments`]); `None` for a call that names none.
+fn descriptor_positions(sysno: Sysno) -> Option<DescriptorPositions> {
+    Some(match sysno {
         Sysno::read
         | Sysno::readv
         | Sysno::pread64
@@ -4571,24 +4592,143 @@ fn descriptor_arguments<M: MemoryAccess>(
         | Sysno::dup3
         | Sysno::getdents
         | Sysno::getdents64
-        | Sysno::fchdir => vec![fd(args.arg0)],
-        Sysno::mmap => vec![fd(args.arg4)],
-        Sysno::sendfile | Sysno::tee => vec![fd(args.arg0), fd(args.arg1)],
-        Sysno::splice | Sysno::copy_file_range => vec![fd(args.arg0), fd(args.arg2)],
-        Sysno::epoll_ctl => vec![fd(args.arg2)],
+        | Sysno::fchdir => DescriptorPositions::Always(&[0]),
+        Sysno::mmap => DescriptorPositions::Always(&[4]),
+        Sysno::sendfile | Sysno::tee => DescriptorPositions::Always(&[0, 1]),
+        Sysno::splice | Sysno::copy_file_range => DescriptorPositions::Always(&[0, 2]),
+        Sysno::epoll_ctl => DescriptorPositions::Always(&[2]),
         Sysno::newfstatat
         | Sysno::statx
         | Sysno::utimensat
         | Sysno::faccessat2
         | Sysno::fchownat
         | Sysno::fchmodat
-        | Sysno::readlinkat
-            if names_itself(args.arg1) =>
-        {
-            vec![fd(args.arg0)]
-        }
-        _ => Vec::new(),
+        | Sysno::readlinkat => DescriptorPositions::WhenPathNamesItself { dirfd: 0, path: 1 },
+        _ => return None,
+    })
+}
+
+/// Whether a call numbered `sysno` may name a descriptor
+/// ([`descriptor_arguments`], whatever its arguments): the calls
+/// [`Detcore::adopt_received_placeholders`] can act on. Part of
+/// `may_name_file_or_descriptor`.
+pub(crate) fn names_a_descriptor(sysno: Sysno) -> bool {
+    descriptor_positions(sysno).is_some()
+}
+
+/// The argument position of the descriptor a call numbered `sysno` writes
+/// through, as [`Detcore::answer_rendered_procfs_write`] answers it: `write`,
+/// `writev`, `ftruncate`, `fallocate`, `pwritev2` (only at the file
+/// position, which its offset decides) and `sendfile` write their argument
+/// 0, and `splice` its argument 2. `None` for any other call.
+fn written_descriptor_position(sysno: Sysno) -> Option<usize> {
+    match sysno {
+        Sysno::write
+        | Sysno::writev
+        | Sysno::ftruncate
+        | Sysno::fallocate
+        | Sysno::pwritev2
+        | Sysno::sendfile => Some(0),
+        Sysno::splice => Some(2),
+        _ => None,
     }
+}
+
+/// Whether a call numbered `sysno` is one whose argument-0 descriptor
+/// [`Detcore::answer_rendered_procfs_operation`] answers for a rendered
+/// procfs file, after the writes ([`written_descriptor_position`]).
+fn operates_on_descriptor(sysno: Sysno) -> bool {
+    matches!(
+        sysno,
+        Sysno::pwrite64
+            | Sysno::pwritev
+            | Sysno::pwritev2
+            | Sysno::fsync
+            | Sysno::fdatasync
+            | Sysno::fchmod
+            | Sysno::fgetxattr
+            | Sysno::flistxattr
+            | Sysno::fsetxattr
+            | Sysno::fremovexattr
+            | Sysno::ioctl
+            | Sysno::fcntl
+    )
+}
+
+/// Whether [`Detcore::answer_rendered_procfs_operation`] can answer a call
+/// numbered `sysno`: a write through a descriptor
+/// ([`written_descriptor_position`], `splice` included, which a `cmdline`
+/// source also answers) or an operation on one ([`operates_on_descriptor`]).
+/// Part of `may_name_file_or_descriptor`.
+pub(crate) fn may_answer_operation(sysno: Sysno) -> bool {
+    written_descriptor_position(sysno).is_some() || operates_on_descriptor(sysno)
+}
+
+/// Whether [`Detcore::answer_rendered_procfs_mapping`] can answer a call
+/// numbered `sysno`: only `mmap` (`Syscall::Mmap`). Part of
+/// `may_name_file_or_descriptor`.
+pub(crate) fn may_answer_mapping(sysno: Sysno) -> bool {
+    sysno == Sysno::mmap
+}
+
+/// The calls [`Detcore::answer_rendered_procfs_path_call`] answers, one per
+/// arm of its table, which matches on this exhaustively: a call can reach
+/// the table only through [`path_call_kind`], and a new arm needs a variant
+/// here.
+#[derive(Clone, Copy, Debug)]
+enum PathCall {
+    Access,
+    Faccessat,
+    Faccessat2,
+    Getxattr,
+    Lgetxattr,
+    Listxattr,
+    Llistxattr,
+    /// `setxattr` and `lsetxattr`.
+    Setxattr,
+    /// `removexattr` and `lremovexattr`.
+    Removexattr,
+    Chmod,
+    Fchmodat,
+    Fchmodat2,
+    Truncate,
+    Utimensat,
+    Utime,
+    Utimes,
+    Chdir,
+}
+
+/// The arm of [`Detcore::answer_rendered_procfs_path_call`]'s table for a
+/// call numbered `sysno`, or `None` for a call the table has no arm for.
+fn path_call_kind(sysno: Sysno) -> Option<PathCall> {
+    Some(match sysno {
+        Sysno::access => PathCall::Access,
+        Sysno::faccessat => PathCall::Faccessat,
+        Sysno::faccessat2 => PathCall::Faccessat2,
+        Sysno::getxattr => PathCall::Getxattr,
+        Sysno::lgetxattr => PathCall::Lgetxattr,
+        Sysno::listxattr => PathCall::Listxattr,
+        Sysno::llistxattr => PathCall::Llistxattr,
+        Sysno::setxattr | Sysno::lsetxattr => PathCall::Setxattr,
+        Sysno::removexattr | Sysno::lremovexattr => PathCall::Removexattr,
+        Sysno::chmod => PathCall::Chmod,
+        Sysno::fchmodat => PathCall::Fchmodat,
+        Sysno::fchmodat2 => PathCall::Fchmodat2,
+        Sysno::truncate => PathCall::Truncate,
+        Sysno::utimensat => PathCall::Utimensat,
+        Sysno::utime => PathCall::Utime,
+        Sysno::utimes => PathCall::Utimes,
+        Sysno::chdir => PathCall::Chdir,
+        _ => return None,
+    })
+}
+
+/// Whether [`Detcore::answer_rendered_procfs_path_call`] can answer a call
+/// numbered `sysno`: whether its table has an arm for it
+/// ([`path_call_kind`], the only way into the table). Part of
+/// `may_name_file_or_descriptor`.
+pub(crate) fn may_answer_path_call(sysno: Sysno) -> bool {
+    path_call_kind(sysno).is_some()
 }
 
 /// An extended attribute's name, and the value a change sets.

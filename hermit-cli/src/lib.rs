@@ -9155,6 +9155,10 @@ mod tests {
     /// on ptrace. `reports_kernel_child_exit_signals` is true for ptrace,
     /// e9patch and SaBRe, whose signal callbacks see the kernel's child-exit
     /// SIGCHLD with its siginfo and can suppress or rewrite it.
+    /// `virtualizes_syscall_clobbers` is true for KVM too since Reverie's
+    /// per-call slice 6: its Tool register snapshot at a syscall has RCX ==
+    /// RIP and R11 == RFLAGS, and it offers no register write, so Detcore's
+    /// canonicalization could change nothing there.
     fn golden_backend_capabilities(backend: Backend) -> serde_json::Value {
         let sabre = backend == Backend::Sabre;
         let kvm = backend == Backend::Kvm;
@@ -9167,7 +9171,7 @@ mod tests {
             "internal_pipe_turns_are_host_timed": sabre,
             "loopback_pollers_yield_to_peers": sabre,
             "guest_clock_reads_bypass_backend": sabre,
-            "virtualizes_syscall_clobbers": sabre,
+            "virtualizes_syscall_clobbers": sabre || kvm,
             "needs_killed_thread_rpc_cancellation": in_guest_liteinst || sabre || dbt || kvm,
             "reports_physical_process_exits": sabre,
             "process_exits_complete_asynchronously": in_guest_liteinst,
@@ -9406,7 +9410,9 @@ mod tests {
     /// first, `cpuid_virtualized_by_backend`, is written false for every
     /// backend now that no backend installs a CPUID profile of its own, and so
     /// is the fourteenth, `backend_virtualizes_capability_prctls`, now that
-    /// the capability prctls reach the kernel on every backend.
+    /// the capability prctls reach the kernel on every backend. KVM's fifth,
+    /// `syscall_clobbers_virtualized_by_backend`, is set since Reverie's
+    /// per-call slice 6 declared `virtualizes_syscall_clobbers`.
     #[test]
     fn every_backend_encodes_its_current_legacy_projection() {
         for (backend, unsequenced, sequential) in [
@@ -9416,7 +9422,7 @@ mod tests {
             (Backend::InGuestTrap, "010001010000000", "010001010000000"),
             (Backend::Sabre, "011111110000000", "011111110000000"),
             (Backend::Dbt, "011001000100000", "011001000100000"),
-            (Backend::Kvm, "000001010010101", "000001010011101"),
+            (Backend::Kvm, "000011010010101", "000011010011101"),
         ] {
             for (sequentialize_threads, expected) in [(false, unsequenced), (true, sequential)] {
                 let config = prepare_backend_config(
