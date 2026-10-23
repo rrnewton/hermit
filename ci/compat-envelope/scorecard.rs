@@ -16334,6 +16334,12 @@ fn validate_scorecard_snapshot(
         // refuses an unknown key inside it). The series writer copies it from
         // the cell's results row when the harness recorded one.
         "strictness",
+        // A verify cell's first divergence (`SeriesDivergence`, whose structs
+        // all deny unknown fields; `validate_for_read` checks it). dev-hermit's
+        // series writer has written it on verify rows since 2026-10-21. Every
+        // scorecard render from then on refused the snapshot here until this
+        // entry existed, so scorecard/parity.json stopped advancing.
+        "divergence",
     ];
     let allowed_series_fields = SERIES_FIELDS.iter().copied().collect::<BTreeSet<_>>();
     let mut rows = Vec::with_capacity(snapshot.rows.len());
@@ -25756,6 +25762,19 @@ fn self_test_tier(commands: Option<&CommandsPart>) -> Result<(), String> {
                 "unknown-series-field",
                 &unknown_series_field,
                 "series has an unknown field",
+            )?;
+
+            // `divergence` is a known series field: it passes the field check
+            // and is judged by the row's own validation, which writes it only on
+            // verify rows (this fixture's row is a replay cell).
+            let mut replay_divergence = row_snapshot_value.clone();
+            replay_divergence["rows"][0]["series"]["divergence"] =
+                serde_json::json!({"self": {"left_len": 3, "right_len": 3}});
+            recompute_snapshot_rows(&mut replay_divergence)?;
+            assert_snapshot_refused_unchanged(
+                "replay-row-divergence",
+                &replay_divergence,
+                "divergence is written only on verify rows",
             )?;
 
             let mut duplicate_event_id = row_snapshot_value.clone();
