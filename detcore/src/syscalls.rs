@@ -38,7 +38,19 @@ mod signal;
 pub(crate) mod signal_shadow;
 /// The guest's virtual SIGALRM blocked bit (signal phase 1).
 pub(crate) use signal::ClaimFault;
+/// An emulated sleep's own check, for the in-guest delivery gate's tests (A5
+/// step 3c.1c).
+#[cfg(test)]
+pub(crate) use signal::SleepCheck;
+/// An emulated sleep's own verdict, for the in-guest delivery gate's tests (A5
+/// step 3c.1c).
+#[cfg(test)]
+pub(crate) use signal::SleepSignal;
 pub(crate) use signal::claim_still_pending;
+/// An emulated sleep's own check, for the in-guest delivery gate's tests (A5
+/// step 3c.1c).
+#[cfg(test)]
+pub(crate) use signal::sleep_signal;
 pub(crate) use signal::take_claim_fault;
 pub(crate) use signal::take_pending_signal;
 pub(crate) use signal::virtual_sigalrm_blocked;
