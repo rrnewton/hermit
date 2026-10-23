@@ -564,3 +564,92 @@ fn under_the_gate_a_scheduler_send_to_a_kernel_run_call_is_refused_by_name_or_le
     scheduler.wake_signaled_guest_as(TARGET, SigWrapper(libc::SIGTERM), false);
     assert!(scheduler.kernel_run_signal_refusal.is_none(), "gate off");
 }
+
+/// Park `thread` in the gate's parked `rt_sigsuspend` (A5 step 3c.1d, D39):
+/// `SleepUntil(INDEFINITE)` tagged `RT_SIGSUSPEND_FYI`, having published its
+/// temporary mask `temporary` (`blocked_signal_mask`, which
+/// `publish_request_guest_mask` publishes).
+fn park_suspend(scheduler: &mut Scheduler, thread: DetTid, temporary: u64) {
+    assert!(scheduler.set_saved_guest_sigmask(thread, Some(temporary)));
+    let mut request = Resources::new(thread);
+    request.insert(
+        ResourceID::SleepUntil(LogicalTime::INDEFINITE),
+        Permission::W,
+    );
+    request.fyi(crate::resources::RT_SIGSUSPEND_FYI);
+    request.blocked_signal_mask = Some(temporary);
+    request.guest_signal_mask = Some(temporary);
+    scheduler.next_turns.get_mut(&thread).unwrap().req = Ivar::full(Ok(request));
+    scheduler
+        .blocked
+        .timed_waiters
+        .insert(LogicalTime::INDEFINITE, thread);
+}
+
+/// A5 step 3c.1d, D39: the gate's parked `rt_sigsuspend` is woken, at a
+/// guest's send (the drain) and at the scheduler's own send alike, exactly
+/// for a signal deliverable under the temporary mask it published, as a
+/// `pause` is under its own; the table's rows hold with the published mask
+/// being the temporary one. Mutation "`RT_SIGSUSPEND_FYI` not a signal
+/// sleep": the rows that must end stay parked.
+#[test]
+fn under_the_gate_a_parked_rt_sigsuspend_ends_only_for_a_signal_its_temporary_mask_lets_in() {
+    for row in rows() {
+        for scheduler_send in [false, true] {
+            let mut scheduler = gated(true);
+            park_suspend(&mut scheduler, TARGET, row.published);
+            scheduler
+                .test_kernel_signal_states
+                .insert(TARGET, row.state);
+            if scheduler_send {
+                scheduler.wake_signaled_guest_as(TARGET, SigWrapper(row.signal), false);
+            } else {
+                scheduler.notify_signal_pending(TARGET, SigWrapper(row.signal));
+                scheduler.drain_pending_cross_task_signals();
+            }
+            assert_eq!(
+                woken(&scheduler, TARGET, row.signal),
+                row.ends,
+                "scheduler send {scheduler_send}: {}",
+                row.name
+            );
+        }
+    }
+    // With the gate off no `RT_SIGSUSPEND_FYI` request is ever filed; were
+    // one, it is no signal sleep.
+    let mut scheduler = gated(false);
+    park_suspend(&mut scheduler, TARGET, 0);
+    assert_eq!(scheduler.signal_sleep(TARGET), None);
+}
+
+/// IR-22 (A5 step 3c.1d): a masked form's observation of a pending real-time
+/// timer expiration (`observe_under_mask`) can drop or refuse one only if
+/// the scheduler keeps it pending, and under the gate it never does: the
+/// gate requires that signal targets are not modelled (D35, F2), and then an
+/// expiration is either discarded or refused at once, whatever the masks and
+/// actions (`real_time_expiration_fate`). So no expiration is pending to be
+/// dropped before a D41 not-run or a temporary-mask wait's end. Mutation
+/// "kept pending without signal-target modelling": a row returns `Queued`.
+#[test]
+fn under_the_gate_no_real_time_expiration_is_kept_pending() {
+    let rt = 34;
+    let rt_bit = bit(rt);
+    for (published, ignored) in [(rt_bit, 0), (0, 0), (rt_bit, rt_bit), (0, rt_bit)] {
+        let mut scheduler = gated(true);
+        assert!(scheduler.set_saved_guest_sigmask(TARGET, Some(published)));
+        scheduler
+            .test_kernel_signal_states
+            .insert(TARGET, state(0, 0, !0, 0, ignored));
+        for target in [
+            timed_waiters::SignalTarget::Process(TARGET),
+            timed_waiters::SignalTarget::Thread(TARGET),
+        ] {
+            assert_ne!(
+                scheduler.real_time_expiration_fate(DetPid::from_raw(TARGET.as_raw()), target, rt),
+                RealTimeFate::Queued,
+                "published {published:#x}, ignored {ignored:#x}"
+            );
+        }
+        assert!(scheduler.pending_real_time_expirations.is_empty());
+    }
+}
