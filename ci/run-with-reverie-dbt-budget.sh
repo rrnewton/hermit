@@ -2513,7 +2513,14 @@ fi
 # algorithm are unchanged, so preserve the calibrated budget, job width and
 # limits. This is a source-identity carry, not a new cold timing/install-key
 # measurement. Related: https://github.com/rrnewton/reverie/pull/1100
-expected_pin=32cd7a75bd15b0c72e933b41a0ff2cc6aa2f8c14
+# CARRY TO 9609e477705e5b3b1181b91eb2afd74217843416 (campaign WIP pin, never pushed): from
+# 32cd7a75bd15b0c72e933b41a0ff2cc6aa2f8c14. One commit (kvm lane, per-call slice 5: reverie-kvm reports the guest's
+# syscall-entry registers and completes plain injections without a box). It
+# changes reverie-kvm/src only; git diff is empty under reverie-dbt/ and
+# third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory, SDK and native inputs, calibrated
+# budget, job width and limits carry unchanged from the 32cd7a75 entry.
+expected_pin=9609e477705e5b3b1181b91eb2afd74217843416
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
