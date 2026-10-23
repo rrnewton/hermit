@@ -3036,7 +3036,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And tool_local::timeslice_tests::replay_ends_a_syscall_boundary_slice_at_its_recorded_time
     // and tool_local::timeslice_tests::replay_ends_a_slice_past_its_recorded_branch_count
     // (a replayed slice ends at its recorded syscall boundary): 2684, listed.
-    ("test.detcore_unit", 2684),
+    // And tool_local::timeslice_tests::a_replayed_slice_needs_an_exact_stop_only_if_branches_reach_its_end
+    // (an exact PMU stop only where a branch can end the slice): 2685, listed.
+    ("test.detcore_unit", 2685),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5264,7 +5266,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Fixed 0.5.4 rebase recount also retains the priority-history regressions.
     // And the same 3c.1e B unit: 2682, listed.
     // And the same two replayed-slice-end units: 2684, listed.
-    ("test.detcore_unit_on_host", 2684),
+    // And the same exact-stop unit: 2685, listed.
+    ("test.detcore_unit_on_host", 2685),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

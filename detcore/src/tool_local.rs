@@ -6699,6 +6699,35 @@ impl<T> ThreadState<T> {
             .is_some_and(|end_of_timeslice| current_time >= end_of_timeslice)
     }
 
+    /// Whether the replayed slice can end at its recorded branch count by
+    /// branches alone: the thread's logical time after the branches left to
+    /// that count is within one RCB of the recorded end. When it is not, time
+    /// that branches do not account for, a syscall's above all, must pass first,
+    /// so the slice ends at a check-in that time comes from rather than at a
+    /// PMU stop on the count, and the stop need not be exact. Exact stops
+    /// single-step the guest across the PMU skid margin, which made replaying a
+    /// syscall-heavy guest's slices that ended at syscalls several times slower
+    /// than recording it. Outside replay, and once the count is passed, there
+    /// is no recorded count to stop on.
+    pub(crate) fn replay_slice_can_end_on_a_branch(&self, use_rcb_time: bool) -> bool {
+        let (Some(target), Some(end)) = (self.replay_rcb_end, self.end_of_timeslice) else {
+            return false;
+        };
+        let Some(branches) = target.checked_sub(self.committed_clock_value) else {
+            return false;
+        };
+        let mut clock = self.thread_logical_time.clone();
+        if use_rcb_time {
+            // As `Detcore::update_logical_time_rcbs` adds them.
+            if self.chaos_slowdown_active {
+                clock.add_rcbs_with_multiplier(branches, self.rcb_time_multiplier());
+            } else {
+                clock.add_rcbs(branches);
+            }
+        }
+        clock.as_nanos() + self.one_rcb_of_time() >= end
+    }
+
     /// The virtual time one more retired conditional branch adds to this
     /// thread's clock, rounded up: the `post_handler_hook` epsilon.
     fn one_rcb_of_time(&self) -> Duration {
@@ -8045,6 +8074,47 @@ mod timeslice_tests {
         assert!(!state.timeslice_expired(), "one syscall has run");
         state.thread_logical_time.add_syscall();
         assert!(state.timeslice_expired(), "the recorded end, after two");
+    }
+
+    /// A replayed slice whose recorded end lies beyond the time its remaining
+    /// branches account for cannot end on a branch, so its PMU stop need not be
+    /// exact; one that the branches alone reach can.
+    #[test]
+    fn a_replayed_slice_needs_an_exact_stop_only_if_branches_reach_its_end() {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let state_with = |end_after: Duration, rcbs: u64| {
+            let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+            let now = state.thread_logical_time.as_nanos();
+            state.preemption_points = Some(
+                ThreadHistory::new()
+                    .with_prio_changes(vec![(now + end_after, DEFAULT_PRIORITY)])
+                    .with_preemption_rcbs(vec![rcbs])
+                    .into_iter(),
+            );
+            state.next_timeslice(&config);
+            state
+        };
+        // 100 RCBs are 1,000ns: a timer stop.
+        assert!(
+            state_with(Duration::from_nanos(1_000), 100).replay_slice_can_end_on_a_branch(true)
+        );
+        // A syscall (10,000ns) must come first: a check-in ends it.
+        assert!(
+            !state_with(Duration::from_nanos(11_000), 100).replay_slice_can_end_on_a_branch(true)
+        );
+        // Reached its count, short of its time: it ends at a later check-in.
+        let mut reached = state_with(Duration::from_nanos(11_000), 100);
+        reached.thread_logical_time.add_rcbs(100);
+        reached.committed_clock_value = 100;
+        assert!(!reached.replay_slice_can_end_on_a_branch(true));
+        // Outside replay there is no count to stop on.
+        let mut live = ThreadState::new(DetPid::from_raw(3), &config, ());
+        live.next_timeslice(&config);
+        assert!(!live.replay_slice_can_end_on_a_branch(true));
     }
 
     /// Past its recorded branch count a replayed slice has ended, whatever the
