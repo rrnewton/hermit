@@ -315,6 +315,24 @@ pub(crate) fn temporary_mask_caught_end_refusal(caller: i32, signal: i32) -> Str
     )
 }
 
+/// The named refusal (A5 design D39) of a masked `pselect6` under the
+/// in-guest delivery gate that Detcore cannot serve on staged copies: more
+/// than 64 descriptors and a nonzero timeout with nothing ready (Detcore polls
+/// only the first word of each set on its internal path, and the kernel would
+/// sleep under the temporary mask, which the in-guest runtime cannot let it
+/// install), or more than 1024 descriptors to copy. `why` says which. The
+/// call fails with ENOSYS after Linux's own argument checks (and, for the
+/// first, a first poll that found nothing ready and no signal that ends it).
+pub(crate) fn masked_pselect6_nfds_refused_warning(caller: i32, nfds: i32, why: &str) -> String {
+    format!(
+        "hermit refused a call (HERMIT_MASKED_PSELECT6_NFDS_REFUSED): pselect6 in thread \
+         {caller} with a temporary signal mask and {nfds} descriptors, with {why}, would need \
+         the kernel to wait or copy under that mask, which the in-guest delivery gate cannot \
+         run; the call returns ENOSYS (A5 design D39, \
+         https://github.com/rrnewton/hermit/issues/4485)."
+    )
+}
+
 /// The run-wide stopping refusal (A5 design D44(b) through D49) for a send
 /// of `signum` to thread `target`, blocked in a kernel-run call (a vfork
 /// parent's wait when `vfork`) whose continuation turn has not been granted:
