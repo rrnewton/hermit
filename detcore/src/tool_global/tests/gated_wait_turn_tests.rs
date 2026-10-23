@@ -187,6 +187,13 @@ struct TurnGuest {
     /// mask pointer of a `ppoll` or `epoll_pwait`) each injected probe
     /// carried, `None` for none, in order (IR-9).
     probe_masks: Vec<Option<usize>>,
+    /// How many poll probes have been injected, shared with a `/proc` script
+    /// that answers by it (`temporary_mask_turn_tests::script_by_probe`).
+    probe_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The scheduler's clock, in nanoseconds, which every
+    /// `GlobalTimeLowerBound` answers and then advances by `clock_step`.
+    clock: Mutex<u64>,
+    clock_step: u64,
 }
 
 impl TurnGuest {
@@ -249,6 +256,12 @@ impl GlobalRPC<GlobalState> for TurnGuest {
             GlobalRequest::TouchFile(_) => GlobalResponse::TouchFile(()),
             // Signal phase 1's ledger: no entry is due, nothing is refused.
             GlobalRequest::Sigalrm(_) => GlobalResponse::Sigalrm(false),
+            GlobalRequest::GlobalTimeLowerBound => {
+                let mut clock = self.clock.lock().unwrap();
+                let now = *clock;
+                *clock += self.clock_step;
+                GlobalResponse::GlobalTimeLowerBound(crate::types::LogicalTime::from_nanos(now))
+            }
             GlobalRequest::ResolveKillTargets(process) => {
                 let target = DetTid::from_raw(process.as_raw());
                 let live = self.live.contains(&target);
@@ -360,25 +373,79 @@ impl Guest<Detcore> for TurnGuest {
                     .pop_front()
                     .unwrap_or(Err(Errno::EAGAIN))
             }
+            // Each poll probe as the kernel answers it: the scripted result,
+            // and for nothing ready the copy-out the kernel makes then (a
+            // select family call writes its emptied sets, `set_fd_set`; a
+            // poll writes every `revents`, `do_sys_poll`), which a read-only
+            // buffer fails with EFAULT.
+            // The wrapper's validation (`validate_pselect6_wrapper`): a
+            // malformed timeout, refused once the wrapper is copied.
+            Syscall::Pselect6(validation)
+                if validation.timeout().is_some_and(|timeout| {
+                    LocalMemory::new()
+                        .read_value::<_, [i64; 2]>(timeout.cast())
+                        .is_ok_and(|timeout| timeout[1] >= 1_000_000_000)
+                }) =>
+            {
+                match validation.sigmask() {
+                    Some(wrapper) => LocalMemory::new()
+                        .read_value::<_, [usize; 2]>(wrapper.cast())
+                        .map_or(Err(Errno::EFAULT), |_| Err(Errno::EINVAL)),
+                    None => Err(Errno::EINVAL),
+                }
+            }
             Syscall::Pselect6(probe) => {
+                self.probe_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mask = probe
                     .sigmask()
                     .map(|wrapper| LocalMemory::new().read_value::<_, usize>(wrapper.cast()))
                     .transpose()?
                     .filter(|inner| *inner != 0);
                 self.probe_masks.push(mask);
-                self.probe_results.pop_front().unwrap_or(Ok(0))
+                let result = self.probe_results.pop_front().unwrap_or(Ok(0));
+                if result == Ok(0) {
+                    let len = (probe.nfds().max(0) as usize).div_ceil(64) * 8;
+                    for set in [probe.readfds(), probe.writefds(), probe.exceptfds()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if len != 0 {
+                            LocalMemory::new()
+                                .write_exact(set.cast(), &vec![0; len])
+                                .map_err(|_| Errno::EFAULT)?;
+                        }
+                    }
+                }
+                result
             }
             Syscall::Select(_) => {
+                self.probe_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.probe_masks.push(None);
                 self.probe_results.pop_front().unwrap_or(Ok(0))
             }
             Syscall::Ppoll(probe) => {
+                self.probe_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.probe_masks
                     .push(probe.sigmask().map(|mask| mask.as_raw()));
-                self.probe_results.pop_front().unwrap_or(Ok(0))
+                let result = self.probe_results.pop_front().unwrap_or(Ok(0));
+                if result.is_ok()
+                    && let Some(fds) = probe.fds()
+                {
+                    for index in 0..probe.nfds() as usize {
+                        let revents = fds.as_raw() + index * 8 + 6;
+                        LocalMemory::new()
+                            .write_exact(AddrMut::<u8>::from_raw(revents).unwrap(), &[0, 0])
+                            .map_err(|_| Errno::EFAULT)?;
+                    }
+                }
+                result
             }
             Syscall::EpollPwait(probe) => {
+                self.probe_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.probe_masks
                     .push(probe.sigmask().map(|mask| mask.as_raw()));
                 self.probe_results.pop_front().unwrap_or(Ok(0))
@@ -391,6 +458,13 @@ impl Guest<Detcore> for TurnGuest {
             }
             other => panic!("an unexpected injection: {other:?}"),
         }
+    }
+    async fn inject_with_purpose<S: SyscallInfo>(
+        &mut self,
+        call: S,
+        _: reverie::InjectionPurpose,
+    ) -> Result<i64, Error> {
+        self.inject(call).await.map_err(Error::from)
     }
     async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
         panic!("a wait must not tail-inject")
@@ -459,6 +533,9 @@ fn turn_guest(gate: bool, own_mask: Option<u64>) -> TurnGuest {
         sigtimedwait_results: VecDeque::new(),
         probe_results: VecDeque::new(),
         probe_masks: Vec::new(),
+        probe_count: Default::default(),
+        clock: Mutex::new(0),
+        clock_step: 300_000_000,
     }
 }
 
