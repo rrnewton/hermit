@@ -935,7 +935,15 @@ impl RecordVersion {
 //   read, recorded, to tell whether it is such a file.
 // An older recording that reads any of these is refused here instead of
 // failing mid-replay.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x198);
+// 0x198 -> 0x19a (next free above main's shipped 0x198 at this rebase; 0x199
+// is already reserved in the reservations ledger): an Mmap event of a
+// MAP_SHARED file mapping names the mapped file (device, inode, offset) and
+// the mapped descriptor's access mode, and replay maps every MAP_SHARED
+// mapping of one file, in any process, as a view of one file that backs it,
+// opened with that access mode, instead of making a separate anonymous copy.
+// An older reader would fail to decode the event, and an older recording
+// would replay those mappings as separate copies, so it is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19a);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -960,7 +968,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x198);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x198;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19a;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
