@@ -201,6 +201,46 @@ pub(crate) fn reserved_signal_arming_refused_warning(
     )
 }
 
+/// The run-wide stopping refusal (A5 design D49) for a syscall that, under
+/// the in-guest delivery gate, finished with one of the kernel's internal
+/// restart codes other than `ERESTARTSYS` although no wait recorded a signal
+/// ending it (design D40): the in-guest runtime would hand the raw code to
+/// the guest, since only `ERESTARTSYS` is re-run there. `ERESTARTSYS` itself
+/// passes through as that re-run.
+pub(crate) fn restart_code_without_signal_refusal(call: &str, code: &str, caller: i32) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_RESTART_CODE_WITHOUT_SIGNAL): {call} in \
+         thread {caller} finished with {code} under the in-guest delivery gate, but no wait \
+         recorded a signal that ended it, so the in-guest runtime would return the kernel's \
+         internal restart code to the guest, which Linux never does \
+         (A5 design D40, https://github.com/rrnewton/hermit/issues/4485)."
+    )
+}
+
+/// The run-wide stopping refusal (A5 design D49) for a wait whose end the
+/// restart checkpoint cannot resolve (`wait_signal_end::DequeueWalk::resolve`,
+/// design D40): a caught signal is delivered first and a default-fatal one is
+/// deliverable behind it, so whether the process dies at the return depends
+/// on the caught handler's mask, and the query of its action failed. Fail
+/// closed: the run ends rather than guess.
+pub(crate) fn caught_action_unreadable_refusal(
+    call: &str,
+    caught: i32,
+    behind: i32,
+    caller: i32,
+) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_CAUGHT_ACTION_UNREADABLE): {call} in \
+         thread {caller} ended for caught signal {caught} ({}) with default-fatal signal \
+         {behind} ({}) deliverable behind it, and the caught signal's action could not be read, \
+         so whether its handler's mask holds the default-fatal signal, or the process dies at \
+         the return, cannot be decided (A5 design D40, \
+         https://github.com/rrnewton/hermit/issues/4485).",
+        signal_name(caught),
+        signal_name(behind),
+    )
+}
+
 /// `signum`'s name: `SIGUSR1`, or, for a realtime signal, its kernel number
 /// (C libraries reserve different numbers of them, so `SIGRTMIN+n` would
 /// depend on the guest's).

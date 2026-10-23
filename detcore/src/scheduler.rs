@@ -14,6 +14,8 @@ pub(crate) mod child_exit_sigchld;
 pub(crate) mod discarded_at_send;
 #[cfg(test)]
 pub(crate) mod exec_teardown_tests;
+#[cfg(test)]
+mod gated_wait_tests;
 pub(crate) mod itimer_coalesce;
 pub(crate) mod parked;
 #[cfg(test)]
@@ -1433,6 +1435,12 @@ pub struct Scheduler {
     /// under `models_signal_targets`. False on every run today: no host sets
     /// the gate before step 3c.1f.
     in_guest_signal_delivery: bool,
+
+    /// The in-guest runtime's reserved signals
+    /// (`Config::in_guest_reserved_signals`), which never end a parked wait
+    /// under the gate (`gated_deliverable`): their `SigCgt` bit is the
+    /// runtime's handler, not a guest disposition.
+    in_guest_reserved_signals: u64,
 
     /// Signals that a host-timed source armed by a guest can post to a process,
     /// keyed by that process: no gated wait of the process ends for them
@@ -4106,6 +4114,7 @@ impl Scheduler {
             pending_cross_task_signals: Default::default(),
             models_signal_targets: cfg.models_signal_targets(),
             in_guest_signal_delivery: cfg.in_guest_signal_delivery,
+            in_guest_reserved_signals: cfg.in_guest_reserved_signals,
             host_timed_signals: Default::default(),
             host_timed_signals_everywhere: startup_host_timed_signals(cfg),
             #[cfg(test)]
@@ -10359,6 +10368,15 @@ impl Scheduler {
             self.runqueue_push_front(dettid);
             return;
         }
+        // Under the in-guest delivery gate (A5 step 3c.1c, design 16.11), the
+        // send's commit ends an internal poll's wait only for a signal in the
+        // design's deliverable set, read now, at this committed point; a
+        // blocked or ignored one leaves the poll as it is. An unreadable state
+        // wakes it, and its own turn reads again. With the gate off, `true`.
+        let gated_wakes = !self.in_guest_signal_delivery
+            || self.gated_deliverable(dettid).map_or(true, |deliverable| {
+                deliverable & kernel_signal_bit(signal.raw()) != 0
+            });
         // Now that the thread is signaled, it needs to be runnable for the scheduler to continue it.
         match self.thread_status(dettid) {
             ThreadStatus::Gone => {
@@ -10399,7 +10417,12 @@ impl Scheduler {
                     }
                     None => false,
                 };
-                if is_internal_io_polling {
+                if is_internal_io_polling && !gated_wakes {
+                    debug!(
+                        "[dtid {}] signal {} is not deliverable to its internal poll; leaving it.",
+                        dettid, signal
+                    );
+                } else if is_internal_io_polling {
                     assert!(self.run_queue.remove_tid(dettid));
                     let mut rsrcs = Resources::new(dettid);
                     rsrcs.insert(ResourceID::InboundSignal(signal), Permission::W);
@@ -10409,6 +10432,11 @@ impl Scheduler {
                     // https://github.com/rrnewton/hermit/issues/4304).
                     let woken = self.force_unblock_thread_at(dettid, rsrcs, true);
                     self.mark_placed_delivery(dettid, signal, woken);
+                } else if is_queued_sleep && self.run_queue.contains_tid(dettid) && !gated_wakes {
+                    debug!(
+                        "[dtid {}] signal {} is not deliverable to its queued sleep; leaving it.",
+                        dettid, signal
+                    );
                 } else if is_queued_sleep && self.run_queue.contains_tid(dettid) {
                     // Read before the wake replaces the sleep request.
                     let ends = self.scheduler_sigchld_ends_sleep(dettid, signal);
@@ -10513,6 +10541,14 @@ impl Scheduler {
                 // found no signal for itself never returned
                 // (https://github.com/rrnewton/hermit/issues/4333).
                 let parked_sleep = self.signal_sleep(dettid).is_some();
+                if parked_sleep && !gated_wakes {
+                    // Under the gate, as a queued sleep above.
+                    debug!(
+                        "[dtid {}] signal {} is not deliverable to its parked sleep; leaving it.",
+                        dettid, signal
+                    );
+                    return;
+                }
                 let ends = parked_sleep && self.scheduler_sigchld_ends_sleep(dettid, signal);
                 let mut rsrcs = Resources::new(dettid);
                 rsrcs.insert(ResourceID::InboundSignal(signal), Permission::W);
@@ -10520,6 +10556,16 @@ impl Scheduler {
                     let woken = self.force_unblock_thread_at(dettid, rsrcs, true);
                     self.mark_woken_sleep_taker(dettid, signal, woken && ends);
                     self.blocked.woken_sleeps.insert(dettid);
+                } else if self.in_guest_signal_delivery
+                    && self.restartable_internal_io_signals(dettid).is_some()
+                    && !gated_wakes
+                {
+                    // A parked restartable poll (a pipe write waiting for room)
+                    // under the gate: as a queued one above.
+                    debug!(
+                        "[dtid {}] signal {} is not deliverable to its parked poll; leaving it.",
+                        dettid, signal
+                    );
                 } else {
                     self.force_unblock_thread(dettid, rsrcs);
                 }
@@ -10749,7 +10795,11 @@ impl Scheduler {
     }
 
     fn restartable_internal_io_signals(&self, dettid: DetTid) -> Option<Vec<SigWrapper>> {
-        if !self.backend.supports_parked_write_signal_interruption {
+        // D50 reader 1 (A5 step 3c.1c): the capability, or the in-guest
+        // delivery gate, whose drain decides from the published mask and
+        // `/proc` (`gated_deliverable`); the capability field is unchanged.
+        if !self.backend.supports_parked_write_signal_interruption && !self.in_guest_signal_delivery
+        {
             return None;
         }
         self.next_turns
@@ -10859,6 +10909,36 @@ impl Scheduler {
     /// `futex_wait_held_signals`, which restartable internal IO polls share.
     fn parked_futex_interrupting_signals(&self, dettid: DetTid, committed: u64) -> Option<u64> {
         let watch = self.parked_futex_waiter(dettid)?.signal_watch?;
+        // D50 reader 9 under the in-guest delivery gate (A5 step 3c.1c): the
+        // design's deliverable set, under the mask the wait published
+        // (`!watch.unblocked`), with nothing held: on in-guest a child's exit
+        // is published inside the every-turn hold and host-timed producers are
+        // refused unless ignored, so no pending bit is host-timed. An
+        // unreadable state wakes the waiter, whose own turn reads again.
+        if self.in_guest_signal_delivery {
+            let mask = !watch.unblocked;
+            #[cfg(test)]
+            if let Some(state) = self.test_kernel_signal_states.get(&dettid) {
+                return Some(crate::wait_signal_end::deliverable(
+                    state,
+                    mask,
+                    self.in_guest_reserved_signals,
+                ));
+            }
+            return Some(
+                match read_kernel_signal_state(
+                    reverie::Pid::from_raw(watch.pid),
+                    reverie::Pid::from_raw(watch.tid),
+                ) {
+                    Ok(state) => crate::wait_signal_end::deliverable(
+                        &state,
+                        mask,
+                        self.in_guest_reserved_signals,
+                    ),
+                    Err(_) => watch.unblocked,
+                },
+            );
+        }
         let held = self.futex_wait_held_signals(dettid)
             & !self.private_sigchld(dettid)
             & !(committed & !self.host_timed_signals(dettid));
@@ -10893,6 +10973,30 @@ impl Scheduler {
     /// (`record_request_guest_mask`), so the poll's signals are those that
     /// mask leaves unblocked rather than the in-guest runtime's; with nothing
     /// published, `state` is kept as read (`SigBlk`).
+    /// Under the in-guest delivery gate (A5 step 3c.1c, design 16.11 and
+    /// D50): the signals deliverable to `dettid` now
+    /// (`wait_signal_end::deliverable`), from its `/proc` status and the mask
+    /// it published at its latest request (`saved_guest_sigmasks`, step
+    /// 3c.1b), or `SigBlk` when it published none. Read only at a committed
+    /// point (a send's commit, the step-2 drain), where no guest thread holds
+    /// the turn, so the dispositions read are a function of the schedule.
+    fn gated_deliverable(
+        &self,
+        dettid: DetTid,
+    ) -> Result<u64, sleep_signal::SleeperStateUnreadable> {
+        let state = self.read_sleeper_signal_state(dettid)?;
+        let mask = self
+            .saved_guest_sigmasks
+            .get(&dettid)
+            .copied()
+            .unwrap_or(state.blocked);
+        Ok(crate::wait_signal_end::deliverable(
+            &state,
+            mask,
+            self.in_guest_reserved_signals,
+        ))
+    }
+
     fn under_published_mask(&self, dettid: DetTid, state: KernelSignalState) -> KernelSignalState {
         match self.saved_guest_sigmasks.get(&dettid) {
             Some(mask) => KernelSignalState {
@@ -11539,7 +11643,10 @@ impl Scheduler {
     /// discarded at send is not kept (`models_signal_targets`), or the mask
     /// cannot be read, every signal is admitted, as before.
     fn poll_mask_admits(&self, dettid: DetTid, signal: SigWrapper) -> bool {
-        if !self.models_signal_targets {
+        // Under the in-guest delivery gate (A5 step 3c.1c) the mask is the one
+        // the poll published at its request (`saved_guest_sigmasks`, step
+        // 3c.1b), or `SigBlk` when it published none.
+        if !self.models_signal_targets && !self.in_guest_signal_delivery {
             return true;
         }
         let mask = match self.saved_guest_sigmasks.get(&dettid) {
@@ -15111,7 +15218,12 @@ impl Scheduler {
                         .unwrap_or((None, false, false));
                     // A poll that checks the disposition itself after the
                     // wake (a parked pipe `writev`) keeps every signal.
-                    let interrupting = if decides_itself {
+                    // Under the in-guest delivery gate every poll is decided
+                    // here by the design's deliverable set (A5 step 3c.1c,
+                    // D50 reader 1), and decides again in its own turn.
+                    let interrupting = if self.in_guest_signal_delivery {
+                        self.gated_deliverable(dettid).unwrap_or(!0)
+                    } else if decides_itself {
                         !0
                     } else {
                         self.restartable_internal_io_interrupting_signals(dettid, task)
