@@ -201,6 +201,101 @@ pub(crate) fn reserved_signal_arming_refused_warning(
     )
 }
 
+/// The run-wide stopping refusal (A5 design D49) for a syscall that, under
+/// the in-guest delivery gate, finished with one of the kernel's internal
+/// restart codes other than `ERESTARTSYS` although no wait recorded a signal
+/// ending it (design D40): the in-guest runtime would hand the raw code to
+/// the guest, since only `ERESTARTSYS` is re-run there. `ERESTARTSYS` itself
+/// passes through as that re-run.
+pub(crate) fn restart_code_without_signal_refusal(call: &str, code: &str, caller: i32) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_RESTART_CODE_WITHOUT_SIGNAL): {call} in \
+         thread {caller} finished with {code} under the in-guest delivery gate, but no wait \
+         recorded a signal that ended it, so the in-guest runtime would return the kernel's \
+         internal restart code to the guest, which Linux never does \
+         (A5 design D40, https://github.com/rrnewton/hermit/issues/4485)."
+    )
+}
+
+/// The run-wide stopping refusal (A5 design D49) for a wait whose end the
+/// restart checkpoint cannot resolve (`wait_signal_end::DequeueWalk::resolve`,
+/// design D40): a caught signal is delivered first and a later delivery
+/// (`behind`) could end the process, depending on the caught action, and the
+/// query of that action failed. Fail closed: the run ends rather than guess.
+pub(crate) fn caught_action_unreadable_refusal(
+    call: &str,
+    caught: i32,
+    behind: i32,
+    caller: i32,
+) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_CAUGHT_ACTION_UNREADABLE): {call} in \
+         thread {caller} ended for caught signal {caught} ({}) with signal {behind} ({}) \
+         deliverable behind it, and the caught signal's action could not be read, so whether \
+         the process dies at the return cannot be decided (A5 design D40, \
+         https://github.com/rrnewton/hermit/issues/4485).",
+        signal_name(caught),
+        signal_name(behind),
+    )
+}
+
+/// The run-wide stopping refusal (A5 design D49, with D48) for a delivery
+/// loop that dequeues a second instance of caught signal `signal` after
+/// `SA_RESETHAND` reset its action to its default, a stop
+/// (`wait_signal_end::WalkRefusal::ResetToStop`): the in-guest backend cannot
+/// stop a guest process on the schedule.
+pub(crate) fn signal_reset_to_stop_refusal(call: &str, signal: i32, caller: i32) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_SIGNAL_RESET_TO_STOP): {call} in thread \
+         {caller} ended for caught signal {signal} ({}), whose SA_RESETHAND resets it to its \
+         default action, a stop, and a second instance of it is pending unblocked, which Linux \
+         would then deliver by stopping the process; the in-guest backend cannot stop a guest \
+         process on the schedule (A5 design D40, D48, \
+         https://github.com/rrnewton/hermit/issues/4485).",
+        signal_name(signal),
+    )
+}
+
+/// The run-wide stopping refusal (A5 design D49) for a caught real-time
+/// signal whose action has `SA_RESETHAND` and leaves the signal unblocked
+/// after its delivery (`wait_signal_end::WalkRefusal::RealtimeInstances`):
+/// another queued instance of it would be dequeued at its default action,
+/// termination, and `/proc` shows only that one instance or more is pending,
+/// so whether the process dies at the return cannot be decided.
+pub(crate) fn realtime_instances_unknown_refusal(call: &str, signal: i32, caller: i32) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_REALTIME_INSTANCES_UNKNOWN): {call} in \
+         thread {caller} ended for caught real-time signal {signal} ({}), whose SA_RESETHAND \
+         resets it to its default action, termination, while it stays unblocked after its \
+         delivery; a second queued instance would then end the process, and how many \
+         instances are queued cannot be read (A5 design D40, \
+         https://github.com/rrnewton/hermit/issues/4485).",
+        signal_name(signal),
+    )
+}
+
+/// The run-wide stopping refusal (A5 design D49) for a caught end whose
+/// restart table restarts the call with a code other than `ERESTARTSYS`
+/// (D40): the restart needs the register rewind and post-handler delivery of
+/// step 3c.2, and the in-guest Tool host would hand the raw code to the
+/// guest. Fail closed.
+pub(crate) fn restart_after_handler_refusal(
+    call: &str,
+    signal: i32,
+    code: &str,
+    caller: i32,
+) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_RESTART_AFTER_HANDLER): {call} in thread \
+         {caller} finished with {code} and caught signal {signal} ({}) ends it, so Linux would \
+         run the handler and then restart the call, which needs a register rewind and a \
+         delivery after the handler that the in-guest delivery gate does not provide before A5 \
+         step 3c.2; the guest would otherwise see the kernel's internal restart code (A5 design \
+         D40, https://github.com/rrnewton/hermit/issues/4485).",
+        signal_name(signal),
+    )
+}
+
 /// `signum`'s name: `SIGUSR1`, or, for a realtime signal, its kernel number
 /// (C libraries reserve different numbers of them, so `SIGRTMIN+n` would
 /// depend on the guest's).
