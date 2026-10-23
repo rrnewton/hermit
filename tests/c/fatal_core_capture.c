@@ -130,6 +130,17 @@ static void segfault_on_a_third_thread(void) {
   exit(4);
 }
 
+/* The main thread waits on a condition variable nothing signals while another
+ * thread faults: the fault ends the process with the leader still blocked in a
+ * futex wait that no thread's exit wakes. */
+static void segfault_while_the_leader_waits(void) {
+  pthread_t thread;
+  if (pthread_create(&thread, NULL, segfault_with_marker, NULL) != 0) {
+    exit(3);
+  }
+  wait_forever(NULL);
+}
+
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "";
   if (strcmp(mode, "segv") == 0) {
@@ -146,11 +157,13 @@ int main(int argc, char** argv) {
     return 0;
   } else if (strcmp(mode, "threads") == 0) {
     segfault_on_a_third_thread();
+  } else if (strcmp(mode, "leader-waits") == 0) {
+    segfault_while_the_leader_waits();
   }
   fprintf(
       stderr,
       "usage: %s segv | dontdump | dumpable-secret | children MIB... | "
-      "child-segv-ok | threads\n",
+      "child-segv-ok | threads | leader-waits\n",
       argv[0]);
   return 2;
 }

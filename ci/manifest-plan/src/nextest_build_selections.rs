@@ -939,7 +939,10 @@ mod tests {
             // test moves there from frontier_app_benchmarks, plus
             // a_declared_redis_pair_is_used_only_when_declared and
             // a_bad_redis_declaration_is_refused_rather_than_replaced (+2): 691.
-            assert_eq!(population, 691);
+            // fatal_core_capture's
+            // a_fault_ends_the_run_while_the_leader_waits_on_a_condition_variable
+            // (+1): 692.
+            assert_eq!(population, 692);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
