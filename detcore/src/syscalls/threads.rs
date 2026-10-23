@@ -1147,7 +1147,7 @@ impl KernelSignalState {
 }
 
 /// The signals whose default action ignores them.
-fn default_ignored_signals() -> KernelSigset {
+pub(crate) fn default_ignored_signals() -> KernelSigset {
     [libc::SIGCHLD, libc::SIGCONT, libc::SIGURG, libc::SIGWINCH]
         .into_iter()
         .fold(0, |set, signal| set | kernel_sigset_bit(signal))

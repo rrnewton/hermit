@@ -72,6 +72,7 @@ use super::kernel_signal_bit;
 use crate::resources::NANOSLEEP_FYI;
 use crate::resources::PAUSE_FYI;
 use crate::resources::Permission;
+use crate::resources::RT_SIGSUSPEND_FYI;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::syscalls::KernelSignalState;
@@ -116,6 +117,11 @@ impl Scheduler {
         };
         match resources.fyi.as_str() {
             PAUSE_FYI if deadline.is_indefinite() => Some(SignalSleep::Pause),
+            // The gate's parked `rt_sigsuspend` (A5 step 3c.1d) ends as a
+            // `pause` does, under the temporary mask it published.
+            RT_SIGSUSPEND_FYI if deadline.is_indefinite() && self.in_guest_signal_delivery => {
+                Some(SignalSleep::Pause)
+            }
             NANOSLEEP_FYI => Some(SignalSleep::Nanosleep {
                 deadline: *deadline,
             }),

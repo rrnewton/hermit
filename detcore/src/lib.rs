@@ -55,6 +55,7 @@ mod finalization;
 pub mod guest_log;
 mod host_inputs;
 pub mod host_timed_producers;
+mod ignored_signals;
 pub mod in_guest_launch;
 pub mod in_guest_site_patching;
 mod io_buffers;

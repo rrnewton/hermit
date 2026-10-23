@@ -296,6 +296,25 @@ pub(crate) fn restart_after_handler_refusal(
     )
 }
 
+/// The run-wide stopping refusal (A5 design D49) for a wait under a
+/// temporary signal mask (`rt_sigsuspend`, a masked `pselect6`, `ppoll`,
+/// `epoll_pwait` or `epoll_pwait2`) that caught signal `signal` would end
+/// under the in-guest delivery gate (step 3c.1d): Linux would run its handler
+/// with the temporary mask in force and restore the thread's own mask only at
+/// the handler's `rt_sigreturn`, which step 3c.w provides. 3c.1 never reaches
+/// it: phase 1 refuses every temporary-mask call in a process that handles
+/// SIGALRM (design F8), and no other guest handler is admitted. Fail closed.
+pub(crate) fn temporary_mask_caught_end_refusal(caller: i32, signal: i32) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_TEMPORARY_MASK_CAUGHT_END): a wait under a \
+         temporary signal mask in thread {caller} would end for caught signal {signal} ({}), \
+         whose handler Linux runs under that mask; the in-guest delivery gate does not run \
+         guest handlers under a temporary mask before A5 step 3c.w (A5 design D39, \
+         https://github.com/rrnewton/hermit/issues/4485).",
+        signal_name(signal),
+    )
+}
+
 /// The run-wide stopping refusal (A5 design D44(b) through D49) for a send
 /// of `signum` to thread `target`, blocked in a kernel-run call (a vfork
 /// parent's wait when `vfork`) whose continuation turn has not been granted:

@@ -3089,6 +3089,208 @@ where
     }
 }
 
+/// The most instances [`remove_ignored_signals`] dequeues in one call before
+/// it gives up: far more than a thread's queues can hold, which
+/// `RLIMIT_SIGPENDING` bounds for real-time signals and one per queue bounds
+/// for standard ones; reached, the removal fails closed.
+const MAX_IGNORED_REMOVALS: usize = 1 << 16;
+
+/// A5 step 3c.1d, design D37: remove the pending instances of `set` (ignored
+/// signals Linux would not hold, `ignored_signals::removable`) from the
+/// calling thread's queues, in its own turn, by repeated trusted zero-timeout
+/// `rt_sigtimedwait` calls until `EAGAIN`. Each call dequeues one instance,
+/// the thread's private queue first and then the shared one
+/// (`dequeue_signal`, kernel/signal.c:626-639 at v6.12), and with a zero
+/// timeout it never sleeps: no instance left gives `-EAGAIN`
+/// (`do_sigtimedwait`, :3629-3676). SIGKILL and SIGSTOP are never in `set`
+/// (they are never ignored), and the kernel drops them from it anyway
+/// (:3648). Nothing is injected for an empty set. An error other than
+/// `EAGAIN`, more instances than any queue can hold, or no scratch stack for
+/// the call's two cells is Hermit's own failure (`Error::Tool`), never an
+/// errno the guest's call could see.
+pub(crate) async fn remove_ignored_signals<T, G>(guest: &mut G, set: u64) -> Result<(), Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if set == 0 {
+        return Ok(());
+    }
+    let mut stack = guest.stack().await;
+    let set_cell = stack.push(set);
+    let timeout = stack.push(Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    });
+    // A stack with no room for the two cells is Hermit's own failure too, never
+    // an EFAULT of the guest's call (round-3 ruling 4).
+    let _stack_guard = stack.commit().map_err(|errno| {
+        Error::Tool(anyhow::anyhow!(
+            "removing ignored signals {set:#x}: no scratch stack for the trusted \
+             rt_sigtimedwait ({errno})"
+        ))
+    })?;
+    // SAFETY: the kernel only reads the set; Reverie types the argument as
+    // mutable.
+    let set_cell = unsafe { set_cell.cast::<libc::sigset_t>().into_mut() };
+    for _ in 0..MAX_IGNORED_REMOVALS {
+        let taken = guest
+            .inject(
+                syscalls::RtSigtimedwait::new()
+                    .with_set(Some(set_cell))
+                    .with_info(None)
+                    .with_timeout(Some(timeout))
+                    .with_sigsetsize(KERNEL_SIGSET_SIZE),
+            )
+            .await;
+        match taken {
+            Ok(signal) => tracing::info!(
+                "[dtid {}] under the in-guest delivery gate, removed ignored signal {} that Linux \
+                 would not hold (D37)",
+                guest.thread_state().dettid,
+                signal
+            ),
+            Err(Errno::EAGAIN) => return Ok(()),
+            // Hermit's own failure, never the guest's result: the guest's call
+            // (rt_sigaction, rt_sigsuspend, a masked wait) cannot return it.
+            Err(errno) => {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "removing ignored signals {set:#x}: the trusted rt_sigtimedwait failed with \
+                     {errno}"
+                )));
+            }
+        }
+    }
+    Err(Error::Tool(anyhow::anyhow!(
+        "removing ignored signals {set:#x} dequeued {MAX_IGNORED_REMOVALS} instances without \
+         emptying the queues"
+    )))
+}
+
+/// What a temporary-mask wait's check finds under the in-guest delivery gate
+/// ([`temporary_mask_check`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TemporaryMaskCheck {
+    /// Nothing ends the wait; the ignored signals Linux would not hold were
+    /// removed (D37 rule (ii)).
+    Waits,
+    /// A default-fatal signal the temporary mask lets in ends it: the D40
+    /// flag `Fatal` is recorded, and the call returns its restart code
+    /// (`-ERESTARTNOHAND`; `-EINTR` for the `epoll` forms), which the restart
+    /// checkpoint turns into `-EINTR` for the death path of step 3c.1e.
+    Fatal,
+    /// A masked `epoll_pwait` or `epoll_pwait2` at its park: an ignored signal
+    /// pending at entry that only the temporary mask lets in, removed, and
+    /// the call returns `EINTR` (D37's exception, IR-3).
+    EpollInterrupted,
+    /// A caught signal would end the wait (or be delivered first): its
+    /// handler would run under the temporary mask, which step 3c.w owns and
+    /// which 3c.1 never reaches (phase 1 refuses every temporary-mask call in
+    /// a process that handles SIGALRM, F8). The stopping refusal
+    /// HERMIT_TEMPORARY_MASK_CAUGHT_END was filed (D49); were the run to go
+    /// on, the call returns `EINTR`.
+    Refused,
+}
+
+/// A5 step 3c.1d (design D37, D39, D50, IR-7): the check of a wait under a
+/// temporary mask `m_temp` (`rt_sigsuspend`, a masked `pselect6`, `ppoll`,
+/// `epoll_pwait` or `epoll_pwait2`), at the point where Linux tests for a
+/// pending signal: the call would wait (nothing ready), in the thread's own
+/// turn, from its `/proc` status (one read).
+///
+/// 1. The design's deliverable set under `m_temp` (`wait_signal_end`): a
+///    default-fatal signal ends the wait (`Fatal`, the D40 flag recorded). A
+///    caught one would run its handler under the temporary mask (step 3c.w,
+///    unreachable in 3c.1): a named stopping refusal (`Refused`).
+/// 2. D37 rule (ii) with IR-7's per-instance masks: the ignored signals `I`
+///    pending now, less `I ∩ M_req ∩ M_next`, are removed, where `M_next` is
+///    `m_temp` and `M_req` is the mask in force when the instance was
+///    queued. `entry` is `Some(!0)` at the wait's first check, which every
+///    form makes in the call's own turn, before any scheduler request, so
+///    every instance pending then was pending at entry and was queued under
+///    the guest's own mask ([`gated_own_mask`]); `None` at any later check,
+///    where every instance kept from entry is in both masks, so `M_req` =
+///    `m_temp` for all of them. (A narrower `entry` set limits the at-entry
+///    rule to those bits.)
+/// 3. `epoll` (a masked `epoll_pwait` or `epoll_pwait2`) at the first check:
+///    an instance pending at entry in `I ∩ M_own ∖ M_temp` makes the call
+///    return `EINTR` (`EpollInterrupted`), as `ep_poll` does
+///    (`ignored_signals::epoll_interrupting`).
+///
+/// With the gate off it is never called.
+pub(crate) async fn temporary_mask_check<T, G>(
+    guest: &mut G,
+    m_temp: KernelSigset,
+    entry: Option<KernelSigset>,
+    epoll: bool,
+) -> Result<TemporaryMaskCheck, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    use crate::wait_signal_end::WaitSignalEnd;
+    let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+    let reserved = guest.config().in_guest_reserved_signals;
+    match crate::wait_signal_end::wait_end(&state, m_temp, reserved) {
+        None => {}
+        Some(end @ WaitSignalEnd::Fatal(_)) => {
+            tracing::info!(
+                "[dtid {}] under the in-guest delivery gate, {:?} ends the wait under its \
+                 temporary mask {:#x}",
+                guest.thread_state().dettid,
+                end,
+                m_temp
+            );
+            guest.thread_state_mut().wait_signal_end = Some(end);
+            return Ok(TemporaryMaskCheck::Fatal);
+        }
+        Some(end) => {
+            let signal = match end {
+                WaitSignalEnd::Caught(signal) => signal,
+                _ => {
+                    (state.pending & !m_temp & state.caught & !reserved).trailing_zeros() as i32 + 1
+                }
+            };
+            let reason = crate::refused_signal_controls::temporary_mask_caught_end_refusal(
+                guest.thread_state().dettid.as_raw(),
+                signal,
+            );
+            tracing::error!("{}", reason);
+            crate::tool_global::stopping_refusal(guest, reason).await;
+            return Ok(TemporaryMaskCheck::Refused);
+        }
+    }
+    let own = gated_own_mask(guest, state.blocked);
+    let now = crate::ignored_signals::pending_ignored(&state, reserved);
+    let (removed, interrupted) = match entry {
+        Some(entry) => {
+            let at_entry = KernelSignalState {
+                pending: state.pending & entry,
+                ..state
+            };
+            let since = KernelSignalState {
+                pending: state.pending & !entry,
+                ..state
+            };
+            let interrupted = epoll
+                && crate::ignored_signals::epoll_interrupting(&at_entry, own, m_temp, reserved)
+                    != 0;
+            (
+                crate::ignored_signals::removable(&at_entry, own, m_temp, reserved)
+                    | crate::ignored_signals::removable(&since, m_temp, m_temp, reserved),
+                interrupted,
+            )
+        }
+        None => (now & !m_temp, false),
+    };
+    remove_ignored_signals(guest, removed).await?;
+    Ok(if interrupted {
+        TemporaryMaskCheck::EpollInterrupted
+    } else {
+        TemporaryMaskCheck::Waits
+    })
+}
+
 /// The `sa_flags` of `signal`'s current action, as the guest set it, read in
 /// this thread's turn with a query `rt_sigaction` (the in-guest runtime
 /// answers it from the guest's action, phase 1's virtual SIGALRM included):
