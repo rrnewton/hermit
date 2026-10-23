@@ -25,7 +25,8 @@ pub struct Config {
     pub max_unmatched_to_print: usize,
     /// Bound quadratic traceback work before falling back to event permutation search.
     pub max_needleman_matrix_cells: usize,
-    /// Number of identical replays required to classify a jittered control schedule.
+    /// How many replays of a jittered control schedule may be run before the
+    /// search gives up; the schedule is classified once two of them agree.
     pub max_replay_attempts: usize,
     /// How many retired conditional branches two replays of one control schedule
     /// may disagree by in a branch event and still count as the same realized
@@ -48,7 +49,7 @@ impl Default for Config {
             max_event_level_search_passes: 100,
             max_unmatched_to_print: 10,
             max_needleman_matrix_cells: 4_000_000,
-            max_replay_attempts: 2,
+            max_replay_attempts: 4,
             max_branch_count_jitter: 64,
             refine_sub_events: true,
             verbose: false,
@@ -68,6 +69,32 @@ struct EventLevelSearchResult {
     passing_schedule: Vec<SchedEvent>,
     failing_schedule: Vec<SchedEvent>,
 }
+
+/// The bisection between a passing and a failing schedule ended one swap
+/// apart, but the failing schedule's failure depends on events only it
+/// executed, so no single adjacent swap separates the outcomes.
+#[derive(Debug)]
+pub struct NoSingleSwap {
+    /// How many events the failing schedule has that the passing one lacks.
+    pub failing_only_events: usize,
+}
+
+impl std::fmt::Display for NoSingleSwap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the search stopped one swap from the passing schedule, but the failing schedule \
+             still has {} events the passing one lacks, and without them it no longer fails. \
+             The failure depends on events only the failing run executed (often branch events \
+             whose preemption points differ), so no single adjacent swap separates the two \
+             outcomes. `hermit analyze --prefix-search` needs no baseline schedule and finds the \
+             scheduling decision within the failing one.",
+            self.failing_only_events
+        )
+    }
+}
+
+impl std::error::Error for NoSingleSwap {}
 
 #[derive(Debug)]
 pub struct CriticalSchedule {
@@ -240,26 +267,37 @@ where
         .bold(),
     );
 
+    // Any two replays that agree classify the schedule: on a host whose
+    // branch counter drifts, the first replay can be the odd one out.
+    let mut replays = vec![(passes, actual_schedule)];
     for attempt in 2..=cfg.max_replay_attempts.max(2) {
         let (replayed_passes, replayed_actual) = tester(requested_schedule)?;
-        if replayed_passes == passes
-            && same_interleaving(
-                &replayed_actual,
-                &actual_schedule,
-                cfg.max_branch_count_jitter,
-            )
-        {
+        if let Some(agreed) = replays.iter().position(|(earlier_passes, earlier_actual)| {
+            replayed_passes == *earlier_passes
+                && same_interleaving(
+                    &replayed_actual,
+                    earlier_actual,
+                    cfg.max_branch_count_jitter,
+                )
+        }) {
             eprintln!(
-                ":: Jittered control schedule reproduced the same outcome and realized trace on attempt {}",
+                ":: Jittered control schedule reproduced the same outcome and realized trace on attempt {} (agreeing with attempt {})",
                 attempt,
+                agreed + 1,
             );
-            return Ok((passes, requested_schedule.to_vec()));
+            return Ok((replayed_passes, requested_schedule.to_vec()));
         }
+        replays.push((replayed_passes, replayed_actual));
     }
 
-    panic!(
-        "Jittered schedule replay was not stable after {} attempts; refusing to attach an outcome to the requested control schedule",
+    anyhow::bail!(
+        "jittered schedule replay was not stable after {} attempts; refusing to attach an outcome \
+         to the requested control schedule. Replays of one schedule realized different traces \
+         (more than {} branches apart or in another order), so this program's schedule cannot be \
+         replayed reproducibly here; on a host whose branch counter is inexact (see `hermit \
+         host-capabilities`) branch counts can drift between runs",
         cfg.max_replay_attempts.max(2),
+        cfg.max_branch_count_jitter,
     );
 }
 
@@ -341,8 +379,8 @@ where
         }
     }
 
-    panic!(
-        "Event-Level Search Failed - No convergence after {} passes",
+    anyhow::bail!(
+        "event-level search failed: no convergence after {} passes",
         cfg.max_event_level_search_passes
     );
 }
@@ -429,8 +467,9 @@ where
         }
 
         if swap_dist == 0 {
-            panic!(
-                "Aborting search: opposite-outcome schedules have no remaining reorderable event distance (edit distance {})",
+            anyhow::bail!(
+                "aborting search: opposite-outcome schedules have no remaining reorderable event \
+                 distance (edit distance {})",
                 edit_dist,
             );
         }
@@ -460,14 +499,9 @@ where
                     });
                 }
             }
-            anyhow::bail!(
-                "the search stopped one swap from the passing schedule, but the failing \
-                 schedule still has {} events the passing one lacks, and without them it no \
-                 longer fails. The failure depends on events only the failing run executed \
-                 (often branch events whose preemption points differ), so no single adjacent \
-                 swap separates the two outcomes.",
-                edit_dist - swap_dist,
-            );
+            return Err(anyhow::Error::new(NoSingleSwap {
+                failing_only_events: edit_dist - swap_dist,
+            }));
         }
 
         let (midpoint_passes, selected_new_point) =
@@ -506,8 +540,8 @@ where
         }
     }
 
-    panic!(
-        "Event-Level Search Failed - No convergence after {} passes",
+    anyhow::bail!(
+        "event-level search failed: no convergence after {} passes",
         cfg.max_event_level_search_passes
     );
 }
@@ -998,6 +1032,83 @@ mod tests {
             None,
             "identical schedules are not one swap apart"
         );
+    }
+
+    /// A failure that needs an event only the failing schedule has ends the
+    /// search one swap apart with a typed error, which analyze answers with a
+    /// prefix search.
+    #[test]
+    fn a_failure_on_failing_only_events_ends_with_no_single_swap() {
+        let a = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook);
+        let b = SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook);
+        let c = SchedEvent::syscall(DetTid::from_raw(3), Sysno::getpid, SyscallPhase::Prehook);
+        let extra = SchedEvent::syscall(DetTid::from_raw(7), Sysno::close, SyscallPhase::Prehook);
+        let passing = vec![a.clone(), b.clone(), c.clone()];
+        let failing = vec![b, extra.clone(), a, c];
+        let tester = |schedule: &[SchedEvent]| -> TrialOutcome {
+            Ok((!schedule.contains(&extra), schedule.to_vec()))
+        };
+        let error =
+            search_for_critical_schedule(tester, passing, failing, &Config::default()).unwrap_err();
+        let no_swap = error
+            .downcast_ref::<NoSingleSwap>()
+            .unwrap_or_else(|| panic!("not NoSingleSwap: {error:#}"));
+        assert_eq!(no_swap.failing_only_events, 1);
+        assert!(error.to_string().contains("--prefix-search"), "{error}");
+    }
+
+    /// A control schedule whose replays never agree ends the search with an
+    /// error, not a panic.
+    #[test]
+    fn an_unstable_control_schedule_is_an_error() {
+        let a = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook);
+        let mut trial = 0;
+        // Every replay realizes a trace no other replay does.
+        let mut tester = |schedule: &[SchedEvent]| -> TrialOutcome {
+            trial += 1;
+            let realized = std::iter::repeat_n(a.clone(), trial)
+                .chain(schedule.iter().cloned())
+                .collect();
+            Ok((true, realized))
+        };
+        let cfg = Config {
+            max_jitter_editdist: 0,
+            max_jitter_swapdist: 0,
+            ..Default::default()
+        };
+        let requested = vec![a.clone()];
+        let error = test_and_select_stable_point(&mut tester, &requested, &cfg).unwrap_err();
+        assert!(error.to_string().contains("was not stable"), "{error}");
+        assert_eq!(trial, cfg.max_replay_attempts);
+    }
+
+    /// Two agreeing replays classify a control schedule even when the first
+    /// replay was the odd one out.
+    #[test]
+    fn two_agreeing_replays_classify_a_schedule_after_an_outlier() {
+        let a = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook);
+        let b = SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook);
+        let mut trial = 0;
+        let mut tester = |_: &[SchedEvent]| -> TrialOutcome {
+            trial += 1;
+            // The first replay fails in another order; the next two agree.
+            Ok(if trial == 1 {
+                (false, vec![b.clone(), a.clone()])
+            } else {
+                (true, vec![a.clone(), b.clone(), b.clone()])
+            })
+        };
+        let cfg = Config {
+            max_jitter_editdist: 0,
+            max_jitter_swapdist: 0,
+            ..Default::default()
+        };
+        let requested = vec![a.clone(), b.clone()];
+        let (passes, selected) =
+            test_and_select_stable_point(&mut tester, &requested, &cfg).unwrap();
+        assert!(passes, "the agreeing replays' outcome");
+        assert_eq!(selected, requested);
+        assert_eq!(trial, 3);
     }
 
     #[test]

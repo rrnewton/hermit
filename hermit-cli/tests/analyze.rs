@@ -261,6 +261,25 @@ fn analyze_racewrite_nostdlib() {
     );
 }
 
+/// `--prefix-search` finds the same race from the target schedule alone: the
+/// deciding event is the parent's return from fork, and the thread the
+/// scheduler would run there instead is the child at its racing write.
+#[test]
+#[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_racewrite_nostdlib_prefix_search() {
+    run_analyze(
+        "analyze racewrite_nostdlib --prefix-search",
+        &workloads().racewrite_nostdlib,
+        &[
+            "--prefix-search",
+            "--run-arg=--base-env=empty",
+            "--target-exit-code=0",
+            "--target-stdout=foobar",
+        ],
+        "racewrite_nostdlib.c:35",
+    );
+}
+
 #[test]
 #[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_nanosleep_threads_rejects_indistinguishable_baseline() {

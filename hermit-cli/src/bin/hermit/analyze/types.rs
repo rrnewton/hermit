@@ -85,6 +85,28 @@ pub struct AnalyzeOpts {
     )]
     pub minimize: bool,
 
+    /// Search within the target run's schedule instead of between it and a baseline run.
+    ///
+    /// Each trial replays the first K events of the target schedule and then lets the
+    /// scheduler continue without chaos. Replaying none of it gives the baseline outcome and
+    /// replaying all of it the target outcome; a binary search finds the K at which the
+    /// outcome flips. Event #K is the scheduling decision that commits the run to the target:
+    /// the report shows the stack of the thread the target schedule runs there and of the
+    /// thread the scheduler would run instead.
+    ///
+    /// Unlike the default search, it needs no baseline schedule, so events that only one of
+    /// two unrelated runs executed (timeslices that end at other points, iterations of a
+    /// polling loop) cannot stop it. It takes about log2(schedule length) trials.
+    #[clap(
+        long,
+        conflicts_with = "minimize",
+        conflicts_with = "run2_seed",
+        conflicts_with = "run2_preemptions",
+        conflicts_with = "run2_schedule",
+        conflicts_with = "run_needleman"
+    )]
+    pub prefix_search: bool,
+
     /// Use `--imprecise-timers` during the (chaos) search phase. Only has an effect if search is
     /// enabled.
     #[clap(long)]
