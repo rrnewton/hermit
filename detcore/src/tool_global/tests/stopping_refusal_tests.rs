@@ -12,8 +12,9 @@
 //! process of the namespace, so a parent waiting for the refusing child, and
 //! a grandchild that would write a file later, never run on.
 //!
-//! Nothing in Hermit files the request yet (its producers come with A5 steps
-//! 3c.1c and 3c.1e), so the run is played by plain processes: a forked
+//! Its producers (A5 step 3c.1c's restart checkpoint and kernel-run refusals,
+//! and step 3c.1e's) file it only under the in-guest delivery gate, which no
+//! run sets yet, so the run is played by plain processes: a forked
 //! process enters a new user and PID namespace, and its first child, PID 1
 //! there, stands for Hermit's container init, where the scheduler runs. It
 //! forks a guest parent, which forks the refusing child and waits for it; the

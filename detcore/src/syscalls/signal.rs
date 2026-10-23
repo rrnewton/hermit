@@ -4139,9 +4139,12 @@ where
     // its place in Linux's dequeue order among the deliverable signals
     // (`wait_signal_end::classify`): a deliverable default-fatal signal that
     // does not dump core still ends the process, and so does a core-dumping
-    // one Linux would dequeue first. IR-12: the `pause` returns
-    // `ERESTARTNOHAND`, which the restart checkpoint turns into `EINTR`. Phase
-    // 1 refuses every other sleep in a process that handles SIGALRM (F8).
+    // one Linux would dequeue first; one behind the SIGALRM ends it unless
+    // the guest's SIGALRM handler's mask holds it, which the restart
+    // checkpoint reads (`WaitSignalEnd::BehindCaught`). IR-12: the `pause`
+    // returns `ERESTARTNOHAND`, which the restart checkpoint turns into
+    // `EINTR`. Phase 1 refuses every other sleep in a process that handles
+    // SIGALRM (F8).
     if guest.config().in_guest_signal_delivery {
         let _ = stops_end_it;
         let phase1_wake = matches!(&check, SleepCheck::AfterWake(Some(woken))

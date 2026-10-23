@@ -128,6 +128,10 @@ struct TurnGuest {
     futex_answer: Option<SchedValue>,
     /// `sa_flags` an injected `rt_sigaction` query reports.
     action_flags: u64,
+    /// `sa_mask` an injected `rt_sigaction` query reports, and whether the
+    /// query fails instead.
+    action_mask: u64,
+    action_query_fails: bool,
     /// Every injected syscall, in order.
     injected: Vec<Sysno>,
     /// What each injected `read` returns, in order (`EAGAIN` once empty).
@@ -232,9 +236,13 @@ impl Guest<Detcore> for TurnGuest {
                 self.write_results.pop_front().unwrap_or(Err(Errno::EAGAIN))
             }
             Syscall::RtSigaction(query) => {
+                if self.action_query_fails {
+                    return Err(Errno::EFAULT);
+                }
                 if let Some(old) = query.old_action() {
                     let mut action = [0_u64; 4];
                     action[1] = self.action_flags;
+                    action[3] = self.action_mask;
                     LocalMemory::new().write_value(old.cast::<[u64; 4]>(), &action)?;
                 }
                 Ok(0)
@@ -285,6 +293,8 @@ fn turn_guest(gate: bool, own_mask: Option<u64>) -> TurnGuest {
         answers: Mutex::new(VecDeque::new()),
         futex_answer: Some(SchedValue::Value(0)),
         action_flags: 0,
+        action_mask: 0,
+        action_query_fails: false,
         injected: Vec::new(),
         read_results: VecDeque::new(),
         write_results: VecDeque::new(),
@@ -381,9 +391,9 @@ async fn under_the_gate_a_sleep_ends_before_its_park_and_after_a_wake_only_for_a
 /// place on the shared queue in Linux's dequeue order: a deliverable
 /// default-fatal signal that does not dump core still makes the end fatal,
 /// and so does a core-dumping one dequeued first (a private one, or a shared
-/// lower-numbered one), but not a shared core-dumping one SIGALRM precedes.
-/// Mutation "any default-fatal signal makes the end fatal": the shared
-/// SIGXCPU row becomes `Fatal(SIGXCPU)`.
+/// lower-numbered one); a shared core-dumping one that SIGALRM precedes is
+/// `BehindCaught`, which the restart checkpoint resolves by SIGALRM's mask
+/// (`under_the_gate_the_restart_checkpoint_resolves_an_end_behind_a_caught_signal`).
 #[tokio::test]
 async fn under_the_gate_phase_1_s_virtual_sigalrm_wake_ends_a_pause_as_caught() {
     use crate::syscalls::SleepCheck;
@@ -405,10 +415,6 @@ async fn under_the_gate_phase_1_s_virtual_sigalrm_wake_ends_a_pause_as_caught() 
             WaitSignalEnd::Fatal(libc::SIGXCPU),
         ),
         (
-            shared(bit(libc::SIGXCPU)),
-            WaitSignalEnd::Caught(libc::SIGALRM),
-        ),
-        (
             shared(bit(libc::SIGQUIT)),
             WaitSignalEnd::Fatal(libc::SIGQUIT),
         ),
@@ -422,6 +428,22 @@ async fn under_the_gate_phase_1_s_virtual_sigalrm_wake_ends_a_pause_as_caught() 
         assert_eq!(verdict, SleepSignal::Pending);
         assert_eq!(guest.thread.wait_signal_end, Some(end));
     }
+    // A shared SIGXCPU behind the virtual SIGALRM.
+    let _seam = script(shared(bit(libc::SIGXCPU)));
+    let mut guest = turn_guest(true, Some(0));
+    guest.thread.sigalrm_handled = true;
+    let verdict = crate::syscalls::sleep_signal(&mut guest, wake.clone(), true)
+        .await
+        .unwrap();
+    assert_eq!(verdict, SleepSignal::Pending);
+    assert!(
+        matches!(
+            guest.thread.wait_signal_end,
+            Some(WaitSignalEnd::BehindCaught(_))
+        ),
+        "{:?}",
+        guest.thread.wait_signal_end
+    );
     // Not a phase-1 process: nothing pending, nothing ends it.
     let _seam = script(proc_state(0, 0, 0));
     let mut guest = turn_guest(true, Some(0));
@@ -429,6 +451,73 @@ async fn under_the_gate_phase_1_s_virtual_sigalrm_wake_ends_a_pause_as_caught() 
         .await
         .unwrap();
     assert_eq!(verdict, SleepSignal::None);
+}
+
+/// The restart checkpoint resolves a `BehindCaught` end (Claude review round
+/// 2): phase 1's virtual SIGALRM wakes a `pause` with a shared SIGXCPU
+/// deliverable behind it, and the checkpoint reads SIGALRM's action with one
+/// query `rt_sigaction`. (a) Its `sa_mask` holds SIGXCPU: `Caught(SIGALRM)`,
+/// the restart table's `EINTR` and a plain checkpoint. (b) It does not:
+/// `Fatal(SIGXCPU)`, `-EINTR` and the interrupted code. (e) The query fails:
+/// fail closed, the stopping refusal HERMIT_CAUGHT_ACTION_UNREADABLE is filed
+/// and the end is `Fatal`. Mutations: "the handler's sa_mask ignored" ((a)
+/// gives the interrupted code), "no fail-closed" ((e) files nothing).
+#[tokio::test]
+async fn under_the_gate_the_restart_checkpoint_resolves_an_end_behind_a_caught_signal() {
+    use crate::syscalls::SleepCheck;
+    let wake = SleepCheck::AfterWake(Some(vec![SigWrapper(libc::SIGALRM)]));
+    let xcpu = bit(libc::SIGXCPU);
+    let state = KernelSignalState {
+        thread_pending: 0,
+        shared_pending: xcpu,
+        ..proc_state(xcpu, 0, 0)
+    };
+    let pause = Syscall::from(reverie::syscalls::Pause::new());
+    for (name, mask, fails, interrupted, refused) in [
+        ("(a) SIGALRM's mask holds SIGXCPU", xcpu, false, None, false),
+        (
+            "(b) SIGALRM's mask does not hold SIGXCPU",
+            0,
+            false,
+            Some(Errno::ERESTARTNOHAND),
+            false,
+        ),
+        (
+            "(e) the action cannot be read",
+            xcpu,
+            true,
+            Some(Errno::ERESTARTNOHAND),
+            true,
+        ),
+    ] {
+        let _seam = script(state);
+        let mut guest = turn_guest(true, Some(0));
+        guest.thread.sigalrm_handled = true;
+        guest.action_mask = mask;
+        guest.action_query_fails = fails;
+        let tool = tool(&guest);
+        crate::syscalls::sleep_signal(&mut guest, wake.clone(), true)
+            .await
+            .unwrap();
+        let (res, code) = tool
+            .wait_end_checkpoint(&mut guest, &pause, Err(Errno::ERESTARTNOHAND.into()))
+            .await;
+        assert!(
+            matches!(res, Err(Error::Errno(Errno::EINTR))),
+            "{name}: {res:?}"
+        );
+        assert_eq!(code, interrupted, "{name}");
+        assert_eq!(guest.injected, [Sysno::rt_sigaction], "{name}");
+        let refusals = guest
+            .rpcs()
+            .iter()
+            .filter(|rpc| {
+                matches!(rpc, GlobalRequest::StoppingRefusal(reason)
+                    if reason.contains("HERMIT_CAUGHT_ACTION_UNREADABLE"))
+            })
+            .count();
+        assert_eq!(refusals, usize::from(refused), "{name}");
+    }
 }
 
 /// With the gate off the in-guest sleep keeps today's answers (its backend

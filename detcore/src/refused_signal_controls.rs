@@ -217,6 +217,30 @@ pub(crate) fn restart_code_without_signal_refusal(call: &str, code: &str, caller
     )
 }
 
+/// The run-wide stopping refusal (A5 design D49) for a wait whose end the
+/// restart checkpoint cannot resolve (`wait_signal_end::DequeueWalk::resolve`,
+/// design D40): a caught signal is delivered first and a default-fatal one is
+/// deliverable behind it, so whether the process dies at the return depends
+/// on the caught handler's mask, and the query of its action failed. Fail
+/// closed: the run ends rather than guess.
+pub(crate) fn caught_action_unreadable_refusal(
+    call: &str,
+    caught: i32,
+    behind: i32,
+    caller: i32,
+) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_CAUGHT_ACTION_UNREADABLE): {call} in \
+         thread {caller} ended for caught signal {caught} ({}) with default-fatal signal \
+         {behind} ({}) deliverable behind it, and the caught signal's action could not be read, \
+         so whether its handler's mask holds the default-fatal signal, or the process dies at \
+         the return, cannot be decided (A5 design D40, \
+         https://github.com/rrnewton/hermit/issues/4485).",
+        signal_name(caught),
+        signal_name(behind),
+    )
+}
+
 /// `signum`'s name: `SIGUSR1`, or, for a realtime signal, its kernel number
 /// (C libraries reserve different numbers of them, so `SIGRTMIN+n` would
 /// depend on the guest's).

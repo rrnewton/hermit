@@ -789,6 +789,58 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// A5 step 3c.1c, D40: resolve a `WaitSignalEnd::BehindCaught` end, in
+    /// the thread's own turn (`wait_end_checkpoint`), by reading the caught
+    /// actions Linux's delivery loop sets up before it could reach the
+    /// default-fatal signal, one query `rt_sigaction` each, in the loop's
+    /// order and only while a default-fatal signal stays deliverable. An
+    /// action that cannot be read files HERMIT_CAUGHT_ACTION_UNREADABLE and
+    /// gives `Fatal`.
+    async fn resolve_wait_end<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+        walk: crate::wait_signal_end::DequeueWalk,
+    ) -> crate::wait_signal_end::WaitSignalEnd {
+        let mut actions: Vec<(i32, Option<crate::wait_signal_end::CaughtAction>)> = Vec::new();
+        let resolved = loop {
+            let mut missing = None;
+            let resolved =
+                walk.resolve(
+                    |signal| match actions.iter().find(|(known, _)| *known == signal) {
+                        Some((_, action)) => *action,
+                        None => {
+                            missing.get_or_insert(signal);
+                            None
+                        }
+                    },
+                );
+            match (resolved, missing) {
+                (Err(_), Some(signal)) => {
+                    let action = crate::syscalls::helpers::caught_action(guest, signal)
+                        .await
+                        .ok();
+                    actions.push((signal, action));
+                }
+                (resolved, _) => break resolved,
+            }
+        };
+        match resolved {
+            Ok(end) => end,
+            Err(unknown) => {
+                let reason = crate::refused_signal_controls::caught_action_unreadable_refusal(
+                    call.number().name(),
+                    unknown.caught,
+                    unknown.behind,
+                    guest.thread_state().dettid.as_raw(),
+                );
+                tracing::error!("{}", reason);
+                crate::tool_global::stopping_refusal(guest, reason).await;
+                crate::wait_signal_end::WaitSignalEnd::Fatal(unknown.behind)
+            }
+        }
+    }
+
     /// The restart checkpoint (A5 step 3c.1c, design D40, with IR-2's
     /// placement): run straight after the dispatch `match`, before every
     /// observer of the result (`fail_on_tool_decided_injection`,
@@ -803,6 +855,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// |---|---|---|---|
     /// | a restart code | `Fatal` | `-EINTR` | interrupted, with the code |
     /// | a restart code | `Caught(sig)` | the x86 restart table with `sig`'s flags | a checkpoint |
+    /// | a restart code | `BehindCaught` | resolved first by the caught handlers' masks (below), then the `Fatal` or `Caught` row | as that row |
     /// | `-ERESTARTSYS` | none | unchanged: the in-guest runtime re-runs it | interrupted |
     /// | `-ERESTARTNOINTR`, `-ERESTARTNOHAND`, `-ERESTART_RESTARTBLOCK` | none | the run ends (D49) | — |
     /// | anything else | any | unchanged | as before |
@@ -820,6 +873,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// needs is step 3c.2's. Returns the guest's result and, for the fatal
     /// row, the original code for the posthook checkpoint. With the gate off
     /// it returns `res` and nothing, and the flag is never set.
+    ///
+    /// A `BehindCaught` end (a caught signal first, a core-dumping one
+    /// deliverable behind it) is resolved here, in the thread's own turn just
+    /// before the guest would resume, where Linux's delivery loop runs: each
+    /// caught action the loop sets up before it could reach the default-fatal
+    /// signal is read with a query `rt_sigaction`, in that order, and its
+    /// `sa_mask` (and the signal, unless `SA_NODEFER`) added to the blocked
+    /// mask (`DequeueWalk::resolve`). An action that cannot be read fails
+    /// closed: the stopping refusal HERMIT_CAUGHT_ACTION_UNREADABLE (D49),
+    /// which ends the run under the gate; were it to return, the end is
+    /// `Fatal` with the default-fatal signal.
     async fn wait_end_checkpoint<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -837,6 +901,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(*errno)
             }
             _ => None,
+        };
+        let end = match (end, code) {
+            (Some(WaitSignalEnd::BehindCaught(walk)), Some(_)) => {
+                Some(self.resolve_wait_end(guest, call, walk).await)
+            }
+            (end, _) => end,
         };
         match (end, code) {
             (Some(WaitSignalEnd::Fatal(_)), Some(code)) => (Err(Errno::EINTR.into()), Some(code)),

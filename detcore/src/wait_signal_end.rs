@@ -34,6 +34,7 @@
 //! one is refused (step 3c.0a).
 
 use crate::syscalls::KernelSignalState;
+use crate::syscalls::SignalQueue;
 use crate::syscalls::kernel_sigset_bit;
 
 /// What ended a wait for a signal under the in-guest delivery gate: D40's
@@ -46,8 +47,9 @@ pub(crate) enum WaitSignalEnd {
     /// call: the guest result is `-EINTR`, and the original restart code is
     /// what the happens-before checkpoint records (IR-2). Either a
     /// non-core-dumping default-fatal signal is deliverable (the first such
-    /// one Linux would dequeue), or the first signal Linux would dequeue is a
-    /// core-dumping default-fatal one ([`classify`]).
+    /// one Linux would dequeue), or Linux's delivery loop reaches a
+    /// core-dumping default-fatal one that no mask blocks ([`classify`],
+    /// [`DequeueWalk::resolve`]).
     ///
     /// The signal is not the exit status for a non-core-dumping end: Linux
     /// takes that from `group_exit_code`, the first such signal SENT, which
@@ -55,13 +57,119 @@ pub(crate) enum WaitSignalEnd {
     /// (kernel/signal.c:1041-1049 at v6.12), not the first one dequeued.
     /// Step 3c.1e, which takes the death's status, must use the send order.
     Fatal(i32),
-    /// The first signal Linux would dequeue is caught and no
-    /// non-core-dumping default-fatal signal is deliverable: that signal's
-    /// handler runs at the return, and the call's result goes through the x86
-    /// restart table with that action's flags
-    /// (`signal_restart::caught_signal_return`). A core-dumping signal also
-    /// deliverable is dequeued later, after the handler.
+    /// The first signal Linux would dequeue is caught, and Linux's delivery
+    /// loop reaches no default-fatal signal: either none is deliverable, or
+    /// the masks of the handlers it sets up before reaching one block it.
+    /// That first signal's handler runs at the return, and the call's result
+    /// goes through the x86 restart table with that action's flags
+    /// (`signal_restart::caught_signal_return`).
     Caught(i32),
+    /// The first signal Linux would dequeue is caught and a core-dumping
+    /// default-fatal signal is deliverable behind it: whether the process
+    /// dies at the return depends on the masks of the handlers Linux sets up
+    /// first, which the restart checkpoint reads in the thread's own turn
+    /// and resolves to `Fatal` or `Caught` ([`DequeueWalk::resolve`]).
+    BehindCaught(DequeueWalk),
+}
+
+/// The parts of a caught signal's action that decide what Linux blocks
+/// while its handler is set up, and the restart table's flags: its
+/// `sa_mask` and `sa_flags`, as a query `rt_sigaction` reads them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CaughtAction {
+    pub(crate) mask: u64,
+    pub(crate) flags: u64,
+}
+
+/// A caught signal's action that the checkpoint could not read while a
+/// default-fatal signal stays deliverable behind it
+/// ([`DequeueWalk::resolve`]): `caught` is the signal whose action is
+/// missing, `behind` the default-fatal signal Linux could reach next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ActionUnknown {
+    pub(crate) caught: i32,
+    pub(crate) behind: i32,
+}
+
+/// The input of Linux's delivery loop at a wait's end, for a
+/// [`WaitSignalEnd::BehindCaught`]: the deliverable signals on the thread's
+/// private queue and on the shared queue, which of them are default-fatal,
+/// and the guest's mask they were found under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DequeueWalk {
+    thread: u64,
+    shared: u64,
+    fatal: u64,
+    mask: u64,
+}
+
+impl DequeueWalk {
+    /// Linux's delivery loop over this walk (v6.12). At the return to user
+    /// mode `exit_to_user_mode_loop` calls `arch_do_signal_or_restart` for as
+    /// long as a signal is pending and unblocked (kernel/entry/common.c:
+    /// 97-130; arch/x86/kernel/signal.c:333-341), before any user
+    /// instruction runs. Each `get_signal` dequeues the next signal in order
+    /// (private queue first, then synchronous signals, then the lowest
+    /// number; kernel/signal.c:634-639, :196-218). For a caught one,
+    /// `handle_signal` sets up its frame and `signal_delivered`
+    /// (kernel/signal.c:2941-2954) adds the action's `sa_mask`, and the
+    /// signal itself unless `SA_NODEFER`, to the blocked mask, and the loop
+    /// goes on; a default-fatal one not blocked by then ends the process
+    /// (:2878-2906) without any handler running. So the end is `Fatal` with
+    /// the first default-fatal signal the loop reaches, or `Caught` with the
+    /// first caught signal when the accumulated masks block every
+    /// default-fatal one. `action` gives a caught signal's action; it is
+    /// asked only while a default-fatal signal is still deliverable, and a
+    /// `None` then is [`ActionUnknown`].
+    ///
+    /// `SA_NODEFER` cannot change the outcome: it only leaves the delivered
+    /// signal itself unblocked, which is caught, so at most another copy of it
+    /// is delivered with the same mask; it never unblocks a default-fatal
+    /// signal. It is applied as Linux applies it all the same.
+    pub(crate) fn resolve(
+        &self,
+        mut action: impl FnMut(i32) -> Option<CaughtAction>,
+    ) -> Result<WaitSignalEnd, ActionUnknown> {
+        let mut blocked = self.mask;
+        let (mut thread, mut shared) = (self.thread, self.shared);
+        let mut first = None;
+        let queued = |thread: u64, shared: u64, set: u64| KernelSignalState {
+            pending: (thread | shared) & set,
+            thread_pending: thread & set,
+            shared_pending: shared & set,
+            ..KernelSignalState::default()
+        };
+        while let Some((signal, queue)) = queued(thread, shared, !0).next_dequeued(blocked) {
+            let bit = kernel_sigset_bit(signal);
+            if self.fatal & bit != 0 {
+                return Ok(WaitSignalEnd::Fatal(signal));
+            }
+            let first = *first.get_or_insert(signal);
+            match queue {
+                SignalQueue::Thread => thread &= !bit,
+                SignalQueue::Shared => shared &= !bit,
+            }
+            if (thread | shared) & self.fatal & !blocked == 0 {
+                return Ok(WaitSignalEnd::Caught(first));
+            }
+            let Some(caught) = action(signal) else {
+                let behind = queued(thread, shared, self.fatal)
+                    .next_dequeued(blocked)
+                    .map_or(0, |(signal, _)| signal);
+                return Err(ActionUnknown {
+                    caught: signal,
+                    behind,
+                });
+            };
+            blocked |= caught.mask;
+            if caught.flags & libc::SA_NODEFER as u64 == 0 {
+                blocked |= bit;
+            }
+        }
+        Ok(WaitSignalEnd::Caught(
+            first.expect("a walk starts with a deliverable caught signal"),
+        ))
+    }
 }
 
 /// The signals whose default action ends the process (terminate or dump core)
@@ -87,8 +195,8 @@ pub(crate) fn deliverable(state: &KernelSignalState, mask: u64, reserved: u64) -
 }
 
 /// What a wait that `deliverable` (a non-empty subset of the design's set for
-/// `state`) ends means for the call's result, or `None` when nothing ends it,
-/// in Linux's order (v6.12):
+/// `state` under the guest's mask `mask`) ends means for the call's result,
+/// or `None` when nothing ends it, in Linux's order (v6.12):
 ///
 /// 1. A deliverable default-fatal signal that does not dump core makes it
 ///    `Fatal`: `complete_signal` starts the group exit when such a signal is
@@ -98,14 +206,20 @@ pub(crate) fn deliverable(state: &KernelSignalState, mask: u64, reserved: u64) -
 ///    named is the first such one Linux would dequeue (see `Fatal` for the
 ///    exit status).
 /// 2. Otherwise the first deliverable signal in `get_signal`'s dequeue order
-///    decides: `dequeue_signal` takes the thread's private queue before the
-///    shared one (kernel/signal.c:634-639), and `next_signal` the synchronous
-///    signals first, then the lowest number (:196-218); here
-///    `KernelSignalState::next_dequeued`. A caught one is `Caught`, even when
-///    a core-dumping signal is also deliverable: its handler runs first, and
-///    the core-dumping signal is dequeued after it. A core-dumping one is
-///    `Fatal`: `get_signal` ends the process for it (:2881-2905).
-pub(crate) fn classify(state: &KernelSignalState, deliverable: u64) -> Option<WaitSignalEnd> {
+///    comes first: `dequeue_signal` takes the thread's private queue before
+///    the shared one (kernel/signal.c:634-639), and `next_signal` the
+///    synchronous signals first, then the lowest number (:196-218); here
+///    `KernelSignalState::next_dequeued`. A core-dumping one is `Fatal`:
+///    `get_signal` ends the process for it (:2881-2905). A caught one is
+///    `Caught` when no default-fatal signal is deliverable; when a
+///    core-dumping one is, the end depends on the masks of the handlers Linux
+///    sets up before reaching it, so it is `BehindCaught`, which the restart
+///    checkpoint resolves ([`DequeueWalk::resolve`]).
+pub(crate) fn classify(
+    state: &KernelSignalState,
+    deliverable: u64,
+    mask: u64,
+) -> Option<WaitSignalEnd> {
     if deliverable == 0 {
         return None;
     }
@@ -124,6 +238,13 @@ pub(crate) fn classify(state: &KernelSignalState, deliverable: u64) -> Option<Wa
     let (signal, _) = among(deliverable).next_dequeued(0)?;
     if fatal & kernel_sigset_bit(signal) != 0 {
         Some(WaitSignalEnd::Fatal(signal))
+    } else if fatal != 0 {
+        Some(WaitSignalEnd::BehindCaught(DequeueWalk {
+            thread: state.thread_pending & deliverable,
+            shared: state.shared_pending & deliverable,
+            fatal,
+            mask,
+        }))
     } else {
         Some(WaitSignalEnd::Caught(signal))
     }
@@ -178,7 +299,7 @@ pub(crate) fn wait_end_with_virtual(
         ignored: state.ignored & !virtual_caught,
         ..*state
     };
-    classify(&state, deliverable)
+    classify(&state, deliverable, mask)
 }
 
 /// Whether `errno` is one of the kernel's internal restart codes
@@ -330,36 +451,147 @@ mod tests {
         }
     }
 
-    /// Rule 2 with a caught signal first: its handler runs before a
-    /// core-dumping signal also deliverable is dequeued, so the end is
-    /// `Caught`. Mutations: "any default-fatal signal makes the end fatal" (the
-    /// rule before this round) and "the lowest number across both queues" (the
-    /// private queue not first): each row becomes `Fatal(SIGQUIT)`.
-    #[test]
-    fn a_caught_signal_dequeued_before_a_core_dumping_one_makes_the_end_caught() {
-        for (name, thread, shared, caught, end) in [
-            (
-                "a private caught signal before a shared, lower-numbered SIGQUIT",
-                bit(libc::SIGUSR2),
-                bit(libc::SIGQUIT),
-                bit(libc::SIGUSR2),
-                libc::SIGUSR2,
-            ),
-            (
-                "both private, the caught one lower-numbered",
-                bit(libc::SIGHUP) | bit(libc::SIGQUIT),
-                0,
-                bit(libc::SIGHUP),
-                libc::SIGHUP,
-            ),
-        ] {
-            let s = state(thread, shared, 0, caught);
-            assert_eq!(
-                wait_end(&s, 0, 0),
-                Some(WaitSignalEnd::Caught(end)),
-                "{name}"
-            );
+    /// A caught action for the walk's lookups: `mask`, and `SA_NODEFER` or not.
+    fn action(mask: u64, nodefer: bool) -> CaughtAction {
+        CaughtAction {
+            mask,
+            flags: if nodefer { libc::SA_NODEFER as u64 } else { 0 },
         }
+    }
+
+    /// The walk a `BehindCaught` end carries, for `state` and `mask`.
+    fn walk(state: &KernelSignalState, mask: u64) -> DequeueWalk {
+        match classify(state, deliverable(state, mask, 0), mask) {
+            Some(WaitSignalEnd::BehindCaught(walk)) => walk,
+            other => panic!("not a walk: {other:?}"),
+        }
+    }
+
+    /// Rule 2 with a caught signal first and a core-dumping one deliverable
+    /// behind it (Claude review round 2): Linux sets up the caught handler and
+    /// goes on delivering under its `sa_mask` (signal_delivered,
+    /// kernel/signal.c:2941-2954), so the core-dumping signal ends the
+    /// process unless that mask, or a later handler's, holds it. Rows: (a) the
+    /// handler's mask blocks it, `Caught` (a private caught signal before a
+    /// shared, lower-numbered SIGQUIT; both private, the caught one
+    /// lower-numbered); (b) it does not, `Fatal`; (c) `SA_NODEFER` or not, the
+    /// same end; (d) two caught signals whose masks together block it,
+    /// `Caught`. Mutations: "the handler's sa_mask ignored" ((a), (d) become
+    /// `Fatal`), "only the first handler's mask" ((d) becomes `Fatal`), "any
+    /// default-fatal signal makes the end fatal" ((a), (d)), "the lowest
+    /// number across both queues" (the first (a) row becomes `Fatal(SIGQUIT)`
+    /// at classification).
+    #[test]
+    fn a_caught_signal_dequeued_before_a_core_dumping_one_is_resolved_by_the_handlers_masks() {
+        let (hup, usr1, usr2) = (bit(libc::SIGHUP), bit(libc::SIGUSR1), bit(libc::SIGUSR2));
+        let (quit, xcpu) = (bit(libc::SIGQUIT), bit(libc::SIGXCPU));
+        type Actions = &'static [(i32, u64, bool)];
+        let rows: [(&str, u64, u64, u64, Actions, WaitSignalEnd); 7] = [
+            (
+                "(a) the private caught signal's mask blocks a shared SIGQUIT",
+                usr2,
+                quit,
+                usr2,
+                &[(libc::SIGUSR2, 1 << (libc::SIGQUIT - 1), false)],
+                WaitSignalEnd::Caught(libc::SIGUSR2),
+            ),
+            (
+                "(a) both private, the caught one's mask blocks SIGQUIT",
+                hup | quit,
+                0,
+                hup,
+                &[(libc::SIGHUP, 1 << (libc::SIGQUIT - 1), false)],
+                WaitSignalEnd::Caught(libc::SIGHUP),
+            ),
+            (
+                "(b) the caught signal's mask does not block SIGQUIT",
+                hup | quit,
+                0,
+                hup,
+                &[(libc::SIGHUP, 1 << (libc::SIGUSR1 - 1), false)],
+                WaitSignalEnd::Fatal(libc::SIGQUIT),
+            ),
+            (
+                "(c) SA_NODEFER, mask blocking SIGQUIT",
+                hup | quit,
+                0,
+                hup,
+                &[(libc::SIGHUP, 1 << (libc::SIGQUIT - 1), true)],
+                WaitSignalEnd::Caught(libc::SIGHUP),
+            ),
+            (
+                "(c) SA_NODEFER, mask not blocking SIGQUIT",
+                hup | quit,
+                0,
+                hup,
+                &[(libc::SIGHUP, 0, true)],
+                WaitSignalEnd::Fatal(libc::SIGQUIT),
+            ),
+            (
+                "(d) two caught signals whose masks together block SIGXCPU",
+                hup | usr1 | xcpu,
+                0,
+                hup | usr1,
+                &[
+                    (libc::SIGHUP, 0, false),
+                    (libc::SIGUSR1, 1 << (libc::SIGXCPU - 1), false),
+                ],
+                WaitSignalEnd::Caught(libc::SIGHUP),
+            ),
+            (
+                "(d) neither mask blocks SIGXCPU",
+                hup | usr1 | xcpu,
+                0,
+                hup | usr1,
+                &[(libc::SIGHUP, 0, false), (libc::SIGUSR1, 0, false)],
+                WaitSignalEnd::Fatal(libc::SIGXCPU),
+            ),
+        ];
+        for (name, thread, shared, caught, actions, end) in rows {
+            let s = state(thread, shared, 0, caught);
+            let walk = walk(&s, 0);
+            let resolved = walk.resolve(|signal| {
+                actions
+                    .iter()
+                    .find(|(known, _, _)| *known == signal)
+                    .map(|(_, mask, nodefer)| action(*mask, *nodefer))
+            });
+            assert_eq!(resolved, Ok(end), "{name}");
+        }
+        // The SA_NODEFER rows give the same ends as without it.
+        let s = state(hup | quit, 0, 0, hup);
+        for mask in [0, quit] {
+            let with = walk(&s, 0).resolve(|_| Some(action(mask, true)));
+            let without = walk(&s, 0).resolve(|_| Some(action(mask, false)));
+            assert_eq!(with, without, "mask {mask:#x}");
+        }
+    }
+
+    /// (e) An action the checkpoint cannot read while a default-fatal signal
+    /// is still deliverable behind its caught signal is `ActionUnknown`, which
+    /// the checkpoint fails closed on; one it no longer needs is not asked
+    /// for (the first handler's mask already holds the default-fatal signal).
+    /// Mutation "no fail-closed" (a missing action taken as an empty mask):
+    /// the unknown row becomes `Fatal(SIGQUIT)`.
+    #[test]
+    fn an_unreadable_caught_action_with_a_fatal_signal_behind_it_is_unknown() {
+        let (hup, usr1, quit) = (bit(libc::SIGHUP), bit(libc::SIGUSR1), bit(libc::SIGQUIT));
+        let s = state(hup | quit, 0, 0, hup);
+        assert_eq!(
+            walk(&s, 0).resolve(|_| None),
+            Err(ActionUnknown {
+                caught: libc::SIGHUP,
+                behind: libc::SIGQUIT,
+            })
+        );
+        let s = state(hup | usr1 | quit, 0, 0, hup | usr1);
+        let mut asked = Vec::new();
+        let resolved = walk(&s, 0).resolve(|signal| {
+            asked.push(signal);
+            (signal == libc::SIGHUP).then_some(action(quit, false))
+        });
+        assert_eq!(resolved, Ok(WaitSignalEnd::Caught(libc::SIGHUP)));
+        assert_eq!(asked, [libc::SIGHUP]);
     }
 
     /// Rule 2 with a core-dumping signal first: `get_signal` ends the process

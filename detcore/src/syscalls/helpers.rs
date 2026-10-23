@@ -3049,6 +3049,23 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
+    Ok(caught_action(guest, signal).await?.flags)
+}
+
+/// The `sa_mask` and `sa_flags` of `signal`'s current action, as the guest set
+/// it, read in this thread's turn with a query `rt_sigaction` (the in-guest
+/// runtime answers it from the guest's action, phase 1's virtual SIGALRM
+/// included): for the restart checkpoint's resolution of a
+/// `WaitSignalEnd::BehindCaught` (A5 design D40) and its caught row. Called
+/// only where the thread holds no committed scratch stack.
+pub(crate) async fn caught_action<T, G>(
+    guest: &mut G,
+    signal: i32,
+) -> Result<crate::wait_signal_end::CaughtAction, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
     let mut stack = guest.stack().await;
     let action = stack.reserve::<KernelSigaction>();
     let _stack_guard = stack.commit()?;
@@ -3062,7 +3079,10 @@ where
         )
         .await?;
     let action: KernelSigaction = guest.memory().read_value(action)?;
-    Ok(action.flags)
+    Ok(crate::wait_signal_end::CaughtAction {
+        mask: action.mask,
+        flags: action.flags,
+    })
 }
 
 /// Whether the scheduler keeps a guest mask that differs from the kernel's
