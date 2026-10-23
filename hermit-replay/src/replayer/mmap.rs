@@ -21,7 +21,10 @@
 //! in order to get a blank memory map of the right size. We can then fill this
 //! with the previously recorded bytes.
 
+use std::collections::HashMap;
 use std::os::unix::fs::FileExt;
+use std::sync::Mutex;
+use std::sync::OnceLock;
 
 use reverie::Errno;
 use reverie::Guest;
@@ -31,12 +34,115 @@ use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Mmap;
 use reverie::syscalls::Mprotect;
+use reverie::syscalls::Mremap;
 use reverie::syscalls::ProtFlags;
 
 use super::Replayer;
 use crate::event::MadviseRefill;
+use crate::event::SharedMapping;
 
 const PAGE_SIZE: usize = 4096;
+
+/// A replay mapping of a shared file, which later mappings of the file in the
+/// same process alias.
+#[derive(Debug, Clone, Copy)]
+struct SharedReplayMapping {
+    address: usize,
+    /// Page-rounded length.
+    length: usize,
+    /// Offset in the file.
+    offset: u64,
+    /// Inode of the anonymous shared memory backing it, which tells whether
+    /// the mapping is still in place.
+    memory: u64,
+}
+
+/// A shared file as one replayed process maps it: the process, and the
+/// file's identity in the recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct SharedFile {
+    pid: i32,
+    device: u64,
+    inode: u64,
+}
+
+impl SharedFile {
+    fn new(pid: i32, shared: SharedMapping) -> Self {
+        Self {
+            pid,
+            device: shared.device,
+            inode: shared.inode,
+        }
+    }
+}
+
+type SharedReplayMappings = HashMap<SharedFile, Vec<SharedReplayMapping>>;
+
+/// Replay mappings of each shared file.
+fn shared_replay_mappings() -> &'static Mutex<SharedReplayMappings> {
+    static MAPPINGS: OnceLock<Mutex<SharedReplayMappings>> = OnceLock::new();
+    MAPPINGS.get_or_init(Default::default)
+}
+
+fn remember_shared_mapping(
+    pid: i32,
+    shared: SharedMapping,
+    address: usize,
+    len: usize,
+    memory: u64,
+) {
+    shared_replay_mappings()
+        .lock()
+        .expect("should not be poisoned: no code panics while holding it")
+        .entry(SharedFile::new(pid, shared))
+        .or_default()
+        .push(SharedReplayMapping {
+            address,
+            length: len.next_multiple_of(PAGE_SIZE),
+            offset: shared.offset,
+            memory,
+        });
+}
+
+/// An address in a replay mapping of `shared`'s file in process `pid`, still
+/// in place, that covers `len` bytes from `shared.offset`, with the inode of
+/// its shared memory. The latest such mapping wins.
+fn shared_source(pid: i32, shared: SharedMapping, len: usize) -> Option<(usize, u64)> {
+    let mappings = shared_replay_mappings()
+        .lock()
+        .expect("should not be poisoned: no code panics while holding it")
+        .get(&SharedFile::new(pid, shared))
+        .cloned()
+        .unwrap_or_default();
+    let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).ok()?;
+    mappings.iter().rev().find_map(|mapping| {
+        let delta = usize::try_from(shared.offset.checked_sub(mapping.offset)?).ok()?;
+        if delta % PAGE_SIZE != 0
+            || delta.checked_add(len)? > mapping.length
+            || shared_memory_at(&maps, mapping.address) != Some(mapping.memory)
+        {
+            return None;
+        }
+        Some((mapping.address + delta, mapping.memory))
+    })
+}
+
+/// The inode of the shared memory mapped at `address` in a `/proc/<pid>/maps`
+/// listing, if a shared mapping starts there.
+fn shared_memory_at(maps: &str, address: usize) -> Option<u64> {
+    maps.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let (start, _) = fields.next()?.split_once('-')?;
+        let perms = fields.next()?;
+        let _offset = fields.next()?;
+        let _device = fields.next()?;
+        let inode = fields.next()?;
+        if usize::from_str_radix(start, 16).ok()? != address || !perms.ends_with('s') {
+            return None;
+        }
+        inode.parse().ok()
+    })
+}
 
 impl Replayer {
     pub(super) async fn handle_mmap<G: Guest<Self>>(
@@ -60,6 +166,14 @@ impl Replayer {
 
         let len = syscall.len();
         let prot = syscall.prot();
+
+        if let Some(shared) = event.shared
+            && let Some(ptr) = self
+                .alias_shared_mapping(guest, event.addr, shared, len, prot)
+                .await?
+        {
+            return Ok(ptr);
+        }
 
         // On replay, we can't actually map the original file because it may not
         // exist. Instead, change this to be an anonymous mapping and write the
@@ -103,7 +217,83 @@ impl Replayer {
                 .await?;
         }
 
+        if let Some(shared) = event.shared
+            && flags.contains(MapFlags::MAP_SHARED)
+        {
+            let pid = guest.pid().as_raw();
+            let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
+            if let Some(memory) = shared_memory_at(&maps, event.addr) {
+                remember_shared_mapping(pid, shared, event.addr, len, memory);
+            }
+        }
+
         Ok(ptr)
+    }
+    /// Replays a `MAP_SHARED` mapping of a file this process already mapped
+    /// as an alias of that earlier mapping, so that writes through either
+    /// appear in both, as they did in the recording. Replay maps a file as
+    /// anonymous memory, so separate mappings would otherwise be separate
+    /// copies: one thread's writes to a memfd shared with another through two
+    /// mappings never reached the other. Returns `None`, and maps nothing, when
+    /// no earlier mapping in place covers the range; mappings made by different
+    /// processes stay separate copies.
+    async fn alias_shared_mapping<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        address: usize,
+        shared: SharedMapping,
+        len: usize,
+        prot: ProtFlags,
+    ) -> Result<Option<i64>, Errno> {
+        let pid = guest.pid().as_raw();
+        let Some((source, memory)) = shared_source(pid, shared, len) else {
+            return Ok(None);
+        };
+        // Take the recorded address the way an unaliased replay mapping does,
+        // as a hint that must be honored, so a diverged address space fails
+        // here rather than having a mapping replaced under it.
+        let placeholder = guest
+            .inject_with_retry(
+                Mmap::new()
+                    .with_addr(AddrMut::<libc::c_void>::from_raw(address).map(Into::into))
+                    .with_len(len)
+                    .with_prot(ProtFlags::PROT_NONE)
+                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                    .with_fd(-1)
+                    .with_offset(0),
+            )
+            .await?;
+        assert_eq!(
+            placeholder as usize, address,
+            "Failed to inject mmap at desired address"
+        );
+        // A zero old length asks Linux for a second mapping of the same shared
+        // pages, which replaces the placeholder. The new mapping takes the
+        // source's protection, so it is set below.
+        let ptr = guest
+            .inject_with_retry(
+                Mremap::new()
+                    .with_addr(AddrMut::from_raw(source))
+                    .with_old_len(0)
+                    .with_new_len(len)
+                    .with_flags((libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED) as usize)
+                    .with_new_addr(AddrMut::from_raw(address)),
+            )
+            .await?;
+        assert_eq!(
+            ptr as usize, address,
+            "Failed to alias a shared mapping at the recorded address"
+        );
+        guest
+            .inject_with_retry(
+                Mprotect::new()
+                    .with_addr(AddrMut::from_raw(address).map(|addr: AddrMut<u8>| addr.cast()))
+                    .with_len(len)
+                    .with_protection(prot),
+            )
+            .await?;
+        remember_shared_mapping(pid, shared, address, len, memory);
+        Ok(Some(ptr))
     }
 
     /// Replays a guest-semantic `madvise` recorded by the recorder's

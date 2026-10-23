@@ -4724,6 +4724,30 @@ fn record_replay_keeps_eventfds_received_over_scm_rights_coherent() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// `MAP_SHARED` mappings of one memfd in one process (see
+/// `tests/c/record_replay_scm_rights.c memfd`): two whole mappings, one at an
+/// offset through the descriptor received over a socketpair, and one a thread
+/// makes. Replay maps a recorded file mapping as anonymous memory filled with
+/// the recorded bytes, so each mapping used to be a separate copy, and a write
+/// through one never reached the others; the guest then read stale bytes, took
+/// another path and replay diverged. Replay now aliases a later mapping of the
+/// file to the earlier replay mapping that covers it. Both phases must print
+/// what a native run prints.
+#[test]
+fn record_replay_shares_memory_between_mappings_of_one_memfd() {
+    let _guard = hermit_record_lock();
+    let failures = record_replay_output_failures(
+        "scm-rights-memfd",
+        &workload("c_record_replay_scm_rights").path,
+        &["memfd"],
+        "memfd: second sees hello\n\
+         memfd: first sees helloworld\n\
+         memfd: offset mapping reaches page two\n\
+         memfd: thread's mapping reaches helloworldthread\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// A guest that accepts its own loopback TCP connections (see
 /// `tests/c/record_replay_tcp_accept.c`). Record used to let `accept(2)` and
 /// `accept4(2)` run live and logged nothing, so replay issued them against a
