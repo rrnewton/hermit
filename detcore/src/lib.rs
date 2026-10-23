@@ -4165,8 +4165,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
         // A FIFO open's path page that a killed task of this address space
         // left mapped goes before this call runs (and, below, before a call
-        // that was waiting returns).
-        Self::unmap_orphaned_staging_pages(guest).await;
+        // that was waiting returns). The flag is the load the cleanup tests
+        // first; read here, it also spares building the cleanup's future
+        // while no page is left.
+        if crate::fifo_peer::any_orphaned_page() {
+            Self::unmap_orphaned_staging_pages(guest).await;
+        }
         crate::syscalls::signal_shadow::at_syscall_entry(guest);
         // Until Detcore finishes it, the kernel may run it (A5 step 3.2).
         guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::KernelRun {
@@ -4421,14 +4425,29 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             self.record_untraced_code_change(guest, &call).await;
         }
 
+        // The file and descriptor checks below act only on a call that may
+        // name a file or a descriptor; for any other (getpid, futex,
+        // clock_gettime, ...) each answers its trivial value with no effect,
+        // so they are skipped, futures and all. The test reads the syscall
+        // number only (`may_name_file_or_descriptor`); no scheduler request,
+        // logical-time update or turn moves.
+        let may_name_files = crate::syscalls::may_name_file_or_descriptor(call.number());
         // The inodes whose last name this call removes, stat'ed before it runs
         // and retired once it succeeds, so that a host reusing one cannot hand
         // a new file the old file's number
         // (https://github.com/rrnewton/hermit/issues/3840).
-        let removed_inodes = self.last_names_removed_by(guest, &call).await;
+        let removed_inodes = if may_name_files {
+            self.last_names_removed_by(guest, &call).await
+        } else {
+            Vec::new()
+        };
         // The guest-made FIFOs whose name this call removes, forgotten once it
         // succeeds (https://github.com/rrnewton/hermit/issues/2203).
-        let removed_guest_fifos = self.guest_made_fifos_removed_by(guest, &call).await;
+        let removed_guest_fifos = if may_name_files {
+            self.guest_made_fifos_removed_by(guest, &call).await
+        } else {
+            Vec::new()
+        };
 
         // Only an emulated RNG readv supplies authoritative imported geometry.
         // A generic pre-dispatch snapshot would become stale across pipe waits.
@@ -4446,13 +4465,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // A rendered procfs descriptor that reached this table over
         // SCM_RIGHTS is adopted as the file it is before anything answers a
         // call through it.
-        let adoption = if sigalrm_refusal.is_none() {
+        let adoption = if sigalrm_refusal.is_none() && may_name_files {
             self.adopt_received_placeholders(guest, &call).await
         } else {
             Ok(())
         };
         let rendered_procfs_answer = if let Err(error) = adoption {
             Some(Err(error))
+        } else if sigalrm_refusal.is_none() && !may_name_files {
+            // The `/proc` device is still taken where the level check would
+            // have taken it first.
+            crate::syscalls::take_proc_device();
+            None
         } else if sigalrm_refusal.is_none() {
             match self
                 .refuse_procfs_name_outside_level(guest, &call)
@@ -5485,7 +5509,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         {
             self.note_fd_readied(guest, fd, wants).await;
         }
-        Self::unmap_orphaned_staging_pages(guest).await;
+        if crate::fifo_peer::any_orphaned_page() {
+            Self::unmap_orphaned_staging_pages(guest).await;
+        }
 
         // With asynchronous exit completion, a descriptor that would make this
         // guest serve another guest's exit ends the run before anything

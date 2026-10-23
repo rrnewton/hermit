@@ -120,6 +120,28 @@ pub(crate) fn any_guest_made() -> bool {
     !GUEST_MADE.lock().unwrap().is_empty()
 }
 
+/// A set of guest-made FIFOs, as a removal consults it
+/// (`Detcore::guest_made_fifos_removed_from`).
+pub(crate) trait GuestMadeFifos {
+    /// Whether the set has any FIFO ([`any_guest_made`]).
+    fn any(&self) -> bool;
+    /// Whether the set has `fifo` ([`is_guest_made`]).
+    fn contains(&self, fifo: (u64, u64)) -> bool;
+}
+
+/// The run's guest-made FIFOs ([`GUEST_MADE`]).
+pub(crate) struct GuestMadeRegistry;
+
+impl GuestMadeFifos for GuestMadeRegistry {
+    fn any(&self) -> bool {
+        any_guest_made()
+    }
+
+    fn contains(&self, fifo: (u64, u64)) -> bool {
+        is_guest_made(fifo)
+    }
+}
+
 /// The guest blocking opens of each FIFO waiting, in polling turns, for the
 /// other end ([`PendingOpen`]). On Linux a blocking open counts as a reader
 /// or writer while it waits, so a waiting reader completes a writer's open
@@ -709,6 +731,13 @@ impl Drop for StagedPage {
 fn leave_orphaned_page(page: OrphanedPage) {
     ORPHANED_PAGES.lock().unwrap().push(page);
     ANY_ORPHANED_PAGE.store(true, Ordering::SeqCst);
+}
+
+/// Whether a page may be left ([`ANY_ORPHANED_PAGE`]): the load
+/// [`take_orphaned_pages`] makes first, which answers no page while it is
+/// false.
+pub(crate) fn any_orphaned_page() -> bool {
+    ANY_ORPHANED_PAGE.load(Ordering::SeqCst)
 }
 
 /// The pages ([`ORPHANED_PAGES`]) left in the address space `mm`, each

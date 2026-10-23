@@ -2749,7 +2749,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool matches NoopTool, a custom record tool without an impl still
     // answers forwarded calls, and the hot-path future size bounds) and
     // scheduler::replayer::tests::a_hard_desync_names_the_fields_that_differ: 2427, listed.
-    ("test.detcore_unit", 2427),
+    // And the four syscalls::files::prefilter_tests units (the prefilter is
+    // the union of each check's syscalls, each check's syscalls are its own
+    // table's, every prefiltered call is one each check answers trivially, a
+    // representative call of each check still reaches it): 2431, listed.
+    ("test.detcore_unit", 2431),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4845,7 +4849,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same slice 3c.1b rejoin-publication unit: 2423, listed.
     // And the same three syscall_hot_path_tests units and the replayer's
     // hard-desync field unit: 2427, listed.
-    ("test.detcore_unit_on_host", 2427),
+    // And the same four prefilter_tests units: 2431, listed.
+    ("test.detcore_unit_on_host", 2431),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -83,6 +83,8 @@ use crate::tool_local::Detcore;
 use crate::tool_local::finish_partial_record_or_replay_write;
 use crate::types::*;
 
+#[cfg(test)]
+mod prefilter_tests;
 pub(crate) mod procfs_levels;
 pub(crate) mod procfs_numbers;
 pub(crate) mod rendered_procfs;
@@ -1115,6 +1117,76 @@ fn resolved_at_fdcwd_path(pid: i32, path: &Path) -> Option<PathBuf> {
     let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
     let guest_cwd = cwd.strip_prefix(root).ok()?;
     Some(Path::new("/").join(guest_cwd).join(path))
+}
+
+/// A name `call` removes, as `(dirfd, path)`.
+type RemovedName<'a> = (RawFd, Option<PathPtr<'a>>);
+
+/// The name `call` removes and, for a rename, its source, which replaces
+/// nothing when it is the target's own file: the name an `unlink`,
+/// `unlinkat` or (with `with_rmdir`) `rmdir` removes, or the target a
+/// `rename`, `renameat` or `renameat2` replaces (not with
+/// `RENAME_EXCHANGE`). `None` for every other call. What
+/// [`Detcore::last_names_removed_by`] (with `rmdir`) and
+/// [`Detcore::guest_made_fifos_removed_by`] (without) look up.
+fn removed_names<'a>(
+    call: &'a Syscall,
+    with_rmdir: bool,
+) -> Option<(RemovedName<'a>, Option<RemovedName<'a>>)> {
+    let at = libc::AT_FDCWD;
+    Some(match call {
+        #[cfg(not(target_arch = "aarch64"))]
+        Syscall::Unlink(c) => ((at, c.path()), None),
+        Syscall::Unlinkat(c) => ((c.dirfd(), c.path()), None),
+        #[cfg(not(target_arch = "aarch64"))]
+        Syscall::Rmdir(c) if with_rmdir => ((at, c.path()), None),
+        #[cfg(not(target_arch = "aarch64"))]
+        Syscall::Rename(c) => ((at, c.newpath()), Some((at, c.oldpath()))),
+        Syscall::Renameat(c) => (
+            (c.newdirfd(), c.newpath()),
+            Some((c.olddirfd(), c.oldpath())),
+        ),
+        Syscall::Renameat2(c) if c.flags() & libc::RENAME_EXCHANGE == 0 => (
+            (c.newdirfd(), c.newpath()),
+            Some((c.olddirfd(), c.oldpath())),
+        ),
+        _ => return None,
+    })
+}
+
+/// Whether a call numbered `sysno` may remove a name ([`removed_names`],
+/// whatever its arguments): the syscalls [`Detcore::last_names_removed_by`]
+/// and [`Detcore::guest_made_fifos_removed_by`] can act on. Part of
+/// [`may_name_file_or_descriptor`]; `syscall_hot_path_tests` checks it
+/// against [`removed_names`] for every syscall number.
+pub(crate) fn removes_a_name(sysno: Sysno) -> bool {
+    match sysno {
+        #[cfg(not(target_arch = "aarch64"))]
+        Sysno::unlink | Sysno::rmdir | Sysno::rename => true,
+        Sysno::unlinkat | Sysno::renameat | Sysno::renameat2 => true,
+        _ => false,
+    }
+}
+
+/// Whether a call numbered `sysno` can be acted on by any of the file and
+/// descriptor checks `Detcore::handle_syscall_event` makes before it
+/// dispatches the call: the names it removes ([`removes_a_name`]), the
+/// rendered procfs descriptors it names
+/// ([`rendered_procfs::names_a_descriptor`]), the `/proc` names it looks up
+/// ([`procfs_levels::looks_up_names`]), and the rendered procfs calls
+/// Detcore answers ([`rendered_procfs::may_answer_operation`],
+/// [`rendered_procfs::may_answer_mapping`],
+/// [`rendered_procfs::may_answer_path_call`]). Each check answers its
+/// trivial value, with no effect, for any other call, so skipping them
+/// for those calls changes nothing but the work. It reads the number only,
+/// never the backend or the arguments.
+pub(crate) fn may_name_file_or_descriptor(sysno: Sysno) -> bool {
+    removes_a_name(sysno)
+        || rendered_procfs::names_a_descriptor(sysno)
+        || procfs_levels::looks_up_names(sysno)
+        || rendered_procfs::may_answer_operation(sysno)
+        || rendered_procfs::may_answer_mapping(sysno)
+        || rendered_procfs::may_answer_path_call(sysno)
 }
 
 /// Whether removing a name of the file `stat` describes leaves it with no
@@ -3835,27 +3907,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !guest.config().virtualize_metadata || !guest.config().sequentialize_threads {
             return Vec::new();
         }
-        let at = libc::AT_FDCWD;
         // The name removed, and for a rename the source, which replaces
         // nothing when it is the target's own file (`rename(a, a)`, or two
         // links of one file).
-        let (removed, source) = match call {
-            #[cfg(not(target_arch = "aarch64"))]
-            Syscall::Unlink(c) => ((at, c.path()), None),
-            Syscall::Unlinkat(c) => ((c.dirfd(), c.path()), None),
-            #[cfg(not(target_arch = "aarch64"))]
-            Syscall::Rmdir(c) => ((at, c.path()), None),
-            #[cfg(not(target_arch = "aarch64"))]
-            Syscall::Rename(c) => ((at, c.newpath()), Some((at, c.oldpath()))),
-            Syscall::Renameat(c) => (
-                (c.newdirfd(), c.newpath()),
-                Some((c.olddirfd(), c.oldpath())),
-            ),
-            Syscall::Renameat2(c) if c.flags() & libc::RENAME_EXCHANGE == 0 => (
-                (c.newdirfd(), c.newpath()),
-                Some((c.olddirfd(), c.oldpath())),
-            ),
-            _ => return Vec::new(),
+        let Some((removed, source)) = removed_names(call, true) else {
+            return Vec::new();
         };
         // Every path the call reads, which the lookups must leave unchanged.
         let inputs = [removed.1, source.and_then(|source| source.1)];
@@ -3890,35 +3946,43 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// succeeds, so that a FIFO that later reuses the number is not taken for
     /// a guest's, while a FIFO that keeps a name stays a guest's. Only where
     /// the set is shared by every guest (`fifo_peer::guest_descriptors_are_visible`).
-    pub(crate) async fn guest_made_fifos_removed_by<G: Guest<Self>>(
+    pub(crate) fn guest_made_fifos_removed_by<'a, G: Guest<Self>>(
+        &'a self,
+        guest: &'a mut G,
+        call: &'a Syscall,
+    ) -> impl std::future::Future<Output = Vec<(u64, u64)>> + 'a {
+        // The run's set, through no wrapper future of its own.
+        self.guest_made_fifos_removed_from(guest, call, &crate::fifo_peer::GuestMadeRegistry)
+    }
+
+    /// [`Self::guest_made_fifos_removed_by`] against the guest-made FIFOs
+    /// `made`: the run's registry in production, a test's own set in tests,
+    /// which so leave the process-wide registry untouched.
+    pub(crate) async fn guest_made_fifos_removed_from<G, M>(
         &self,
         guest: &mut G,
         call: &Syscall,
-    ) -> Vec<(u64, u64)> {
-        if !crate::fifo_peer::any_guest_made()
+        made: &M,
+    ) -> Vec<(u64, u64)>
+    where
+        G: Guest<Self>,
+        M: crate::fifo_peer::GuestMadeFifos + Sync,
+    {
+        // The call's number, then the backend capability, both lock-free,
+        // before the registry's lock: most calls remove no name, and where
+        // the capability is false (KVM, DBT) the set is never consulted. The
+        // three conjuncts are pure, so their order changes no answer.
+        if !removes_a_name(call.number())
             || !crate::fifo_peer::guest_descriptors_are_visible(
                 &self.cfg.backend,
                 guest.thread_state().physical_tid,
             )
+            || !made.any()
         {
             return Vec::new();
         }
-        let at = libc::AT_FDCWD;
-        let (removed, source) = match call {
-            #[cfg(not(target_arch = "aarch64"))]
-            Syscall::Unlink(c) => ((at, c.path()), None),
-            Syscall::Unlinkat(c) => ((c.dirfd(), c.path()), None),
-            #[cfg(not(target_arch = "aarch64"))]
-            Syscall::Rename(c) => ((at, c.newpath()), Some((at, c.oldpath()))),
-            Syscall::Renameat(c) => (
-                (c.newdirfd(), c.newpath()),
-                Some((c.olddirfd(), c.oldpath())),
-            ),
-            Syscall::Renameat2(c) if c.flags() & libc::RENAME_EXCHANGE == 0 => (
-                (c.newdirfd(), c.newpath()),
-                Some((c.olddirfd(), c.oldpath())),
-            ),
-            _ => return Vec::new(),
+        let Some((removed, source)) = removed_names(call, false) else {
+            return Vec::new();
         };
         let inputs = [removed.1, source.and_then(|source| source.1)];
         let Some(path) = removed.1 else {
@@ -3929,7 +3993,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let fifo = (stat.st_dev, stat.st_ino);
         if stat.st_mode & libc::S_IFMT != libc::S_IFIFO
-            || !crate::fifo_peer::is_guest_made(fifo)
+            || !made.contains(fifo)
             || !retires_on_removal(&stat)
         {
             return Vec::new();

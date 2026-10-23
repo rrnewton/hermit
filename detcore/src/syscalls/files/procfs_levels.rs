@@ -93,6 +93,12 @@ pub(super) fn looked_up(sysno: Sysno) -> Option<Lookups> {
     if let Some(paths) = path_operands(sysno) {
         return Some(Lookups::Paths(paths.to_vec()));
     }
+    socket_lookups(sysno)
+}
+
+/// What a socket call numbered `sysno` looks up: the address it binds,
+/// connects or sends to ([`looked_up`] for a call with no path operands).
+fn socket_lookups(sysno: Sysno) -> Option<Lookups> {
     match sysno {
         Sysno::bind | Sysno::connect => Some(Lookups::SocketAddress {
             address: 1,
@@ -107,6 +113,22 @@ pub(super) fn looked_up(sysno: Sysno) -> Option<Lookups> {
         Sysno::sendmsg => Some(Lookups::MessageAddress),
         _ => None,
     }
+}
+
+/// Whether a call numbered `sysno` looks anything up ([`looked_up`] is
+/// `Some`), without allocating: the calls
+/// `Detcore::refuse_procfs_name_outside_level` can act on. Part of
+/// `may_name_file_or_descriptor`.
+pub(crate) fn looks_up_names(sysno: Sysno) -> bool {
+    path_operands(sysno).is_some() || socket_lookups(sysno).is_some()
+}
+
+/// Take the device of the guest's procfs mount now, if it was not taken
+/// yet, as `Detcore::refuse_procfs_name_outside_level` does first for every
+/// call: it must be taken before the guest's first call can change its root,
+/// so a call that skips the check takes it here.
+pub(crate) fn take_proc_device() {
+    let _ = rendered_procfs::proc_device();
 }
 
 /// The path operands of a call that looks up paths ([`Lookups::Paths`] of
@@ -383,7 +405,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: &Syscall,
     ) -> Result<Option<i64>, Error> {
         // Taken before the guest's first call can change its root.
-        let _ = rendered_procfs::proc_device();
+        take_proc_device();
         let (sysno, args) = call.into_parts();
         let Some(lookups) = looked_up(sysno) else {
             return Ok(None);
