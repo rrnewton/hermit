@@ -100,6 +100,7 @@ mod tool_global;
 pub use tool_global::initial_mm_probe;
 mod tool_local;
 pub mod util;
+mod wait_signal_end;
 
 pub mod detlog;
 pub mod preemptions;
@@ -767,16 +768,219 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Codex review of https://github.com/rrnewton/hermit/pull/4048). Which
     /// results are a completion is decided by [`posthook_checkpoint`]; the
     /// pending names are consumed either way.
+    ///
+    /// `interrupted` is the restart code of a wait a default-fatal signal
+    /// ended under the in-guest delivery gate (`wait_end_checkpoint`, A5
+    /// design D40 and IR-2): the guest never resumes after such a call, as on
+    /// ptrace, so the anchors fire as interrupted with that code, although the
+    /// guest's result is `-EINTR`.
     async fn publish_posthook_checkpoint<G: Guest<Self>>(
         &self,
         guest: &mut G,
         count: u64,
         res: &Result<i64, Error>,
+        interrupted: Option<Errno>,
     ) {
         let posthook = std::mem::take(&mut guest.thread_state_mut().stats.hb_pending_posthook);
-        if let Some(checkpoint) = posthook_checkpoint(count, posthook, res) {
+        let interrupted = interrupted.map(|code| Err(Error::Errno(code)));
+        if let Some(checkpoint) =
+            posthook_checkpoint(count, posthook, interrupted.as_ref().unwrap_or(res))
+        {
             let request = guest.thread_state().mk_request(checkpoint, Permission::R);
             resource_request(guest, request).await;
+        }
+    }
+
+    /// A5 step 3c.1c, D40: resolve a `WaitSignalEnd::BehindCaught` end, in
+    /// the thread's own turn (`wait_end_checkpoint`), by reading the caught
+    /// actions Linux's delivery loop sets up, one query `rt_sigaction` each,
+    /// in the loop's order and only while a later delivery could still end
+    /// the process (`DequeueWalk::resolve`). A loop it cannot decide files a
+    /// named stopping refusal (D49), which ends the run under the gate:
+    /// HERMIT_CAUGHT_ACTION_UNREADABLE for an action it cannot read,
+    /// HERMIT_SIGNAL_RESET_TO_STOP for an instance reset to a stop,
+    /// HERMIT_REALTIME_INSTANCES_UNKNOWN for a real-time signal whose queued
+    /// instances would meet its reset default. Were it to return, the end is
+    /// `Fatal`.
+    async fn resolve_wait_end<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+        walk: crate::wait_signal_end::DequeueWalk,
+    ) -> crate::wait_signal_end::WaitSignalEnd {
+        let mut actions: Vec<(i32, Option<crate::wait_signal_end::CaughtAction>)> = Vec::new();
+        let resolved = loop {
+            let mut missing = None;
+            let resolved =
+                walk.resolve(
+                    |signal| match actions.iter().find(|(known, _)| *known == signal) {
+                        Some((_, action)) => *action,
+                        None => {
+                            missing.get_or_insert(signal);
+                            None
+                        }
+                    },
+                );
+            match (resolved, missing) {
+                (Err(_), Some(signal)) => {
+                    let action = crate::syscalls::helpers::caught_action(guest, signal)
+                        .await
+                        .ok();
+                    actions.push((signal, action));
+                }
+                (resolved, _) => break resolved,
+            }
+        };
+        use crate::refused_signal_controls as refusals;
+        use crate::wait_signal_end::WalkRefusal;
+        let caller = guest.thread_state().dettid.as_raw();
+        let name = call.number().name();
+        let (reason, signal) = match resolved {
+            Ok(end) => return end,
+            Err(WalkRefusal::ActionUnknown { caught, behind }) => (
+                refusals::caught_action_unreadable_refusal(name, caught, behind, caller),
+                behind,
+            ),
+            Err(WalkRefusal::ResetToStop { signal }) => (
+                refusals::signal_reset_to_stop_refusal(name, signal, caller),
+                signal,
+            ),
+            Err(WalkRefusal::RealtimeInstances { signal }) => (
+                refusals::realtime_instances_unknown_refusal(name, signal, caller),
+                signal,
+            ),
+        };
+        tracing::error!("{}", reason);
+        crate::tool_global::stopping_refusal(guest, reason).await;
+        crate::wait_signal_end::WaitSignalEnd::Fatal(signal)
+    }
+
+    /// The restart checkpoint (A5 step 3c.1c, design D40, with IR-2's
+    /// placement): run straight after the dispatch `match`, before every
+    /// observer of the result (`fail_on_tool_decided_injection`,
+    /// `delivery_interruption`, DETLOG's `SyscallResult`, the posthook
+    /// happens-before checkpoint, the post-handler hook and the completion),
+    /// so each of them, and the backend, sees the result it returns. Under the
+    /// in-guest delivery gate only, and on the current call's D40 flag
+    /// (`ThreadState::wait_signal_end`), which the path that ended a wait for
+    /// a signal set:
+    ///
+    /// | `res` | flag | guest result | posthook records |
+    /// |---|---|---|---|
+    /// | a restart code | `Fatal` | `-EINTR` | interrupted, with the code |
+    /// | a restart code | `Caught(sig)` | the x86 restart table with `sig`'s flags (a restart of `-ERESTARTSYS` passed through, not honoured before 3c.2; any other restart refused, below) | a checkpoint |
+    /// | a restart code | `BehindCaught` | resolved first by the caught handlers' masks (below), then the `Fatal` or `Caught` row | as that row |
+    /// | `-ERESTARTSYS` | none | unchanged: the in-guest runtime re-runs it | interrupted |
+    /// | `-ERESTARTNOINTR`, `-ERESTARTNOHAND`, `-ERESTART_RESTARTBLOCK` | none | the run ends (D49) | — |
+    /// | anything else | any | unchanged | as before |
+    ///
+    /// The `-ERESTARTSYS` re-run is Reverie's restart protocol
+    /// (<https://github.com/rrnewton/reverie/issues/362>), which in-guest's
+    /// parked `wait4` and pipe reads reach today (3c.1.0's finding F6).
+    ///
+    /// A default-fatal end is `-EINTR` because the process dies at the return
+    /// and the guest never sees the value; DETLOG then shows `-EINTR` where
+    /// ptrace's record shows the kernel's restart code (a named record
+    /// difference). A caught end that the table restarts with `-ERESTARTSYS`
+    /// (`SA_RESTART`) is passed through, but not yet honoured: the in-guest
+    /// Tool host re-runs the call at once (reverie-inguest
+    /// `drive_tool_syscall`, src/tool_host.rs:283-301 at 5d9d4c4f), with no
+    /// handler run in between, where Linux runs the handler and then restarts
+    /// the call. It is unreachable in 3c.1: phase 1 admits only `pause` in a
+    /// process that handles SIGALRM (F8), and `pause` ends with
+    /// `-ERESTARTNOHAND`. Running the handler before the host's re-run is a
+    /// step-3c.2 obligation. Any other restart code (`-ERESTARTNOINTR`, from
+    /// D41's not-run call when the caught handlers' masks hold the
+    /// default-fatal signal behind them) would need
+    /// the register rewind and post-handler delivery of step 3c.2, and the
+    /// pinned in-guest host would hand the raw code to the guest. It fails
+    /// closed: the stopping refusal HERMIT_RESTART_AFTER_HANDLER (D49), which
+    /// ends the run under the gate; were it to return, the result is `-EINTR`.
+    /// (In that schedule Linux runs the handler with the default-fatal signal
+    /// blocked and, unless the handler changes it, ends the process at the
+    /// handler's `rt_sigreturn`, before the call is made again.) Returns the
+    /// guest's result and, for the fatal row, the original code for the
+    /// posthook checkpoint. With the gate off it returns `res` and nothing,
+    /// and the flag is never set.
+    ///
+    /// A `BehindCaught` end (a caught signal first, and a later delivery that
+    /// could end the process) is resolved here, in the thread's own turn just
+    /// before the guest would resume, where Linux's delivery loop runs: each
+    /// caught action the loop needs is read with a query `rt_sigaction`, in
+    /// that order, and applied as Linux applies it (`sa_mask`, the signal
+    /// unless `SA_NODEFER`, the reset to `SIG_DFL` under `SA_RESETHAND`;
+    /// `DequeueWalk::resolve`, `resolve_wait_end`). A loop it cannot decide
+    /// fails closed by a named stopping refusal (D49), which ends the run under
+    /// the gate; were it to return, the end is `Fatal`.
+    async fn wait_end_checkpoint<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+        res: Result<i64, Error>,
+    ) -> (Result<i64, Error>, Option<Errno>) {
+        use crate::signal_restart::CaughtSignalReturn;
+        use crate::wait_signal_end::WaitSignalEnd;
+        let end = guest.thread_state_mut().wait_signal_end.take();
+        if !self.cfg.in_guest_signal_delivery {
+            return (res, None);
+        }
+        let code = match &res {
+            Err(Error::Errno(errno)) if crate::wait_signal_end::is_restart_code(*errno) => {
+                Some(*errno)
+            }
+            _ => None,
+        };
+        let end = match (end, code) {
+            (Some(WaitSignalEnd::BehindCaught(walk)), Some(_)) => {
+                Some(self.resolve_wait_end(guest, call, walk).await)
+            }
+            (end, _) => end,
+        };
+        match (end, code) {
+            (Some(WaitSignalEnd::Fatal(_)), Some(code)) => (Err(Errno::EINTR.into()), Some(code)),
+            (Some(WaitSignalEnd::Caught(signal)), Some(code)) => {
+                let flags = if code == Errno::ERESTARTSYS {
+                    match crate::syscalls::helpers::caught_action_flags(guest, signal).await {
+                        Ok(flags) => flags,
+                        Err(error) => return (Err(error), None),
+                    }
+                } else {
+                    0
+                };
+                match crate::signal_restart::caught_signal_return(
+                    -i64::from(code.into_raw()),
+                    flags,
+                ) {
+                    CaughtSignalReturn::Returns(value) if value < 0 => (
+                        Err(Errno::new(i32::try_from(-value).unwrap_or(libc::EINVAL)).into()),
+                        None,
+                    ),
+                    CaughtSignalReturn::Returns(value) => (Ok(value), None),
+                    CaughtSignalReturn::Restarts if code == Errno::ERESTARTSYS => (res, None),
+                    CaughtSignalReturn::Restarts => {
+                        let reason = crate::refused_signal_controls::restart_after_handler_refusal(
+                            call.number().name(),
+                            signal,
+                            code.name().unwrap_or("a restart code"),
+                            guest.thread_state().dettid.as_raw(),
+                        );
+                        tracing::error!("{}", reason);
+                        crate::tool_global::stopping_refusal(guest, reason).await;
+                        (Err(Errno::EINTR.into()), None)
+                    }
+                }
+            }
+            (None, Some(code)) if code != Errno::ERESTARTSYS => {
+                let reason = crate::refused_signal_controls::restart_code_without_signal_refusal(
+                    call.number().name(),
+                    code.name().unwrap_or("a restart code"),
+                    guest.thread_state().dettid.as_raw(),
+                );
+                tracing::error!("{}", reason);
+                crate::tool_global::stopping_refusal(guest, reason).await;
+                (res, None)
+            }
+            _ => (res, None),
         }
     }
 
@@ -3608,6 +3812,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // A new thread's first stop is at the exit of the call
                     // that made it, which Detcore did not finish for it.
                     delivery_interruption: None,
+                    // A new thread has no wait in progress.
+                    wait_signal_end: None,
                     delivery_frame_handler: 0,
                     delivery_frame_signal: 0,
                     delivery_frame_orig_ax: 0,
@@ -5472,6 +5678,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
             }
         };
+        // The restart checkpoint (A5 step 3c.1c, design D40, placed by IR-2):
+        // under the in-guest delivery gate, a wait a signal ended gets the
+        // result the guest sees here, before anything below observes `res`.
+        // With the gate off it changes nothing.
+        let (res, interrupted) = self.wait_end_checkpoint(guest, &call, res).await;
+
         // A call Detcore injected that the backend left to the Tool
         // (`UnsupportedOperation::ToolDecided`), such as the getpgrp a clone3
         // race passes through (https://github.com/rrnewton/hermit/issues/4531),
@@ -5571,7 +5783,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         if let Err(error) = self.detlog_memory_maps(guest) {
             let res = Err(error);
-            self.publish_posthook_checkpoint(guest, new_count, &res)
+            self.publish_posthook_checkpoint(guest, new_count, &res, interrupted)
                 .await;
             return self.complete_syscall(guest, res).await;
         }
@@ -5591,7 +5803,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             )
         {
             let res = Err(error);
-            self.publish_posthook_checkpoint(guest, new_count, &res)
+            self.publish_posthook_checkpoint(guest, new_count, &res, interrupted)
                 .await;
             return self.complete_syscall(guest, res).await;
         }
@@ -5611,7 +5823,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // Posthook happens-before anchors this call reached fire now that its
         // result is decided and before the guest resumes
         // (https://github.com/rrnewton/hermit/issues/3929).
-        self.publish_posthook_checkpoint(guest, new_count, &res)
+        self.publish_posthook_checkpoint(guest, new_count, &res, interrupted)
             .await;
 
         // The syscall is finished; a turn the post-hook takes (a timeslice

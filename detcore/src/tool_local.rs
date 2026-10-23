@@ -4108,6 +4108,15 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) delivery_interruption: Option<reverie::Interruption>,
 
+    /// Under the in-guest delivery gate, what ended the current syscall's wait
+    /// for a signal (A5 step 3c.1c, design D40): set by the path that ends
+    /// the wait, and taken by the restart checkpoint straight after the
+    /// dispatch `match` (`Detcore::wait_end_checkpoint`), which turns the
+    /// wait's restart code into the guest's result. `None` on every other
+    /// call, and always with the gate off.
+    #[serde(skip)]
+    pub(crate) wait_signal_end: Option<crate::wait_signal_end::WaitSignalEnd>,
+
     /// With `delivery_interruption` `AfterFrame`, the handler address the
     /// kernel's frame jumps to: a further delivery at the same exit, before
     /// any guest instruction, stops with the instruction pointer there.
@@ -5047,6 +5056,7 @@ impl<T> ThreadState<T> {
             signal_shadow: None,
             signal_shadow_lost: false,
             delivery_interruption: None,
+            wait_signal_end: None,
             delivery_frame_handler: 0,
             delivery_frame_signal: 0,
             delivery_frame_orig_ax: 0,
