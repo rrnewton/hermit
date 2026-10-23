@@ -3061,7 +3061,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and scheduler::test::a_replayed_retry_is_not_backed_off_as_a_poller (a
     // schedule replay follows its recording through a multithreaded program):
     // 2741, listed.
-    ("test.detcore_unit", 2741),
+    // And replayer::tests::stacktrace_positions_follow_the_schedule_and_continue_past_its_end,
+    // strict_boundary_admission_tests::a_stacktrace_index_past_a_legacy_schedule_is_kept_for_the_run_after_it,
+    // scheduler::test::a_replayed_stacktrace_event_prints_at_its_schedule_position
+    // and scheduler::test::a_replay_leaves_its_record_at_its_first_hard_desync
+    // (replay stack positions and the unguided-child warning): 2745, listed.
+    ("test.detcore_unit", 2745),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5343,7 +5348,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same P2b deletion of the anchor device unit: 2694, listed.
     // And the same two directory st_nlink units: 2738, listed.
     // And the same three schedule-replay units: 2741, listed.
-    ("test.detcore_unit_on_host", 2741),
+    // And the same four replay-diagnostics units: 2745, listed.
+    ("test.detcore_unit_on_host", 2745),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
