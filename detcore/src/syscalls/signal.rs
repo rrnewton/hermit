@@ -2136,6 +2136,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Sysno::kill,
                 call.sig(),
                 ReservedSendTarget::Process(call.pid()),
+                ReservedSendSiginfo::None,
             )
             .await
         {
@@ -2947,6 +2948,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     tgid: Some(call.tgid()),
                     tid: call.tid(),
                 },
+                ReservedSendSiginfo::None,
             )
             .await
         {
@@ -3088,6 +3090,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     tgid: None,
                     tid: call.tid(),
                 },
+                ReservedSendSiginfo::None,
             )
             .await
         {
@@ -3253,13 +3256,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
         use crate::scheduler::child_exit_sigchld::ChildExitSigchldControl;
         let syscall: syscalls::Syscall = syscall.into();
+        // D44 asks about the thread the send reaches: for a thread-directed
+        // send the one it names, as the scheduler numbers it (`named`, which
+        // the handlers translate from a nested PID namespace's id; `target`
+        // there is the caller's own id), and for a process-directed one the
+        // receiving thread the handler chose (`target`).
+        let receiver = if thread_directed { named } else { target };
         if let Some(refused) = self
-            .refuse_kernel_run_target_send(
-                guest,
-                reverie::syscalls::SyscallInfo::number(&syscall),
-                target,
-                raw_signal,
-            )
+            .refuse_kernel_run_target_send(guest, syscall, receiver, named, raw_signal)
             .await
         {
             return refused;
@@ -3344,13 +3348,20 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// cannot be read refuse, fail closed. Signal 0, SIGKILL (Detcore retires
     /// its victims at the sender's turn), a send to the sender itself, and
     /// every send with the gate off take the ordinary path (`None`).
+    ///
+    /// Only a valid send reaches the refusal: a send `syscall` the kernel
+    /// would fail before sending anything gets that errno instead, with no
+    /// refusal (`refused_send_kernel_errno`, with `named`, the task the call
+    /// names, as the scheduler numbers it).
     async fn refuse_kernel_run_target_send<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        sysno: Sysno,
+        syscall: syscalls::Syscall,
         target: DetTid,
+        named: DetTid,
         raw_signal: i32,
     ) -> Option<Result<i64, Error>> {
+        let sysno = reverie::syscalls::SyscallInfo::number(&syscall);
         if !guest.config().in_guest_signal_delivery
             || raw_signal == 0
             || raw_signal == libc::SIGKILL
@@ -3373,6 +3384,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         if !refused {
             return None;
+        }
+        let (siginfo, group) = refused_send_arguments(syscall);
+        if let Some(errno) = self
+            .refused_send_kernel_errno(guest, raw_signal, siginfo, named, group)
+            .await
+        {
+            return Some(Err(errno.into()));
         }
         let reason = crate::refused_signal_controls::kernel_run_signal_refusal(
             sysno.name(),
@@ -3546,12 +3564,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// a reaped or unknown id is ESRCH), as do a thread outside the group a
     /// `tgkill` names, a non-positive id, and group sends, which their handlers
     /// refuse first (F15). With the gate off, or another signal, `None`.
+    ///
+    /// Only a valid send reaches the refusal: one the kernel would fail
+    /// before sending anything (its `siginfo`, a forged `si_code`;
+    /// `refused_send_kernel_errno`) gets that errno, without the WARN.
     pub(crate) async fn refuse_stop_signal_send<G: Guest<Self>>(
         &self,
         guest: &mut G,
         sysno: Sysno,
         signal: i32,
         target: ReservedSendTarget,
+        siginfo: ReservedSendSiginfo,
     ) -> Option<Result<i64, Error>> {
         use crate::refused_signal_controls::StopSendRefusal;
         if !guest.config().in_guest_signal_delivery
@@ -3603,6 +3626,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Err(_) => StopSendRefusal::StatusUnreadable,
             }
         };
+        // A thread-directed send names `receiver`; a process-directed one
+        // names the process `query` is.
+        let named = thread.unwrap_or(query);
+        if let Some(errno) = self
+            .refused_send_kernel_errno(guest, signal, siginfo, named, None)
+            .await
+        {
+            return Some(Err(errno.into()));
+        }
         tracing::warn!(
             "{}",
             crate::refused_signal_controls::stop_signal_send_refused_warning(
@@ -3614,6 +3646,72 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
         );
         Some(Err(Errno::EPERM.into()))
+    }
+
+    /// A5 step 3c.1c: Linux's answer, before anything is sent, for a send to
+    /// the live task `named` (as the scheduler numbers it) that a D44 or D48
+    /// refusal would otherwise refuse, so that only a valid send reaches a
+    /// refusal. In the kernel's order (v6.12 kernel/signal.c):
+    ///
+    /// 1. the copy of the `siginfo` from the caller's memory, EFAULT or E2BIG,
+    ///    and for `pidfd_send_signal` EINVAL when its `si_signo` is not the
+    ///    signal (`reserved_send_siginfo_errno`; `rt_sigqueueinfo`,
+    ///    :4079-4087, `rt_tgsigqueueinfo`, :4119-4127, `pidfd_send_signal`,
+    ///    :3959-3966);
+    /// 2. a non-positive tgid named by `tgkill` or `rt_tgsigqueueinfo`
+    ///    (`group`), EINVAL (:4038-4039, :4106-4107);
+    /// 3. a `si_code` only the target thread itself may use (`si_code >= 0`
+    ///    or `SI_TKILL`) from a caller that is not the task the call names,
+    ///    EPERM (`do_rt_sigqueueinfo`, :4065-4067; `do_rt_tgsigqueueinfo`,
+    ///    :4112-4114; `pidfd_send_signal`, :3968-3972);
+    /// 4. a tgid that is not `named`'s process, ESRCH (`do_send_specific`,
+    ///    :3994). A tgid Detcore cannot name (a nested caller's, on a backend
+    ///    that names no nested ids) is not judged here.
+    ///
+    /// `None` for a valid send. The signal number is valid: D44 and D48 pass
+    /// only signals 1 to 64, which `valid_signal` (:836) admits, and the target
+    /// exists.
+    async fn refused_send_kernel_errno<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        signal: i32,
+        siginfo: ReservedSendSiginfo,
+        named: DetTid,
+        group: Option<libc::pid_t>,
+    ) -> Option<Errno> {
+        if let Some(errno) = self.reserved_send_siginfo_errno(guest, signal, siginfo) {
+            return Some(errno);
+        }
+        if group.is_some_and(|tgid| tgid <= 0) {
+            return Some(Errno::EINVAL);
+        }
+        let address = match siginfo {
+            ReservedSendSiginfo::Queued(address) | ReservedSendSiginfo::Pidfd(Some(address)) => {
+                Some(address)
+            }
+            ReservedSendSiginfo::None | ReservedSendSiginfo::Pidfd(None) => None,
+        };
+        if let Some(address) = address {
+            // The copy above read these bytes in this turn.
+            let code = AddrMut::<[u8; KERNEL_SIGINFO_SIZE]>::from_raw(address)
+                .and_then(|head| guest.memory().read_value(head).ok())
+                .map(|head| i32::from_ne_bytes(head[8..12].try_into().expect("four bytes")));
+            let Some(code) = code else {
+                return Some(Errno::EFAULT);
+            };
+            if (code >= 0 || code == libc::SI_TKILL) && named != guest.thread_state().dettid {
+                return Some(Errno::EPERM);
+            }
+        }
+        if let Some(tgid) = group
+            && let Some(process) = self.reserved_send_task(guest, tgid).await
+        {
+            let leader = registered_process_of(guest, named).await;
+            if leader != Some(DetPid::from_raw(process.as_raw())) {
+                return Some(Errno::ESRCH);
+            }
+        }
+        None
     }
 
     /// Linux's answer for the `siginfo` of a send that would otherwise be
@@ -3789,6 +3887,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     tgid: Some(call.tgid()),
                     tid: call.tid(),
                 },
+                ReservedSendSiginfo::Queued(call.siginfo().map_or(0, |info| info.as_raw())),
             )
             .await
         {
@@ -3953,6 +4052,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Sysno::rt_sigqueueinfo,
                 call.sig(),
                 ReservedSendTarget::Process(call.tgid()),
+                ReservedSendSiginfo::Queued(call.siginfo().map_or(0, |info| info.as_raw())),
             )
             .await
         {
@@ -5287,10 +5387,42 @@ pub(crate) enum ReservedSendTarget {
 /// address `rt_sigqueueinfo` and `rt_tgsigqueueinfo` copy (0 for a null
 /// pointer, which Linux's copy refuses too); or `pidfd_send_signal`'s,
 /// which may be absent.
+#[derive(Clone, Copy)]
 pub(crate) enum ReservedSendSiginfo {
     None,
     Queued(usize),
     Pidfd(Option<usize>),
+}
+
+/// What a send `syscall` carries that Linux checks before sending
+/// (`Detcore::refused_send_kernel_errno`): its `siginfo` (`rt_sigqueueinfo`,
+/// `rt_tgsigqueueinfo`, `pidfd_send_signal`'s third argument) and the tgid a
+/// `tgkill` or `rt_tgsigqueueinfo` names.
+fn refused_send_arguments(
+    syscall: syscalls::Syscall,
+) -> (ReservedSendSiginfo, Option<libc::pid_t>) {
+    let address = |info: Option<AddrMut<'_, libc::siginfo_t>>| info.map_or(0, |info| info.as_raw());
+    match syscall {
+        syscalls::Syscall::RtSigqueueinfo(call) => {
+            (ReservedSendSiginfo::Queued(address(call.siginfo())), None)
+        }
+        syscalls::Syscall::RtTgsigqueueinfo(call) => (
+            ReservedSendSiginfo::Queued(address(call.siginfo())),
+            Some(call.tgid()),
+        ),
+        syscalls::Syscall::Tgkill(call) => (ReservedSendSiginfo::None, Some(call.tgid())),
+        other => {
+            let (sysno, args) = reverie::syscalls::SyscallInfo::into_parts(other);
+            if sysno == Sysno::pidfd_send_signal {
+                (
+                    ReservedSendSiginfo::Pidfd((args.arg2 != 0).then_some(args.arg2)),
+                    None,
+                )
+            } else {
+                (ReservedSendSiginfo::None, None)
+            }
+        }
+    }
 }
 
 /// The size of Linux's `struct kernel_siginfo` on x86-64, the part of a

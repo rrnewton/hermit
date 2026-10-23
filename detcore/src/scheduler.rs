@@ -10386,14 +10386,19 @@ impl Scheduler {
         let has_external_blocker = self.blocked.external_io_blockers.contains_key(&dettid)
             || self.blocked.rt_sigsuspend_blockers.contains_key(&dettid);
         // D44's arming assertion under the in-guest delivery gate (A5 step
-        // 3c.1c): a guest's send to a thread blocked in a kernel-run call is
-        // refused before it is made (`refuse_kernel_run_target_send`), so the
-        // only sends that get here are the scheduler's own (a timer, a child's
-        // exit). One that would interrupt the call (`kernel_run_send_refused`)
-        // ends the run by name, fail closed, from committed state: the record
-        // of the thread's kernel-run request, not which pool holds it. Nothing
-        // is armed or waited for. One that would not stays pending, as Linux
-        // keeps it, and the call goes on.
+        // 3c.1c): a guest's send to a thread blocked in a kernel-run call that
+        // would interrupt the call is refused before it is made
+        // (`refuse_kernel_run_target_send`). What gets here is the scheduler's
+        // own sends (a timer, a child's exit) and the guest sends that check
+        // did not refuse (blocked by the call's mask, ignored, or a vfork
+        // parent's caught or core-dumping signal), which this block decides
+        // identically: the same record, the same dispositions, the pending set
+        // not read, so it does not refuse them either. One that would
+        // interrupt the call (`kernel_run_send_refused`) ends the run by name,
+        // fail closed, from committed state: the record of the thread's
+        // kernel-run request, not which pool holds it. Nothing is armed or
+        // waited for. One that would not stays pending, as Linux keeps it, and
+        // the call goes on.
         if self.in_guest_signal_delivery
             && let Some(block) = self.kernel_run_block(dettid)
         {

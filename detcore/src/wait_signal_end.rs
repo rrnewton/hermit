@@ -215,7 +215,6 @@ pub(crate) fn kernel_run_send_refused(
     }
 }
 
-
 /// Whether `errno` is one of the kernel's internal restart codes
 /// (include/linux/errno.h v6.12 lines 14-18), which a guest never sees: the
 /// kernel either restarts the call or turns the code into `EINTR` at the

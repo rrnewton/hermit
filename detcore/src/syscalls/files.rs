@@ -7617,6 +7617,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         mut call: syscalls::Write,
     ) -> Result<i64, Error> {
+        // D41 (A5 step 3c.1c), at the handler's entry: a write can be a
+        // kernel-run call (execute_nonblockable_fd_syscall's blocking branch
+        // files it), and its virtual mtime bump below (touch_file) is a
+        // guest-visible effect a call not run must not leave; a default-fatal
+        // signal deliverable here arrived before the call, a schedule Linux
+        // permits for any write. The check at the filing point stays for a
+        // signal sent while this call waits for its turn below.
+        if let Some(refused) = super::helpers::kernel_run_entry_refusal(guest)? {
+            return Err(refused);
+        }
         if self.timer_slack_binding(guest, call.fd())?.is_some() {
             return self
                 .write_timer_slack(guest, call.fd(), call.buf(), call.len())
@@ -12428,6 +12438,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     named,
                     thread: scope == PidfdSignalScope::Thread,
                 },
+                crate::syscalls::signal::ReservedSendSiginfo::Pidfd(info.map(|info| info.as_raw())),
             )
             .await
         {
