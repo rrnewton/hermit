@@ -3054,15 +3054,25 @@ where
 /// calls this as its first statement, before any guest-visible effect, and
 /// returns the error this gives, `ERESTARTNOINTR` with the D40 flag `Fatal`
 /// recorded, which the restart checkpoint turns into `-EINTR` (the death path
-/// of step 3c.1e follows at the return). A caught signal at entry, or none,
-/// keeps today's path (`None`): the call runs. With the gate off, `None`.
+/// of step 3c.1e follows at the return). A default-fatal signal behind a
+/// caught one (`BehindCaught`) means the call is not run either: Linux
+/// delivers the caught signal first and then either reaches the default-fatal
+/// one in the same delivery loop or, if the handlers' masks hold it, at the
+/// return from the handlers, before the call is made again; the flag is
+/// recorded as it is, and the checkpoint resolves it (`Fatal`: `-EINTR`;
+/// `Caught`: the restart table restarts `ERESTARTNOINTR` after the handler).
+/// Only caught signals at entry, or none, keep today's path (`None`): the
+/// call runs. With the gate off, `None`.
 pub(crate) fn kernel_run_entry_refusal<T, G>(guest: &mut G) -> Result<Option<Error>, Error>
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
     match gated_wait_end(guest, None)? {
-        Some(end @ crate::wait_signal_end::WaitSignalEnd::Fatal(_)) => {
+        Some(
+            end @ (crate::wait_signal_end::WaitSignalEnd::Fatal(_)
+            | crate::wait_signal_end::WaitSignalEnd::BehindCaught(_)),
+        ) => {
             tracing::info!(
                 "[dtid {}] under the in-guest delivery gate, {:?} is deliverable at a kernel-run \
                  call's entry: the call is not run",

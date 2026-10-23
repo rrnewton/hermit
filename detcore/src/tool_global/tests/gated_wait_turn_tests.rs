@@ -169,6 +169,10 @@ struct TurnGuest {
     /// The threads Detcore's model shows live, each its own process: what
     /// `GlobalRequest::ResolveKillTargets` answers.
     live: Vec<DetTid>,
+    /// The host thread id `Guest::tid` reports instead of `THREAD`, for a
+    /// path that reads the caller's own `/proc/<tid>` (`None`: `THREAD`); the
+    /// thread's `dettid` is set to it too, as a guest thread's always is.
+    host_tid: Option<i32>,
     stack: usize,
 }
 
@@ -255,7 +259,7 @@ impl Guest<Detcore> for TurnGuest {
         Pid::from_raw(THREAD.as_raw())
     }
     fn tid(&self) -> Pid {
-        Pid::from_raw(THREAD.as_raw())
+        Pid::from_raw(self.host_tid.unwrap_or(THREAD.as_raw()))
     }
     fn ppid(&self) -> Option<Pid> {
         None
@@ -366,6 +370,7 @@ fn turn_guest(gate: bool, own_mask: Option<u64>) -> TurnGuest {
         kernel_run_for: None,
         nested: Vec::new(),
         live: vec![THREAD, PEER],
+        host_tid: None,
         stack,
     }
 }
@@ -1182,6 +1187,35 @@ async fn under_the_gate_a_kernel_run_call_with_a_fatal_signal_at_its_entry_is_no
         assert!(matches!(res, Err(Error::Errno(Errno::EINTR))), "{family}");
         assert_eq!(code, Some(Errno::ERESTARTNOINTR), "{family}");
     }
+    // A core-dumping signal deliverable behind a caught one: Linux delivers
+    // the caught signal first and then the core-dumping one, at once or at
+    // the return from the handler, before the call is made again, so the call
+    // is not run either, and the end is left for the checkpoint to resolve.
+    // Mutation "a BehindCaught end runs the call": the read is filed.
+    let _seam = script(proc_state(
+        bit(libc::SIGHUP) | bit(libc::SIGQUIT),
+        bit(libc::SIGHUP),
+        0,
+    ));
+    let mut guest = turn_guest(true, Some(0));
+    let tool = tool(&guest);
+    let result = tool
+        .record_or_replay_blocking(&mut guest, read.into())
+        .await;
+    assert!(
+        matches!(result, Err(Error::Errno(Errno::ERESTARTNOINTR))),
+        "{result:?}"
+    );
+    assert!(
+        matches!(
+            guest.thread.wait_signal_end,
+            Some(WaitSignalEnd::BehindCaught(_))
+        ),
+        "{:?}",
+        guest.thread.wait_signal_end
+    );
+    assert!(guest.rpcs().is_empty(), "{:?}", guest.rpcs());
+    assert!(guest.injected.is_empty(), "{:?}", guest.injected);
 }
 
 /// D41 refuses only a default-fatal signal at entry: a caught one, a blocked
@@ -2376,6 +2410,122 @@ async fn under_the_gate_a_background_read_with_a_fatal_signal_at_its_entry_is_no
                 "{name}: {:?}",
                 guest.requests()
             );
+        }
+    }
+}
+
+/// A siginfo page this test thread can write but whose reads fail: written,
+/// then left `PROT_WRITE` only (x86 Linux's `copy_from_user` reads it, and
+/// `process_vm_readv` refuses it). Leaked.
+fn write_only_siginfo_page(signal: i32) -> usize {
+    let page = siginfo_page(
+        signal,
+        libc::SI_QUEUE,
+        0,
+        libc::PROT_READ | libc::PROT_WRITE,
+    );
+    // SAFETY: the page `siginfo_page` mapped for this test.
+    assert_eq!(
+        unsafe { libc::mprotect(page as *mut libc::c_void, 4096, libc::PROT_WRITE) },
+        0
+    );
+    page
+}
+
+/// A page-aligned address in no mapping of this process: a page mapped and
+/// then unmapped.
+fn unmapped_page() -> usize {
+    let page = siginfo_page(0, 0, 0, libc::PROT_READ);
+    // SAFETY: the page `siginfo_page` mapped for this test.
+    assert_eq!(unsafe { libc::munmap(page as *mut libc::c_void, 4096) }, 0);
+    page
+}
+
+/// A refused send's siginfo that the caller's own reads cannot reach is
+/// EFAULT only where Linux's copy faults too, as the caller's
+/// `/proc/<tid>/smaps` shows (both reviews, round 2): through the real
+/// `rt_tgsigqueueinfo` handler, a SIGSTOP (D48) and a SIGTERM to a thread
+/// blocked in a kernel-run call (D44). A write-only mapping, which x86 Linux
+/// copies from, takes the refusal (EPERM and the WARN; EPERM and the
+/// stopping refusal), and so does any unreadable siginfo when the caller's
+/// mappings cannot be read (fail closed); a `PROT_NONE` page and an unmapped
+/// page are EFAULT, with neither. Mutation "an unverifiable read taken as
+/// EFAULT": the write-only and unreadable-mappings rows become EFAULT.
+#[tokio::test]
+async fn under_the_gate_a_refused_send_s_unreadable_siginfo_is_efault_only_where_linux_faults() {
+    use crate::scheduler::KernelRunBlock;
+    // SAFETY: gettid has no preconditions.
+    let own = unsafe { libc::gettid() };
+    let peer = PEER.as_raw();
+    for refusal in ["D48", "D44"] {
+        let signal = if refusal == "D48" {
+            libc::SIGSTOP
+        } else {
+            libc::SIGTERM
+        };
+        for (name, address, host_tid, errno) in [
+            (
+                "a write-only mapping",
+                write_only_siginfo_page(signal),
+                own,
+                None,
+            ),
+            (
+                "a PROT_NONE page",
+                siginfo_page(signal, libc::SI_QUEUE, 0, libc::PROT_NONE),
+                own,
+                Some(Errno::EFAULT),
+            ),
+            (
+                "the caller's mappings unreadable",
+                write_only_siginfo_page(signal),
+                i32::MAX - 1,
+                None,
+            ),
+            // Last, so no later mapping of this row set takes its place.
+            (
+                "an unmapped page",
+                unmapped_page(),
+                own,
+                Some(Errno::EFAULT),
+            ),
+        ] {
+            let _seam = script_both(proc_state(0, 0, 0), Ok(proc_state(0, 0, 0)));
+            let log = WarnLog::default();
+            let _subscriber = tracing::subscriber::set_default(log.clone());
+            let mut guest = turn_guest(true, Some(0));
+            guest.host_tid = Some(host_tid);
+            guest.thread.dettid = DetTid::from_raw(host_tid);
+            if refusal == "D44" {
+                guest.kernel_run = Some(KernelRunBlock {
+                    vfork: false,
+                    mask: Some(0),
+                });
+            }
+            let tool = tool(&guest);
+            let result = tool
+                .handle_rt_tgsigqueueinfo(
+                    &mut guest,
+                    reverie::syscalls::RtTgsigqueueinfo::new()
+                        .with_tgid(peer)
+                        .with_tid(peer)
+                        .with_sig(signal)
+                        .with_siginfo(AddrMut::from_raw(address)),
+                )
+                .await;
+            let wanted = errno.unwrap_or(Errno::EPERM);
+            assert!(
+                matches!(result, Err(Error::Errno(got)) if got == wanted),
+                "{refusal}: {name}: {result:?}"
+            );
+            let refused = usize::from(errno.is_none());
+            let (warns, stops) = (log.0.lock().unwrap().len(), kernel_run_refusals(&guest));
+            if refusal == "D48" {
+                assert_eq!((warns, stops), (refused, 0), "{refusal}: {name}");
+            } else {
+                assert_eq!((warns, stops), (0, refused), "{refusal}: {name}");
+            }
+            assert!(guest.injected.is_empty(), "{refusal}: {name}: nothing sent");
         }
     }
 }

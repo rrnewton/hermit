@@ -3670,7 +3670,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// `None` for a valid send. The signal number is valid: D44 and D48 pass
     /// only signals 1 to 64, which `valid_signal` (:836) admits, and the target
-    /// exists.
+    /// exists. A siginfo Linux could copy but Detcore cannot read
+    /// (`refused_send_siginfo`, `Unverifiable`) leaves its later checks
+    /// unjudged, so the send takes its refusal, fail closed, rather than an
+    /// errno Linux would not give.
     async fn refused_send_kernel_errno<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3679,29 +3682,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         named: DetTid,
         group: Option<libc::pid_t>,
     ) -> Option<Errno> {
-        if let Some(errno) = self.reserved_send_siginfo_errno(guest, signal, siginfo) {
-            return Some(errno);
-        }
+        let code = match refused_send_siginfo(guest, signal, siginfo) {
+            RefusedSendSiginfo::Errno(errno) => return Some(errno),
+            RefusedSendSiginfo::NoCopy => None,
+            RefusedSendSiginfo::Copied { code } => Some(code),
+            RefusedSendSiginfo::Unverifiable => {
+                if group.is_some_and(|tgid| tgid <= 0) {
+                    return Some(Errno::EINVAL);
+                }
+                tracing::info!(
+                    "[detcore, dtid {}] a send's siginfo lies in memory the caller's own reads \
+                     cannot reach though Linux could copy it: its si_code and target checks are \
+                     not judged, and the send takes its refusal",
+                    guest.thread_state().dettid,
+                );
+                return None;
+            }
+        };
         if group.is_some_and(|tgid| tgid <= 0) {
             return Some(Errno::EINVAL);
         }
-        let address = match siginfo {
-            ReservedSendSiginfo::Queued(address) | ReservedSendSiginfo::Pidfd(Some(address)) => {
-                Some(address)
-            }
-            ReservedSendSiginfo::None | ReservedSendSiginfo::Pidfd(None) => None,
-        };
-        if let Some(address) = address {
-            // The copy above read these bytes in this turn.
-            let code = AddrMut::<[u8; KERNEL_SIGINFO_SIZE]>::from_raw(address)
-                .and_then(|head| guest.memory().read_value(head).ok())
-                .map(|head| i32::from_ne_bytes(head[8..12].try_into().expect("four bytes")));
-            let Some(code) = code else {
-                return Some(Errno::EFAULT);
-            };
-            if (code >= 0 || code == libc::SI_TKILL) && named != guest.thread_state().dettid {
-                return Some(Errno::EPERM);
-            }
+        if let Some(code) = code
+            && (code >= 0 || code == libc::SI_TKILL)
+            && named != guest.thread_state().dettid
+        {
+            return Some(Errno::EPERM);
         }
         if let Some(tgid) = group
             && let Some(process) = self.reserved_send_task(guest, tgid).await
@@ -5395,6 +5400,94 @@ pub(crate) enum ReservedSendSiginfo {
     None,
     Queued(usize),
     Pidfd(Option<usize>),
+}
+
+/// The copy of a refused send's `siginfo` (`Detcore::refused_send_kernel_errno`).
+enum RefusedSendSiginfo {
+    /// The call carries none.
+    NoCopy,
+    /// Linux's answer to the copy: EFAULT, E2BIG, or for `pidfd_send_signal`
+    /// EINVAL when `si_signo` is not the signal.
+    Errno(Errno),
+    /// The copy succeeds; `code` is its `si_code`.
+    Copied { code: i32 },
+    /// The caller cannot read bytes Linux's copy could read, or the caller's
+    /// mappings cannot be read to tell: Linux's answer is not known.
+    Unverifiable,
+}
+
+/// A5 step 3c.1c: the copy of a refused send's `siginfo` from the caller's
+/// memory, in Linux's order (`siginfo_copy_errno`: the head, then the
+/// expansion only for a layout Linux does not know, then `si_signo` for
+/// `pidfd_send_signal`). The bytes are read through `Guest::memory()`, which
+/// on the in-guest backends refuses some memory x86's `copy_from_user` reads
+/// (a write-only mapping; `reserved_send_siginfo_errno`). So a read that
+/// fails is EFAULT only where Linux's copy faults too, as the caller's own
+/// `/proc/<tid>/smaps`, read in its turn, shows: a byte in no mapping (and
+/// not below a grow-down one) or in a mapping without read, write or execute
+/// permission (`first_user_unreadable`). Any other failure, or mappings that
+/// cannot be read, is `Unverifiable`. 3c.0a's reserved-send path
+/// (`reserved_send_siginfo_errno`) keeps answering such a read EFAULT, a
+/// known residual.
+fn refused_send_siginfo<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    signal: i32,
+    siginfo: ReservedSendSiginfo,
+) -> RefusedSendSiginfo {
+    let (address, pidfd) = match siginfo {
+        ReservedSendSiginfo::None | ReservedSendSiginfo::Pidfd(None) => {
+            return RefusedSendSiginfo::NoCopy;
+        }
+        ReservedSendSiginfo::Queued(address) => (address, false),
+        ReservedSendSiginfo::Pidfd(Some(address)) => (address, true),
+    };
+    let tid = guest.tid().as_raw();
+    // Why `[start, start + len)` could not be read: EFAULT only where Linux
+    // would fault.
+    let unreadable = |start: usize, len: usize| {
+        if start.checked_add(len).is_none() {
+            return RefusedSendSiginfo::Errno(Errno::EFAULT);
+        }
+        let Ok(smaps) = std::fs::read_to_string(format!("/proc/{tid}/smaps")) else {
+            return RefusedSendSiginfo::Unverifiable;
+        };
+        match first_user_unreadable(&parse_smaps(&smaps), start, len) {
+            Some(Unreadable::NoPermission)
+            | Some(Unreadable::Hole {
+                below_growsdown: false,
+            }) => RefusedSendSiginfo::Errno(Errno::EFAULT),
+            _ => RefusedSendSiginfo::Unverifiable,
+        }
+    };
+    let head = address
+        .checked_add(KERNEL_SIGINFO_SIZE)
+        .and_then(|_| AddrMut::<[u8; KERNEL_SIGINFO_SIZE]>::from_raw(address))
+        .and_then(|head| guest.memory().read_value(head).ok());
+    let Some(head) = head else {
+        return unreadable(address, KERNEL_SIGINFO_SIZE);
+    };
+    let field = |offset: usize| {
+        i32::from_ne_bytes(head[offset..offset + 4].try_into().expect("four bytes"))
+    };
+    let (si_signo, code) = (field(0), field(8));
+    if !known_siginfo_layout(if pidfd { si_signo } else { signal }, code) {
+        let start = address + KERNEL_SIGINFO_SIZE;
+        let expansion = start
+            .checked_add(SI_EXPANSION_SIZE)
+            .and_then(|_| AddrMut::<[u8; SI_EXPANSION_SIZE]>::from_raw(start))
+            .and_then(|expansion| guest.memory().read_value(expansion).ok());
+        match expansion {
+            None => return unreadable(start, SI_EXPANSION_SIZE),
+            Some(bytes) if bytes.iter().any(|byte| *byte != 0) => {
+                return RefusedSendSiginfo::Errno(Errno::E2BIG);
+            }
+            Some(_) => {}
+        }
+    }
+    if pidfd && si_signo != signal {
+        return RefusedSendSiginfo::Errno(Errno::EINVAL);
+    }
+    RefusedSendSiginfo::Copied { code }
 }
 
 /// What a send `syscall` carries that Linux checks before sending
