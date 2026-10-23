@@ -3827,6 +3827,11 @@ impl GlobalState {
             GlobalRequest::NamesHermitTask(caller, tgid, tid) => {
                 R::NamesHermitTask(hermit_task_named(caller, tgid, tid))
             }
+            GlobalRequest::KernelRunTarget(target) => R::KernelRunTarget(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .kernel_run_block(target),
+            ),
             GlobalRequest::HoldTurnForGroupExit(dettid) => R::HoldTurnForGroupExit(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -4442,6 +4447,9 @@ impl GlobalState {
             // in-guest delivery gate off, and for a rejoin, whose filing is
             // host-timed (recorded when the thread is readmitted instead).
             sched.record_request_guest_mask(dettid, &rs);
+            // Whether it is a kernel-run call (A5 step 3c.1c, D44), recorded
+            // in the same ordered filing; a no-op with the gate off.
+            sched.record_request_kernel_run(dettid, &rs);
             sched.request_put(&nextturn.req, rs.clone(), &self.global_time);
             nextturn.resp
         };
@@ -6585,6 +6593,11 @@ pub enum GlobalRequest {
     /// `Config::in_guest_signal_delivery`, whose gate requires that
     /// ownership. Appended last.
     StoppingRefusal(String),
+    /// What the scheduler holds for this thread if its latest committed
+    /// request is a kernel-run call whose continuation turn has not been
+    /// granted (A5 design D44, `Scheduler::kernel_run_block`), asked by a
+    /// sender in its turn under the in-guest delivery gate. Appended last.
+    KernelRunTarget(DetTid),
 }
 
 /// Responses from the global object
@@ -6819,6 +6832,8 @@ pub enum GlobalResponse {
     LockLedgerRefused(()),
     /// Appended mapping capture response.
     MappingCapture(mapping_capture::Reply),
+    /// The answer to `GlobalRequest::KernelRunTarget`. Appended last.
+    KernelRunTarget(Option<crate::scheduler::KernelRunBlock>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -7214,6 +7229,25 @@ where
         ),
         "unexpected response to PolicyRefusal: {response:?}"
     );
+}
+
+/// What the scheduler holds for `target` if it is blocked in a kernel-run
+/// call whose continuation turn has not been granted (A5 design D44,
+/// `GlobalRequest::KernelRunTarget`).
+pub(crate) async fn kernel_run_target<G, T>(
+    guest: &mut G,
+    target: DetTid,
+) -> Option<crate::scheduler::KernelRunBlock>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = send_and_update_time(guest, GlobalRequest::KernelRunTarget(target)).await;
+    match response {
+        GlobalResponse::KernelRunTarget(block) => block,
+        GlobalResponse::ThreadExited => None,
+        response => panic!("unexpected response to KernelRunTarget: {response:?}"),
+    }
 }
 
 /// File the run-wide stopping refusal `reason` (A5 design D49,
