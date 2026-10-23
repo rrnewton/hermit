@@ -119,8 +119,6 @@ use crate::scheduler::rejoin_log::Rejoin;
 use crate::scheduler::rejoin_log::RejoinRefusal;
 use crate::scheduler::rejoin_log::RejoinWriter;
 use crate::scheduler::replayer::StopReason;
-use crate::scheduler::replayer::events_consistent;
-use crate::scheduler::replayer::events_match;
 use crate::syscalls::KernelSignalState;
 use crate::syscalls::read_kernel_signal_state;
 use crate::syscalls::thread_is_gone;
@@ -4293,10 +4291,14 @@ impl Scheduler {
                             .collect();
                         let vec = record.into_global();
                         trace!("Trace loaded, length {}", vec.len());
+                        // Indices are schedule positions (`Replayer::stacktrace_position`),
+                        // so no recorded event is kept to match against, and one at or
+                        // past the end names the events the run makes after the
+                        // schedule runs out.
                         let toprint = cfg
                             .stacktrace_event
                             .iter()
-                            .map(|(ix, path)| (*ix, Some(vec[*ix as usize].clone()), path.clone()))
+                            .map(|(ix, path)| (*ix, None, path.clone()))
                             .collect();
                         let mut replayer = Replayer::new(vec);
                         replayer.replay_exhausted_panic = cfg.replay_exhausted_panic;
@@ -5284,6 +5286,9 @@ impl Scheduler {
 
     /// Try to pop the next event from the sorted list of stacktrace_events, if it matches the given
     /// index.  This is idempotent, because subsequent attempts will just fizzle.
+    ///
+    /// The index is the traced count when recording, and the schedule position
+    /// (`Replayer::stacktrace_position`) under `--replay-schedule-from`.
     fn try_pop_stacktrace_event(
         &mut self,
         current_ix: u64,
@@ -5291,29 +5296,22 @@ impl Scheduler {
     ) -> MaybePrintStack {
         let mut result = None;
         if let Some(iter) = &mut self.stacktrace_events
-            && let Some((next_ix, event, m_path)) = iter.peek()
+            && let Some((next_ix, _, m_path)) = iter.peek()
+            && *next_ix == current_ix
         {
-            let go = if let Some(ev) = event {
-                (*next_ix == current_ix && events_consistent(observed, ev))
-                    || events_match(observed, ev)
-            } else {
-                *next_ix == current_ix
-            };
-            if go {
-                info!(
-                    "Now output stack trace for scheduled event #{} = {}:",
-                    current_ix, observed,
+            info!(
+                "Now output stack trace for scheduled event #{} = {}:",
+                current_ix, observed,
+            );
+            if m_path.is_none() {
+                crate::util::capped_eprintln!(
+                    "\nPrinting stack trace for scheduled event #{} = {}:",
+                    current_ix,
+                    observed,
                 );
-                if m_path.is_none() {
-                    crate::util::capped_eprintln!(
-                        "\nPrinting stack trace for scheduled event #{} = {}:",
-                        current_ix,
-                        observed,
-                    );
-                }
-                result = Some(m_path.clone());
-                let _ = iter.next();
             }
+            result = Some(m_path.clone());
+            let _ = iter.next();
         }
         result
     }
@@ -5371,11 +5369,13 @@ impl Scheduler {
         debug_assert!(self.replayer.is_some());
         let mytid = observed.dettid;
 
-        if let Some((ix, action)) = self.replayer.as_mut().map(|r| {
+        if let Some((ix, action, position)) = self.replayer.as_mut().map(|r| {
             let current_ix = r.traced_event_count;
-            (current_ix, r.observe_event(observed))
+            let action = r.observe_event(observed);
+            (current_ix, action, r.stacktrace_position(current_ix))
         }) {
-            let print_stack = self.try_pop_stacktrace_event(ix, observed);
+            let print_stack =
+                position.and_then(|position| self.try_pop_stacktrace_event(position, observed));
             debug!("Next ReplayAction = {:?}", action);
             self.release_replay_priorities_if_exhausted();
 
@@ -16075,6 +16075,17 @@ impl Scheduler {
         }
     }
 
+    /// Whether a schedule replay has been in hard desync with its record at
+    /// some point: a thread ran an event other than the recorded one.
+    pub(crate) fn replay_left_its_record(&self) -> bool {
+        self.replayer.as_ref().is_some_and(|replayer| {
+            replayer
+                .desync_counts
+                .values()
+                .any(|counts| counts.hard > 0)
+        })
+    }
+
     /// Once the replayed schedule has no events left, give every thread the
     /// default priority, once. Nothing guides the run past that point, and a
     /// thread the schedule left at the deferred priority would otherwise wait
@@ -19385,6 +19396,54 @@ mod test {
         assert!(sched.run_queue.remove_tid(readmitted));
         sched.readmit_ready_thread(readmitted);
         assert_eq!(sched.run_queue.queued_priority(readmitted), Some(eager));
+    }
+
+    /// A replay has left its record once a thread runs an event other than the
+    /// recorded one; until then it has not.
+    #[test]
+    fn a_replay_leaves_its_record_at_its_first_hard_desync() {
+        let mut sched = Scheduler::new(&Config::default());
+        assert!(!sched.replay_left_its_record(), "not replaying");
+        let at = LogicalTime::from_nanos;
+        let first = SchedEvent::syscall(DetTid::from_raw(3), Sysno::getpid, SyscallPhase::Prehook)
+            .with_time(at(10_000));
+        let second =
+            SchedEvent::syscall(DetTid::from_raw(3), Sysno::getppid, SyscallPhase::Prehook)
+                .with_time(at(20_000));
+        let third = SchedEvent::syscall(DetTid::from_raw(3), Sysno::getuid, SyscallPhase::Prehook)
+            .with_time(at(30_000));
+        sched.replayer = Some(Replayer::new(vec![first.clone(), second, third]));
+        let _ = sched.consume_schedevent(&first);
+        assert!(!sched.replay_left_its_record(), "in step");
+        let other = SchedEvent::syscall(DetTid::from_raw(5), Sysno::gettid, SyscallPhase::Prehook)
+            .with_time(at(20_000));
+        let _ = sched.consume_schedevent(&other);
+        assert!(sched.replay_left_its_record());
+    }
+
+    /// Under a schedule replay a `--stacktrace-event` index is a schedule
+    /// position: an event the replay observes that the recording lacks (a
+    /// timeslice split by a few branches) neither prints the stack nor shifts
+    /// the recorded event that does.
+    #[test]
+    fn a_replayed_stacktrace_event_prints_at_its_schedule_position() {
+        let mut sched = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw(3);
+        let at = LogicalTime::from_nanos;
+        let first =
+            SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Prehook).with_time(at(10_000));
+        let second =
+            SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Posthook).with_time(at(20_000));
+        sched.replayer = Some(Replayer::new(vec![first.clone(), second.clone()]));
+        sched.stacktrace_events = Some(vec![(1, None, None)].into_iter().peekable());
+        assert_eq!(sched.consume_schedevent(&first).print_stack, None);
+        let extra = SchedEvent::branches(tid, 2).with_time(at(15_000));
+        assert_eq!(
+            sched.consume_schedevent(&extra).print_stack,
+            None,
+            "the second observed event is not recorded event #1"
+        );
+        assert_eq!(sched.consume_schedevent(&second).print_stack, Some(None));
     }
 
     /// A thread queued at the deferred replay priority when the recording
@@ -38442,6 +38501,39 @@ mod strict_boundary_admission_tests {
             };
             assert!(std::panic::catch_unwind(|| Scheduler::new(&cfg)).is_err());
         }
+    }
+
+    /// A `--stacktrace-event` index at or past the end of a replayed legacy
+    /// schedule names an event the run makes after the schedule runs out, so
+    /// building the scheduler takes it as it is instead of indexing the
+    /// recording with it, which panicked.
+    #[test]
+    fn a_stacktrace_index_past_a_legacy_schedule_is_kept_for_the_run_after_it() {
+        use reverie::syscalls::Sysno;
+
+        use crate::preemptions::PreemptionRecord;
+        use crate::preemptions::boundary_recording::Recording;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("schedule.json");
+        let tid = DetTid::from_raw(3);
+        Recording::Legacy(PreemptionRecord::from_sched_events(vec![
+            SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Prehook),
+            SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Posthook),
+        ]))
+        .write(&path)
+        .unwrap();
+        let cfg = Config {
+            replay_schedule_from: Some(path),
+            stacktrace_event: vec![(7, None), (2, None)],
+            ..Config::default()
+        };
+        let scheduler = Scheduler::new(&cfg);
+        let positions: Vec<u64> = scheduler
+            .stacktrace_events
+            .unwrap()
+            .map(|(position, _, _)| position)
+            .collect();
+        assert_eq!(positions, vec![2, 7]);
     }
 }
 
