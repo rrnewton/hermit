@@ -211,7 +211,12 @@ impl PublishingGuest {
     }
 
     fn last(&self) -> Filed {
-        self.filed.lock().unwrap().last().cloned().expect("a filed request")
+        self.filed
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("a filed request")
     }
 }
 
@@ -427,8 +432,11 @@ async fn file_parent(guest: &mut PublishingGuest, parent: &str) -> Expect {
             Expect::Temporary
         }
         "out-of-schedule external call" => {
-            resource_request(guest, request(ResourceID::BlockingExternalIO(op), "recvfrom"))
-                .await;
+            resource_request(
+                guest,
+                request(ResourceID::BlockingExternalIO(op), "recvfrom"),
+            )
+            .await;
             Expect::Own
         }
         "ready, request filed" => {
@@ -444,8 +452,11 @@ async fn file_parent(guest: &mut PublishingGuest, parent: &str) -> Expect {
             Expect::Temporary
         }
         "readmitted with the mask restored" => {
-            resource_request(guest, request(ResourceID::BlockedExternalContinue(op), "read"))
-                .await;
+            resource_request(
+                guest,
+                request(ResourceID::BlockedExternalContinue(op), "read"),
+            )
+            .await;
             Expect::Own
         }
         "vfork parent" => {
@@ -521,7 +532,11 @@ async fn every_parent_publishes_its_mask_at_its_request() {
                 filed.parked,
                 filed.published
             );
-            assert_eq!(filed.recorded, Some(wanted), "{parent}: the scheduler records it");
+            assert_eq!(
+                filed.recorded,
+                Some(wanted),
+                "{parent}: the scheduler records it"
+            );
             if filed.parked {
                 parked_rows += 1;
             } else {
@@ -560,8 +575,9 @@ async fn with_the_gate_off_no_parent_publishes() {
 
 /// A backend that keeps no guest mask apart (every backend before step
 /// 3c.1e) publishes nothing for an own-mask parent, and a request that
-/// publishes nothing leaves what the scheduler holds. A call whose temporary
-/// mask could not be read publishes nothing either.
+/// publishes nothing leaves the scheduler holding none for the thread, not
+/// the mask an earlier request published. A call whose temporary mask could
+/// not be read publishes nothing either.
 #[tokio::test]
 async fn nothing_is_published_without_a_known_mask() {
     let _mask = MaskGuard::block(&[]);
@@ -572,7 +588,10 @@ async fn nothing_is_published_without_a_known_mask() {
     file_parent(&mut guest, "out-of-schedule external call").await;
     let filed = guest.last();
     assert_eq!(filed.published, None);
-    assert_eq!(filed.recorded, Some(TEMPORARY), "None publishes nothing");
+    assert_eq!(
+        filed.recorded, None,
+        "no mask an earlier request published is kept"
+    );
 
     let mut guest = publishing_guest(true, false);
     let mut unknown = request(
@@ -669,8 +688,8 @@ fn guest_masks_are_published_under_modelling_or_the_gate() {
 
 /// Through the real RPC: the coordinator records the mask a
 /// `RequestResources` publishes before the scheduler can act on the request,
-/// keeps it across a request that publishes nothing, and records nothing
-/// with the gate off.
+/// and records nothing with the gate off. A `ParkedRequest` is filed through
+/// the same function (`GlobalState::recv_resources_with_origin`).
 #[tokio::test]
 async fn the_coordinator_records_a_published_mask_as_the_request_is_filed() {
     for gate in [true, false] {

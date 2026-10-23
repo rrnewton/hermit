@@ -1780,8 +1780,8 @@ pub struct Scheduler {
     /// `thread_signal_mask_for`.
     ///
     /// Under the in-guest delivery gate (`in_guest_signal_delivery`) it also
-    /// holds the guest mask each thread published at its latest request that
-    /// published one (`record_request_guest_mask`), because the kernel's
+    /// holds the guest mask each thread published at its latest request
+    /// (`record_request_guest_mask`), because the kernel's
     /// `SigBlk` may then be the in-guest runtime's mask; and those two readers
     /// take it too (`read_thread_blocked_mask_result`).
     saved_guest_sigmasks: BTreeMap<DetTid, u64>,
@@ -6544,20 +6544,16 @@ impl Scheduler {
         self.saved_guest_sigmasks.get(&dettid).copied()
     }
 
-    /// Record the guest mask `rs` publishes for `dettid`
-    /// (`Resources::guest_signal_mask`) in `saved_guest_sigmasks`, under the
-    /// in-guest delivery gate only (A5 step 3c.1b, design 18.16.1 section 6),
-    /// as the request is filed and before the scheduler can act on it. A
-    /// request that publishes nothing (`None`) leaves what is held, and with
-    /// the gate off nothing is recorded, whatever the request carries. Returns
-    /// whether a mask was recorded.
+    /// Under the in-guest delivery gate only (A5 step 3c.1b, design 18.16.1
+    /// section 6), make `saved_guest_sigmasks` hold for `dettid` exactly the
+    /// guest mask `rs` publishes (`Resources::guest_signal_mask`), as the
+    /// request is filed and before the scheduler can act on it: the mask, or
+    /// for a request that knows none (`None`) nothing, so that readers take
+    /// `SigBlk` rather than a mask an earlier request published. With the gate
+    /// off nothing changes, whatever the request carries. Returns whether the
+    /// entry was set from `rs`.
     pub(crate) fn record_request_guest_mask(&mut self, dettid: DetTid, rs: &Resources) -> bool {
-        match rs.guest_signal_mask {
-            Some(mask) if self.in_guest_signal_delivery => {
-                self.set_saved_guest_sigmask(dettid, Some(mask))
-            }
-            _ => false,
-        }
+        self.in_guest_signal_delivery && self.set_saved_guest_sigmask(dettid, rs.guest_signal_mask)
     }
 
     /// Record (`Some`) or clear (`None`) the mask Linux's `blocked` holds for
@@ -13019,7 +13015,6 @@ impl Scheduler {
                         perm,
                         rs.signal_interrupt_errno(),
                         rs.blocked_signal_mask,
-                        rs.guest_signal_mask,
                         resp,
                     );
                     if blocked.is_err() {
@@ -13118,7 +13113,6 @@ impl Scheduler {
         perm: &Permission,
         signal_interrupt_errno: Option<i32>,
         blocked_signal_mask: Option<u64>,
-        published_guest_mask: Option<u64>,
         resp: &Ivar<SchedResponse>,
     ) -> Result<(), SkipTurn> {
         match rid {
@@ -13210,14 +13204,16 @@ impl Scheduler {
                 //
                 // Under the in-guest delivery gate (`in_guest_signal_delivery`,
                 // A5 step 3c.1b) the mask is recorded too, from what this
-                // request published (`Resources::guest_signal_mask`: the
-                // call's temporary mask, or the guest's own as the backend
-                // records it), never from `/proc`, whose `SigBlk` may be the
-                // in-guest runtime's: the guest mask at the call's request. A
-                // request that published nothing records an unknown mask
-                // (`None`), as `blocked_signal_mask_unknown` does, so no reader
-                // takes the kernel's. Nothing is armed from it below: arming
-                // stays under `models_signal_targets`.
+                // request published (`Resources::guest_signal_mask`, held in
+                // `saved_guest_sigmasks` since the request was filed,
+                // `record_request_guest_mask`: the call's temporary mask, or
+                // the guest's own as the backend records it), never from
+                // `/proc`, whose `SigBlk` may be the in-guest runtime's: the
+                // guest mask at the call's request. A request that published
+                // nothing records an unknown mask (`None`), as
+                // `blocked_signal_mask_unknown` does, so no reader takes the
+                // kernel's. Nothing is armed from it below: arming stays under
+                // `models_signal_targets`.
                 let own_mask = self
                     .models_signal_targets
                     .then(|| self.read_thread_blocked_mask(dettid))
@@ -13225,7 +13221,10 @@ impl Scheduler {
                 let sleeping_mask = if self.models_signal_targets {
                     Some(blocked_signal_mask.or(own_mask))
                 } else if self.in_guest_signal_delivery {
-                    Some(blocked_signal_mask.or(published_guest_mask))
+                    Some(
+                        blocked_signal_mask
+                            .or_else(|| self.saved_guest_sigmasks.get(&dettid).copied()),
+                    )
                 } else {
                     None
                 };
@@ -16552,8 +16551,9 @@ mod test {
                     },
                     &Permission::RW,
                     None,
-                    None, None,
-                    &Ivar::new(),)
+                    None,
+                    &Ivar::new(),
+                )
                 .is_ok()
         );
         assert_eq!(
@@ -19492,8 +19492,9 @@ mod test {
                     },
                     &Permission::RW,
                     None,
-                    None, None,
-                    &Ivar::new(),)
+                    None,
+                    &Ivar::new(),
+                )
                 .is_ok()
         );
         assert!(scheduler.vfork_barriers.is_empty());
@@ -19624,8 +19625,9 @@ mod test {
                     },
                     &Permission::RW,
                     None,
-                    None, None,
-                    &Ivar::new(),)
+                    None,
+                    &Ivar::new(),
+                )
                 .is_ok()
         );
         assert!(scheduler.released_vfork_barriers.contains(&parent));
@@ -23535,7 +23537,7 @@ mod test {
                     &inbound,
                     &Permission::W,
                     None,
-                    None, None,
+                    None,
                     &Ivar::new()
                 )
                 .is_err()
@@ -24011,8 +24013,9 @@ mod test {
                                 &ResourceID::BlockedExternalContinue(pselect),
                                 &Permission::RW,
                                 None,
-                                None, None,
-                                &Ivar::new(),)
+                                None,
+                                &Ivar::new(),
+                            )
                             .is_ok()
                     );
                     assert!(
@@ -24125,8 +24128,9 @@ mod test {
                     &ResourceID::VforkFailed(op),
                     &Permission::RW,
                     None,
-                    None, None,
-                    &Ivar::new(),)
+                    None,
+                    &Ivar::new(),
+                )
                 .is_ok()
         );
         assert!(!scheduler.blocked.continuation_masks.contains_key(&thread));
@@ -25223,15 +25227,7 @@ mod test {
         assert_eq!(scheduler.run_queue.tentative_pop_tid(thread), Some(thread));
         assert!(
             scheduler
-                .block_for_one_resource(
-                    thread,
-                    &rid,
-                    &Permission::RW,
-                    None,
-                    mask,
-                    None,
-                    &Ivar::new()
-                )
+                .block_for_one_resource(thread, &rid, &Permission::RW, None, mask, &Ivar::new())
                 .is_err()
         );
     }
@@ -25280,8 +25276,8 @@ mod test {
     /// published at its latest request (`read_thread_blocked_mask_result`,
     /// and through it `thread_signal_mask` and `thread_signal_mask_for`), as
     /// does a restartable poll's filter (`under_published_mask`). With nothing
-    /// published, `SigBlk`; a later request that publishes nothing keeps what
-    /// was published. With the gate off, `SigBlk` throughout, as before.
+    /// published, `SigBlk`, including after a later request that publishes
+    /// nothing. With the gate off, `SigBlk` throughout, as before.
     /// Mutations: the gate test removed from `read_thread_blocked_mask_result`
     /// (the kernel's mask is read under the gate), or the record made
     /// unconditional (a published mask is read with the gate off).
@@ -25291,7 +25287,11 @@ mod test {
         let published = kernel_signal_bit(libc::SIGUSR2);
         for gate in [true, false] {
             let (mut scheduler, _parent, thread) = in_guest_publication_family(gate, kernel);
-            assert_eq!(scheduler.thread_signal_mask(thread), Some(kernel), "gate {gate}");
+            assert_eq!(
+                scheduler.thread_signal_mask(thread),
+                Some(kernel),
+                "gate {gate}"
+            );
             assert_eq!(
                 scheduler.record_request_guest_mask(
                     thread,
@@ -25311,8 +25311,17 @@ mod test {
                 ..Default::default()
             };
             assert_eq!(scheduler.under_published_mask(thread, state).blocked, want);
-            assert!(!scheduler.record_request_guest_mask(thread, &publishing_request(thread, None)));
-            assert_eq!(scheduler.thread_signal_mask(thread), Some(want), "gate {gate}");
+            // A later request that publishes nothing leaves nothing published
+            // under the gate: `SigBlk` again.
+            assert_eq!(
+                scheduler.record_request_guest_mask(thread, &publishing_request(thread, None)),
+                gate
+            );
+            assert_eq!(
+                scheduler.thread_signal_mask(thread),
+                Some(kernel),
+                "gate {gate}"
+            );
         }
     }
 
@@ -25368,6 +25377,11 @@ mod test {
                     state.shared_pending = chld;
                 }
                 scheduler.note_signal_left_in_shared_queue(parent, libc::SIGCHLD);
+                // The request was filed with its publication
+                // (`record_request_guest_mask`).
+                let mut filed = publishing_request(thread, published);
+                filed.blocked_signal_mask = blocked;
+                scheduler.record_request_guest_mask(thread, &filed);
                 let reads = scheduler
                     .test_kernel_mask_reads
                     .load(std::sync::atomic::Ordering::Relaxed);
@@ -25381,14 +25395,17 @@ mod test {
                             &Permission::RW,
                             None,
                             blocked,
-                            published,
                             &Ivar::new()
                         )
                         .is_err(),
                     "{case}"
                 );
                 assert_eq!(
-                    scheduler.blocked.out_of_scheduler_masks.get(&thread).copied(),
+                    scheduler
+                        .blocked
+                        .out_of_scheduler_masks
+                        .get(&thread)
+                        .copied(),
                     gate.then_some(want),
                     "{case}, gate {gate}"
                 );
@@ -26246,7 +26263,7 @@ mod test {
         );
         assert!(
             scheduler
-                .block_for_one_resource(creator, &inbound, &Permission::W, None, None, None, &Ivar::new())
+                .block_for_one_resource(creator, &inbound, &Permission::W, None, None, &Ivar::new())
                 .is_ok()
         );
         assert!(scheduler.blocked.sigchld_deferred.is_empty());
@@ -26935,7 +26952,7 @@ mod test {
         );
         assert!(
             scheduler
-                .block_for_one_resource(creator, &inbound, &Permission::W, None, None, None, &Ivar::new())
+                .block_for_one_resource(creator, &inbound, &Permission::W, None, None, &Ivar::new())
                 .is_err()
         );
         assert!(scheduler.blocked.sigchld_deferred.contains(&creator));
@@ -27483,7 +27500,7 @@ mod test {
         assert_eq!(scheduler.run_queue.tentative_pop_tid(parent), Some(parent));
         assert!(
             scheduler
-                .block_for_one_resource(parent, &inbound, &Permission::W, None, None, None, &Ivar::new())
+                .block_for_one_resource(parent, &inbound, &Permission::W, None, None, &Ivar::new())
                 .is_err()
         );
         assert!(scheduler.blocked.sigchld_deferred.contains(&parent));
@@ -27542,8 +27559,9 @@ mod test {
                     },
                     &Permission::RW,
                     None,
-                    None, None,
-                    &Ivar::new(),)
+                    None,
+                    &Ivar::new(),
+                )
                 .is_ok()
         );
 
@@ -28446,8 +28464,9 @@ mod test {
                     resources.resources.keys().next().unwrap(),
                     &Permission::W,
                     resources.signal_interrupt_errno(),
-                    None, None,
-                    &Ivar::new(),)
+                    None,
+                    &Ivar::new(),
+                )
                 .is_ok()
         );
         assert!(scheduler.blocked.sigchld_deferred.is_empty());
@@ -29158,8 +29177,9 @@ mod test {
                     &ResourceID::WaitPhysicalChild(child),
                     &Permission::W,
                     None,
-                    None, None,
-                    &Ivar::new(),)
+                    None,
+                    &Ivar::new(),
+                )
                 .is_err()
         );
         assert_eq!(
@@ -30420,8 +30440,9 @@ mod test {
                     },
                     &Permission::RW,
                     Option::None,
-                    Option::None, None,
-                    &Ivar::new(),)
+                    Option::None,
+                    &Ivar::new(),
+                )
                 .is_ok()
         );
     }
@@ -33431,8 +33452,9 @@ mod test {
                     &ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD)),
                     &Permission::W,
                     None,
-                    None, None,
-                    &Ivar::new(),)
+                    None,
+                    &Ivar::new(),
+                )
                 .is_ok();
             if scheduler.run_queue.tentative_pop_in_progress() {
                 scheduler.run_queue.undo_tentative_pop();

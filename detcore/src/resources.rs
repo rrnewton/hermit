@@ -728,8 +728,9 @@ pub struct Resources {
     /// `None` with the gate off (every run today), on a request that does not
     /// pass through that function, when the backend keeps no guest mask apart
     /// (every backend before step 3c.1e), and when the call's temporary mask
-    /// could not be read (`blocked_signal_mask_unknown`). `None` publishes
-    /// nothing: the scheduler keeps whatever it held. Appended last and
+    /// could not be read (`blocked_signal_mask_unknown`). Under the gate a
+    /// `None` leaves the scheduler holding no published mask for the thread,
+    /// so its readers take `SigBlk`. Appended last and
     /// `#[serde(default)]`, with no `skip_serializing_if`: `Resources`
     /// travels in bincode RPCs, which decode by position.
     #[serde(default)]
