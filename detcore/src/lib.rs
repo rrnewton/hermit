@@ -96,6 +96,7 @@ mod tool_global;
 pub use tool_global::initial_mm_probe;
 mod tool_local;
 pub mod util;
+mod wait_signal_end;
 
 pub mod detlog;
 pub mod preemptions;
@@ -760,16 +761,112 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Codex review of https://github.com/rrnewton/hermit/pull/4048). Which
     /// results are a completion is decided by [`posthook_checkpoint`]; the
     /// pending names are consumed either way.
+    ///
+    /// `interrupted` is the restart code of a wait a default-fatal signal
+    /// ended under the in-guest delivery gate (`wait_end_checkpoint`, A5
+    /// design D40 and IR-2): the guest never resumes after such a call, as on
+    /// ptrace, so the anchors fire as interrupted with that code, although the
+    /// guest's result is `-EINTR`.
     async fn publish_posthook_checkpoint<G: Guest<Self>>(
         &self,
         guest: &mut G,
         count: u64,
         res: &Result<i64, Error>,
+        interrupted: Option<Errno>,
     ) {
         let posthook = std::mem::take(&mut guest.thread_state_mut().stats.hb_pending_posthook);
-        if let Some(checkpoint) = posthook_checkpoint(count, posthook, res) {
+        let interrupted = interrupted.map(|code| Err(Error::Errno(code)));
+        if let Some(checkpoint) =
+            posthook_checkpoint(count, posthook, interrupted.as_ref().unwrap_or(res))
+        {
             let request = guest.thread_state().mk_request(checkpoint, Permission::R);
             resource_request(guest, request).await;
+        }
+    }
+
+    /// The restart checkpoint (A5 step 3c.1c, design D40, with IR-2's
+    /// placement): run straight after the dispatch `match`, before every
+    /// observer of the result (`fail_on_tool_decided_injection`,
+    /// `delivery_interruption`, DETLOG's `SyscallResult`, the posthook
+    /// happens-before checkpoint, the post-handler hook and the completion),
+    /// so each of them, and the backend, sees the result it returns. Under the
+    /// in-guest delivery gate only, and on the current call's D40 flag
+    /// (`ThreadState::wait_signal_end`), which the path that ended a wait for
+    /// a signal set:
+    ///
+    /// | `res` | flag | guest result | posthook records |
+    /// |---|---|---|---|
+    /// | a restart code | `Fatal` | `-EINTR` | interrupted, with the code |
+    /// | a restart code | `Caught(sig)` | the x86 restart table with `sig`'s flags | a checkpoint |
+    /// | `-ERESTARTSYS` | none | unchanged: the in-guest runtime re-runs it | interrupted |
+    /// | `-ERESTARTNOINTR`, `-ERESTARTNOHAND`, `-ERESTART_RESTARTBLOCK` | none | the run ends (D49) | — |
+    /// | anything else | any | unchanged | as before |
+    ///
+    /// The `-ERESTARTSYS` re-run is Reverie's restart protocol
+    /// (<https://github.com/rrnewton/reverie/issues/362>), which in-guest's
+    /// parked `wait4` and pipe reads reach today (3c.1.0's finding F6).
+    ///
+    /// A default-fatal end is `-EINTR` because the process dies at the return
+    /// and the guest never sees the value; DETLOG then shows `-EINTR` where
+    /// ptrace's record shows the kernel's restart code (a named record
+    /// difference). A caught end that the table restarts keeps its restart
+    /// code: no 3c.1 wait has one (phase 1's `pause` returns `ERESTARTNOHAND`,
+    /// which the table turns into `EINTR`), and the register rewind a restart
+    /// needs is step 3c.2's. Returns the guest's result and, for the fatal
+    /// row, the original code for the posthook checkpoint. With the gate off
+    /// it returns `res` and nothing, and the flag is never set.
+    async fn wait_end_checkpoint<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+        res: Result<i64, Error>,
+    ) -> (Result<i64, Error>, Option<Errno>) {
+        use crate::signal_restart::CaughtSignalReturn;
+        use crate::wait_signal_end::WaitSignalEnd;
+        let end = guest.thread_state_mut().wait_signal_end.take();
+        if !self.cfg.in_guest_signal_delivery {
+            return (res, None);
+        }
+        let code = match &res {
+            Err(Error::Errno(errno)) if crate::wait_signal_end::is_restart_code(*errno) => {
+                Some(*errno)
+            }
+            _ => None,
+        };
+        match (end, code) {
+            (Some(WaitSignalEnd::Fatal(_)), Some(code)) => (Err(Errno::EINTR.into()), Some(code)),
+            (Some(WaitSignalEnd::Caught(signal)), Some(code)) => {
+                let flags = if code == Errno::ERESTARTSYS {
+                    match crate::syscalls::helpers::caught_action_flags(guest, signal).await {
+                        Ok(flags) => flags,
+                        Err(error) => return (Err(error), None),
+                    }
+                } else {
+                    0
+                };
+                match crate::signal_restart::caught_signal_return(
+                    -i64::from(code.into_raw()),
+                    flags,
+                ) {
+                    CaughtSignalReturn::Returns(value) if value < 0 => (
+                        Err(Errno::new(i32::try_from(-value).unwrap_or(libc::EINVAL)).into()),
+                        None,
+                    ),
+                    CaughtSignalReturn::Returns(value) => (Ok(value), None),
+                    CaughtSignalReturn::Restarts => (res, None),
+                }
+            }
+            (None, Some(code)) if code != Errno::ERESTARTSYS => {
+                let reason = crate::refused_signal_controls::restart_code_without_signal_refusal(
+                    call.number().name(),
+                    code.name().unwrap_or("a restart code"),
+                    guest.thread_state().dettid.as_raw(),
+                );
+                tracing::error!("{}", reason);
+                crate::tool_global::stopping_refusal(guest, reason).await;
+                (res, None)
+            }
+            _ => (res, None),
         }
     }
 
@@ -3512,6 +3609,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // A new thread's first stop is at the exit of the call
                     // that made it, which Detcore did not finish for it.
                     delivery_interruption: None,
+                    // A new thread has no wait in progress.
+                    wait_signal_end: None,
                     delivery_frame_handler: 0,
                     delivery_frame_signal: 0,
                     delivery_frame_orig_ax: 0,
@@ -5327,6 +5426,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     .await
             }
         };
+        // The restart checkpoint (A5 step 3c.1c, design D40, placed by IR-2):
+        // under the in-guest delivery gate, a wait a signal ended gets the
+        // result the guest sees here, before anything below observes `res`.
+        // With the gate off it changes nothing.
+        let (res, interrupted) = self.wait_end_checkpoint(guest, &call, res).await;
+
         // A call Detcore injected that the backend left to the Tool
         // (`UnsupportedOperation::ToolDecided`), such as the getpgrp a clone3
         // race passes through (https://github.com/rrnewton/hermit/issues/4531),
@@ -5424,7 +5529,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
         if let Err(error) = self.detlog_memory_maps(guest) {
             let res = Err(error);
-            self.publish_posthook_checkpoint(guest, new_count, &res)
+            self.publish_posthook_checkpoint(guest, new_count, &res, interrupted)
                 .await;
             return self.complete_syscall(guest, res).await;
         }
@@ -5444,7 +5549,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             )
         {
             let res = Err(error);
-            self.publish_posthook_checkpoint(guest, new_count, &res)
+            self.publish_posthook_checkpoint(guest, new_count, &res, interrupted)
                 .await;
             return self.complete_syscall(guest, res).await;
         }
@@ -5464,7 +5569,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // Posthook happens-before anchors this call reached fire now that its
         // result is decided and before the guest resumes
         // (https://github.com/rrnewton/hermit/issues/3929).
-        self.publish_posthook_checkpoint(guest, new_count, &res)
+        self.publish_posthook_checkpoint(guest, new_count, &res, interrupted)
             .await;
 
         // The syscall is finished; a turn the post-hook takes (a timeslice
