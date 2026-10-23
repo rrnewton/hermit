@@ -2547,7 +2547,15 @@ fi
 # Cargo.lock and rust-toolchain.toml, so the inventory, SDK and native inputs,
 # calibrated budget, job width and limits carry unchanged from the bc876517
 # entry.
-expected_pin=5d9d4c4fb062cbef95b9a9628e740f98f22946cc
+# CARRY TO 8de33d8f0a64a48a959b0c96e69517fc1230d05d (2026-10-23): from
+# 5d9d4c4fb062cbef95b9a9628e740f98f22946cc. One commit (kvm lane, per-call slice 6b:
+# reverie-kvm runs the synchronous starts of the syscall-return signal
+# boundary, its receipt and its injection signal-effect flush without
+# building their futures). It changes reverie-kvm/src only; git diff is empty
+# under reverie-dbt/ and third-party/ and for the root Cargo.toml, Cargo.lock
+# and rust-toolchain.toml, so the inventory, SDK and native inputs, calibrated
+# budget, job width and limits carry unchanged from the 5d9d4c4f entry.
+expected_pin=8de33d8f0a64a48a959b0c96e69517fc1230d05d
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
