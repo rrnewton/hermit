@@ -3401,7 +3401,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 285, listed.
     // And dispatch_stats::ptrace_syscall_histograms_of_two_runs_are_identical
     // (the per-run syscall histogram (dh-te7ep)): 286, listed.
-    ("test.hermit_integration_2", 286),
+    // And fatal_core_capture's
+    // a_fault_ends_the_run_while_the_leader_waits_on_a_condition_variable (a
+    // thread's fault ends the run by its signal while main waits on a
+    // condition variable): 287, listed.
+    ("test.hermit_integration_2", 287),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU

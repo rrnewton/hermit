@@ -63,6 +63,7 @@ fn deregistration(tid: DetTid, mm: MmId, count: u64) -> ThreadDeregistration {
         syscall_count: count,
         syscall_histogram: Default::default(),
         chaos_epochs: Vec::new(),
+        killed_by_group_signal: false,
     }
 }
 

@@ -5764,6 +5764,7 @@ impl GlobalState {
             syscall_count,
             syscall_histogram,
             chaos_epochs,
+            killed_by_group_signal,
         } = deregistration;
         if !sched.rpc_incarnation_matches(dettid, mm) {
             debug!(
@@ -5801,6 +5802,9 @@ impl GlobalState {
             return;
         }
         sched.retire_deregistered_thread(dettid, detpid, mm);
+        if killed_by_group_signal {
+            sched.note_signal_killed_group(dettid, detpid);
+        }
         trace!(
             "[detcore, dtid {}] thread deregistered, removed from sched structures.",
             dettid
@@ -6387,6 +6391,9 @@ pub struct ThreadDeregistration {
     /// total is `syscall_count`.
     pub(crate) syscall_histogram: SparseSyscallHistogram,
     pub(crate) chaos_epochs: Vec<ChaosEpochTransition>,
+    /// The thread died of a signal that ends its whole thread group
+    /// (`signal_ends_thread_group`, `Scheduler::note_signal_killed_group`).
+    pub(crate) killed_by_group_signal: bool,
 }
 
 /// A question about, or a record in, the scheduler's ledger of guest-handled
@@ -11813,6 +11820,7 @@ mod tests {
     mod exec_teardown_tests;
     mod gated_wait_turn_tests;
     mod guest_mask_publication_tests;
+    mod sigkill_deregistration_tests;
     mod stopping_refusal_tests;
     mod temporary_mask_publication_tests;
     mod timerless_clock_tests;
@@ -12297,6 +12305,7 @@ mod tests {
                     syscall_count: 0,
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
+                    killed_by_group_signal: false,
                 },
             );
             assert_eq!(
@@ -14814,6 +14823,7 @@ mod tests {
                     syscall_count: 3,
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
+                    killed_by_group_signal: false,
                 };
                 for _ in 0..2 {
                     let (_, done) = state
@@ -14940,6 +14950,7 @@ mod tests {
                             syscall_count: 3,
                             syscall_histogram: Default::default(),
                             chaos_epochs: Vec::new(),
+                            killed_by_group_signal: false,
                         }),
                     ),
                 )
@@ -16627,6 +16638,7 @@ mod tests {
                     syscall_count: 0,
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
+                    killed_by_group_signal: false,
                 },
             )
             .await;
@@ -16787,6 +16799,7 @@ mod tests {
                         syscall_count: 0,
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
+                        killed_by_group_signal: false,
                     }),
                 ),
             )
@@ -18197,6 +18210,7 @@ mod tests {
                     syscall_count: 0,
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
+                    killed_by_group_signal: false,
                 },
             )
             .await;
@@ -18225,6 +18239,7 @@ mod tests {
                     syscall_count: 0,
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
+                    killed_by_group_signal: false,
                 },
             )
             .await;
@@ -18541,6 +18556,7 @@ mod tests {
                         syscall_count: 17,
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
+                        killed_by_group_signal: false,
                     }),
                 ),
             )
@@ -18577,6 +18593,7 @@ mod tests {
                         syscall_count: 99,
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
+                        killed_by_group_signal: false,
                     }),
                 ),
             )
