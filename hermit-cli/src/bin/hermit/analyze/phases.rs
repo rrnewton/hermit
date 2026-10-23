@@ -13,6 +13,7 @@ use std::fs::File;
 use std::path::Path;
 use std::path::PathBuf;
 
+use anyhow::Context as _;
 use anyhow::bail;
 use colored::Colorize;
 use detcore::preemptions::PreemptionReader;
@@ -33,6 +34,7 @@ use crate::analyze::types::AnalyzeOpts;
 use crate::analyze::types::ExitStatusConstraint;
 use crate::analyze::types::Report;
 use crate::analyze::types::ReportCriticalEvent;
+use crate::container::RunTimeoutMarker;
 use crate::global_opts::GlobalOpts;
 use crate::logdiff::LogDiffCLIOpts;
 use crate::run::RunOpts;
@@ -52,6 +54,29 @@ fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
 
 fn yellow_msg(msg: &str) {
     eprintln!(":: {}", msg.yellow().bold());
+}
+
+/// Why the critical pair a search settled on may not be a race, if there is a reason.
+///
+/// Swapping two events of one thread is no interleaving any execution can take, so
+/// the outcome change at such a pair comes from the replay falling off the schedule.
+/// Trials that timed out were counted as not reaching the target, which can steer
+/// the search onto exactly such a pair.
+fn critical_pair_caveat(crit: &CriticalSchedule, timed_out: usize) -> Option<String> {
+    let index = crit.critical_event_index;
+    let schedule = &crit.failing_schedule;
+    let same_thread =
+        index > 0 && index < schedule.len() && schedule[index - 1].dettid == schedule[index].dettid;
+    if !same_thread {
+        return None;
+    }
+    Some(format!(
+        "the critical events #{} and #{index} both belong to thread {}, so swapping them is \
+         not an interleaving and this pair is not a race. {timed_out} trial(s) timed out and \
+         were counted as the baseline condition.",
+        index - 1,
+        schedule[index].dettid,
+    ))
 }
 
 impl AnalyzeOpts {
@@ -134,7 +159,18 @@ impl AnalyzeOpts {
             (critical_event_index, Some(stack2_path.clone())),
         ]
         .to_vec();
-        run.launch()?;
+        if let Err(error) = run.launch() {
+            // The stacks are written when the replay reaches the critical events, so a
+            // replay that hangs afterwards has still done its job.
+            if error.downcast_ref::<RunTimeoutMarker>().is_none() || !stack2_path.exists() {
+                return Err(error);
+            }
+            eprintln!(
+                ":: {} ({}) after recording the critical stacks",
+                "WARNING: the stack-trace replay timed out".yellow().bold(),
+                error.root_cause()
+            );
+        }
         Ok((run, stack1_path, stack2_path))
     }
 
@@ -196,9 +232,16 @@ impl AnalyzeOpts {
 
     /// Mutates AnalyzeOpts in order to initialize some fields.
     fn phase0_initialize(&mut self) -> anyhow::Result<()> {
-        let dir = tempfile::Builder::new()
-            .prefix("hermit_analyze")
-            .tempdir()?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("hermit_analyze");
+        let dir = match &self.tmp_dir {
+            Some(parent) => {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("cannot create --tmp-dir {}", parent.display()))?;
+                builder.tempdir_in(parent)?
+            }
+            None => builder.tempdir()?,
+        };
         let tmpdir_path = dir.keep(); // For now always keep the temporary results.
         eprintln!(":: Temp workspace: {}", tmpdir_path.display());
         self.tmp_dir = Some(tmpdir_path);
@@ -462,10 +505,14 @@ impl AnalyzeOpts {
         baseline: &[SchedEvent],
     ) -> anyhow::Result<CriticalSchedule> {
         let mut i = 0;
+        let mut timed_out = 0;
 
         // Each call is one trial. A trial that cannot finish (for example, one
         // that --max-log-bytes ended) returns its error unchanged, and the
-        // search stops there.
+        // search stops there. A trial that the run arguments' --timeout ended
+        // is the exception: a spliced schedule can leave the guest waiting for
+        // an event that never comes, so it did not reach the target, and the
+        // search goes on.
         let test_fn = |sched: &[SchedEvent]| -> TrialOutcome {
             i += 1;
             let runname = format!("bisect_round_{:0wide$}", i, wide = 3);
@@ -485,7 +532,17 @@ impl AnalyzeOpts {
                 );
             }
 
-            newrun.launch()?;
+            if let Err(error) = newrun.launch() {
+                if error.downcast_ref::<RunTimeoutMarker>().is_none() {
+                    return Err(error);
+                }
+                timed_out += 1;
+                eprintln!(
+                    " => Timed out ({}); counted as the baseline condition",
+                    error.root_cause()
+                );
+                return Ok((true, sched.to_owned()));
+            }
             let is_match = newrun.is_a_match();
             if is_match {
                 eprintln!(" => Target condition ({})", self.display_criteria());
@@ -513,6 +570,9 @@ impl AnalyzeOpts {
             "Critical event of final on-target schedule is {}",
             crit.critical_event_index
         );
+        if let Some(caveat) = critical_pair_caveat(&crit, timed_out) {
+            eprintln!(":: {} {caveat}", "WARNING:".yellow().bold());
+        }
         Ok(crit)
     }
 
@@ -1051,6 +1111,47 @@ mod tests {
     use super::*;
     use crate::container::LogCapExceeded;
     use crate::container::PolicyRefusal;
+
+    fn critical(tids: &[i32], index: usize) -> CriticalSchedule {
+        let schedule: Vec<SchedEvent> = tids
+            .iter()
+            .map(|&tid| SchedEvent::branches(detcore::types::DetTid::from_raw(tid), 1))
+            .collect();
+        CriticalSchedule {
+            failing_schedule: schedule.clone(),
+            passing_schedule: schedule,
+            critical_event_index: index,
+        }
+    }
+
+    /// `--tmp-dir` names the directory the workspace is created in, and is
+    /// created if it is missing.
+    #[test]
+    fn the_workspace_is_created_in_the_tmp_dir() {
+        let parent = tempfile::tempdir().unwrap();
+        let requested = parent.path().join("not-yet-created");
+        let tmp_dir = format!("--tmp-dir={}", requested.display());
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
+        options.phase0_initialize().unwrap();
+        let workspace = options.get_tmp().unwrap();
+        assert_eq!(workspace.parent(), Some(requested.as_path()));
+        assert!(workspace.is_dir(), "{}", workspace.display());
+    }
+
+    #[test]
+    fn a_same_thread_critical_pair_is_flagged_and_a_cross_thread_one_is_not() {
+        let caveat = critical_pair_caveat(&critical(&[3, 3, 5], 1), 2)
+            .expect("two events of thread 3 cannot be reordered");
+        assert!(caveat.contains("both belong to thread 3"), "{caveat}");
+        assert!(caveat.contains("2 trial(s) timed out"), "{caveat}");
+
+        assert_eq!(
+            critical_pair_caveat(&critical(&[3, 3, 5], 2), 0),
+            None,
+            "3 then 5 is a race"
+        );
+    }
 
     /// A search round whose trial `--max-log-bytes` ended stops the `--search`
     /// loop and returns that error, still a `LogCapExceeded`, so main reports

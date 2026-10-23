@@ -175,9 +175,10 @@ pub struct AnalyzeOpts {
     #[clap(long, short, value_name = "EVTCNT", default_value = "5")]
     pub execution_context: usize,
 
-    /// Where the analysis run will store its temporary artifacts.
+    /// Directory under which the analysis creates its workspace of temporary artifacts
+    /// (schedules, logs, reports of every run), created if missing.
     ///
-    /// By default this is a directory in `/tmp`
+    /// By default the workspace is a directory in `/tmp`
     #[clap(long, value_name = "PATH")]
     pub tmp_dir: Option<PathBuf>,
 

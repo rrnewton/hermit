@@ -14,6 +14,7 @@ use detcore::edit_distance::NeedlemanWunsch;
 use detcore::edit_distance::NeedlemanWunschError;
 use detcore::edit_distance::generate_permutation;
 use detcore::edit_distance::iterable_bubble_sort;
+use detcore::types::Op;
 use detcore::types::SchedEvent;
 
 /// User configurable settings.
@@ -26,6 +27,12 @@ pub struct Config {
     pub max_needleman_matrix_cells: usize,
     /// Number of identical replays required to classify a jittered control schedule.
     pub max_replay_attempts: usize,
+    /// How many retired conditional branches two replays of one control schedule
+    /// may disagree by in a branch event and still count as the same realized
+    /// trace. Hosts whose branch counter is not exact (AMD Zen with SpecLockMap
+    /// enabled, which a VM guest cannot turn off) move a preemption by a few
+    /// branches between runs while the interleaving stays the same.
+    pub max_branch_count_jitter: u32,
     /// Try to split a final adjacent event pair into a precise branch boundary.
     pub refine_sub_events: bool,
     pub verbose: bool,
@@ -42,6 +49,7 @@ impl Default for Config {
             max_unmatched_to_print: 10,
             max_needleman_matrix_cells: 4_000_000,
             max_replay_attempts: 2,
+            max_branch_count_jitter: 64,
             refine_sub_events: true,
             verbose: false,
             needleman_search: false,
@@ -169,6 +177,45 @@ fn just_distance(sched1: &[SchedEvent], sched2: &[SchedEvent]) -> (usize, usize)
     (bubbles.edit_distance(), bubbles.swap_distance())
 }
 
+/// `schedule` without the events `other` has no counterpart for, matched as
+/// multisets from the left, if what is left differs from `other` by exactly one
+/// adjacent swap.
+fn events_shared_with(schedule: &[SchedEvent], other: &[SchedEvent]) -> Option<Vec<SchedEvent>> {
+    let mut available: std::collections::HashMap<&SchedEvent, usize> =
+        std::collections::HashMap::new();
+    for event in other {
+        *available.entry(event).or_default() += 1;
+    }
+    let shared: Vec<SchedEvent> = schedule
+        .iter()
+        .filter(|event| match available.get_mut(event) {
+            Some(count) if *count > 0 => {
+                *count -= 1;
+                true
+            }
+            _ => false,
+        })
+        .cloned()
+        .collect();
+    (shared.len() == other.len() && just_distance(&shared, other) == (1, 1)).then_some(shared)
+}
+
+/// Whether two realized traces of one control schedule are the same interleaving:
+/// the same events of the same threads in the same order, with branch counts that
+/// differ by at most `branch_jitter`. Event times are not compared: they follow
+/// from the counts, so a branch-count difference shifts every later time.
+fn same_interleaving(first: &[SchedEvent], second: &[SchedEvent], branch_jitter: u32) -> bool {
+    first.len() == second.len()
+        && first.iter().zip(second).all(|(a, b)| {
+            let allowed = if a.op == Op::Branch { branch_jitter } else { 0 };
+            a.dettid == b.dettid
+                && a.op == b.op
+                && a.start_rip == b.start_rip
+                && a.end_rip == b.end_rip
+                && a.count.abs_diff(b.count) <= allowed
+        })
+}
+
 fn test_and_select_stable_point<F>(
     tester: &mut F,
     requested_schedule: &[SchedEvent],
@@ -195,7 +242,13 @@ where
 
     for attempt in 2..=cfg.max_replay_attempts.max(2) {
         let (replayed_passes, replayed_actual) = tester(requested_schedule)?;
-        if replayed_passes == passes && replayed_actual == actual_schedule {
+        if replayed_passes == passes
+            && same_interleaving(
+                &replayed_actual,
+                &actual_schedule,
+                cfg.max_branch_count_jitter,
+            )
+        {
             eprintln!(
                 ":: Jittered control schedule reproduced the same outcome and realized trace on attempt {}",
                 attempt,
@@ -390,8 +443,29 @@ where
         }
 
         if swap_dist == 1 {
-            panic!(
-                "Aborting search: schedules are one swap apart but still contain {} unmatched event edits",
+            // The failing run took a path the passing one did not (an error branch, a
+            // retry), so its schedule keeps events the passing one lacks. Without them
+            // the two differ by the one remaining swap; that order is the critical
+            // pair if it still fails.
+            if let Some(trimmed) = events_shared_with(&failing_schedule, &passing_schedule) {
+                eprintln!(
+                    ":: Schedules are one swap apart; testing the failing schedule without its {} events the passing one lacks",
+                    failing_schedule.len() - trimmed.len(),
+                );
+                let (trimmed_passes, _) = tester(&trimmed)?;
+                if !trimmed_passes {
+                    return Ok(EventLevelSearchResult {
+                        passing_schedule,
+                        failing_schedule: trimmed,
+                    });
+                }
+            }
+            anyhow::bail!(
+                "the search stopped one swap from the passing schedule, but the failing \
+                 schedule still has {} events the passing one lacks, and without them it no \
+                 longer fails. The failure depends on events only the failing run executed \
+                 (often branch events whose preemption points differ), so no single adjacent \
+                 swap separates the two outcomes.",
                 edit_dist - swap_dist,
             );
         }
@@ -904,6 +978,55 @@ mod tests {
         assert!(passes);
         assert_eq!(selected, requested);
         assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn a_failing_schedule_with_extra_events_reduces_to_the_one_swap() {
+        let a = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook);
+        let b = SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook);
+        let c = SchedEvent::syscall(DetTid::from_raw(3), Sysno::getpid, SyscallPhase::Prehook);
+        let extra = SchedEvent::syscall(DetTid::from_raw(7), Sysno::close, SyscallPhase::Prehook);
+        let passing = vec![a.clone(), b.clone(), c.clone()];
+        let failing = vec![b.clone(), extra.clone(), a.clone(), c.clone(), extra];
+        assert_eq!(
+            events_shared_with(&failing, &passing),
+            Some(vec![b, a, c.clone()]),
+            "the events only the failing run had are dropped"
+        );
+        assert_eq!(
+            events_shared_with(&passing, &passing),
+            None,
+            "identical schedules are not one swap apart"
+        );
+    }
+
+    #[test]
+    fn replays_differing_only_by_branch_skid_are_one_interleaving() {
+        let tid = DetTid::from_raw(3);
+        let other = DetTid::from_raw(5);
+        let trace = |count: u32, end_time: u64| {
+            vec![
+                SchedEvent {
+                    end_time: Some(detcore::types::LogicalTime::from_nanos(end_time)),
+                    ..SchedEvent::branches(tid, count)
+                },
+                SchedEvent::syscall(other, Sysno::read, SyscallPhase::Prehook),
+            ]
+        };
+        assert!(
+            same_interleaving(&trace(115, 10), &trace(121, 70), 64),
+            "a few branches of skid and the times it shifts are the same interleaving"
+        );
+        assert!(
+            !same_interleaving(&trace(115, 10), &trace(500, 10), 64),
+            "a preemption hundreds of branches away is a different trace"
+        );
+        let mut reordered = trace(115, 10);
+        reordered.reverse();
+        assert!(
+            !same_interleaving(&trace(115, 10), &reordered, 64),
+            "another order is another interleaving"
+        );
     }
 
     #[test]
