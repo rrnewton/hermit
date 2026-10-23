@@ -698,6 +698,11 @@ impl Tool for Recorder {
             // replay may stand in for with an eventfd placeholder, so the
             // answer is recorded (https://github.com/rrnewton/hermit/issues/31).
             Syscall::EpollCtl(_) => self.handle_simple(guest, syscall).await,
+            // Detcore refuses a guest's own kcmp, so this is only Detcore's
+            // probe of a descriptor received over SCM_RIGHTS. Its answer names
+            // open files that replay stands in for with placeholders, so it is
+            // recorded.
+            Syscall::Kcmp(_) => self.handle_simple(guest, syscall).await,
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-3871): Replay does not recreate a connection's
