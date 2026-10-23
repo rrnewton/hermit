@@ -6642,6 +6642,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                     virtual_cpuinfo: virtual_cpuinfo.clone(),
                     machine: machine.clone(),
                     published_sigblk,
+                    // A5 step 3c.1d, design D37: the pending ignored signals
+                    // the guest's mask lets in are left out, under the gate
+                    // only.
+                    status_hides_ignored: guest.config().in_guest_signal_delivery,
                     lock_rows_kept: lock_rows_kept.clone(),
                     task_stat,
                 },

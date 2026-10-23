@@ -45,6 +45,14 @@ pub(crate) const PAUSE_FYI: &str = "pause";
 /// (`scheduler::sleep_signal`).
 pub(crate) const NANOSLEEP_FYI: &str = "nanosleep";
 
+/// Identifies the parked `rt_sigsuspend` of the in-guest delivery gate
+/// (`SleepUntil(INDEFINITE)`; A5 step 3c.1d, design D39): the scheduler ends
+/// it as it ends a `pause` (`scheduler::sleep_signal`), for a signal its
+/// temporary mask, which the request publishes (`blocked_signal_mask`), lets
+/// in. Phase 1's SIGALRM ledger never sees it: phase 1 refuses
+/// `rt_sigsuspend` in a process that handles SIGALRM.
+pub(crate) const RT_SIGSUSPEND_FYI: &str = "rt_sigsuspend";
+
 /// The SIGALRM action read in the owner turn of an emulated in-guest sleep.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum SigalrmSleepDisposition {

@@ -1494,6 +1494,15 @@ pub(crate) struct ProcfsSnapshotContext {
     /// (Codex review of R2b-2 stage 2, P2;
     /// https://github.com/rrnewton/hermit/issues/4273). Built by the caller.
     pub(crate) published_sigblk: Option<u64>,
+    /// For a status snapshot under the in-guest delivery gate
+    /// (`Config::in_guest_signal_delivery`; A5 step 3c.1d, design D37):
+    /// leave out of `SigPnd` and `ShdPnd` the pending ignored signals that
+    /// the thread's guest mask (`published_sigblk`, or the snapshot's own
+    /// `SigBlk` when none was published) does not block, which Linux
+    /// discarded when they were sent, though the in-guest runtime's mask
+    /// holds them (`ignored_signals::hidden_from_status`). False keeps both
+    /// fields as the kernel rendered them, as before.
+    pub(crate) status_hides_ignored: bool,
     /// For `/proc/locks`, which of the kernel's rows, in order, the guest
     /// owns (`locks::guest_lock_rows`); the others are dropped before the
     /// sanitizer numbers identities. Built by the caller, which asks
@@ -2425,6 +2434,7 @@ impl ProcfsFile {
             virtual_cpuinfo,
             machine,
             published_sigblk,
+            status_hides_ignored,
             lock_rows_kept,
             task_stat,
         } = context;
@@ -2447,6 +2457,7 @@ impl ProcfsFile {
                 &contents,
                 Some((virtual_pid, virtual_pid, virtual_ppid)),
                 published_sigblk,
+                status_hides_ignored,
             ),
             ProcfsKind::ThreadStat => {
                 let (_, tid, ppid) = self
@@ -2458,7 +2469,12 @@ impl ProcfsFile {
                 let (tgid, tid, ppid) = self
                     .bound_thread_identity
                     .expect("thread-self status was not bound when opened");
-                sanitize_status(&contents, Some((tgid, tid, ppid)), published_sigblk)
+                sanitize_status(
+                    &contents,
+                    Some((tgid, tid, ppid)),
+                    published_sigblk,
+                    status_hides_ignored,
+                )
             }
             ProcfsKind::ProcessStat => {
                 let sanitized = sanitize_stat(&contents, None);
@@ -2469,7 +2485,8 @@ impl ProcfsFile {
             }
             ProcfsKind::Statm => sanitize_statm(&contents),
             ProcfsKind::ProcessStatus => {
-                let sanitized = sanitize_status(&contents, None, published_sigblk);
+                let sanitized =
+                    sanitize_status(&contents, None, published_sigblk, status_hides_ignored);
                 match &self.guest_numbers {
                     Some(numbers) => renumber_status(&sanitized, numbers),
                     None => sanitized,
@@ -3208,6 +3225,7 @@ fn sanitize_status(
     contents: &[u8],
     virtual_identity: Option<(i32, i32, i32)>,
     published_sigblk: Option<u64>,
+    hides_ignored: bool,
 ) -> Vec<u8> {
     const STATE: &[u8] = b"State:";
     const TGID: &[u8] = b"Tgid:";
@@ -3219,6 +3237,8 @@ fn sanitize_status(
     const NS_PGID: &[u8] = b"NSpgid:";
     const NS_SID: &[u8] = b"NSsid:";
     const SIGQ: &[u8] = b"SigQ:";
+    const SIGPND: &[u8] = b"SigPnd:";
+    const SHDPND: &[u8] = b"ShdPnd:";
     const SIGBLK: &[u8] = b"SigBlk:";
     const CPUS_ALLOWED: &[u8] = b"Cpus_allowed:";
     const CPUS_ALLOWED_LIST: &[u8] = b"Cpus_allowed_list:";
@@ -3249,11 +3269,48 @@ fn sanitize_status(
         b"HugetlbPages",
     ];
 
+    // Under the in-guest delivery gate (A5 step 3c.1d, design D37): the
+    // ignored signals the guest's mask lets in, which Linux discarded when
+    // they were sent, are left out of both pending fields. The actions and
+    // the mask are the snapshot's own lines, all read under one lock of the
+    // thread's signal state (fs/proc/array.c:264-300 at v6.12). A status
+    // missing one of them is left as it is.
+    let hidden = if hides_ignored {
+        let field = |label: &[u8]| {
+            contents
+                .split(|byte| *byte == b'\n')
+                .find_map(|line| line.strip_prefix(label))
+                .and_then(|value| std::str::from_utf8(value).ok())
+                .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+        };
+        match (field(b"SigIgn:"), field(b"SigCgt:"), field(SIGBLK)) {
+            (Some(ignored), Some(caught), Some(blocked)) => {
+                Some((ignored, caught, published_sigblk.unwrap_or(blocked)))
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
     let mut normalized = Vec::with_capacity(contents.len());
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
         let has_newline = line.last() == Some(&b'\n');
         let body = line.strip_suffix(b"\n").unwrap_or(line);
-        if body.starts_with(STATE) {
+        let pending_label = hidden.and_then(|_| {
+            [SIGPND, SHDPND]
+                .into_iter()
+                .find(|label| body.starts_with(label))
+        });
+        if let (Some(label), Some((ignored, caught, mask))) = (pending_label, hidden)
+            && let Some(pending) = std::str::from_utf8(&body[label.len()..])
+                .ok()
+                .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
+        {
+            let shown = pending
+                & !crate::ignored_signals::hidden_from_status(pending, ignored, caught, mask);
+            normalized.extend_from_slice(label);
+            normalized.extend_from_slice(format!("\t{shown:016x}").as_bytes());
+        } else if body.starts_with(STATE) {
             normalized.extend_from_slice(b"State:\tS (sleeping)");
         } else if let Some((virtual_tgid, _, _)) = virtual_identity
             && (body.starts_with(TGID) || body.starts_with(NS_TGID))
@@ -7133,7 +7190,7 @@ Rss:                   4 kB\n" as &[u8];
     fn status_normalizes_affinity_and_context_switches() {
         let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nVmHWM:\t1572 kB\nVmRSS:\t1568 kB\nRssFile:\t1452 kB\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nMems_allowed:\t00000000,00000003\nMems_allowed_list:\t0-1\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
         assert_eq!(
-            sanitize_status(input, Some((3, 3, 1)), None),
+            sanitize_status(input, Some((3, 3, 1)), None, false),
             b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t1\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nMems_allowed:\t00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
         );
     }
@@ -7175,8 +7232,80 @@ Rss:                   4 kB\n" as &[u8];
         );
         let status = b"Name:\thermit\nState:\tR (running)\nPid:\t1\nPPid:\t0\nVmSize:\t249000 kB\nVmRSS:\t30000 kB\n";
         assert_eq!(
-            sanitize_status(status, None, None),
+            sanitize_status(status, None, None, false),
             b"Name:\thermit\nState:\tS (sleeping)\nPid:\t1\nPPid:\t0\nVmSize:\t0 kB\nVmRSS:\t0 kB\n"
+        );
+    }
+
+    /// A5 step 3c.1d, design D37's visibility rule: under the in-guest
+    /// delivery gate a status leaves out of `SigPnd` and `ShdPnd` the pending
+    /// ignored signals the thread's published guest mask lets in (Linux
+    /// discarded them at send), and keeps a blocked one, a caught one and
+    /// every one that is not ignored; with nothing published the snapshot's
+    /// own `SigBlk` is the mask. With the gate off both fields are the
+    /// kernel's, byte for byte. Mutations: "the subtraction ignores the
+    /// mask" (the blocked SIGURG row loses it), "the subtraction keyed on
+    /// the gate being off" (the gate-off row changes).
+    #[test]
+    fn under_the_gate_a_status_hides_ignored_signals_the_guest_mask_lets_in() {
+        let urg = 1_u64 << (libc::SIGURG - 1);
+        let term = 1_u64 << (libc::SIGTERM - 1);
+        let winch = 1_u64 << (libc::SIGWINCH - 1);
+        let status = |pending: u64, shared: u64, blocked: u64, caught: u64| {
+            format!(
+                "Name:\tworker\nSigQ:\t0/0\nSigPnd:\t{pending:016x}\nShdPnd:\t{shared:016x}\n\
+                 SigBlk:\t{blocked:016x}\nSigIgn:\t0000000000000000\nSigCgt:\t{caught:016x}\n"
+            )
+            .into_bytes()
+        };
+        let pending_fields = |output: &[u8]| {
+            let text = String::from_utf8(output.to_vec()).unwrap();
+            let field = |label: &str| {
+                let line = text.lines().find(|line| line.starts_with(label)).unwrap();
+                u64::from_str_radix(line[label.len()..].trim(), 16).unwrap()
+            };
+            (field("SigPnd:"), field("ShdPnd:"))
+        };
+        let input = status(urg | term, winch, !0, 0);
+        assert_eq!(
+            pending_fields(&sanitize_status(&input, None, Some(0), true)),
+            (term, 0),
+            "the guest mask blocks nothing: both ignored signals are hidden"
+        );
+        assert_eq!(
+            pending_fields(&sanitize_status(&input, None, Some(urg), true)),
+            (urg | term, 0),
+            "a blocked ignored signal stays"
+        );
+        assert_eq!(
+            pending_fields(&sanitize_status(
+                &status(urg, winch, urg, 0),
+                None,
+                None,
+                true
+            )),
+            (urg, 0),
+            "with nothing published, the snapshot's SigBlk is the mask"
+        );
+        assert_eq!(
+            pending_fields(&sanitize_status(
+                &status(urg, 0, 0, urg),
+                None,
+                Some(0),
+                true
+            )),
+            (urg, 0),
+            "a caught SIGURG is not ignored"
+        );
+        assert_eq!(
+            sanitize_status(&input, None, None, false),
+            input,
+            "with the gate off both fields are the kernel's"
+        );
+        assert_eq!(
+            pending_fields(&sanitize_status(&input, None, Some(0), false)),
+            (urg | term, winch),
+            "with the gate off nothing is hidden, whatever the published mask"
         );
     }
 
@@ -7189,11 +7318,11 @@ Rss:                   4 kB\n" as &[u8];
     fn a_status_reports_the_published_guest_mask_as_sigblk() {
         let status = b"Name:\tworker\nPid:\t5\nSigPnd:\t0000000000000000\nSigBlk:\tfffffffe7ffb7eef\nSigIgn:\t0000000000000000\n";
         assert_eq!(
-            sanitize_status(status, None, Some(0x800)),
+            sanitize_status(status, None, Some(0x800), false),
             b"Name:\tworker\nPid:\t5\nSigPnd:\t0000000000000000\nSigBlk:\t0000000000000800\nSigIgn:\t0000000000000000\n"
         );
         assert_eq!(
-            sanitize_status(status, None, None),
+            sanitize_status(status, None, None, false),
             status.to_vec(),
             "with nothing published, the kernel's mask stands"
         );
