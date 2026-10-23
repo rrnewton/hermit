@@ -4122,6 +4122,42 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    // D50 reader 8 under the in-guest delivery gate (A5 step 3c.1c, design
+    // 16.11): before the park and after a wake alike, the sleep ends exactly
+    // when the design's deliverable set under the thread's published mask is
+    // not empty, read here in its own turn (`gated_wait_ends`, which records
+    // the end for the restart checkpoint, D40). Nothing is held: on in-guest
+    // a child's exit is published inside the every-turn hold, and host-timed
+    // producers are refused unless ignored (step 3c.0b). A default stop is
+    // never deliverable (stop sends are refused under the gate, D48), so
+    // `stops_end_it` changes nothing here.
+    //
+    // Signal phase 1's SIGALRM is virtual: the scheduler's ledger wakes a
+    // `pause` for it (`Scheduler::sigalrm_wake`) with no physical copy
+    // pending, so such a wake counts as a caught delivery of SIGALRM, unless
+    // a default-fatal signal is deliverable too, which ends the process
+    // whatever handler runs first. IR-12: the `pause` returns
+    // `ERESTARTNOHAND`, which the restart checkpoint turns into `EINTR`. Phase
+    // 1 refuses every other sleep in a process that handles SIGALRM (F8).
+    if guest.config().in_guest_signal_delivery {
+        use crate::wait_signal_end::WaitSignalEnd;
+        let _ = stops_end_it;
+        let end = crate::syscalls::helpers::gated_wait_end(guest, None)?;
+        let phase1_wake = matches!(&check, SleepCheck::AfterWake(Some(woken))
+            if woken.iter().any(|signal| signal.raw() == libc::SIGALRM))
+            && guest.config().backend.virtualizes_guest_sigalrm
+            && guest.thread_state().sigalrm_handled;
+        let end = match end {
+            Some(WaitSignalEnd::Fatal(signal)) => Some(WaitSignalEnd::Fatal(signal)),
+            _ if phase1_wake => Some(WaitSignalEnd::Caught(libc::SIGALRM)),
+            other => other,
+        };
+        let Some(end) = end else {
+            return Ok(SleepSignal::None);
+        };
+        guest.thread_state_mut().wait_signal_end = Some(end);
+        return Ok(SleepSignal::Pending);
+    }
     if !guest
         .config()
         .backend
