@@ -2581,8 +2581,16 @@ fi
 # Cargo.toml, Cargo.lock and rust-toolchain.toml, so the inventory, SDK and
 # native inputs, calibrated budget, job width and limits carry unchanged from
 # the 80f7dc63 entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 93a4273376476c5fa5a93f735ecbcf53bdbc5cc6 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 93a4273376476c5fa5a93f735ecbcf53bdbc5cc6 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 995f330668880617b14512462a418538a1effffe (2026-10-22): from
+# 93a4273376476c5fa5a93f735ecbcf53bdbc5cc6. One commit (kvm lane,
+# per-call slice 4: reverie-kvm per-entry mechanics without tree, CPUID or
+# clone churn). It changes reverie-kvm/ and the reverie-kvm target's lints in
+# the root BUCK only; git diff is empty under reverie-dbt/ and third-party/
+# and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml, so the
+# inventory, SDK and native inputs, calibrated budget, job width and limits
+# carry unchanged from the 93a42733 entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 995f330668880617b14512462a418538a1effffe ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 995f330668880617b14512462a418538a1effffe (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
