@@ -2795,7 +2795,22 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // /proc/<pid>/stat (procfs::task_stat seven, procfs five, the
     // scheduler's task-name, parent and RSS-limit unit, rendered_procfs's
     // comm-authentication unit and misc's PR_SET_NAME unit): 2515, listed.
-    ("test.detcore_unit", 2515),
+    // And A5 step 3c.1d-i's fourteen: four ignored_signals::tests units (D37's
+    // I, removal set, epoll exception and status subtraction), one
+    // procfs::tests unit (the status subtraction under the gate), two
+    // scheduler::gated_wait_tests units (the parked rt_sigsuspend's wake under
+    // its temporary mask, IR-22: no real-time expiration kept pending under
+    // the gate) and seven
+    // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
+    // units (rt_sigsuspend parked and decided by its temporary mask, gate off,
+    // the park's removals, the removal loop, the SIG_BLOCK of SIGCHLD rows,
+    // rt_sigaction's rule (iii), phase 1's refusal of temporary-mask calls):
+    // 2529, listed.
+    // And 3c.1d-i review round 1's two
+    // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
+    // units (the parked rt_sigsuspend publishes the mask Linux installs; a
+    // caught end of a temporary-mask wait is the named refusal): 2531, listed.
+    ("test.detcore_unit", 2531),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4908,7 +4923,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the nineteen callback-history units of
     // https://github.com/rrnewton/hermit/pull/4582: 2500.
     // And the same fifteen D4c-1 units: 2515, listed.
-    ("test.detcore_unit_on_host", 2515),
+    // And the same fourteen slice 3c.1d-i units: 2529, listed.
+    // And the same two 3c.1d-i review round 1 units: 2531, listed.
+    ("test.detcore_unit_on_host", 2531),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
