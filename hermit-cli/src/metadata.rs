@@ -832,7 +832,12 @@ impl RecordVersion {
 // guest procfs bytes and refuses unsupported observation domains. ABI15 and
 // private capture storage can also shift runtime layout. Older recordings must
 // not replay with different values.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x186);
+// 0x186 -> 0x187 (HIGHEST_SHIPPED + 1 at this base; the lander re-checks it
+// at land): a recording stores the schedule it ran under (`record start
+// --chaos --seed=N`), and replay follows it. An older reader would replay a
+// chaos recording under the default schedule and fall out of step, so it is
+// refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x187);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -857,7 +862,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x186);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x186;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x187;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -865,6 +870,46 @@ const _: () = assert!(
      build would carry a label an older reader already claims. If this fired during a \
      rebase, the version constant was resolved BACKWARD -- merge it forward."
 );
+
+/// How a recording schedules guest threads. Replay schedules them the same
+/// way, so a schedule-dependent failure that one chaos seed provokes replays.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecordedSchedule {
+    /// Detcore's default scheduler.
+    #[default]
+    Default,
+    /// Chaos scheduling, as `hermit run --chaos` does, driven by `seed`.
+    Chaos {
+        /// Seed of the scheduler's random number generator.
+        seed: u64,
+    },
+}
+
+impl RecordedSchedule {
+    /// Makes a record/replay configuration schedule threads this way. Only the
+    /// scheduler is seeded: the guest's own randomness is recorded, not seeded.
+    pub(crate) fn apply(self, config: &mut detcore::Config) {
+        if let Self::Chaos { seed } = self {
+            config.chaos = true;
+            config.sched_seed = Some(seed);
+        }
+    }
+}
+
+/// Choices `hermit record start` makes that the recording stores in its
+/// `metadata.json` and that its replays honor.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RecordOptions {
+    /// Run the guest with an isolated loopback interface instead of the host
+    /// network (`record start --network local`).
+    pub local_networking: bool,
+    /// How much of `/proc` the guest sees.
+    pub proc_level: detcore_model::config::ProcLevel,
+    /// The CPU the guest sees.
+    pub cpu_profile: detcore_model::cpu_profile::CpuProfile,
+    /// How the guest's threads are scheduled.
+    pub schedule: RecordedSchedule,
+}
 
 /// Metadata associated with the recording. This is serialized as a JSON file.
 #[derive(Debug, Serialize, Deserialize)]
@@ -954,6 +999,10 @@ pub struct Metadata {
     /// recording sees it.
     #[serde(default)]
     pub cpu_profile_residual: Option<String>,
+    /// How the recording scheduled guest threads (`record start --chaos`).
+    /// Absent means the default scheduler.
+    #[serde(default)]
+    pub schedule: RecordedSchedule,
 }
 
 impl Metadata {
@@ -1015,6 +1064,7 @@ impl Metadata {
             cpu_profile_host: None,
             cpu_table_digest: None,
             cpu_profile_residual: None,
+            schedule: RecordedSchedule::Default,
         })
     }
 
@@ -2272,5 +2322,31 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(metadata.local_networking, None);
+        assert_eq!(metadata.schedule, RecordedSchedule::Default);
+    }
+
+    /// A chaos schedule sets chaos mode and seeds only the scheduler: the
+    /// guest's random numbers are recorded, not seeded.
+    #[test]
+    fn a_chaos_schedule_reaches_the_record_replay_configuration() {
+        let mut config = record_or_replay_config(Path::new("replay-data"));
+        RecordedSchedule::Default.apply(&mut config);
+        assert!(!config.chaos);
+        assert_eq!(config.sched_seed, None);
+
+        let seed = config.seed;
+        RecordedSchedule::Chaos { seed: 16 }.apply(&mut config);
+        assert!(config.chaos);
+        assert_eq!(config.sched_seed(), 16);
+        assert_eq!(config.seed, seed, "only the scheduler is seeded");
+    }
+
+    #[test]
+    fn a_recorded_schedule_round_trips_through_metadata_json() {
+        let mut metadata = Metadata::new(&Command::new("/bin/true")).unwrap();
+        metadata.schedule = RecordedSchedule::Chaos { seed: 7 };
+        let loaded: Metadata =
+            serde_json::from_str(&serde_json::to_string(&metadata).unwrap()).unwrap();
+        assert_eq!(loaded.schedule, RecordedSchedule::Chaos { seed: 7 });
     }
 }
