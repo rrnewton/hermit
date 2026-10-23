@@ -2810,7 +2810,26 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
     // units (the parked rt_sigsuspend publishes the mask Linux installs; a
     // caught end of a temporary-mask wait is the named refusal): 2531, listed.
-    ("test.detcore_unit", 2531),
+    // And A5 step 3c.1d-ii's ten
+    // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
+    // units (the staged zero-timeout pselect6 rows, pselect6 with more than 64
+    // descriptors, each select form under its mask (IR-9), the masked ppoll
+    // rows, the masked epoll_pwait rows with D37's exception (IR-3, IR-7),
+    // epoll_pwait2's route, the gate-off paths, the 3c.1.0 base rows kept,
+    // IR-7 rows (A) and (B) for pselect6 and ppoll, D41 at a masked form's
+    // entry): 2541, listed.
+    // And 3c.1d-ii review round 1's four
+    // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
+    // units (an invalid masked call meets D41 only under the own mask, every
+    // masked wait publishes the mask Linux installs, an unreadable pselect6
+    // argument is EFAULT only where Linux faults, the sets read before the
+    // more-than-1024 refusal): 2545, listed.
+    // And 3c.1d-ii review round 2's two
+    // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
+    // units (a masked wait ready at its first probe still yields once; a
+    // masked ppoll on a tight stack gets the kernel's answer first): 2547,
+    // listed.
+    ("test.detcore_unit", 2547),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4925,7 +4944,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fifteen D4c-1 units: 2515, listed.
     // And the same fourteen slice 3c.1d-i units: 2529, listed.
     // And the same two 3c.1d-i review round 1 units: 2531, listed.
-    ("test.detcore_unit_on_host", 2531),
+    // And the same ten slice 3c.1d-ii units: 2541, listed.
+    // And the same four 3c.1d-ii review round 1 units: 2545, listed.
+    // And the same two 3c.1d-ii review round 2 units: 2547, listed.
+    ("test.detcore_unit_on_host", 2547),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
