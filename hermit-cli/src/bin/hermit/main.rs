@@ -75,6 +75,8 @@ mod run_config;
 mod run_timeout;
 mod schedule_search;
 mod strace;
+#[cfg(test)]
+mod test_isolation;
 mod tracing;
 mod verify;
 mod verify_inputs;
