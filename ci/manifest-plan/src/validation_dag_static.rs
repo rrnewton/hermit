@@ -1839,7 +1839,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And A5 slice 3c.1e B's forced-gate harness (in_guest_delivery_harness):
     // the_parent_runner_never_forces_the_gate and six forced_gate_* rows:
     // 1121, listed (1114 on main plus seven).
-    ("test.hermit_unit", 1121),
+    // And analyze's trial-input tests: phases::tests::{the_workspace_is_created_in_the_tmp_dir,
+    // a_same_thread_critical_pair_is_flagged_and_a_cross_thread_one_is_not},
+    // rundata::tests::{trials_bind_only_a_workspace_the_private_tmp_would_hide,
+    // every_trial_hands_the_guest_the_target_seed_inputs} and
+    // schedule_search::tests::{a_failing_schedule_with_extra_events_reduces_to_the_one_swap,
+    // replays_differing_only_by_branch_skid_are_one_interleaving}: 1127.
+    ("test.hermit_unit", 1127),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5626,7 +5632,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (validation_dag::HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS) while
     // test.hermit_unit runs all seven: 1115, listed
     // (1114 on main plus one).
-    ("test.hermit_unit_on_host", 1115),
+    // And the same six analyze trial-input tests: 1121.
+    ("test.hermit_unit_on_host", 1121),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
