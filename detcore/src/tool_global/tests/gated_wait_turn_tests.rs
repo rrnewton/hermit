@@ -1238,6 +1238,66 @@ async fn under_the_gate_a_kernel_run_call_with_a_fatal_signal_at_its_entry_is_no
     assert!(guest.injected.is_empty(), "{:?}", guest.injected);
 }
 
+/// D41's not-run call with a core-dumping signal behind a caught one, through
+/// the restart checkpoint (Claude review round 3): the checkpoint reads the
+/// caught action. Its mask does not hold SIGQUIT: `Fatal`, `-EINTR` with the
+/// interrupted code, nothing refused. Its mask holds SIGQUIT: `Caught`, whose
+/// restart table would restart `ERESTARTNOINTR` after the handler, which 3c.1
+/// cannot do, so the stopping refusal HERMIT_RESTART_AFTER_HANDLER is filed
+/// and no restart code reaches the guest. Mutation "the restart-after-handler
+/// refusal removed": the held row returns `ERESTARTNOINTR` and files nothing.
+#[tokio::test]
+async fn under_the_gate_a_not_run_call_behind_a_caught_signal_is_resolved_at_the_checkpoint() {
+    let readonly: &'static [u8; 16] = Box::leak(Box::new([0; 16]));
+    let read = reverie::syscalls::Read::new()
+        .with_fd(5)
+        .with_buf(AddrMut::from_raw(readonly.as_ptr() as usize))
+        .with_len(16);
+    let quit = bit(libc::SIGQUIT);
+    for (name, mask, result, interrupted, refused) in [
+        (
+            "the handler's mask does not hold SIGQUIT",
+            0,
+            Errno::EINTR,
+            Some(Errno::ERESTARTNOINTR),
+            false,
+        ),
+        (
+            "the handler's mask holds SIGQUIT",
+            quit,
+            Errno::EINTR,
+            None,
+            true,
+        ),
+    ] {
+        let _seam = script(proc_state(bit(libc::SIGHUP) | quit, bit(libc::SIGHUP), 0));
+        let mut guest = turn_guest(true, Some(0));
+        guest.action_mask = mask;
+        let tool = tool(&guest);
+        let entry = tool
+            .record_or_replay_blocking(&mut guest, read.into())
+            .await;
+        assert!(
+            matches!(entry, Err(Error::Errno(Errno::ERESTARTNOINTR))),
+            "{name}: {entry:?}"
+        );
+        let (res, code) = tool
+            .wait_end_checkpoint(&mut guest, &Syscall::from(read), entry)
+            .await;
+        assert!(
+            matches!(res, Err(Error::Errno(errno)) if errno == result),
+            "{name}: {res:?}"
+        );
+        assert_eq!(code, interrupted, "{name}");
+        assert_eq!(guest.injected, [Sysno::rt_sigaction], "{name}");
+        let filed = guest.rpcs().iter().any(|rpc| {
+            matches!(rpc, GlobalRequest::StoppingRefusal(reason)
+                if reason.contains("HERMIT_RESTART_AFTER_HANDLER"))
+        });
+        assert_eq!(filed, refused, "{name}");
+    }
+}
+
 /// D41 refuses only a default-fatal signal at entry: a caught one, a blocked
 /// one, or the gate off, and the background read is filed and run, here
 /// faulting on its read-only buffer as the kernel would.

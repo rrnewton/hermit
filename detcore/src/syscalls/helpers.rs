@@ -3054,15 +3054,18 @@ where
 /// calls this as its first statement, before any guest-visible effect, and
 /// returns the error this gives, `ERESTARTNOINTR` with the D40 flag `Fatal`
 /// recorded, which the restart checkpoint turns into `-EINTR` (the death path
-/// of step 3c.1e follows at the return). A default-fatal signal behind a
-/// caught one (`BehindCaught`) means the call is not run either: Linux
-/// delivers the caught signal first and then either reaches the default-fatal
-/// one in the same delivery loop or, if the handlers' masks hold it, at the
-/// return from the handlers, before the call is made again; the flag is
-/// recorded as it is, and the checkpoint resolves it (`Fatal`: `-EINTR`;
-/// `Caught`: the restart table restarts `ERESTARTNOINTR` after the handler).
-/// Only caught signals at entry, or none, keep today's path (`None`): the
-/// call runs. With the gate off, `None`.
+/// of step 3c.1e follows at the return). A `BehindCaught` end (a caught
+/// signal first, and a later delivery in the same loop that could end the
+/// process) means the call is not run either: the flag is recorded as it is,
+/// and the checkpoint resolves it. `Fatal` gives `-EINTR`. `Caught` (the
+/// handlers' masks hold the default-fatal signal, or no reset instance is
+/// reached) would need the handler run and then the call restarted, which
+/// 3c.1 cannot do, so the checkpoint refuses it by name
+/// (HERMIT_RESTART_AFTER_HANDLER, fail closed); in that schedule Linux runs
+/// the handler and, unless it changes the default-fatal signal's disposition
+/// or mask, ends the process at its `rt_sigreturn`, before the call is made
+/// again. Only a single caught signal at entry, or none, keeps today's path
+/// (`None`): the call runs. With the gate off, `None`.
 pub(crate) fn kernel_run_entry_refusal<T, G>(guest: &mut G) -> Result<Option<Error>, Error>
 where
     T: RecordOrReplay,

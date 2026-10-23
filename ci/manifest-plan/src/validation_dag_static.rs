@@ -2780,7 +2780,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And 3c.1c-ii review round 2's
     // tool_global::tests::gated_wait_turn_tests unit for a refused send's
     // siginfo the caller cannot read: 2476, listed.
-    ("test.detcore_unit", 2476),
+    // And 3c.1c-ii review round 3's
+    // tool_global::tests::gated_wait_turn_tests unit for D41's not-run call
+    // behind a caught signal through the restart checkpoint: 2477, listed.
+    ("test.detcore_unit", 2477),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4884,7 +4887,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed.
     // And the same five 3c.1c-ii review round 1 units: 2475, listed.
     // And the same 3c.1c-ii review round 2 unit: 2476, listed.
-    ("test.detcore_unit_on_host", 2476),
+    // And the same 3c.1c-ii review round 3 unit: 2477, listed.
+    ("test.detcore_unit_on_host", 2477),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
