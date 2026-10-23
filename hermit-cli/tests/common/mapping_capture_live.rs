@@ -196,7 +196,10 @@ fn run_with_containment(
                     global.force_shutdown_with_error();
                     global.cancel_internal_scheduler().await;
                 }
-                global.clean_up(false, &None).await;
+                global
+                    .clean_up(false, &None)
+                    .await
+                    .expect("Detcore cleanup after the mapping-capture run");
                 Ok(output)
             }
             Err(error) => Err(error),
