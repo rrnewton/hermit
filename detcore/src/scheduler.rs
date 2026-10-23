@@ -2060,6 +2060,15 @@ pub struct Scheduler {
 
     /// An instance of replayer that is responsible for replaying events in case --replay-preemptions-from is specified
     pub replayer: Option<Replayer>,
+    /// Fixed by recording configuration or the loaded legacy annotations,
+    /// never by whether the mutable per-thread checkpoint queues are empty.
+    pub(crate) callback_history_active: bool,
+    pub(crate) callback_checkpoints: BTreeMap<
+        DetTid,
+        std::collections::VecDeque<crate::preemptions::callback_history::Checkpoint>,
+    >,
+    callback_checkpoint_desyncs: Vec<String>,
+    pub(crate) callback_progress: BTreeMap<DetTid, crate::preemptions::callback_history::Progress>,
 
     // New-format construction remains disabled until actual callback and
     // lifecycle integration is complete. Controller tests install it directly.
@@ -4004,6 +4013,10 @@ impl Scheduler {
         if let Err(reason) = validate_strict_boundary_config(cfg) {
             exit_on_scheduler_refusal(&anyhow::anyhow!(reason));
         }
+        let mut callback_checkpoints: BTreeMap<
+            DetTid,
+            std::collections::VecDeque<crate::preemptions::callback_history::Checkpoint>,
+        > = BTreeMap::new();
         let mut boundary_replayer = None;
         let mut boundary_stacktrace_events = BTreeMap::new();
         let (replayer, m_vec) = match &cfg.replay_schedule_from {
@@ -4017,6 +4030,11 @@ impl Scheduler {
                     .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
                 match recording {
                     Recording::Legacy(record) => {
+                        callback_checkpoints = record
+                            .callback_checkpoints()
+                            .iter()
+                            .map(|(tid, points)| (*tid, points.clone().into()))
+                            .collect();
                         let vec = record.into_global();
                         trace!("Trace loaded, length {}", vec.len());
                         let toprint = cfg
@@ -4092,6 +4110,13 @@ impl Scheduler {
         let (backend_failure_sender, backend_failure_wake) = oneshot::channel();
         Self {
             preemption_writer,
+            callback_history_active: crate::preemptions::callback_history::recording_enabled(cfg)
+                || callback_checkpoints
+                    .values()
+                    .any(|points| !points.is_empty()),
+            callback_checkpoints,
+            callback_checkpoint_desyncs: Vec::new(),
+            callback_progress: BTreeMap::new(),
             replayer,
             boundary_replayer,
             boundary_stacktrace_events,
@@ -13345,6 +13370,45 @@ impl Scheduler {
         rs: &Resources,
         resp: &Ivar<SchedResponse>,
     ) -> Result<(), SkipTurn> {
+        if let Some(origin) = rs.callback_checkpoint.as_deref() {
+            assert_eq!(
+                rs.resources.len(),
+                1,
+                "callback checkpoint is a singleton priority request"
+            );
+            let (ResourceID::PriorityChangePoint(prio, time, rcbs, epochs), Permission::W) =
+                rs.resources.iter().next().unwrap()
+            else {
+                panic!("callback checkpoint attached to another operation");
+            };
+            assert_eq!((*time, *rcbs), (origin.time, origin.rcbs));
+            let priority = if self.replayer.is_some() {
+                let expected = self
+                    .callback_checkpoints
+                    .get_mut(&dettid)
+                    .and_then(|points| points.pop_front())
+                    .expect("callback request has a recorded origin");
+                assert_eq!(
+                    expected.origin, *origin,
+                    "callback request matches the independently observed checkpoint"
+                );
+                // Read at selection, not filing: the unchanged event cursor may
+                // have transferred its foreground band while this request waited.
+                self.get_priority(dettid)
+            } else {
+                *prio
+            };
+            let answer = self.perform_priority_changepoint(dettid, priority, *time, *rcbs, epochs);
+            if !self.has_schedule_replay()
+                && let Some(writer) = &mut self.preemption_writer
+            {
+                writer.insert_callback_checkpoint(dettid, origin.clone());
+            }
+            if answer.is_err() {
+                self.work_span_note_wait(dettid, rs);
+            }
+            return answer;
+        }
         if rs.poll_attempt > 0 {
             // The thread is polling and hasn't been "remade" as runnable yet.
             info!(
@@ -15601,6 +15665,43 @@ impl Scheduler {
         self.per_thread_syscalls.insert(dettid, total);
     }
 
+    /// Report a checkpoint mismatch without inserting an event or moving the
+    /// legacy cursor, its resynchronization state, priorities, or virtual time.
+    pub(crate) fn callback_checkpoint_mismatch(
+        &mut self,
+        tid: DetTid,
+        checkpoint: &crate::preemptions::callback_history::Checkpoint,
+        hard: bool,
+        actual: &crate::preemptions::callback_history::Origin,
+    ) {
+        let expected = self
+            .callback_checkpoints
+            .get_mut(&tid)
+            .and_then(|points| points.pop_front());
+        assert_eq!(
+            expected.as_ref(),
+            Some(checkpoint),
+            "mismatch refers to the current callback checkpoint"
+        );
+        let message = format!(
+            "DESYNC callback checkpoint {} for {tid}: expected {:?}, observed {:?} ({})",
+            checkpoint.history_index,
+            checkpoint.origin,
+            actual,
+            if hard { "hard" } else { "soft" }
+        );
+        tracing::warn!("{}", message);
+        self.callback_checkpoint_desyncs.push(message);
+        if hard
+            && self
+                .replayer
+                .as_ref()
+                .is_some_and(|replayer| replayer.die_on_desync)
+        {
+            immediate_fatal_exit();
+        }
+    }
+
     /// Summarize the run after completion, as a RunSummary. This is partial because the Scheduler
     /// does not have all the necessary information.
     ///
@@ -15643,7 +15744,7 @@ impl Scheduler {
             .unwrap_or_default();
 
         let total_desyncs = total_desync_stats.soft + total_desync_stats.hard;
-        let desync_descrip = if total_desyncs > 0 {
+        let mut desync_descrip = if total_desyncs > 0 {
             let mut buf = String::new();
             write!(
                 buf,
@@ -15673,6 +15774,26 @@ impl Scheduler {
         } else {
             None
         };
+
+        // Legacy EOF policy does not make an unconsumed suffix fatal. Name
+        // incomplete callback metadata separately; do not invent guest events.
+        for (tid, points) in &self.callback_checkpoints {
+            if !points.is_empty() {
+                let message = format!(
+                    "DESYNC incomplete callback history for {tid}: {} unconsumed checkpoints",
+                    points.len()
+                );
+                tracing::warn!("{}", message);
+                desync_descrip
+                    .get_or_insert_with(String::new)
+                    .push_str(&format!("{message}\n"));
+            }
+        }
+        for message in &self.callback_checkpoint_desyncs {
+            desync_descrip
+                .get_or_insert_with(String::new)
+                .push_str(&format!("{message}\n"));
+        }
 
         let (reprio_descrip, info_reprio_descrip) = if let Some(pw) = self.preemption_writer.take()
         {
@@ -35308,3 +35429,6 @@ mod strict_boundary_admission_tests {
         }
     }
 }
+
+#[cfg(test)]
+include!("scheduler/callback_history_tests.rs");
