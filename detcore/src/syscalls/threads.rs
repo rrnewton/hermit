@@ -1835,6 +1835,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         // cloned thread's syscalls through this tool.
         let is_vfork = flags.contains(CloneFlags::CLONE_VFORK);
 
+        // D41 with IR-5 (A5 step 3c.1c): the first statement of the vfork
+        // branch, before `clone_flags` and `pending_vfork` are set, the
+        // descriptors promoted or the signal-state copy cloned, so a vfork not
+        // run leaves none of them for the death path's exit lifecycle to read.
+        if is_vfork && let Some(refused) = super::helpers::kernel_run_entry_refusal(guest)? {
+            return Err(refused);
+        }
+
         let ts = guest.thread_state_mut();
         assert_eq!(ts.clone_flags, None);
         assert!(ts.pending_vfork.is_none());
