@@ -2800,7 +2800,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the park's removals, the removal loop, the SIG_BLOCK of SIGCHLD rows,
     // rt_sigaction's rule (iii), phase 1's refusal of temporary-mask calls):
     // 2495, listed.
-    ("test.detcore_unit", 2495),
+    // And A5 step 3c.1d-ii's ten
+    // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
+    // units (the staged zero-timeout pselect6 rows, pselect6 with more than 64
+    // descriptors, each select form under its mask (IR-9), the masked ppoll
+    // rows, the masked epoll_pwait rows with D37's exception (IR-3, IR-7),
+    // epoll_pwait2's route, the gate-off paths, the 3c.1.0 base rows kept,
+    // IR-7 rows (A) and (B) for pselect6 and ppoll, D41 at a masked form's
+    // entry): 2505, listed.
+    ("test.detcore_unit", 2505),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4907,7 +4915,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 3c.1c-ii review round 2 unit: 2480, listed.
     // And the same 3c.1c-ii review round 3 unit: 2481, listed.
     // And the same fourteen slice 3c.1d-i units: 2495, listed.
-    ("test.detcore_unit_on_host", 2495),
+    // And the same ten slice 3c.1d-ii units: 2505, listed.
+    ("test.detcore_unit_on_host", 2505),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
