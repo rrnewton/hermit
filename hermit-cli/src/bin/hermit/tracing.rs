@@ -1304,6 +1304,9 @@ mod tests {
 
     #[test]
     fn synchronous_pid_alignment_matches_the_file_appender_baseline() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let synchronous_pid = pid_namespace()
             .run(|| {
                 assert_eq!(unsafe { libc::getpid() }, 1);
@@ -1328,6 +1331,9 @@ mod tests {
 
     #[test]
     fn pid_alignment_succeeds_when_host_thread_creation_is_denied() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let guest_pid = pid_namespace()
             .run(|| {
                 assert_eq!(unsafe { libc::getpid() }, 1);
@@ -1342,6 +1348,9 @@ mod tests {
 
     #[test]
     fn kvm_pid_alignment_allocates_no_host_task() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let next_pid = pid_namespace()
             .run(|| {
                 assert_eq!(unsafe { libc::getpid() }, 1);

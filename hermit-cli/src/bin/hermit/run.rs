@@ -4199,10 +4199,13 @@ fn skid_margin_override_keeps_the_keep_margin_up_to_the_table_largest() {
 /// `hermit run` records `--skid-margin` as the skid margin of Reverie's
 /// per-process PMU configuration, so a later margin is refused; where this
 /// host has a PMU profile, the configuration built from it carries the margin
-/// and the processor's own keep margin. This relies on nextest running each
-/// test in a process of its own, as the validation DAG does.
+/// and the processor's own keep margin. That configuration is per-process,
+/// so the test runs in a process of its own.
 #[test]
 fn run_installs_its_skid_margin() {
+    if crate::test_isolation::rerun_alone() {
+        return;
+    }
     let mut opts = RunOpts::parse_from(["fakehermit", "--skid-margin=7777", "fakeprog"]);
     opts.validate_args_with_perf_support(true).unwrap();
     opts.install_pmu_config().unwrap();
@@ -12101,6 +12104,9 @@ mod tests {
 
     #[test]
     fn forwarded_detlog_plan_record_reaches_eof_while_parent_waits() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let options = forwarding_plan_options(true);
         let plan = options.forwarded_detlog_plan().unwrap();
         assert!(plan.requires_socket());
@@ -12129,6 +12135,9 @@ mod tests {
 
     #[test]
     fn forwarded_detlog_plan_duplicate_writer_blocks_eof() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         use std::os::fd::FromRawFd;
 
         let options = forwarding_plan_options(true);
@@ -12159,6 +12168,9 @@ mod tests {
 
     #[test]
     fn forwarded_detlog_plan_nonforwarded_opens_no_channel() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let options = forwarding_plan_options(false);
         let plan = options.forwarded_detlog_plan().unwrap();
         assert!(!plan.requires_socket());
@@ -12173,6 +12185,9 @@ mod tests {
 
     #[test]
     fn forwarded_detlog_plan_two_runs_keep_streams_independent() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let options = forwarding_plan_options(true);
         let plans = (
             options.forwarded_detlog_plan().unwrap(),
@@ -12562,6 +12577,9 @@ mod tests {
 
     #[test]
     fn real_returned_guest_disposition_still_uses_first_run_rejected() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("verify.json");
         write_pending_verification_json(&path).unwrap();
