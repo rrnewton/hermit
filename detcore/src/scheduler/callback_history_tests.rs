@@ -311,4 +311,51 @@ mod callback_history_scheduler_tests {
             assert!(text.contains("DESYNC incomplete callback history"));
         }
     }
+    #[test]
+    fn callback_history_recording_activation_preserves_strict_and_history_modes() {
+        use crate::preemptions::callback_history::recording_enabled;
+
+        for timer in [false, true] {
+            let mut cfg = Config {
+                sequentialize_threads: true,
+                record_preemptions: true,
+                chaos: true,
+                ..Config::default()
+            }
+            .with_backend(|backend| backend.delivers_preemption_timer_events = timer);
+            assert!(recording_enabled(&cfg));
+            assert!(crate::scheduler::Scheduler::new(&cfg).callback_history_active);
+            // Priority-history replay is distinct from global schedule replay;
+            // preserve the pre-existing recording producer's exact predicate.
+            cfg.replay_preemptions_from = Some("history.json".into());
+            assert!(recording_enabled(&cfg));
+            cfg.chaos = false;
+            assert!(!recording_enabled(&cfg));
+            cfg.replay_preemptions_from = None;
+            cfg.chaos = true;
+            cfg.strict_schedule_boundaries = true;
+            assert!(!recording_enabled(&cfg));
+            // Strict+chaos is refused by the existing admission gate. The
+            // supported strict recording mode is independently inactive too.
+            assert!(crate::scheduler::validate_strict_boundary_config(&cfg).is_err());
+            cfg.chaos = false;
+            assert!(!crate::scheduler::Scheduler::new(&cfg).callback_history_active);
+
+            // Load an admitted strict recording through the real scheduler;
+            // the legacy progress mechanism remains inactive on replay too.
+            use crate::preemptions::boundary_recording::{BoundaryRecording, Recording};
+            let typed = Recording::Boundaries(
+                BoundaryRecording::new(
+                    crate::preemptions::PreemptionRecord::default(),
+                    detcore_model::schedule::boundary::Schedule::new(vec![]).unwrap(),
+                ).unwrap(),
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("strict.json");
+            std::fs::write(&path, typed.encode().unwrap()).unwrap();
+            cfg.record_preemptions = false;
+            cfg.replay_schedule_from = Some(path);
+            assert!(!crate::scheduler::Scheduler::new(&cfg).callback_history_active);
+        }
+    }
 }

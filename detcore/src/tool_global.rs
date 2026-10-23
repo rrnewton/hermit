@@ -3723,10 +3723,10 @@ impl GlobalState {
                                 .unwrap_or_default(),
                         };
                         let response = R::StartNewThread(history);
-                        if startup == crate::preemptions::callback_history::Startup::default() {
-                            response
-                        } else {
+                        if sched.callback_history_active {
                             R::WithCallbackHistory(startup, Box::new(response))
+                        } else {
+                            response
                         }
                     }
                     SchedulerRpcResult::ThreadExited => R::ThreadExited,
@@ -5854,11 +5854,13 @@ impl GlobalState {
             if !sched.rpc_incarnation_matches(ev.dettid, request_mm) {
                 return SchedulerRpcResult::ThreadExited;
             }
-            sched
-                .callback_progress
-                .entry(ev.dettid)
-                .or_default()
-                .observe_event(&ev);
+            if sched.callback_history_active {
+                sched
+                    .callback_progress
+                    .entry(ev.dettid)
+                    .or_default()
+                    .observe_event(&ev);
+            }
             // TODO(T124316762): debug address randomization in the tracer and get rid of this hack:
             let ev = {
                 if self.past_first_execve.load(SeqCst) {
@@ -7707,6 +7709,11 @@ where
             .thread_state_mut()
             .callback_history
             .install(checkpoints);
+    } else if matches!(resp.1, GlobalResponse::StartNewThread(_)) {
+        assert!(
+            !guest.thread_state().callback_history.is_active(),
+            "preserved callback activation matches coordinator startup"
+        );
     }
     guest.thread_state_mut().last_grant_deadline = deadline;
     cap_timeslice_at_deadline(guest, deadline);
@@ -8908,7 +8915,11 @@ where
 
     let detpid = guest.thread_state().detpid.expect("detpid unset");
     let command_bootstrap = guest.is_command_bootstrap();
-    guest.thread_state_mut().callback_history.observe_event(&ev);
+    if crate::preemptions::callback_history::recording_enabled(guest.config())
+        || guest.thread_state().callback_history.is_active()
+    {
+        guest.thread_state_mut().callback_history.observe_event(&ev);
+    }
     let resp = send_and_update_time(
         guest,
         GlobalRequest::TraceSchedEvent(ev, detpid, command_bootstrap),

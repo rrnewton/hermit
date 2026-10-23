@@ -21,6 +21,15 @@ use crate::types::LogicalTime;
 use crate::types::Op;
 use crate::types::SchedEvent;
 
+/// Recording must track actual events before its first optional checkpoint.
+/// Re-recording an old schedule does not manufacture replay authority.
+pub(crate) fn recording_enabled(cfg: &crate::Config) -> bool {
+    cfg.chaos
+        && cfg.record_preemptions
+        && !cfg.strict_schedule_boundaries
+        && cfg.replay_schedule_from.is_none()
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 /// The original callback location that ended the logical slice.
 pub enum Site {
@@ -162,6 +171,7 @@ pub struct Startup {
 pub(crate) struct State {
     progress: Progress,
     checkpoints: VecDeque<Checkpoint>,
+    active: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -176,6 +186,10 @@ pub(crate) enum Decision {
 }
 
 impl State {
+    pub(crate) fn is_active(&self) -> bool {
+        self.active
+    }
+
     pub(crate) fn progress(&self) -> Progress {
         self.progress.clone()
     }
@@ -184,7 +198,7 @@ impl State {
     }
 
     pub fn install(&mut self, startup: Startup) {
-        if self.progress != Progress::default() {
+        if self.active || self.progress != Progress::default() {
             assert_eq!(
                 self.progress, startup.progress,
                 "preserved Tool progress matches actual coordinator observations"
@@ -197,6 +211,9 @@ impl State {
         }
         self.progress = startup.progress;
         self.checkpoints = startup.checkpoints.into();
+        // Envelope presence is activation, even at zero progress with no
+        // remaining checkpoints. Exhaustion and exec do not disable tracking.
+        self.active = true;
     }
 
     pub fn origin<T>(
@@ -524,5 +541,60 @@ mod tests {
             bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
         assert_eq!(decoded, resources);
         assert_eq!(used, bytes.len());
+    }
+
+    #[test]
+    fn callback_history_activation_survives_empty_custody_and_refuses_disagreement() {
+        let expected = Origin {
+            progress: 0,
+            last_op: None,
+            ..origin()
+        };
+        let mut state = replay(expected.clone());
+        assert_eq!(state.check(expected.clone()), Decision::Act(expected));
+        assert!(state.checkpoints.is_empty());
+        assert!(state.is_active());
+        state.observe_event(&SchedEvent::branches(DetTid::from_raw(3), 7));
+        let startup = Startup {
+            progress: state.progress(),
+            checkpoints: Vec::new(),
+        };
+        let mut reloaded = State::default();
+        reloaded.install(startup.clone());
+        assert_eq!(reloaded, state);
+        reloaded.install(startup);
+        assert_eq!(reloaded, state);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reloaded.install(Startup::default());
+            }))
+            .is_err()
+        );
+
+        // An active empty envelope is not an inactive startup. A preserved
+        // zero-progress Tool must refuse new, conflicting checkpoint custody.
+        let mut empty = State::default();
+        empty.install(Startup::default());
+        assert!(empty.is_active());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                empty.install(Startup {
+                    checkpoints: vec![Checkpoint {
+                        history_index: 0,
+                        origin: origin(),
+                    }],
+                    ..Startup::default()
+                });
+            }))
+            .is_err()
+        );
+        for original in [State::default(), state] {
+            let bytes =
+                bincode::serde::encode_to_vec(&original, bincode::config::legacy()).unwrap();
+            let (decoded, used): (State, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+            assert_eq!(decoded, original);
+            assert_eq!(used, bytes.len());
+        }
     }
 }

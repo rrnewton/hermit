@@ -2018,6 +2018,9 @@ pub struct Scheduler {
 
     /// An instance of replayer that is responsible for replaying events in case --replay-preemptions-from is specified
     pub replayer: Option<Replayer>,
+    /// Fixed by recording configuration or the loaded legacy annotations,
+    /// never by whether the mutable per-thread checkpoint queues are empty.
+    pub(crate) callback_history_active: bool,
     pub(crate) callback_checkpoints: BTreeMap<
         DetTid,
         std::collections::VecDeque<crate::preemptions::callback_history::Checkpoint>,
@@ -3963,7 +3966,10 @@ impl Scheduler {
         if let Err(reason) = validate_strict_boundary_config(cfg) {
             exit_on_scheduler_refusal(&anyhow::anyhow!(reason));
         }
-        let mut callback_checkpoints = BTreeMap::new();
+        let mut callback_checkpoints: BTreeMap<
+            DetTid,
+            std::collections::VecDeque<crate::preemptions::callback_history::Checkpoint>,
+        > = BTreeMap::new();
         let mut boundary_replayer = None;
         let mut boundary_stacktrace_events = BTreeMap::new();
         let (replayer, m_vec) = match &cfg.replay_schedule_from {
@@ -4057,6 +4063,10 @@ impl Scheduler {
         let (backend_failure_sender, backend_failure_wake) = oneshot::channel();
         Self {
             preemption_writer,
+            callback_history_active: crate::preemptions::callback_history::recording_enabled(cfg)
+                || callback_checkpoints
+                    .values()
+                    .any(|points| !points.is_empty()),
             callback_checkpoints,
             callback_checkpoint_desyncs: Vec::new(),
             callback_progress: BTreeMap::new(),

@@ -381,7 +381,13 @@ async fn legacy_callback_close_trial(
         (state.global_time.lock().unwrap().as_nanos() - global_before).as_nanos(),
         500_000
     );
+    // The replay has spent its checkpoint through the real selected request.
+    // A subsequent actual event must still advance local/global progress.
+    super::trace_schedevent(&mut guest, SchedEvent::branches(tid, 1), false).await;
+    assert_eq!(guest.thread.callback_history.progress().count, 13);
     let mut scheduler = state.sched.lock().unwrap();
+    assert!(scheduler.callback_history_active);
+    assert_eq!(scheduler.callback_progress[&tid], guest.thread.callback_history.progress());
     assert!(
         scheduler
             .callback_checkpoints
@@ -458,17 +464,58 @@ async fn start_history_image(
 #[tokio::test]
 async fn legacy_callback_history_restores_actual_progress_after_same_leader_reload() {
     use reverie::Tool;
-    for recording in [false, true] {
-        let config = Config {
+    // Exercise actual loaded formats and startup replies, not a manually
+    // enabled State. Ordinary modes must retain completely inactive history.
+    for (recording, chaos, replay, annotated) in [
+        (true, true, false, false),
+        (false, false, true, true),
+        (false, true, true, true),
+        (false, false, false, false),
+        (true, false, false, false),
+        (false, false, true, false),
+        (true, true, true, false),
+    ] {
+        let active = annotated || (recording && chaos && !replay);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reload.json");
+        let leader = super::ROOT_DETPID;
+        if replay {
+            let mut writer = crate::preemptions::PreemptionWriter::new(None);
+            writer.register_thread(leader, DEFAULT_PRIORITY);
+            writer.insert_schedevent(SchedEvent::branches(leader, 10));
+            writer.insert_schedevent(SchedEvent::branches(leader, 7));
+            if annotated {
+                use crate::preemptions::callback_history::{Origin, Site};
+                use crate::slice_boundary::callbacks::Callback;
+                let at = LogicalTime::from_nanos(100);
+                writer.insert_reprioritization(leader, at, 0, DEFAULT_PRIORITY, DEFAULT_PRIORITY);
+                writer.insert_callback_checkpoint(leader, Origin {
+                    callback: Callback::PmuTimer,
+                    site: Site::Prehook,
+                    progress: 17,
+                    last_op: Some(Op::Branch),
+                    time: at,
+                    rcbs: 0,
+                });
+            }
+            std::fs::write(&path, writer.into_string()).unwrap();
+        }
+        let mut config = Config {
             sequentialize_threads: true,
             max_timeslice: None,
             no_rcb_time: true,
+            chaos,
+            replay_schedule_from: replay.then_some(path),
             record_preemptions: recording,
             ..Config::default()
         }
         .with_backend(|backend| backend.needs_killed_thread_rpc_cancellation = true);
+        config.validate();
         let state = GlobalState::initialize(&config, false);
-        let leader = super::ROOT_DETPID;
+        assert_eq!(state.sched.lock().unwrap().callback_history_active, active);
+        let loaded_points = state.sched.lock().unwrap().callback_checkpoints
+            .get(&leader).map(|points| points.iter().cloned().collect::<Vec<_>>()).unwrap_or_default();
+        assert_eq!(loaded_points.len(), usize::from(annotated));
         let tool: Detcore = Detcore::new(Tid::from_raw(leader.as_raw()), &config);
         let new_guest = || LegacyDeadlineGuest {
             inner: ExternalRegistrationGuest {
@@ -499,13 +546,20 @@ async fn legacy_callback_history_restores_actual_progress_after_same_leader_relo
             ],
         )
         .await;
-        super::trace_schedevent(&mut old, SchedEvent::branches(leader, 10), false).await;
+        assert_eq!(old.thread.callback_history.is_active(), active);
+        let inactive = bincode::serde::encode_to_vec(&old.thread.callback_history, bincode::config::legacy()).unwrap();
+        let mut event = SchedEvent::branches(leader, 10);
+        event.end_time = Some(old.thread.thread_logical_time.as_nanos());
+        super::trace_schedevent(&mut old, event, false).await;
         let observed = old.thread.callback_history.progress();
-        assert_eq!(observed.count, 10);
-        assert_eq!(
-            state.sched.lock().unwrap().callback_progress[&leader],
-            observed
-        );
+        if active {
+            assert_eq!(observed.count, 10);
+            assert_eq!(state.sched.lock().unwrap().callback_progress[&leader], observed);
+        } else {
+            assert_eq!(bincode::serde::encode_to_vec(&old.thread.callback_history, bincode::config::legacy()).unwrap(), inactive);
+            assert!(state.sched.lock().unwrap().callback_progress.is_empty());
+        }
+        let preserved_history = old.thread.callback_history.clone();
         let old_mm = old.thread.mm_id;
         super::prepare_exec(&mut old, old_mm, Default::default(), Vec::new(), None).await;
         // A real future alarm supplies a grant hint in ordinary mode.
@@ -531,10 +585,11 @@ async fn legacy_callback_history_restores_actual_progress_after_same_leader_relo
         start_history_image(&tool, &mut successor, &[ResourceID::MemAddrSpace(leader)]).await;
         assert_eq!(successor.thread.mm_id, old_mm.for_exec(leader));
         assert_eq!(successor.thread.callback_history.progress(), observed);
+        assert_eq!(successor.thread.callback_history, preserved_history);
+        assert_eq!(successor.thread.callback_history.is_active(), active);
         {
             let responses = successor.responses.lock().unwrap();
-            assert!(
-                responses.iter().any(|response| {
+            let carries_history = responses.iter().any(|response| {
                     let GlobalResponse::Granted(response) = response else {
                         return false;
                     };
@@ -546,17 +601,21 @@ async fn legacy_callback_history_restores_actual_progress_after_same_leader_relo
                         return false;
                     };
                     startup.progress == observed
+                        && startup.checkpoints == loaded_points
                         && matches!(response.as_ref(), GlobalResponse::StartNewThread(None))
-                }),
-                "actual startup carries and consumes both envelopes: {responses:?}"
-            );
+                });
+            assert_eq!(carries_history, active, "actual startup carries and consumes active history with its deadline: {responses:?}");
         }
-        super::trace_schedevent(&mut successor, SchedEvent::branches(leader, 7), false).await;
-        assert_eq!(successor.thread.callback_history.progress().count, 17);
-        assert_eq!(
-            state.sched.lock().unwrap().callback_progress[&leader].count,
-            17
-        );
+        let mut event = SchedEvent::branches(leader, 7);
+        event.end_time = Some(successor.thread.thread_logical_time.as_nanos());
+        super::trace_schedevent(&mut successor, event, false).await;
+        if active {
+            assert_eq!(successor.thread.callback_history.progress().count, 17);
+            assert_eq!(state.sched.lock().unwrap().callback_progress[&leader].count, 17);
+        } else {
+            assert_eq!(bincode::serde::encode_to_vec(&successor.thread.callback_history, bincode::config::legacy()).unwrap(), inactive);
+            assert!(state.sched.lock().unwrap().callback_progress.is_empty());
+        }
         if recording {
             let encoded = state
                 .sched
@@ -682,11 +741,13 @@ async fn legacy_callback_branch_deadline_trial(annotated: bool, owner_switch: bo
     thread.detpid = Some(process);
     thread.past_global_first_execve = true;
     thread.next_timeslice(&config);
+    if annotated {
     thread.callback_history.install(Startup {
         checkpoints: state.sched.lock().unwrap().callback_checkpoints
             .get(&tid).map(|points| points.iter().cloned().collect()).unwrap_or_default(),
         ..Startup::default()
     });
+    }
     let mut guest = LegacyDeadlineGuest {
         inner: ExternalRegistrationGuest {
             global: &state, config: &config, thread,
@@ -858,7 +919,9 @@ async fn legacy_callback_expired_deadline_trial(annotated: bool, owner_switch: b
     let mut thread = crate::ThreadState::new(tid, &config, ());
     thread.detpid = Some(process); thread.past_global_first_execve = true;
     thread.next_timeslice(&config);
+    if annotated {
     thread.callback_history.install(Startup { checkpoints: state.sched.lock().unwrap().callback_checkpoints.get(&tid).map(|points| points.iter().cloned().collect()).unwrap_or_default(), ..Startup::default() });
+    }
     let mut guest = LegacyDeadlineGuest { inner: ExternalRegistrationGuest { global: &state, config: &config, thread, requests: Mutex::new(Vec::new()), post_exec: false, ppid: None, private_memory: None }, clock_reads: 0, reported_rcbs: 1, timers: Vec::new(), responses: Mutex::new(Vec::new()) };
     let tool: Detcore = Detcore::new(Tid::from_raw(tid.as_raw()), &config);
     let first = tool.pre_handler_hook_observed(&mut guest, true, crate::CheckIn::Event, Some(Callback::PmuTimer)).await;

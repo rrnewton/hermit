@@ -1854,11 +1854,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         token: &Option<preemptions::callback_history::Token>,
         site: preemptions::callback_history::Site,
     ) -> Option<preemptions::callback_history::Origin> {
-        if !self.cfg.chaos
-            || !self.cfg.record_preemptions
-            || self.cfg.strict_schedule_boundaries
-            || self.cfg.replay_schedule_from.is_some()
-        {
+        if !preemptions::callback_history::recording_enabled(&self.cfg) {
             return None;
         }
         let thread = guest.thread_state();
