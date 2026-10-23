@@ -10,10 +10,10 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
-reverie-liteinst-artifact = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "fb93f1bda11d8b5286031359bed252ddcd2e3fdf", default-features = false }
+reverie-liteinst-artifact = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "42ba7f0fcdbcbb8728a641c8cb543eba8bfed2c6", default-features = false }
 serde_json = "1"
 toml = "0.8"
 
 [build-dependencies]
-reverie-dbt = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "fb93f1bda11d8b5286031359bed252ddcd2e3fdf", default-features = false }
-reverie-sabre = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "fb93f1bda11d8b5286031359bed252ddcd2e3fdf" }
+reverie-dbt = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "42ba7f0fcdbcbb8728a641c8cb543eba8bfed2c6", default-features = false }
+reverie-sabre = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "42ba7f0fcdbcbb8728a641c8cb543eba8bfed2c6" }
