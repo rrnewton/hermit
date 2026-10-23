@@ -4122,6 +4122,48 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    // D50 reader 8 under the in-guest delivery gate (A5 step 3c.1c, design
+    // 16.11): before the park and after a wake alike, the sleep ends exactly
+    // when the design's deliverable set under the thread's published mask is
+    // not empty, read here in its own turn (`gated_wait_ends`, which records
+    // the end for the restart checkpoint, D40). Nothing is held: on in-guest
+    // a child's exit is published inside the every-turn hold, and host-timed
+    // producers are refused unless ignored (step 3c.0b). A default stop is
+    // never deliverable (stop sends are refused under the gate, D48), so
+    // `stops_end_it` changes nothing here.
+    //
+    // Signal phase 1's SIGALRM is virtual: the scheduler's ledger wakes a
+    // `pause` for it (`Scheduler::sigalrm_wake`) with no physical copy
+    // pending, so such a wake counts as a caught SIGALRM pending on the
+    // process's shared queue, where Linux's timer would queue it, and takes
+    // its place in Linux's dequeue order among the deliverable signals
+    // (`wait_signal_end::classify`): a deliverable default-fatal signal that
+    // does not dump core still ends the process, and so does a core-dumping
+    // one Linux would dequeue first; one behind the SIGALRM ends it unless
+    // the guest's SIGALRM handler's mask holds it, which the restart
+    // checkpoint reads (`WaitSignalEnd::BehindCaught`). IR-12: the `pause`
+    // returns `ERESTARTNOHAND`, which the restart checkpoint turns into
+    // `EINTR`. Phase 1 refuses every other sleep in a process that handles
+    // SIGALRM (F8).
+    if guest.config().in_guest_signal_delivery {
+        let _ = stops_end_it;
+        let phase1_wake = matches!(&check, SleepCheck::AfterWake(Some(woken))
+            if woken.iter().any(|signal| signal.raw() == libc::SIGALRM))
+            && guest.config().backend.virtualizes_guest_sigalrm
+            && guest.thread_state().sigalrm_handled;
+        let virtual_caught = if phase1_wake {
+            kernel_sigset_bit(libc::SIGALRM)
+        } else {
+            0
+        };
+        let end =
+            crate::syscalls::helpers::gated_wait_end_with_virtual(guest, None, virtual_caught)?;
+        let Some(end) = end else {
+            return Ok(SleepSignal::None);
+        };
+        guest.thread_state_mut().wait_signal_end = Some(end);
+        return Ok(SleepSignal::Pending);
+    }
     if !guest
         .config()
         .backend

@@ -547,7 +547,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let turn_mask_cell = stack.reserve::<KernelSigset>();
         let action_addr = stack.reserve::<KernelSigaction>();
         let _mask_guard = stack.commit()?;
-        let checks_at_turn = decides_interruption_at_turn(guest, guest_signal_state_task(guest));
+        // A parked pipe write under the in-guest delivery gate (A5 step 3c.1c,
+        // D50 reader 1) installs no private mask: once an attempt would wait
+        // for room, the design's deliverable set under the thread's published
+        // mask decides (`gated_wait_ends`).
+        let gated = guest.config().in_guest_signal_delivery;
+        let checks_at_turn =
+            !gated && decides_interruption_at_turn(guest, guest_signal_state_task(guest));
         // Where the turn decides (`read_turn_signals`), the state is read, and
         // the first attempt made, in the slice of the call's own entry, as the
         // scalar writer's first attempt is, under the guest's own mask: that
@@ -580,7 +586,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut turn_wait = checks_at_turn
             .then(|| KernelSignalWait::new(guest, 0, false, call.signal_interrupt_errno()));
         let mut turn_mask: Option<KernelSigset> = None;
-        let guest_signal_mask = if checks_at_turn {
+        let guest_signal_mask = if checks_at_turn || gated {
             0
         } else {
             block_signals_for_disposition(guest, blocked_mask_addr, old_mask_addr).await?
@@ -630,7 +636,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     (status, turn)
                 }
             };
-            if turn.is_none() {
+            if turn.is_none() && !gated {
                 let disposition = match wait_signal_disposition(
                     guest,
                     status.clone(),
@@ -709,6 +715,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if turn.is_some_and(|turn| turn.ends(true)) {
                         break Ok(written_total as i64);
                     }
+                    if gated {
+                        match gated_wait_ends(guest, None) {
+                            Ok(true) => break Ok(written_total as i64),
+                            Ok(false) => {}
+                            Err(error) => break Err(error),
+                        }
+                    }
                     current = match remaining_writev_segment(
                         call.fd(),
                         &iovecs,
@@ -731,6 +744,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                     };
                 }
                 Err(Error::Errno(Errno::EAGAIN)) => {
+                    if gated {
+                        match gated_wait_ends(guest, None) {
+                            Ok(true) => {
+                                break if written_total > 0 {
+                                    Ok(written_total as i64)
+                                } else {
+                                    Err(call.signal_interrupt_errno().into())
+                                };
+                            }
+                            Ok(false) => {}
+                            Err(error) => break Err(error),
+                        }
+                    }
                     if !atomic_pipe_write && matches!(current, Syscall::Writev(_)) {
                         current = match remaining_writev_segment(call.fd(), &iovecs, 0, target) {
                             Ok(Some(write)) => Syscall::Write(write),
@@ -773,6 +799,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Err(error) => Err(error),
                 }
             }
+            None if gated => result,
             None => {
                 restore_signals_after_disposition(guest, old_mask_addr).await?;
                 result
@@ -849,7 +876,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let subtool = self.cfg.recordreplay_modes.then_some(self);
         let mut current = call;
         let mut written_total = 0usize;
-        let checks_at_turn = decides_interruption_at_turn(guest, resources.signal_state_task);
+        // Under the in-guest delivery gate (A5 step 3c.1c, D50 reader 1), as
+        // for a pipe `writev`: no private mask, and the design's deliverable
+        // set decides once an attempt would wait for room.
+        let gated = guest.config().in_guest_signal_delivery;
+        let checks_at_turn =
+            !gated && decides_interruption_at_turn(guest, resources.signal_state_task);
         // The write owns the guest's mask while it blocks every blockable
         // signal, as the generic poll does (`retry_nonblocking_syscall_helper`):
         // an attempt after the first is a private injection of the
@@ -901,7 +933,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else {
                 None
             };
-            let signaled = if turn.is_some() {
+            let signaled = if turn.is_some() || gated {
                 false
             } else {
                 match (&status, &disposition_scratch) {
@@ -972,6 +1004,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if written_total == target || turn.map_or(signaled, |turn| turn.ends(true)) {
                         break Ok(written_total as i64);
                     }
+                    if gated {
+                        match gated_wait_ends(guest, None) {
+                            Ok(true) => break Ok(written_total as i64),
+                            Ok(false) => {}
+                            Err(error) => break Err(error),
+                        }
+                    }
                     let Some(buffer) = call.buf() else {
                         break Err(Errno::EFAULT.into());
                     };
@@ -999,7 +1038,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                         Err(call.signal_interrupt_errno().into())
                     };
                 }
-                Err(Error::Errno(Errno::EAGAIN)) => {}
+                Err(Error::Errno(Errno::EAGAIN)) => {
+                    if gated {
+                        match gated_wait_ends(guest, None) {
+                            Ok(true) => {
+                                break if written_total > 0 {
+                                    Ok(written_total as i64)
+                                } else {
+                                    Err(call.signal_interrupt_errno().into())
+                                };
+                            }
+                            Ok(false) => {}
+                            Err(error) => break Err(error),
+                        }
+                    }
+                }
                 Err(error) => {
                     break finish_partial_record_or_replay_write(written_total as i64, error);
                 }
@@ -2290,10 +2343,14 @@ where
     G: Guest<Detcore<T>>,
 {
     let maybe_tup = maybe_timeout.map(|t| (t, call.timeout_return_val()));
+    // Under the in-guest delivery gate the private-mask machinery is never
+    // taken (A5 step 3c.1c, D50): the helper below decides by the published
+    // mask instead (`gated_wait_ends`).
     if guest
         .config()
         .backend
         .supports_blocked_wait_signal_interruption
+        && !guest.config().in_guest_signal_delivery
     {
         return retry_blocking_wait_with_kernel_signal_state(guest, call, rsrc, maybe_tup).await;
     }
@@ -2386,7 +2443,13 @@ where
         // deliver is pending, so a blocked or ignored signal leaves it waiting.
         rsrc.signal_state_task = guest_signal_state_task(guest);
     }
-    let checks_at_turn = rsrc.signal_interrupt_errno() == Some(Errno::ERESTARTSYS.into_raw())
+    // D50 reader 2 under the in-guest delivery gate (A5 step 3c.1c): no
+    // private kernel mask; once an attempt would block, the design's
+    // deliverable set under the thread's published mask decides
+    // (`gated_wait_ends`), at each turn, the first included.
+    let gated = guest.config().in_guest_signal_delivery;
+    let checks_at_turn = !gated
+        && rsrc.signal_interrupt_errno() == Some(Errno::ERESTARTSYS.into_raw())
         && decides_interruption_at_turn(guest, rsrc.signal_state_task);
     // Where the turn decides, the call owns the guest's mask while it blocks
     // every blockable signal (`KernelSignalWait::block_in_place`), from the
@@ -2465,7 +2528,7 @@ where
         // pending ends it (`TurnSignals::ends`).
         let signaled = match turn {
             Some(turn) => turn.ends(false),
-            None => matches!(resumed, ResumeStatus::Signaled(_)),
+            None => !gated && matches!(resumed, ResumeStatus::Signaled(_)),
         };
         // A pending real-time timer expiration in the set this wait takes
         // (https://github.com/rrnewton/hermit/issues/4089).
@@ -2502,6 +2565,16 @@ where
                 errno
             );
             break Err(errno.into());
+        }
+        // Under the gate the wait ends here, where it would block (as
+        // Linux checks for a pending signal only then), for a signal sent
+        // before it parked or one whose commit woke it.
+        if gated && call.syscall_would_have_blocked(syscall_result) {
+            match gated_wait_ends(guest, None) {
+                Ok(true) => break Err(call.signal_interrupt_errno().into()),
+                Ok(false) => {}
+                Err(error) => break Err(error),
+            }
         }
         if call.syscall_would_have_blocked(syscall_result) {
             rsrc.poll_attempt += 1;
@@ -2880,6 +2953,136 @@ where
     };
     crate::tool_global::set_saved_guest_sigmask(guest, Some(mask)).await;
     Ok(mask)
+}
+
+/// A5 step 3c.1c (design 16.11, D50): under the in-guest delivery gate, the
+/// guest mask a wait under the thread's own mask decides by, in the thread's
+/// own turn: the mask it publishes at its requests
+/// (`tool_global::publish_request_guest_mask`), or, when it publishes none,
+/// `fallback`, which is the kernel's `SigBlk` unless the caller knows the
+/// guest's mask better. No backend records the guest's mask apart from the
+/// kernel's before step 3c.1e, and step 3c.1b's readers take `SigBlk` then
+/// too.
+pub(crate) fn gated_own_mask<T, G>(guest: &G, fallback: KernelSigset) -> KernelSigset
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let own = Resources::new(guest.thread_state().dettid);
+    crate::tool_global::publish_request_guest_mask(guest, &own).unwrap_or(fallback)
+}
+
+/// A5 step 3c.1c (design 16.11, D50): under the in-guest delivery gate, what
+/// ends this thread's wait now, read in its own turn from its `/proc` status
+/// and its own published mask ([`gated_own_mask`], with `fallback` for
+/// `SigBlk` when the caller knows the guest's own mask better). `None` when no
+/// signal is deliverable, and always with the gate off. A state that cannot be
+/// read is handled as a wait's first read is (`read_thread_wait_signal_state`):
+/// a thread that no longer exists ends the call with `ERESTARTNOINTR`, and
+/// otherwise the run ends with a diagnostic.
+pub(crate) fn gated_wait_end<T, G>(
+    guest: &G,
+    fallback: Option<KernelSigset>,
+) -> Result<Option<crate::wait_signal_end::WaitSignalEnd>, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    gated_wait_end_with_virtual(guest, fallback, 0)
+}
+
+/// [`gated_wait_end`] with `virtual_caught`, caught signals the scheduler
+/// knows are pending on the process's shared queue with no physical copy
+/// (signal phase 1's virtual SIGALRM;
+/// `wait_signal_end::wait_end_with_virtual`).
+pub(crate) fn gated_wait_end_with_virtual<T, G>(
+    guest: &G,
+    fallback: Option<KernelSigset>,
+    virtual_caught: KernelSigset,
+) -> Result<Option<crate::wait_signal_end::WaitSignalEnd>, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if !guest.config().in_guest_signal_delivery {
+        return Ok(None);
+    }
+    let state = crate::syscalls::threads::read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+    let mask = gated_own_mask(guest, fallback.unwrap_or(state.blocked));
+    Ok(crate::wait_signal_end::wait_end_with_virtual(
+        &state,
+        mask,
+        guest.config().in_guest_reserved_signals,
+        virtual_caught,
+    ))
+}
+
+/// [`gated_wait_end`], recording a found end as the current call's D40 flag
+/// (`ThreadState::wait_signal_end`) for the restart checkpoint. Returns
+/// whether a signal ends the wait.
+pub(crate) fn gated_wait_ends<T, G>(
+    guest: &mut G,
+    fallback: Option<KernelSigset>,
+) -> Result<bool, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let end = gated_wait_end(guest, fallback)?;
+    if let Some(end) = end {
+        tracing::info!(
+            "[dtid {}] under the in-guest delivery gate, {:?} ends the wait",
+            guest.thread_state().dettid,
+            end
+        );
+        guest.thread_state_mut().wait_signal_end = Some(end);
+    }
+    Ok(end.is_some())
+}
+
+/// The `sa_flags` of `signal`'s current action, as the guest set it, read in
+/// this thread's turn with a query `rt_sigaction` (the in-guest runtime
+/// answers it from the guest's action, phase 1's virtual SIGALRM included):
+/// for the restart checkpoint's caught row (A5 design D40).
+pub(crate) async fn caught_action_flags<T, G>(guest: &mut G, signal: i32) -> Result<u64, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    Ok(caught_action(guest, signal).await?.flags)
+}
+
+/// The `sa_mask` and `sa_flags` of `signal`'s current action, as the guest set
+/// it, read in this thread's turn with a query `rt_sigaction` (the in-guest
+/// runtime answers it from the guest's action, phase 1's virtual SIGALRM
+/// included): for the restart checkpoint's resolution of a
+/// `WaitSignalEnd::BehindCaught` (A5 design D40) and its caught row. Called
+/// only where the thread holds no committed scratch stack.
+pub(crate) async fn caught_action<T, G>(
+    guest: &mut G,
+    signal: i32,
+) -> Result<crate::wait_signal_end::CaughtAction, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut stack = guest.stack().await;
+    let action = stack.reserve::<KernelSigaction>();
+    let _stack_guard = stack.commit()?;
+    guest
+        .inject_with_retry(
+            syscalls::RtSigaction::new()
+                .with_signum(signal)
+                .with_action(None)
+                .with_old_action(Some(action.cast()))
+                .with_sigsetsize(KERNEL_SIGSET_SIZE),
+        )
+        .await?;
+    let action: KernelSigaction = guest.memory().read_value(action)?;
+    Ok(crate::wait_signal_end::CaughtAction {
+        mask: action.mask,
+        flags: action.flags,
+    })
 }
 
 /// Whether the scheduler keeps a guest mask that differs from the kernel's

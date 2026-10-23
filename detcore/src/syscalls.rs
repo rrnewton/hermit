@@ -40,7 +40,19 @@ mod signal;
 pub(crate) mod signal_shadow;
 /// The guest's virtual SIGALRM blocked bit (signal phase 1).
 pub(crate) use signal::ClaimFault;
+/// An emulated sleep's own check, for the in-guest delivery gate's tests (A5
+/// step 3c.1c).
+#[cfg(test)]
+pub(crate) use signal::SleepCheck;
+/// An emulated sleep's own verdict, for the in-guest delivery gate's tests (A5
+/// step 3c.1c).
+#[cfg(test)]
+pub(crate) use signal::SleepSignal;
 pub(crate) use signal::claim_still_pending;
+/// An emulated sleep's own check, for the in-guest delivery gate's tests (A5
+/// step 3c.1c).
+#[cfg(test)]
+pub(crate) use signal::sleep_signal;
 pub(crate) use signal::take_claim_fault;
 pub(crate) use signal::take_pending_signal;
 pub(crate) use signal::virtual_sigalrm_blocked;
@@ -53,6 +65,8 @@ pub(crate) use threads::FutexDeadline;
 /// The kernel's view of a guest thread's signals, which the scheduler reads when
 /// it commits a wake for a parked precise-mode futex waiter or an emulated sleep.
 pub(crate) use threads::KernelSignalState;
+/// One of a thread's two queues of pending signals.
+pub(crate) use threads::SignalQueue;
 pub(crate) use threads::default_action_ends_process;
 pub(crate) use threads::host_signal_state_reads_refused;
 pub(crate) use threads::ignored_at_generation;
