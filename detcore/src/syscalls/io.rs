@@ -75,6 +75,8 @@ use crate::tool_local::Detcore;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 
+mod temporary_mask_forms;
+
 // Printing helper
 // TODO: this should be subsumed by better syscall printing.
 fn print_poll(call: &syscalls::Poll) {
@@ -1205,6 +1207,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !self.cfg.sequentialize_threads {
             return Ok(guest.inject(call).await?);
         }
+        // Under the in-guest delivery gate (A5 step 3c.1d) the forms follow
+        // design D39 and D50, and no probe carries the guest's temporary mask
+        // (IR-9): `gated_pselect6`.
+        if self.cfg.in_guest_signal_delivery {
+            return Box::pin(self.gated_pselect6(guest, call)).await;
+        }
 
         if call.nfds() < 0 {
             return Ok(guest.inject(call).await?);
@@ -1392,31 +1400,40 @@ impl<T: RecordOrReplay> Detcore<T> {
         sigmask: Option<u64>,
     ) -> Result<i64, Error> {
         let len = pselect6_fd_set_len(call.nfds())?;
+        // Under the in-guest delivery gate (A5 step 3c.1d, D50 reader (3)):
+        // no probe carries the temporary mask (IR-9); each turn that finds
+        // nothing ready decides from the thread's `/proc` status under the
+        // temporary mask (`temporary_mask_check`), or under the guest's own
+        // mask without one (`gated_wait_ends`); the first probe and its check
+        // run in the call's own turn, before any request, so that check sees
+        // exactly the instances pending at entry (IR-7, round-1 ruling 2);
+        // the request publishes the temporary mask; and a set Detcore cannot
+        // read is EFAULT only where Linux's copy faults
+        // (`temporary_mask_forms::read_gated_fd_set`).
+        let gated = self.cfg.in_guest_signal_delivery;
+        let mut entry = (gated && sigmask.is_some()).then_some(!0);
         let deadline = match timeout {
             Some(timeout) => Some(thread_observe_time(guest).await + timeout),
             None => None,
         };
-        let original_readfds = match read_pselect6_fd_set(guest, call.readfds(), len) {
-            Ok(value) => value,
-            Err(error) => {
-                self.write_pselect6_remaining(guest, call, deadline).await?;
-                return Err(error);
+        let mut originals = Vec::with_capacity(3);
+        for set in [call.readfds(), call.writefds(), call.exceptfds()] {
+            let read = if gated {
+                temporary_mask_forms::read_gated_fd_set(guest, "pselect6", set, len).await
+            } else {
+                read_pselect6_fd_set(guest, set, len)
+            };
+            match read {
+                Ok(value) => originals.push(value),
+                Err(error) => {
+                    self.write_pselect6_remaining(guest, call, deadline).await?;
+                    return Err(error);
+                }
             }
-        };
-        let original_writefds = match read_pselect6_fd_set(guest, call.writefds(), len) {
-            Ok(value) => value,
-            Err(error) => {
-                self.write_pselect6_remaining(guest, call, deadline).await?;
-                return Err(error);
-            }
-        };
-        let original_exceptfds = match read_pselect6_fd_set(guest, call.exceptfds(), len) {
-            Ok(value) => value,
-            Err(error) => {
-                self.write_pselect6_remaining(guest, call, deadline).await?;
-                return Err(error);
-            }
-        };
+        }
+        let original_exceptfds = originals.pop().flatten();
+        let original_writefds = originals.pop().flatten();
+        let original_readfds = originals.pop().flatten();
 
         let mut stack = guest.stack().await;
         let readfds = call.readfds().map(|_| stack.reserve::<libc::fd_set>());
@@ -1434,15 +1451,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `KernelSignalWait` below decides interruption against the temporary
         // mask instead (`with_wait_mask`), and the probes carry no mask.
         let kernel_signal_wait = self.cfg.backend.supports_blocked_wait_signal_interruption;
-        let probe_sigmask = sigmask.filter(|_| !kernel_signal_wait).map(|mask| {
-            let sigset = stack.push(mask);
-            stack
-                .push(Pselect6SigmaskArg {
-                    sigmask: sigset.as_raw(),
-                    sigsetsize: KERNEL_SIGSET_SIZE,
-                })
-                .cast()
-        });
+        let probe_sigmask = sigmask
+            .filter(|_| !kernel_signal_wait && !gated)
+            .map(|mask| {
+                let sigset = stack.push(mask);
+                stack
+                    .push(Pselect6SigmaskArg {
+                        sigmask: sigset.as_raw(),
+                        sigsetsize: KERNEL_SIGSET_SIZE,
+                    })
+                    .cast()
+            });
         // On a backend whose kernel reports the guest's signal state, only a
         // signal that would end the wait natively does; the mask cell lets the
         // wait block signals under the one scratch-stack guard
@@ -1487,6 +1506,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.fyi("pselect6");
         resources.poll_deadline = poll_deadline_for(guest, deadline);
+        if gated {
+            resources.blocked_signal_mask = sigmask;
+        }
         // Keep the request metadata accurate, but do not make it eligible for
         // the scheduler's ERESTARTSYS wakeup. A cross-task signal must first be
         // checked against pselect6's snapshotted temporary mask and disposition.
@@ -1503,11 +1525,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             let published = &mut published;
             let deliver_under_temporary_mask = &mut deliver_under_temporary_mask;
             async move {
+                // Under the gate the first probe and its check run in the
+                // call's own turn (see `entry` above).
+                let mut first_turn = gated;
                 loop {
-                    let signaled = matches!(
-                        resource_request(guest, resources.clone()).await,
-                        ResumeStatus::Signaled(_)
-                    );
+                    let signaled = !first_turn
+                        && matches!(
+                            resource_request(guest, resources.clone()).await,
+                            ResumeStatus::Signaled(_)
+                        );
+                    first_turn = false;
                     // Virtual timerfds first (`crate::syscalls::timerfd`).
                     let next_timerfd =
                         crate::syscalls::timerfd::publish_expired_in(guest, Some(timerfd_scratch))
@@ -1540,7 +1567,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // the wait gets EBADF, where Linux reports it ready. Without the
                     // kernel's signal state, a scheduler `Signaled` answer still ends
                     // the call before the probe.
-                    if signals.is_none() && signaled {
+                    if signals.is_none() && signaled && !gated {
                         self.write_pselect6_remaining(guest, call, deadline).await?;
                         return Err(Errno::EINTR.into());
                     }
@@ -1587,6 +1614,37 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // `Signaled` answer is only a hint here; the kernel's state decides.
                     // pselect6 returns ERESTARTNOHAND: EINTR after a handler, a restart
                     // with the remaining timeout after a stop.
+                    if gated {
+                        let ends = match sigmask {
+                            Some(mask) => {
+                                // Boxed: the gate-off future stays its size.
+                                match Box::pin(crate::syscalls::helpers::temporary_mask_check(
+                                    guest,
+                                    mask,
+                                    entry.take(),
+                                    false,
+                                ))
+                                .await
+                                {
+                                    Ok(crate::syscalls::helpers::TemporaryMaskCheck::Waits) => None,
+                                    Ok(crate::syscalls::helpers::TemporaryMaskCheck::Fatal) => {
+                                        Some(Errno::ERESTARTNOHAND)
+                                    }
+                                    Ok(_) => Some(Errno::EINTR),
+                                    Err(error) => break Err(error),
+                                }
+                            }
+                            None => match crate::syscalls::helpers::gated_wait_ends(guest, None) {
+                                Ok(true) => Some(Errno::ERESTARTNOHAND),
+                                Ok(false) => None,
+                                Err(error) => break Err(error),
+                            },
+                        };
+                        if let Some(errno) = ends {
+                            self.write_pselect6_remaining(guest, call, deadline).await?;
+                            break Err(errno.into());
+                        }
+                    }
                     if let Some(signals) = signals.as_ref() {
                         match signals.interrupted_with_state() {
                             Ok((false, _)) => {}
@@ -1857,6 +1915,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_exceptfds(exceptfds)
             .with_timeout(Some(probe_timeout));
 
+        // Under the in-guest delivery gate (A5 step 3c.1d, D50 reader (4)): a
+        // turn that finds nothing ready decides from the thread's `/proc`
+        // status under the mask it published, its own (`gated_wait_ends`).
+        let gated = self.cfg.in_guest_signal_delivery;
         let mut resources = Resources::new(guest.thread_state().dettid);
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.fyi("select");
@@ -1907,7 +1969,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // the wait gets EBADF, where Linux reports it ready. Without the
                     // kernel's signal state, a scheduler `Signaled` answer still ends
                     // the call before the probe.
-                    if signals.is_none() && signaled {
+                    if signals.is_none() && signaled && !gated {
                         self.write_select_remaining(guest, call, deadline).await?;
                         return Err(Errno::EINTR.into());
                     }
@@ -1953,6 +2015,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // `Signaled` answer is only a hint here; the kernel's state decides.
                     // select returns ERESTARTNOHAND: EINTR after a handler, a restart
                     // with the remaining timeout after a stop.
+                    if gated {
+                        match crate::syscalls::helpers::gated_wait_ends(guest, None) {
+                            Ok(true) => {
+                                self.write_select_remaining(guest, call, deadline).await?;
+                                break Err(Errno::ERESTARTNOHAND.into());
+                            }
+                            Ok(false) => {}
+                            Err(error) => break Err(error),
+                        }
+                    }
                     if let Some(signals) = signals.as_ref() {
                         match signals.interrupted_with_state() {
                             Ok((false, _)) => {}
@@ -2047,6 +2119,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Ppoll,
     ) -> Result<i64, Error> {
+        // A masked ppoll under the in-guest delivery gate (A5 step 3c.1d, D50
+        // reader (5)): `gated_masked_ppoll`, which reads the timeout itself.
+        if self.cfg.in_guest_signal_delivery
+            && call.sigmask().is_some()
+            && !ppoll_uses_kernel_wait(self.cfg.sequentialize_threads, self.cfg.recordreplay_modes)
+        {
+            return Box::pin(self.gated_masked_ppoll(guest, call)).await;
+        }
         let timeout_address = call.timeout();
         let timeout = match timeout_address {
             Some(timeout) => Some(ppoll_timeout_duration(guest.memory().read_value(timeout)?)?),
@@ -2671,6 +2751,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         if call.sigmask().is_some() && self.cfg.recordreplay_modes && call.timeout() != 0 {
             return self.record_or_replay_masked_epoll_pwait(guest, call).await;
         }
+        // Under the in-guest delivery gate (A5 step 3c.1d, D39) a masked call
+        // polls with no mask on its probes and decides under its temporary
+        // mask, with D37's EINTR exception; a zero timeout makes one maskless
+        // probe (`gated_masked_epoll_pwait`; IR-9).
+        if call.sigmask().is_some()
+            && self.cfg.sequentialize_threads
+            && self.cfg.in_guest_signal_delivery
+        {
+            return Box::pin(self.gated_masked_epoll_pwait(guest, call)).await;
+        }
         if call.sigmask().is_some()
             && call.timeout() != 0
             && self.cfg.sequentialize_threads
@@ -2966,6 +3056,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     self.record_or_replay_blocking(guest, call).await
                 };
             }
+        } else if self.cfg.sequentialize_threads
+            && args.arg4 != 0
+            && self.cfg.in_guest_signal_delivery
+        {
+            // Under the in-guest delivery gate (A5 step 3c.1d, D39), as a
+            // masked epoll_pwait (`gated_masked_epoll_pwait2`).
+            return Box::pin(self.gated_masked_epoll_pwait2(guest, args, !observed)).await;
         } else if self.cfg.sequentialize_threads
             && !zero_timeout
             && (args.arg4 == 0 || self.cfg.backend.supports_blocked_wait_signal_interruption)
