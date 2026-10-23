@@ -184,6 +184,22 @@ pub enum SchedResponse {
     // Exit,
 }
 
+/// What the scheduler holds, under the in-guest delivery gate, for a thread
+/// whose latest request is a kernel-run call (`ResourceID::is_kernel_run_blocking`)
+/// and whose continuation turn has not been granted (A5 step 3c.1c, D44): the
+/// answer to `GlobalRequest::KernelRunTarget`. It travels in a bincode RPC,
+/// so it has no `skip_serializing_if`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KernelRunBlock {
+    /// The call is a vfork parent's wait (`BlockingVfork`), which Linux ends
+    /// only for a fatal signal that is not core-dumping.
+    pub vfork: bool,
+    /// The guest mask the request published (`Resources::guest_signal_mask`:
+    /// the call's temporary mask, or the thread's own), `None` when it
+    /// published none.
+    pub mask: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialOrd, PartialEq, Eq, Serialize, Deserialize)]
 /// A value that the scheduler returns to the guest when resuming.  This is weakly typed in that it
 /// is only relevant to certain scheduler requests, and its meaning is dependent on what was
@@ -1556,6 +1572,24 @@ pub struct Scheduler {
     /// Set when step2a's valve expires; `sched_loop_inner` ends the run with
     /// it (`exit_on_scheduler_refusal`).
     vfork_barrier_refusal: Option<VforkBarrierRefusal>,
+
+    /// Under the in-guest delivery gate, each thread whose latest filed
+    /// request is a kernel-run call, until its continuation turn is granted
+    /// (A5 step 3c.1c, D44): recorded as the request is filed, in the
+    /// thread's own turn (`record_request_kernel_run`), and cleared when the
+    /// continuation is granted or the thread is retired, both ordered points.
+    /// It never reads which blocked pool holds the thread, which the
+    /// background harvest changes at moments host timing decides.
+    kernel_run_requests: BTreeMap<DetTid, KernelRunBlock>,
+
+    /// Set, under the in-guest delivery gate, when a signal the scheduler
+    /// sends would interrupt a thread blocked in a kernel-run call (D44's
+    /// arming assertion, `wake_signaled_guest_as`); `sched_loop_inner` ends
+    /// the run with it (`exit_on_scheduler_refusal`), rather than waiting, as
+    /// the release barrier's 30-second valve would where signal targets are
+    /// modelled, or holding the signal pending under the runtime's mask for
+    /// as long as the call blocks.
+    kernel_run_signal_refusal: Option<String>,
 
     /// When the SIGKILL fence started waiting for the current committed
     /// victims, in host time (`sigkill_retirement`).
@@ -3101,6 +3135,11 @@ async fn sched_loop_inner(
         if let Some(refusal) = vfork_refusal {
             exit_on_scheduler_refusal(&refusal);
         }
+        // D44's arming assertion under the in-guest delivery gate.
+        let kernel_run_refusal = sched.lock().unwrap().kernel_run_signal_refusal.take();
+        if let Some(refusal) = kernel_run_refusal {
+            exit_on_scheduler_refusal(&refusal);
+        }
         // A SIGKILL whose victims' deaths or exit publications never arrived
         // (`Scheduler::SIGKILL_FENCE_VALVE`).
         let sigkill_refusal = sched.lock().unwrap().sigkill_fence_refusal.take();
@@ -4142,6 +4181,8 @@ impl Scheduler {
             signaled_background_refusal: None,
             vfork_barrier_wait_since: None,
             vfork_barrier_refusal: None,
+            kernel_run_requests: Default::default(),
+            kernel_run_signal_refusal: None,
             sigkill_fence_wait_since: None,
             sigkill_fence_refusal: None,
             sigkill_fence_valve: Self::SIGKILL_FENCE_VALVE,
@@ -5166,6 +5207,7 @@ impl Scheduler {
         self.release_vfork_child(*dtid, false);
         self.vfork_registration_origins.remove(dtid);
         self.saved_guest_sigmasks.remove(dtid);
+        self.kernel_run_requests.remove(dtid);
         self.published_masks.remove(dtid);
         let retired = self
             .discarded_at_send
@@ -6674,6 +6716,43 @@ impl Scheduler {
         self.in_guest_signal_delivery
             && !rs.is_rejoin()
             && self.set_saved_guest_sigmask(dettid, rs.guest_signal_mask)
+    }
+
+    /// Under the in-guest delivery gate only (A5 step 3c.1c, D44): as `rs` is
+    /// filed, in `dettid`'s own turn, record whether it is a kernel-run call
+    /// (`kernel_run_requests`), with the mask it published, or forget an
+    /// earlier record when it is any other request. A rejoin, which host
+    /// timing files while the thread is still outside the schedule, changes
+    /// nothing: the record holds until the continuation is granted
+    /// (`block_for_one_resource`). Returns whether a record is held.
+    pub(crate) fn record_request_kernel_run(&mut self, dettid: DetTid, rs: &Resources) -> bool {
+        if !self.in_guest_signal_delivery || rs.is_rejoin() {
+            return self.kernel_run_requests.contains_key(&dettid);
+        }
+        match rs.resources.keys().find(|rid| rid.is_kernel_run_blocking()) {
+            Some(rid) => {
+                self.kernel_run_requests.insert(
+                    dettid,
+                    KernelRunBlock {
+                        vfork: matches!(rid, ResourceID::BlockingVfork(_)),
+                        mask: rs.guest_signal_mask,
+                    },
+                );
+                true
+            }
+            None => {
+                self.kernel_run_requests.remove(&dettid);
+                false
+            }
+        }
+    }
+
+    /// The answer to `GlobalRequest::KernelRunTarget` (D44): what the
+    /// scheduler holds for `dettid` if its latest committed request is a
+    /// kernel-run call whose continuation turn has not been granted, read from
+    /// committed state alone (`kernel_run_requests`).
+    pub(crate) fn kernel_run_block(&self, dettid: DetTid) -> Option<KernelRunBlock> {
+        self.kernel_run_requests.get(&dettid).copied()
     }
 
     /// Record (`Some`) or clear (`None`) the mask Linux's `blocked` holds for
@@ -10306,6 +10385,53 @@ impl Scheduler {
         // scheduler and must await its own continuation.
         let has_external_blocker = self.blocked.external_io_blockers.contains_key(&dettid)
             || self.blocked.rt_sigsuspend_blockers.contains_key(&dettid);
+        // D44's arming assertion under the in-guest delivery gate (A5 step
+        // 3c.1c): a guest's send to a thread blocked in a kernel-run call that
+        // would interrupt the call is refused before it is made
+        // (`refuse_kernel_run_target_send`). What gets here is the scheduler's
+        // own sends (a timer, a child's exit) and the guest sends that check
+        // did not refuse (blocked by the call's mask, ignored, or a vfork
+        // parent's caught or core-dumping signal), which this block decides
+        // identically: the same record, the same dispositions, the pending set
+        // not read, so it does not refuse them either. One that would
+        // interrupt the call (`kernel_run_send_refused`) ends the run by name,
+        // fail closed, from committed state: the record of the thread's
+        // kernel-run request, not which pool holds it. Nothing is armed or
+        // waited for. One that would not stays pending, as Linux keeps it, and
+        // the call goes on.
+        if self.in_guest_signal_delivery
+            && let Some(block) = self.kernel_run_block(dettid)
+        {
+            let state = self.read_sleeper_signal_state(dettid);
+            let refused = match &state {
+                Ok(state) => crate::wait_signal_end::kernel_run_send_refused(
+                    state,
+                    block.mask.unwrap_or(state.blocked),
+                    signal.raw(),
+                    block.vfork,
+                    self.in_guest_reserved_signals,
+                ),
+                Err(_) => true,
+            };
+            if refused {
+                let reason = crate::refused_signal_controls::kernel_run_signal_refusal(
+                    "the scheduler",
+                    signal.raw(),
+                    None,
+                    dettid.as_raw(),
+                    block.vfork,
+                    state.is_err(),
+                );
+                tracing::error!("{}", reason);
+                self.kernel_run_signal_refusal.get_or_insert(reason);
+            } else {
+                debug!(
+                    "[dtid {}] signal {} would not interrupt its kernel-run call; it stays pending.",
+                    dettid, signal
+                );
+            }
+            return;
+        }
         if self.models_signal_targets && !has_external_blocker {
             self.note_signaled_sigsuspend_request(dettid, signal);
         }
@@ -13525,6 +13651,9 @@ impl Scheduler {
                 // in, this resource request is immediately granted. From here
                 // the thread runs again, so its mask is the kernel's.
                 self.blocked.continuation_masks.remove(&dettid);
+                // Its continuation turn is granted: a send no longer finds it
+                // blocked in a kernel-run call (D44).
+                self.kernel_run_requests.remove(&dettid);
                 Ok(())
             }
 

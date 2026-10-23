@@ -317,3 +317,250 @@ fn under_the_gate_a_poll_is_admitted_by_its_published_mask() {
     park(&mut scheduler, TARGET, Kind::Poll, bit(libc::SIGTERM));
     assert!(scheduler.poll_mask_admits(TARGET, term));
 }
+
+/// A request for `rid` that publishes `mask`.
+fn publishing(thread: DetTid, rid: ResourceID, mask: Option<u64>) -> Resources {
+    let mut request = Resources::new(thread);
+    request.insert(rid, Permission::RW);
+    request.guest_signal_mask = mask;
+    request
+}
+
+/// File `request` as `thread`'s next request, as the coordinator does
+/// (`recv_request_resources`): record what it publishes, then fill it in.
+fn file(scheduler: &mut Scheduler, thread: DetTid, request: Resources) -> bool {
+    scheduler.record_request_guest_mask(thread, &request);
+    let recorded = scheduler.record_request_kernel_run(thread, &request);
+    scheduler.next_turns.get_mut(&thread).unwrap().req = Ivar::full(Ok(request));
+    recorded
+}
+
+/// Grant `thread`'s filed request for `rid` in step 3's way.
+fn grant(scheduler: &mut Scheduler, thread: DetTid, rid: &ResourceID) -> Result<(), SkipTurn> {
+    if !scheduler.run_queue.contains_tid(thread) {
+        scheduler.runqueue_push_back(thread);
+    }
+    assert_eq!(scheduler.run_queue.tentative_pop_tid(thread), Some(thread));
+    scheduler.block_for_one_resource(thread, rid, &Permission::RW, None, None, &Ivar::new())
+}
+
+/// D44's committed-state query (A5 step 3c.1c): for each kernel-run
+/// resource, the scheduler holds the thread from the filing of its request
+/// (in its own turn) until its continuation turn is granted, whatever the
+/// background harvest does with the rejoin it files at a moment host timing
+/// chooses: here run (as with `BG_HARVEST_SKIP` off) and skipped (as with it
+/// on). A rejoin's filing changes nothing; the continuation's grant and the
+/// next ordinary request each clear it. Mutation: "the query reads pool
+/// membership" (`external_io_blockers`/`rt_sigsuspend_blockers`): it says
+/// no before the background grant and after the harvest readmits the thread.
+#[test]
+fn under_the_gate_a_kernel_run_call_is_held_from_its_filing_to_its_continuation_grant() {
+    let mask = Some(bit(libc::SIGUSR2));
+    for harvest in [true, false] {
+        for (rid, vfork) in [
+            (
+                ResourceID::BlockingExternalIO(ExternalOpId::new(TARGET, 3)),
+                false,
+            ),
+            (
+                ResourceID::BlockingRtSigsuspend(ExternalOpId::new(TARGET, 3)),
+                false,
+            ),
+        ] {
+            let name = format!("{rid:?} harvest={harvest}");
+            let mut scheduler = gated(true);
+            assert!(file(
+                &mut scheduler,
+                TARGET,
+                publishing(TARGET, rid.clone(), mask)
+            ));
+            let held = Some(KernelRunBlock { vfork, mask });
+            assert_eq!(scheduler.kernel_run_block(TARGET), held, "{name}: filed");
+            assert!(grant(&mut scheduler, TARGET, &rid).is_err(), "{name}");
+            assert_eq!(scheduler.kernel_run_block(TARGET), held, "{name}: out");
+            // The call returns, and the thread files its rejoin.
+            let op = ExternalOpId::new(TARGET, 3);
+            let rejoin = publishing(TARGET, ResourceID::BlockedExternalContinue(op), Some(0));
+            assert!(
+                file(&mut scheduler, TARGET, rejoin),
+                "{name}: a rejoin keeps it"
+            );
+            if harvest {
+                assert!(scheduler.step2c_process_io_blockers().is_ok(), "{name}");
+                assert!(
+                    scheduler.run_queue.contains_tid(TARGET),
+                    "{name}: readmitted"
+                );
+            }
+            assert_eq!(scheduler.kernel_run_block(TARGET), held, "{name}: rejoined");
+            assert!(
+                grant(
+                    &mut scheduler,
+                    TARGET,
+                    &ResourceID::BlockedExternalContinue(op)
+                )
+                .is_ok(),
+                "{name}"
+            );
+            assert_eq!(
+                scheduler.kernel_run_block(TARGET),
+                None,
+                "{name}: continued"
+            );
+            // A later kernel-run request, then an ordinary one.
+            assert!(file(
+                &mut scheduler,
+                TARGET,
+                publishing(TARGET, rid.clone(), mask)
+            ));
+            assert!(!file(
+                &mut scheduler,
+                TARGET,
+                publishing(TARGET, ResourceID::SchedYield, Some(0))
+            ));
+            assert_eq!(
+                scheduler.kernel_run_block(TARGET),
+                None,
+                "{name}: superseded"
+            );
+        }
+    }
+    // The vfork parent: held as such, until its continuation, or its
+    // retirement.
+    let mut scheduler = gated(true);
+    let vfork = ResourceID::BlockingVfork(ExternalOpId::new(TARGET, 4));
+    assert!(file(
+        &mut scheduler,
+        TARGET,
+        publishing(TARGET, vfork, None)
+    ));
+    assert_eq!(
+        scheduler.kernel_run_block(TARGET),
+        Some(KernelRunBlock {
+            vfork: true,
+            mask: None
+        })
+    );
+    scheduler.logically_kill_thread(
+        &TARGET,
+        &DetPid::from_raw(TARGET.as_raw()),
+        MmId::initial(DetPid::from_raw(TARGET.as_raw())),
+    );
+    assert_eq!(scheduler.kernel_run_block(TARGET), None, "retired");
+}
+
+/// With the gate off nothing is recorded, and the query says no.
+#[test]
+fn with_the_gate_off_no_kernel_run_call_is_recorded() {
+    let mut scheduler = gated(false);
+    let rid = ResourceID::BlockingExternalIO(ExternalOpId::new(TARGET, 3));
+    assert!(!file(
+        &mut scheduler,
+        TARGET,
+        publishing(TARGET, rid, Some(0))
+    ));
+    assert_eq!(scheduler.kernel_run_block(TARGET), None);
+}
+
+/// D44's arming assertion: under the gate the scheduler's own send to a
+/// thread blocked in a kernel-run call records the run-ending refusal at once
+/// (`kernel_run_signal_refusal`, taken by `sched_loop_inner`) when the signal
+/// would interrupt the call, and nothing when it would not: blocked by the
+/// mask the request published, ignored, default-ignored, and for a vfork
+/// parent caught or core-dumping. Unreadable dispositions refuse, fail
+/// closed. With the gate off nothing is refused and the thread is left to its
+/// continuation, as before. Mutation: "the arming kept" (no refusal: the
+/// signal waits behind the call, where a modelled backend would wait out the
+/// release barrier's 30-second valve).
+#[test]
+fn under_the_gate_a_scheduler_send_to_a_kernel_run_call_is_refused_by_name_or_left_pending() {
+    let term = bit(libc::SIGTERM);
+    let usr1 = bit(libc::SIGUSR1);
+    for (name, rid, signal, published, caught, ignored, refused) in [
+        (
+            "external, default-fatal",
+            false,
+            libc::SIGTERM,
+            0,
+            0,
+            0,
+            true,
+        ),
+        ("external, caught", false, libc::SIGUSR1, 0, usr1, 0, true),
+        (
+            "external, core-dumping",
+            false,
+            libc::SIGQUIT,
+            0,
+            0,
+            0,
+            true,
+        ),
+        ("external, blocked", false, libc::SIGTERM, term, 0, 0, false),
+        ("external, SIG_IGN", false, libc::SIGTERM, 0, 0, term, false),
+        (
+            "external, default-ignored",
+            false,
+            libc::SIGCHLD,
+            0,
+            0,
+            0,
+            false,
+        ),
+        ("vfork, default-fatal", true, libc::SIGTERM, 0, 0, 0, true),
+        ("vfork, caught", true, libc::SIGUSR1, 0, usr1, 0, false),
+        ("vfork, core-dumping", true, libc::SIGQUIT, 0, 0, 0, false),
+    ] {
+        let mut scheduler = gated(true);
+        let op = ExternalOpId::new(TARGET, 3);
+        let rid = if rid {
+            ResourceID::BlockingVfork(op)
+        } else {
+            ResourceID::BlockingExternalIO(op)
+        };
+        file(
+            &mut scheduler,
+            TARGET,
+            publishing(TARGET, rid, Some(published)),
+        );
+        scheduler.blocked.external_io_blockers.insert(TARGET, op);
+        scheduler
+            .test_kernel_signal_states
+            .insert(TARGET, state(bit(signal), 0, !0, caught, ignored));
+        scheduler.wake_signaled_guest_as(TARGET, SigWrapper(signal), false);
+        let refusal = scheduler.kernel_run_signal_refusal.take();
+        assert_eq!(refusal.is_some(), refused, "{name}: {refusal:?}");
+        if let Some(refusal) = refusal {
+            assert!(
+                refusal.contains("HERMIT_KERNEL_RUN_SIGNAL_REFUSED"),
+                "{name}: {refusal}"
+            );
+        }
+        assert!(scheduler.blocked.signaled_background.is_empty(), "{name}");
+    }
+    // Unreadable dispositions: fail closed.
+    let mut scheduler = gated(true);
+    let op = ExternalOpId::new(TARGET, 3);
+    file(
+        &mut scheduler,
+        TARGET,
+        publishing(TARGET, ResourceID::BlockingExternalIO(op), Some(0)),
+    );
+    scheduler.blocked.external_io_blockers.insert(TARGET, op);
+    scheduler.test_sleeper_read_failures.insert(
+        TARGET,
+        sleep_signal::SleeperStateUnreadable::Unreadable(Errno::EIO),
+    );
+    scheduler.wake_signaled_guest_as(TARGET, SigWrapper(libc::SIGTERM), false);
+    assert!(scheduler.kernel_run_signal_refusal.is_some(), "unreadable");
+    // Gate off: today's path, nothing refused.
+    let mut scheduler = gated(false);
+    file(
+        &mut scheduler,
+        TARGET,
+        publishing(TARGET, ResourceID::BlockingExternalIO(op), Some(0)),
+    );
+    scheduler.blocked.external_io_blockers.insert(TARGET, op);
+    scheduler.wake_signaled_guest_as(TARGET, SigWrapper(libc::SIGTERM), false);
+    assert!(scheduler.kernel_run_signal_refusal.is_none(), "gate off");
+}
