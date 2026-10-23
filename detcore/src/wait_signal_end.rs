@@ -59,16 +59,20 @@ pub(crate) enum WaitSignalEnd {
     Fatal(i32),
     /// The first signal Linux would dequeue is caught, and Linux's delivery
     /// loop reaches no default-fatal signal: either none is deliverable, or
-    /// the masks of the handlers it sets up before reaching one block it.
-    /// That first signal's handler runs at the return, and the call's result
-    /// goes through the x86 restart table with that action's flags
-    /// (`signal_restart::caught_signal_return`).
+    /// the masks of the handlers it sets up before reaching one block it,
+    /// and no second instance of a caught signal is dequeued under a default
+    /// action that `SA_RESETHAND` restored. That first signal's handler runs
+    /// at the return, and the call's result goes through the x86 restart
+    /// table with that action's flags (`signal_restart::caught_signal_return`).
     Caught(i32),
-    /// The first signal Linux would dequeue is caught and a core-dumping
-    /// default-fatal signal is deliverable behind it: whether the process
-    /// dies at the return depends on the masks of the handlers Linux sets up
-    /// first, which the restart checkpoint reads in the thread's own turn
-    /// and resolves to `Fatal` or `Caught` ([`DequeueWalk::resolve`]).
+    /// The first signal Linux would dequeue is caught, and a later delivery
+    /// in the same loop might end the process: a core-dumping default-fatal
+    /// signal is deliverable behind it, or a caught signal has a second
+    /// instance (a standard signal pending on both queues) or may have one (a
+    /// real-time signal), which `SA_RESETHAND` would leave at its default
+    /// action. The end depends on the caught actions (their `sa_mask` and
+    /// `sa_flags`), which the restart checkpoint reads in the thread's own
+    /// turn and resolves ([`DequeueWalk::resolve`]).
     BehindCaught(DequeueWalk),
 }
 
@@ -81,20 +85,47 @@ pub(crate) struct CaughtAction {
     pub(crate) flags: u64,
 }
 
-/// A caught signal's action that the checkpoint could not read while a
-/// default-fatal signal stays deliverable behind it
-/// ([`DequeueWalk::resolve`]): `caught` is the signal whose action is
-/// missing, `behind` the default-fatal signal Linux could reach next.
+/// A delivery loop the checkpoint cannot decide ([`DequeueWalk::resolve`]),
+/// which it refuses by name (D49), fail closed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ActionUnknown {
-    pub(crate) caught: i32,
-    pub(crate) behind: i32,
+pub(crate) enum WalkRefusal {
+    /// The action of caught signal `caught` could not be read while a later
+    /// delivery could still end the process; `behind` is the signal that
+    /// could (HERMIT_CAUGHT_ACTION_UNREADABLE).
+    ActionUnknown { caught: i32, behind: i32 },
+    /// `SA_RESETHAND` reset caught signal `signal` to its default action, a
+    /// stop, and a second instance of it is dequeued: the in-guest backend
+    /// cannot stop a guest process on the schedule (D48;
+    /// HERMIT_SIGNAL_RESET_TO_STOP).
+    ResetToStop { signal: i32 },
+    /// A caught real-time signal with `SA_RESETHAND` stays unblocked after its
+    /// delivery, so another queued instance of it would be dequeued at its
+    /// default action, termination; `/proc` shows only whether one instance
+    /// is pending, not how many, and Detcore keeps no count of the
+    /// physically pending ones (HERMIT_REALTIME_INSTANCES_UNKNOWN).
+    RealtimeInstances { signal: i32 },
+}
+
+/// The real-time signals, 32 to 64 in the kernel's numbering (`SIGRTMIN`
+/// is 32 there; C libraries reserve the first few). Any number of instances
+/// of one can be queued (`collect_signal`, kernel/signal.c:566-596 at
+/// v6.12).
+fn realtime() -> u64 {
+    !0 << 31
+}
+
+/// The stop signals, whose default action stops the thread group.
+fn stops() -> u64 {
+    [libc::SIGSTOP, libc::SIGTSTP, libc::SIGTTIN, libc::SIGTTOU]
+        .into_iter()
+        .fold(0, |set, signal| set | kernel_sigset_bit(signal))
 }
 
 /// The input of Linux's delivery loop at a wait's end, for a
 /// [`WaitSignalEnd::BehindCaught`]: the deliverable signals on the thread's
-/// private queue and on the shared queue, which of them are default-fatal,
-/// and the guest's mask they were found under.
+/// private queue and on the shared queue (a standard signal on both is two
+/// instances), which of them are default-fatal (the rest are caught), and
+/// the guest's mask they were found under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DequeueWalk {
     thread: u64,
@@ -104,71 +135,116 @@ pub(crate) struct DequeueWalk {
 }
 
 impl DequeueWalk {
+    /// The first instance, in dequeue order, that could still end the
+    /// process: unblocked, and default-fatal, or reset to its default action
+    /// (`reset`), or a caught real-time signal (it may be queued again), or a
+    /// caught standard signal pending on both queues (two instances).
+    fn at_risk(&self, thread: u64, shared: u64, blocked: u64, reset: u64) -> Option<i32> {
+        let unblocked = (thread | shared) & !blocked;
+        let caught = !self.fatal;
+        let risky = unblocked & (self.fatal | reset | (caught & (realtime() | (thread & shared))));
+        queued(thread, shared, risky)
+            .next_dequeued(blocked)
+            .map(|(signal, _)| signal)
+    }
+
     /// Linux's delivery loop over this walk (v6.12). At the return to user
     /// mode `exit_to_user_mode_loop` calls `arch_do_signal_or_restart` for as
     /// long as a signal is pending and unblocked (kernel/entry/common.c:
     /// 97-130; arch/x86/kernel/signal.c:333-341), before any user
-    /// instruction runs. Each `get_signal` dequeues the next signal in order
-    /// (private queue first, then synchronous signals, then the lowest
-    /// number; kernel/signal.c:634-639, :196-218). For a caught one,
-    /// `handle_signal` sets up its frame and `signal_delivered`
-    /// (kernel/signal.c:2941-2954) adds the action's `sa_mask`, and the
-    /// signal itself unless `SA_NODEFER`, to the blocked mask, and the loop
-    /// goes on; a default-fatal one not blocked by then ends the process
-    /// (:2878-2906) without any handler running. So the end is `Fatal` with
-    /// the first default-fatal signal the loop reaches, or `Caught` with the
-    /// first caught signal when the accumulated masks block every
-    /// default-fatal one. `action` gives a caught signal's action; it is
-    /// asked only while a default-fatal signal is still deliverable, and a
-    /// `None` then is [`ActionUnknown`].
+    /// instruction runs. Each `get_signal` dequeues the next instance in
+    /// order (private queue first, then synchronous signals, then the lowest
+    /// number; kernel/signal.c:634-639, :196-218):
     ///
-    /// `SA_NODEFER` cannot change the outcome: it only leaves the delivered
-    /// signal itself unblocked, which is caught, so at most another copy of it
-    /// is delivered with the same mask; it never unblocks a default-fatal
-    /// signal. It is applied as Linux applies it all the same.
+    /// - a caught one: `get_signal` resets the action to `SIG_DFL` when it has
+    ///   `SA_RESETHAND` (`SA_ONESHOT`, :2821-2822), `handle_signal` sets up its
+    ///   frame, and `signal_delivered` (:2941-2954) adds the action's
+    ///   `sa_mask`, and the signal itself unless `SA_NODEFER`, to the blocked
+    ///   mask; the loop goes on;
+    /// - a default-fatal one not blocked by then ends the process
+    ///   (:2878-2906) without any handler running: `Fatal`;
+    /// - a second instance of a caught signal whose action was reset is
+    ///   taken at its default action: termination or a core dump is `Fatal`,
+    ///   a default-ignored one is discarded (the loop goes on), a stop is
+    ///   [`WalkRefusal::ResetToStop`].
+    ///
+    /// So `SA_NODEFER` matters exactly when a second instance of the same
+    /// signal exists and `SA_RESETHAND` reset it: the legacy `signal()`
+    /// installs both (`SA_ONESHOT | SA_NOMASK`, kernel/signal.c:4675). A
+    /// standard signal has at most one instance per queue, so one pending on
+    /// both queues is two. A real-time signal may have any number, which
+    /// `/proc` does not show: a caught one with `SA_RESETHAND` that stays
+    /// unblocked after its delivery is [`WalkRefusal::RealtimeInstances`].
+    /// With every remaining instance blocked or harmless, the end is
+    /// `Caught` with the first caught signal.
+    ///
+    /// `action` gives a caught signal's action. It is asked only while a
+    /// later delivery could still end the process ([`Self::at_risk`], or the
+    /// delivered signal is real-time or has another instance); a `None` then
+    /// is [`WalkRefusal::ActionUnknown`].
     pub(crate) fn resolve(
         &self,
         mut action: impl FnMut(i32) -> Option<CaughtAction>,
-    ) -> Result<WaitSignalEnd, ActionUnknown> {
+    ) -> Result<WaitSignalEnd, WalkRefusal> {
         let mut blocked = self.mask;
+        let mut reset = 0;
         let (mut thread, mut shared) = (self.thread, self.shared);
         let mut first = None;
-        let queued = |thread: u64, shared: u64, set: u64| KernelSignalState {
-            pending: (thread | shared) & set,
-            thread_pending: thread & set,
-            shared_pending: shared & set,
-            ..KernelSignalState::default()
-        };
         while let Some((signal, queue)) = queued(thread, shared, !0).next_dequeued(blocked) {
             let bit = kernel_sigset_bit(signal);
-            if self.fatal & bit != 0 {
-                return Ok(WaitSignalEnd::Fatal(signal));
-            }
-            let first = *first.get_or_insert(signal);
             match queue {
                 SignalQueue::Thread => thread &= !bit,
                 SignalQueue::Shared => shared &= !bit,
             }
-            if (thread | shared) & self.fatal & !blocked == 0 {
+            if reset & bit != 0 {
+                if crate::syscalls::default_action_ends_process(0, 0, signal) {
+                    return Ok(WaitSignalEnd::Fatal(signal));
+                }
+                if stops() & bit != 0 {
+                    return Err(WalkRefusal::ResetToStop { signal });
+                }
+                continue;
+            }
+            if self.fatal & bit != 0 {
+                return Ok(WaitSignalEnd::Fatal(signal));
+            }
+            let first = *first.get_or_insert(signal);
+            let again = (thread | shared) & bit != 0 || realtime() & bit != 0;
+            let risk = self.at_risk(thread, shared, blocked, reset);
+            if risk.is_none() && !again {
                 return Ok(WaitSignalEnd::Caught(first));
             }
             let Some(caught) = action(signal) else {
-                let behind = queued(thread, shared, self.fatal)
-                    .next_dequeued(blocked)
-                    .map_or(0, |(signal, _)| signal);
-                return Err(ActionUnknown {
+                return Err(WalkRefusal::ActionUnknown {
                     caught: signal,
-                    behind,
+                    behind: risk.unwrap_or(signal),
                 });
             };
             blocked |= caught.mask;
             if caught.flags & libc::SA_NODEFER as u64 == 0 {
                 blocked |= bit;
             }
+            if caught.flags & libc::SA_RESETHAND as u64 != 0 {
+                reset |= bit;
+                if realtime() & bit != 0 && blocked & bit == 0 {
+                    return Err(WalkRefusal::RealtimeInstances { signal });
+                }
+            }
         }
         Ok(WaitSignalEnd::Caught(
             first.expect("a walk starts with a deliverable caught signal"),
         ))
+    }
+}
+
+/// The instances on the private queue `thread` and the shared queue
+/// `shared` among `set`, as a state `next_dequeued` reads.
+fn queued(thread: u64, shared: u64, set: u64) -> KernelSignalState {
+    KernelSignalState {
+        pending: (thread | shared) & set,
+        thread_pending: thread & set,
+        shared_pending: shared & set,
+        ..KernelSignalState::default()
     }
 }
 
@@ -211,10 +287,12 @@ pub(crate) fn deliverable(state: &KernelSignalState, mask: u64, reserved: u64) -
 ///    synchronous signals first, then the lowest number (:196-218); here
 ///    `KernelSignalState::next_dequeued`. A core-dumping one is `Fatal`:
 ///    `get_signal` ends the process for it (:2881-2905). A caught one is
-///    `Caught` when no default-fatal signal is deliverable; when a
-///    core-dumping one is, the end depends on the masks of the handlers Linux
-///    sets up before reaching it, so it is `BehindCaught`, which the restart
-///    checkpoint resolves ([`DequeueWalk::resolve`]).
+///    `Caught` unless a later delivery in the same loop could end the
+///    process: a core-dumping signal deliverable behind it, a deliverable
+///    caught standard signal pending on both queues, or a deliverable caught
+///    real-time signal (the last two through `SA_RESETHAND`). Then the end
+///    depends on the caught actions, so it is `BehindCaught`, which the
+///    restart checkpoint resolves ([`DequeueWalk::resolve`]).
 pub(crate) fn classify(
     state: &KernelSignalState,
     deliverable: u64,
@@ -236,12 +314,17 @@ pub(crate) fn classify(
         return Some(WaitSignalEnd::Fatal(signal));
     }
     let (signal, _) = among(deliverable).next_dequeued(0)?;
+    let (thread, shared) = (
+        state.thread_pending & deliverable,
+        state.shared_pending & deliverable,
+    );
+    let caught = deliverable & !fatal;
     if fatal & kernel_sigset_bit(signal) != 0 {
         Some(WaitSignalEnd::Fatal(signal))
-    } else if fatal != 0 {
+    } else if fatal != 0 || caught & (realtime() | (thread & shared)) != 0 {
         Some(WaitSignalEnd::BehindCaught(DequeueWalk {
-            thread: state.thread_pending & deliverable,
-            shared: state.shared_pending & deliverable,
+            thread,
+            shared,
             fatal,
             mask,
         }))
@@ -472,7 +555,7 @@ mod tests {
     fn end_of(
         state: &KernelSignalState,
         action: impl FnMut(i32) -> Option<CaughtAction>,
-    ) -> Result<WaitSignalEnd, ActionUnknown> {
+    ) -> Result<WaitSignalEnd, WalkRefusal> {
         match classify(state, deliverable(state, 0, 0), 0) {
             Some(WaitSignalEnd::BehindCaught(walk)) => walk.resolve(action),
             Some(end) => Ok(end),
@@ -487,8 +570,11 @@ mod tests {
     /// process unless that mask, or a later handler's, holds it. Rows: (a) the
     /// handler's mask blocks it, `Caught` (a private caught signal before a
     /// shared, lower-numbered SIGQUIT; both private, the caught one
-    /// lower-numbered); (b) it does not, `Fatal`; (c) `SA_NODEFER` or not, the
-    /// same end; (d) two caught signals whose masks together block it,
+    /// lower-numbered); (b) it does not, `Fatal`; (c) `SA_NODEFER` with one
+    /// instance of the caught signal, decided by the mask alone (where it does
+    /// matter, with `SA_RESETHAND`:
+    /// `sa_resethand_and_a_second_instance_decide_the_end`); (d) two caught
+    /// signals whose masks together block it,
     /// `Caught`. Mutations: "the handler's sa_mask ignored" ((a), (d) become
     /// `Fatal`), "only the first handler's mask" ((d) becomes `Fatal`), "any
     /// default-fatal signal makes the end fatal" ((a), (d)), "the lowest
@@ -575,20 +661,124 @@ mod tests {
                 wrong.push(format!("{name}: {resolved:?}"));
             }
         }
-        // The SA_NODEFER rows give the same ends as without it.
-        let s = state(hup | quit, 0, 0, hup);
-        for mask in [0, quit] {
-            let with = end_of(&s, |_| Some(action(mask, true)));
-            let without = end_of(&s, |_| Some(action(mask, false)));
-            if with != without {
-                wrong.push(format!("(c) SA_NODEFER changes the end, mask {mask:#x}"));
+        assert!(wrong.is_empty(), "rows: {wrong:#?}");
+    }
+
+    /// `SA_RESETHAND` and a second instance (both reviews, round 3): Linux
+    /// resets an `SA_RESETHAND` action to `SIG_DFL` when it dequeues it
+    /// (`get_signal`, kernel/signal.c:2821-2822 at v6.12), so a second
+    /// instance of the same signal that its masks leave unblocked
+    /// (`SA_NODEFER`, the legacy `signal()`'s flags, :4675) is taken at the
+    /// default action. A standard signal pending on both queues is two
+    /// instances; a real-time one may have any number. Rows: SIGUSR1 on both
+    /// queues with `SA_RESETHAND|SA_NODEFER`, `Fatal(SIGUSR1)`; the same
+    /// without `SA_NODEFER`, `Caught`; `SA_RESETHAND` alone with one instance,
+    /// `Caught`; reset to a default-ignored SIGWINCH, discarded, `Caught`;
+    /// reset to a default stop (SIGTSTP), `ResetToStop`; a real-time signal
+    /// with `SA_RESETHAND|SA_NODEFER`, `RealtimeInstances`; the same without
+    /// `SA_RESETHAND`, `Caught`; and `SA_RESETHAND|SA_NODEFER` with SIGUSR1's
+    /// own mask holding it, `Caught`. Mutations: "SA_NODEFER ignored",
+    /// "SA_RESETHAND ignored", "the second queue's instance ignored" and "the
+    /// real-time refusal removed" each change a row.
+    #[test]
+    fn sa_resethand_and_a_second_instance_decide_the_end() {
+        let (usr1, winch, tstp) = (bit(libc::SIGUSR1), bit(libc::SIGWINCH), bit(libc::SIGTSTP));
+        let rt = 40;
+        let rtbit = bit(rt);
+        let resethand = libc::SA_RESETHAND as u64;
+        let nodefer = libc::SA_NODEFER as u64;
+        // name, private, shared, caught, the caught signal's action
+        // (mask, flags), the end
+        type Row = (
+            &'static str,
+            u64,
+            u64,
+            u64,
+            (u64, u64),
+            Result<WaitSignalEnd, WalkRefusal>,
+        );
+        let rows: [Row; 8] = [
+            (
+                "SIGUSR1 on both queues, SA_RESETHAND|SA_NODEFER",
+                usr1,
+                usr1,
+                usr1,
+                (0, resethand | nodefer),
+                Ok(WaitSignalEnd::Fatal(libc::SIGUSR1)),
+            ),
+            (
+                "SIGUSR1 on both queues, SA_RESETHAND without SA_NODEFER",
+                usr1,
+                usr1,
+                usr1,
+                (0, resethand),
+                Ok(WaitSignalEnd::Caught(libc::SIGUSR1)),
+            ),
+            (
+                "SIGUSR1 on both queues, SA_RESETHAND|SA_NODEFER, its own mask holding it",
+                usr1,
+                usr1,
+                usr1,
+                (usr1, resethand | nodefer),
+                Ok(WaitSignalEnd::Caught(libc::SIGUSR1)),
+            ),
+            (
+                "SIGUSR1 once, SA_RESETHAND|SA_NODEFER",
+                usr1,
+                0,
+                usr1,
+                (0, resethand | nodefer),
+                Ok(WaitSignalEnd::Caught(libc::SIGUSR1)),
+            ),
+            (
+                "SIGWINCH on both queues, reset to its default, ignore",
+                winch,
+                winch,
+                winch,
+                (0, resethand | nodefer),
+                Ok(WaitSignalEnd::Caught(libc::SIGWINCH)),
+            ),
+            (
+                "SIGTSTP on both queues, reset to its default, a stop",
+                tstp,
+                tstp,
+                tstp,
+                (0, resethand | nodefer),
+                Err(WalkRefusal::ResetToStop {
+                    signal: libc::SIGTSTP,
+                }),
+            ),
+            (
+                "a real-time signal, SA_RESETHAND|SA_NODEFER",
+                rtbit,
+                0,
+                rtbit,
+                (0, resethand | nodefer),
+                Err(WalkRefusal::RealtimeInstances { signal: rt }),
+            ),
+            (
+                "a real-time signal, SA_NODEFER without SA_RESETHAND",
+                rtbit,
+                0,
+                rtbit,
+                (0, nodefer),
+                Ok(WaitSignalEnd::Caught(rt)),
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (name, thread, shared, caught, (mask, flags), end) in rows {
+            let s = state(thread, shared, 0, caught);
+            let resolved = end_of(&s, |_| Some(CaughtAction { mask, flags }));
+            if resolved != end {
+                wrong.push(format!("{name}: {resolved:?}"));
             }
         }
         assert!(wrong.is_empty(), "rows: {wrong:#?}");
     }
 
     /// (e) An action the checkpoint cannot read while a default-fatal signal
-    /// is still deliverable behind its caught signal is `ActionUnknown`, which
+    /// is still deliverable behind its caught signal is
+    /// `WalkRefusal::ActionUnknown`, which
     /// the checkpoint fails closed on; one it no longer needs is not asked
     /// for (the first handler's mask already holds the default-fatal signal).
     /// Mutation "no fail-closed" (a missing action taken as an empty mask):
@@ -599,7 +789,7 @@ mod tests {
         let s = state(hup | quit, 0, 0, hup);
         assert_eq!(
             walk(&s, 0).resolve(|_| None),
-            Err(ActionUnknown {
+            Err(WalkRefusal::ActionUnknown {
                 caught: libc::SIGHUP,
                 behind: libc::SIGQUIT,
             })

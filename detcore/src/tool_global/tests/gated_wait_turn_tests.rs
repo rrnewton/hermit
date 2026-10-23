@@ -700,8 +700,9 @@ async fn under_the_gate_a_restartable_poll_ends_where_it_would_block_only_for_a_
 }
 
 /// D40's checkpoint, row by row (IR-2): the guest's result, and the code the
-/// posthook checkpoint records. Mutation "interrupted dropped": the fatal row
-/// returns no code.
+/// posthook checkpoint records. Mutations: "interrupted dropped" (the fatal
+/// row returns no code), "the restart-after-handler refusal removed" (the
+/// caught ERESTARTNOINTR row returns the raw code and files nothing).
 #[tokio::test]
 async fn under_the_gate_the_restart_checkpoint_gives_each_row_its_result() {
     use reverie::syscalls::Pause;
@@ -711,7 +712,8 @@ async fn under_the_gate_the_restart_checkpoint_gives_each_row_its_result() {
         Err(Error::Errno(errno)) => Some(*errno),
         _ => None,
     };
-    // name, flag, sa_flags, result, guest errno, interrupted code, refused
+    // name, flag, sa_flags, result, guest errno, interrupted code, the
+    // stopping refusal filed
     type Case = (
         &'static str,
         Option<WaitSignalEnd>,
@@ -719,7 +721,7 @@ async fn under_the_gate_the_restart_checkpoint_gives_each_row_its_result() {
         Errno,
         Option<Errno>,
         Option<Errno>,
-        bool,
+        Option<&'static str>,
     );
     let cases: Vec<Case> = vec![
         (
@@ -729,7 +731,7 @@ async fn under_the_gate_the_restart_checkpoint_gives_each_row_its_result() {
             Errno::ERESTARTNOHAND,
             Some(Errno::EINTR),
             Some(Errno::ERESTARTNOHAND),
-            false,
+            None,
         ),
         (
             "fatal, ERESTARTSYS",
@@ -738,7 +740,7 @@ async fn under_the_gate_the_restart_checkpoint_gives_each_row_its_result() {
             Errno::ERESTARTSYS,
             Some(Errno::EINTR),
             Some(Errno::ERESTARTSYS),
-            false,
+            None,
         ),
         (
             "caught, ERESTARTNOHAND",
@@ -747,7 +749,7 @@ async fn under_the_gate_the_restart_checkpoint_gives_each_row_its_result() {
             Errno::ERESTARTNOHAND,
             Some(Errno::EINTR),
             None,
-            false,
+            None,
         ),
         (
             "caught, ERESTARTSYS without SA_RESTART",
@@ -756,7 +758,7 @@ async fn under_the_gate_the_restart_checkpoint_gives_each_row_its_result() {
             Errno::ERESTARTSYS,
             Some(Errno::EINTR),
             None,
-            false,
+            None,
         ),
         (
             "caught, ERESTARTSYS with SA_RESTART: the code is kept for step 3c.2's rewind",
@@ -765,7 +767,16 @@ async fn under_the_gate_the_restart_checkpoint_gives_each_row_its_result() {
             Errno::ERESTARTSYS,
             Some(Errno::ERESTARTSYS),
             None,
-            false,
+            None,
+        ),
+        (
+            "caught, ERESTARTNOINTR: the table restarts, which 3c.1 cannot honour: refused",
+            Some(WaitSignalEnd::Caught(libc::SIGUSR1)),
+            0,
+            Errno::ERESTARTNOINTR,
+            Some(Errno::EINTR),
+            None,
+            Some("HERMIT_RESTART_AFTER_HANDLER"),
         ),
         (
             "no flag, ERESTARTSYS: Reverie's re-run (https://github.com/rrnewton/reverie/issues/362)",
@@ -774,7 +785,7 @@ async fn under_the_gate_the_restart_checkpoint_gives_each_row_its_result() {
             Errno::ERESTARTSYS,
             Some(Errno::ERESTARTSYS),
             None,
-            false,
+            None,
         ),
         (
             "no flag, ERESTARTNOHAND: refused",
@@ -783,7 +794,7 @@ async fn under_the_gate_the_restart_checkpoint_gives_each_row_its_result() {
             Errno::ERESTARTNOHAND,
             Some(Errno::ERESTARTNOHAND),
             None,
-            true,
+            Some("HERMIT_RESTART_CODE_WITHOUT_SIGNAL"),
         ),
         (
             "no flag, ERESTARTNOINTR: refused",
@@ -792,7 +803,7 @@ async fn under_the_gate_the_restart_checkpoint_gives_each_row_its_result() {
             Errno::ERESTARTNOINTR,
             Some(Errno::ERESTARTNOINTR),
             None,
-            true,
+            Some("HERMIT_RESTART_CODE_WITHOUT_SIGNAL"),
         ),
         (
             "no flag, ERESTART_RESTARTBLOCK: refused",
@@ -801,7 +812,7 @@ async fn under_the_gate_the_restart_checkpoint_gives_each_row_its_result() {
             Errno::ERESTART_RESTARTBLOCK,
             Some(Errno::ERESTART_RESTARTBLOCK),
             None,
-            true,
+            Some("HERMIT_RESTART_CODE_WITHOUT_SIGNAL"),
         ),
         (
             "fatal, EINTR already: unchanged",
@@ -810,7 +821,7 @@ async fn under_the_gate_the_restart_checkpoint_gives_each_row_its_result() {
             Errno::EINTR,
             Some(Errno::EINTR),
             None,
-            false,
+            None,
         ),
     ];
     for (name, flag, sa_flags, result, guest_errno, interrupted, refused) in cases {
@@ -827,11 +838,20 @@ async fn under_the_gate_the_restart_checkpoint_gives_each_row_its_result() {
             guest.thread.wait_signal_end, None,
             "{name}: the flag is taken"
         );
-        let filed = guest.rpcs().iter().any(|rpc| {
-            matches!(rpc, GlobalRequest::StoppingRefusal(reason)
-                if reason.contains("HERMIT_RESTART_CODE_WITHOUT_SIGNAL"))
-        });
-        assert_eq!(filed, refused, "{name}");
+        let filed: Vec<&str> = guest
+            .rpcs()
+            .iter()
+            .filter_map(|rpc| match rpc {
+                GlobalRequest::StoppingRefusal(reason) => [
+                    "HERMIT_RESTART_CODE_WITHOUT_SIGNAL",
+                    "HERMIT_RESTART_AFTER_HANDLER",
+                ]
+                .into_iter()
+                .find(|code| reason.contains(code)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(filed, Vec::from_iter(refused), "{name}");
     }
 }
 

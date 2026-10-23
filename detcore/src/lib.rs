@@ -793,11 +793,15 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// A5 step 3c.1c, D40: resolve a `WaitSignalEnd::BehindCaught` end, in
     /// the thread's own turn (`wait_end_checkpoint`), by reading the caught
-    /// actions Linux's delivery loop sets up before it could reach the
-    /// default-fatal signal, one query `rt_sigaction` each, in the loop's
-    /// order and only while a default-fatal signal stays deliverable. An
-    /// action that cannot be read files HERMIT_CAUGHT_ACTION_UNREADABLE and
-    /// gives `Fatal`.
+    /// actions Linux's delivery loop sets up, one query `rt_sigaction` each,
+    /// in the loop's order and only while a later delivery could still end
+    /// the process (`DequeueWalk::resolve`). A loop it cannot decide files a
+    /// named stopping refusal (D49), which ends the run under the gate:
+    /// HERMIT_CAUGHT_ACTION_UNREADABLE for an action it cannot read,
+    /// HERMIT_SIGNAL_RESET_TO_STOP for an instance reset to a stop,
+    /// HERMIT_REALTIME_INSTANCES_UNKNOWN for a real-time signal whose queued
+    /// instances would meet its reset default. Were it to return, the end is
+    /// `Fatal`.
     async fn resolve_wait_end<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -827,20 +831,28 @@ impl<T: RecordOrReplay> Detcore<T> {
                 (resolved, _) => break resolved,
             }
         };
-        match resolved {
-            Ok(end) => end,
-            Err(unknown) => {
-                let reason = crate::refused_signal_controls::caught_action_unreadable_refusal(
-                    call.number().name(),
-                    unknown.caught,
-                    unknown.behind,
-                    guest.thread_state().dettid.as_raw(),
-                );
-                tracing::error!("{}", reason);
-                crate::tool_global::stopping_refusal(guest, reason).await;
-                crate::wait_signal_end::WaitSignalEnd::Fatal(unknown.behind)
-            }
-        }
+        use crate::refused_signal_controls as refusals;
+        use crate::wait_signal_end::WalkRefusal;
+        let caller = guest.thread_state().dettid.as_raw();
+        let name = call.number().name();
+        let (reason, signal) = match resolved {
+            Ok(end) => return end,
+            Err(WalkRefusal::ActionUnknown { caught, behind }) => (
+                refusals::caught_action_unreadable_refusal(name, caught, behind, caller),
+                behind,
+            ),
+            Err(WalkRefusal::ResetToStop { signal }) => (
+                refusals::signal_reset_to_stop_refusal(name, signal, caller),
+                signal,
+            ),
+            Err(WalkRefusal::RealtimeInstances { signal }) => (
+                refusals::realtime_instances_unknown_refusal(name, signal, caller),
+                signal,
+            ),
+        };
+        tracing::error!("{}", reason);
+        crate::tool_global::stopping_refusal(guest, reason).await;
+        crate::wait_signal_end::WaitSignalEnd::Fatal(signal)
     }
 
     /// The restart checkpoint (A5 step 3c.1c, design D40, with IR-2's
@@ -869,23 +881,30 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// A default-fatal end is `-EINTR` because the process dies at the return
     /// and the guest never sees the value; DETLOG then shows `-EINTR` where
     /// ptrace's record shows the kernel's restart code (a named record
-    /// difference). A caught end that the table restarts keeps its restart
-    /// code: no 3c.1 wait has one (phase 1's `pause` returns `ERESTARTNOHAND`,
-    /// which the table turns into `EINTR`), and the register rewind a restart
-    /// needs is step 3c.2's. Returns the guest's result and, for the fatal
-    /// row, the original code for the posthook checkpoint. With the gate off
-    /// it returns `res` and nothing, and the flag is never set.
+    /// difference). A caught end that the table restarts can be honoured only
+    /// for `-ERESTARTSYS`, which the in-guest Tool host re-runs; any other
+    /// code (`-ERESTARTNOINTR`, from D41's not-run call when the caught
+    /// handlers' masks hold the default-fatal signal behind them) would need
+    /// the register rewind and post-handler delivery of step 3c.2, and the
+    /// pinned in-guest host would hand the raw code to the guest. It fails
+    /// closed: the stopping refusal HERMIT_RESTART_AFTER_HANDLER (D49), which
+    /// ends the run under the gate; were it to return, the result is `-EINTR`.
+    /// (In that schedule Linux runs the handler with the default-fatal signal
+    /// blocked and, unless the handler changes it, ends the process at the
+    /// handler's `rt_sigreturn`, before the call is made again.) Returns the
+    /// guest's result and, for the fatal row, the original code for the
+    /// posthook checkpoint. With the gate off it returns `res` and nothing,
+    /// and the flag is never set.
     ///
-    /// A `BehindCaught` end (a caught signal first, a core-dumping one
-    /// deliverable behind it) is resolved here, in the thread's own turn just
+    /// A `BehindCaught` end (a caught signal first, and a later delivery that
+    /// could end the process) is resolved here, in the thread's own turn just
     /// before the guest would resume, where Linux's delivery loop runs: each
-    /// caught action the loop sets up before it could reach the default-fatal
-    /// signal is read with a query `rt_sigaction`, in that order, and its
-    /// `sa_mask` (and the signal, unless `SA_NODEFER`) added to the blocked
-    /// mask (`DequeueWalk::resolve`). An action that cannot be read fails
-    /// closed: the stopping refusal HERMIT_CAUGHT_ACTION_UNREADABLE (D49),
-    /// which ends the run under the gate; were it to return, the end is
-    /// `Fatal` with the default-fatal signal.
+    /// caught action the loop needs is read with a query `rt_sigaction`, in
+    /// that order, and applied as Linux applies it (`sa_mask`, the signal
+    /// unless `SA_NODEFER`, the reset to `SIG_DFL` under `SA_RESETHAND`;
+    /// `DequeueWalk::resolve`, `resolve_wait_end`). A loop it cannot decide
+    /// fails closed by a named stopping refusal (D49), which ends the run under
+    /// the gate; were it to return, the end is `Fatal`.
     async fn wait_end_checkpoint<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -930,7 +949,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                         None,
                     ),
                     CaughtSignalReturn::Returns(value) => (Ok(value), None),
-                    CaughtSignalReturn::Restarts => (res, None),
+                    CaughtSignalReturn::Restarts if code == Errno::ERESTARTSYS => (res, None),
+                    CaughtSignalReturn::Restarts => {
+                        let reason = crate::refused_signal_controls::restart_after_handler_refusal(
+                            call.number().name(),
+                            signal,
+                            code.name().unwrap_or("a restart code"),
+                            guest.thread_state().dettid.as_raw(),
+                        );
+                        tracing::error!("{}", reason);
+                        crate::tool_global::stopping_refusal(guest, reason).await;
+                        (Err(Errno::EINTR.into()), None)
+                    }
                 }
             }
             (None, Some(code)) if code != Errno::ERESTARTSYS => {
