@@ -2747,7 +2747,26 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool matches NoopTool, a custom record tool without an impl still
     // answers forwarded calls, and the hot-path future size bounds) and
     // scheduler::replayer::tests::a_hard_desync_names_the_fields_that_differ: 2427, listed.
-    ("test.detcore_unit", 2427),
+    // And A5 step 3c.1c-i's twenty-seven: the eleven wait_signal_end::tests
+    // rows (the deliverable predicate), the five
+    // scheduler::gated_wait_tests units (each parked wait kind at a guest's and
+    // at the scheduler's send, gate off, every reached parked thread, the
+    // published-mask poll admission) and the eleven
+    // tool_global::tests::gated_wait_turn_tests units (the readers' own-turn
+    // checks, the restart checkpoint's rows, and IR-2's observers): 2454,
+    // listed.
+    // And 3c.1c-i review round 1's four: the three wait_signal_end::tests
+    // dequeue-order classifications and
+    // tool_global::tests::stopping_refusal_tests's IR-16 gate-off unit: 2458,
+    // listed.
+    // And 3c.1c-i review round 2's net two: wait_signal_end::tests's
+    // handler-mask resolution replaces its caught-beside-core unit and adds
+    // the unreadable-action unit, and
+    // tool_global::tests::gated_wait_turn_tests adds the checkpoint's
+    // resolution unit: 2460, listed.
+    // And 3c.1c-i review round 3's wait_signal_end::tests unit for
+    // SA_RESETHAND and a second instance: 2461, listed.
+    ("test.detcore_unit", 2461),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4843,7 +4862,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same slice 3c.1b rejoin-publication unit: 2423, listed.
     // And the same three syscall_hot_path_tests units and the replayer's
     // hard-desync field unit: 2427, listed.
-    ("test.detcore_unit_on_host", 2427),
+    // And the same twenty-seven slice 3c.1c-i parked-wait units: 2454, listed.
+    // And the same four 3c.1c-i review round 1 units: 2458, listed.
+    // And the same net two 3c.1c-i review round 2 units: 2460, listed.
+    // And the same 3c.1c-i review round 3 unit: 2461, listed.
+    ("test.detcore_unit_on_host", 2461),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
