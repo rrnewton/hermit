@@ -1255,7 +1255,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nextest list.
     // Full validate at 85b8cec25a executed 1973, all passed, against the
     // 1971 pin: 1971 + 2 = 1973, measured by that run.
-    ("test.regular_crates", 1973),
+    // And three hermit-replay units of the shared-file backing (replayer::mmap::tests): 1929 + 3 = 1932.
+    // And four more of them (the listed view, an incomplete listing, a named backing, the
+    // seccomp check) and recorder::mmap::tests::a_descriptors_access_mode_is_read_from_its_fdinfo: 1937.
+    // And two more (a read-only hand-off, a link into a chrooted root): 1973 + 10 = 1983.
+    ("test.regular_crates", 1983),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3838,7 +3842,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds two
     // record/replay units: 229 + 2 = 231, measured by the 216dbc929a full
     // validate.
-    ("test.record_replay", 231),
+    // And record_replay_shares_memory_between_mappings_of_one_memfd: 227.
+    // And the ten shared-mapping shapes of tests/c/record_replay_shared_mappings.c
+    // (overlap both ways, adjacent span, head and tail unmap, a moved source,
+    // pwrite before a remap and before a read, a forked child, a full table): 237.
+    // And four more (a thread's own descriptor table, a new PID namespace, a read-only
+    // mprotect, a guest asking for a seccomp filter): 241.
+    // And a chrooted guest's new mapping: 242.
+    // And a replay under an inherited seccomp filter refusing by name: 231 + 17 = 248.
+    ("test.record_replay", 248),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -6442,7 +6454,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nextest list.
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a), none hosted-excluded: 1957 + 2 = 1959 (1973 - 14).
-    ("test.regular_crates_on_host", 1959),
+    // The three shared-file backing units: 1932 - 14 = 1918.
+    // And the same five more units: 1923.
+    // And the same two more: 1959 + 10 = 1969.
+    ("test.regular_crates_on_host", 1969),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
