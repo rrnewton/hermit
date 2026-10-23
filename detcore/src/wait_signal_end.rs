@@ -501,6 +501,19 @@ mod tests {
         }
     }
 
+    /// The end of a wait on `state` (guest mask 0), a `BehindCaught` one
+    /// resolved with `action`.
+    fn end_of(
+        state: &KernelSignalState,
+        action: impl FnMut(i32) -> Option<CaughtAction>,
+    ) -> Result<WaitSignalEnd, ActionUnknown> {
+        match classify(state, deliverable(state, 0, 0), 0) {
+            Some(WaitSignalEnd::BehindCaught(walk)) => walk.resolve(action),
+            Some(end) => Ok(end),
+            None => panic!("nothing ends the wait"),
+        }
+    }
+
     /// Rule 2 with a caught signal first and a core-dumping one deliverable
     /// behind it (Claude review round 2): Linux sets up the caught handler and
     /// goes on delivering under its `sa_mask` (signal_delivered,
@@ -581,24 +594,31 @@ mod tests {
                 WaitSignalEnd::Fatal(libc::SIGXCPU),
             ),
         ];
+        // Every row is checked before the test fails, so that a mutation's
+        // failure names the rows it changes.
+        let mut wrong = Vec::new();
         for (name, thread, shared, caught, actions, end) in rows {
             let s = state(thread, shared, 0, caught);
-            let walk = walk(&s, 0);
-            let resolved = walk.resolve(|signal| {
+            let resolved = end_of(&s, |signal| {
                 actions
                     .iter()
                     .find(|(known, _, _)| *known == signal)
                     .map(|(_, mask, nodefer)| action(*mask, *nodefer))
             });
-            assert_eq!(resolved, Ok(end), "{name}");
+            if resolved != Ok(end) {
+                wrong.push(format!("{name}: {resolved:?}"));
+            }
         }
         // The SA_NODEFER rows give the same ends as without it.
         let s = state(hup | quit, 0, 0, hup);
         for mask in [0, quit] {
-            let with = walk(&s, 0).resolve(|_| Some(action(mask, true)));
-            let without = walk(&s, 0).resolve(|_| Some(action(mask, false)));
-            assert_eq!(with, without, "mask {mask:#x}");
+            let with = end_of(&s, |_| Some(action(mask, true)));
+            let without = end_of(&s, |_| Some(action(mask, false)));
+            if with != without {
+                wrong.push(format!("(c) SA_NODEFER changes the end, mask {mask:#x}"));
+            }
         }
+        assert!(wrong.is_empty(), "rows: {wrong:#?}");
     }
 
     /// (e) An action the checkpoint cannot read while a default-fatal signal
