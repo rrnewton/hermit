@@ -2725,7 +2725,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (slice 3c.1b review round 1): 2336, listed.
     // And scheduler::test::under_the_gate_a_rejoin_publishes_at_its_readmission_not_at_its_filing
     // (slice 3c.1b review round 2): 2337, listed.
-    ("test.detcore_unit", 2337),
+    // And A5 step 3c.1c-i's twenty-seven: the eleven wait_signal_end::tests
+    // rows (the deliverable predicate), the five
+    // scheduler::gated_wait_tests units (each parked wait kind at a guest's and
+    // at the scheduler's send, gate off, every reached parked thread, the
+    // published-mask poll admission) and the eleven
+    // tool_global::tests::gated_wait_turn_tests units (the readers' own-turn
+    // checks, the restart checkpoint's rows, and IR-2's observers): 2364,
+    // listed.
+    ("test.detcore_unit", 2364),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4814,7 +4822,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same nine slice 3c.1b guest-mask publication units: 2335, listed.
     // And the same slice 3c.1b /proc status SigBlk unit: 2336, listed.
     // And the same slice 3c.1b rejoin-publication unit: 2337, listed.
-    ("test.detcore_unit_on_host", 2337),
+    // And the same twenty-seven slice 3c.1c-i parked-wait units: 2364, listed.
+    ("test.detcore_unit_on_host", 2364),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
