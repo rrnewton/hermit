@@ -2751,7 +2751,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_global::tests::gated_wait_turn_tests units (the readers' own-turn
     // checks, the restart checkpoint's rows, and IR-2's observers): 2450,
     // listed.
-    ("test.detcore_unit", 2450),
+    // And A5 step 3c.1c-ii's nine: the D44 refusal rows in
+    // wait_signal_end::tests, three scheduler::gated_wait_tests units (the
+    // kernel-run record from filing to continuation, gate off, the arming
+    // assertion) and five tool_global::tests::gated_wait_turn_tests units (D41
+    // not run and run, D44's one refusal per kernel-run resource, D48's
+    // refusals and its hooks): 2459, listed.
+    ("test.detcore_unit", 2459),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4845,7 +4851,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same slice 3c.1b /proc status SigBlk unit: 2422, listed.
     // And the same slice 3c.1b rejoin-publication unit: 2423, listed.
     // And the same twenty-seven slice 3c.1c-i parked-wait units: 2450, listed.
-    ("test.detcore_unit_on_host", 2450),
+    // And the same nine slice 3c.1c-ii kernel-run and stop-send units: 2459,
+    // listed.
+    ("test.detcore_unit_on_host", 2459),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
