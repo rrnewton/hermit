@@ -186,6 +186,15 @@ fn is_hard_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
     strip2.end_time = None;
     strip1.count = 0;
     strip2.count = 0;
+    // As in `is_desync`, the observed event may carry information the trace
+    // lacks: a recorded timer preemption's branch event has no end RIP while the
+    // replayed one does, and that is the same event, not a different one.
+    if expected.start_rip.is_none() {
+        strip1.start_rip = None;
+    }
+    if expected.end_rip.is_none() {
+        strip1.end_rip = None;
+    }
     strip1 != strip2
 }
 
@@ -262,6 +271,18 @@ impl Replayer {
         self.cursor
             .peek()
             .map(|next| (next.dettid, self.resolve_time_to_run(next)))
+    }
+
+    /// Whether the next replayed event is `tid` retrying a blocked syscall: either
+    /// another unsuccessful attempt or its completion.
+    pub(super) fn next_is_retry_by(&self, tid: DetTid) -> bool {
+        self.cursor.peek().is_some_and(|next| {
+            next.dettid == tid
+                && matches!(
+                    next.op,
+                    Op::Syscall(_, SyscallPhase::Polling | SyscallPhase::Posthook)
+                )
+        })
     }
 
     /// Whether the recorded schedule still has an event to replay. Past its
@@ -554,6 +575,7 @@ mod builder {
 
 #[cfg(test)]
 mod tests {
+    use detcore_model::schedule::InstructionPointer;
     use pretty_assertions::assert_eq;
     use reverie::syscalls::Sysno;
 
@@ -596,6 +618,76 @@ mod tests {
             vec!["dettid", "end_rip"]
         );
         assert!(hard_desync_fields(&recorded, &recorded).is_empty());
+    }
+
+    #[test]
+    fn an_observed_rip_the_trace_lacks_is_not_a_hard_desync() {
+        let mut b = builder::SchedTestBuilder::new();
+        let recorded = SchedEvent {
+            end_rip: None,
+            ..b.branch(12203, tid(59))
+        };
+        let replayed = SchedEvent {
+            end_rip: Some(InstructionPointer::new(0x7fff_f7c9_6c68).unwrap()),
+            end_time: Some(LogicalTime::from_nanos(150)),
+            ..recorded.clone()
+        };
+        assert!(
+            !is_hard_desync(&replayed, &recorded),
+            "the trace leaves the RIP open"
+        );
+        assert!(is_desync(&replayed, &recorded), "the time still differs");
+
+        let other_rip = SchedEvent {
+            end_rip: Some(InstructionPointer::new(0x1000).unwrap()),
+            ..recorded.clone()
+        };
+        let recorded_with_rip = SchedEvent {
+            end_rip: Some(InstructionPointer::new(0x2000).unwrap()),
+            ..recorded
+        };
+        assert!(
+            is_hard_desync(&other_rip, &recorded_with_rip),
+            "a RIP the trace names must match"
+        );
+    }
+
+    #[test]
+    fn a_blocked_syscall_retry_is_recognized_only_for_its_thread() {
+        let mut b = builder::SchedTestBuilder::new();
+        let pre = b.syscall_pre(Sysno::read, SOME_RIP, tid(3));
+        let polling = SchedEvent {
+            op: Op::Syscall(Sysno::read, SyscallPhase::Polling),
+            ..b.syscall_pre(Sysno::read, SOME_RIP, tid(3))
+        };
+        let schedule = vec![
+            pre,
+            polling,
+            b.syscall_post(Sysno::read, SOME_RIP, tid(3)),
+            b.branch(5, tid(5)),
+        ];
+        let mut replayer = Replayer::new(schedule.clone());
+
+        let _ = replayer.observe_event(&schedule[0]);
+        assert!(
+            replayer.next_is_retry_by(tid(3)),
+            "thread 3 polls its read next"
+        );
+        assert!(
+            !replayer.next_is_retry_by(tid(5)),
+            "thread 5 has nothing to retry"
+        );
+        let _ = replayer.observe_event(&schedule[1]);
+        assert!(
+            replayer.next_is_retry_by(tid(3)),
+            "thread 3 completes its read next"
+        );
+        let _ = replayer.observe_event(&schedule[2]);
+        assert!(!replayer.next_is_retry_by(tid(3)), "the read is done");
+        assert!(
+            !replayer.next_is_retry_by(tid(5)),
+            "a branch is not a retry"
+        );
     }
 
     #[test]
