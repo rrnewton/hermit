@@ -296,6 +296,88 @@ pub(crate) fn restart_after_handler_refusal(
     )
 }
 
+/// The run-wide stopping refusal (A5 design D44(b) through D49) for a send
+/// of `signum` to thread `target`, blocked in a kernel-run call (a vfork
+/// parent's wait when `vfork`) whose continuation turn has not been granted:
+/// the call runs in the kernel under the in-guest runtime's mask, so the
+/// signal would stay pending and the call would never end for it, where Linux
+/// interrupts it. `call` is the sending call (or "the scheduler" for its own
+/// send), `sender` the sending thread. `unreadable`: the target's dispositions
+/// could not be read, which refuses, fail closed.
+pub(crate) fn kernel_run_signal_refusal(
+    call: &str,
+    signum: i32,
+    sender: Option<i32>,
+    target: i32,
+    vfork: bool,
+    unreadable: bool,
+) -> String {
+    let name = signal_name(signum);
+    let sender = sender.map_or_else(String::new, |sender| format!(" by thread {sender}"));
+    let blocked_in = if vfork {
+        "a vfork parent's wait for its child"
+    } else {
+        "a call the kernel runs outside the schedule"
+    };
+    let why = if unreadable {
+        "its signal dispositions could not be read, so the send is refused, fail closed"
+    } else {
+        "Linux would interrupt the call for it, but the in-guest runtime's mask holds it pending \
+         for as long as the call blocks"
+    };
+    format!(
+        "hermit refused to continue the run (HERMIT_KERNEL_RUN_SIGNAL_REFUSED): signal {signum} \
+         ({name}) sent{sender} through {call} to thread {target}, which is blocked in {blocked_in} \
+         and has not been granted its continuation turn: {why} \
+         (A5 design D44, https://github.com/rrnewton/hermit/issues/4485)."
+    )
+}
+
+/// Why a stop-signal send was refused (`stop_signal_send_refused_warning`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StopSendRefusal {
+    /// SIGSTOP, which always stops.
+    Sigstop,
+    /// SIGTSTP, SIGTTIN or SIGTTOU while the target's action is `SIG_DFL`, as
+    /// its `/proc/<tid>/status` `SigIgn`/`SigCgt` say in the sender's turn.
+    DefaultAction,
+    /// The target's `/proc/<tid>/status` could not be read, so whether its
+    /// action is `SIG_DFL` is unknown: refused, fail closed.
+    StatusUnreadable,
+}
+
+/// The WARN for a send of a stop signal that Detcore refused with EPERM
+/// under the in-guest delivery gate (A5 design D48, IR-4): `call` is the
+/// system call, `sender` the calling thread, `target` the thread or process it
+/// named. A program that ignores the EPERM and then waits for the target with
+/// `waitpid(WUNTRACED)` waits until the run's wall timeout (IR-4(c)).
+pub(crate) fn stop_signal_send_refused_warning(
+    call: &str,
+    signum: i32,
+    sender: i32,
+    target: i32,
+    why: StopSendRefusal,
+) -> String {
+    let name = signal_name(signum);
+    let why = match why {
+        StopSendRefusal::Sigstop => "SIGSTOP always stops its target".to_string(),
+        StopSendRefusal::DefaultAction => format!(
+            "the target's action for {name} is SIG_DFL (its /proc status SigIgn and SigCgt, read in \
+             the sender's turn), which stops it"
+        ),
+        StopSendRefusal::StatusUnreadable => format!(
+            "the target's /proc status could not be read, so whether its action for {name} is \
+             SIG_DFL is unknown, and the send is refused, fail closed"
+        ),
+    };
+    format!(
+        "HERMIT_STOP_SIGNAL_SEND_REFUSED signum={signum} ({name}) call={call} sender={sender} \
+         target={target}: received EPERM and nothing was sent: {why}, and the in-guest backend \
+         cannot stop a guest process on the schedule. A named refusal, not Linux's behaviour \
+         (A5 design D48, https://github.com/rrnewton/hermit/issues/4485)."
+    )
+}
+
 /// `signum`'s name: `SIGUSR1`, or, for a realtime signal, its kernel number
 /// (C libraries reserve different numbers of them, so `SIGRTMIN+n` would
 /// depend on the guest's).
