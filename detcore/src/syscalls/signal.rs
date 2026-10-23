@@ -328,6 +328,51 @@ where
     })
 }
 
+/// A5 step 3c.1d, design D37 rule (iii): before an `rt_sigaction` that moves
+/// `signum` away from ignored (its action now `SIG_IGN`, or `SIG_DFL` for a
+/// default-ignored signal with no handler; the new `handler` neither) runs,
+/// remove the pending ignored signals the guest's mask at this request
+/// (`M_req`, which governs next too) lets in, `I ∖ M_req`
+/// (`ignored_signals::removable`). Linux discarded each of them when it was
+/// sent, since an unblocked ignored signal is never queued (`sig_ignored`,
+/// kernel/signal.c:104-120 at v6.12), but the in-guest runtime's mask held it
+/// queued; once the new action is installed (`do_sigaction`, :4170-4233) it
+/// would be delivered at the return. A blocked one stays: Linux queued it
+/// too, and delivers it under the new action once unblocked. Under the gate
+/// only; one `/proc` read, and injections only for instances to remove.
+async fn remove_ignored_before_unignore<G, T>(
+    guest: &mut G,
+    signum: i32,
+    handler: u64,
+) -> Result<(), Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if !(1..=64).contains(&signum) || signum == libc::SIGKILL || signum == libc::SIGSTOP {
+        return Ok(());
+    }
+    let bit = kernel_sigset_bit(signum);
+    let stays_ignored = handler == libc::SIG_IGN as u64
+        || (handler == libc::SIG_DFL as u64
+            && crate::syscalls::threads::default_ignored_signals() & bit != 0);
+    if stays_ignored {
+        return Ok(());
+    }
+    let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+    if crate::syscalls::ignored_at_generation(state.ignored, state.caught) & bit == 0 {
+        return Ok(());
+    }
+    let own = crate::syscalls::helpers::gated_own_mask(guest, state.blocked);
+    let removed = crate::ignored_signals::removable(
+        &state,
+        own,
+        own,
+        guest.config().in_guest_reserved_signals,
+    );
+    crate::syscalls::helpers::remove_ignored_signals(guest, removed).await
+}
+
 /// Take one pending copy of `signo` from the calling thread's queues, its own
 /// first and then its process's shared one, as Linux dequeues it, with a
 /// zero-timeout `rt_sigtimedwait` injected while the thread holds its turn.
@@ -1078,6 +1123,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         let temporary_mask =
             restart_if_first_probe_not_run(read_kernel_sigset(guest, mask_addr).await)?;
         super::signal_shadow::note_wait_mask(guest, temporary_mask);
+        // Under the in-guest delivery gate the call is parked in the
+        // scheduler, never run by the kernel (A5 step 3c.1d, D39).
+        if self.cfg.in_guest_signal_delivery {
+            return Box::pin(self.parked_rt_sigsuspend(guest, temporary_mask)).await;
+        }
         // The temporary mask lets the kernel take a pending real-time timer
         // expiration that every thread blocked when it expired
         // (https://github.com/rrnewton/hermit/issues/4089).
@@ -1164,6 +1214,91 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             self.record_or_replay_rt_sigsuspend(guest, call, installed_mask)
                 .await
+        }
+    }
+
+    /// A5 step 3c.1d, design D39: `rt_sigsuspend` under the in-guest delivery
+    /// gate, parked in the scheduler as a `pause` is, under its temporary mask
+    /// (`temporary_mask`, read at entry in Linux's order, `sigsuspend`,
+    /// kernel/signal.c:4697-4728 at v6.12), which the kernel never installs:
+    /// the in-guest runtime's mask holds every signal sent while the thread
+    /// waits, and Detcore decides.
+    ///
+    /// - The default-fatal check under the guest's own mask at entry (D41)
+    ///   has already run, as the handler's first statement; signal phase 1's
+    ///   refusal of temporary-mask calls in a process that handles SIGALRM
+    ///   runs before any handler (`sigalrm_phase1`, F8).
+    /// - Each check, before the park and after each wake
+    ///   (`helpers::temporary_mask_check`), ends the wait for a default-fatal
+    ///   signal the temporary mask lets in: `-ERESTARTNOHAND`, as `sigsuspend`
+    ///   returns, with the D40 flag, which the restart checkpoint turns into
+    ///   `-EINTR` for the death path of step 3c.1e. Otherwise it removes the
+    ///   ignored signals Linux would not hold (D37 rule (ii)): those pending at
+    ///   entry, queued under the own mask, unless both masks block them (the
+    ///   transparent restart discards them: `signal_pending` counts them,
+    ///   :157-166, and `get_signal` drops them, :2815, :2830), and those sent
+    ///   since, unless the temporary mask blocks them (discarded at send).
+    ///   The first check runs in this turn, before any request, so everything
+    ///   pending then was pending at entry.
+    /// - The temporary mask is the one Linux installs, without SIGKILL and
+    ///   SIGSTOP (`set_current_blocked`, :3089-3092).
+    /// - The park is a `SleepUntil(INDEFINITE)` request tagged
+    ///   `RT_SIGSUSPEND_FYI` that publishes the temporary mask
+    ///   (`Resources::blocked_signal_mask`, so `publish_request_guest_mask`
+    ///   publishes it): the scheduler wakes it, as a `pause`, at a send's
+    ///   commit for a signal deliverable under that mask
+    ///   (`Scheduler::sleep_interrupting_signals`). It files no in-guest
+    ///   SIGALRM sleep snapshot, so a one-shot alarm reaches it through the
+    ///   ordinary send and the same wake, never the phase-1 fatal-alarm
+    ///   divert, whose check reads the guest's own mask.
+    /// - A pending real-time timer expiration is observed under the temporary
+    ///   mask only after the first check found the call waiting, so a D41-like
+    ///   end never drops one first (IR-22); under the gate the scheduler never
+    ///   keeps one pending in any case (`real_time_expiration_fate` keeps one
+    ///   only where signal targets are modelled, which the gate excludes).
+    async fn parked_rt_sigsuspend<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        temporary_mask: KernelSigset,
+    ) -> Result<i64, Error> {
+        use crate::syscalls::helpers::TemporaryMaskCheck;
+        // The mask Linux installs (`set_current_blocked`, kernel/signal.c:
+        // 3089-3092 at v6.12, from `sigsuspend`, :4700): never SIGKILL or
+        // SIGSTOP. It is what the wait decides by and what it publishes, so a
+        // `/proc` status shows the `SigBlk` Linux shows.
+        let temporary_mask = kernel_installed_signal_mask(temporary_mask);
+        let mut entry = Some(!0);
+        loop {
+            let first = entry.is_some();
+            match crate::syscalls::helpers::temporary_mask_check(
+                guest,
+                temporary_mask,
+                entry.take(),
+                false,
+            )
+            .await?
+            {
+                TemporaryMaskCheck::Waits => {}
+                TemporaryMaskCheck::Fatal => return Err(Errno::ERESTARTNOHAND.into()),
+                TemporaryMaskCheck::Refused | TemporaryMaskCheck::EpollInterrupted => {
+                    return Err(Errno::EINTR.into());
+                }
+            }
+            if first {
+                observe_under_mask(guest, temporary_mask).await?;
+            }
+            let mut request = Self::sleep_request_abs(guest, LogicalTime::INDEFINITE).await;
+            request.fyi(crate::resources::RT_SIGSUSPEND_FYI);
+            request.blocked_signal_mask = Some(temporary_mask);
+            match resource_request(guest, request).await {
+                ResumeStatus::Signaled(_) => {}
+                status @ (ResumeStatus::Normal
+                | ResumeStatus::NothingElseCanRun
+                | ResumeStatus::InGuestFatalAlarm) => panic!(
+                    "Internal violation: a parked rt_sigsuspend returned from the scheduler \
+                     with {status:?}, not by interruption"
+                ),
+            }
         }
     }
 
@@ -1262,6 +1397,20 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .is_ok_and(|state| state.ignored & kernel_sigset_bit(call.signum()) != 0)
                 }
             };
+        // D37 rule (iii) under the in-guest delivery gate (A5 step 3c.1d): a
+        // call that moves the signal away from ignored first removes the
+        // ignored signals Linux would not hold, before the kernel installs the
+        // new action, which would otherwise make one deliverable.
+        if self.cfg.in_guest_signal_delivery
+            && let Some(action) = kernel_action
+        {
+            Box::pin(remove_ignored_before_unignore(
+                guest,
+                call.signum(),
+                action.handler,
+            ))
+            .await?;
+        }
         let result = if let Some(kernel_action) = kernel_action {
             // The kernel treats `action` as input. Sanitize a private copy instead
             // of writing through the guest pointer: the input may be read-only,
