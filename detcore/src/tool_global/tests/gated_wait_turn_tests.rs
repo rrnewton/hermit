@@ -174,6 +174,19 @@ struct TurnGuest {
     /// thread's `dettid` is set to it too, as a guest thread's always is.
     host_tid: Option<i32>,
     stack: usize,
+    /// The set of each injected `rt_sigtimedwait` (A5 step 3c.1d's removal of
+    /// ignored signals, D37), in order.
+    sigtimedwait_sets: Vec<u64>,
+    /// What each injected `rt_sigtimedwait` returns, in order (`EAGAIN` once
+    /// empty: nothing left to dequeue).
+    sigtimedwait_results: VecDeque<Result<i64, Errno>>,
+    /// What each injected poll probe (`pselect6`, `select`, `ppoll`,
+    /// `epoll_pwait`) returns, in order (0 once empty: nothing ready).
+    probe_results: VecDeque<Result<i64, Errno>>,
+    /// The temporary mask (the inner pointer of a `pselect6` wrapper, or the
+    /// mask pointer of a `ppoll` or `epoll_pwait`) each injected probe
+    /// carried, `None` for none, in order (IR-9).
+    probe_masks: Vec<Option<usize>>,
 }
 
 impl TurnGuest {
@@ -234,6 +247,8 @@ impl GlobalRPC<GlobalState> for TurnGuest {
             ),
             GlobalRequest::NamesHermitTask(..) => GlobalResponse::NamesHermitTask(false),
             GlobalRequest::TouchFile(_) => GlobalResponse::TouchFile(()),
+            // Signal phase 1's ledger: no entry is due, nothing is refused.
+            GlobalRequest::Sigalrm(_) => GlobalResponse::Sigalrm(false),
             GlobalRequest::ResolveKillTargets(process) => {
                 let target = DetTid::from_raw(process.as_raw());
                 let live = self.live.contains(&target);
@@ -303,6 +318,17 @@ impl Guest<Detcore> for TurnGuest {
             Syscall::Tkill(send) => valid_signal_sent(send.sig()),
             Syscall::RtTgsigqueueinfo(send) => valid_signal_sent(send.sig()),
             Syscall::RtSigqueueinfo(send) => valid_signal_sent(send.sig()),
+            // The kernel-access probe of an action (`read_kernel_sigaction`):
+            // SIGKILL's action cannot change, so the kernel refuses it once it
+            // has copied the action.
+            Syscall::RtSigaction(probe) if probe.signum() == libc::SIGKILL => {
+                match probe.action() {
+                    Some(action) => LocalMemory::new()
+                        .read_value::<_, [u64; 4]>(action.cast())
+                        .map_or(Err(Errno::EFAULT), |_| Err(Errno::EINVAL)),
+                    None => Ok(0),
+                }
+            }
             Syscall::RtSigaction(query) => {
                 if self.action_query_fails {
                     return Err(Errno::EFAULT);
@@ -314,6 +340,48 @@ impl Guest<Detcore> for TurnGuest {
                     LocalMemory::new().write_value(old.cast::<[u64; 4]>(), &action)?;
                 }
                 Ok(0)
+            }
+            // The kernel-access probe of a mask (`read_kernel_sigset`): an
+            // unknown `how`, refused once the set is copied.
+            Syscall::RtSigprocmask(probe) if probe.how() == -1 => match probe.set() {
+                Some(set) => LocalMemory::new()
+                    .read_value::<_, u64>(set.cast())
+                    .map_or(Err(Errno::EFAULT), |_| Err(Errno::EINVAL)),
+                None => Err(Errno::EINVAL),
+            },
+            Syscall::RtSigtimedwait(wait) => {
+                let set = wait
+                    .set()
+                    .map(|set| LocalMemory::new().read_value::<_, u64>(set.cast()))
+                    .transpose()?
+                    .unwrap_or(0);
+                self.sigtimedwait_sets.push(set);
+                self.sigtimedwait_results
+                    .pop_front()
+                    .unwrap_or(Err(Errno::EAGAIN))
+            }
+            Syscall::Pselect6(probe) => {
+                let mask = probe
+                    .sigmask()
+                    .map(|wrapper| LocalMemory::new().read_value::<_, usize>(wrapper.cast()))
+                    .transpose()?
+                    .filter(|inner| *inner != 0);
+                self.probe_masks.push(mask);
+                self.probe_results.pop_front().unwrap_or(Ok(0))
+            }
+            Syscall::Select(_) => {
+                self.probe_masks.push(None);
+                self.probe_results.pop_front().unwrap_or(Ok(0))
+            }
+            Syscall::Ppoll(probe) => {
+                self.probe_masks
+                    .push(probe.sigmask().map(|mask| mask.as_raw()));
+                self.probe_results.pop_front().unwrap_or(Ok(0))
+            }
+            Syscall::EpollPwait(probe) => {
+                self.probe_masks
+                    .push(probe.sigmask().map(|mask| mask.as_raw()));
+                self.probe_results.pop_front().unwrap_or(Ok(0))
             }
             Syscall::RtSigprocmask(query) => {
                 if let Some(old) = query.oldset() {
@@ -387,6 +455,10 @@ fn turn_guest(gate: bool, own_mask: Option<u64>) -> TurnGuest {
         live: vec![THREAD, PEER],
         host_tid: None,
         stack,
+        sigtimedwait_sets: Vec::new(),
+        sigtimedwait_results: VecDeque::new(),
+        probe_results: VecDeque::new(),
+        probe_masks: Vec::new(),
     }
 }
 
@@ -2533,11 +2605,14 @@ fn write_only_siginfo_page(signal: i32) -> usize {
 
 /// A page-aligned address in no mapping of this process: a page mapped and
 /// then unmapped.
+/// An address in no mapping of this process, and not below a grow-down
+/// one: the page at 0x1000, below `vm.mmap_min_addr` (65536 by default), which
+/// no mapping of this test process occupies. A page this test mapped and then
+/// unmapped could be taken by another test's mmap in the same process (plain
+/// `cargo test` runs tests as threads of one process) before the read, which
+/// once made the row fail.
 fn unmapped_page() -> usize {
-    let page = siginfo_page(0, 0, 0, libc::PROT_READ);
-    // SAFETY: the page `siginfo_page` mapped for this test.
-    assert_eq!(unsafe { libc::munmap(page as *mut libc::c_void, 4096) }, 0);
-    page
+    0x1000
 }
 
 /// A refused send's siginfo that the caller's own reads cannot reach is
@@ -2628,3 +2703,5 @@ async fn under_the_gate_a_refused_send_s_unreadable_siginfo_is_efault_only_where
         }
     }
 }
+
+mod temporary_mask_turn_tests;
