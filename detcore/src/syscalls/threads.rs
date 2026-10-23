@@ -2811,10 +2811,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Err(Error::Errno(Errno::EAGAIN))
                 } else {
                     let maybe_timeout_lt = self.futex_deadline(guest, call, deadline).await?;
+                    // D50 reader 9 (A5 step 3c.1c): the capability, or the
+                    // in-guest delivery gate, which decides by the design's
+                    // deliverable set under the thread's published mask.
+                    let gated = guest.config().in_guest_signal_delivery;
                     let signal_interruption = guest
                         .config()
                         .backend
-                        .supports_blocked_wait_signal_interruption;
+                        .supports_blocked_wait_signal_interruption
+                        || gated;
                     // Whether this wait was woken for a signal and is checking again.
                     let mut rewait = false;
                     // The signals the scheduler committed to this waiter at that wake
@@ -2867,7 +2872,48 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // can change the dispositions at any time, so the scheduler
                         // reads them when it commits a wake, not here
                         // (https://github.com/rrnewton/hermit/issues/3146).
-                        let signal_watch = if signal_interruption {
+                        let signal_watch = if gated {
+                            // Under the gate: a deliverable signal pending at
+                            // the park, or still pending after a wake, ends the
+                            // wait with the futex's restart errno, its end
+                            // recorded for the restart checkpoint (D40).
+                            let state = match read_wait_signal_state(guest.pid(), guest.tid()) {
+                                Ok(state) => state,
+                                Err(error) => break Err(error),
+                            };
+                            let mask = super::helpers::gated_own_mask(guest, state.blocked);
+                            if let Some(end) = crate::wait_signal_end::wait_end(
+                                &state,
+                                mask,
+                                guest.config().in_guest_reserved_signals,
+                            ) {
+                                let errno = call.kernel_restart_errno();
+                                trace!(
+                                    "[detcore, dtid {}] futex wait ended under the in-guest delivery gate by {:?}: {:?}",
+                                    &dettid, end, errno
+                                );
+                                guest.thread_state_mut().wait_signal_end = Some(end);
+                                break Err(Error::Errno(errno));
+                            }
+                            // The futex wait files no `Resources` request, so
+                            // it publishes the guest's mask itself, before its
+                            // wait request, as every request does under the gate
+                            // (step 3c.1b, carried into 3c.1c): the scheduler's
+                            // readers then see this wait's mask, not an earlier
+                            // request's. None clears the entry, as at a request.
+                            let published = crate::tool_global::publish_request_guest_mask(
+                                guest,
+                                &Resources::new(dettid),
+                            );
+                            crate::tool_global::set_saved_guest_sigmask(guest, published).await;
+                            Some(FutexSignalWatch {
+                                unblocked: !mask
+                                    & !kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32),
+                                defers_default_stops: call.restart_keeps_deadline(),
+                                pid: guest.pid().as_raw(),
+                                tid: guest.tid().as_raw(),
+                            })
+                        } else if signal_interruption {
                             // A failed read is never the call's errno
                             // (`read_wait_signal_state`).
                             let state = match read_wait_signal_state(guest.pid(), guest.tid()) {

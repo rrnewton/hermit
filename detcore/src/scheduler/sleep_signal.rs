@@ -103,7 +103,8 @@ impl Scheduler {
     /// The sleep `dettid`'s filed request is, if it is one a cross-task signal
     /// can end on this backend.
     pub(super) fn signal_sleep(&self, dettid: DetTid) -> Option<SignalSleep> {
-        if !self.models_signal_targets {
+        // D50 reader 8 under the in-guest delivery gate (A5 step 3c.1c).
+        if !self.models_signal_targets && !self.in_guest_signal_delivery {
             return None;
         }
         let resources = self.next_turns.get(&dettid)?.req.try_read()?.ok()?;
@@ -148,10 +149,16 @@ impl Scheduler {
     /// is. A state that cannot be read here is recorded, and the drain decides.
     pub(super) fn admits_sleep_signal(&self, dettid: DetTid, signal: SigWrapper) -> bool {
         let bit = kernel_signal_bit(signal.raw());
-        if signal.raw() == libc::SIGKILL
-            || self.signal_sleep(dettid).is_none()
-            || self.futex_wait_held_signals(dettid) & !self.private_sigchld(dettid) & bit != 0
-        {
+        if signal.raw() == libc::SIGKILL || self.signal_sleep(dettid).is_none() {
+            return false;
+        }
+        // Under the in-guest delivery gate every other signal is recorded,
+        // and the drain decides by the design's deliverable set
+        // (`sleep_interrupting_signals`), which needs it still pending.
+        if self.in_guest_signal_delivery {
+            return true;
+        }
+        if self.futex_wait_held_signals(dettid) & !self.private_sigchld(dettid) & bit != 0 {
             return false;
         }
         match self.read_sleeper_signal_state(dettid) {
@@ -174,6 +181,12 @@ impl Scheduler {
         dettid: DetTid,
         sleep: SignalSleep,
     ) -> Result<u64, SleeperStateUnreadable> {
+        // Under the in-guest delivery gate (A5 step 3c.1c): the design's
+        // deliverable set under the sleep's published mask, for `pause` and
+        // `nanosleep` alike, since a default stop is never deliverable there.
+        if self.in_guest_signal_delivery {
+            return self.gated_deliverable(dettid);
+        }
         let state = self.read_sleeper_signal_state(dettid)?;
         let interrupting = (state.pending & !self.futex_wait_held_signals(dettid)
             | self.private_sigchld(dettid))

@@ -3285,9 +3285,34 @@ impl GlobalState {
             // Acted on even from a committed SIGKILL victim (it is in the
             // victim's answered list, as PolicyRefusal is). Whether a victim
             // gets to file one before it dies is host-timed once 3c.1c and
-            // 3c.1e add producers; to be re-examined there.
+            // 3c.1e add producers; to be re-examined there. Every 3c.1c
+            // producer files it in the producing thread's own turn, which a
+            // committed SIGKILL victim never gets again, so none of them can
+            // race its victim's death.
+            //
+            // IR-16 (A5 step 3c.1c): the run-wide exit is taken only under
+            // the in-guest delivery gate, whose conditions include that the
+            // scheduler is the init of the guest's PID namespace (D51, D52),
+            // which is what makes the exit end every guest. Without the gate
+            // the request is refused that guarantee: the reason is recorded as
+            // a policy refusal, which ends the run with
+            // `HERMIT_POLICY_REFUSAL_EXIT` once it completes, and the request
+            // is answered, so the coordinator never exits on behalf of a run
+            // whose guests it might not take with it.
+            //
+            // The gate-off answer is the `PolicyRefusal` arm's, and like it
+            // goes through the bookkeeping after this `match` (the teardown
+            // and SIGKILL-retirement checks, the time update).
             GlobalRequest::StoppingRefusal(reason) => {
-                crate::scheduler::exit_on_scheduler_refusal(&reason)
+                if self.cfg.in_guest_signal_delivery {
+                    crate::scheduler::exit_on_scheduler_refusal(&reason)
+                }
+                warn!(
+                    "[detcore] a stopping refusal was filed without the in-guest delivery gate; recorded as a policy refusal, without the run-wide exit: {}",
+                    reason
+                );
+                self.policy_refusal.lock().unwrap().get_or_insert(reason);
+                R::PolicyRefusal(())
             }
             // TODO-HUMAN-REVIEW(PR-643): Review run-wide unsupported-syscall aggregation.
             GlobalRequest::ReportUnsupportedSyscall(name) => {
@@ -7410,6 +7435,26 @@ where
     );
 }
 
+/// File the run-wide stopping refusal `reason` (A5 design D49,
+/// `GlobalRequest::StoppingRefusal`). Under the in-guest delivery gate the
+/// coordinator exits on it, taking every guest with it, and this never
+/// returns; with the gate off (IR-16) the coordinator records it as a policy
+/// refusal and answers, and this returns.
+pub(crate) async fn stopping_refusal<G, T>(guest: &mut G, reason: String)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) = send_and_update_time(guest, GlobalRequest::StoppingRefusal(reason)).await;
+    assert!(
+        matches!(
+            response,
+            GlobalResponse::PolicyRefusal(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to StoppingRefusal: {response:?}"
+    );
+}
+
 /// Mirrors a successful `set_tid_address(2)` into scheduler-owned exit state.
 /// Tells the scheduler the calling thread's own signal mask while Detcore holds
 /// it under a private blocking mask (`Some`), or that the guest's mask is back
@@ -10959,6 +11004,7 @@ mod tests {
     mod backend_failure_tests;
     mod exec_identity_tests;
     mod exec_teardown_tests;
+    mod gated_wait_turn_tests;
     mod guest_mask_publication_tests;
     mod stopping_refusal_tests;
     mod timerless_clock_tests;
