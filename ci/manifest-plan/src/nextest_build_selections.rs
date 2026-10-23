@@ -941,7 +941,10 @@ mod tests {
             // a_bad_redis_declaration_is_refused_rather_than_replaced (+2): 691.
             // Separately name the optional e9patch source-inspection leg (+1): 692.
             // And the two-run syscall-histogram test in dispatch_stats (+1): 693.
-            assert_eq!(population, 693);
+            // random_determinism's
+            // a_schedule_replay_hands_the_guest_the_recorded_random_values (+1):
+            // 694.
+            assert_eq!(population, 694);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
