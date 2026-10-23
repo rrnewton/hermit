@@ -708,6 +708,20 @@ Run `hermit analyze --help` before using this workflow. Search, minimization,
 and schedule replay can perform many guest executions and require a reliably
 reproducible target condition.
 
+By default analyze bisects between the failing schedule and a passing one from
+another run. When the two runs differ in events only one of them executed (for
+example timeslices that end at other points, or extra iterations of a polling
+loop), no single swap may separate the outcomes. `--prefix-search` searches
+within the failing schedule instead: each trial replays its first K events and
+then schedules without chaos, and a binary search finds the event at which the
+outcome flips. The report shows the stack of the thread the failing schedule
+runs at that event and of the thread that runs there otherwise:
+
+```bash
+hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
+  --target-exit-code=any --report-file=analysis.json -- --chaos -- PROGRAM
+```
+
 ## Common Run Options
 
 ### Scheduling And Determinism

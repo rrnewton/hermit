@@ -40,6 +40,7 @@ use crate::logdiff::LogDiffCLIOpts;
 use crate::run::RunOpts;
 use crate::schedule_search::Config;
 use crate::schedule_search::CriticalSchedule;
+use crate::schedule_search::NoSingleSwap;
 use crate::schedule_search::TrialOutcome;
 use crate::schedule_search::search_for_critical_schedule;
 
@@ -54,6 +55,47 @@ fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
 
 fn yellow_msg(msg: &str) {
     eprintln!(":: {}", msg.yellow().bold());
+}
+
+/// The result of `--prefix-search`: replaying the first `decision` events of
+/// `schedule` and then scheduling without chaos misses the target, while
+/// replaying event `decision` too meets it.
+pub struct PrefixDecision {
+    pub schedule: Vec<SchedEvent>,
+    pub decision: usize,
+}
+
+/// The binary search of `--prefix-search` over a schedule of `len` events:
+/// returns `k` such that the prefix of `k` events misses the target and the
+/// prefix of `k + 1` meets it, after checking that the empty prefix misses and
+/// the whole schedule meets it. Uses about log2(len) + 2 trials.
+fn search_prefix_boundary(
+    len: usize,
+    mut meets_target: impl FnMut(usize) -> anyhow::Result<bool>,
+) -> anyhow::Result<usize> {
+    if meets_target(0)? {
+        bail!(
+            "the scheduler alone, replaying none of the target schedule and without chaos, \
+             already meets the target criteria, so no event of the target schedule decides the \
+             outcome"
+        );
+    }
+    if !meets_target(len)? {
+        bail!(
+            "replaying the whole target schedule did not meet the target criteria, so schedule \
+             replay does not reproduce this run and a prefix search cannot work"
+        );
+    }
+    let (mut passing, mut failing) = (0, len);
+    while failing - passing > 1 {
+        let mid = passing + (failing - passing) / 2;
+        if meets_target(mid)? {
+            failing = mid;
+        } else {
+            passing = mid;
+        }
+    }
+    Ok(passing)
 }
 
 /// Why the critical pair a search settled on may not be a race, if there is a reason.
@@ -172,6 +214,217 @@ impl AnalyzeOpts {
             );
         }
         Ok((run, stack1_path, stack2_path))
+    }
+
+    /// One `--prefix-search` trial: replay the first `len` events of `target`,
+    /// then let the scheduler go on without chaos.
+    fn prefix_trial(
+        &self,
+        runname: &str,
+        target: &[SchedEvent],
+        len: usize,
+    ) -> anyhow::Result<RunData> {
+        let mut run = RunData::new_baseline(self, runname.to_string())?;
+        run.runopts.det_opts.det_config.chaos = false;
+        let path = run.sched_path_in().to_path_buf();
+        self.write_trial_schedule(target[..len].to_vec(), &path)?;
+        Ok(run.with_schedule_replay_from(path))
+    }
+
+    /// Launch a prefix trial; true when it meets the target criteria. A trial
+    /// that the run arguments' --timeout ends did not reach the target.
+    fn launch_prefix_trial(&self, run: &mut RunData) -> anyhow::Result<bool> {
+        if self.verbose {
+            eprintln!(
+                ":: {}\n    {}",
+                "Prefix trial, repro command:".yellow().bold(),
+                run.to_repro()
+            );
+        }
+        match run.launch() {
+            Ok(()) => Ok(run.is_a_match()),
+            Err(error) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
+                eprintln!(
+                    " => Timed out ({}); counted as the baseline condition",
+                    error.root_cause()
+                );
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// `--prefix-search`: find the shortest prefix of the target schedule that,
+    /// replayed and then continued without chaos, still meets the target
+    /// criteria. Returns the index of that prefix's last event.
+    pub fn phase5_prefix_search(&self, target: &[SchedEvent]) -> anyhow::Result<PrefixDecision> {
+        let mut trial = 0;
+        let mut meets_target = |len: usize| -> anyhow::Result<bool> {
+            trial += 1;
+            let mut run = self.prefix_trial(&format!("prefix_round_{trial:03}"), target, len)?;
+            let is_match = self.launch_prefix_trial(&mut run)?;
+            eprintln!(
+                ":: Prefix of {len} of {} events => {}",
+                target.len(),
+                if is_match {
+                    format!("target condition ({})", self.display_criteria())
+                } else {
+                    "baseline condition".to_string()
+                }
+            );
+            Ok(is_match)
+        };
+
+        let passing = search_prefix_boundary(target.len(), &mut meets_target)?;
+        let failing = passing + 1;
+        // On a host whose branch counter is not exact, two replays of one
+        // prefix can differ, so the boundary is checked once more.
+        if meets_target(passing)? || !meets_target(failing)? {
+            eprintln!(
+                ":: {} replaying the prefixes of {passing} and {failing} events again gave other \
+                 outcomes; the decision below may not repeat",
+                "WARNING:".yellow().bold()
+            );
+        }
+        eprintln!(
+            ":: The scheduling decision at event #{passing} of {} decides the outcome: {}",
+            target.len(),
+            target[passing]
+        );
+        Ok(PrefixDecision {
+            schedule: target.to_vec(),
+            decision: passing,
+        })
+    }
+
+    /// Replay the first `len` events of `schedule` as a prefix trial and
+    /// return whether it met the target with the stack at schedule position
+    /// `position`: a replayed event, or, at `len`, the first event the
+    /// scheduler ran after the prefix.
+    fn prefix_stack(
+        &self,
+        runname: &str,
+        schedule: &[SchedEvent],
+        len: usize,
+        position: usize,
+    ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)> {
+        let mut run = self.prefix_trial(runname, schedule, len)?;
+        let stack_path = run.root_path().with_extension("stack");
+        run.runopts.det_opts.det_config.stacktrace_event =
+            vec![(position as u64, Some(stack_path.clone()))];
+        let is_match = self.launch_prefix_trial(&mut run)?;
+        eprintln!(
+            ":: {}\n{}",
+            "Stack-trace run completed.  Repro command:".green().bold(),
+            run.to_repro()
+        );
+        let stack = match File::open(&stack_path) {
+            Ok(file) => Some(serde_json::from_reader(file).with_context(|| {
+                format!("cannot parse the stack trace in {}", stack_path.display())
+            })?),
+            Err(_) => None,
+        };
+        Ok((is_match, stack))
+    }
+
+    /// The schedule a prefix trial of the first `len` events of `schedule`
+    /// realized: the replayed events, then the events the scheduler ran after
+    /// them. Empty if the trial wrote no schedule (it timed out).
+    fn prefix_continuation(
+        &self,
+        schedule: &[SchedEvent],
+        len: usize,
+    ) -> anyhow::Result<Vec<SchedEvent>> {
+        let mut run = self
+            .prefix_trial("final_baseline_schedule", schedule, len)?
+            .with_schedule_recording();
+        self.launch_prefix_trial(&mut run)?;
+        let path = run.sched_path_out().to_path_buf();
+        Ok(if path.exists() {
+            PreemptionReader::new(&path).load_all().into_global()
+        } else {
+            Vec::new()
+        })
+    }
+
+    /// The report of `--prefix-search`: the stacks of the two threads that
+    /// could run at the deciding event.
+    pub fn phase6_record_prefix_outputs(&self, found: PrefixDecision) -> anyhow::Result<Report> {
+        let PrefixDecision { schedule, decision } = found;
+        let (target_met, chosen) = self.prefix_stack(
+            "final_target_for_stacktraces",
+            &schedule,
+            decision + 1,
+            decision,
+        )?;
+        // The thread the scheduler runs at event #decision once the prefix
+        // ends. `--stacktrace-event` names a position of the replayed schedule
+        // only, so the prefix trial without event #decision runs first with its
+        // schedule recorded, and the stack is taken from a replay of that
+        // schedule's first decision + 1 events.
+        let continued = self.prefix_continuation(&schedule, decision)?;
+        let (baseline_met, instead) = if continued.len() > decision {
+            self.prefix_stack(
+                "final_baseline_for_stacktraces",
+                &continued,
+                decision + 1,
+                decision,
+            )?
+        } else {
+            eprintln!(
+                ":: {} the run without event #{decision} ended after {} events, so no thread \
+                 runs there instead and stack2 is empty",
+                "WARNING:".yellow().bold(),
+                continued.len()
+            );
+            (false, None)
+        };
+        if !target_met || baseline_met {
+            eprintln!(
+                ":: {} the stack-trace runs did not repeat the search's outcomes (target met: {}, \
+                 baseline met: {}); read the stacks with care",
+                "WARNING:".yellow().bold(),
+                target_met,
+                baseline_met
+            );
+        }
+
+        let mut header = format!(
+            "The scheduling decision at event #{decision} of the target schedule decides the \
+             outcome.\nReplaying the first {decision} events and then scheduling without chaos \
+             does not meet the target criteria; replaying event #{decision} too ({}) does ({}).\n",
+            schedule[decision],
+            self.display_criteria()
+        );
+        header.push_str(
+            "stack1 is the thread the target schedule runs at that point; stack2 is the thread \
+             that runs there instead when the scheduler continues without chaos.\nThe outcome \
+             depends on which of the two runs first: add synchronization that makes the order \
+             irrelevant, or that enforces the passing order.\n",
+        );
+        let context = Self::generate_context(&schedule, decision.max(1), self.execution_context);
+
+        println!(
+            "\n------------------------------ hermit analyze report ------------------------------"
+        );
+        println!("{}", header);
+        Self::print_stack("stack1", &chosen);
+        Self::print_stack("stack2", &instead);
+        println!("\n{}", context);
+
+        Ok(Report {
+            header,
+            additional_context: context,
+            baseline_run: false,
+            critical_event1: ReportCriticalEvent {
+                event_index: decision,
+                stack: chosen,
+            },
+            critical_event2: ReportCriticalEvent {
+                event_index: decision,
+                stack: instead,
+            },
+        })
     }
 
     /// It's weird if no filter is specified.
@@ -906,6 +1159,10 @@ impl AnalyzeOpts {
         // One endpoint of the bisection search:
         let mut target_endpoint_run = self.save_final_target_sched_events(min_run)?;
 
+        if self.prefix_search {
+            return self.prefix_search_and_report(&mut target_endpoint_run);
+        }
+
         // The other endpoint of the bisection search:
         // What we thought was the final_pr can change here:
         let mut baseline_endpoint_run =
@@ -924,9 +1181,48 @@ impl AnalyzeOpts {
             baseline_sched_name,
             target_sched_name,
         );
-        let crit_sched = self.phase5_bisect_traces(target, baseline)?;
+        let crit_sched = match self.phase5_bisect_traces(target, baseline) {
+            Ok(crit_sched) => crit_sched,
+            // The two endpoints differ in events only the failing run executed:
+            // the decision is still within the failing schedule, and a prefix
+            // search needs no baseline to find it.
+            Err(error) if error.downcast_ref::<NoSingleSwap>().is_some() => {
+                eprintln!(
+                    ":: {} {error:#}\n:: Searching within the failing schedule instead \
+                     (--prefix-search).",
+                    "No single swap separates the endpoints:".yellow().bold(),
+                );
+                return self.prefix_search_and_report(&mut target_endpoint_run);
+            }
+            Err(error) => return Err(error),
+        };
 
         let report = self.phase6_record_outputs(crit_sched)?;
+        self.write_report_and_exit(report)
+    }
+
+    /// `--prefix-search` over the target endpoint's schedule, and its report.
+    fn prefix_search_and_report(
+        &self,
+        target_endpoint_run: &mut RunData,
+    ) -> anyhow::Result<ExitStatus> {
+        let target = target_endpoint_run.sched_out().clone();
+        eprintln!(
+            ":: {} ({} events): {}",
+            "Beginning prefix search within the target schedule"
+                .yellow()
+                .bold(),
+            target.len(),
+            target_endpoint_run.sched_out_file_name(),
+        );
+        let decision = self.phase5_prefix_search(&target)?;
+        let report = self.phase6_record_prefix_outputs(decision)?;
+        self.write_report_and_exit(report)
+    }
+
+    /// Write `report` to `--report-file`, if given, and return the exit status
+    /// of a successful analysis.
+    fn write_report_and_exit(&self, report: Report) -> anyhow::Result<ExitStatus> {
         if let Some(path) = &self.report_file {
             let txt = serde_json::to_string(&report).unwrap();
             std::fs::write(path, txt).expect("Unable to write report file");
@@ -1137,6 +1433,40 @@ mod tests {
         let workspace = options.get_tmp().unwrap();
         assert_eq!(workspace.parent(), Some(requested.as_path()));
         assert!(workspace.is_dir(), "{}", workspace.display());
+    }
+
+    /// The prefix search finds the event at which the outcome flips, wherever
+    /// it lies, in about log2(len) + 2 trials, and refuses a schedule whose
+    /// endpoints do not differ.
+    #[test]
+    fn the_prefix_search_finds_the_deciding_event() {
+        for (len, decision) in [
+            (1, 0),
+            (2, 1),
+            (37_710, 0),
+            (37_710, 33_225),
+            (37_710, 37_709),
+        ] {
+            let mut trials = 0;
+            let found = search_prefix_boundary(len, |prefix| {
+                trials += 1;
+                Ok(prefix > decision)
+            })
+            .unwrap();
+            assert_eq!(found, decision, "len {len}");
+            assert!(
+                trials <= 2 + (len as f64).log2().ceil() as usize,
+                "{trials} trials"
+            );
+        }
+
+        let always = search_prefix_boundary(10, |_| Ok(true)).unwrap_err();
+        assert!(always.to_string().contains("replaying none"), "{always}");
+        let never = search_prefix_boundary(10, |_| Ok(false)).unwrap_err();
+        assert!(
+            never.to_string().contains("whole target schedule"),
+            "{never}"
+        );
     }
 
     #[test]
