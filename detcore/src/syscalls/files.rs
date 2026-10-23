@@ -12417,6 +12417,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return refused;
         }
+        // D48 (A5 step 3c.1c): a stop signal under the in-guest delivery
+        // gate, the caller's own process included.
+        if let Some(refused) = self
+            .refuse_stop_signal_send(
+                guest,
+                Sysno::pidfd_send_signal,
+                signal,
+                crate::syscalls::signal::ReservedSendTarget::Pidfd {
+                    named,
+                    thread: scope == PidfdSignalScope::Thread,
+                },
+            )
+            .await
+        {
+            return refused;
+        }
         let process = match named {
             Some(named) => Some(signal_target_process(guest, named).await.unwrap_or(named)),
             None => None,
