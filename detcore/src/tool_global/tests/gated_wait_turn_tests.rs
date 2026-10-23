@@ -377,18 +377,43 @@ async fn under_the_gate_a_sleep_ends_before_its_park_and_after_a_wake_only_for_a
 }
 
 /// Signal phase 1's virtual SIGALRM wake ends a `pause` as a caught
-/// delivery of SIGALRM, with no physical copy pending (IR-12); a deliverable
-/// default-fatal signal still makes the end fatal.
+/// delivery of SIGALRM, with no physical copy pending (IR-12), taking its
+/// place on the shared queue in Linux's dequeue order: a deliverable
+/// default-fatal signal that does not dump core still makes the end fatal,
+/// and so does a core-dumping one dequeued first (a private one, or a shared
+/// lower-numbered one), but not a shared core-dumping one SIGALRM precedes.
+/// Mutation "any default-fatal signal makes the end fatal": the shared
+/// SIGXCPU row becomes `Fatal(SIGXCPU)`.
 #[tokio::test]
 async fn under_the_gate_phase_1_s_virtual_sigalrm_wake_ends_a_pause_as_caught() {
     use crate::syscalls::SleepCheck;
     use crate::syscalls::SleepSignal;
     let wake = SleepCheck::AfterWake(Some(vec![SigWrapper(libc::SIGALRM)]));
-    for (pending, end) in [
-        (0, WaitSignalEnd::Caught(libc::SIGALRM)),
-        (bit(libc::SIGTERM), WaitSignalEnd::Fatal(libc::SIGTERM)),
+    let shared = |pending| KernelSignalState {
+        thread_pending: 0,
+        shared_pending: pending,
+        ..proc_state(pending, 0, 0)
+    };
+    for (state, end) in [
+        (proc_state(0, 0, 0), WaitSignalEnd::Caught(libc::SIGALRM)),
+        (
+            proc_state(bit(libc::SIGTERM), 0, 0),
+            WaitSignalEnd::Fatal(libc::SIGTERM),
+        ),
+        (
+            proc_state(bit(libc::SIGXCPU), 0, 0),
+            WaitSignalEnd::Fatal(libc::SIGXCPU),
+        ),
+        (
+            shared(bit(libc::SIGXCPU)),
+            WaitSignalEnd::Caught(libc::SIGALRM),
+        ),
+        (
+            shared(bit(libc::SIGQUIT)),
+            WaitSignalEnd::Fatal(libc::SIGQUIT),
+        ),
     ] {
-        let _seam = script(proc_state(pending, 0, 0));
+        let _seam = script(state);
         let mut guest = turn_guest(true, Some(0));
         guest.thread.sigalrm_handled = true;
         let verdict = crate::syscalls::sleep_signal(&mut guest, wake.clone(), true)

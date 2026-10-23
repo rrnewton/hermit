@@ -209,7 +209,11 @@ pub(crate) fn reserved_signal_arming_refused_warning(
 /// passes through as that re-run.
 pub(crate) fn restart_code_without_signal_refusal(call: &str, code: &str, caller: i32) -> String {
     format!(
-        "hermit refused to continue the run (HERMIT_RESTART_CODE_WITHOUT_SIGNAL): {call} in          thread {caller} finished with {code} under the in-guest delivery gate, but no wait          recorded a signal that ended it, so the in-guest runtime would return the kernel's          internal restart code to the guest, which Linux never does          (A5 design D40, https://github.com/rrnewton/hermit/issues/4485)."
+        "hermit refused to continue the run (HERMIT_RESTART_CODE_WITHOUT_SIGNAL): {call} in \
+         thread {caller} finished with {code} under the in-guest delivery gate, but no wait \
+         recorded a signal that ended it, so the in-guest runtime would return the kernel's \
+         internal restart code to the guest, which Linux never does \
+         (A5 design D40, https://github.com/rrnewton/hermit/issues/4485)."
     )
 }
 

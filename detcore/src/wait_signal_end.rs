@@ -42,16 +42,25 @@ use crate::syscalls::kernel_sigset_bit;
 /// straight after the dispatch `match` (`Detcore::wait_end_checkpoint`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WaitSignalEnd {
-    /// A default-fatal signal is deliverable, so the process dies at the
-    /// return and the guest never resumes after the call: the guest result is
-    /// `-EINTR`, and the original restart code is what the happens-before
-    /// checkpoint records (IR-2). The signal is the first default-fatal one
-    /// Linux would dequeue.
+    /// The process dies at the return and the guest never resumes after the
+    /// call: the guest result is `-EINTR`, and the original restart code is
+    /// what the happens-before checkpoint records (IR-2). Either a
+    /// non-core-dumping default-fatal signal is deliverable (the first such
+    /// one Linux would dequeue), or the first signal Linux would dequeue is a
+    /// core-dumping default-fatal one ([`classify`]).
+    ///
+    /// The signal is not the exit status for a non-core-dumping end: Linux
+    /// takes that from `group_exit_code`, the first such signal SENT, which
+    /// `complete_signal` records when it starts the group exit
+    /// (kernel/signal.c:1041-1049 at v6.12), not the first one dequeued.
+    /// Step 3c.1e, which takes the death's status, must use the send order.
     Fatal(i32),
-    /// Only caught signals are deliverable: the first one Linux would dequeue
-    /// runs its handler at the return, and the call's result goes through the
-    /// x86 restart table with that action's flags
-    /// (`signal_restart::caught_signal_return`).
+    /// The first signal Linux would dequeue is caught and no
+    /// non-core-dumping default-fatal signal is deliverable: that signal's
+    /// handler runs at the return, and the call's result goes through the x86
+    /// restart table with that action's flags
+    /// (`signal_restart::caught_signal_return`). A core-dumping signal also
+    /// deliverable is dequeued later, after the handler.
     Caught(i32),
 }
 
@@ -78,12 +87,24 @@ pub(crate) fn deliverable(state: &KernelSignalState, mask: u64, reserved: u64) -
 }
 
 /// What a wait that `deliverable` (a non-empty subset of the design's set for
-/// `state`) ends means for the call's result, or `None` when nothing ends it.
-/// Any default-fatal signal makes it `Fatal`, since the process then dies at
-/// the return whatever handlers run first; otherwise the first caught signal
-/// in Linux's dequeue order (`KernelSignalState::next_dequeued`: the thread's
-/// queue before the shared one, synchronous signals first) is the delivery
-/// whose action the restart table reads.
+/// `state`) ends means for the call's result, or `None` when nothing ends it,
+/// in Linux's order (v6.12):
+///
+/// 1. A deliverable default-fatal signal that does not dump core makes it
+///    `Fatal`: `complete_signal` starts the group exit when such a signal is
+///    sent to a thread that wants it, queueing SIGKILL to every thread
+///    (kernel/signal.c:1034-1054, its `!sig_kernel_coredump(sig)` branch), so
+///    the process dies at the return whatever else is pending. The signal
+///    named is the first such one Linux would dequeue (see `Fatal` for the
+///    exit status).
+/// 2. Otherwise the first deliverable signal in `get_signal`'s dequeue order
+///    decides: `dequeue_signal` takes the thread's private queue before the
+///    shared one (kernel/signal.c:634-639), and `next_signal` the synchronous
+///    signals first, then the lowest number (:196-218); here
+///    `KernelSignalState::next_dequeued`. A caught one is `Caught`, even when
+///    a core-dumping signal is also deliverable: its handler runs first, and
+///    the core-dumping signal is dequeued after it. A core-dumping one is
+///    `Fatal`: `get_signal` ends the process for it (:2881-2905).
 pub(crate) fn classify(state: &KernelSignalState, deliverable: u64) -> Option<WaitSignalEnd> {
     if deliverable == 0 {
         return None;
@@ -95,12 +116,36 @@ pub(crate) fn classify(state: &KernelSignalState, deliverable: u64) -> Option<Wa
         shared_pending: state.shared_pending & set,
         ..*state
     };
-    if fatal != 0 {
-        let (signal, _) = among(fatal).next_dequeued(0)?;
+    let group_exit = fatal & !core_dumping();
+    if group_exit != 0 {
+        let (signal, _) = among(group_exit).next_dequeued(0)?;
         return Some(WaitSignalEnd::Fatal(signal));
     }
     let (signal, _) = among(deliverable).next_dequeued(0)?;
-    Some(WaitSignalEnd::Caught(signal))
+    if fatal & kernel_sigset_bit(signal) != 0 {
+        Some(WaitSignalEnd::Fatal(signal))
+    } else {
+        Some(WaitSignalEnd::Caught(signal))
+    }
+}
+
+/// The signals whose default action dumps core (`SIG_KERNEL_COREDUMP_MASK`,
+/// include/linux/signal.h:426-432 at v6.12).
+pub(crate) fn core_dumping() -> u64 {
+    [
+        libc::SIGQUIT,
+        libc::SIGILL,
+        libc::SIGTRAP,
+        libc::SIGABRT,
+        libc::SIGFPE,
+        libc::SIGSEGV,
+        libc::SIGBUS,
+        libc::SIGSYS,
+        libc::SIGXCPU,
+        libc::SIGXFSZ,
+    ]
+    .into_iter()
+    .fold(0, |set, signal| set | kernel_sigset_bit(signal))
 }
 
 /// [`deliverable`] then [`classify`].
@@ -109,7 +154,31 @@ pub(crate) fn wait_end(
     mask: u64,
     reserved: u64,
 ) -> Option<WaitSignalEnd> {
-    classify(state, deliverable(state, mask, reserved))
+    wait_end_with_virtual(state, mask, reserved, 0)
+}
+
+/// [`wait_end`] with `virtual_caught`, caught signals the scheduler knows
+/// are pending on the process's shared queue although no physical copy is:
+/// signal phase 1's virtual SIGALRM, which Linux's `ITIMER_REAL` and `alarm`
+/// queue on the shared queue (`it_real_fn`, kernel/time/itimer.c:156-166 at
+/// v6.12) and which the scheduler's ledger delivers only when the guest's
+/// mask admits it. They join the deliverable set and take their place in
+/// Linux's dequeue order ([`classify`]).
+pub(crate) fn wait_end_with_virtual(
+    state: &KernelSignalState,
+    mask: u64,
+    reserved: u64,
+    virtual_caught: u64,
+) -> Option<WaitSignalEnd> {
+    let deliverable = deliverable(state, mask, reserved) | virtual_caught;
+    let state = KernelSignalState {
+        pending: state.pending | virtual_caught,
+        shared_pending: state.shared_pending | virtual_caught,
+        caught: state.caught | virtual_caught,
+        ignored: state.ignored & !virtual_caught,
+        ..*state
+    };
+    classify(&state, deliverable)
 }
 
 /// Whether `errno` is one of the kernel's internal restart codes
@@ -219,6 +288,117 @@ mod tests {
             wait_end(&s, 0, 0),
             Some(WaitSignalEnd::Fatal(libc::SIGTERM))
         );
+    }
+
+    /// `complete_signal`'s group exit at send (classify, rule 1): a deliverable
+    /// default-fatal signal that does not dump core ends the wait as `Fatal`
+    /// whatever Linux would dequeue first. Mutation "the first dequeued
+    /// decides every end" (rule 1 removed): each row becomes `Caught` or names
+    /// the core-dumping signal.
+    #[test]
+    fn a_non_core_dumping_fatal_signal_makes_the_end_fatal_whatever_is_dequeued_first() {
+        let usr1 = bit(libc::SIGUSR1);
+        for (name, thread, shared, caught, end) in [
+            (
+                "a private caught signal before a shared SIGTERM",
+                usr1,
+                bit(libc::SIGTERM),
+                usr1,
+                libc::SIGTERM,
+            ),
+            (
+                "a lower-numbered private caught signal before a private SIGTERM",
+                usr1 | bit(libc::SIGTERM),
+                0,
+                usr1,
+                libc::SIGTERM,
+            ),
+            (
+                "a synchronous core-dumping signal before a SIGTERM",
+                bit(libc::SIGSEGV) | bit(libc::SIGTERM),
+                0,
+                0,
+                libc::SIGTERM,
+            ),
+        ] {
+            let s = state(thread, shared, 0, caught);
+            assert_eq!(
+                wait_end(&s, 0, 0),
+                Some(WaitSignalEnd::Fatal(end)),
+                "{name}"
+            );
+        }
+    }
+
+    /// Rule 2 with a caught signal first: its handler runs before a
+    /// core-dumping signal also deliverable is dequeued, so the end is
+    /// `Caught`. Mutations: "any default-fatal signal makes the end fatal" (the
+    /// rule before this round) and "the lowest number across both queues" (the
+    /// private queue not first): each row becomes `Fatal(SIGQUIT)`.
+    #[test]
+    fn a_caught_signal_dequeued_before_a_core_dumping_one_makes_the_end_caught() {
+        for (name, thread, shared, caught, end) in [
+            (
+                "a private caught signal before a shared, lower-numbered SIGQUIT",
+                bit(libc::SIGUSR2),
+                bit(libc::SIGQUIT),
+                bit(libc::SIGUSR2),
+                libc::SIGUSR2,
+            ),
+            (
+                "both private, the caught one lower-numbered",
+                bit(libc::SIGHUP) | bit(libc::SIGQUIT),
+                0,
+                bit(libc::SIGHUP),
+                libc::SIGHUP,
+            ),
+        ] {
+            let s = state(thread, shared, 0, caught);
+            assert_eq!(
+                wait_end(&s, 0, 0),
+                Some(WaitSignalEnd::Caught(end)),
+                "{name}"
+            );
+        }
+    }
+
+    /// Rule 2 with a core-dumping signal first: `get_signal` ends the process
+    /// for it, so the end is `Fatal` even though a caught signal is also
+    /// deliverable. Mutations: "the caught signal always wins over a
+    /// core-dumping one" (each row becomes `Caught`) and "synchronous signals
+    /// not first" (the SIGSEGV row becomes `Caught(SIGHUP)`).
+    #[test]
+    fn a_core_dumping_signal_dequeued_first_makes_the_end_fatal() {
+        for (name, thread, shared, caught, end) in [
+            (
+                "both private, the core-dumping one lower-numbered",
+                bit(libc::SIGQUIT) | bit(libc::SIGUSR1),
+                0,
+                bit(libc::SIGUSR1),
+                libc::SIGQUIT,
+            ),
+            (
+                "a synchronous core-dumping signal before a lower-numbered caught one",
+                bit(libc::SIGSEGV) | bit(libc::SIGHUP),
+                0,
+                bit(libc::SIGHUP),
+                libc::SIGSEGV,
+            ),
+            (
+                "a private core-dumping signal before a shared caught one",
+                bit(libc::SIGABRT),
+                bit(libc::SIGHUP),
+                bit(libc::SIGHUP),
+                libc::SIGABRT,
+            ),
+        ] {
+            let s = state(thread, shared, 0, caught);
+            assert_eq!(
+                wait_end(&s, 0, 0),
+                Some(WaitSignalEnd::Fatal(end)),
+                "{name}"
+            );
+        }
     }
 
     #[test]

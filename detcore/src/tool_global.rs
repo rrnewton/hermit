@@ -3299,16 +3299,20 @@ impl GlobalState {
             // `HERMIT_POLICY_REFUSAL_EXIT` once it completes, and the request
             // is answered, so the coordinator never exits on behalf of a run
             // whose guests it might not take with it.
+            //
+            // The gate-off answer is the `PolicyRefusal` arm's, and like it
+            // goes through the bookkeeping after this `match` (the teardown
+            // and SIGKILL-retirement checks, the time update).
             GlobalRequest::StoppingRefusal(reason) => {
-                if !self.cfg.in_guest_signal_delivery {
-                    warn!(
-                        "[detcore] a stopping refusal was filed without the in-guest delivery gate; recorded as a policy refusal, without the run-wide exit: {}",
-                        reason
-                    );
-                    self.policy_refusal.lock().unwrap().get_or_insert(reason);
-                    return (None, R::PolicyRefusal(()));
+                if self.cfg.in_guest_signal_delivery {
+                    crate::scheduler::exit_on_scheduler_refusal(&reason)
                 }
-                crate::scheduler::exit_on_scheduler_refusal(&reason)
+                warn!(
+                    "[detcore] a stopping refusal was filed without the in-guest delivery gate; recorded as a policy refusal, without the run-wide exit: {}",
+                    reason
+                );
+                self.policy_refusal.lock().unwrap().get_or_insert(reason);
+                R::PolicyRefusal(())
             }
             // TODO-HUMAN-REVIEW(PR-643): Review run-wide unsupported-syscall aggregation.
             GlobalRequest::ReportUnsupportedSyscall(name) => {

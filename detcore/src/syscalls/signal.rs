@@ -4134,24 +4134,27 @@ where
     //
     // Signal phase 1's SIGALRM is virtual: the scheduler's ledger wakes a
     // `pause` for it (`Scheduler::sigalrm_wake`) with no physical copy
-    // pending, so such a wake counts as a caught delivery of SIGALRM, unless
-    // a default-fatal signal is deliverable too, which ends the process
-    // whatever handler runs first. IR-12: the `pause` returns
+    // pending, so such a wake counts as a caught SIGALRM pending on the
+    // process's shared queue, where Linux's timer would queue it, and takes
+    // its place in Linux's dequeue order among the deliverable signals
+    // (`wait_signal_end::classify`): a deliverable default-fatal signal that
+    // does not dump core still ends the process, and so does a core-dumping
+    // one Linux would dequeue first. IR-12: the `pause` returns
     // `ERESTARTNOHAND`, which the restart checkpoint turns into `EINTR`. Phase
     // 1 refuses every other sleep in a process that handles SIGALRM (F8).
     if guest.config().in_guest_signal_delivery {
-        use crate::wait_signal_end::WaitSignalEnd;
         let _ = stops_end_it;
-        let end = crate::syscalls::helpers::gated_wait_end(guest, None)?;
         let phase1_wake = matches!(&check, SleepCheck::AfterWake(Some(woken))
             if woken.iter().any(|signal| signal.raw() == libc::SIGALRM))
             && guest.config().backend.virtualizes_guest_sigalrm
             && guest.thread_state().sigalrm_handled;
-        let end = match end {
-            Some(WaitSignalEnd::Fatal(signal)) => Some(WaitSignalEnd::Fatal(signal)),
-            _ if phase1_wake => Some(WaitSignalEnd::Caught(libc::SIGALRM)),
-            other => other,
+        let virtual_caught = if phase1_wake {
+            kernel_sigset_bit(libc::SIGALRM)
+        } else {
+            0
         };
+        let end =
+            crate::syscalls::helpers::gated_wait_end_with_virtual(guest, None, virtual_caught)?;
         let Some(end) = end else {
             return Ok(SleepSignal::None);
         };
