@@ -4146,7 +4146,8 @@ impl Scheduler {
             let writer = PreemptionWriter::new(cfg.record_preemptions_to.clone())
                 .with_epoch(cfg.epoch)
                 .with_pipe_wake_latency(cfg.pipe_wake_latency_in_effect())
-                .with_signal_state_copy(cfg.signal_state_copy);
+                .with_signal_state_copy(cfg.signal_state_copy)
+                .with_rng_seed(cfg.rng_seed());
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -35685,6 +35686,37 @@ mod test {
         assert!(scheduler.sigalrm_pending(target));
         assert!(!scheduler.in_guest_fatal_alarm_pending(target));
         assert_eq!(scheduler.host_signal_attempts, 0);
+    }
+
+    /// A recording scheduler stores the seed of the guest's randomness in its
+    /// preemption record, in the legacy and the slice-boundary format alike,
+    /// so a replay can hand the guest the values the recording read.
+    #[test]
+    fn a_recorded_schedule_stores_the_guest_rng_seed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("schedule.json");
+        for (strict_schedule_boundaries, rng_seed, stored) in [
+            (false, None, 3),
+            (false, Some(11), 11),
+            (true, Some(11), 11),
+        ] {
+            let config = Config {
+                sequentialize_threads: true,
+                record_preemptions: true,
+                strict_schedule_boundaries,
+                seed: 3,
+                rng_seed,
+                ..Config::default()
+            };
+            let mut scheduler = Scheduler::new(&config);
+            let record = scheduler.preemption_writer.take().unwrap().into_string();
+            std::fs::write(&path, record).unwrap();
+            assert_eq!(
+                crate::preemptions::read_recorded_rng_seed(&path),
+                Ok(Some(stored)),
+                "strict_schedule_boundaries={strict_schedule_boundaries}, rng_seed={rng_seed:?}"
+            );
+        }
     }
 }
 

@@ -1762,7 +1762,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Eight terminal-finalization custody and classification tests.
     // And container::tests::identity_hardening_freezes_the_dynamic_linker_cache
     // (the frozen /etc/ld.so.cache, Hermit c10c2882): 1096.
-    ("test.hermit_unit", 1096),
+    // And run::replay_takes_the_recorded_rng_seed_and_refuses_another (a replay
+    // adopts the recorded --rng-seed and refuses another): 1097, listed.
+    ("test.hermit_unit", 1097),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2805,7 +2807,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // epoch read without copying the configuration, and its placeholder
     // gate): 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit", 2529),
+    // And scheduler::test::a_recorded_schedule_stores_the_guest_rng_seed (a
+    // preemption record stores the guest's --rng-seed, in either format): 2530,
+    // listed.
+    ("test.detcore_unit", 2530),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3175,7 +3180,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And 28 retained coherent mapping-capture controls: 339.
     // Split the five birth cases into separately bounded identities (+4): 343.
     // And two pure declared-Redis input controls in redis_strict: 345, listed.
-    ("test.hermit_integration_3", 345),
+    // And random_determinism's
+    // a_schedule_replay_hands_the_guest_the_recorded_random_values (a replay
+    // adopts the recorded --rng-seed and refuses another): 346, listed.
+    ("test.hermit_integration_3", 346),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -4925,7 +4933,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twelve A+ units: 2527, listed.
     // And the same three slice 7d determinize_stat_tests units: 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit_on_host", 2529),
+    // And the same recorded rng-seed unit: 2530, listed.
+    ("test.detcore_unit_on_host", 2530),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5037,7 +5046,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 28 retained coherent mapping-capture controls: 685.
     // Split the five birth cases into separately bounded identities (+4): 689.
     // And two pure declared-Redis input controls in redis_strict: 691, listed.
-    ("test.hermit_integration_on_host", 691),
+    // And the same random_determinism schedule-replay test: 692, listed.
+    ("test.hermit_integration_on_host", 692),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -5268,7 +5278,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // The same eight finalization tests, with the existing selection unchanged.
     // And the frozen ld.so.cache container test (Hermit c10c2882): 1096.
-    ("test.hermit_unit_on_host", 1096),
+    // And the same recorded rng-seed replay test: 1097, listed.
+    ("test.hermit_unit_on_host", 1097),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

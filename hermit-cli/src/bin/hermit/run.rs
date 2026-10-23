@@ -3791,6 +3791,52 @@ fn replay_networking_adopts_the_trace_epoch_and_refuses_another() {
     );
 }
 
+#[test]
+fn replay_takes_the_recorded_rng_seed_and_refuses_another() {
+    let directory = tempfile::tempdir().unwrap();
+    let record = directory.path().join("schedule.preempts");
+    fs::write(&record, r#"{"per_thread":{},"global":[],"rng_seed":6}"#).unwrap();
+    let replay_arg = format!("--replay-schedule-from={}", record.display());
+
+    let mut omitted =
+        RunOpts::parse_from(["fakehermit", "--seed=1", replay_arg.as_str(), "fakeprog"]);
+    omitted.adopt_replayed_rng_seed().unwrap();
+    let config = &omitted.det_opts.det_config;
+    assert_eq!(
+        config.rng_seed(),
+        6,
+        "the recorded seed replaces the one --seed implies"
+    );
+    assert_eq!(
+        config.sched_seed(),
+        1,
+        "the schedule seed stays the caller's"
+    );
+
+    let mut explicit = RunOpts::parse_from([
+        "fakehermit",
+        "--rng-seed=1",
+        replay_arg.as_str(),
+        "fakeprog",
+    ]);
+    let refusal = explicit
+        .adopt_replayed_rng_seed()
+        .expect_err("the guest would read other random values than the recording");
+    assert!(
+        format!("{refusal:#}").contains("--rng-seed=1 differs from the seed 6"),
+        "{refusal:#}"
+    );
+
+    let mut matching = RunOpts::parse_from([
+        "fakehermit",
+        "--rng-seed=6",
+        replay_arg.as_str(),
+        "fakeprog",
+    ]);
+    matching.adopt_replayed_rng_seed().unwrap();
+    assert_eq!(matching.det_opts.det_config.rng_seed(), 6);
+}
+
 /// The environment variable that turned the signal-state copy on while it
 /// was opt-in (before A5 step 2d). It is no longer read.
 const SIGNAL_STATE_CHECK_ENV: &str = "HERMIT_SIGNAL_STATE_CHECK";
@@ -6192,6 +6238,51 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Replay a preemption or schedule record with the guest random seed it was
+    /// recorded under.
+    ///
+    /// `--seed` also seeds what the guest reads as randomness (getrandom,
+    /// `/dev/urandom`), so a replay at another `--seed`, or at the default one,
+    /// handed the guest other values than the recording did and desynced from
+    /// the schedule it replays. An omitted `--rng-seed` now takes the recorded
+    /// one, and a different explicit one is refused before anything is
+    /// launched. A record written before the seed was stored is replayed as
+    /// before.
+    fn adopt_replayed_rng_seed(&mut self) -> Result<(), Error> {
+        if self.namespace_only {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        let Some(path) = config
+            .replay_preemptions_from
+            .clone()
+            .or_else(|| config.replay_schedule_from.clone())
+        else {
+            return Ok(());
+        };
+        let Some(recorded) =
+            detcore::preemptions::read_recorded_rng_seed(&path).map_err(Error::msg)?
+        else {
+            return Ok(());
+        };
+        match self.det_opts.det_config.rng_seed {
+            None => {
+                self.det_opts.det_config.rng_seed = Some(recorded);
+                Ok(())
+            }
+            Some(explicit) if explicit != recorded => {
+                Err(Error::new(PolicyRefusal).context(format!(
+                    "the explicit --rng-seed={explicit} differs from the seed {recorded} that {} \
+                     was recorded under. The guest would read other random values than the \
+                     recorded run did, so the recorded schedule cannot reproduce it. Omit \
+                     --rng-seed to replay with the recorded seed, or pass --rng-seed={recorded}.",
+                    path.display(),
+                )))
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
     /// Refuse to replay a preemption or schedule record made under another
     /// `--pipe-wake-latency` than this run's, including a different latency
     /// (https://github.com/rrnewton/hermit/issues/4380). A record without the
@@ -6975,6 +7066,7 @@ impl RunOpts {
         // off, and still before stdin is read or anything is launched.
         self.refuse_happens_before_without_preemption()?;
         self.adopt_replayed_schedule_epoch()?;
+        self.adopt_replayed_rng_seed()?;
         // After the replayed epoch is adopted, which makes an omitted epoch
         // explicit, and still before stdin is read or anything is launched.
         self.refuse_strict_with_host_drawn_inputs()?;
