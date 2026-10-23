@@ -385,6 +385,40 @@ pub(crate) fn wait_end_with_virtual(
     classify(&state, deliverable, mask)
 }
 
+/// D44 (A5 step 3c.1c): whether a send of `signal` to a thread blocked in a
+/// kernel-run call (`ResourceID::is_kernel_run_blocking`), whose guest mask at
+/// that call's request was `mask`, is refused: Linux would deliver it by
+/// interrupting the call, which the kernel runs under the in-guest runtime's
+/// mask, so it would stay pending and the call would never end for it. That
+/// is a signal `mask` leaves unblocked that is caught, or default-fatal and not
+/// ignored. A vfork parent (`vfork`) sleeps killable, and Linux wakes it only
+/// for a fatal signal that is not core-dumping (`wait_for_vfork_done`,
+/// kernel/fork.c:1572-1590; `complete_signal`, kernel/signal.c:1034-1054): a
+/// caught or core-dumping signal waits for the child's release, which keeping
+/// it pending reproduces, so only an unblocked, non-core-dumping default-fatal
+/// signal is refused there. `state` gives the dispositions; its pending set
+/// is not read. SIGKILL and signal 0 are never passed here.
+pub(crate) fn kernel_run_send_refused(
+    state: &KernelSignalState,
+    mask: u64,
+    signal: i32,
+    vfork: bool,
+    reserved: u64,
+) -> bool {
+    if !(1..=64).contains(&signal) {
+        return false;
+    }
+    let bit = kernel_sigset_bit(signal);
+    if mask & bit != 0 || reserved & bit != 0 {
+        return false;
+    }
+    if vfork {
+        default_fatal(state) & bit != 0 && core_dumping() & bit == 0
+    } else {
+        (state.caught | default_fatal(state)) & bit != 0
+    }
+}
+
 /// Whether `errno` is one of the kernel's internal restart codes
 /// (include/linux/errno.h v6.12 lines 14-18), which a guest never sees: the
 /// kernel either restarts the call or turns the code into `EINTR` at the
@@ -868,6 +902,42 @@ mod tests {
             wait_end(&s, 0, 0),
             Some(WaitSignalEnd::Fatal(libc::SIGKILL))
         );
+    }
+
+    /// D44's refusal and its vfork narrowing. Mutations: "vfork not
+    /// narrowed" (the caught and core-dumping vfork rows), "the mask
+    /// ignored" (the blocked rows).
+    #[test]
+    fn a_kernel_run_send_is_refused_only_for_a_signal_that_would_interrupt_the_call() {
+        let usr1 = bit(libc::SIGUSR1);
+        let term = bit(libc::SIGTERM);
+        let dispositions = state(0, 0, bit(libc::SIGHUP), usr1);
+        for (signal, mask, vfork, refused, name) in [
+            (libc::SIGTERM, 0, false, true, "default-fatal"),
+            (libc::SIGQUIT, 0, false, true, "core-dumping"),
+            (libc::SIGUSR1, 0, false, true, "caught"),
+            (libc::SIGTERM, term, false, false, "blocked"),
+            (libc::SIGHUP, 0, false, false, "SIG_IGN"),
+            (libc::SIGURG, 0, false, false, "default-ignored"),
+            (libc::SIGTSTP, 0, false, false, "default stop"),
+            (libc::SIGTERM, 0, true, true, "vfork: default-fatal"),
+            (libc::SIGQUIT, 0, true, false, "vfork: core-dumping"),
+            (libc::SIGUSR1, 0, true, false, "vfork: caught"),
+            (libc::SIGTERM, term, true, false, "vfork: blocked"),
+        ] {
+            assert_eq!(
+                kernel_run_send_refused(&dispositions, mask, signal, vfork, 0),
+                refused,
+                "{name}"
+            );
+        }
+        assert!(!kernel_run_send_refused(
+            &dispositions,
+            0,
+            libc::SIGTERM,
+            false,
+            term
+        ));
     }
 
     #[test]
