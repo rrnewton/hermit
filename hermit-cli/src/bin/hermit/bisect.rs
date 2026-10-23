@@ -535,10 +535,13 @@ mod tests {
 
     /// Bisect's replays apply `--skid-margin`: it is recorded as the skid
     /// margin of Reverie's per-process PMU configuration before either
-    /// schedule is read, so a later margin is refused. This relies on nextest running each
-    /// test in a process of its own, as the validation DAG does.
+    /// schedule is read, so a later margin is refused. That configuration is
+    /// per-process, so the test runs in a process of its own.
     #[test]
     fn bisect_installs_the_replays_skid_margin() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let argv = [
             "hermit",
             "bisect",

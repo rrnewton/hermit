@@ -2698,16 +2698,25 @@ mod tests {
 
     #[test]
     fn real_container_failure_replaces_run1_stamp() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         check_real_container_failure(VerificationRun::Run1);
     }
 
     #[test]
     fn real_container_failure_replaces_run2_stamp_without_claiming_run1_status() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         check_real_container_failure(VerificationRun::Run2);
     }
 
     #[test]
     fn real_container_zero_exit_and_deliberate_stops_remain_distinct() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("verify.json");
         for code in [
@@ -2846,6 +2855,9 @@ mod tests {
 
     #[test]
     fn returned_guest_signal_and_unknown_error_do_not_become_container_failure() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("verify.json");
         write_pending_verification_json(&path).unwrap();
@@ -2884,6 +2896,9 @@ mod tests {
 
     #[test]
     fn container_failure_keeps_primary_type_and_secondary_errors() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let error = real_container_exit(
             &dir.path().join("absent/verify.json"),

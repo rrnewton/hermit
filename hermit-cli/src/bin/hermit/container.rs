@@ -5617,6 +5617,9 @@ mod tests {
     /// init is still running when the budget expires.
     #[test]
     fn a_namespace_init_honours_stop_signals_sent_before_it_arms() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         for signal in CONTAINER_INIT_STOP_SIGNALS {
             let status = in_isolated_process(|| {
                 set_default_stop_dispositions()?;
@@ -5642,6 +5645,9 @@ mod tests {
     /// the wait status `SIG_DFL` would have given it.
     #[test]
     fn the_process_holding_the_bridge_still_dies_from_stop_signals() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         fn hold_the_bridge() -> bool {
             if set_default_stop_dispositions().is_err() {
                 return false;
@@ -5673,6 +5679,9 @@ mod tests {
     /// what was there before.
     #[test]
     fn the_bridge_leaves_ignored_and_handled_signals_alone_and_restores_the_default() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         extern "C" fn someone_elses_handler(_signal: libc::c_int) {}
         let dispositions = in_isolated_process(|| {
             let read = || -> Result<Vec<libc::sighandler_t>, String> {
@@ -5733,6 +5742,9 @@ mod tests {
     /// the way rather than guessing which of the two it is running in.
     #[test]
     fn the_bridge_is_not_installed_by_a_process_that_is_pid_1() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         fn install_as_pid_1() -> bool {
             // SAFETY: getpid(2) has no preconditions.
             if unsafe { libc::getpid() } != 1 || set_default_stop_dispositions().is_err() {
@@ -5940,6 +5952,9 @@ mod tests {
 
     #[test]
     fn default_container_uses_readonly_proc_fallback() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         // The outer child confines the irreversible seccomp filter to this test.
         let (mounts, status) = Container::new()
             .run(|| {
@@ -5955,6 +5970,9 @@ mod tests {
 
     #[test]
     fn image_container_uses_readonly_proc_fallback() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let rootfs = tempfile::tempdir().unwrap();
         let tmpfs = tempfile::tempdir().unwrap();
         for directory in ["proc", "tmp", "dev/pts"] {
@@ -5992,6 +6010,9 @@ mod tests {
     /// with both locked flags still present.
     #[test]
     fn image_container_accepts_a_rootfs_on_a_nosuid_nodev_filesystem() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         fn root_mount_flags() -> Result<(bool, bool, bool), String> {
             let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
             // SAFETY: the path is a valid NUL-terminated string and `stat` is a
@@ -6674,6 +6695,9 @@ mod tests {
     /// death signal must not go on to start a guest.
     #[test]
     fn log_cap_crossed_before_the_container_init_arms_stops_the_init() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let outcome = arm_after_the_parent_crossed(|| arm_container_init_guards().is_ok());
         assert_stopped_by_the_crossing("arm_container_init_guards", outcome);
     }
@@ -6682,6 +6706,9 @@ mod tests {
     /// arms in `pre_exec` and then execs the guest itself.
     #[test]
     fn log_cap_crossed_before_the_namespace_only_guest_arms_stops_the_exec() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let outcome = arm_after_the_parent_crossed(|| arm_namespace_only_guest().is_ok());
         assert_stopped_by_the_crossing("arm_namespace_only_guest", outcome);
     }

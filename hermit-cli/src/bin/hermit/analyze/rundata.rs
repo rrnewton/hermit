@@ -1663,11 +1663,13 @@ mod tests {
     /// Analyze's trials apply `--skid-margin`: its preflight records it as the
     /// skid margin of Reverie's per-process PMU configuration, so a later
     /// margin is refused. `main` refuses the unimplemented `--run1-schedule`
-    /// right after that preflight, which stops it before any workspace. This
-    /// relies on nextest running each test in a process of its own, as the
-    /// validation DAG does.
+    /// right after that preflight, which stops it before any workspace. That
+    /// configuration is per-process, so the test runs in a process of its own.
     #[test]
     fn analyze_installs_the_trials_skid_margin() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let argv = [
             "hermit",
             "analyze",
