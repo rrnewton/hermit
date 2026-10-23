@@ -6123,13 +6123,41 @@ impl<T> ThreadState<T> {
     }
 
     /// Whether this thread has consumed its current logical timeslice.
+    ///
+    /// A replayed slice ends where the recorded one did: at its recorded branch
+    /// count, and, at that count, once the thread's logical time is within one
+    /// RCB of the recorded end. A slice that ended at a syscall boundary shares
+    /// its branch count with every check-in since the thread's last branch (no
+    /// branch runs between two syscalls, or between a branch-exact timer stop
+    /// and the next syscall), and only the logical time, which a syscall
+    /// advances by far more than one RCB, tells which of them it was. The one
+    /// RCB of slack keeps a PMU check-in that lands a little short of the
+    /// recorded time ending its slice at the exact count. Past the recorded
+    /// count the slice has ended whatever the time says.
     pub(crate) fn timeslice_expired(&self) -> bool {
-        if let Some(replay_rcb_end) = self.replay_rcb_end {
-            return self.committed_clock_value >= replay_rcb_end;
-        }
         let current_time = self.thread_logical_time.as_nanos();
+        if let Some(replay_rcb_end) = self.replay_rcb_end {
+            return match self.committed_clock_value.cmp(&replay_rcb_end) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Less => false,
+                std::cmp::Ordering::Equal => self.end_of_timeslice.is_none_or(|end_of_timeslice| {
+                    current_time + self.one_rcb_of_time() >= end_of_timeslice
+                }),
+            };
+        }
         self.end_of_timeslice
             .is_some_and(|end_of_timeslice| current_time >= end_of_timeslice)
+    }
+
+    /// The virtual time one more retired conditional branch adds to this
+    /// thread's clock, rounded up: the `post_handler_hook` epsilon.
+    fn one_rcb_of_time(&self) -> Duration {
+        Duration::from_nanos(
+            (NANOS_PER_RCB
+                * self.thread_logical_time.multiplier()
+                * self.rcb_time_multiplier().as_f64())
+            .ceil() as u64,
+        )
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -7418,10 +7446,11 @@ mod timeslice_tests {
         };
         let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
         let now = state.thread_logical_time.as_nanos();
+        // Four RCBs are 40ns at 10ns each: both slices ended there.
         let history = ThreadHistory::new()
             .with_prio_changes(vec![
-                (now + Duration::from_nanos(70), DEFAULT_PRIORITY),
-                (now + Duration::from_nanos(80), DEFAULT_PRIORITY),
+                (now + Duration::from_nanos(40), DEFAULT_PRIORITY),
+                (now + Duration::from_nanos(40), DEFAULT_PRIORITY),
             ])
             .with_preemption_rcbs(vec![4, 4]);
         state.preemption_points = Some(history.into_iter());
@@ -7433,6 +7462,66 @@ mod timeslice_tests {
 
         state.next_timeslice(&config);
         assert_eq!(state.replay_rcb_end, Some(4));
+        assert!(state.timeslice_expired());
+    }
+
+    /// A recorded slice that ended at a syscall boundary ends at that boundary
+    /// in replay, not at an earlier check-in with the same branch count. The
+    /// first slice of a guest with no branches before its third syscall ended
+    /// after the second syscall, at 0 RCBs; the replay sees 0 RCBs at every
+    /// check-in before then, and only the logical time tells them apart.
+    #[test]
+    fn replay_ends_a_syscall_boundary_slice_at_its_recorded_time() {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+        let mut after_two_syscalls = state.thread_logical_time.clone();
+        after_two_syscalls.add_syscall();
+        after_two_syscalls.add_syscall();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![(after_two_syscalls.as_nanos(), DEFAULT_PRIORITY)])
+            .with_preemption_rcbs(vec![0]);
+        state.preemption_points = Some(history.into_iter());
+
+        state.next_timeslice(&config);
+        assert_eq!(state.replay_rcb_end, Some(0));
+        assert_eq!(state.thread_logical_time.as_nanos(), now);
+        assert!(!state.timeslice_expired(), "no syscall has run yet");
+        state.thread_logical_time.add_syscall();
+        assert!(!state.timeslice_expired(), "one syscall has run");
+        state.thread_logical_time.add_syscall();
+        assert!(state.timeslice_expired(), "the recorded end, after two");
+    }
+
+    /// Past its recorded branch count a replayed slice has ended, whatever the
+    /// logical time.
+    #[test]
+    fn replay_ends_a_slice_past_its_recorded_branch_count() {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![(now + Duration::from_nanos(50_000), DEFAULT_PRIORITY)])
+            .with_preemption_rcbs(vec![10]);
+        state.preemption_points = Some(history.into_iter());
+
+        state.next_timeslice(&config);
+        state.thread_logical_time.add_rcbs(10);
+        state.committed_clock_value = 10;
+        assert!(
+            !state.timeslice_expired(),
+            "at the count, short of the time"
+        );
+        state.thread_logical_time.add_rcbs(1);
+        state.committed_clock_value = 11;
         assert!(state.timeslice_expired());
     }
 
