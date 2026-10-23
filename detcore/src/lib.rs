@@ -2544,8 +2544,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             let (ns_remaining, max_rcbs_remaining) = if let Some(replay_rcb_end) = replay_rcb_end {
                 assert!(
-                    replay_rcb_end > current_pmu_rcbs,
-                    "recorded PMU RCB deadline {} is not ahead of current {}",
+                    replay_rcb_end >= current_pmu_rcbs,
+                    "recorded PMU RCB deadline {} is behind current {}",
                     replay_rcb_end,
                     current_pmu_rcbs
                 );
@@ -2554,7 +2554,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 } else {
                     LogicalTime::ZERO
                 };
-                (logical_remaining, replay_rcb_end - current_pmu_rcbs)
+                let rcbs_remaining = if replay_rcb_end > current_pmu_rcbs {
+                    replay_rcb_end - current_pmu_rcbs
+                } else {
+                    // The recorded count is reached and the slice ends at a
+                    // later syscall boundary, when the thread's logical time
+                    // reaches the recorded end (`timeslice_expired`). A replay
+                    // that follows its record runs no branch before then; the
+                    // timer only bounds one that does not.
+                    logical_remaining
+                        .into_rcbs_with_multiplier(clock_multiplier)
+                        .max(1)
+                };
+                (logical_remaining, rcbs_remaining)
             } else {
                 let logical_remaining = max_timeslice_end - current_time;
                 (

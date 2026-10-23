@@ -3033,7 +3033,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And A5 slice 3c.1e B's unit: threads' disposition_mask_tests::
     // a_gated_managed_wait_reads_the_guest_mask_without_replacing_it: 2682,
     // listed.
-    ("test.detcore_unit", 2682),
+    // And tool_local::timeslice_tests::replay_ends_a_syscall_boundary_slice_at_its_recorded_time
+    // and tool_local::timeslice_tests::replay_ends_a_slice_past_its_recorded_branch_count
+    // (a replayed slice ends at its recorded syscall boundary): 2684, listed.
+    ("test.detcore_unit", 2684),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5260,7 +5263,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five shared runtime-FD readlink regressions: 2667, listed.
     // Fixed 0.5.4 rebase recount also retains the priority-history regressions.
     // And the same 3c.1e B unit: 2682, listed.
-    ("test.detcore_unit_on_host", 2682),
+    // And the same two replayed-slice-end units: 2684, listed.
+    ("test.detcore_unit_on_host", 2684),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
