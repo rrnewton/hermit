@@ -868,7 +868,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// | `res` | flag | guest result | posthook records |
     /// |---|---|---|---|
     /// | a restart code | `Fatal` | `-EINTR` | interrupted, with the code |
-    /// | a restart code | `Caught(sig)` | the x86 restart table with `sig`'s flags | a checkpoint |
+    /// | a restart code | `Caught(sig)` | the x86 restart table with `sig`'s flags (a restart of `-ERESTARTSYS` passed through, not honoured before 3c.2; any other restart refused, below) | a checkpoint |
     /// | a restart code | `BehindCaught` | resolved first by the caught handlers' masks (below), then the `Fatal` or `Caught` row | as that row |
     /// | `-ERESTARTSYS` | none | unchanged: the in-guest runtime re-runs it | interrupted |
     /// | `-ERESTARTNOINTR`, `-ERESTARTNOHAND`, `-ERESTART_RESTARTBLOCK` | none | the run ends (D49) | — |
@@ -881,10 +881,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// A default-fatal end is `-EINTR` because the process dies at the return
     /// and the guest never sees the value; DETLOG then shows `-EINTR` where
     /// ptrace's record shows the kernel's restart code (a named record
-    /// difference). A caught end that the table restarts can be honoured only
-    /// for `-ERESTARTSYS`, which the in-guest Tool host re-runs; any other
-    /// code (`-ERESTARTNOINTR`, from D41's not-run call when the caught
-    /// handlers' masks hold the default-fatal signal behind them) would need
+    /// difference). A caught end that the table restarts with `-ERESTARTSYS`
+    /// (`SA_RESTART`) is passed through, but not yet honoured: the in-guest
+    /// Tool host re-runs the call at once (reverie-inguest
+    /// `drive_tool_syscall`, src/tool_host.rs:283-301 at 5d9d4c4f), with no
+    /// handler run in between, where Linux runs the handler and then restarts
+    /// the call. It is unreachable in 3c.1: phase 1 admits only `pause` in a
+    /// process that handles SIGALRM (F8), and `pause` ends with
+    /// `-ERESTARTNOHAND`. Running the handler before the host's re-run is a
+    /// step-3c.2 obligation. Any other restart code (`-ERESTARTNOINTR`, from
+    /// D41's not-run call when the caught handlers' masks hold the
+    /// default-fatal signal behind them) would need
     /// the register rewind and post-handler delivery of step 3c.2, and the
     /// pinned in-guest host would hand the raw code to the guest. It fails
     /// closed: the stopping refusal HERMIT_RESTART_AFTER_HANDLER (D49), which
