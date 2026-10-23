@@ -5873,6 +5873,28 @@ fn parse_smaps(smaps: &str) -> Vec<Mapping> {
     mappings
 }
 
+/// A5 step 3c.1d (round-1 ruling 4, 3c.1c's rule): whether Linux's copy
+/// from user memory of `[start, start + len)` by thread `tid` faults, as the
+/// thread's `/proc/<tid>/smaps` shows in its own turn: `Some(true)` for a byte
+/// in no mapping and not below a grow-down one, or in a mapping with no read,
+/// write or execute permission (x86 user mode reads any page with one of
+/// them; `first_user_unreadable`), or a range that overflows; `Some(false)`
+/// when every byte is readable by user mode or lies below a grow-down mapping
+/// the copy may grow; `None` when the mappings cannot be read.
+pub(crate) fn user_copy_faults(tid: i32, start: usize, len: usize) -> Option<bool> {
+    if start.checked_add(len).is_none() {
+        return Some(true);
+    }
+    let smaps = std::fs::read_to_string(format!("/proc/{tid}/smaps")).ok()?;
+    Some(matches!(
+        first_user_unreadable(&parse_smaps(&smaps), start, len),
+        Some(Unreadable::NoPermission)
+            | Some(Unreadable::Hole {
+                below_growsdown: false
+            })
+    ))
+}
+
 /// Why a byte is not readable by user mode (`first_user_unreadable`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Unreadable {
