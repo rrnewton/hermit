@@ -941,7 +941,10 @@ mod tests {
             // a_bad_redis_declaration_is_refused_rather_than_replaced (+2): 691.
             // Separately name the optional e9patch source-inspection leg (+1): 692.
             // And the two-run syscall-histogram test in dispatch_stats (+1): 693.
-            assert_eq!(population, 693);
+            // fatal_core_capture's
+            // a_fault_ends_the_run_while_the_leader_waits_on_a_condition_variable
+            // (+1): 694.
+            assert_eq!(population, 694);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

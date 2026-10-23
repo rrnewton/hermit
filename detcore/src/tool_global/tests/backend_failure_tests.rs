@@ -523,6 +523,7 @@ async fn unknown_deregistration(
                     syscall_count: 0,
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
+                    killed_by_group_signal: false,
                 }),
             ),
         )
@@ -607,6 +608,7 @@ async fn dbt_missing_physical_id_start_preserves_tombstone_deregistration_accoun
                         syscall_count: count,
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
+                        killed_by_group_signal: false,
                     }),
                 ),
             )

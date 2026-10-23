@@ -1732,8 +1732,17 @@ pub struct Scheduler {
     /// deadlocked.
     namespace_zap_victims: BTreeSet<DetPid>,
 
-    /// When the current wait for `namespace_zap_victims` began; reset once
-    /// none is left. Bounded by `namespace_zap_valve`.
+    /// Processes a fatal signal is ending: one of their threads died of a
+    /// signal that ends its whole thread group (`note_signal_killed_group`),
+    /// and Linux is ending the others, whose deaths are reported one by one
+    /// (the leader's last). While one of them still has a thread, an empty
+    /// run queue is waiting for those deaths, not deadlocked. Bounded, with
+    /// `namespace_zap_victims`, by `namespace_zap_valve`.
+    signal_death_victims: BTreeSet<DetPid>,
+
+    /// When the current wait for `namespace_zap_victims` or
+    /// `signal_death_victims` began; reset once none is left. Bounded by
+    /// `namespace_zap_valve`.
     namespace_zap_wait_since: Option<std::time::Instant>,
 
     /// `NAMESPACE_ZAP_VALVE`, shortened only by tests that expire it.
@@ -4383,6 +4392,7 @@ impl Scheduler {
             deregistration_accounted: Default::default(),
             pending_physical_process_exits: Default::default(),
             namespace_zap_victims: Default::default(),
+            signal_death_victims: Default::default(),
             namespace_zap_wait_since: None,
             namespace_zap_valve: Self::NAMESPACE_ZAP_VALVE,
             logically_exited_processes: Default::default(),
@@ -4707,6 +4717,13 @@ impl Scheduler {
         }
     }
 
+    /// Whether an empty run queue waits for `process`'s deaths after one of
+    /// its threads died of a fatal signal (test observation).
+    #[cfg(test)]
+    pub(crate) fn signal_death_victim(&self, process: DetPid) -> bool {
+        self.signal_death_victims.contains(&process)
+    }
+
     /// Whether a committed SIGKILL doomed `process`, and whether one with an
     /// unnamed victim was seen (test observation of the record above).
     #[cfg(test)]
@@ -4723,8 +4740,10 @@ impl Scheduler {
         self.forget_sigkill_receipt(dettid);
         self.committed_exits.remove(&dettid);
         self.retired_exited_leaders.remove(&dettid);
-        // A reused pid names a new process, not one a namespace's end doomed.
+        // A reused pid names a new process, not one a namespace's end or a
+        // fatal signal doomed.
         self.namespace_zap_victims.remove(&dettid);
+        self.signal_death_victims.remove(&dettid);
     }
 
     pub(crate) fn note_process_sigkill(
@@ -5451,6 +5470,7 @@ impl Scheduler {
                 .any(|tid| self.next_turns.contains_key(&tid))
         {
             self.namespace_zap_victims.remove(&registered);
+            self.signal_death_victims.remove(&registered);
             self.reparent_orphans(registered);
             self.work_span_parent_gone(registered);
         }
@@ -5459,8 +5479,9 @@ impl Scheduler {
             self.reparent_orphans(*detpid);
             self.work_span_parent_gone(*detpid);
             self.logically_exited_processes.insert(*detpid);
-            // The kill a namespace's end owed it has arrived.
+            // The kill a namespace's end or a fatal signal owed it has arrived.
             self.namespace_zap_victims.remove(detpid);
+            self.signal_death_victims.remove(detpid);
             // Linux decides at exit whether the parent reaps this child
             // automatically (do_notify_parent), and only for a child whose
             // exit signal is SIGCHLD; a later change of the parent's
@@ -5948,20 +5969,25 @@ impl Scheduler {
         }
     }
 
-    /// Whether a process `note_pid_namespace_end` saw Linux about to kill
-    /// still has a thread in the scheduler. Victims whose threads are all
-    /// gone are dropped. The run already carries the determinism loss for
-    /// them, so waiting here only lets the host's kill arrive; it cannot make
-    /// a comparable run depend on host timing.
+    /// Whether a process `note_pid_namespace_end` saw Linux about to kill,
+    /// or one a fatal signal is ending (`note_signal_killed_group`), still
+    /// has a thread in the scheduler. Victims whose threads are all gone are
+    /// dropped. A namespace's victims already carry the run's determinism
+    /// loss; a fatal signal's are threads the kernel has already queued
+    /// SIGKILL to, which run no further guest code. Either way, waiting here
+    /// only lets the host report deaths that are certain; it grants no turn
+    /// and moves no virtual time.
     fn awaiting_namespace_zap(&mut self) -> bool {
         let next_turns = &self.next_turns;
         let thread_tree = &self.thread_tree;
-        self.namespace_zap_victims.retain(|victim| {
+        let has_a_thread = |victim: &DetPid| {
             next_turns
                 .keys()
                 .any(|tid| thread_tree.process_of(*tid) == Some(*victim))
-        });
-        !self.namespace_zap_victims.is_empty()
+        };
+        self.namespace_zap_victims.retain(has_a_thread);
+        self.signal_death_victims.retain(has_a_thread);
+        !self.namespace_zap_victims.is_empty() || !self.signal_death_victims.is_empty()
     }
 
     /// The reaper Linux's `find_new_reaper` falls back to when no subreaper
@@ -6735,6 +6761,33 @@ impl Scheduler {
             && !self.thread_is_logically_killed(dettid)
         {
             self.logically_kill_thread(&dettid, &detpid, mm);
+        }
+    }
+
+    /// `dettid`, a thread of `detpid`, died of a signal that ends its whole
+    /// thread group (`signal_ends_thread_group`), and its accounted
+    /// deregistration took the ordinary path: no guest sent a SIGKILL through
+    /// the scheduler (`sigkill_retirement`). Such a death comes from a fault
+    /// (SIGSEGV, SIGBUS), an abort, a debugger's `kill` or `signal`, the OOM
+    /// killer or a host `kill`. Linux ends every thread of the group
+    /// (`get_signal` calls `do_group_exit`), and each death is reported in
+    /// turn, the leader's last. Until they all are, a thread of the group left
+    /// blocked, a leader in a futex wait no exit wakes above all, must not
+    /// read as a deadlock, so the process becomes a signal-death victim that
+    /// an empty run queue waits for (`awaiting_namespace_zap`). Each thread is
+    /// still retired at its own deregistration, which keeps the order a robust
+    /// list's owner deaths are accounted in.
+    pub(crate) fn note_signal_killed_group(&mut self, dettid: DetTid, detpid: DetPid) {
+        let others_live = self
+            .live_group_members(detpid)
+            .into_iter()
+            .any(|thread| thread != dettid && self.next_turns.contains_key(&thread));
+        if others_live {
+            info!(
+                "[scheduler] dettid {} died of a fatal signal; waiting for the other threads of process {} to die",
+                dettid, detpid
+            );
+            self.signal_death_victims.insert(detpid);
         }
     }
 
@@ -8207,7 +8260,8 @@ impl Scheduler {
     pub(crate) const SIGKILL_FENCE_VALVE: Duration = Duration::from_secs(30);
 
     /// How long, in host time, an empty run queue waits for Linux's kill of
-    /// the processes of an ended PID namespace to be reported
+    /// the processes of an ended PID namespace, or of the rest of a thread
+    /// group a fatal signal ends, to be reported
     /// (`report_terminal_deadlock_unless_zap_pending`) before the run is
     /// stopped by name. A backend that never reports such a death (an
     /// in-guest tool that a SIGKILL gives no exit hook) would otherwise wait
@@ -13263,9 +13317,10 @@ impl Scheduler {
     }
 
     /// [`Self::report_terminal_deadlock`], except while a process Linux is
-    /// killing for its namespace's end still has a thread
-    /// ([`Self::awaiting_namespace_zap`]): that thread, often a `pause(2)`
-    /// with no deadline, is about to die, so the state is not terminal. Spin
+    /// killing for its namespace's end, or for a fatal signal, still has a
+    /// thread ([`Self::awaiting_namespace_zap`]): that thread, often a
+    /// `pause(2)` or a futex wait with no deadline, is about to die, so the
+    /// state is not terminal. Spin
     /// until the backend reports the kill, as the external-IO wait does, but
     /// at most `namespace_zap_valve`: a backend that never reports the death
     /// gets a named deadlock instead of an unbounded wait.
@@ -13279,8 +13334,8 @@ impl Scheduler {
             .get_or_insert_with(std::time::Instant::now);
         if since.elapsed() < self.namespace_zap_valve {
             trace!(
-                "[scheduler] empty run-queue while Linux kills {:?} for their PID namespace's end. SPINNING!",
-                &self.namespace_zap_victims
+                "[scheduler] empty run-queue while Linux kills {:?} for their PID namespace's end and {:?} for a fatal signal. SPINNING!",
+                &self.namespace_zap_victims, &self.signal_death_victims
             );
             std::thread::yield_now();
             return SkipTurn;
@@ -13293,10 +13348,17 @@ impl Scheduler {
             && !self.terminal_is_refusal
             && let Some(report) = self.terminal_deadlock.as_mut()
         {
-            *report = format!(
-                "HERMIT_DEADLOCK: processes {:?}, which Linux kills because their PID namespace's init exited, were not reported dead within {:?}\n{}",
-                self.namespace_zap_victims, self.namespace_zap_valve, report
-            );
+            *report = if self.namespace_zap_victims.is_empty() {
+                format!(
+                    "HERMIT_DEADLOCK: processes {:?}, which a fatal signal ends, were not reported dead within {:?}\n{}",
+                    self.signal_death_victims, self.namespace_zap_valve, report
+                )
+            } else {
+                format!(
+                    "HERMIT_DEADLOCK: processes {:?}, which Linux kills because their PID namespace's init exited, were not reported dead within {:?}\n{}",
+                    self.namespace_zap_victims, self.namespace_zap_valve, report
+                )
+            };
         }
         skip
     }
@@ -31290,6 +31352,90 @@ mod test {
             report.contains("thread(s) waiting on futex"),
             "unexpected report:\n{report}"
         );
+    }
+
+    /// A thread that died of a fatal signal no guest sent through the
+    /// scheduler (a fault, a debugger's `kill`, the OOM killer) took its whole
+    /// group with it. Its leader, blocked in a futex wait no exit wakes, has
+    /// its exit reported only after every other thread is reaped; until then
+    /// the empty run queue waits for that death instead of reporting a
+    /// deadlock, and past the valve it names the process.
+    #[test]
+    fn a_fatal_signal_death_waits_for_its_group_so_a_blocked_leader_is_no_deadlock() {
+        let config = Config::default();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let parent = DetTid::from_raw(1);
+        let leader = DetTid::from_raw(3);
+        let worker = DetTid::from_raw(5);
+        let process = DetPid::from_raw(3);
+        let mm = MmId::initial(leader);
+        let futex = FutexID::private(mm, 0x4040e8);
+        let scheduler = || {
+            let mut scheduler = Scheduler::new(&config);
+            scheduler.thread_tree.add_child(parent, parent, true);
+            scheduler.thread_tree.add_child(parent, leader, true);
+            scheduler.thread_tree.add_child(leader, worker, false);
+            let mut wait = Resources::new(leader);
+            wait.insert(ResourceID::FutexWait, Permission::R);
+            for (thread, request) in [(leader, Ivar::full(Ok(wait))), (worker, Ivar::new())] {
+                scheduler.next_turns.insert(
+                    thread,
+                    ThreadNextTurn {
+                        dettid: thread,
+                        child_tid_addr: 0,
+                        req: request,
+                        resp: Ivar::new(),
+                        protocol: Default::default(),
+                    },
+                );
+            }
+            scheduler
+                .blocked
+                .futex_waiters
+                .entry(futex)
+                .or_default()
+                .push(futex_waiter(3, u32::MAX));
+            scheduler
+        };
+
+        // Retiring only the dead worker leaves the leader blocked.
+        let mut worker_only = scheduler();
+        worker_only.retire_deregistered_thread(worker, process, mm);
+        assert!(worker_only.step2d_handle_empty_queue(&global_time).is_err());
+        assert!(
+            worker_only.take_terminal_deadlock().is_some(),
+            "the blocked leader reads as a deadlock"
+        );
+
+        let mut killed = scheduler();
+        killed.retire_deregistered_thread(worker, process, mm);
+        killed.note_signal_killed_group(worker, process);
+        assert!(
+            killed.next_turns.contains_key(&leader),
+            "the leader is retired at its own deregistration"
+        );
+        assert!(killed.step2d_handle_empty_queue(&global_time).is_err());
+        assert_eq!(
+            killed.take_terminal_deadlock(),
+            None,
+            "the empty run queue waits for the leader's death"
+        );
+        killed.retire_deregistered_thread(leader, process, mm);
+        assert!(killed.futex_waiters_for_test(futex).is_empty());
+        let _ = killed.step2d_handle_empty_queue(&global_time);
+        assert_eq!(killed.take_terminal_deadlock(), None);
+
+        // A leader that never dies is a deadlock after all, at the valve.
+        let mut stuck = scheduler();
+        stuck.namespace_zap_valve = Duration::ZERO;
+        stuck.retire_deregistered_thread(worker, process, mm);
+        stuck.note_signal_killed_group(worker, process);
+        assert!(stuck.step2d_handle_empty_queue(&global_time).is_err());
+        let _ = stuck.step2d_handle_empty_queue(&global_time);
+        let report = stuck
+            .take_terminal_deadlock()
+            .expect("past the valve the wait is reported");
+        assert!(report.contains("which a fatal signal ends"), "{report}");
     }
 
     /// The positive half of the bracket: refusing to fast-forward onto an
