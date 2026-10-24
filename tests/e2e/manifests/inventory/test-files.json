@@ -1114,7 +1114,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/kill_multithreaded_process.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/kill_multithreaded_process.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_process_directed_signal_to_several_threads_is_refused_by_name compiles this guest, which sends kill and rt_sigqueueinfo to its own process with one thread and then with two, and requires delivery with one thread, the policy-refusal status naming the call under a fail-closed run, and ENOSYS with --allow-unsupported-syscalls (https://github.com/rrnewton/hermit/issues/4034); it remains a guest fixture because a generic manifest cannot assert this exact output or refusal status."
+      "why": "tests/c/kill_multithreaded_process.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_process_directed_signal_to_a_sleeping_sibling_is_refused_by_name compiles this guest, which sends kill and rt_sigqueueinfo to its own process with one thread and then with two, the second sleeping in sigsuspend, and requires delivery with one thread, the policy-refusal status naming the call under a fail-closed run, and ENOSYS with --allow-unsupported-syscalls (https://github.com/rrnewton/hermit/issues/4034); it remains a guest fixture because a generic manifest cannot assert this exact output or refusal status."
     },
     {
       "disposition": "guest-fixture",
@@ -1480,7 +1480,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/own_process_signal.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/own_process_signal.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests a_signal_to_the_senders_own_process_goes_to_the_sender_at_bitwise_parity and each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name compile this guest, which sends kill or rt_sigqueueinfo to its own two-threaded process in one mode per admitted case and per named refusal, and require Linux's output at bitwise parity for each admitted mode and the named refusal for each other (https://github.com/rrnewton/hermit/issues/4034); it remains a guest fixture because a generic manifest cannot assert these exact outputs, refusal reasons or verdicts."
+      "why": "tests/c/own_process_signal.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests a_signal_to_the_senders_own_process_goes_to_the_sender_at_bitwise_parity, each_unforced_signal_to_the_senders_own_process_reaches_the_thread_linux_chooses and each_signal_to_the_senders_own_process_detcore_cannot_route_is_refused_by_name compile this guest, which sends kill or rt_sigqueueinfo to its own two-threaded process in one mode per case, and require Linux's output at bitwise parity for each forwarded mode, Linux's output for each routed mode, and the named refusal for each other (https://github.com/rrnewton/hermit/issues/4034); it remains a guest fixture because a generic manifest cannot assert these exact outputs, refusal reasons or verdicts."
     },
     {
       "disposition": "guest-fixture",
@@ -1612,7 +1612,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/pidfd_send_signal_multithread.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/pidfd_send_signal_multithread.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_pidfd_signal_to_several_threads_is_refused_by_name compiles this guest, which sends pidfd_send_signal to its own process with one thread and then two, and requires delivery with one thread, the policy-refusal status naming pidfd_send_signal under a fail-closed run, and ENOSYS with --allow-unsupported-syscalls (https://github.com/rrnewton/hermit/issues/4047); it remains a guest fixture because a generic manifest cannot assert this exact output or refusal status."
+      "why": "tests/c/pidfd_send_signal_multithread.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test a_pidfd_signal_to_a_sleeping_sibling_is_refused_by_name compiles this guest, which sends pidfd_send_signal to its own process with one thread and then two, the second sleeping in sigsuspend, and requires delivery with one thread, the policy-refusal status under a fail-closed run, ENOSYS with --allow-unsupported-syscalls, and the kernel's answer without sequentialized threads (https://github.com/rrnewton/hermit/issues/4034); it remains a guest fixture because a generic manifest cannot assert this exact output or refusal status."
     },
     {
       "disposition": "manifest-test",
@@ -1859,6 +1859,12 @@
       "path": "tests/c/process_mrelease_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/process_mrelease_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/process_signal_receiver.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/process_signal_receiver.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests a_process_directed_signal_goes_to_the_thread_linux_chooses and a_signal_to_the_senders_own_process_that_another_thread_takes_is_refused_by_name compile this guest, which sends process-directed signals to multi-threaded processes (a parent's SIGTERM to a four-thread child whose threads all, all but one, or none leave it unblocked, a worker's pidfd SIGSEGV to its own process at the default disposition, and a worker's SIGUSR1 to its own process) and prints the receiving thread and its siginfo, and requires Linux's output under --strict, at bitwise parity for the three SIGTERM modes, and the named refusal for the SIGUSR1 mode (https://github.com/rrnewton/hermit/issues/4034); it remains a guest fixture because a generic manifest cannot assert this exact output, refusal reason or verdict."
     },
     {
       "disposition": "manifest-test",
