@@ -19,6 +19,7 @@ use reverie::syscalls;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Displayable;
+use reverie::syscalls::FcntlCmd;
 use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::ProtFlags;
@@ -1630,6 +1631,12 @@ pub trait NonblockableSyscall: SyscallInfo {
         0
     }
 
+    /// Whether this call is a receive that Linux ends without waiting once
+    /// its socket's read side is shut down (`finish_after_read_shutdown`).
+    fn ends_at_read_shutdown(&self) -> bool {
+        false
+    }
+
     /// Convert a physical nonblocking completion into the result expected by the guest.
     /// `retried` is true after a prior result was classified as blocked.
     fn normalize_nonblocking_result(
@@ -1972,6 +1979,10 @@ impl NonblockableSyscall for reverie::syscalls::Read {
         // Note that we've ruled out 0-count reads before this point.
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
     }
+
+    fn ends_at_read_shutdown(&self) -> bool {
+        true
+    }
 }
 
 /// While the read syscall is quite general, this nonblocking capacity is used
@@ -2006,6 +2017,10 @@ impl NonblockableSyscall for reverie::syscalls::Readv {
 
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+
+    fn ends_at_read_shutdown(&self) -> bool {
+        true
     }
 }
 
@@ -2084,6 +2099,10 @@ impl NonblockableSyscall for reverie::syscalls::Recvfrom {
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
     }
+
+    fn ends_at_read_shutdown(&self) -> bool {
+        true
+    }
 }
 
 #[async_trait]
@@ -2097,6 +2116,10 @@ impl NonblockableSyscall for reverie::syscalls::Recvmsg {
 
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+
+    fn ends_at_read_shutdown(&self) -> bool {
+        true
     }
 }
 
@@ -2113,6 +2136,10 @@ impl NonblockableSyscall for reverie::syscalls::Recvmmsg {
 
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+
+    fn ends_at_read_shutdown(&self) -> bool {
+        true
     }
 }
 
@@ -2563,6 +2590,17 @@ where
             Err(Error::Errno(error)) => Err(error),
             Err(error) => break Err(error),
         };
+        // Before the signal check: Linux looks for a pending signal only when
+        // the call must wait, and a receive on a socket shut down for reading
+        // does not. Record and replay poll a receive here only on a
+        // socketpair, through `subtool`; finishing it there would add
+        // recorded calls, a new recording format, so they keep polling.
+        if subtool.is_none()
+            && call.syscall_would_have_blocked(syscall_result)
+            && let Some(result) = finish_after_read_shutdown(guest, call).await
+        {
+            break result;
+        }
         if signaled && call.syscall_would_have_blocked(syscall_result) {
             let errno = call.signal_interrupt_errno();
             tracing::trace!(
@@ -2642,6 +2680,101 @@ where
         }
         _ => result,
     }
+}
+
+/// Ends a polled blocking receive as Linux does once its socket's read side is
+/// shut down.
+///
+/// Detcore polls a blocking receive on a physically nonblocking socket with
+/// nonblocking attempts (`retry_nonblocking_syscall`). On a datagram socket
+/// whose read side is shut down, Linux's blocking receive does not wait: with
+/// nothing queued it returns 0 at once (`__skb_wait_for_more_packets`). The
+/// nonblocking attempt fails with `EAGAIN` instead, every time, so the polled
+/// receive never ended, and a thread that shut a reader's socket down and then
+/// joined the reader waited forever.
+///
+/// After an attempt that would block on a socket whose read side a guest shut
+/// down (`DetFd::read_shutdown_requested`), this asks the kernel whether it is
+/// still shut (`read_side_shut_down`): a TCP disconnect opens it again. If it
+/// is, the blocking call cannot wait, so this runs the guest's call once with
+/// `O_NONBLOCK` cleared, then sets the flag back, and returns what Linux
+/// returned, with the address lengths it wrote. `None` for any other call or
+/// socket, or while the read side is open: the attempt's `EAGAIN` stands and
+/// the poll goes on, with no extra call.
+async fn finish_after_read_shutdown<T, G, C>(guest: &mut G, call: C) -> Option<Result<i64, Error>>
+where
+    C: NonblockableSyscall + Into<Syscall>,
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let fd = get_fd(call.into()).filter(|_| call.ends_at_read_shutdown())?;
+    let shut_down_by_guest = guest.thread_state().with_detfd(fd, |detfd| {
+        matches!(detfd.ty(), FdType::Socket) && detfd.read_shutdown_requested()
+    });
+    if shut_down_by_guest != Ok(true) || !read_side_shut_down(guest, fd).await {
+        return None;
+    }
+    let fcntl = |cmd| syscalls::Fcntl::new().with_fd(fd).with_cmd(cmd);
+    // Nothing has changed if either of these fails: the attempt's EAGAIN stands.
+    let flags = match guest.inject_with_retry(fcntl(FcntlCmd::F_GETFL)).await {
+        Ok(flags) => flags as libc::c_int,
+        Err(errno) => {
+            tracing::warn!("socket {fd}: F_GETFL before a read-shutdown receive failed: {errno}");
+            return None;
+        }
+    };
+    let blocking = fcntl(FcntlCmd::F_SETFL(flags & !libc::O_NONBLOCK));
+    if let Err(errno) = guest.inject_with_retry(blocking).await {
+        tracing::warn!(
+            "socket {fd}: clearing O_NONBLOCK for a read-shutdown receive failed: {errno}"
+        );
+        return None;
+    }
+    let result = guest.inject_with_retry(call).await.map_err(Error::from);
+    // Every later attempt on this description assumes it is nonblocking; one
+    // that blocked would hold the turn forever.
+    if let Err(errno) = guest
+        .inject_with_retry(fcntl(FcntlCmd::F_SETFL(flags)))
+        .await
+    {
+        panic!("socket {fd}: restoring O_NONBLOCK after a read-shutdown receive failed: {errno}");
+    }
+    tracing::trace!(
+        "retry_nonblocking_syscall: {} ran blocking after a read shutdown: {:?}",
+        call.display(&guest.memory()),
+        result
+    );
+    Some(result)
+}
+
+/// Whether the kernel reports `fd`'s read side shut down: `POLLRDHUP` from a
+/// `poll` with a zero timeout, which Linux sets exactly when the socket's
+/// `RCV_SHUTDOWN` is set (`datagram_poll`, `unix_dgram_poll`, `tcp_poll`).
+async fn read_side_shut_down<T, G>(guest: &mut G, fd: i32) -> bool
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut stack = guest.stack().await;
+    let pollfd: AddrMut<libc::pollfd> = stack.reserve();
+    let Ok(_guard) = stack.commit() else {
+        return false;
+    };
+    let probe = syscalls::Poll::new()
+        .with_fds(Some(pollfd.cast()))
+        .with_nfds(1)
+        .with_timeout(0);
+    let request = libc::pollfd {
+        fd,
+        events: libc::POLLRDHUP,
+        revents: 0,
+    };
+    guest.memory().write_value(pollfd, &request).is_ok()
+        && guest.inject_with_retry(probe).await == Ok(1)
+        && guest
+            .memory()
+            .read_value(pollfd)
+            .is_ok_and(|polled| polled.revents & libc::POLLRDHUP != 0)
 }
 
 /// Retry a blocking wait on a backend that decides signal interruption from the

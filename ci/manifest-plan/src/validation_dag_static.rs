@@ -3999,7 +3999,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (A5 step 3c slice 0c): 600, listed.
     // And liteinst_in_guest_programs::in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name
     // (A5 step 3c slice 0g): 601, listed.
-    ("test.cli", 601),
+    // And a_datagram_receive_ends_when_its_read_side_is_shut_down: 602.
+    ("test.cli", 602),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4489,7 +4490,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unchanged at 520.
     // The in-guest unsequentialized-handler refusal test (slice 0g) starts the
     // in-guest runtime too and joins the hosted exclusions: unchanged at 520.
-    ("test.cli_on_host", 520),
+    // And a_datagram_receive_ends_when_its_read_side_is_shut_down: 521.
+    ("test.cli_on_host", 521),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

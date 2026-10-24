@@ -504,6 +504,12 @@ struct OpenFileDescription {
     // TODO-HUMAN-REVIEW(PR-3908)
     #[serde(default)]
     accept_in_turn_eligible: bool,
+    /// True once a guest's `shutdown(2)` with `SHUT_RD` or `SHUT_RDWR` shut
+    /// this socket's read side. A polled blocking receive on it then asks the
+    /// kernel whether the call would still wait. Permanent. See
+    /// `read_shutdown_requested`.
+    #[serde(default)]
+    read_shutdown_requested: bool,
     /// True once this socket was named in an `SCM_RIGHTS` message, so a
     /// process outside Detcore's view may hold it. Permanent. See
     /// `is_exported`.
@@ -643,6 +649,7 @@ impl std::fmt::Debug for OpenFileDescription {
         debug.field("socketpair_endpoint", &self.socketpair_endpoint);
         debug.field("accepted_connection", &self.accepted_connection);
         debug.field("accept_in_turn_eligible", &self.accept_in_turn_eligible);
+        debug.field("read_shutdown_requested", &self.read_shutdown_requested);
         debug.field("exported", &self.exported);
         debug.field("receive_timeout", &self.receive_timeout);
         debug.field("flock_mode", &self.flock_mode);
@@ -883,6 +890,7 @@ impl DetFd {
                 socketpair_endpoint: false,
                 accepted_connection: false,
                 accept_in_turn_eligible: false,
+                read_shutdown_requested: false,
                 exported: false,
                 receive_timeout: ReceiveTimeout::None,
                 flock_mode: None,
@@ -1897,6 +1905,21 @@ impl DetFd {
     /// Whether this open file was marked eligible, exported or not.
     pub(crate) fn is_accept_in_turn_eligible(&self) -> bool {
         self.with_description(|d| d.accept_in_turn_eligible)
+    }
+
+    /// Mark this socket as one whose read side a guest shut down. It applies
+    /// to the open file description, so dup and fork aliases are covered too.
+    pub(crate) fn set_read_shutdown_requested(&self) {
+        self.with_description(|d| d.read_shutdown_requested = true);
+    }
+
+    /// Whether a guest shut this socket's read side down. Only such a datagram
+    /// socket can have a blocking receive that Linux ends at once while its
+    /// nonblocking attempt fails with `EAGAIN`, because Linux sets a datagram
+    /// socket's read shutdown only in its own `shutdown(2)`
+    /// (`syscalls::helpers::finish_after_read_shutdown`).
+    pub(crate) fn read_shutdown_requested(&self) -> bool {
+        self.with_description(|d| d.read_shutdown_requested)
     }
 
     /// Mark this open file description's locks as followed by
