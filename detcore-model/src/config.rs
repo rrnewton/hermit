@@ -766,17 +766,25 @@ pub struct Config {
     #[clap(long)]
     pub kill_daemons: bool,
 
-    /// Start gdbserver on `gdbserver_port` for remote debugging
-    /// Disabled by default.
+    /// Serve the guest to one gdb client on 127.0.0.1:`--gdbserver-port`, and
+    /// wait for it before the guest runs; attach with
+    /// `gdb -ex 'target remote 127.0.0.1:PORT' PROGRAM`. The port is bound in the
+    /// host's network namespace, so the guest keeps the network `--network`
+    /// gives it, and a `--strict` run can be debugged with every strict refusal
+    /// in force. The debugger is an input of the run: breakpoints, writes to the
+    /// guest's memory or registers and the signals it sends all change it. With
+    /// a gdbserver, Detcore also takes no reports of the guest's signal-handler
+    /// returns, so a multithreaded guest whose handlers take scheduler turns can
+    /// be scheduled differently than without one (docs/SIGNAL_STATE_CHECK.md).
+    /// Only the ptrace backend (the default, and `--backend=e9patch`, whose
+    /// rewritten guest runs under it) serves gdb: `--backend=kvm`, `dbt`,
+    /// `sabre`, `liteinst` and `in-guest-trap`, and `--namespace-only`, refuse
+    /// `--gdbserver` and `--dap-listen`.
     #[clap(long)]
     pub gdbserver: bool,
-    /// port gdbserver listening on
-    #[clap(
-        long,
-        value_name = "uint16",
-        help = "Port gdbserver listening on",
-        default_value = "1234"
-    )]
+    /// The loopback TCP port `--gdbserver` serves on; 0 lets the system pick a
+    /// free one, which the run prints.
+    #[clap(long, value_name = "uint16", default_value = "1234")]
     pub gdbserver_port: u16,
 
     /// Configure the maximum time a guest thread may run without returning to Detcore. This is

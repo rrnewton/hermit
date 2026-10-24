@@ -1081,8 +1081,9 @@ pub struct RunOpts {
     /// Implies --gdbserver: it starts `hermit-dap --listen` from beside this
     /// executable, and the client's attach request names the program and the
     /// GDB server, as printed. Not with --verify, which runs the program
-    /// twice, --namespace-only, which has no GDB server, or --image, whose
-    /// program lives in the image. See DEBUGGING.md.
+    /// twice, --namespace-only, which has no GDB server, a backend without
+    /// one (only ptrace serves gdb), or --image, whose program lives in the
+    /// image. See DEBUGGING.md.
     #[clap(
         long,
         value_name = "[HOST:]PORT",
@@ -4713,6 +4714,74 @@ fn liteinst_in_guest_refuses_options_it_cannot_honour() {
         .unwrap();
 }
 
+/// Only the ptrace backend serves gdb. `--gdbserver` and `--dap-listen` on a
+/// backend without a gdbserver, `--strict` included, and with
+/// `--namespace-only`, are refused naming the remedy; the ptrace and e9patch
+/// backends keep them, and the other backends run without them as before.
+#[test]
+fn backends_without_a_gdbserver_refuse_gdbserver_and_dap_listen() {
+    let refusal = |argv: &[&str]| {
+        let mut argv = argv.to_vec();
+        argv.push("fakeprog");
+        run_opts_for(&argv).refuse_gdbserver_without_a_gdbserver()
+    };
+    for backend in ["kvm", "dbt", "sabre"] {
+        let flag = format!("--backend={backend}");
+        for (options, option) in [
+            (&["--gdbserver"][..], "--gdbserver"),
+            (&["--strict", "--gdbserver"], "--gdbserver"),
+            (&["--dap-listen=4711"], "--dap-listen"),
+        ] {
+            let mut argv = vec!["hermit", flag.as_str(), "run"];
+            argv.extend_from_slice(options);
+            let error = refusal(&argv).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                error.downcast_ref::<PolicyRefusal>().is_some(),
+                "{argv:?}: {error:#}"
+            );
+            assert!(
+                message.starts_with(&format!("{option} needs a gdbserver")),
+                "{argv:?}: {message}"
+            );
+            assert!(
+                message.contains(&format!("the {backend} backend has none")),
+                "{argv:?}: {message}"
+            );
+            assert!(
+                message.contains(&format!("drop {flag} (ptrace is the default)")),
+                "{argv:?}: {message}"
+            );
+        }
+        refusal(&["hermit", flag.as_str(), "run"]).unwrap();
+    }
+    let error = refusal(&["hermit", "run", "--namespace-only", "--gdbserver"]).unwrap_err();
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    assert!(
+        error.to_string().contains("drop --namespace-only"),
+        "{error:#}"
+    );
+    for flag in ["--backend=ptrace", "--backend=e9patch"] {
+        refusal(&["hermit", flag, "run", "--gdbserver"]).unwrap();
+        refusal(&["hermit", flag, "run", "--strict", "--gdbserver"]).unwrap();
+    }
+    refusal(&["hermit", "run", "--dap-listen=4711"]).unwrap();
+    // Argument validation refuses it too, before any other check of the run.
+    let mut strict_kvm = run_opts_for(&[
+        "hermit",
+        "--backend=kvm",
+        "run",
+        "--strict",
+        "--gdbserver",
+        "fakeprog",
+    ]);
+    let error = strict_kvm.validate_args().unwrap_err();
+    assert!(
+        error.to_string().contains("the kvm backend has none"),
+        "{error:#}"
+    );
+}
+
 /// Without the `liteinst` feature there is no in-guest runtime to advise
 /// about: a `--backend=liteinst` run that no other in-guest refusal stops,
 /// including one with the default maximum timeslice, is refused for the
@@ -5097,14 +5166,18 @@ fn strict_rejects_strace_only() {
 
 #[test]
 fn strict_rejects_every_route_to_host_networking() {
-    // Explicit, and the two routes that reach host networking as a side effect
-    // of a flag that is not about networking. All three were accepted silently
-    // before: measured from inside the guest, each showed interfaces `eth0 lo`
-    // where `--strict` alone shows `lo`.
+    // Explicit, and the route that reaches host networking as a side effect of
+    // a flag that is not about networking. Both were accepted silently before:
+    // measured from inside the guest, each showed interfaces `eth0 lo` where
+    // `--strict` alone shows `lo`. With `--gdbserver` as well, the refusal
+    // still names the network flag, the one cause.
     for (args, expected_cause) in [
         (vec!["--strict", "--network=host"], "--network=host"),
         (vec!["--strict", "--no-namespace"], "--no-namespace"),
-        (vec!["--strict", "--gdbserver"], "--gdbserver"),
+        (
+            vec!["--strict", "--gdbserver", "--network=host"],
+            "--network=host",
+        ),
     ] {
         let mut argv = vec!["fakehermit"];
         argv.extend(args.iter().copied());
@@ -5312,20 +5385,26 @@ fn non_strict_runs_still_allow_host_networking() {
     assert_eq!(opts.network, NetworkingMode::Host);
 }
 
+/// `--gdbserver` leaves the network as asked: its port is bound in the host's
+/// network namespace before the container exists, so the guest keeps its
+/// private network, under `--strict` too, where a debugger can now attach to
+/// the strict run itself.
 #[test]
-fn gdbserver_forces_host_networking() {
-    // Without --gdbserver the default networking stays local.
-    let mut plain = RunOpts::parse_from(["fakehermit", "fakeprog"]);
-    plain.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(plain.network, NetworkingMode::Local);
-
-    // With --gdbserver the isolated network namespace would hide the gdbserver
-    // port from a host gdb client, so networking is forced to host.
-    let mut opts = RunOpts::parse_from(["fakehermit", "--gdbserver", "fakeprog"]);
-    assert_eq!(opts.network, NetworkingMode::Local);
-    opts.validate_args_with_perf_support(true).unwrap();
-    assert!(opts.det_opts.det_config.gdbserver);
-    assert_eq!(opts.network, NetworkingMode::Host);
+fn gdbserver_keeps_the_guest_network() {
+    for args in [
+        &["--gdbserver"][..],
+        &["--strict", "--gdbserver"],
+        &["--strict", "--gdbserver", "--gdbserver-port=0"],
+    ] {
+        let mut argv = vec!["fakehermit"];
+        argv.extend(args);
+        argv.push("fakeprog");
+        let mut opts = RunOpts::parse_from(&argv);
+        opts.validate_args_with_perf_support(true)
+            .unwrap_or_else(|error| panic!("{argv:?} must be admitted: {error:#}"));
+        assert!(opts.det_opts.det_config.gdbserver, "{argv:?}");
+        assert_eq!(opts.network, NetworkingMode::Local, "{argv:?}");
+    }
 }
 
 #[test]
@@ -5335,21 +5414,18 @@ fn gdbserver_respects_explicit_host_networking() {
     assert_eq!(opts.network, NetworkingMode::Host);
 }
 
+/// `--analyze-networking` needs the isolated namespace, which `--gdbserver`
+/// no longer leaves, so the two combine.
 #[test]
-fn gdbserver_conflicts_with_analyze_networking() {
+fn gdbserver_combines_with_analyze_networking() {
     let mut opts = RunOpts::parse_from([
         "fakehermit",
         "--gdbserver",
         "--analyze-networking",
         "fakeprog",
     ]);
-    let error = opts.validate_args_with_perf_support(true).unwrap_err();
-    let message = error.to_string();
-    assert!(message.contains("--gdbserver"), "message: {message}");
-    assert!(
-        message.contains("--analyze-networking"),
-        "message: {message}"
-    );
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert!(opts.network.uses_local_namespace(opts.analyze_networking));
 }
 
 #[test]
@@ -6480,6 +6556,47 @@ impl RunOpts {
         }
     }
 
+    /// Refuses `--gdbserver`, and `--dap-listen`, which implies it, where the
+    /// run would have no gdbserver. Only Reverie's ptrace tracer serves gdb:
+    /// `--backend=ptrace`, the default, and `--backend=e9patch`, whose
+    /// rewritten guest runs under it. The KVM, DBT and SaBRe backends used to
+    /// run the guest without a gdbserver and without a word, so the debugger
+    /// waited on a port nothing served, and a `--strict` run took the flag
+    /// once `--gdbserver` stopped forcing host networking. `--namespace-only`
+    /// runs no tracer at all. The in-guest LiteInst backends refuse it on
+    /// their own (`refuse_unqualified_liteinst_in_guest_options`).
+    fn refuse_gdbserver_without_a_gdbserver(&self) -> Result<(), Error> {
+        let option = if self.dap_listen.is_some() {
+            "--dap-listen"
+        } else if self.det_opts.det_config.gdbserver {
+            "--gdbserver"
+        } else {
+            return Ok(());
+        };
+        let (cause, remedy) = if self.namespace_only {
+            (
+                "--namespace-only runs the guest without a tracer".to_owned(),
+                "drop --namespace-only".to_owned(),
+            )
+        } else {
+            match self.selected_backend() {
+                backend @ (Backend::Kvm | Backend::Dbt | Backend::Sabre) => (
+                    format!("the {} backend has none", backend.as_str()),
+                    format!(
+                        "run it with the ptrace backend: drop --backend={} (ptrace is the \
+                         default) or pass --backend=ptrace",
+                        backend.as_str()
+                    ),
+                ),
+                _ => return Ok(()),
+            }
+        };
+        Err(Error::new(PolicyRefusal).context(format!(
+            "{option} needs a gdbserver, which only the ptrace backend runs: {cause}, so no \
+             debugger could attach; {remedy}"
+        )))
+    }
+
     fn refuse_unqualified_liteinst_in_guest_options(&self) -> Result<(), Error> {
         if !self.uses_in_guest_liteinst() {
             return Ok(());
@@ -6821,6 +6938,10 @@ impl RunOpts {
         // Admission must see the actual global backend before any launch.
         self.set_backend(global.backend);
         self.refuse_unready_exec_stop()?;
+        // Before stdin is read or any backend is probed, so a backend that
+        // cannot even start here gets the same verdict, and before
+        // `--dap-listen` binds its port and starts the run it supervises.
+        self.refuse_gdbserver_without_a_gdbserver()?;
         if self.dap_listen.is_some() {
             // Before validation, so every --gdbserver refusal applies.
             self.det_opts.det_config.gdbserver = true;
@@ -7267,6 +7388,7 @@ impl RunOpts {
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
         self.refuse_unready_exec_stop()?;
+        self.refuse_gdbserver_without_a_gdbserver()?;
         refuse_signal_state_check_env(std::env::var_os(SIGNAL_STATE_CHECK_ENV).as_deref())
             .map_err(Error::msg)?;
         let timer = if self.arms_reverie_ptrace_pmu_timer() {
@@ -7709,32 +7831,6 @@ impl RunOpts {
             );
         }
 
-        // The gdbserver listens on a TCP port that is bound inside the guest's
-        // network namespace. With the default isolated (`local`) networking, that
-        // port lives in the guest's unshared netns and is unreachable from a host
-        // gdb client, so `hermit run --gdbserver` silently hangs waiting for a
-        // connection that can never arrive. Fall back to host networking so the
-        // debugger can attach. This mirrors how replay-mode gdbserver already
-        // works: a gdb-served replay never unshares the network namespace, which
-        // is exactly why its gdbserver is reachable from the host.
-        if self.det_opts.det_config.gdbserver && self.network == NetworkingMode::Local {
-            if self.analyze_networking {
-                anyhow::bail!(
-                    "--gdbserver requires host networking so a host gdb client can reach the \
-                     gdbserver port, but --analyze-networking forces an isolated network \
-                     namespace. Run these two modes separately."
-                );
-            }
-            // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
-            crate::tracing::diagnostic_eprintln!(
-                "WARNING: --gdbserver requires host networking so a host gdb client can reach \
-                 the gdbserver port; overriding --network=local with --network=host for this \
-                 debug session. Network isolation and deterministic networking are disabled \
-                 while the gdbserver is attached."
-            );
-            self.network = NetworkingMode::Host;
-        }
-
         // `--strict` calls itself fail-closed strict deterministic mode, so it
         // must refuse the settings hermit itself documents as
         // determinism-compromising rather than accept them silently. Before
@@ -7742,14 +7838,14 @@ impl RunOpts {
         // `--network`'s own help says `host` "compromises isolation and
         // deterministic reproducibility".
         //
-        // Checked HERE, after every override above, because two of the three
-        // routes to host networking are side effects of flags that are not
-        // about networking at all: `--no-namespace` sets it above, and
-        // `--gdbserver` sets it just above (that one at least prints a
-        // warning; the others were silent). Measured from inside the guest,
-        // `--strict` alone sees interfaces `lo`, while `--strict --network=host`,
-        // `--strict --no-namespace` and `--strict --strace-only` all see
-        // `eth0 lo`.
+        // Checked HERE, after every override above, because one of the two
+        // routes to host networking is a side effect of a flag that is not
+        // about networking at all: `--no-namespace` sets it above, silently.
+        // Measured from inside the guest, `--strict` alone sees interfaces
+        // `lo`, while `--strict --network=host`, `--strict --no-namespace` and
+        // `--strict --strace-only` all see `eth0 lo`. `--gdbserver` is not a
+        // route: its port is bound in the host's namespace before the
+        // container exists (`hermit::gdbserver`), so the guest keeps `lo`.
         //
         // This forbids rather than warns because the directive is that a hole
         // must be opened deliberately: drop `--strict`, or ask for the hole
@@ -7757,8 +7853,6 @@ impl RunOpts {
         if self.strict && self.network == NetworkingMode::Host {
             let cause = if self.no_namespace {
                 "--no-namespace, which forces host networking"
-            } else if self.det_opts.det_config.gdbserver {
-                "--gdbserver, which forces host networking"
             } else {
                 "--network=host"
             };
@@ -7842,8 +7936,7 @@ impl RunOpts {
             (
                 config.gdbserver,
                 "--gdbserver",
-                "it moves every trial to the host network and makes each one wait for a debugger \
-                 on the same port",
+                "it makes every trial wait for a debugger on the same port",
             ),
             (
                 self.dap_listen.is_some(),
@@ -8890,6 +8983,7 @@ impl RunOpts {
         T: serde::Serialize + serde::de::DeserializeOwned + 'static,
     {
         self.refuse_unready_exec_stop()?;
+        let gdbserver_port = self.bind_gdbserver_port()?;
         let (mut container, tmpfs, identity, resources) = if self.no_namespace {
             let mut container = Container::new();
             apply_affinity(&mut container, self.pin_threads);
@@ -8918,16 +9012,19 @@ impl RunOpts {
         let native_plan: Option<()> = None;
         super::owned_container::run(
             &mut container,
-            (tmpfs, identity, guards, native_plan),
+            (tmpfs, identity, guards, native_plan, gdbserver_port),
             resources,
             !self.no_namespace,
             "with_container",
             timeout,
-            move |(_, identity, guards, native_plan)| {
+            move |(_, identity, guards, native_plan, gdbserver_port)| {
                 // What the mount plan made, before anything else uses the
                 // container's mounts (a no-op for a plan with no record).
                 if let Some(identity) = identity.as_mut() {
                     identity.record_plan()?;
+                }
+                if let Some(port) = gdbserver_port.take() {
+                    port.serve_next_gdbserver();
                 }
                 #[cfg(feature = "native-exec")]
                 let native = native_plan
@@ -8939,7 +9036,41 @@ impl RunOpts {
                 work(guards, identity.as_ref(), native)
             },
         )
-        .map(|(value, (_, _, guards, _))| (value, guards))
+        .map(|(value, (_, _, guards, _, _))| (value, guards))
+    }
+
+    /// For a `--gdbserver` run on the ptrace tracer, the one that serves gdb,
+    /// binds the gdbserver's port here, in the host's network namespace,
+    /// before the container exists, so a gdb client on the host reaches it
+    /// whatever network the guest has ([`hermit::gdbserver`]), and says where
+    /// to attach.
+    fn bind_gdbserver_port(&self) -> Result<Option<hermit::gdbserver::GdbPort>, Error> {
+        let config = &self.det_opts.det_config;
+        if !config.gdbserver || self.runtime_backend() != Backend::Ptrace {
+            return Ok(None);
+        }
+        let port = hermit::gdbserver::GdbPort::bind(config.gdbserver_port).with_context(|| {
+            // `--dap-listen` must know the port, so it refuses 0.
+            let remedy = if self.dap_listen.is_some() {
+                "pass another --gdbserver-port"
+            } else {
+                "pass another --gdbserver-port, or --gdbserver-port=0 to let the system pick one"
+            };
+            format!(
+                "Hermit cannot serve gdb on 127.0.0.1:{}: {remedy}",
+                config.gdbserver_port
+            )
+        })?;
+        // A `--dap-listen` run's supervisor names the attach request instead.
+        if self.dap_listen.is_none() {
+            crate::tracing::diagnostic_eprintln!(
+                "hermit run: the guest waits for one gdb client on 127.0.0.1:{0} before it \
+                 starts; attach with: gdb -ex 'target remote 127.0.0.1:{0}' {1}",
+                port.port(),
+                self.program.display()
+            );
+        }
+        Ok(Some(port))
     }
 
     fn run_with_namespace_only(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
