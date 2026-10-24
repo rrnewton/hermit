@@ -1177,8 +1177,9 @@ pub struct RunOpts {
     /// Implies --gdbserver: it starts `hermit-dap --listen` from beside this
     /// executable, and the client's attach request names the program and the
     /// GDB server, as printed. Not with --verify, which runs the program
-    /// twice, --namespace-only, which has no GDB server, or --image, whose
-    /// program lives in the image. See DEBUGGING.md.
+    /// twice, --namespace-only, which has no GDB server, a backend without
+    /// one (only ptrace serves gdb), or --image, whose program lives in the
+    /// image. See DEBUGGING.md.
     #[clap(
         long,
         value_name = "[HOST:]PORT",
@@ -4985,6 +4986,74 @@ fn liteinst_in_guest_refuses_options_it_cannot_honour() {
         .unwrap();
 }
 
+/// Only the ptrace backend serves gdb. `--gdbserver` and `--dap-listen` on a
+/// backend without a gdbserver, `--strict` included, and with
+/// `--namespace-only`, are refused naming the remedy; the ptrace and e9patch
+/// backends keep them, and the other backends run without them as before.
+#[test]
+fn backends_without_a_gdbserver_refuse_gdbserver_and_dap_listen() {
+    let refusal = |argv: &[&str]| {
+        let mut argv = argv.to_vec();
+        argv.push("fakeprog");
+        run_opts_for(&argv).refuse_gdbserver_without_a_gdbserver()
+    };
+    for backend in ["kvm", "dbt", "sabre"] {
+        let flag = format!("--backend={backend}");
+        for (options, option) in [
+            (&["--gdbserver"][..], "--gdbserver"),
+            (&["--strict", "--gdbserver"], "--gdbserver"),
+            (&["--dap-listen=4711"], "--dap-listen"),
+        ] {
+            let mut argv = vec!["hermit", flag.as_str(), "run"];
+            argv.extend_from_slice(options);
+            let error = refusal(&argv).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                error.downcast_ref::<PolicyRefusal>().is_some(),
+                "{argv:?}: {error:#}"
+            );
+            assert!(
+                message.starts_with(&format!("{option} needs a gdbserver")),
+                "{argv:?}: {message}"
+            );
+            assert!(
+                message.contains(&format!("the {backend} backend has none")),
+                "{argv:?}: {message}"
+            );
+            assert!(
+                message.contains(&format!("drop {flag} (ptrace is the default)")),
+                "{argv:?}: {message}"
+            );
+        }
+        refusal(&["hermit", flag.as_str(), "run"]).unwrap();
+    }
+    let error = refusal(&["hermit", "run", "--namespace-only", "--gdbserver"]).unwrap_err();
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    assert!(
+        error.to_string().contains("drop --namespace-only"),
+        "{error:#}"
+    );
+    for flag in ["--backend=ptrace", "--backend=e9patch"] {
+        refusal(&["hermit", flag, "run", "--gdbserver"]).unwrap();
+        refusal(&["hermit", flag, "run", "--strict", "--gdbserver"]).unwrap();
+    }
+    refusal(&["hermit", "run", "--dap-listen=4711"]).unwrap();
+    // Argument validation refuses it too, before any other check of the run.
+    let mut strict_kvm = run_opts_for(&[
+        "hermit",
+        "--backend=kvm",
+        "run",
+        "--strict",
+        "--gdbserver",
+        "fakeprog",
+    ]);
+    let error = strict_kvm.validate_args().unwrap_err();
+    assert!(
+        error.to_string().contains("the kvm backend has none"),
+        "{error:#}"
+    );
+}
+
 /// Without the `liteinst` feature there is no in-guest runtime to advise
 /// about: a `--backend=liteinst` run that no other in-guest refusal stops,
 /// including one with the default maximum timeslice, is refused for the
@@ -6924,6 +6993,10 @@ impl RunOpts {
         self.set_backend(backend);
         self.lower_strace_only();
         self.refuse_unready_exec_stop()?;
+        // Before stdin is read or any backend is probed, so a backend that
+        // cannot even start here gets the same verdict, and before
+        // `--dap-listen` binds its port and starts the run it supervises.
+        self.refuse_gdbserver_without_a_gdbserver()?;
         if self.dap_listen.is_none() {
             return Ok(RunDispatch::Run);
         }
@@ -7139,6 +7212,47 @@ impl RunOpts {
             Err(refusal) => Err(Error::new(PolicyRefusal)
                 .context(format!("--cpu-profile x86-64-v3 refused: {refusal}"))),
         }
+    }
+
+    /// Refuses `--gdbserver`, and `--dap-listen`, which implies it, where the
+    /// run would have no gdbserver. Only Reverie's ptrace tracer serves gdb:
+    /// `--backend=ptrace`, the default, and `--backend=e9patch`, whose
+    /// rewritten guest runs under it. The KVM, DBT and SaBRe backends used to
+    /// run the guest without a gdbserver and without a word, so the debugger
+    /// waited on a port nothing served, and a `--strict` run took the flag
+    /// once `--gdbserver` stopped forcing host networking. `--namespace-only`
+    /// runs no tracer at all. The in-guest LiteInst backends refuse it on
+    /// their own (`refuse_unqualified_liteinst_in_guest_options`).
+    fn refuse_gdbserver_without_a_gdbserver(&self) -> Result<(), Error> {
+        let option = if self.dap_listen.is_some() {
+            "--dap-listen"
+        } else if self.det_opts.det_config.gdbserver {
+            "--gdbserver"
+        } else {
+            return Ok(());
+        };
+        let (cause, remedy) = if self.namespace_only {
+            (
+                "--namespace-only runs the guest without a tracer".to_owned(),
+                "drop --namespace-only".to_owned(),
+            )
+        } else {
+            match self.selected_backend() {
+                backend @ (Backend::Kvm | Backend::Dbt | Backend::Sabre) => (
+                    format!("the {} backend has none", backend.as_str()),
+                    format!(
+                        "run it with the ptrace backend: drop --backend={} (ptrace is the \
+                         default) or pass --backend=ptrace",
+                        backend.as_str()
+                    ),
+                ),
+                _ => return Ok(()),
+            }
+        };
+        Err(Error::new(PolicyRefusal).context(format!(
+            "{option} needs a gdbserver, which only the ptrace backend runs: {cause}, so no \
+             debugger could attach; {remedy}"
+        )))
     }
 
     fn refuse_unqualified_liteinst_in_guest_options(&self) -> Result<(), Error> {
@@ -7933,6 +8047,7 @@ impl RunOpts {
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
         self.refuse_unready_exec_stop()?;
+        self.refuse_gdbserver_without_a_gdbserver()?;
         refuse_signal_state_check_env(std::env::var_os(SIGNAL_STATE_CHECK_ENV).as_deref())
             .map_err(Error::msg)?;
         let timer = if self.arms_reverie_ptrace_pmu_timer() {
