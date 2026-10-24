@@ -2252,6 +2252,18 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/scm_rights_received_anon_inodes.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/scm_rights_received_anon_inodes.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Receives an eventfd, an EFD_SEMAPHORE eventfd, a nonblocking eventfd and a signalfd over SCM_RIGHTS and pins, on ptrace and KVM, that Detcore leaves received anonymous inodes unrecorded without hanging"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/scm_rights_received_descriptors.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/scm_rights_received_descriptors.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Receives a file, pipe, eventfd, socketpair and append descriptor over SCM_RIGHTS (recvmsg, MSG_CMSG_CLOEXEC, recvmmsg, MSG_CTRUNC) and uses them, on every backend, as Detcore records received descriptors where its tool does not discover them as they are used"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/seccomp_refusal.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/seccomp_refusal.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"

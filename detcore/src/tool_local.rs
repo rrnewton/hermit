@@ -1446,32 +1446,7 @@ impl FileMetadata {
         }
         let raw_stat =
             stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).map_err(|_| Errno::last())?;
-        let file_type = stat::SFlag::from_bits_truncate(raw_stat.st_mode);
-        let ty = if file_type.contains(stat::SFlag::S_IFIFO) {
-            FdType::Pipe
-        } else if file_type.contains(stat::SFlag::S_IFSOCK) {
-            FdType::Socket
-        } else if status_flags & libc::O_PATH == 0
-            && crate::fd::is_random_device(raw_stat.st_mode, raw_stat.st_rdev)
-        {
-            // Linux's random devices by device number, as an open classifies
-            // them (`Detcore::handle_openat`).
-            FdType::Rng
-        } else {
-            FdType::Regular
-        };
-        let mut flags = OFlag::from_bits_truncate(status_flags);
-        let physically_nonblocking = flags.contains(OFlag::O_NONBLOCK);
-        // Discovered descriptors have unknown provenance, so an observed
-        // O_NONBLOCK bit must remain guest-visible. Detcore-created scheduler
-        // pipes are registered when created and do not reach this fallback.
-        if fd_flags & libc::FD_CLOEXEC != 0 {
-            flags.insert(OFlag::O_CLOEXEC);
-        }
-        self.add_fd(owner, fd, flags, ty, Some(raw_stat.into()))?;
-        // This newly discovered description predates our observation. Its
-        // kernel lock may be held, but no cached lock claim existed to go stale.
-        self.with_detfd(fd, |detfd| detfd.mark_flock_mode_unobserved())?;
+        self.add_discovered_fd(owner, fd, fd_flags, status_flags, &raw_stat)?;
         // A placeholder for a procfs file Detcore renders, which the backend
         // rediscovers after `exec`: the file again, at the position the old
         // image left and with the snapshot it took, as a backend that keeps
@@ -1536,6 +1511,53 @@ impl FileMetadata {
         if let Some(resource) = stdio_resource(fd) {
             self.with_detfd(fd, |detfd| detfd.set_resource(resource.clone()))?;
         }
+        Ok(())
+    }
+
+    /// Record descriptor `fd`, whose creation Detcore did not see, from the
+    /// kernel's facts about it: its descriptor flags `fd_flags` (`F_GETFD`),
+    /// status flags `status_flags` (`F_GETFL`) and `raw_stat` (`fstat`). Its
+    /// type is the file's (pipe, socket, random device or regular), its
+    /// flags are the kernel's (an observed `O_NONBLOCK` stays guest-visible:
+    /// the provenance is unknown), and its lock state is unobserved. Shared by
+    /// the in-guest discovery ([`Self::discover_fd_from_current_process`])
+    /// and by the record of a descriptor received over `SCM_RIGHTS`
+    /// (`Detcore::record_received_descriptors`), so both make the same
+    /// description from the same facts.
+    fn add_discovered_fd(
+        &mut self,
+        owner: DetTid,
+        fd: RawFd,
+        fd_flags: libc::c_int,
+        status_flags: libc::c_int,
+        raw_stat: &libc::stat,
+    ) -> Result<(), Errno> {
+        let file_type = stat::SFlag::from_bits_truncate(raw_stat.st_mode);
+        let ty = if file_type.contains(stat::SFlag::S_IFIFO) {
+            FdType::Pipe
+        } else if file_type.contains(stat::SFlag::S_IFSOCK) {
+            FdType::Socket
+        } else if status_flags & libc::O_PATH == 0
+            && crate::fd::is_random_device(raw_stat.st_mode, raw_stat.st_rdev)
+        {
+            // Linux's random devices by device number, as an open classifies
+            // them (`Detcore::handle_openat`).
+            FdType::Rng
+        } else {
+            FdType::Regular
+        };
+        let mut flags = OFlag::from_bits_truncate(status_flags);
+        let physically_nonblocking = flags.contains(OFlag::O_NONBLOCK);
+        // Discovered descriptors have unknown provenance, so an observed
+        // O_NONBLOCK bit must remain guest-visible. Detcore-created scheduler
+        // pipes are registered when created and do not reach this fallback.
+        if fd_flags & libc::FD_CLOEXEC != 0 {
+            flags.insert(OFlag::O_CLOEXEC);
+        }
+        self.add_fd(owner, fd, flags, ty, Some((*raw_stat).into()))?;
+        // This newly discovered description predates our observation. Its
+        // kernel lock may be held, but no cached lock claim existed to go stale.
+        self.with_detfd(fd, |detfd| detfd.mark_flock_mode_unobserved())?;
         if ty == FdType::Pipe && physically_nonblocking {
             self.with_detfd(fd, |detfd| detfd.set_physically_nonblocking())?;
         }
@@ -2422,6 +2444,79 @@ mod file_metadata_tests {
                 .unwrap(),
             None
         );
+    }
+
+    /// A descriptor received over `SCM_RIGHTS` on a backend whose tool does
+    /// not share the guest's table is recorded from injected facts
+    /// (`add_discovered_fd`); an in-guest backend discovers the same
+    /// descriptor in process. Both make the same description: type, status
+    /// flags, close-on-exec, physical nonblocking and an unobserved lock.
+    #[test]
+    fn a_received_descriptor_is_recorded_as_the_in_guest_discovery_records_it() {
+        let owner = DetTid::from_raw(9031);
+        let facts = |fd: RawFd| {
+            // SAFETY: fcntl and fstat only read this test's descriptor.
+            let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+            (fd_flags, status, stat)
+        };
+        let shape = |metadata: &FileMetadata, fd: RawFd| {
+            let detfd = &metadata.file_handles[&fd];
+            (
+                detfd.ty(),
+                detfd.status_flags(),
+                detfd.is_cloexec(),
+                detfd.physically_nonblocking(),
+                detfd.is_nonblocking(),
+                detfd.known_flock_mode(),
+                detfd.flock_may_have_been_granted(),
+                detfd.stat().map(|stat| stat.raw_inode()),
+            )
+        };
+        let (pipe_read, _pipe_write) =
+            nix::unistd::pipe2(OFlag::O_NONBLOCK | OFlag::O_CLOEXEC).unwrap();
+        let (socket, _peer) = nix::sys::socket::socketpair(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::Stream,
+            None,
+            nix::sys::socket::SockFlag::empty(),
+        )
+        .unwrap();
+        let file = std::fs::File::open("/proc/self/exe").unwrap();
+        let random = std::fs::File::open("/dev/urandom").unwrap();
+        let cases = [
+            (pipe_read.as_raw_fd(), FdType::Pipe),
+            (socket.as_raw_fd(), FdType::Socket),
+            (file.as_raw_fd(), FdType::Regular),
+            (random.as_raw_fd(), FdType::Rng),
+        ];
+        for (fd, ty) in cases {
+            let mut recorded = FileMetadata::new(owner);
+            let (fd_flags, status, stat) = facts(fd);
+            recorded
+                .add_discovered_fd(owner, fd, fd_flags, status, &stat)
+                .unwrap();
+            let mut discovered = FileMetadata::new(owner);
+            discovered
+                .discover_fd_from_current_process(owner, fd)
+                .unwrap();
+            assert_eq!(shape(&recorded, fd), shape(&discovered, fd), "fd {fd}");
+            assert_eq!(recorded.file_handles[&fd].ty(), ty, "fd {fd}");
+            // Recorded unobserved: no lock claim, and one may be held.
+            assert_eq!(recorded.file_handles[&fd].known_flock_mode(), None);
+        }
+        let pipe = pipe_read.as_raw_fd();
+        let mut recorded = FileMetadata::new(owner);
+        let (fd_flags, status, stat) = facts(pipe);
+        recorded
+            .add_discovered_fd(owner, pipe, fd_flags, status, &stat)
+            .unwrap();
+        let detfd = &recorded.file_handles[&pipe];
+        // The kernel's flags are what the record knows: O_NONBLOCK stays
+        // visible and physical, and FD_CLOEXEC is the slot's.
+        assert!(detfd.is_cloexec() && detfd.is_nonblocking() && detfd.physically_nonblocking());
     }
 
     /// Under `--pipe-wake-latency` a rediscovering exec carries each surviving
@@ -3952,6 +4047,15 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) open_file_creator: Option<DetTid>,
 
+    /// The input geometry of the `recvmsg` or `recvmmsg` this thread is
+    /// running, while Detcore needs it to name the descriptors it receives:
+    /// `Some` from the handler's entry, re-read before each attempt of the
+    /// internal polling loop so that it is the geometry of the attempt that
+    /// succeeds (`retry_nonblocking_syscall_helper`), taken when the call
+    /// returns. Never carried across a fork or a migration.
+    #[serde(skip)]
+    pub(crate) receive_geometry: Option<Option<crate::syscalls::scm_rights::ReceiveGeometry>>,
+
     /// Linux memory address space shared by tasks created with `CLONE_VM`.
     pub mm_id: MmId,
 
@@ -5035,6 +5139,7 @@ impl<T> ThreadState<T> {
             physical_tid: None,
             signal_task_identity: None,
             open_file_creator: None,
+            receive_geometry: None,
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
             pedigree: Pedigree::new(), // Root thread.
@@ -5639,6 +5744,26 @@ impl<T> ThreadState<T> {
         )
     }
 
+    /// Record descriptor `fd`, which Linux installed by a route Detcore did not
+    /// model as it ran (`SCM_RIGHTS`), from the kernel's facts about it, as an
+    /// in-guest backend records a descriptor it discovers
+    /// (`FileMetadata::add_discovered_fd`).
+    pub(crate) fn add_discovered_fd(
+        &self,
+        fd: RawFd,
+        fd_flags: libc::c_int,
+        status_flags: libc::c_int,
+        raw_stat: &libc::stat,
+    ) -> Result<(), Errno> {
+        self.metadata().add_discovered_fd(
+            self.open_file_creator.unwrap_or(self.dettid),
+            fd,
+            fd_flags,
+            status_flags,
+            raw_stat,
+        )
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1063): Review backend-supplied open-file creator identity.
     /// Overrides the task identity embedded in subsequently allocated open-file descriptions.
@@ -6022,10 +6147,10 @@ impl<T> ThreadState<T> {
     }
 
     /// Install `detfd`, which refers to an open file description Detcore
-    /// models, as descriptor `detfd.fd` of this table: a descriptor that
-    /// reached the description by a route Detcore does not model
-    /// (`SCM_RIGHTS`), adopted when the guest first names it
-    /// (`Detcore::adopt_received_placeholders`).
+    /// models, as descriptor `detfd.fd` of this table: a rendered procfs
+    /// descriptor that reached the description over `SCM_RIGHTS`, adopted
+    /// when it is received (`Detcore::record_received_descriptors`) or when
+    /// the guest first names it (`Detcore::adopt_received_placeholders`).
     pub(crate) fn install_alias(&self, detfd: DetFd) {
         self.metadata().add_detfd(detfd);
     }

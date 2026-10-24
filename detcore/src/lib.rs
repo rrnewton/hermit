@@ -3913,6 +3913,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     physical_tid: None,
                     signal_task_identity: None,
                     open_file_creator: None,
+                    receive_geometry: None,
                     mm_id: MmId::for_clone(
                         pts.1.mm_id,
                         dettid,

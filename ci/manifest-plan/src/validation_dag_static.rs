@@ -2866,7 +2866,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // to user memory faults where no mapping is writable): 2566, listed.
     // And 3c.1d-ii review round 4's tool_global::tests unit (a clock
     // observation grants no turn and moves no time): 2567, listed.
-    ("test.detcore_unit", 2567),
+    // And package K slice F0a's units: syscalls::scm_rights's eight
+    // (delivered control bytes, a truncated receive, recvmsg/recvmmsg
+    // delivery, the placeholder shape, the control buffer named before the
+    // call, an output that may overlap only its own input, a receive whose
+    // outputs overlap its inputs, a batch above UIO_MAXIOV; its two parser
+    // units moved from syscalls::network_trace) and tool_local's
+    // a_received_descriptor_is_recorded_as_the_in_guest_discovery_records_it:
+    // 2576, listed.
+    ("test.detcore_unit", 2576),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2960,7 +2968,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And package K slice A+'s two proc_stat_lifecycle tests: every spelling
     // of a task's comm stays the kernel's under a tracer, and stat, cgroup
     // and comm take only RWF_HIPRI in a vectored read: 159.
-    ("test.detcore_misc", 159),
+    // And package K slice F0a's four readdir_order variants that keep the
+    // unrecorded received-descriptor path under unsequentialized threads
+    // (unrecorded_received_descriptor_lists_whole_directory,
+    // unrecorded_passed_on_descriptor_misses_no_entry,
+    // unrecorded_passed_on_descriptor_follows_repeated_seeks,
+    // negative_count_on_unrecorded_received_descriptors): 163.
+    ("test.detcore_misc", 163),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -4656,7 +4670,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two 4213 cpuinfo-session tests: 137.
     // And the same twenty D4c-1 proc_stat_lifecycle tests: 157.
     // And the same two A+ tests: 159.
-    ("test.detcore_misc_on_host", 159),
+    // And the same four F0a readdir_order variants: 163.
+    ("test.detcore_misc_on_host", 163),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -5019,7 +5034,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two 3c.1d-ii review round 2 units: 2562, listed.
     // And the same four 3c.1d-ii review round 3 units: 2566, listed.
     // And the same one 3c.1d-ii review round 4 unit: 2567, listed.
-    ("test.detcore_unit_on_host", 2567),
+    // And the same nine F0a units: 2576, listed.
+    ("test.detcore_unit_on_host", 2576),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

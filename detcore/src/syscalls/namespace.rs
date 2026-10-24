@@ -2147,7 +2147,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // looks it up (`Detcore::procfs_spelling_at`): below a `/proc/self`
         // or `/proc/<pid>` directory, the task the directory was opened on
         // (ESRCH once that task is gone), and below a descriptor Detcore has
-        // no record of (one received over `SCM_RIGHTS`), the procfs directory
+        // no recorded path for (one received over `SCM_RIGHTS`), the procfs directory
         // the kernel names for it; so a namespace or descriptor link there is
         // modeled and canonicalized as the same link spelled absolutely. Any
         // other such name stays relative, and the kernel decides.

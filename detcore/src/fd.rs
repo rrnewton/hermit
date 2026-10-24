@@ -154,9 +154,10 @@ pub struct DetFd {
 /// A handle on an open file description that Detcore models, which does not
 /// keep it alive: once no modeled descriptor refers to the description, the
 /// handle reaches nothing. Where one tool process serves every guest process
-/// (ptrace, KVM), a descriptor that reaches the same Linux `struct file` by a
-/// route Detcore does not model (`SCM_RIGHTS`) joins the description through
-/// it, as a `dup` would (`Detcore::adopt_received_placeholders`).
+/// (ptrace, KVM), a rendered procfs descriptor that reaches the same Linux
+/// `struct file` over `SCM_RIGHTS` joins the description through it, as a
+/// `dup` would, when it is received (`Detcore::record_received_descriptors`)
+/// or first named (`Detcore::adopt_received_placeholders`).
 #[derive(Clone, Debug)]
 pub(crate) struct OpenFileHandle(std::sync::Weak<Mutex<OpenFileState>>);
 

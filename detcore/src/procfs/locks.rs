@@ -100,8 +100,10 @@
 //! - an OFD lock the guest's descriptions held before Detcore read it is not
 //!   shown until a call through a modelled descriptor of it: a description
 //!   inherited already locked at the start; one received over `SCM_RIGHTS`
-//!   where Detcore keeps no model of the receiver's descriptor (ptrace), once
-//!   the sender's tables let go of it; one received through `recvmmsg`; one an
+//!   where Detcore keeps no model of the receiver's descriptor (not recorded
+//!   under record and replay, or without sequentialized threads on ptrace
+//!   and KVM), once the sender's tables let go of it; one received through
+//!   `recvmmsg`; one an
 //!   in-guest backend's exec rebuilds under a new identity;
 //! - a flock whose taker is not a guest process, while a guest description
 //!   holds it: a taker that has exited (its descriptor was inherited), or one
@@ -128,8 +130,9 @@
 //!   `CLONE_FILES`), whose calls the ledger cannot tell from the leader's;
 //! - once a lock or unlock goes through a descriptor whose description the
 //!   ledger may know under another identity (one Detcore keeps no model of,
-//!   such as a descriptor received over `SCM_RIGHTS` on ptrace, or one an
-//!   in-guest backend registered on reception), no lock on that inode number,
+//!   such as a descriptor received over `SCM_RIGHTS` and not recorded, or one
+//!   registered on reception, a second model of the sender's description), no
+//!   lock on that inode number,
 //!   on any device, is shown again; if that descriptor's fdinfo cannot be
 //!   read, no OFD or flock lock is shown again;
 //! - a lease set by a process that was then reaped, under `--no-namespace`,

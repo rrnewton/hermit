@@ -416,8 +416,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut values = [
             args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
         ];
-        // A relative spelling below a descriptor Detcore has no record of (one
-        // received over `SCM_RIGHTS`) is judged as the name the kernel will
+        // A relative spelling below a descriptor Detcore has no recorded path
+        // for (one received over `SCM_RIGHTS`) is judged as the name the kernel will
         // look up: the directory the descriptor is open on, joined with it
         // (`Detcore::unrecorded_procfs_directory`). Otherwise a received
         // `/proc` descriptor would reach a name the level omits. Recovered

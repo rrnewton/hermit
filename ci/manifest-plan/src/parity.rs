@@ -6215,7 +6215,11 @@ mod tests {
         // per candidate backend: 2980.
         // system-utils/stat-alias-root (D4c-1's root through a symbolic link)
         // adds one row per candidate backend: 2985.
-        assert_eq!(parsed.cells.len(), 2985);
+        // c-programs/scm-rights-received-descriptors (package K slice F0a's
+        // guest) adds one row per candidate backend: 2990.
+        // c-programs/scm-rights-received-anon-inodes (F0a's anonymous-inode
+        // guest) adds one row per candidate backend: 2995.
+        assert_eq!(parsed.cells.len(), 2995);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448

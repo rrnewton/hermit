@@ -1300,10 +1300,12 @@ pub fn ioaction_based_on_fd_status<
 /// class -- but neither claim is airtight.
 ///
 /// The converse gap: a socketpair endpoint or pipe that a guest RECEIVES over
-/// `SCM_RIGHTS` is untracked by Detcore, so it is not recognized here and keeps the
-/// kernel-authoritative external path. Its open file description is still physically
-/// nonblocking, so a blocking read through the received descriptor can return EAGAIN
-/// under record, as it already could for a received pipe.
+/// `SCM_RIGHTS` is recorded (`Detcore::record_received_descriptors`) or discovered
+/// from the kernel's facts, which do not say that a guest made it, or not recorded
+/// at all (record and replay), so it is not recognized as internal here. Its open
+/// file description is still physically nonblocking, and the kernel's `O_NONBLOCK`
+/// is all the receiver's record knows, so a blocking read through the received
+/// descriptor can return EAGAIN where Linux would wait.
 ///
 /// Syscalls whose fd is not directly extractable (e.g. poll/ppoll, which carry a
 /// pointer to an fd array) return false and keep their existing handling.
@@ -2540,6 +2542,14 @@ where
         // (https://github.com/rrnewton/hermit/issues/4089).
         let pending = pending_real_time_among(guest, consumed).await;
         act_on_pending_real_time(guest, pending, consumed, 0).await;
+        // A receive whose descriptors Detcore names reads its geometry again
+        // right before each attempt: a sibling may have changed it while an
+        // earlier attempt waited (`ThreadState::receive_geometry`).
+        if guest.thread_state().receive_geometry.is_some() {
+            let geometry =
+                crate::syscalls::scm_rights::ReceiveGeometry::before(&guest.memory(), &call.into());
+            guest.thread_state_mut().receive_geometry = Some(geometry);
+        }
         // Route through the record/replay subtool for internal pipes so each poll (an
         // EAGAIN, or the final data-bearing read) becomes one recorded event that replay
         // reproduces deterministically; otherwise execute the syscall directly.

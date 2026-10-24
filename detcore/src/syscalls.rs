@@ -33,9 +33,9 @@ mod misc;
 mod namespace;
 pub(crate) use namespace::anonymous_object_devices;
 pub(crate) use namespace::guest_task_procfs;
-pub(crate) use network_trace::received_descriptors;
 mod network_trace;
 pub(crate) mod robust_list;
+pub(crate) mod scm_rights;
 mod signal;
 pub(crate) mod signal_shadow;
 /// The guest's virtual SIGALRM blocked bit (signal phase 1).

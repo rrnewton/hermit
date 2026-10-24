@@ -21359,6 +21359,22 @@ exit "$(cat "$PWD/exit-status")"
                 "the kvm cell passes no expected pipe capacity (ptrace, dbt and sabre pass \
                  8192), so its guest prints F_GETPIPE_SZ without asserting Detcore's pin",
             ),
+            (
+                "c-programs/scm-rights-received-descriptors",
+                "in-guest-trap",
+                "`--no-exec` skips the exec check: in-guest LiteInst refuses execve",
+            ),
+            (
+                "c-programs/scm-rights-received-descriptors",
+                "liteinst",
+                "`--no-exec` skips the exec check: in-guest LiteInst refuses execve",
+            ),
+            (
+                "c-programs/scm-rights-received-descriptors",
+                "sabre",
+                "`--no-exec` skips the exec check: SaBRe's path evidence does not admit \
+                 the exec'd image's libc sites",
+            ),
         ];
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let manifests = ManifestSet::load(&root).unwrap();

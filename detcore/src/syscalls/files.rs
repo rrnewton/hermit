@@ -1299,6 +1299,8 @@ pub(crate) enum LockCall {
     PidfdGetfd,
     /// `recvmsg` with `SCM_RIGHTS`, which adds a slot.
     Recvmsg,
+    /// `recvmmsg` with `SCM_RIGHTS`, which adds slots.
+    Recvmmsg,
 }
 
 impl LockCall {
@@ -1309,6 +1311,7 @@ impl LockCall {
             Self::Flock => "flock",
             Self::PidfdGetfd => "pidfd_getfd",
             Self::Recvmsg => "recvmsg",
+            Self::Recvmmsg => "recvmmsg",
         }
     }
 
@@ -3685,8 +3688,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// below that directory whoever holds the descriptor: a `/proc/self` or
     /// `/proc/thread-self` directory is the task the selector reached when it
     /// was opened (`DetFd::procfs_reached`), and a descriptor Detcore has no
-    /// record of (one received over `SCM_RIGHTS`, which a fresh discovery
-    /// leaves without one) is named as the kernel names the directory it is
+    /// record of (one received over `SCM_RIGHTS`, which its record or a fresh
+    /// discovery leaves without one) is named as the kernel names the directory it is
     /// open on, where that is on procfs ([`Self::unrecorded_procfs_directory`]).
     /// Detcore's own decisions about procfs names (the files it renders, the
     /// `--proc` level, the links it canonicalizes) use this spelling. A name
@@ -3846,8 +3849,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             resolved_at_fdcwd_path(guest.pid().as_raw(), path).unwrap_or_else(|| path.to_path_buf())
         } else {
             // A descriptor Detcore has no state for (one received over
-            // `SCM_RIGHTS` under a backend whose tool does not discover
-            // descriptors as they are used) keeps the relative spelling, which
+            // `SCM_RIGHTS` and not recorded,
+            // `Detcore::record_received_descriptors`) keeps the relative spelling, which
             // the kernel looks up from it; the kernel, not this lookup,
             // decides whether the descriptor is open. Before, such an `openat`
             // failed with EBADF though the descriptor was open.
@@ -4917,8 +4920,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 };
                 // Where `N`, in the caller's own table, has no recorded path
-                // at all (a descriptor received through SCM_RIGHTS, which
-                // Detcore does not track, or one discovered without one), a
+                // at all (a descriptor received through SCM_RIGHTS, recorded
+                // without one or not recorded, or one discovered without one), a
                 // procfs directory is named as the kernel beneath the backend
                 // names the opened descriptor (`procfs_directory_named_for`,
                 // one injected `readlinkat`). Only where Detcore renders
@@ -5280,7 +5283,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// That cache covers locks Detcore granted while it had sole knowledge of
     /// the open file description. State becomes permanently unknown when the
     /// descriptor is inherited across a process fork, discovered after tracing
-    /// begins, or received through `SCM_RIGHTS`, because another process can
+    /// begins, or received through `SCM_RIGHTS` (recorded unobserved), because another process can
     /// change that shared kernel lock without updating this cache. A blocking
     /// conversion in unknown state is refused before the nonblocking probe, so
     /// the refusal cannot destroy a lock Detcore cannot restore.
@@ -9886,8 +9889,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// A lock or unlock through a descriptor whose description the ledger
     /// may know under another identity (one Detcore keeps no model of, such
-    /// as a descriptor received over `SCM_RIGHTS` on ptrace, or one an
-    /// in-guest backend registered on reception) can leave that other
+    /// as a descriptor received over `SCM_RIGHTS` and not recorded
+    /// (`Detcore::record_received_descriptors`), or one registered on
+    /// reception, which is a second model of the sender's description) can leave that other
     /// identity's entry stale, so no lock on that file's inode number counts
     /// from then on (`procfs::locks::LockLedger::alias_inode`): hidden, never
     /// a host's row admitted. If that descriptor's fdinfo cannot be read for
@@ -9901,7 +9905,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<(), Error> {
         let model = guest.thread_state().with_detfd(fd, |detfd| {
             detfd.set_lock_tracked();
-            if call == LockCall::Recvmsg {
+            if matches!(call, LockCall::Recvmsg | LockCall::Recvmmsg) {
                 detfd.set_received_for_locks();
             }
             if call == LockCall::Fcntl {
@@ -11159,7 +11163,8 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Detcore's table update after the kernel's `dup2` or `dup3` put
     /// `old_fd`'s description in slot `new_fd`. If Detcore keeps no model of
-    /// `old_fd` (one received over `SCM_RIGHTS` on ptrace), the update fails,
+    /// `old_fd` (one received over `SCM_RIGHTS` and not recorded,
+    /// `Detcore::record_received_descriptors`), the update fails,
     /// but the kernel replaced the slot all the same: its old description is
     /// dropped from the model and `lock_tracked` (what the slot named) is
     /// reported to `procfs::locks::LockLedger`, so no stale entry can admit
@@ -13148,7 +13153,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             Ok(lock) => lock,
             // Detcore has no open file description for this descriptor (one
-            // received through SCM_RIGHTS, for example), so there is nowhere
+            // received through SCM_RIGHTS and not recorded, for example), so there is nowhere
             // to keep a stream. Sort the one kernel buffer instead, as before
             // directory streams existed; the kernel reports a descriptor that
             // is not open at all.
@@ -15271,7 +15276,7 @@ mod test {
     }
 
     /// Where the descriptor a link names has no recorded path (one received
-    /// through `SCM_RIGHTS`, which Detcore does not track), an open through
+    /// through `SCM_RIGHTS`, which has none), an open through
     /// the link records the procfs directory the kernel names for the opened
     /// descriptor (`Detcore::procfs_directory_named_for`): `/proc`, below
     /// which `stat` is `/proc/stat`. Without that name it keeps the

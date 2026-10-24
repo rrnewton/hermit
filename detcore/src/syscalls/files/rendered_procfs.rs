@@ -1348,7 +1348,7 @@ pub(super) struct RenderedTarget {
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// Whether Detcore renders procfs files for this guest thread now.
-    pub(super) fn renders_procfs<G: Guest<Self>>(&self, guest: &G) -> bool {
+    pub(crate) fn renders_procfs<G: Guest<Self>>(&self, guest: &G) -> bool {
         !self.cfg.recordreplay_modes
             && !guest
                 .thread_state()
@@ -3999,10 +3999,13 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Adopt, before `call` runs, each descriptor it names that Detcore has
     /// no record of and that is a placeholder this tool process made: a
-    /// rendered procfs descriptor that reached this table by a route Detcore
-    /// does not model, `SCM_RIGHTS` (where the tool does not discover
-    /// descriptors as they are used: ptrace and KVM; an in-guest backend
-    /// discovers it first, `discover_fd_from_current_process`). Then every
+    /// rendered procfs descriptor that reached this table over `SCM_RIGHTS`
+    /// and was not recorded as it arrived. Where the tool does not discover
+    /// descriptors as they are used (ptrace and KVM), Detcore records each
+    /// received descriptor as the receive returns, adopting a placeholder
+    /// there (`Detcore::record_received_descriptors`), except without
+    /// sequentialized threads, which leaves it to this adoption; an in-guest
+    /// backend discovers it first (`discover_fd_from_current_process`). Then every
     /// call through it (reads, the cursor, a mapping, the write family, the
     /// task's reap) is answered as for a descriptor Detcore opened, and none
     /// reaches the memfd.
@@ -4102,9 +4105,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Make descriptor `fd`, which Detcore has no record of, the placeholder
-    /// `identity` for the rendered file `path` it is
+    /// `identity` for the rendered file `path` it is, as it is received
+    /// (`Detcore::record_received_descriptors`) or first named
     /// ([`Self::adopt_received_placeholders`]).
-    async fn adopt_received_placeholder<G: Guest<Self>>(
+    pub(crate) async fn adopt_received_placeholder<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,

@@ -63,7 +63,8 @@ use crate::syscalls::helpers::result_after_restore;
 use crate::syscalls::helpers::retry_blocking_wait_under_mask;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::helpers::unblocked_by;
-use crate::syscalls::network_trace::received_descriptors;
+use crate::syscalls::scm_rights::ReceiveGeometry;
+use crate::syscalls::scm_rights::received_descriptors;
 use crate::syscalls::signal::STACK_RED_ZONE;
 use crate::syscalls::signal::kernel_installed_signal_mask;
 use crate::syscalls::signal::read_kernel_sigset;
@@ -3691,10 +3692,78 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(timestamp)
     }
 
+    /// Receive one message, then record the descriptors it received over
+    /// `SCM_RIGHTS` (`Detcore::record_received_descriptors`) and read their
+    /// locks (`Detcore::refresh_description_locks`). Both read only the
+    /// control bytes Linux reports writing, at the control buffer the
+    /// message named before the call (`ReceiveGeometry`).
+    pub async fn handle_recvmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Recvmsg,
+    ) -> Result<i64, Error> {
+        let discovered = self.discovers_received_descriptors(guest);
+        let wanted = !discovered || self.cfg.virtualize_time;
+        let in_turn = self.receipt_is_observable(guest, call);
+        Self::begin_receive_geometry(guest, wanted, &Syscall::Recvmsg(call));
+        let result = self.receive_one_message(guest, call).await;
+        let geometry = guest.thread_state_mut().receive_geometry.take().flatten();
+        let result = result?;
+        let delivered = geometry
+            .map(|geometry| geometry.delivered(&guest.memory(), result))
+            .unwrap_or_default();
+        let recorded = self
+            .record_received_descriptors(guest, &delivered, in_turn)
+            .await;
+        // Where the tool discovers received descriptors, recvmsg's refresh
+        // covers every descriptor delivered, as before; elsewhere only those
+        // this receipt recorded.
+        let refreshed = if discovered {
+            delivered.fds.as_slice()
+        } else {
+            recorded.as_slice()
+        };
+        self.refresh_received_locks(guest, refreshed, super::files::LockCall::Recvmsg)
+            .await?;
+        Ok(result)
+    }
+
+    /// Keep the input geometry of `call` (a `recvmsg` or `recvmmsg`) in the
+    /// thread state when `wanted`: read here, at entry, and again before each
+    /// attempt of the internal polling loop, so that the geometry the caller
+    /// takes when the call returns is that of the attempt that completed
+    /// (`ThreadState::receive_geometry`).
+    fn begin_receive_geometry<G: Guest<Self>>(guest: &mut G, wanted: bool, call: &Syscall) {
+        guest.thread_state_mut().receive_geometry =
+            wanted.then(|| ReceiveGeometry::before(&guest.memory(), call));
+    }
+
+    /// A descriptor received over `SCM_RIGHTS` that Detcore models joins
+    /// this process's table in `procfs::locks::LockLedger` with whatever OFD
+    /// or flock locks its description holds, and is marked as received, so
+    /// that a lock change through it invalidates the identity the sender's
+    /// tables know the description by. One Detcore keeps no model of (not
+    /// recorded, `Detcore::record_received_descriptors`) is left out, so its
+    /// locks are hidden once no modelled table names the description (a
+    /// named residual).
+    async fn refresh_received_locks<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fds: &[RawFd],
+        call: super::files::LockCall,
+    ) -> Result<(), Error> {
+        if self.cfg.virtualize_time {
+            for &fd in fds {
+                self.refresh_description_locks(guest, fd, call).await?;
+            }
+        }
+        Ok(())
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-901)
     /// Receive one message and replace host socket timestamps with logical time.
-    pub async fn handle_recvmsg<G: Guest<Self>>(
+    async fn receive_one_message<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Recvmsg,
@@ -3737,16 +3806,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         let now = self.observe_socket_receive(guest, call.sockfd()).await?;
         let mut control = vec![0; control_len];
         guest.memory().read_exact(control_address, &mut control)?;
-        // A descriptor received over `SCM_RIGHTS` that Detcore models (an
-        // in-guest backend discovers it as it is used) joins this process's
-        // table in `procfs::locks::LockLedger` with whatever OFD or flock
-        // locks its description holds. One Detcore keeps no model of (ptrace)
-        // is left out, so its locks are hidden once no modelled table names
-        // the description (a named residual).
-        for fd in received_descriptors(&control) {
-            self.refresh_description_locks(guest, fd, super::files::LockCall::Recvmsg)
-                .await?;
-        }
         if socket_timestamp_messages(&control).is_empty() {
             return Ok(result);
         }
@@ -4037,10 +4096,36 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(result)
     }
 
+    /// Receive a message batch, then record the descriptors it received over
+    /// `SCM_RIGHTS` (`Detcore::record_received_descriptors`) and read their
+    /// locks, as for `recvmsg`.
+    pub async fn handle_recvmmsg<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Recvmmsg,
+    ) -> Result<i64, Error> {
+        let wanted = !self.discovers_received_descriptors(guest);
+        let in_turn = self.receipt_is_observable(guest, call);
+        Self::begin_receive_geometry(guest, wanted, &Syscall::Recvmmsg(call));
+        let result = self.receive_message_batch(guest, call).await;
+        let geometry = guest.thread_state_mut().receive_geometry.take().flatten();
+        let result = result?;
+        let delivered = geometry
+            .map(|geometry| geometry.delivered(&guest.memory(), result))
+            .unwrap_or_default();
+        let recorded = self
+            .record_received_descriptors(guest, &delivered, in_turn)
+            .await;
+        // Only the descriptors this receipt recorded.
+        self.refresh_received_locks(guest, &recorded, super::files::LockCall::Recvmmsg)
+            .await?;
+        Ok(result)
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-901)
     /// Receive a message batch and replace every host socket timestamp with logical time.
-    pub async fn handle_recvmmsg<G: Guest<Self>>(
+    async fn receive_message_batch<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Recvmmsg,
