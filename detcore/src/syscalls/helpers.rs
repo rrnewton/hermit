@@ -400,17 +400,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         };
 
-        // Is this operation on a container-INTERNAL fd (a pipe or a socketpair
-        // endpoint)? Internal fds are made physically nonblocking even in
-        // record/replay (see handle_pipe2 and handle_socketpair), so they can take the
+        // Is this operation on a container-INTERNAL fd (a pipe, a socketpair
+        // endpoint, or a socket whose peer is a guest)? Internal fds are made
+        // physically nonblocking even in record/replay (see handle_pipe2,
+        // handle_socketpair and classify_socket_peer), so they can take the
         // deterministic InternalIOPolling nonblockize-and-retry path. They must NOT be
         // forced onto the BlockingExternalIO path in R/R: a reader and its paired
         // writer are not independent, so descheduling the reader as "external
         // blocking IO" deadlocks the sequentialized scheduler (the documented R/R pipe
         // hang), and a one-shot read on the physically nonblocking fd returns EAGAIN.
-        // Truly external endpoints (host fds, network sockets) still use
-        // BlockingExternalIO. Other sockets are left external for now: there is no
-        // internal-vs-external socket detection yet (see the handle_accept4 comment).
+        // Truly external endpoints (host fds, network sockets, sockets whose peer
+        // is a host process) still use BlockingExternalIO.
         let internal_fd = syscall_targets_internal_fd(guest, wrapped);
 
         if !self.cfg.sequentialize_threads
@@ -1289,9 +1289,10 @@ pub fn ioaction_based_on_fd_status<
 ///
 /// A socketpair is the one socket case where internality is known at creation time:
 /// the kernel creates BOTH ends, so no peer outside the container can ever hold one.
-/// That is why it does not need the general internal-vs-external socket detection
-/// (loopback / AF_UNIX-to-another-guest vs a real host peer) that remains unsolved;
-/// every OTHER socket still conservatively remains external.
+/// Under record and replay a connected socket whose peer is a guest, which
+/// `Detcore::classify_socket_peer` finds from the peer's credentials after
+/// `connect`, `accept` or an `SCM_RIGHTS` receive, is internal too. Every other
+/// socket, including every loopback IP socket, conservatively remains external.
 ///
 /// The residual assumption, stated because it is an assumption and not a proof: a
 /// guest could pass a socketpair endpoint out of the container over `SCM_RIGHTS` to a
@@ -1299,11 +1300,10 @@ pub fn ioaction_based_on_fd_status<
 /// has always accepted that for pipes, so recognizing socketpairs widens no exposure
 /// class -- but neither claim is airtight.
 ///
-/// The converse gap: a socketpair endpoint or pipe that a guest RECEIVES over
-/// `SCM_RIGHTS` is untracked by Detcore, so it is not recognized here and keeps the
-/// kernel-authoritative external path. Its open file description is still physically
-/// nonblocking, so a blocking read through the received descriptor can return EAGAIN
-/// under record, as it already could for a received pipe.
+/// A descriptor a guest RECEIVES over `SCM_RIGHTS` joins the table as an alias
+/// when it names an open file the table holds, and so keeps that file's marks; a
+/// received socket is classified by its peer, and a received pipe from another
+/// process is a pipe here.
 ///
 /// Syscalls whose fd is not directly extractable (e.g. poll/ppoll, which carry a
 /// pointer to an fd array) return false and keep their existing handling.
@@ -1327,7 +1327,7 @@ pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
                 {
                     return false;
                 }
-                matches!(detfd.ty(), FdType::Pipe) || detfd.is_socketpair_endpoint()
+                matches!(detfd.ty(), FdType::Pipe) || detfd.is_internal_socket()
             })
             .unwrap_or(false),
         None => false,
@@ -1383,9 +1383,10 @@ fn read_family_fd(call: Syscall) -> Option<i32> {
 ///
 /// This follows the replayer's dispatch. It serves `accept`, `accept4`, `connect`,
 /// `sendto`, `sendmsg`, `recvfrom` and `recvmsg` from its log whatever the descriptor
-/// is, so they count even on a descriptor Detcore does not track, such as a listener
-/// received over `SCM_RIGHTS`; an untagged accept there would let its stand-in take a
-/// slot at a host-timed point. `read`, `readv`, `write` and `writev` count only on a
+/// is, so they count on any descriptor, a listener received over `SCM_RIGHTS` (an
+/// exported alias, or a new description another process sent) included; an
+/// untagged accept there would let its stand-in take a slot at a host-timed point.
+/// `read`, `readv`, `write` and `writev` count only on a
 /// socket Detcore created with `socket(2)` or `accept(2)`: on other descriptors,
 /// replay may run them for real as eventfd operations, which can block, so an unknown
 /// descriptor is not assumed to be served from the log. `recvmmsg` and `sendmmsg` are
