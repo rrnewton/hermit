@@ -1190,7 +1190,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's
     // syscall_histogram::tests::the_finished_form_keeps_only_nonzero_slots_and_sums_back_exactly
     // (finished threads keep sparse histograms): 1867, listed.
-    ("test.regular_crates", 1880),
+    // And detcore-model's four host-input set tests (host_input::tests): 1884,
+    // listed.
+    ("test.regular_crates", 1884),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3044,7 +3046,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // copy only where the count proves it): 2691, listed.
     // And passthru_opt_intercepts_the_protection_key_calls (the inotify
     // fault path's protection-key record under --passthru-opt): 2692, listed.
-    ("test.detcore_unit", 2695),
+    // And the host-input set's eight units (host_inputs six, tool_global's
+    // a_schedule_replay_reports_host_inputs_changed_since_its_recording and
+    // exec_record's
+    // an_image_names_its_program_interpreter_as_the_kernel_reads_it): 2703,
+    // listed.
+    ("test.detcore_unit", 2703),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4323,7 +4330,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity, the ptrace
     // halves of https://github.com/rrnewton/hermit/issues/4798's two run_kvm_
     // tests: 632 + 2 = 634.
-    ("test.cli", 637),
+    // And a_schedule_replay_names_a_host_input_changed_since_the_recording,
+    // which needs no PMU: 638, listed.
+    ("test.cli", 638),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4850,7 +4859,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed.
     // And the same two ptrace group-exit signal-wait tests, not excluded:
     // 551 + 2 = 553.
-    ("test.cli_on_host", 556),
+    // a_schedule_replay_names_a_host_input_changed_since_the_recording needs
+    // neither a PMU nor CPUID faulting: 557, listed.
+    ("test.cli_on_host", 557),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5313,7 +5324,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 3c.1e B unit: 2682, listed.
     // And the same nine units for a read that faults: 2691, listed.
     // And the same protection-key subscription unit: 2692, listed.
-    ("test.detcore_unit_on_host", 2695),
+    // And the same eight host-input set units: 2703, listed.
+    ("test.detcore_unit_on_host", 2703),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5886,7 +5898,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same native-client publication regression is included on the host.
     // And the same detcore-dbt fingerprint test: 1852, listed.
     // And the same finished-thread sparse histogram unit: 1853, listed.
-    ("test.regular_crates_on_host", 1866),
+    // And the same four host-input set tests: 1870, listed.
+    ("test.regular_crates_on_host", 1870),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

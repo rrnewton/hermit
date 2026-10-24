@@ -17298,6 +17298,220 @@ fn run_chaos_preemption_replay_reuses_the_recorded_epoch() {
     );
 }
 
+/// A schedule replay names a host file the guest reads whose bytes changed
+/// since the recording, once, on stderr and in its summary, and stays quiet
+/// for a file rewritten with the same bytes. Hermit does not make a changing
+/// filesystem deterministic: a replay that reads other bytes may diverge, as
+/// a seed rerun on a host whose package manager rewrote `/etc/ld.so.cache`
+/// did, and it now says why. The recorded schedule and the summary carry the
+/// set of host files the run read; recording it changes no scheduling
+/// decision. PMU-free: no `--chaos`, so the schedule records no preemptions,
+/// and the host-input comparison does not depend on any.
+///
+/// Only the test's own file `F` is asserted on: other host files the shell
+/// reads (the loader cache among them) can be rewritten by the host between
+/// the runs, and then reporting them is right.
+#[test]
+fn a_schedule_replay_names_a_host_input_changed_since_the_recording() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let input = directory.path().join("F");
+    fs::write(&input, "input\n").unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let input_path = input.to_str().unwrap();
+    let run = |schedule_arg: String, summary: &Path| {
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let args = [
+            "run",
+            "--base-env=minimal",
+            detcore_model::config::CANONICAL_TEST_EPOCH_ARG,
+            &schedule_arg,
+            &summary_arg,
+            "--",
+            "/bin/cat",
+            input_path,
+        ];
+        let output = hermit_test::hermit_output(
+            "host-input schedule run",
+            hermit_command(&args).stdin(Stdio::null()),
+        );
+        assert_success(&output, &args);
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(summary).unwrap()).unwrap();
+        (stdout(&output), stderr(&output), summary)
+    };
+    // The lines naming `F`, and the summary's changes to `F`.
+    let named = |stderr: &str| -> Vec<String> {
+        stderr
+            .lines()
+            .filter(|line| line.starts_with("HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING"))
+            .filter(|line| line.contains(&format!("host input {input_path} changed")))
+            .map(str::to_owned)
+            .collect()
+    };
+    let changed = |summary: &serde_json::Value| -> Vec<serde_json::Value> {
+        summary["host_inputs_changed"]
+            .as_array()
+            .map(|changes| {
+                changes
+                    .iter()
+                    .filter(|change| change["path"] == input_path)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let (out, _, summary) = run(
+        format!("--record-preemptions-to={}", schedule.display()),
+        &directory.path().join("record.json"),
+    );
+    assert_eq!(out, "input\n");
+    // The schedule and the summary carry the same set, which holds `F` with
+    // its size and the SHA-256 of its bytes (`printf 'input\n' | sha256sum`).
+    let recorded: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&schedule).unwrap()).unwrap();
+    assert_eq!(
+        recorded["host_inputs"], summary["host_inputs"],
+        "{recorded}"
+    );
+    let file = recorded["host_inputs"]["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == input_path)
+        .unwrap_or_else(|| panic!("the recording does not hold {input_path}: {recorded}"))
+        .clone();
+    assert_eq!(file["size"], 6, "{file}");
+    assert_eq!(
+        file["content"], "7d3f9b6284c6f36e77b425cac882e8fbbcc97a4727ec20790853076d0f463453",
+        "{file}"
+    );
+    assert_eq!(
+        recorded["host_inputs"]["digest"].as_str().map(str::len),
+        Some(64),
+        "{recorded}"
+    );
+    // The program the kernel exec'd is in the set too, under the path its
+    // `/proc/<pid>/exe` link names, and so is the ELF interpreter it names.
+    let holds = |path: &str| {
+        recorded["host_inputs"]["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|file| file["path"] == path)
+    };
+    let program = fs::canonicalize("/bin/cat").unwrap();
+    assert!(
+        holds(program.to_str().unwrap()),
+        "the recording does not hold {}: {recorded}",
+        program.display()
+    );
+    if let Some(interpreter) = elf_program_interpreter(&program) {
+        assert!(
+            holds(&interpreter),
+            "the recording does not hold {interpreter}: {recorded}"
+        );
+    }
+
+    let replay = || format!("--replay-preemptions-from={}", schedule.display());
+    let (out, err, summary) = run(replay(), &directory.path().join("unchanged.json"));
+    assert_eq!(out, "input\n");
+    assert!(named(&err).is_empty(), "{err}");
+    assert!(changed(&summary).is_empty(), "{summary}");
+
+    // Replaced with other bytes: named once, with the recorded and the new size.
+    let replacement = directory.path().join("F.new");
+    fs::write(&replacement, "changed input\n").unwrap();
+    fs::rename(&replacement, &input).unwrap();
+    let (out, err, summary) = run(replay(), &directory.path().join("changed.json"));
+    assert_eq!(out, "changed input\n");
+    let lines = named(&err);
+    assert_eq!(lines.len(), 1, "{err}");
+    assert!(
+        lines[0].contains("size 6 mtime") && lines[0].contains("size 14 mtime"),
+        "{}",
+        lines[0]
+    );
+    let changes = changed(&summary);
+    assert_eq!(changes.len(), 1, "{summary}");
+    assert_eq!(
+        (&changes[0]["recorded"]["size"], &changes[0]["now"]["size"]),
+        (&serde_json::json!(6), &serde_json::json!(14))
+    );
+    // A schedule-trace replay of the same recording compares the same way.
+    let (out, err, summary) = run(
+        format!("--replay-schedule-from={}", schedule.display()),
+        &directory.path().join("changed-trace.json"),
+    );
+    assert_eq!(out, "changed input\n");
+    assert_eq!(named(&err).len(), 1, "{err}");
+    assert_eq!(changed(&summary).len(), 1, "{summary}");
+
+    // Rewritten with the recorded bytes under a new inode: not a change.
+    fs::write(&replacement, "input\n").unwrap();
+    fs::rename(&replacement, &input).unwrap();
+    let (out, err, summary) = run(replay(), &directory.path().join("restored.json"));
+    assert_eq!(out, "input\n");
+    assert!(named(&err).is_empty(), "{err}");
+    assert!(changed(&summary).is_empty(), "{summary}");
+    // The digest follows what the comparison compares: paths and bytes (or
+    // an identity where a file was not hashed), not `F`'s new inode. Other
+    // host files may really change between the runs; only when none did must
+    // the digests agree.
+    let compared = |set: &serde_json::Value| -> Vec<(String, String)> {
+        set["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|file| {
+                let key = match file["content"].as_str() {
+                    Some(content) => content.to_owned(),
+                    None => format!("{}:{}:{}", file["dev"], file["ino"], file["size"]),
+                };
+                (file["path"].as_str().unwrap().to_owned(), key)
+            })
+            .collect()
+    };
+    let inode = |set: &serde_json::Value| {
+        set["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == input_path)
+            .map(|file| file["ino"].clone())
+    };
+    assert_ne!(
+        inode(&summary["host_inputs"]),
+        inode(&recorded["host_inputs"])
+    );
+    if compared(&summary["host_inputs"]) == compared(&recorded["host_inputs"]) {
+        assert_eq!(
+            summary["host_inputs"]["digest"], recorded["host_inputs"]["digest"],
+            "{summary}"
+        );
+    }
+}
+
+/// The program interpreter (`PT_INTERP`) an ELF64 executable names, or `None`
+/// for a static one.
+fn elf_program_interpreter(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let u16_at = |at: usize| u16::from_le_bytes([bytes[at], bytes[at + 1]]) as usize;
+    let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()) as usize;
+    if bytes.get(..4)? != b"\x7fELF" {
+        return None;
+    }
+    let (phoff, phentsize, phnum) = (u64_at(32), u16_at(54), u16_at(56));
+    (0..phnum)
+        .map(|index| phoff + index * phentsize)
+        .find(|entry| u32::from_le_bytes(bytes[*entry..*entry + 4].try_into().unwrap()) == 3)
+        .map(|entry| {
+            let (offset, size) = (u64_at(entry + 8), u64_at(entry + 32));
+            let name = &bytes[offset..offset + size];
+            String::from_utf8_lossy(name.split(|byte| *byte == 0).next().unwrap()).into_owned()
+        })
+}
+
 #[test]
 fn run_ptrace_nonleader_exec_refuses_preemption_artifacts() {
     nonleader_exec::run_preemption_artifacts();

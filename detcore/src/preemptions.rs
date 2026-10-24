@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use chrono::DateTime;
 use chrono::Utc;
 use detcore_model::collections::ReplayCursor;
+use detcore_model::host_input::HostInputSet;
 use serde::Deserialize;
 use serde::Serialize;
 use tracing::trace;
@@ -80,6 +81,14 @@ pub struct PreemptionRecord {
     /// synthesized in memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rng_seed: Option<u64>,
+    /// The host files the recorded run's guest opened
+    /// (`detcore_model::host_input::HostInputSet`), so that a replay can
+    /// report one that changed since (`HERMIT_HOST_INPUT_CHANGED_SINCE_RECORDING`).
+    /// Information only: a replay never refuses or alters its schedule for
+    /// it. `None` for records written before the field existed, and for
+    /// records synthesized in memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_inputs: Option<HostInputSet>,
 }
 
 impl std::fmt::Display for PreemptionRecord {
@@ -100,6 +109,7 @@ impl PreemptionRecord {
             signal_state_copy: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
+            host_inputs: None,
         }
     }
 
@@ -126,6 +136,11 @@ impl PreemptionRecord {
     /// from, if the record says.
     pub fn signal_state_copy(&self) -> Option<bool> {
         self.signal_state_copy
+    }
+
+    /// The host files the recorded run's guest opened, if the record says.
+    pub fn host_inputs(&self) -> Option<&HostInputSet> {
+        self.host_inputs.as_ref()
     }
 
     /// The same record, stating whether the copy was on in the trials it
@@ -205,6 +220,7 @@ impl PreemptionRecord {
             signal_state_copy: self.signal_state_copy,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: self.rng_seed,
+            host_inputs: self.host_inputs.clone(),
         }
     }
 
@@ -266,6 +282,7 @@ impl PreemptionRecord {
             signal_state_copy: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
+            host_inputs: None,
         }
     }
 
@@ -1311,6 +1328,12 @@ impl PreemptionWriter {
     pub fn with_rng_seed(mut self, rng_seed: u64) -> Self {
         self.inner.rng_seed = Some(rng_seed);
         self
+    }
+
+    /// Store the host files the run's guest opened, once the run has ended
+    /// and before the record is flushed.
+    pub fn set_host_inputs(&mut self, inputs: HostInputSet) {
+        self.inner.host_inputs = Some(inputs);
     }
 
     /// Does the record have zero entries?

@@ -224,6 +224,11 @@ impl Recording {
         self.metadata().signal_state_copy()
     }
 
+    /// The host files the recorded run's guest opened, if the recording says.
+    pub fn host_inputs(&self) -> Option<&detcore_model::host_input::HostInputSet> {
+        self.metadata().host_inputs()
+    }
+
     fn metadata(&self) -> &PreemptionRecord {
         match self {
             Self::Legacy(record) => record,
@@ -240,6 +245,11 @@ pub(crate) struct HistoryReader(Recording);
 impl HistoryReader {
     pub(crate) fn read(path: &Path) -> anyhow::Result<Self> {
         Recording::read(path).map(Self)
+    }
+
+    /// The host files the recorded run's guest opened, if the recording says.
+    pub(crate) fn host_inputs(&self) -> Option<&detcore_model::host_input::HostInputSet> {
+        self.0.host_inputs()
     }
 
     /// History-only replay cannot honor boundary records. Admission must not
