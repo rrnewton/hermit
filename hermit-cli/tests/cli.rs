@@ -191,6 +191,7 @@ static FUSE_DIRECTORY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LAST_BAND_BACKGROUND_CALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_POLLER_BESIDE_SLEEPERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMED_WAIT_POLLERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SOCKET_READER_BESIDE_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SCHEDULER_SIGNAL_WAITING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_WAITING_BESIDE_BACKGROUND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAIT_UNREADABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -42989,6 +42990,110 @@ fn a_schedule_replay_charges_expired_waits_as_its_recording_did() {
             assert_eq!(polls(&replayed), polls(&recorded), "{name}");
         }
     }
+}
+
+/// A reader thread in `poll(-1)` on a Unix stream socket answers five
+/// one-byte requests from a client thread, while main spins against a 10 s
+/// deadline in a loop whose only system call is a `clock_gettime` every 2^20
+/// iterations (tests/c/socket_reader_beside_spinner.c). The send that
+/// readies each poll takes no turn, so each poller retries only when it is
+/// selected, and the spinner, always runnable, is selected ahead of a
+/// backed-off poller. On main 512b7570 a poll upgrade came only every 200
+/// queueing operations, about 100 of the spinner's slices, and the run
+/// missed its deadline with or without chaos. A poll upgrade now also comes
+/// once a poll-upgrade period (200 ms here) of virtual time passes without
+/// one, so every round finishes. A chaos run also verifies at bitwise parity, and a chaos
+/// recording replays its schedule without a desync, although the replay
+/// runs no timed upgrade of its own. The spinner's slices end at PMU
+/// preemptions, so the test needs the performance counters the strict
+/// suite already requires.
+#[test]
+fn a_socket_reader_beside_a_spinner_is_retried_within_a_poll_upgrade_period() {
+    let guest = futex_c_guest(
+        &SOCKET_READER_BESIDE_SPINNER_GUEST,
+        "socket_reader_beside_spinner",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let verdict_arg = verdict.to_str().unwrap().to_owned();
+    for hermit_args in [
+        &[][..],
+        &["--chaos", "--seed", "1"][..],
+        &["--chaos", "--seed", "2"][..],
+        &[
+            "--chaos",
+            "--seed",
+            "3",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict_arg.as_str(),
+        ][..],
+    ] {
+        let mut args = vec!["run", "--strict", "--timeout", "120"];
+        args.extend_from_slice(hermit_args);
+        args.extend_from_slice(&["--", guest.as_str(), "5", "10"]);
+        let output = hermit(&args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.starts_with("5/5 rounds"),
+            "{args:?}: every round must finish before the deadline\nstatus: {}\nstdout:\n{stdout}\n\
+             stderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&verdict).expect("failed to read the verify verdict"),
+    )
+    .expect("the verify verdict is not JSON");
+    assert_eq!(report["verdict"], "matched", "{report}");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+
+    let schedule = directory.path().join("schedule.json");
+    let record = format!("--record-preemptions-to={}", schedule.display());
+    let recorded = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "2",
+        &record,
+        "--",
+        &guest,
+        "5",
+        "10",
+    ]);
+    assert!(recorded.status.success(), "{}", stderr(&recorded));
+    let replay = format!("--replay-schedule-from={}", schedule.display());
+    let replayed = hermit(&[
+        "--log=info",
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        &replay,
+        "--",
+        &guest,
+        "5",
+        "10",
+    ]);
+    let log = stderr(&replayed);
+    assert!(
+        replayed.status.success()
+            && stdout(&replayed).starts_with("5/5 rounds")
+            && log.contains("(0 desynced)"),
+        "the schedule replay must finish every round without a desync:\n{}",
+        log.lines()
+            .filter(|line| line.contains("desync") || line.contains("expected to be running"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }
 
 /// Run tests/c/scheduler_signal_waiting.c under `run --strict` in each mode

@@ -2719,6 +2719,12 @@
       "why": "tests/c/socket_options.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/socket_reader_beside_spinner.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/socket_reader_beside_spinner.c is owned by hermit-cli/tests/cli.rs: The integration test a_socket_reader_beside_a_spinner_is_retried_within_a_poll_upgrade_period runs this guest under run --strict, without chaos and at three chaos seeds (one with --verify --verify-strict), requires all five socket round trips to finish before the guest's 10 s deadline while main spins without system calls, and replays a chaos recording under --replay-schedule-from without a desync; a generic manifest cannot express the deadline, the parity check or the replay."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/socket_timestamp_edge_cases.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

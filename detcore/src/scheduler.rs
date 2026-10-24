@@ -1200,6 +1200,15 @@ impl BackgroundReadSignals {
     }
 }
 
+/// The least virtual time between two timed poll upgrades
+/// (`Scheduler::upgrade_pollers_on_time`), whatever the maximum timeslice: a
+/// period near one turn charge would ready every filed retry at every pass
+/// and switch the pollers' backoff off. The period is also at least
+/// `POLLING_UPGRADE_INTERVAL` turn charges, so a round of readied retries,
+/// one turn per poller, cannot use it up before the queueing-operation
+/// interval would have upgraded anyway.
+const MIN_POLL_UPGRADE_PERIOD_NS: u64 = 200_000_000;
+
 /// The state for the deterministic scheduler.
 #[derive(Debug)]
 pub struct Scheduler {
@@ -2219,6 +2228,19 @@ pub struct Scheduler {
     poll_deadlines: BTreeSet<(LogicalTime, DetTid)>,
     /// Each thread's entry in `poll_deadlines`.
     poll_deadline_of: BTreeMap<DetTid, LogicalTime>,
+    /// When the next timed poll upgrade is due (`upgrade_pollers_on_time`),
+    /// and the run queue's upgrade count when that was set: an upgrade the
+    /// queueing-operation interval runs first restarts the period. `None`
+    /// until the first scheduler pass.
+    next_timed_poll_upgrade: Option<(LogicalTime, u64)>,
+    /// The committed time `upgrade_pollers_on_time` last looked at: it looks
+    /// once per committed time.
+    timed_poll_upgrade_checked: Option<LogicalTime>,
+    /// The most virtual time between two poll upgrades
+    /// (`upgrade_pollers_on_time`): the maximum timeslice, but at least
+    /// `MIN_POLL_UPGRADE_PERIOD_NS` and `POLLING_UPGRADE_INTERVAL` turn
+    /// charges.
+    poll_upgrade_period: Duration,
     /// A cached copy of the same (immutable) field in Config.
     fuzz_futexes: bool,
     /// A cached copy of the same (immutable) field in Config. When set (and only
@@ -3918,6 +3940,7 @@ pub async fn do_a_turn_blocking(
                                 timed_event_processed = state.step2b_process_timed(&global_time);
                             }
                             state.step2b_restore_due_pollers();
+                            state.upgrade_pollers_on_time();
                             if let Err(error) = state.select_parked_alarm() {
                                 state.fail_parked_selection(error);
                             }
@@ -4349,6 +4372,18 @@ impl Scheduler {
             ),
             poll_deadlines: BTreeSet::new(),
             poll_deadline_of: BTreeMap::new(),
+            next_timed_poll_upgrade: None,
+            timed_poll_upgrade_checked: None,
+            poll_upgrade_period: Duration::from_nanos(
+                cfg.max_timeslice
+                    .map_or(0, std::num::NonZeroU64::get)
+                    .max(MIN_POLL_UPGRADE_PERIOD_NS)
+                    .max(
+                        cfg.scheduler_turn_charge()
+                            .unwrap_or(0)
+                            .saturating_mul(runqueue::POLLING_UPGRADE_INTERVAL),
+                    ),
+            ),
             run_queue: RunQueue::new(
                 cfg.sched_heuristic,
                 cfg.sched_seed(),
@@ -8286,6 +8321,7 @@ impl Scheduler {
         }
         self.step2b_process_timed(global_time);
         self.step2b_restore_due_pollers();
+        self.upgrade_pollers_on_time();
         // A timed signal that just armed a background thread is followed by an
         // empty pass, so the barrier above requeues it at the top of the next
         // one whether or not its continuation is already posted.
@@ -8734,6 +8770,114 @@ impl Scheduler {
             self.poll_deadlines.remove(&(deadline, dettid));
             self.poll_deadline_of.remove(&dettid);
         }
+    }
+
+    /// Run a poll upgrade once `poll_upgrade_period` of virtual time has
+    /// passed without one: restore every backed-off poller to its normal
+    /// priority (`RunQueue::upgrade_pollers`), and make every queued live
+    /// poller's filed retry runnable at its next selection
+    /// (`ready_filed_retries`).
+    ///
+    /// A backed-off poller retries only when it is selected, and any runnable
+    /// thread is selected ahead of it. The queueing-operation interval
+    /// (`POLLING_UPGRADE_INTERVAL`) bounds that wait in scheduler activity,
+    /// not in time. A thread that runs whole timeslices without taking a turn,
+    /// a spin loop, adds about two queueing operations per slice, so a socket
+    /// or pipe reader whose data had arrived waited about 100 of the
+    /// spinner's slices, 10 to 20 s of virtual time, for its next retry. Now, at the end of the
+    /// slice in which the period runs out, such a poller is runnable at its
+    /// normal priority. Without chaos it retries next. Under chaos it competes
+    /// by priority, and once passed over at two change points the starvation
+    /// bound puts the changing thread behind it (`bound_chaos_starvation`).
+    /// A program whose queueing operations already upgrade within the period
+    /// sees no extra upgrade. When one runs, each queued poller costs at most
+    /// a skipped and a committed turn.
+    ///
+    /// Nothing is upgraded here under a schedule replayer, whose trace sets
+    /// the run queue (as for `ready_channel`); under `hermit record` and
+    /// `hermit replay` (`recordreplay_modes`), whose recordings must keep
+    /// replaying (as for `note_poll_deadline`); or under a heuristic that
+    /// picks threads regardless of priority, where a poller cannot starve.
+    ///
+    /// Determinism: the inputs are committed time, the run queue, its upgrade
+    /// count and the filed requests at the first scheduler pass that sees a
+    /// new committed time, after all threads have quiesced, so every run
+    /// upgrades at the same pass. Later passes at the same committed time,
+    /// whose number can depend on host timing (a skipped pass, the KVM loop's
+    /// refreshes), do not look again: an operation-count upgrade one of them
+    /// runs is seen at the next committed time, in every run alike. A thread a
+    /// committed decision doomed (`poller_is_doomed`) may still be queued or
+    /// not, at host-timed moments: its retry is not readied and it is not
+    /// counted in the INFO line, and once a SIGKILL's victim could not be
+    /// named no retry is readied at all, as for `ready_channel`.
+    fn upgrade_pollers_on_time(&mut self) {
+        if self.has_schedule_replay()
+            || self.recordreplay_modes
+            || !self.run_queue.is_priority_ordered()
+            || self.timed_poll_upgrade_checked == Some(self.committed_time)
+        {
+            return;
+        }
+        self.timed_poll_upgrade_checked = Some(self.committed_time);
+        let upgrades = self.run_queue.poll_upgrade_count();
+        if let Some((due, seen)) = self.next_timed_poll_upgrade
+            && seen == upgrades
+        {
+            if self.committed_time < due {
+                return;
+            }
+            let restored = self
+                .run_queue
+                .upgrade_pollers()
+                .into_iter()
+                .filter(|tid| !self.unresolved_sigkill && !self.poller_is_doomed(*tid))
+                .count();
+            let readied = if self.unresolved_sigkill {
+                0
+            } else {
+                self.ready_filed_retries()
+            };
+            if restored + readied > 0 {
+                info!(
+                    "[scheduler] poll upgrade after {:?} of virtual time without one: {} backed-off \
+                     pollers restored to their normal priority, {} filed retries made runnable",
+                    self.poll_upgrade_period, restored, readied
+                );
+            }
+        }
+        self.next_timed_poll_upgrade = Some((
+            self.committed_time + self.poll_upgrade_period,
+            self.run_queue.poll_upgrade_count(),
+        ));
+    }
+
+    /// Make the filed retry of every queued live poller runnable at its next
+    /// selection, as `ready_channel` does: that selection would otherwise
+    /// only defer it once more in step 4 and back it off again, a slice
+    /// later. Nothing has readied its descriptor, so the retry may fail; it
+    /// then files the next one, as any retry does. Answers how many it made
+    /// runnable.
+    fn ready_filed_retries(&mut self) -> usize {
+        let queued: Vec<DetTid> = self.run_queue.tids().copied().collect();
+        let mut readied = 0;
+        for tid in queued {
+            if self.poller_is_doomed(tid) {
+                continue;
+            }
+            let Some(request) = self
+                .next_turns
+                .get(&tid)
+                .and_then(|turn| turn.req.try_read())
+                .and_then(|request| request.as_ref().ok().cloned())
+                .filter(|rs| rs.poll_attempt > 0 && Self::is_polling_turn(rs))
+            else {
+                continue;
+            };
+            self.note_sigalrm_polling_wait(tid, &request);
+            self.upgrade_polled_to_runnable(tid, &request);
+            readied += 1;
+        }
+        readied
     }
 
     /// Check whether it is time for the *earliest* time-based event to execute INSTEAD of
@@ -20945,6 +21089,209 @@ mod test {
             &sleep(LogicalTime::from_nanos(6_000_000)),
             now
         ));
+    }
+
+    /// A backed-off poller is restored to its normal priority once a
+    /// poll-upgrade period of virtual time passes without a poll upgrade
+    /// (`upgrade_pollers_on_time`), and not before. An upgrade the
+    /// queueing-operation interval runs in the meantime restarts the period,
+    /// at the next committed time the scheduler looks at: a second look at
+    /// the same committed time changes nothing.
+    #[test]
+    fn a_backed_off_poller_is_upgraded_once_a_poll_upgrade_period_passes_without_one() {
+        let mut sched = Scheduler::new(&Config::default());
+        let period = sched.poll_upgrade_period;
+        assert_eq!(
+            period,
+            Duration::from_millis(200),
+            "the default maximum timeslice"
+        );
+        let poller = DetTid::from_raw(13);
+        let normal = 500;
+        sched.priorities.insert(poller, normal);
+        sched.run_queue.push_poller(poller, normal, 6);
+        let backed_off = Some(runqueue::LAST_PRIORITY);
+        assert_eq!(sched.run_queue.queued_priority(poller), backed_off);
+        let start = LogicalTime::from_nanos(1_000_000_000);
+        sched.committed_time = start;
+        sched.upgrade_pollers_on_time();
+        assert_eq!(
+            sched.run_queue.queued_priority(poller),
+            backed_off,
+            "the first pass only starts the period"
+        );
+        sched.committed_time = start + (period - Duration::from_nanos(1));
+        sched.upgrade_pollers_on_time();
+        assert_eq!(
+            sched.run_queue.queued_priority(poller),
+            backed_off,
+            "before the period runs out"
+        );
+        sched.committed_time = start + period;
+        sched.upgrade_pollers_on_time();
+        assert_eq!(
+            sched.run_queue.queued_priority(poller),
+            Some(normal),
+            "once it runs out"
+        );
+
+        // The poller retries and backs off again; an upgrade the interval
+        // runs then restarts the period, so the next timed one is due a whole
+        // period after the pass that saw it.
+        assert!(sched.run_queue.remove_tid(poller));
+        sched.run_queue.push_poller(poller, normal, 7);
+        let looked = start + period + Duration::from_millis(50);
+        sched.committed_time = looked;
+        sched.upgrade_pollers_on_time();
+        // An interval upgrade after the scheduler looked at this committed
+        // time is seen at the next one, however often it looks again here.
+        assert_eq!(sched.run_queue.upgrade_pollers(), vec![poller]);
+        assert!(sched.run_queue.remove_tid(poller));
+        sched.run_queue.push_poller(poller, normal, 8);
+        sched.upgrade_pollers_on_time();
+        let restart = looked + Duration::from_millis(10);
+        sched.committed_time = restart;
+        sched.upgrade_pollers_on_time();
+        sched.committed_time = looked + period;
+        sched.upgrade_pollers_on_time();
+        assert_eq!(
+            sched.run_queue.queued_priority(poller),
+            backed_off,
+            "the interval's upgrade restarted the period at the next committed time"
+        );
+        sched.committed_time = restart + period;
+        sched.upgrade_pollers_on_time();
+        assert_eq!(sched.run_queue.queued_priority(poller), Some(normal));
+    }
+
+    /// A timed poll upgrade also makes a queued live poller's filed retry
+    /// runnable at its next selection (`ready_filed_retries`), as readying a
+    /// pipe does. A poller whose process a committed fatal signal doomed and
+    /// a queued thread that is not polling are left alone. Under `hermit
+    /// record`/`hermit replay` and under a heuristic that picks threads
+    /// regardless of priority nothing happens at all. The period has a floor
+    /// of 200 ms whatever the maximum timeslice.
+    #[test]
+    fn a_timed_poll_upgrade_readies_a_live_pollers_filed_retry() {
+        let actor = DetTid::from_raw(1);
+        let live = DetTid::from_raw(3);
+        let doomed = DetTid::from_raw(5);
+        let worker = DetTid::from_raw(7);
+        let start = LogicalTime::from_nanos(1_000_000_000);
+        let run = |config: &Config, record_replay: bool| {
+            let mut sched = Scheduler::new(config);
+            sched.recordreplay_modes = record_replay;
+            for tid in [actor, live, doomed, worker] {
+                sched.thread_tree.add_child(actor, tid, true);
+                register_known_thread_for(&mut sched, tid);
+            }
+            sched.record_committed_fatal_signal(doomed);
+            for poller in [live, doomed] {
+                let mut request = Resources::new(poller);
+                request.insert(ResourceID::InternalIOPolling, Permission::W);
+                request.poll_attempt = 3;
+                sched.next_turns[&poller].req.put(Ok(request));
+                sched.runqueue_push_back(poller);
+            }
+            sched.next_turns[&worker]
+                .req
+                .put(Ok(Resources::new(worker)));
+            sched.runqueue_push_back(worker);
+            sched.committed_time = start;
+            sched.upgrade_pollers_on_time();
+            sched.committed_time = start + sched.poll_upgrade_period;
+            sched.upgrade_pollers_on_time();
+            sched
+        };
+        let request = |sched: &Scheduler, tid: DetTid| {
+            sched.next_turns[&tid]
+                .req
+                .try_read()
+                .unwrap()
+                .expect("a filed request")
+        };
+        let sched = run(&Config::default(), false);
+        let readied = request(&sched, live);
+        assert_eq!(
+            (readied.poll_attempt, readied.upgraded_from_attempt),
+            (0, 3),
+            "the live poller's retry is runnable, still counted as its third"
+        );
+        assert!(sched.in_polling_wait(live));
+        assert_eq!(request(&sched, doomed).poll_attempt, 3, "a doomed poller");
+        assert!(
+            request(&sched, worker).resources.is_empty(),
+            "a thread that is not polling"
+        );
+        assert_eq!(
+            request(&run(&Config::default(), true), live).poll_attempt,
+            3,
+            "under hermit record/replay"
+        );
+        let random = Config {
+            sched_heuristic: crate::config::SchedHeuristic::Random,
+            ..Config::default()
+        };
+        assert_eq!(
+            request(&run(&random, false), live).poll_attempt,
+            3,
+            "under the random heuristic"
+        );
+        let short = Config {
+            max_timeslice: std::num::NonZeroU64::new(400_000),
+            ..Config::default()
+        };
+        assert_eq!(
+            Scheduler::new(&short).poll_upgrade_period,
+            Duration::from_millis(200),
+            "a 400 us timeslice still waits 200 ms between timed upgrades"
+        );
+        let costly = Config {
+            scheduler_turn_cost: std::num::NonZeroU64::new(50_000_000),
+            ..Config::default()
+        };
+        assert_eq!(
+            Scheduler::new(&costly).poll_upgrade_period,
+            Duration::from_secs(10),
+            "200 turn charges of 50 ms"
+        );
+    }
+
+    /// Once a SIGKILL's victim could not be named, a doomed poller cannot be
+    /// told from a live one, so a timed poll upgrade readies no filed retry
+    /// (as `ready_channel` readies nothing). It still restores backed-off
+    /// pollers, as the queueing-operation interval does.
+    #[test]
+    fn a_timed_poll_upgrade_readies_nothing_after_an_unresolved_sigkill() {
+        let actor = DetTid::from_raw(1);
+        let poller = DetTid::from_raw(3);
+        let mut sched = Scheduler::new(&Config::default());
+        for tid in [actor, poller] {
+            sched.thread_tree.add_child(actor, tid, true);
+            register_known_thread_for(&mut sched, tid);
+        }
+        let mut request = Resources::new(poller);
+        request.insert(ResourceID::InternalIOPolling, Permission::W);
+        request.poll_attempt = 3;
+        sched.next_turns[&poller].req.put(Ok(request));
+        sched.run_queue.push_poller(poller, DEFAULT_PRIORITY, 3);
+        sched.unresolved_sigkill = true;
+        let start = LogicalTime::from_nanos(1_000_000_000);
+        sched.committed_time = start;
+        sched.upgrade_pollers_on_time();
+        sched.committed_time = start + sched.poll_upgrade_period;
+        sched.upgrade_pollers_on_time();
+        assert_eq!(
+            sched.run_queue.queued_priority(poller),
+            Some(DEFAULT_PRIORITY),
+            "restored"
+        );
+        let filed = sched.next_turns[&poller]
+            .req
+            .try_read()
+            .unwrap()
+            .expect("a filed request");
+        assert_eq!(filed.poll_attempt, 3, "not readied");
     }
 
     /// https://github.com/rrnewton/hermit/issues/3517: a committed turn that
