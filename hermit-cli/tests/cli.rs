@@ -136,6 +136,7 @@ static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_STDERR_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_LOG_ENV_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_GUEST_ENVIRONMENT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static ABSTRACT_UNIX_BIND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -552,6 +553,39 @@ fn dbt_guest_environment_guest() -> &'static Path {
         );
         guest
     })
+}
+
+fn abstract_unix_bind_guest() -> &'static Path {
+    ABSTRACT_UNIX_BIND_GUEST.get_or_init(|| {
+        let build_root = process_build_root("abstract-unix-bind");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create abstract-unix-bind guest directory");
+        let guest = build_root.join("abstract_unix_bind");
+        let output = Command::new("cc")
+            .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/abstract_unix_bind.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile abstract-unix-bind guest");
+        assert!(
+            output.status.success(),
+            "abstract-unix-bind guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// The lines of `output`'s standard error that are Detcore's notice for an
+/// abstract `AF_UNIX` bind under host networking.
+fn host_network_abstract_bind_notices(output: &Output) -> Vec<String> {
+    stderr(output)
+        .lines()
+        .filter(|line| line.starts_with("hermit: NOTICE: the guest"))
+        .map(str::to_owned)
+        .collect()
 }
 
 fn read_terminal_dbt_verdict(path: &Path) -> serde_json::Value {
@@ -5314,6 +5348,155 @@ fn namespace_only_does_not_report_an_active_preemption_timer() {
     assert!(
         !message.contains("Configured maximum timeslice:"),
         "namespace-only execution has no Detcore timer: {message}"
+    );
+}
+
+/// Under `--network=host` a guest's abstract `AF_UNIX` names are the host's, so
+/// a concurrent run that builds the same name, for instance from its pid (3 in
+/// every run), fails to bind it. On the ptrace backend the first abstract bind
+/// prints one notice that names it and points at `--network=local`; the second
+/// prints nothing more. The names carry this test's pid, so concurrent tests do
+/// not collide.
+#[test]
+fn run_host_network_abstract_unix_bind_prints_one_notice() {
+    let guest = abstract_unix_bind_guest()
+        .to_str()
+        .expect("abstract-unix-bind guest path should be UTF-8");
+    let first = format!("hermit-cli-abstract-{}-a", std::process::id());
+    let second = format!("hermit-cli-abstract-{}-b", std::process::id());
+    let args = [
+        "run",
+        "--base-env=minimal",
+        "--network=host",
+        "--",
+        guest,
+        &first,
+        &second,
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), format!("bound {first}\nbound {second}\n"));
+    let notices = host_network_abstract_bind_notices(&output);
+    assert_eq!(notices.len(), 1, "stderr:\n{}", stderr(&output));
+    assert!(
+        notices[0].contains(&format!(
+            "hermit: NOTICE: the guest bound the abstract unix socket \"@{first}\" under \
+             --network=host."
+        )),
+        "{}",
+        notices[0]
+    );
+    assert!(
+        notices[0].contains("--network=local (the default) gives each run its own names"),
+        "{}",
+        notices[0]
+    );
+}
+
+/// The collision itself: with the name already held in the host's network
+/// namespace (here by this test), the guest's bind fails with `EADDRINUSE`, as
+/// it would against a concurrent Hermit run, and the notice says so.
+#[test]
+fn run_host_network_abstract_unix_bind_collision_names_eaddrinuse() {
+    use std::os::linux::net::SocketAddrExt as _;
+    use std::os::unix::net::SocketAddr;
+    use std::os::unix::net::UnixListener;
+
+    let guest = abstract_unix_bind_guest()
+        .to_str()
+        .expect("abstract-unix-bind guest path should be UTF-8");
+    let name = format!("hermit-cli-abstract-{}-held", std::process::id());
+    let _holder = UnixListener::bind_addr(
+        &SocketAddr::from_abstract_name(name.as_bytes()).expect("abstract socket address"),
+    )
+    .expect("this test holds the abstract name");
+    let args = [
+        "run",
+        "--base-env=minimal",
+        "--network=host",
+        "--",
+        guest,
+        &name,
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), format!("bind {name}: EADDRINUSE\n"));
+    let notices = host_network_abstract_bind_notices(&output);
+    assert_eq!(notices.len(), 1, "stderr:\n{}", stderr(&output));
+    assert!(
+        notices[0].contains(&format!(
+            "hermit: NOTICE: the guest's bind of the abstract unix socket \"@{name}\" under \
+             --network=host failed with EADDRINUSE"
+        )),
+        "{}",
+        notices[0]
+    );
+}
+
+/// An autobind under `--network=host` gets the notice too, naming the name
+/// Hermit chose: a leading NUL and five hex digits, the same in every run, so
+/// another concurrent run can hold it. The bind's own result is not checked
+/// for that reason.
+#[test]
+fn run_host_network_unix_autobind_prints_the_notice() {
+    let guest = abstract_unix_bind_guest()
+        .to_str()
+        .expect("abstract-unix-bind guest path should be UTF-8");
+    let args = [
+        "run",
+        "--base-env=minimal",
+        "--network=host",
+        "--",
+        guest,
+        "autobind",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    let notices = host_network_abstract_bind_notices(&output);
+    assert_eq!(notices.len(), 1, "stderr:\n{}", stderr(&output));
+    let name = notices[0]
+        .split_once("abstract unix socket \"@")
+        .map(|(_, rest)| rest)
+        .and_then(|rest| rest.split_once('"'))
+        .map(|(name, _)| name)
+        .unwrap_or_default();
+    assert!(
+        name.len() == 5 && name.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "{}",
+        notices[0]
+    );
+}
+
+/// With the default isolated network each run has its own abstract names, so
+/// the same binds print no notice.
+#[test]
+fn run_local_network_abstract_unix_bind_prints_no_notice() {
+    let guest = abstract_unix_bind_guest()
+        .to_str()
+        .expect("abstract-unix-bind guest path should be UTF-8");
+    let args = [
+        "run",
+        "--base-env=minimal",
+        "--",
+        guest,
+        "hermit-cli-abstract-local",
+        "autobind",
+    ];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "bound hermit-cli-abstract-local\nbound autobind\n"
+    );
+    assert_eq!(
+        host_network_abstract_bind_notices(&output),
+        Vec::<String>::new(),
+        "stderr:\n{}",
+        stderr(&output)
     );
 }
 
