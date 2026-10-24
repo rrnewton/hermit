@@ -4013,7 +4013,18 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (A5 step 3c slice 0c): 600, listed.
     // And liteinst_in_guest_programs::in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name
     // (A5 step 3c slice 0g): 601, listed.
-    ("test.cli", 601),
+    // rendered_process_files_hold_linuxs_relations_natively and
+    // virtual_kernel_files_hold_linuxs_invariants_natively, the native controls
+    // of existing tests, and
+    // detcore_refuses_removing_the_procfs_names_outside_the_level_on_every_backend
+    // and detcore_refuses_removing_the_procfs_names_outside_the_level_on_kvm, the
+    // omitted-names guest's two removals, all moved out of existing tests
+    // unchanged: 605, listed.
+    // a_nested_namespace_only_run_is_refused_without_its_kill_filter is the
+    // nested-refusal sub-check split out of
+    // a_namespace_only_guests_kill_0_never_reaches_hermits_group
+    // (https://github.com/rrnewton/hermit/issues/4065), unchanged: 606, listed.
+    ("test.cli", 606),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4503,7 +4514,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unchanged at 520.
     // The in-guest unsequentialized-handler refusal test (slice 0g) starts the
     // in-guest runtime too and joins the hosted exclusions: unchanged at 520.
-    ("test.cli_on_host", 520),
+    // And the same four tests moved out of existing ones (native controls and
+    // removals), none excluded: 524.
+    // And a_nested_namespace_only_run_is_refused_without_its_kill_filter, split
+    // out unchanged and not excluded: 525.
+    ("test.cli_on_host", 525),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
