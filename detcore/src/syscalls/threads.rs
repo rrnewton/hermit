@@ -3361,28 +3361,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.exec_image_at(guest, libc::AT_FDCWD, &path)
     }
 
-    /// The name this image's exec gave it as Linux names it from the
-    /// filename the exec was given (`kbasename(bprm->filename)`,
-    /// `procfs::task_stat::TaskComm::of_exec_filename`), read from the
-    /// image's `AT_EXECFN`, which points at a copy of that filename on its
-    /// initial stack (`create_elf_tables`). `None` where the auxiliary vector
-    /// has no such entry or its string cannot be read.
-    pub(crate) fn execfn_comm<G: Guest<Self>>(
-        &self,
-        guest: &G,
-    ) -> Option<crate::procfs::task_stat::TaskComm> {
-        use std::os::unix::ffi::OsStrExt;
-
-        use reverie::syscalls::FromToRaw;
-        let address = guest.auxv().at_execfn()?.as_raw();
-        let path: std::path::PathBuf = Option::<syscalls::PathPtr>::from_raw(address)?
-            .read(&guest.memory())
-            .ok()?;
-        Some(crate::procfs::task_stat::TaskComm::of_exec_filename(
-            path.as_os_str().as_bytes(),
-        ))
-    }
-
     /// `Self::exec_image` for a `path` the caller already read from the
     /// guest: public for a backend that runs the native `execve` outside
     /// Detcore's handler, prepares the exec itself (`crate::prepare_exec`)

@@ -4444,29 +4444,6 @@ impl GlobalState {
                 }
                 R::ProcfsTask(answer)
             }
-            GlobalRequest::TaskStatFacts(named, thread) => R::TaskStatFacts(
-                self.lock_rpc_scheduler(false)
-                    .await
-                    .task_stat_facts(named, thread),
-            ),
-            GlobalRequest::SetTaskComm(tid, comm) => {
-                self.lock_rpc_scheduler(false)
-                    .await
-                    .set_task_comm(tid, comm);
-                R::SetTaskComm(())
-            }
-            GlobalRequest::RecordExternalParent(process, parent) => {
-                self.lock_rpc_scheduler(false)
-                    .await
-                    .record_external_parent(process, parent);
-                R::RecordExternalParent(())
-            }
-            GlobalRequest::SetRssLimit(process, limit) => {
-                self.lock_rpc_scheduler(false)
-                    .await
-                    .set_rss_limit(process, limit);
-                R::SetRssLimit(())
-            }
             GlobalRequest::RenderedFileState(inode, change) => R::RenderedFileState(
                 self.inodes
                     .lock()
@@ -6883,22 +6860,6 @@ pub enum GlobalRequest {
         /// Independently observed actual callback coordinates.
         actual: crate::preemptions::callback_history::Origin,
     },
-    /// What the process table says about the task a per-process `stat` file
-    /// names (`Scheduler::task_stat_facts`): the top-level number and the
-    /// thread below `task/`. Appended last.
-    TaskStatFacts(DetTid, Option<DetTid>),
-    /// Record a task's name (`Scheduler::set_task_comm`): the name a new
-    /// image's `AT_EXECFN` gives it at its exec, or the one `PR_SET_NAME`
-    /// set, in the task's own turn. Appended last.
-    SetTaskComm(DetTid, crate::procfs::task_stat::TaskComm),
-    /// Record the guest-visible parent of a process whose real parent is
-    /// outside the guest's tree, its own `getppid` answer when it first
-    /// opens or lists its rendered `stat`
-    /// (`Scheduler::record_external_parent`). Appended last.
-    RecordExternalParent(DetPid, i32),
-    /// Record a process's virtual soft `RLIMIT_RSS` after a `setrlimit` or
-    /// `prlimit64` changed it (`Scheduler::set_rss_limit`). Appended last.
-    SetRssLimit(DetPid, u64),
 }
 
 /// Responses from the global object
@@ -7157,14 +7118,6 @@ pub enum GlobalResponse {
     ),
     /// A mismatch report acknowledges no scheduler grant and carries no time.
     CallbackCheckpointMismatch(()),
-    /// The answer to `GlobalRequest::TaskStatFacts`. Appended last.
-    TaskStatFacts(crate::procfs::task_stat::TaskStatFacts),
-    /// Appended last.
-    SetTaskComm(()),
-    /// Appended last.
-    RecordExternalParent(()),
-    /// Appended last.
-    SetRssLimit(()),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -9858,68 +9811,6 @@ where
         GlobalResponse::ProcfsTask(answer) => answer,
         _ => unreachable!(),
     }
-}
-
-/// What the process table says about the task a per-process `stat` file
-/// names (`Scheduler::task_stat_facts`).
-pub(crate) async fn task_stat_facts<G, T>(
-    guest: &mut G,
-    task: crate::procfs::BoundTask,
-) -> crate::procfs::task_stat::TaskStatFacts
-where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    let request = GlobalRequest::TaskStatFacts(
-        DetTid::from_raw(task.process),
-        task.thread.map(DetTid::from_raw),
-    );
-    match send_and_update_time(guest, request).await.1 {
-        GlobalResponse::TaskStatFacts(facts) => facts,
-        _ => unreachable!(),
-    }
-}
-
-/// Record `comm` as task `tid`'s name (`Scheduler::set_task_comm`).
-pub(crate) async fn set_task_comm<G, T>(
-    guest: &mut G,
-    tid: DetTid,
-    comm: crate::procfs::task_stat::TaskComm,
-) where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    let response = send_and_update_time(guest, GlobalRequest::SetTaskComm(tid, comm))
-        .await
-        .1;
-    assert_eq!(response, GlobalResponse::SetTaskComm(()));
-}
-
-/// Record `parent` as the guest-visible parent of `process`, whose real
-/// parent is outside the guest's tree (`Scheduler::record_external_parent`).
-pub(crate) async fn record_external_parent<G, T>(guest: &mut G, process: DetPid, parent: i32)
-where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    let response =
-        send_and_update_time(guest, GlobalRequest::RecordExternalParent(process, parent))
-            .await
-            .1;
-    assert_eq!(response, GlobalResponse::RecordExternalParent(()));
-}
-
-/// Record `limit` as `process`'s virtual soft `RLIMIT_RSS`
-/// (`Scheduler::set_rss_limit`).
-pub(crate) async fn set_rss_limit<G, T>(guest: &mut G, process: DetPid, limit: u64)
-where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    let response = send_and_update_time(guest, GlobalRequest::SetRssLimit(process, limit))
-        .await
-        .1;
-    assert_eq!(response, GlobalResponse::SetRssLimit(()));
 }
 
 /// Record the auxiliary vector the sender's process's new image found on

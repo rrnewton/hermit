@@ -1681,12 +1681,6 @@
       "why": "tests/c/proc_locks.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
-      "disposition": "manifest-test",
-      "path": "tests/c/proc_stat_comm.c",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
-      "why": "tests/c/proc_stat_comm.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Reads its own /proc/<pid>/stat (52 fields) by every spelling, a thread's task stat, a fork child's and a descriptor kept across an exec, and checks the name stat shows after PR_SET_NAME, comm writes, pthread_setname_np, an exec through a long symbolic link and execveat(AT_EMPTY_PATH) (c-programs/proc-stat-comm); Detcore renders a process's own stat"
-    },
-    {
       "disposition": "guest-fixture",
       "path": "tests/c/process_cgroup.c",
       "runner": "hermit-cli/tests/procfs_determinism.rs",
@@ -4157,18 +4151,6 @@
       "path": "tests/e2e/system-utils/ssh-keygen-ed25519.sh",
       "runner": "target/debug/test-harness via tests/e2e/manifests/*.yaml",
       "why": "tests/e2e/system-utils/ssh-keygen-ed25519.sh is owned by target/debug/test-harness via tests/e2e/manifests/*.yaml: Direct schema-v2 program; all modes and backend policy are centralized in the YAML bucket manifests"
-    },
-    {
-      "disposition": "support-data",
-      "path": "tests/e2e/system-utils/stat-alias",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
-      "why": "tests/e2e/system-utils/stat-alias is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: A symbolic link to /usr/bin/bash through which system-utils/stat-alias-root launches its root image, so the run's root is an ELF executed by an alias name; Detcore's stat names it by the link on ptrace and KVM; the KVM row records the executor's canonical naming, and the DBT row DynamoRIO's naming by the link's target"
-    },
-    {
-      "disposition": "manifest-test",
-      "path": "tests/e2e/system-utils/stat-root.sh",
-      "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
-      "why": "tests/e2e/system-utils/stat-root.sh is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: The run's root image is this #!/usr/bin/bash script, which prints the name its own /proc/<pid>/stat, status Name: and comm show (system-utils/stat-script-root); Detcore renders the stat, and the KVM row records the executor's interpreter naming of a script root, the DBT row DynamoRIO's"
     },
     {
       "disposition": "manifest-test",

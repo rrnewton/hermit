@@ -1482,67 +1482,6 @@ impl DetFd {
         });
     }
 
-    /// Whether this is a process's `stat` Detcore opened as rendered
-    /// (`ProcfsFile::renders_task_record`).
-    pub(crate) fn procfs_renders_task_record(&self) -> bool {
-        self.with_description(|d| {
-            d.procfs
-                .as_ref()
-                .is_some_and(ProcfsFile::renders_task_record)
-        })
-    }
-
-    /// Drop a rendered `stat`'s snapshot before a read at `position` that
-    /// Linux would render anew (`ProcfsFile::drop_stale_task_snapshot`).
-    pub(crate) fn procfs_drop_stale_task_snapshot(&self, position: usize) {
-        self.with_description(|d| {
-            if let Some(procfs) = d.procfs.as_mut() {
-                procfs.drop_stale_task_snapshot(position);
-            }
-        });
-    }
-
-    /// Record where a positioned read left a rendered `stat`'s sequence
-    /// (`ProcfsFile::note_read_end`).
-    pub(crate) fn procfs_note_read_end(&self, position: usize) {
-        self.with_description(|d| {
-            if let Some(procfs) = d.procfs.as_mut() {
-                procfs.note_read_end(position);
-            }
-        });
-    }
-
-    /// Record the outcome of rendering a rendered `stat`'s record for a read
-    /// at `position` (`ProcfsFile::note_task_record_rendered`).
-    pub(crate) fn procfs_note_task_record_rendered(&self, position: usize, rendered: bool) {
-        self.with_description(|d| {
-            if let Some(procfs) = d.procfs.as_mut() {
-                procfs.note_task_record_rendered(position, rendered);
-            }
-        });
-    }
-
-    /// Move a rendered `stat`'s cursor as `seq_lseek` does
-    /// (`ProcfsFile::seek_task_record`): whether the caller must render its
-    /// record now.
-    pub(crate) fn seek_procfs_task_record(&self, offset: usize) -> bool {
-        self.with_description(|d| {
-            d.procfs
-                .as_mut()
-                .is_some_and(|procfs| procfs.seek_task_record(offset))
-        })
-    }
-
-    /// Leave a rendered `stat` whose `show` failed at a seek as `seq_lseek`
-    /// does (`ProcfsFile::reset_task_record`).
-    pub(crate) fn reset_procfs_task_record(&self) {
-        self.with_description(|d| {
-            if let Some(procfs) = d.procfs.as_mut() {
-                procfs.reset_task_record();
-            }
-        });
-    }
-
     /// Read a deterministic procfs snapshot without changing its shared cursor.
     pub(crate) fn take_procfs_at(&self, offset: usize, maximum: usize) -> Option<Vec<u8>> {
         self.with_description(|d| {

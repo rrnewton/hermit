@@ -34,7 +34,6 @@ pub(crate) mod levels;
 pub(crate) mod listing;
 pub(crate) mod locks;
 pub(crate) mod private_maps;
-pub(crate) mod task_stat;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 enum ProcfsKind {
@@ -1147,23 +1146,6 @@ pub(crate) struct ProcfsFile {
     mount_view_kernel: Option<bool>,
     contents: Option<Vec<u8>>,
     offset: usize,
-    /// For a rendered `stat`, where the sequence is (Linux's `m->read_pos`)
-    /// when it is elsewhere than the shared cursor (a positioned read, a
-    /// traversal, a failed `show`); `None` where it is at the cursor
-    /// ([`Self::sequence_position`]). It decides whether a read or a seek
-    /// renders the record again ([`Self::drop_stale_task_snapshot`],
-    /// [`Self::seek_task_record`]). Not serialized, so `ProcfsFile`'s wire
-    /// shape stays as it was. A description rebuilt from its placeholder
-    /// starts with `None` and no snapshot, so its next read renders. A rendered
-    /// `stat` description is never promoted to Detcore's global state
-    /// (`Detcore::promote_shared_open_files` promotes random-device and
-    /// timerfd descriptions only), so where the tool runs in each guest process
-    /// (DBT, SaBRe, LiteInst) every process that holds it after `fork` keeps
-    /// its own copy of this state and of the snapshot, sharing only the
-    /// placeholder's kernel cursor (declared at
-    /// `Detcore::adopt_rendered_procfs_position`).
-    #[serde(skip)]
-    read_pos: Option<usize>,
 }
 
 /// A non-mutating candidate for one sequential timer-slack read.
@@ -1493,10 +1475,6 @@ pub(crate) struct ProcfsSnapshotContext {
     /// whose rows do not parse (refused whole by the sanitizer) or a unit
     /// test gives.
     pub(crate) lock_rows_kept: Option<Vec<bool>>,
-    /// For a process's `stat` Detcore opened as rendered, the task's facts,
-    /// its name and what the reader adds to them (`procfs::task_stat`).
-    /// Built by the caller, which asks Detcore's global state.
-    pub(crate) task_stat: Option<task_stat::TaskStat>,
 }
 
 impl ProcfsFile {
@@ -1688,7 +1666,6 @@ impl ProcfsFile {
             mount_view_kernel: None,
             contents: None,
             offset: 0,
-            read_pos: None,
         })
     }
 
@@ -1736,15 +1713,8 @@ impl ProcfsFile {
     }
 
     /// The per-process files Detcore renders, by their name in a process's
-    /// directory. Every spelling of a process's `stat` names one file: the
-    /// caller's `/proc/self/stat` and `/proc/thread-self/stat`, which the
-    /// kernel's file is sanitized as when the kernel opens it (`Stat`,
-    /// `ThreadStat`), are the `stat` of the task they bind to.
+    /// directory.
     fn per_process_name_of(kind: &ProcfsKind) -> Option<&'static str> {
-        let kind = match kind {
-            ProcfsKind::Stat | ProcfsKind::ThreadStat => &ProcfsKind::ProcessStat,
-            other => other,
-        };
         Self::PER_PROCESS_KINDS
             .iter()
             .find(|(candidate, _)| candidate == kind)
@@ -1755,18 +1725,17 @@ impl ProcfsFile {
     /// and `mounts` only in a session with a container mount table
     /// ([`RenderedFiles::mounts`]). A name's index numbers its files' inodes
     /// (`procfs_inode::per_process_inode`), so a new name goes last.
-    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 6] = [
+    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 5] = [
         (ProcfsKind::ProcessCgroup, "cgroup"),
         (ProcfsKind::ProcessAuxv, "auxv"),
         (ProcfsKind::Mountinfo, "mountinfo"),
         (ProcfsKind::ProcessMounts, "mounts"),
         (ProcfsKind::ProcessCmdline, "cmdline"),
-        (ProcfsKind::ProcessStat, "stat"),
     ];
 
     /// The names of the per-process files Detcore renders.
-    pub(crate) const PER_PROCESS_NAMES: [&'static str; 6] =
-        ["cgroup", "auxv", "mountinfo", "mounts", "cmdline", "stat"];
+    pub(crate) const PER_PROCESS_NAMES: [&'static str; 5] =
+        ["cgroup", "auxv", "mountinfo", "mounts", "cmdline"];
 
     /// Pin which view of the mounts this kernel-opened `mountinfo` or `mounts`
     /// reads: the kernel's (`kernel`, its task's root had changed when it was
@@ -1801,9 +1770,6 @@ impl ProcfsFile {
     /// Nor a process's `cmdline`, which Linux reads from the process's memory
     /// at every read: a descriptor the kernel opened keeps reading the
     /// kernel's file, as before Detcore rendered it.
-    ///
-    /// A process's `stat` the kernel opened is classified, and sanitized, as
-    /// before Detcore rendered it.
     pub(crate) fn kernel_served(&self) -> bool {
         !self.is_plain_process_file()
     }
@@ -1844,75 +1810,6 @@ impl ProcfsFile {
     /// Whether this is a process's `cmdline`.
     pub(crate) fn is_process_cmdline(&self) -> bool {
         self.kind == ProcfsKind::ProcessCmdline
-    }
-
-    /// Whether this is a process's `stat`, by any spelling.
-    pub(crate) fn is_task_stat(&self) -> bool {
-        matches!(
-            self.kind,
-            ProcfsKind::Stat | ProcfsKind::ThreadStat | ProcfsKind::ProcessStat
-        )
-    }
-
-    /// Whether this is a process's `stat` that Detcore opened as rendered,
-    /// whose snapshot is rendered from the task's facts (`procfs::task_stat`)
-    /// at the first read, and again whenever a read or a seek moves to a
-    /// position other than where the last read left the sequence
-    /// ([`Self::drop_stale_task_snapshot`]).
-    pub(crate) fn renders_task_record(&self) -> bool {
-        self.rendered && self.is_task_stat()
-    }
-
-    /// Where this rendered `stat`'s sequence is (Linux's `m->read_pos`): the
-    /// mark a positioned read left, else the shared cursor.
-    fn sequence_position(&self) -> usize {
-        self.read_pos.unwrap_or(self.offset)
-    }
-
-    /// Drop this rendered `stat`'s snapshot before a read at `position` where
-    /// Linux's `seq_read_iter` runs its `show` again (fs/seq_file.c:188-206
-    /// in 6.17): a read at 0, which resets the iterator, and a read that does
-    /// not start where the sequence is (`m->read_pos`), which `traverse`s to
-    /// `position`. The caller then renders and reports the outcome
-    /// ([`Self::note_task_record_rendered`]) before it copies anything. A
-    /// sequential read that continues the sequence keeps the buffered
-    /// record. Nothing for any other file. Called only after the read's
-    /// destination and range were validated, as `vfs_read` checks them before
-    /// it reaches `seq_read_iter`.
-    pub(crate) fn drop_stale_task_snapshot(&mut self, position: usize) {
-        if self.renders_task_record() && (position == 0 || self.sequence_position() != position) {
-            self.contents = None;
-        }
-    }
-
-    /// The outcome of rendering this `stat`'s record for a read at
-    /// `position`: where it succeeded (`rendered`), the sequence is there, as
-    /// Linux sets `m->read_pos` once `traverse` succeeds, before the copy, so
-    /// a copy that faults leaves the record buffered and a retry at the same
-    /// position reads it, not a new one; where it failed (ESRCH, the named
-    /// refusal), the sequence state is reset, as `seq_read_iter` resets
-    /// `read_pos`, `index` and `count` after a failed traversal
-    /// (fs/seq_file.c:196-201), and the file cursor stays where it was, so a
-    /// later seek into the record traverses (and fails) again.
-    pub(crate) fn note_task_record_rendered(&mut self, position: usize, rendered: bool) {
-        if !self.renders_task_record() {
-            return;
-        }
-        if rendered {
-            self.read_pos = Some(position);
-        } else {
-            self.contents = None;
-            self.read_pos = Some(0);
-        }
-    }
-
-    /// Record where a positioned read of this rendered `stat` left the
-    /// sequence (`m->read_pos`): `position`, the read's start plus the bytes
-    /// it copied.
-    pub(crate) fn note_read_end(&mut self, position: usize) {
-        if self.renders_task_record() {
-            self.read_pos = Some(position);
-        }
     }
 
     /// Whether every read of this file, Detcore having opened it as rendered,
@@ -2118,9 +2015,6 @@ impl ProcfsFile {
             // reads from the process's memory
             // (`Detcore::read_rendered_cmdline`); no snapshot is taken.
             ProcfsKind::ProcessCmdline => b"",
-            // The bytes are the task's facts in Detcore's process table,
-            // which the first read supplies (`procfs::task_stat`).
-            ProcfsKind::Stat | ProcfsKind::ThreadStat | ProcfsKind::ProcessStat => b"",
             // The bytes are the session's container mount table, which the
             // first read supplies (`Detcore::mount_table_snapshot`).
             ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts => b"",
@@ -2381,17 +2275,8 @@ impl ProcfsFile {
             machine,
             published_sigblk,
             lock_rows_kept,
-            task_stat,
         } = context;
         let mapping_identities = &mapping_identities;
-        // A process's `stat` Detcore opened is rendered from the task's
-        // facts, which the caller looked up for this read; the template
-        // stands in for nothing.
-        if self.renders_task_record() {
-            let task_stat = task_stat.expect("a rendered stat read without its task's facts");
-            self.contents = Some(task_stat::render_stat(&task_stat));
-            return;
-        }
         self.contents = Some(match &self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, Some((virtual_pid, virtual_ppid))),
             ProcfsKind::Status => sanitize_status(
@@ -2546,7 +2431,6 @@ impl ProcfsFile {
             "procfs cursor changed between preview and commit"
         );
         self.offset = self.offset.saturating_add(copied);
-        self.read_pos = Some(self.offset);
     }
 
     /// Return the task id bound to a top-level timer-slack procfs file.
@@ -2671,41 +2555,10 @@ impl ProcfsFile {
     /// choose (a placeholder's, after a backend rediscovers the descriptor)
     /// is no rewind and keeps the snapshot.
     pub(crate) fn seek_to(&mut self, offset: usize) {
-        if self.renders_task_record() {
-            self.seek_task_record(offset);
-            return;
-        }
         self.set_offset(offset);
         if offset == 0 && self.rendered && self.shows_at_read() {
             self.contents = None;
         }
-    }
-
-    /// Moves a rendered `stat`'s cursor as Linux's `seq_lseek` does
-    /// (fs/seq_file.c:308-340 in 6.17), and says whether the caller must
-    /// render the record now: a seek to anywhere but where the sequence is
-    /// `traverse`s there, which drops the buffered record and, for a positive
-    /// position, runs `show` at the seek, not at the next read, so a rename
-    /// between the seek and the read does not reach it. A traverse to 0 runs
-    /// no `show` (the next read renders). A seek to where the sequence is
-    /// keeps the buffered record.
-    pub(crate) fn seek_task_record(&mut self, offset: usize) -> bool {
-        let traverses = self.sequence_position() != offset;
-        self.offset = offset;
-        if traverses {
-            self.contents = None;
-            self.read_pos = Some(offset);
-        }
-        traverses && offset > 0
-    }
-
-    /// Where a rendered `stat` whose `show` failed during a seek is left, as
-    /// `seq_lseek` leaves it (fs/seq_file.c:327-332 in 6.17): the cursor and
-    /// the sequence at 0, nothing buffered.
-    pub(crate) fn reset_task_record(&mut self) {
-        self.offset = 0;
-        self.read_pos = Some(0);
-        self.contents = None;
     }
 
     pub(crate) fn target_fd(&self) -> Option<i32> {
@@ -9053,243 +8906,9 @@ total_commit_ms 0\n"
         assert!(rendered.reads_memory_at_every_read());
         // No snapshot is ever taken: every read reads memory.
         assert_eq!(rendered.rendered_snapshot(), None);
-        // The name came after the others, so they keep their inode numbers.
-        assert_eq!(ProcfsFile::PER_PROCESS_NAMES[4], "cmdline");
-    }
-
-    /// A process's `stat` is a per-process file Detcore renders (package K
-    /// slice D4c-1), by every spelling of a task's directory, appended after
-    /// `cmdline` so the other files keep their inode numbers. It is a
-    /// `single_open` seq file whose `show` runs at a read, like `cgroup`. A
-    /// `stat` the kernel opened is classified and sanitized as before.
-    /// `comm` stays the kernel's (no per-process name), and `/proc/stat` and
-    /// `/proc/self/statm` are neither.
-    #[test]
-    fn a_process_stat_is_a_rendered_per_process_seq_file() {
-        assert_eq!(ProcfsFile::PER_PROCESS_NAMES.last(), Some(&"stat"));
-        for spelling in [
-            "/proc/self/stat",
-            "/proc/thread-self/stat",
-            "/proc/7/stat",
-            "/proc/7/task/8/stat",
-            "/proc/self/task/8/stat",
-        ] {
-            let file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
-            assert_eq!(file.per_process_name(), Some("stat"), "{spelling}");
-            assert!(file.is_task_stat(), "{spelling}");
-            assert!(file.kernel_served(), "{spelling}");
-            assert!(file.shows_at_read(), "{spelling}");
-            assert!(file.snapshot_at_first_read(), "{spelling}");
-            assert!(file.has_read_iter(), "{spelling}");
-            // Not rendered: a kernel-opened descriptor keeps its sanitizer.
-            assert!(!file.renders_task_record(), "{spelling}");
-        }
-        for other in [
-            "/proc/stat",
-            "/proc/self/statm",
-            "/proc/self/stat/x",
-            "/proc/self/comm",
-            "/proc/self/task/8/comm",
-        ] {
-            assert!(
-                ProcfsFile::from_path(Path::new(other))
-                    .is_none_or(|file| file.per_process_name().is_none()),
-                "{other}"
-            );
-        }
-        for (spelling, path) in [
-            ("/proc/self/stat", "/proc/3/stat"),
-            ("/proc/thread-self/stat", "/proc/3/task/5/stat"),
-            ("/proc/3/task/5/stat", "/proc/3/task/5/stat"),
-        ] {
-            let rendered = bound_rendered_stat(spelling);
-            assert_eq!(rendered.opened_path(), Some(Path::new(path)), "{spelling}");
-            assert!(rendered_path_is_seq_file(Path::new(path)), "{spelling}");
-            assert!(rendered.rendering_template().is_empty(), "{spelling}");
-            assert!(rendered.renders_task_record(), "{spelling}");
-        }
-    }
-
-    fn bound_rendered_stat(spelling: &str) -> ProcfsFile {
-        let mut file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
-        file.bind_task(3, 5);
-        file.set_task_incarnation(TaskIncarnation {
-            process: 1,
-            thread: file.bound_task().unwrap().thread.map(|_| 1),
-        });
-        file.into_rendered()
-    }
-
-    fn stat_record(num_threads: i32) -> task_stat::TaskStat {
-        task_stat::TaskStat {
-            pid: 3,
-            comm: task_stat::TaskComm::new(b"probe"),
-            facts: task_stat::TaskStatFacts {
-                comm: Some(task_stat::TaskComm::new(b"probe")),
-                leads: true,
-                process_exit_signal: libc::SIGCHLD,
-                num_threads,
-                process: Some(3),
-                ..Default::default()
-            },
-            reader_is_task: true,
-            ppid: 1,
-            rsslim: task_stat::RLIM_INFINITY,
-        }
-    }
-
-    /// A rendered `stat` snapshot is rendered from the task's facts the
-    /// caller looked up, whatever the template held; a `stat` the kernel
-    /// opened is still the kernel's line, sanitized.
-    #[test]
-    fn a_rendered_stat_snapshot_is_the_tasks_record() {
-        let record = stat_record(1);
-        let context = || ProcfsSnapshotContext {
-            task_stat: Some(record),
-            ..ProcfsSnapshotContext::default()
-        };
-        let mut stat = bound_rendered_stat("/proc/self/stat");
-        stat.initialize(Vec::new(), context());
-        assert_eq!(
-            stat.rendered_snapshot(),
-            Some(&task_stat::render_stat(&record)[..])
-        );
-        // The kernel's own file of another process, sanitized as before.
-        let mut kernel = ProcfsFile::from_path(Path::new("/proc/9/stat")).unwrap();
-        let line = b"9 (other) R 1 9 9 34816 9 4194304 1 2 3 4 5 6 7 8 20 0 1 0 99 4096 7 \
-            18446744073709551615 1 2 3 4 5 6 7 8 9 0 0 0 17 3 0 0 0 0 0 1 2 3 4 5 6 7 0\n";
-        kernel.initialize(line.to_vec(), context());
-        let sanitized = String::from_utf8(kernel.contents.clone().unwrap()).unwrap();
-        assert!(
-            sanitized.starts_with("9 (other) S 1 9 9 34816 9 4194304 0 "),
-            "{sanitized}"
-        );
-    }
-
-    /// A rendered `stat` follows Linux's seq_file positions: a read that
-    /// continues the sequence keeps the buffered record; a read at 0, a read
-    /// elsewhere (a `pread`, or a `read` after a `pread` moved the sequence)
-    /// renders it anew (`seq_read_iter`); a seek elsewhere renders it at the
-    /// seek, except to 0, where the next read renders (`seq_lseek`'s
-    /// `traverse`). A kernel-opened file keeps its snapshot.
-    #[test]
-    fn a_rendered_stat_renders_again_where_linux_traverses() {
-        let mut stat = bound_rendered_stat("/proc/self/stat");
-        let render = |stat: &mut ProcfsFile, position, threads| {
-            stat.initialize(
-                Vec::new(),
-                ProcfsSnapshotContext {
-                    task_stat: Some(stat_record(threads)),
-                    ..ProcfsSnapshotContext::default()
-                },
-            );
-            stat.note_task_record_rendered(position, true);
-        };
-        // The first read at 0 renders; it copies 4 bytes.
-        stat.drop_stale_task_snapshot(0);
-        assert!(stat.needs_snapshot());
-        render(&mut stat, 0, 1);
-        stat.commit_read(0, 4);
-        // A sequential read continues the buffered record.
-        stat.drop_stale_task_snapshot(4);
-        assert!(!stat.needs_snapshot());
-        // A pread at 0 renders again, and leaves the sequence after its bytes.
-        stat.drop_stale_task_snapshot(0);
-        assert!(stat.needs_snapshot());
-        render(&mut stat, 0, 2);
-        stat.note_read_end(10);
-        // A pread that continues it keeps the buffer.
-        stat.drop_stale_task_snapshot(10);
-        assert!(!stat.needs_snapshot());
-        // A read at the file position (4), not where the pread left it,
-        // renders again.
-        stat.drop_stale_task_snapshot(4);
-        assert!(stat.needs_snapshot());
-        render(&mut stat, 4, 3);
-        stat.commit_read(4, 2);
-        // A seek to where the sequence is keeps it; a seek elsewhere renders
-        // at the seek.
-        assert!(!stat.seek_task_record(6));
-        assert!(!stat.needs_snapshot());
-        assert!(stat.seek_task_record(9));
-        assert!(stat.needs_snapshot());
-        render(&mut stat, 9, 4);
-        // After that seek the sequence is at 9: a read there keeps it.
-        stat.drop_stale_task_snapshot(9);
-        assert!(!stat.needs_snapshot());
-        // A seek to 0 renders nothing; the read at 0 does.
-        assert!(!stat.seek_task_record(0));
-        assert!(stat.needs_snapshot());
-        // A kernel-opened stat keeps its snapshot whatever the position.
-        let mut kernel = ProcfsFile::from_path(Path::new("/proc/9/stat")).unwrap();
-        kernel.initialize(b"9 (x) S 1\n".to_vec(), ProcfsSnapshotContext::default());
-        kernel.drop_stale_task_snapshot(3);
-        kernel.note_task_record_rendered(3, false);
-        assert!(!kernel.needs_snapshot());
-    }
-
-    /// A read that renders moves the sequence once the rendering succeeds,
-    /// before its copy, as Linux sets `m->read_pos` when `traverse`
-    /// succeeds: a copy that faults leaves the record buffered at that
-    /// position, and a retry there reads it rather than a new rendering. A
-    /// read at 0 always renders anew, as `seq_read_iter` resets the iterator
-    /// there.
-    #[test]
-    fn a_rendered_stat_read_that_faults_keeps_its_traversal() {
-        let mut stat = bound_rendered_stat("/proc/self/stat");
-        let render = |stat: &mut ProcfsFile, position| {
-            stat.initialize(
-                Vec::new(),
-                ProcfsSnapshotContext {
-                    task_stat: Some(stat_record(1)),
-                    ..ProcfsSnapshotContext::default()
-                },
-            );
-            stat.note_task_record_rendered(position, true);
-        };
-        stat.drop_stale_task_snapshot(3);
-        assert!(stat.needs_snapshot());
-        render(&mut stat, 3);
-        // The copy faulted: nothing committed. The retry keeps the record.
-        stat.drop_stale_task_snapshot(3);
-        assert!(!stat.needs_snapshot());
-        // At 0, a faulted read's retry renders again, as on Linux.
-        stat.drop_stale_task_snapshot(0);
-        assert!(stat.needs_snapshot());
-        render(&mut stat, 0);
-        stat.drop_stale_task_snapshot(0);
-        assert!(stat.needs_snapshot());
-    }
-
-    /// A rendering that fails (the task is gone) resets the sequence state,
-    /// as `seq_read_iter` does after a failed `traverse`, and leaves the file
-    /// cursor: a later seek into the record traverses again, where it fails
-    /// as well, and a read at the cursor renders again.
-    #[test]
-    fn a_failed_rendering_resets_the_sequence_and_keeps_the_cursor() {
-        let mut stat = bound_rendered_stat("/proc/self/stat");
-        stat.drop_stale_task_snapshot(0);
-        stat.initialize(
-            Vec::new(),
-            ProcfsSnapshotContext {
-                task_stat: Some(stat_record(2)),
-                ..ProcfsSnapshotContext::default()
-            },
-        );
-        stat.note_task_record_rendered(0, true);
-        stat.commit_read(0, 4);
-        // A pread at 3 traverses, and its rendering fails.
-        stat.drop_stale_task_snapshot(3);
-        assert!(stat.needs_snapshot());
-        stat.note_task_record_rendered(3, false);
-        assert_eq!(stat.position(), (4, None), "the cursor stays at 4");
-        // A seek to 3 traverses again (the sequence is at 0, not 3).
-        assert!(stat.seek_task_record(3));
-        // A read at the cursor renders again.
-        stat.reset_task_record();
-        stat.offset = 4;
-        stat.drop_stale_task_snapshot(4);
-        assert!(stat.needs_snapshot());
+        // The name is the last per-process name, so the others keep their
+        // inode numbers.
+        assert_eq!(ProcfsFile::PER_PROCESS_NAMES.last(), Some(&"cmdline"));
     }
 
     /// Guest memory for the `cmdline` rules: `bytes` at `base`, readable only

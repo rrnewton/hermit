@@ -6209,13 +6209,7 @@ mod tests {
         // candidate backend: 2965.
         // c-programs/proc-cmdline-other-processes (the same guest, another
         // process's file) adds one row per candidate backend: 2970.
-        // c-programs/proc-stat-comm (LinuxEmu D4c-1's guest) adds one row per
-        // candidate backend: 2975.
-        // system-utils/stat-script-root (D4c-1's #! script root) adds one row
-        // per candidate backend: 2980.
-        // system-utils/stat-alias-root (D4c-1's root through a symbolic link)
-        // adds one row per candidate backend: 2985.
-        assert_eq!(parsed.cells.len(), 2985);
+        assert_eq!(parsed.cells.len(), 2970);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448

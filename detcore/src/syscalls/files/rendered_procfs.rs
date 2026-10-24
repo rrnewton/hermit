@@ -147,24 +147,6 @@ fn descriptor_stable_across_injections(sequentialized: bool, guest_code_between:
     sequentialized && !guest_code_between
 }
 
-/// Whether the tool may read a task's kernel `comm` by path at all: not
-/// where it shares the guest's root (`shares_root`: DBT, SaBRe, LiteInst)
-/// and the guest has changed that root (`changed_root`), because the path is
-/// then looked up through a root the guest controls, where no check on the
-/// opened file authenticates the task (`Detcore::kernel_task_comm`). A
-/// tracer's own root is not the guest's.
-fn comm_read_is_trusted(shares_root: bool, changed_root: bool) -> bool {
-    !(shares_root && changed_root)
-}
-
-/// Whether the open file `file` is on a procfs (`fstatfs` reports
-/// `PROC_SUPER_MAGIC`), which refuses an ordinary file mounted over a
-/// task's `comm` path.
-fn comm_file_is_on_procfs(file: &crate::util::RawFd) -> bool {
-    file.fs_type()
-        .is_ok_and(|kind| kind == reverie::syscalls::linux_abi::PROC_SUPER_MAGIC as u64)
-}
-
 /// Whether a first read may read and write the uptime carried on the
 /// placeholder behind its descriptor (`Detcore::first_read_uptime`): only
 /// where the descriptor number keeps naming the same file between Detcore's
@@ -2394,12 +2376,6 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// target's memory at each read), or the caller's own where Detcore
     /// recorded no argument area for its image (the same backends and stacks
     /// as for `auxv`).
-    ///
-    /// And whether `file` is a process's `stat` that the kernel serves:
-    /// another process's (package K slice D4c-1 renders the reader's own
-    /// process's only), or, where the name's source is Detcore's record
-    /// (`Self::comm_source`), the caller's own before a name is recorded
-    /// (`procfs::task_stat::renders_task_stat`).
     async fn kept_by_kernel<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2409,35 +2385,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Some(task) = file.bound_task() else {
             return false;
         };
-        if file.is_task_stat() {
-            let facts = crate::tool_global::task_stat_facts(guest, task).await;
-            let own = self.own_detpid(guest).as_raw();
-            let rendered =
-                crate::procfs::task_stat::renders_task_stat(&facts, own, self.comm_source());
-            // The guest-visible parent of a process whose real parent is
-            // outside the guest's tree (the run's root, and a CLONE_PARENT
-            // child of such a process), which no other record of Detcore's
-            // holds, is its own getppid answer, recorded here, in its own
-            // turn, before any descriptor of its rendered stat exists: a
-            // descriptor that reaches another process (across fork or
-            // SCM_RIGHTS) renders it (`Scheduler::guest_visible_parent`).
-            // Every rendered stat of a process is opened, or listed, by one of
-            // its own threads, so this runs before any other process can read
-            // one. The global tool ignores it for a process whose model knows
-            // its parent.
-            if rendered
-                && facts.parent.is_none()
-                && let Ok(parent) = guest.inject(syscalls::Getppid::new()).await
-            {
-                crate::tool_global::record_external_parent(
-                    guest,
-                    detcore_model::pid::DetPid::from_raw(own),
-                    parent as i32,
-                )
-                .await;
-            }
-            return !rendered;
-        }
         let process = detcore_model::pid::DetPid::from_raw(task.process);
         if file.is_process_cmdline() {
             let (process, area) = crate::tool_global::process_cmdline(guest, process).await;
@@ -2449,201 +2396,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         crate::tool_global::process_auxv(guest, process)
             .await
             .is_none()
-    }
-
-    /// Where a rendered `stat`'s name comes from on this backend
-    /// (`procfs::task_stat::CommSource::of_backend`): the kernel beneath's
-    /// own where its guest threads are host tasks the tool can name (the
-    /// declared `tool_can_name_guest_descriptors` capability: ptrace, DBT,
-    /// SaBRe, LiteInst), Detcore's record elsewhere (KVM).
-    pub(super) fn comm_source(&self) -> crate::procfs::task_stat::CommSource {
-        crate::procfs::task_stat::CommSource::of_backend(
-            crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend),
-        )
-    }
-
-    /// The parent Detcore's model records for another process's rendered
-    /// `stat` (`parent`), numbered as that process's own `getppid` answers
-    /// it, which Detcore passes to the kernel: where the kernel numbers
-    /// processes otherwise than Detcore (DBT,
-    /// `Self::translates_procfs_numbers`), the kernel's number for that
-    /// guest process (`tool_global::procfs_ids`); a number of no guest
-    /// process (the namespace's init, 1, whose number both numberings share,
-    /// and 0 for a parent outside the PID namespace, the only outside
-    /// parents a guest has) as it is. So a descriptor that reached another
-    /// process shows the parent the described process's own `stat` shows,
-    /// the reader's `getppid` answer, on every backend.
-    async fn getppid_numbered_parent<G: Guest<Self>>(guest: &mut G, parent: i32) -> i32 {
-        if parent <= 1 || !Self::registered_kernel_ids(guest) {
-            return parent;
-        }
-        crate::tool_global::procfs_ids(guest, true, vec![parent])
-            .await
-            .into_iter()
-            .next()
-            .flatten()
-            .unwrap_or(parent)
-    }
-
-    /// Whether this guest thread's backend registered its kernel ids (DBT,
-    /// and an in-guest native exec, whose numberings agree), so that a
-    /// number Detcore gives a task may not be the kernel's: whatever the
-    /// guest's root or PID namespace, which `Self::translates_procfs_numbers`
-    /// also weighs because it translates the guest's own paths. A rendered
-    /// `stat` reaches the container's procfs by the tool's own spelling, so
-    /// it translates by this alone. `tool_global::procfs_ids` returns each
-    /// number unchanged where the numberings agree.
-    fn registered_kernel_ids<G: Guest<Self>>(guest: &G) -> bool {
-        guest.thread_state().physical_tid.is_some()
-    }
-
-    /// The kernel beneath's name (`comm`) of the task a rendered `stat`
-    /// describes (the thread below `task/`, else the task the top-level
-    /// number names), read by the tool itself from that task's own procfs
-    /// directory, `/proc/<pid>/task/<tid>/comm` (`/proc/<pid>/comm` for a
-    /// top-level number), by the kernel's numbers for them
-    /// (`tool_global::procfs_ids` wherever the backend registered kernel ids,
-    /// [`Self::registered_kernel_ids`], whatever the guest's root or PID
-    /// namespace), with raw syscalls; never through the reader's own
-    /// `/proc/self`, so a descriptor that reached another process (across
-    /// fork or `SCM_RIGHTS`) reads the described task's name. Only where
-    /// [`Self::comm_source`] is the kernel. It runs in the reader's turn, and
-    /// the name is the guest's own history's: every way Linux renames a task
-    /// (an exec, by Linux's own rule for the host's kernel version, a clone,
-    /// `PR_SET_NAME`, a write to a `comm` file by any spelling) is a guest
-    /// system call, sequentialized.
-    ///
-    /// Where the tool shares the guest's root (DBT, SaBRe, LiteInst) and the
-    /// guest has changed it, nothing is read: the path would be looked up
-    /// through the guest's own root, where the guest decides what
-    /// /proc/<pid>/comm is (an ordinary file, a link into a bind-mounted
-    /// procfs naming another task, a bind-mounted subdirectory), and no
-    /// check on the opened file can tell that it is the described task's.
-    /// That read is the failure policy's named refusal (declared). A tracer
-    /// (ptrace) reads its own `/proc`, which no guest `chroot` changes.
-    /// Otherwise the file must be on a procfs ([`comm_file_is_on_procfs`]),
-    /// which refuses an ordinary file mounted over the path.
-    /// `Err` names why there is no name.
-    async fn kernel_task_comm<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        task: crate::procfs::BoundTask,
-    ) -> Result<crate::procfs::task_stat::TaskComm, &'static str> {
-        let changed_root = guest
-            .thread_state()
-            .changed_root
-            .load(std::sync::atomic::Ordering::SeqCst);
-        if !comm_read_is_trusted(
-            guest.config().backend.tool_shares_guest_descriptor_table,
-            changed_root,
-        ) {
-            return Err(
-                "the guest changed its root, and the tool, which shares it, would look the \
-                 task's comm up through it",
-            );
-        }
-        let unreadable = "the tool could not read the kernel's comm of the task";
-        let mut ids = vec![task.process];
-        ids.extend(task.thread);
-        let kernel = if Self::registered_kernel_ids(guest) {
-            crate::tool_global::procfs_ids(guest, true, ids)
-                .await
-                .into_iter()
-                .collect::<Option<Vec<_>>>()
-                .ok_or(unreadable)?
-        } else {
-            ids
-        };
-        let path = match kernel[..] {
-            [process] => format!("/proc/{process}/comm"),
-            [process, thread] => format!("/proc/{process}/task/{thread}/comm"),
-            _ => return Err(unreadable),
-        };
-        let file =
-            crate::util::RawFd::open(Path::new(&path), libc::O_RDONLY).map_err(|_| unreadable)?;
-        if !comm_file_is_on_procfs(&file) {
-            return Err("the task's comm path is not on a procfs");
-        }
-        let mut bytes = [0_u8; 2 * crate::procfs::task_stat::TASK_COMM_LEN];
-        let read = file.read_at(&mut bytes, 0).map_err(|_| unreadable)?;
-        Ok(crate::procfs::task_stat::TaskComm::from_comm_file(
-            &bytes[..read],
-        ))
-    }
-
-    /// The facts a snapshot of the rendered `stat` open as `fd` renders
-    /// (`procfs::task_stat::TaskStat`), taken at its first read and again
-    /// where Linux's `seq_file` would run `do_task_stat` again
-    /// (`ProcfsFile::drop_stale_task_snapshot`). `None` for any other file.
-    ///
-    /// - The task must still be the one the file was bound to (ESRCH
-    ///   otherwise), as `do_task_stat`'s `get_proc_task` requires.
-    /// - The name, from [`Self::comm_source`]
-    ///   (`procfs::task_stat::stat_comm`): the kernel's own
-    ///   ([`Self::kernel_task_comm`]) where the backend's guest threads are
-    ///   host tasks, and a failed read there is the failure policy's named
-    ///   refusal, never Detcore's record, which a host resource would then
-    ///   choose and which a write to a `comm` file leaves stale; Detcore's
-    ///   record elsewhere (KVM), and with none, the same refusal.
-    /// - The parent: the reader's own `getppid` answer (`ppid`) for its own
-    ///   process; for another process's file (a descriptor that reached the
-    ///   reader across `fork` or `SCM_RIGHTS`), the guest-visible parent
-    ///   Detcore's model records (`procfs::task_stat::TaskStatFacts::parent`),
-    ///   numbered as that process's `getppid` answers it
-    ///   ([`Self::getppid_numbered_parent`]).
-    /// - `rsslim`: the described process's virtual `RLIMIT_RSS`, whoever
-    ///   reads it (`procfs::task_stat::TaskStatFacts::rsslim`).
-    pub(super) async fn rendered_task_stat<G: Guest<Self>>(
-        &self,
-        guest: &mut G,
-        fd: RawFd,
-        ppid: i32,
-    ) -> Result<Option<crate::procfs::task_stat::TaskStat>, Error> {
-        let Some(path) = guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.procfs_rendered_path())?
-        else {
-            return Ok(None);
-        };
-        let Some(file) = ProcfsFile::from_rendered_path(path).filter(ProcfsFile::is_task_stat)
-        else {
-            return Ok(None);
-        };
-        let task = file.bound_task().ok_or(Errno::ESRCH)?;
-        match self.rendered_task_state(guest, path).await {
-            Some((_, true)) => {}
-            _ => return Err(Errno::ESRCH.into()),
-        }
-        let facts = crate::tool_global::task_stat_facts(guest, task).await;
-        let source = self.comm_source();
-        let kernel = if source == crate::procfs::task_stat::CommSource::Kernel {
-            self.kernel_task_comm(guest, task).await
-        } else {
-            Err("the backend's tasks have no kernel comm the tool can read")
-        };
-        let comm = match crate::procfs::task_stat::stat_comm(source, kernel, facts.comm) {
-            Ok(comm) => comm,
-            Err(why) => {
-                let reason =
-                    format!("the /proc/<pid>/stat of task {task:?} has no name to render: {why}");
-                return Err(Self::scratch_failure(guest, Sysno::read, reason).await);
-            }
-        };
-        let described = task.thread.unwrap_or(task.process);
-        let own = facts.process == Some(self.own_detpid(guest).as_raw());
-        let ppid = if own {
-            ppid
-        } else {
-            Self::getppid_numbered_parent(guest, facts.parent.unwrap_or(0)).await
-        };
-        Ok(Some(crate::procfs::task_stat::TaskStat {
-            pid: described,
-            comm,
-            facts,
-            reader_is_task: described == guest.thread_state().dettid.as_raw(),
-            ppid,
-            rsslim: facts.rsslim,
-        }))
     }
 
     /// One plain read of the rendered `/proc/<pid>/cmdline` open as `fd`, of
@@ -2961,25 +2713,6 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Detcore keeps at each one's cursor after every read and seek
     /// (`sync_rendered_procfs_position`). Where one tool process serves every
     /// guest, the cursor itself is shared.
-    ///
-    /// DECLARED for a rendered `stat` (package K slice D4c-1), whose
-    /// description is never promoted to Detcore's global state: where the
-    /// tool runs in each guest process (DBT, SaBRe, LiteInst), each process
-    /// that holds it after `fork` keeps its own copy of its snapshot and
-    /// sequence (`ProcfsFile::read_pos`), and only this kernel cursor is
-    /// shared. A read by a process whose copy holds no snapshot, or whose
-    /// sequence is not at the shared cursor (another process read or seeked
-    /// since), renders the record anew at the shared cursor, in the reader's
-    /// turn, where Linux continues the one buffered record (and is at its end
-    /// once another process consumed it). A stat descriptor sent with
-    /// `SCM_RIGHTS` to another process that holds no alias of the same open
-    /// file Detcore models is rebuilt there from its placeholder (the registry
-    /// of placeholders is each tool process's own) and renders anew at its
-    /// next read, even while the sender still holds it; a receiver that
-    /// already holds an alias (inherited at `fork`, say) joins that local
-    /// description (`FileMetadata::adopt_placeholder`) and shares its copy's
-    /// state. Every outcome follows from the guest's own sequentialized
-    /// history.
     pub(super) async fn adopt_rendered_procfs_position<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3796,21 +3529,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         // its placeholder (as `/proc/uptime` carries its first read's uptime,
         // `first_read_uptime`) before it is rendered, or its rebuilt
         // descriptor reads other bytes than the sender's buffer held.
-        // DECLARED for a process's `stat` (package K slice D4c-1), which
-        // carries none: its record is rendered again wherever Linux's
-        // seq_file traverses, so no one snapshot can be carried, and neither
-        // the placeholder's name, fixed when it is made, nor its modification
-        // time, 64 bits, can hold one. A rebuilt `stat` renders its record
-        // again at its next read, at the shared cursor, where Linux continues
-        // the buffered one: where one tool process serves every guest
-        // (ptrace, KVM), a descriptor whose every modeled alias closed before
-        // a receiver's first call naming it
-        // (tests/misc/proc_stat_lifecycle.rs
-        // `a_queued_stat_descriptor_whose_sender_closed_it_renders_again_under_detcore`);
-        // where the tool runs in each guest process, a descriptor another
-        // process receives when it holds no alias of the open file Detcore
-        // models, and the image after `exec`
-        // (`Detcore::adopt_rendered_procfs_position`).
         let snapshot = registered.map(|(_, snapshot)| snapshot).unwrap_or_default();
         let metadata = self.rendered_metadata(guest, path).await?;
         let mut flags = OFlag::from_bits_truncate(status);
@@ -5604,47 +5322,6 @@ mod tests {
         let mut joined = head;
         joined.extend(after.take(64).unwrap());
         assert_eq!(joined, snapshot);
-    }
-
-    /// Where the tool shares the guest's root and the guest has changed it,
-    /// no task's kernel `comm` is read by path at all: a forged ordinary
-    /// file and a substitution on the very procfs (a link or bind mount to
-    /// another task's genuine `comm`, which no check on the opened file can
-    /// tell apart) both get the named refusal. Shown here: another task's
-    /// genuine comm (the parent's) passes the procfs check, so only the
-    /// root rule refuses it. A tracer, or an unchanged root, reads; an
-    /// ordinary file is refused by the procfs check.
-    #[test]
-    fn a_comm_is_not_read_through_a_changed_root_the_tool_shares() {
-        assert!(!comm_read_is_trusted(true, true));
-        assert!(comm_read_is_trusted(true, false));
-        assert!(comm_read_is_trusted(false, true));
-        assert!(comm_read_is_trusted(false, false));
-        let substituted = crate::util::RawFd::open(
-            Path::new(&format!(
-                "/proc/{}/comm",
-                std::os::unix::process::parent_id()
-            )),
-            libc::O_RDONLY,
-        )
-        .unwrap();
-        assert!(
-            comm_file_is_on_procfs(&substituted),
-            "a same-device substitution passes every file check"
-        );
-        let forged = std::env::temp_dir().join(format!(
-            "detcore-forged-comm-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&forged, b"forged\n").unwrap();
-        let file = crate::util::RawFd::open(&forged, libc::O_RDONLY).unwrap();
-        assert!(!comm_file_is_on_procfs(&file));
-        drop(file);
-        std::fs::remove_file(&forged).unwrap();
     }
 
     #[test]

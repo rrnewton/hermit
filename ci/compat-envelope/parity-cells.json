@@ -8,59 +8,59 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 2985,
-      "applicable": 1880,
-      "selectable": 1643,
-      "population": 2920,
-      "population_candidate_selected": 1643,
+      "cells": 2970,
+      "applicable": 1874,
+      "selectable": 1637,
+      "population": 2905,
+      "population_candidate_selected": 1637,
       "population_candidate_not_selected": 230,
-      "population_candidate_disabled": 1047
+      "population_candidate_disabled": 1038
     },
     "by_backend": {
       "dbt": {
-        "cells": 597,
-        "applicable": 253,
-        "selectable": 252,
-        "population": 584,
-        "population_candidate_selected": 252,
+        "cells": 594,
+        "applicable": 250,
+        "selectable": 249,
+        "population": 581,
+        "population_candidate_selected": 249,
         "population_candidate_not_selected": 1,
         "population_candidate_disabled": 331
       },
       "in-guest-trap": {
-        "cells": 597,
+        "cells": 594,
         "applicable": 302,
         "selectable": 302,
-        "population": 584,
+        "population": 581,
         "population_candidate_selected": 302,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 282
+        "population_candidate_disabled": 279
       },
       "kvm": {
-        "cells": 597,
-        "applicable": 554,
-        "selectable": 551,
-        "population": 584,
-        "population_candidate_selected": 551,
+        "cells": 594,
+        "applicable": 551,
+        "selectable": 548,
+        "population": 581,
+        "population_candidate_selected": 548,
         "population_candidate_not_selected": 1,
         "population_candidate_disabled": 32
       },
       "liteinst": {
-        "cells": 597,
+        "cells": 594,
         "applicable": 303,
         "selectable": 303,
-        "population": 584,
+        "population": 581,
         "population_candidate_selected": 303,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 281
+        "population_candidate_disabled": 278
       },
       "sabre": {
-        "cells": 597,
+        "cells": 594,
         "applicable": 468,
         "selectable": 235,
-        "population": 584,
+        "population": 581,
         "population_candidate_selected": 235,
         "population_candidate_not_selected": 228,
-        "population_candidate_disabled": 121
+        "population_candidate_disabled": 118
       }
     }
   },
@@ -910,11 +910,6 @@
     {"test_id":"c-programs/proc-locks","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/proc-locks","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/proc-locks","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/proc-stat-comm","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/proc-stat-comm","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: NAMED GAP: the guest re-executes itself to name itself, and the in-guest runtime refuses execve and execveat with a typed refusal that ends the run (https://github.com/rrnewton/hermit/issues/4567)."},
-    {"test_id":"c-programs/proc-stat-comm","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"c-programs/proc-stat-comm","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: NAMED GAP: the guest re-executes itself to name itself, and the in-guest runtime refuses execve and execveat with a typed refusal that ends the run (https://github.com/rrnewton/hermit/issues/4567)."},
-    {"test_id":"c-programs/proc-stat-comm","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: NAMED GAP, not fixed, under the owner's ruling that SaBRe is a drop candidate: the guest re-executes itself four times and starts a thread that exits; SaBRe kills a guest with SIGSEGV when a thread exits, at glibc's madvise(MADV_DONTNEED) of the exiting thread's stack (https://github.com/rrnewton/hermit/issues/4562)."},
     {"test_id":"c-programs/process-mrelease-enosys","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/process-mrelease-enosys","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/process-mrelease-enosys","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
@@ -3020,16 +3015,6 @@
     {"test_id":"system-utils/startup-tls-guards","backend":"kvm","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"system-utils/startup-tls-guards","backend":"liteinst","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: glibc copies the kernel's AT_RANDOM into the TLS stack canary and pointer guard in the loader window before the in-guest runtime starts (the named loader-window divergence); Detcore's post-exec AT_RANDOM rewrite comes after, so STACK_CANARY and POINTER_GUARD differ between runs while AT_RANDOM_BYTES match. Closed when the root launch goes through the launcher (launcher design 7.1, phase LC)."},
     {"test_id":"system-utils/startup-tls-guards","backend":"sabre","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"system-utils/stat-alias-root","backend":"dbt","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"system-utils/stat-alias-root","backend":"in-guest-trap","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: NOT-QUALIFIED: this cell checks the name Detcore's rendered stat gives a root launched through a symbolic link; in-guest-trap has not been run on it."},
-    {"test_id":"system-utils/stat-alias-root","backend":"kvm","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"system-utils/stat-alias-root","backend":"liteinst","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: NOT-QUALIFIED: this cell checks the name Detcore's rendered stat gives a root launched through a symbolic link; in-guest LiteInst has not been run on it."},
-    {"test_id":"system-utils/stat-alias-root","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: NOT-QUALIFIED: this cell checks the name Detcore's rendered stat gives a root launched through a symbolic link against the kernel's status and comm; SaBRe has not been run on it, and SaBRe is a drop candidate under the owner's ruling."},
-    {"test_id":"system-utils/stat-script-root","backend":"dbt","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"system-utils/stat-script-root","backend":"in-guest-trap","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: NOT-QUALIFIED: this cell checks the name Detcore's rendered stat gives a #! script root; in-guest-trap has not been run on it."},
-    {"test_id":"system-utils/stat-script-root","backend":"kvm","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
-    {"test_id":"system-utils/stat-script-root","backend":"liteinst","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: NOT-QUALIFIED: this cell checks the name Detcore's rendered stat gives a #! script root; in-guest LiteInst has not been run on it."},
-    {"test_id":"system-utils/stat-script-root","backend":"sabre","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: NOT-QUALIFIED: this cell checks the name Detcore's rendered stat gives a #! script root against the kernel's status and comm; SaBRe has not been run on it, and SaBRe is a drop candidate under the owner's ruling."},
     {"test_id":"system-utils/sysfs-sanitized-prefixes","backend":"dbt","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness"},
     {"test_id":"system-utils/sysfs-sanitized-prefixes","backend":"in-guest-trap","category":"system-utils","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
     {"test_id":"system-utils/sysfs-sanitized-prefixes","backend":"kvm","category":"system-utils","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
