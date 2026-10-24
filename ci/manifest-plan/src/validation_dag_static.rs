@@ -1839,7 +1839,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And A5 slice 3c.1e B's forced-gate harness (in_guest_delivery_harness):
     // the_parent_runner_never_forces_the_gate and six forced_gate_* rows:
     // 1121, listed (1114 on main plus seven).
-    ("test.hermit_unit", 1121),
+    // And the four chaos_timeslice::tests and nine run::preemption_tests
+    // units of --chaos-seeded-timeslice: 1134.
+    ("test.hermit_unit", 1134),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5626,7 +5628,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (validation_dag::HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS) while
     // test.hermit_unit runs all seven: 1115, listed
     // (1114 on main plus one).
-    ("test.hermit_unit_on_host", 1115),
+    // And the same thirteen --chaos-seeded-timeslice units: 1128.
+    ("test.hermit_unit_on_host", 1128),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
