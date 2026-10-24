@@ -9081,7 +9081,24 @@ fn wait_for_scorecard_write_lock(
     }
 }
 
-fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
+/// An absolute path that replaces the repository's scorecard write-back lock.
+/// Only tests set it: a worktree's lock is its Git common directory's, which
+/// every worktree of the primary checkout shares, so a test running `check`
+/// would otherwise wait the full timeout behind a live write-back elsewhere on
+/// the host.
+const WRITEBACK_LOCK_ENV: &str = "HERMIT_SCORECARD_WRITEBACK_LOCK";
+
+fn scorecard_write_lock_path(root: &Path) -> Result<PathBuf, String> {
+    if let Some(path) = std::env::var_os(WRITEBACK_LOCK_ENV).filter(|path| !path.is_empty()) {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            return Err(format!(
+                "{WRITEBACK_LOCK_ENV} must be an absolute path: {}",
+                path.display()
+            ));
+        }
+        return Ok(path);
+    }
     let output = Command::new("git")
         .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .current_dir(root)
@@ -9090,12 +9107,16 @@ fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
     if !output.status.success() {
         return Err("git rev-parse failed while locating the scorecard write-back lock".into());
     }
-    let path = PathBuf::from(
+    Ok(PathBuf::from(
         std::str::from_utf8(&output.stdout)
             .map_err(|e| format!("scorecard write-back lock path is not UTF-8: {e}"))?
             .trim(),
     )
-    .join("scorecard-writeback.lock");
+    .join("scorecard-writeback.lock"))
+}
+
+fn acquire_scorecard_write_lock(root: &Path) -> Result<File, String> {
+    let path = scorecard_write_lock_path(root)?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
