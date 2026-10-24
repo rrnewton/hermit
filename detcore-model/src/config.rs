@@ -65,6 +65,16 @@ pub const DEFAULT_BACKEND_CAPABILITIES: BackendCapabilities = {
     backend
 };
 
+/// The RCB clock a [`Config`] was prepared for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RcbClockClaim {
+    /// Nobody prepared the configuration for a qualified clock.
+    #[default]
+    Unset,
+    /// Prepared for this qualified clock key.
+    Known(reverie::pmu_config::ClockKey),
+}
+
 /// Sets `supports_blocked_wait_signal_interruption` and the four capabilities
 /// Detcore read from it until A5 step 3c.0 split them out
 /// (`kernel_signal_state_is_guests`, `kernel_signal_targets_are_predictable`,
@@ -267,6 +277,15 @@ pub struct Config {
     #[serde(default = "default_backend_capabilities")]
     #[clap(skip = DEFAULT_BACKEND_CAPABILITIES)]
     pub backend: BackendCapabilities,
+
+    /// The RCB clock the host prepared this run for
+    /// (`hermit_cli::prepare_backend_config`). Detcore checks it against the
+    /// clock it actually finds before it records or replays a history, and
+    /// never trusts it alone. It is not serialized: a configuration read from
+    /// JSON or bincode has none, and its histories are unqualified.
+    #[serde(skip)]
+    #[clap(skip)]
+    pub rcb_clock_claim: RcbClockClaim,
 
     /// The guest may start with a terminal: one of the launcher's standard
     /// descriptors is a terminal, the launcher has a controlling terminal that
@@ -3466,6 +3485,7 @@ mod tests {
         assert!(!config.backend.delivers_preemption_timer_events);
         assert!(!config.backend.runs_guest_code_between_injections);
         assert!(config.backend.rcb_clock_contract.is_none());
+        assert_eq!(config.rcb_clock_claim, RcbClockClaim::Unset);
         assert!(!config.guest_may_inherit_a_terminal);
         assert!(config.in_guest_detlog_forward_policy.is_none());
         assert!(!config.in_guest_site_patching_off);

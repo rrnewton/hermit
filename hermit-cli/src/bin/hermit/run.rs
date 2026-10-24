@@ -3870,7 +3870,7 @@ fn replay_refuses_another_pipe_wake_latency() {
     let dir = tempfile::tempdir().unwrap();
     let record = |name: &str, latency: Option<u64>| {
         let path = dir.path().join(name);
-        let record = detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+        let record = detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new(), None)
             .with_pipe_wake_latency(latency);
         std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
         path
@@ -3911,6 +3911,47 @@ fn replay_refuses_another_pipe_wake_latency() {
             }
         }
     }
+}
+
+/// A replayed history that states no RCB coordinate identity, or an
+/// unqualified one, is refused before launch under both replay flags, on any
+/// host: neither can be executed whatever this host's clock is. A run with
+/// nothing to replay is not refused.
+#[test]
+fn replay_refuses_a_history_it_cannot_execute_before_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, identity| {
+        let path = dir.path().join(name);
+        detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new(), identity)
+            .write_to_disk(&path)
+            .unwrap();
+        path
+    };
+    let legacy = write("legacy.json", None);
+    let unqualified = write(
+        "unqualified.json",
+        Some(detcore::preemptions::HistoryIdentity::Unqualified(
+            "claim-unset".to_owned(),
+        )),
+    );
+    for flag in ["--replay-schedule-from", "--replay-preemptions-from"] {
+        for (path, cause) in [
+            (&legacy, "states no RCB coordinate identity"),
+            (&unqualified, "unqualified RCB clock (claim-unset)"),
+        ] {
+            let replay = format!("{flag}={}", path.display());
+            let ro = RunOpts::parse_from(["fakehermit", replay.as_str(), "fakeprog"]);
+            let error = ro.refuse_unadmitted_rcb_histories(&[]).unwrap_err();
+            assert!(error.is::<PolicyRefusal>(), "{error:#}");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains(&format!("{flag} {}", path.display())) && message.contains(cause),
+                "{message}"
+            );
+        }
+    }
+    let ro = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    ro.refuse_unadmitted_rcb_histories(&[]).unwrap();
 }
 
 #[test]
@@ -6493,6 +6534,47 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Refuses, before anything is launched, a history this run replays, or
+    /// one of `recordings` (each an option and a path) that the trials of
+    /// `analyze` or `bisect` built from these run arguments would replay,
+    /// whose RCB coordinate identity the run's effective clock cannot execute
+    /// (`hermit::rcb_history_refusal`). Detcore checks identity again, and a
+    /// history's strict or legacy mode, when the run starts. It reads the
+    /// configuration the runtime backend receives and installs no PMU
+    /// configuration.
+    pub(crate) fn refuse_unadmitted_rcb_histories(
+        &self,
+        recordings: &[(&str, &Path)],
+    ) -> Result<(), Error> {
+        if self.namespace_only {
+            return Ok(());
+        }
+        let config =
+            hermit::prepare_backend_config(self.effective_det_config(), self.runtime_backend());
+        let inputs: Vec<(&str, &Path)> = recordings
+            .iter()
+            .copied()
+            .chain(
+                [
+                    (
+                        "--replay-schedule-from",
+                        config.replay_schedule_from.as_deref(),
+                    ),
+                    (
+                        "--replay-preemptions-from",
+                        config.replay_preemptions_from.as_deref(),
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(option, path)| Some((option, path?))),
+            )
+            .collect();
+        match hermit::rcb_history_refusal(&config, &inputs)? {
+            Some(refusal) => Err(Error::new(PolicyRefusal).context(refusal)),
+            None => Ok(()),
+        }
+    }
+
     /// Whether the record `--replay-preemptions-from` names carries callback
     /// checkpoints (`Config::annotated_priority_replay`), refusing a
     /// configuration that cannot replay such a record
@@ -7294,8 +7376,10 @@ impl RunOpts {
         self.refuse_strict_with_host_drawn_inputs()?;
         self.refuse_replay_under_another_pipe_wake_latency()?;
         self.refuse_replay_under_another_signal_state_copy()?;
+        self.refuse_unadmitted_rcb_histories(&[])?;
         // Refused here too, before stdin is read; each run's preparation
-        // below sets the configuration from the same record.
+        // below sets the configuration from the same record. After identity
+        // admission, so a record it refuses is refused by name first.
         self.annotated_priority_replay_admission()?;
         if !self.namespace_only
             && (self.verify_verbose

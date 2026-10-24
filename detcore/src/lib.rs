@@ -36,6 +36,7 @@
 #![deny(missing_docs)]
 #![allow(clippy::uninlined_format_args)]
 
+pub mod clock_identity;
 mod config;
 mod consts;
 mod cpuid;

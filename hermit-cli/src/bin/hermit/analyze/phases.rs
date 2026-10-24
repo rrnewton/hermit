@@ -15,6 +15,8 @@ use std::path::PathBuf;
 
 use anyhow::bail;
 use colored::Colorize;
+use detcore::clock_identity::combined_identity;
+use detcore::preemptions::HistoryIdentity;
 use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
 use detcore::types::SchedEvent;
@@ -153,21 +155,25 @@ impl AnalyzeOpts {
     }
 
     /// Write analyze's final on-target and baseline schedules, stamped
-    /// ([`Self::stamp_trial_record`]), and say where.
+    /// ([`Self::stamp_trial_record`]) and stating their sources' `identity`,
+    /// and say where.
     pub fn write_final_schedules(
         &self,
+        identity: Option<&HistoryIdentity>,
         failing: Vec<SchedEvent>,
         failing_path: &Path,
         passing: Vec<SchedEvent>,
         passing_path: &Path,
     ) {
-        self.write_trial_schedule(failing, failing_path).unwrap();
+        self.write_trial_schedule(failing, identity, failing_path)
+            .unwrap();
         eprintln!(
             "Wrote final on-target ({}) schedule to {}",
             self.display_criteria(),
             failing_path.display()
         );
-        self.write_trial_schedule(passing, passing_path).unwrap();
+        self.write_trial_schedule(passing, identity, passing_path)
+            .unwrap();
         eprintln!(
             "Wrote final baseline (off-target) schedule to {}",
             passing_path.display()
@@ -456,10 +462,14 @@ impl AnalyzeOpts {
     }
 
     /// Perform the binary search through schedule-space, identifying critical events.
+    /// `identity` is the one both endpoint histories state; every trial
+    /// schedule states it, and a trial whose recording states another ends
+    /// the search.
     pub fn phase5_bisect_traces(
         &self,
         target: &[SchedEvent],
         baseline: &[SchedEvent],
+        identity: Option<&HistoryIdentity>,
     ) -> anyhow::Result<CriticalSchedule> {
         let mut i = 0;
 
@@ -473,7 +483,7 @@ impl AnalyzeOpts {
                 .with_schedule_replay() // Default input path
                 .with_schedule_recording(); // Default output path
             // Prepare the next synthetic schedule on disk:
-            self.write_trial_schedule(sched.to_owned(), newrun.sched_path_in())?;
+            self.write_trial_schedule(sched.to_owned(), identity, newrun.sched_path_in())?;
 
             if self.verbose {
                 eprintln!(
@@ -494,6 +504,11 @@ impl AnalyzeOpts {
             }
 
             let sched_out = PreemptionReader::new(newrun.sched_path_out()).load_all();
+            combined_identity(
+                ("the bisection endpoints", identity),
+                (&newrun.sched_out_file_name(), sched_out.identity()),
+            )
+            .map_err(anyhow::Error::msg)?;
             Ok((!is_match, sched_out.into_global()))
         };
 
@@ -521,6 +536,7 @@ impl AnalyzeOpts {
         &mut self,
         good: Vec<SchedEvent>,
         bad: Vec<SchedEvent>,
+        identity: Option<HistoryIdentity>,
     ) -> anyhow::Result<ExitStatus> {
         self.phase0_initialize()?;
         eprintln!(
@@ -529,7 +545,7 @@ impl AnalyzeOpts {
             bad.len(),
         );
 
-        let critical = self.phase5_bisect_traces(&bad, &good)?;
+        let critical = self.phase5_bisect_traces(&bad, &good, identity.as_ref())?;
         let index = critical.critical_event_index;
         if index == 0 || index >= critical.failing_schedule.len() {
             bail!("schedule search returned an invalid critical event index {index}");
@@ -548,7 +564,7 @@ impl AnalyzeOpts {
         );
         println!("Swapping these adjacent events reproduces the good outcome.");
 
-        let report = self.phase6_record_outputs(critical)?;
+        let report = self.phase6_record_outputs(critical, identity.as_ref())?;
         if let Some(path) = &self.report_file {
             let text = serde_json::to_string_pretty(&report)?;
             std::fs::write(path, text)?;
@@ -585,7 +601,11 @@ impl AnalyzeOpts {
     }
 
     /// Record the schedules on disk as reproducers and report stack-traces of critical events.
-    pub fn phase6_record_outputs(&self, crit: CriticalSchedule) -> Result<Report, Error> {
+    pub fn phase6_record_outputs(
+        &self,
+        crit: CriticalSchedule,
+        identity: Option<&HistoryIdentity>,
+    ) -> Result<Report, Error> {
         let tmp_dir = self.get_tmp()?;
         let CriticalSchedule {
             failing_schedule,
@@ -610,6 +630,7 @@ impl AnalyzeOpts {
         );
 
         self.write_final_schedules(
+            identity,
             failing_schedule,
             &final_failing_path,
             passing_schedule,
@@ -782,7 +803,8 @@ impl AnalyzeOpts {
         .filter_map(|(option, path)| Some((option, path?)))
         .collect();
         self.adopt_recorded_epoch(&recordings)?;
-        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
+        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)?;
+        self.refuse_unadmitted_rcb_histories(&recordings)
     }
 
     /// Take the settings `analyze` inherits from the global options: every
@@ -845,6 +867,17 @@ impl AnalyzeOpts {
 
         let baseline_sched_name = baseline_endpoint_run.sched_out_file_name();
         let target_sched_name = target_endpoint_run.sched_out_file_name();
+        let identity = combined_identity(
+            (
+                &target_sched_name,
+                target_endpoint_run.preempts_out().identity(),
+            ),
+            (
+                &baseline_sched_name,
+                baseline_endpoint_run.preempts_out().identity(),
+            ),
+        )
+        .map_err(anyhow::Error::msg)?;
         let target = target_endpoint_run.sched_out();
         let baseline = baseline_endpoint_run.sched_out();
 
@@ -856,9 +889,9 @@ impl AnalyzeOpts {
             baseline_sched_name,
             target_sched_name,
         );
-        let crit_sched = self.phase5_bisect_traces(target, baseline)?;
+        let crit_sched = self.phase5_bisect_traces(target, baseline, identity.as_ref())?;
 
-        let report = self.phase6_record_outputs(crit_sched)?;
+        let report = self.phase6_record_outputs(crit_sched, identity.as_ref())?;
         if let Some(path) = &self.report_file {
             let txt = serde_json::to_string(&report).unwrap();
             std::fs::write(path, txt).expect("Unable to write report file");
@@ -1081,15 +1114,35 @@ mod tests {
     const RECORDED_RFC3339: &str = "2000-12-31T23:59:59.123456789+00:00";
     const OTHER: &str = "2026-01-01T00:00:00Z";
 
+    /// A synthetic preemption record of three branch events of thread 3 that
+    /// states the qualified RCB metric explicitly. It records no run; a
+    /// checked-in recording's producer is unknown, so none is relabelled.
+    fn synthetic_record() -> serde_json::Value {
+        let tid = detcore::DetTid::from_raw(3);
+        let mut writer = detcore::preemptions::PreemptionWriter::new(None).with_identity(
+            detcore::preemptions::HistoryIdentity::Known(
+                reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1,
+            ),
+        );
+        writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
+        for count in [1, 2, 3] {
+            writer.insert_schedevent(SchedEvent::branches(tid, count));
+        }
+        serde_json::from_str(&writer.into_string()).unwrap()
+    }
+
+    /// The settings of a record from `synthetic_record`, inside its identity
+    /// envelope.
+    fn settings(record: &mut serde_json::Value) -> &mut serde_json::Value {
+        &mut record["rcb_history"]["recording"]
+    }
+
     /// A preemption record written to `dir` under `name`, with the given
     /// recorded epoch.
     fn record_with_epoch(dir: &Path, name: &str, epoch: Option<&str>) -> PathBuf {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("test-resources/flaky_cas_sequence_schedules-passing.json");
-        let mut record: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(source).unwrap()).unwrap();
+        let mut record = synthetic_record();
         if let Some(epoch) = epoch {
-            record["epoch"] = serde_json::Value::from(epoch);
+            settings(&mut record)["epoch"] = serde_json::Value::from(epoch);
         }
         let path = dir.join(format!("{name}.json"));
         std::fs::write(&path, record.to_string()).unwrap();
@@ -1141,7 +1194,7 @@ mod tests {
             let mut value: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             if let Some(latency) = latency {
-                value["pipe_wake_latency"] = serde_json::Value::from(latency);
+                settings(&mut value)["pipe_wake_latency"] = serde_json::Value::from(latency);
             }
             std::fs::write(&path, value.to_string()).unwrap();
             path
@@ -1169,15 +1222,17 @@ mod tests {
                 dir.path().join("final-passing.json"),
                 dir.path().join("trial.json"),
             );
-            options.write_final_schedules(Vec::new(), &failing, Vec::new(), &passing);
-            options.write_trial_schedule(Vec::new(), &trial).unwrap();
+            options.write_final_schedules(None, Vec::new(), &failing, Vec::new(), &passing);
+            options
+                .write_trial_schedule(Vec::new(), None, &trial)
+                .unwrap();
             [failing, passing, trial]
                 .map(|path| detcore::preemptions::read_recorded_pipe_wake_latency(&path).unwrap())
         };
         assert_eq!(written(&options), [Some(0); 3]);
         assert_eq!(
             options
-                .stamp_trial_record(PreemptionRecord::from_vecs(&Default::default()))
+                .stamp_trial_record(PreemptionRecord::from_vecs(&Default::default(), None))
                 .pipe_wake_latency(),
             Some(0)
         );
@@ -1219,7 +1274,7 @@ mod tests {
             let mut value: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             if let Some(copy) = copy {
-                value["signal_state_copy"] = serde_json::Value::from(copy);
+                settings(&mut value)["signal_state_copy"] = serde_json::Value::from(copy);
             }
             std::fs::write(&path, value.to_string()).unwrap();
             path
@@ -1240,7 +1295,9 @@ mod tests {
         let off = record("off", Some(false));
         let written = |options: &AnalyzeOpts| {
             let trial = dir.path().join("copy-trial.json");
-            options.write_trial_schedule(Vec::new(), &trial).unwrap();
+            options
+                .write_trial_schedule(Vec::new(), None, &trial)
+                .unwrap();
             detcore::preemptions::read_recorded_signal_state_copy(&trial).unwrap()
         };
         let default = prepare(&on, &[]).unwrap();

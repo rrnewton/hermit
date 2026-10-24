@@ -21,6 +21,7 @@ use clap::CommandFactory;
 use clap::FromArgMatches;
 use clap::parser::ValueSource;
 use colored::Colorize;
+use detcore::preemptions::HistoryIdentity;
 use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
 use detcore::preemptions::strip_times_from_events_file;
@@ -740,11 +741,21 @@ impl AnalyzeOpts {
     }
 
     /// Write the schedule `events` for a trial to replay, stamped
-    /// ([`Self::stamp_trial_record`]).
-    pub fn write_trial_schedule(&self, events: Vec<SchedEvent>, path: &Path) -> anyhow::Result<()> {
-        self.stamp_trial_record(PreemptionRecord::from_sched_events(events))
-            .write_to_disk(path)
-            .map_err(anyhow::Error::msg)
+    /// ([`Self::stamp_trial_record`]). `identity` is the one the histories
+    /// `events` come from state ([`detcore::clock_identity::combined_identity`]),
+    /// never the current host's.
+    pub fn write_trial_schedule(
+        &self,
+        events: Vec<SchedEvent>,
+        identity: Option<&HistoryIdentity>,
+        path: &Path,
+    ) -> anyhow::Result<()> {
+        self.stamp_trial_record(PreemptionRecord::from_sched_events(
+            events,
+            identity.cloned(),
+        ))
+        .write_to_disk(path)
+        .map_err(anyhow::Error::msg)
     }
 
     /// Refuse, before any trial, recordings made under another
@@ -758,6 +769,17 @@ impl AnalyzeOpts {
     /// recordings are checked for the signal-state copy setting
     /// (`--no-signal-state-copy`), which a record without that field does not
     /// state, so it is accepted under either.
+    /// Refuse, before any trial, recordings whose RCB coordinates the trials'
+    /// effective clock cannot execute, or a record the run arguments replay
+    /// that it cannot (`RunOpts::refuse_unadmitted_rcb_histories`). Every
+    /// trial would be refused for it when it starts.
+    pub fn refuse_unadmitted_rcb_histories(
+        &self,
+        recordings: &[(&str, &Path)],
+    ) -> anyhow::Result<()> {
+        RunData::get_raw_runopts(self).refuse_unadmitted_rcb_histories(recordings)
+    }
+
     pub fn refuse_recordings_under_another_pipe_wake_latency(
         &self,
         recordings: &[(&str, &Path)],

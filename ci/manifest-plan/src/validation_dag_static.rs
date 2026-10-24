@@ -1167,7 +1167,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Both histories combined on main a21f47d1 with c36b658e: 1852, listed.
     // The RCB clock contract pin: detcore-model
     // config::tests::every_backend_constant_states_a_listed_rcb_clock_contract: 1853, listed.
-    ("test.regular_crates", 1853),
+    // RCB coordinate identity admission: hermit-verify
+    // common::verify::test::{priority_histories,schedules}_are_compared_inside_the_identity_envelope,
+    // schedule_trace::tests::interpolate_keeps_the_common_identity_and_refuses_different_ones and
+    // interpolation_writes_what_it_read_whatever_later_replaces_its_inputs: 1857, listed.
+    ("test.regular_crates", 1857),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1786,7 +1790,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Callback-annotated priority replay (https://github.com/rrnewton/hermit/issues/4082): two preemption_admission
     // admission tests: 1098, listed.
     // Both histories combined on main a21f47d1 with c36b658e: 1093, listed.
-    ("test.hermit_unit", 1093),
+    // RCB coordinate identity admission: error::tests::
+    // an_unconsumed_schedule_without_identity_is_refused_before_replay, metadata::tests::
+    // record_version_rejects_streams_from_before_the_corrected_rcb_event, and the hermit binary's
+    // analyze::minimize::tests::minimize_trials_keep_the_input_identity,
+    // bisect::tests::bisect_refuses_endpoints_it_cannot_execute_or_mix and
+    // run::replay_refuses_a_history_it_cannot_execute_before_launch: 1098, listed.
+    ("test.hermit_unit", 1098),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2834,7 +2844,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // row-1 fixture: 2541, listed.
     // And the two no-identity and custody overshot-refusal tests (https://github.com/rrnewton/hermit/pull/4657):
     // 2543, listed.
-    ("test.detcore_unit", 2543),
+    // RCB coordinate identity admission: 13 clock_identity::tests, six
+    // preemptions::boundary_recording::identity_tests, priority_custody_tests::
+    // checkpoints_install_from_the_admitted_priority_history and two writer_identity_tests: 2565, listed.
+    ("test.detcore_unit", 2565),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4990,7 +5003,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And -1 from 979f3fed: 2529.
     // And the same twelve priority-replay units (https://github.com/rrnewton/hermit/issues/4082): 2541, listed.
     // And the same two overshot-refusal tests (https://github.com/rrnewton/hermit/pull/4657): 2543, listed.
-    ("test.detcore_unit_on_host", 2543),
+    // And the same 22 RCB identity admission units: 2565, listed.
+    ("test.detcore_unit_on_host", 2565),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5339,7 +5353,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // strict-schedule-boundaries refusal unit: 1091, listed.
     // And the same two admission tests (https://github.com/rrnewton/hermit/issues/4082): 1098, listed.
     // Both histories combined on main a21f47d1 with c36b658e: 1093, listed.
-    ("test.hermit_unit_on_host", 1093),
+    // And the same five RCB identity admission tests, outside the existing skips: 1098, listed.
+    ("test.hermit_unit_on_host", 1098),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5537,7 +5552,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the hosted exclusions: 1836, listed.
     // Both histories combined on main a21f47d1 with c36b658e: 1838, listed.
     // And the same RCB clock contract test, not excluded: 1839, listed.
-    ("test.regular_crates_on_host", 1839),
+    // And the same four identity-admission verifier tests, not excluded: 1843, listed.
+    ("test.regular_crates_on_host", 1843),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
