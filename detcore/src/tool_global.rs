@@ -1671,9 +1671,37 @@ impl GlobalState {
     }
 
     fn initialize(cfg: &Config, spawn_scheduler: bool) -> Self {
+        if let Some(refusal) = crate::preemptions::annotated_replay_mode_refusal(cfg) {
+            crate::scheduler::exit_on_scheduler_refusal(&refusal);
+        }
         let sched = Arc::new(Mutex::new(Scheduler::new(cfg)));
         let global_time = Arc::new(Mutex::new(GlobalTime::new(cfg)));
         let process_exit_cleanup = ProcessExitCleanup::default();
+
+        let preemptions_to_replay: Option<HistoryReader> =
+            cfg.replay_preemptions_from.as_ref().map(|path| {
+                // Keep ordinary file/JSON errors in their original panic class.
+                let history = HistoryReader::read(path).unwrap();
+                history
+                    .require_legacy_mode()
+                    .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
+                // The scheduler takes the same record's callback checkpoints,
+                // and checks them against the launch decision, before its
+                // loop runs or any thread starts.
+                sched
+                    .lock()
+                    .unwrap()
+                    .install_priority_checkpoints(history.callback_checkpoints())
+                    .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
+                history
+            });
+        if preemptions_to_replay.is_none() && cfg.annotated_priority_replay {
+            crate::scheduler::exit_on_scheduler_refusal(
+                &"HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE: the run was prepared to replay a \
+                  callback-annotated priority history, but names no --replay-preemptions-from",
+            );
+        }
+
         let handle = if cfg.sequentialize_threads && spawn_scheduler {
             // Announce before spawning, not from inside the spawned task. The
             // task's first poll is unordered with respect to the rest of this
@@ -1687,15 +1715,6 @@ impl GlobalState {
             None
         };
 
-        let preemptions_to_replay: Option<HistoryReader> =
-            cfg.replay_preemptions_from.as_ref().map(|path| {
-                // Keep ordinary file/JSON errors in their original panic class.
-                let history = HistoryReader::read(path).unwrap();
-                history
-                    .require_legacy_mode()
-                    .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
-                history
-            });
         let range = Self::read_port_range();
         let network = Self::network_engine(cfg).map(Mutex::new);
 
@@ -3732,7 +3751,12 @@ impl GlobalState {
                     .await
                 {
                     SchedulerRpcResult::Continue(history) => {
-                        let sched = self.lock_rpc_scheduler(false).await;
+                        let mut sched = self.lock_rpc_scheduler(false).await;
+                        // A callback-annotated history replays from its
+                        // first row only at the thread's birth.
+                        if let Err(refusal) = sched.authenticate_priority_birth(dettid) {
+                            crate::scheduler::exit_on_scheduler_refusal(&refusal);
+                        }
                         let startup = crate::preemptions::callback_history::Startup {
                             checkpoints: sched
                                 .callback_checkpoints
@@ -5340,6 +5364,7 @@ impl GlobalState {
                     slice_boundary: None,
                     guest_signal_mask: None,
                     callback_checkpoint: None,
+                    priority_row: None,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {

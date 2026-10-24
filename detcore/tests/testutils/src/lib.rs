@@ -110,6 +110,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         in_guest_reserved_signals: 0,
         in_guest_refuses_host_timed_producers: false,
         in_guest_signal_delivery: false,
+        annotated_priority_replay: false,
         launch_image: None,
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
         virtualize_time: false,
@@ -218,6 +219,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         in_guest_reserved_signals: 0,
         in_guest_refuses_host_timed_producers: false,
         in_guest_signal_delivery: false,
+        annotated_priority_replay: false,
         launch_image: None,
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
         virtualize_time: true, // stat* could depends on this
@@ -326,6 +328,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         in_guest_reserved_signals: 0,
         in_guest_refuses_host_timed_producers: false,
         in_guest_signal_delivery: false,
+        annotated_priority_replay: false,
         launch_image: None,
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
         virtualize_time: true,
