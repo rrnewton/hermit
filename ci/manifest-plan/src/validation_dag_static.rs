@@ -1848,7 +1848,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // pinned to (https://github.com/rrnewton/hermit/issues/4824): 1135, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1172.
     // Train 6 recount (measured on 21f770f6 base): 1187.
-    ("test.hermit_unit", 1198),
+    // And analyze's per-trial bound: rundata::tests::{the_trial_bound_derives_from_the_slowest_endpoint_run,
+    // runs_take_the_bound_and_the_target_run_does_not, a_run_the_trial_bound_ends_names_the_bound,
+    // a_trials_log_is_capped_by_the_largest_endpoint_log,
+    // a_trial_that_a_bound_ends_did_not_reach_the_target,
+    // an_unenforceable_trial_timeout_is_refused_and_auto_does_without} and
+    // global_opts::tests::a_runs_log_bound_only_tightens_the_environment_bound: 1205.
+    ("test.hermit_unit", 1205),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5749,7 +5755,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fourteen pinned_cpu::tests units: 1129, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1166.
     // Train 6 recount (measured on 21f770f6 base): 1181.
-    ("test.hermit_unit_on_host", 1192),
+    // And the same seven analyze per-trial bound tests: 1199.
+    ("test.hermit_unit_on_host", 1199),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

@@ -30,10 +30,12 @@ use reverie::process::Output;
 
 use crate::analyze::consts::*;
 use crate::analyze::rundata::RunData;
+use crate::analyze::rundata::TrialEnd;
 use crate::analyze::types::AnalyzeOpts;
 use crate::analyze::types::ExitStatusConstraint;
 use crate::analyze::types::Report;
 use crate::analyze::types::ReportCriticalEvent;
+use crate::analyze::types::TrialTimeout;
 use crate::container::RunTimeoutMarker;
 use crate::global_opts::GlobalOpts;
 use crate::logdiff::LogDiffCLIOpts;
@@ -95,6 +97,23 @@ fn stack_pair_sentences(
             .to_owned()
     }
 }
+
+/// The baseline run (from `.0`) did not finish: a wall-clock bound ended it,
+/// so it recorded no schedule to bisect against.
+#[derive(Debug)]
+pub struct BaselineUnfinished(&'static str);
+
+impl std::fmt::Display for BaselineUnfinished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the baseline run ({}) did not finish, so it recorded no schedule to bisect against",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for BaselineUnfinished {}
 
 /// The result of `--prefix-search`: replaying the first `decision` events of
 /// `schedule` and then scheduling without chaos misses the target, while
@@ -231,8 +250,7 @@ impl AnalyzeOpts {
         if self.imprecise_search {
             rundat.runopts.det_opts.det_config.imprecise_timers = true; // TODO: enable this by default when bugs are fixed.
         }
-        rundat.launch()?;
-        if rundat.is_a_match() {
+        if rundat.launch_trial()?.reached_target() {
             eprintln!(
                 ":: {}:\n    {}",
                 "Target run established by --search. Reproducer"
@@ -275,8 +293,7 @@ impl AnalyzeOpts {
         if let Some(path) = record_sched_path {
             run = run.with_schedule_recording_to(path.to_path_buf());
         }
-        run.launch()?;
-        let is_match = run.is_a_match();
+        let is_match = run.launch_trial()?.reached_target();
         Ok((is_match, run.into_runopts()))
     }
 
@@ -288,7 +305,7 @@ impl AnalyzeOpts {
         runname: &str,
         schedule_path: &Path,
         critical_event_index: u64,
-    ) -> anyhow::Result<(RunData, PathBuf, PathBuf)> {
+    ) -> anyhow::Result<(RunData, bool, PathBuf, PathBuf)> {
         let mut run = RunData::new_baseline(self, runname.to_string())?
             .with_schedule_replay_from(schedule_path.to_path_buf());
 
@@ -301,19 +318,22 @@ impl AnalyzeOpts {
             (critical_event_index, Some(stack2_path.clone())),
         ]
         .to_vec();
-        if let Err(error) = run.launch() {
-            // The stacks are written when the replay reaches the critical events, so a
-            // replay that hangs afterwards has still done its job.
-            if error.downcast_ref::<RunTimeoutMarker>().is_none() || !stack2_path.exists() {
-                return Err(error);
+        let finished = match run.launch() {
+            Ok(()) => true,
+            // The stacks are written when the replay reaches the critical
+            // events, so a replay that hangs afterwards has still done its job.
+            Err(error)
+                if error.downcast_ref::<RunTimeoutMarker>().is_some() && stack2_path.exists() =>
+            {
+                eprintln!(
+                    ":: {} ({error}) after recording the critical stacks",
+                    "WARNING: the stack-trace replay timed out".yellow().bold(),
+                );
+                false
             }
-            eprintln!(
-                ":: {} ({}) after recording the critical stacks",
-                "WARNING: the stack-trace replay timed out".yellow().bold(),
-                error.root_cause()
-            );
-        }
-        Ok((run, stack1_path, stack2_path))
+            Err(error) => return Err(error),
+        };
+        Ok((run, finished, stack1_path, stack2_path))
     }
 
     /// One `--prefix-search` trial: replay the first `len` events of `target`,
@@ -339,7 +359,7 @@ impl AnalyzeOpts {
     }
 
     /// Launch a prefix trial; true when it meets the target criteria. A trial
-    /// that the run arguments' --timeout ends did not reach the target.
+    /// that a wall-clock bound ends did not reach the target.
     fn launch_prefix_trial(&self, run: &mut RunData) -> anyhow::Result<bool> {
         if self.verbose {
             eprintln!(
@@ -348,17 +368,7 @@ impl AnalyzeOpts {
                 run.to_repro()
             );
         }
-        match run.launch() {
-            Ok(()) => Ok(run.is_a_match()),
-            Err(error) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
-                eprintln!(
-                    " => Timed out ({}); counted as the baseline condition",
-                    error.root_cause()
-                );
-                Ok(false)
-            }
-            Err(error) => Err(error),
-        }
+        Ok(run.launch_trial()?.reached_target())
     }
 
     /// `--prefix-search`: find the shortest prefix of the target schedule that,
@@ -641,7 +651,7 @@ impl AnalyzeOpts {
 
     /// Create our workspace and verify the input run matches the criteria, or find one that does.
     /// Returns the results of the target run.
-    fn phase1_establish_target_run(&self) -> Result<RunData, Error> {
+    fn phase1_establish_target_run(&mut self) -> Result<RunData, Error> {
         let mut run1data = RunData::new_run1_target(self, "run1_target".to_string())?;
         eprintln!(
             // `to_repro` is already a complete `hermit ... run ...` command.
@@ -654,6 +664,13 @@ impl AnalyzeOpts {
             let preempts_path = run1data.preempts_path_out();
             // Copy preempts to the output location as though they were recorded by this run:
             std::fs::copy(p, preempts_path).expect("copy file to succeed");
+            if self.trial_timeout == TrialTimeout::Auto {
+                eprintln!(
+                    ":: --run1-preemptions runs no target run to measure, so runs are not \
+                     bounded until analyze replays the record to verify it (not every search \
+                     does); pass --trial-timeout=SECONDS to bound every run."
+                );
+            }
             // Careful, returning a NON-launched RunData just to contain the output path.
             return Ok(run1data);
         }
@@ -661,6 +678,7 @@ impl AnalyzeOpts {
         // Translate the seed into a set of preemptions we can work from.
         let mut run1data = run1data.with_preemption_recording();
         run1data.launch()?;
+        self.record_endpoint(&run1data);
 
         if !run1data.is_a_match() {
             if self.search {
@@ -813,7 +831,7 @@ impl AnalyzeOpts {
     ///
     /// Returns a path to a file containing recorded schedule events for the baseline run.
     pub fn phase4_choose_baseline_sched_events(
-        &self,
+        &mut self,
         matching_pr: PreemptionRecord,
     ) -> anyhow::Result<RunData> {
         if self.minimize {
@@ -868,7 +886,21 @@ impl AnalyzeOpts {
                 // Otherwise we just assume that a *baseline* (non-chaos) run will do the trick.
                 ro.det_opts.det_config.chaos = false;
             }
-            newrun.launch()?;
+            if newrun.launch_trial()? == TrialEnd::Unfinished {
+                // Without a baseline the user chose, analyze searches within
+                // the target schedule instead; one the user chose is not
+                // replaced behind their back.
+                if self.run2_seed.is_none() && self.run2_preemptions.is_none() {
+                    return Err(BaselineUnfinished(from_where).into());
+                }
+                bail!(
+                    "the baseline run ({from_where}) did not finish (see above). Pass a larger \
+                     --trial-timeout, or another baseline; without one, analyze bisects against \
+                     the run without chaos, or searches within the target schedule when that \
+                     does not finish either."
+                );
+            }
+            self.record_endpoint(&newrun);
 
             eprintln!(
                 ":: Recorded schedule from {} as baseline run ({})",
@@ -901,10 +933,10 @@ impl AnalyzeOpts {
 
         // Each call is one trial. A trial that cannot finish (for example, one
         // that --max-log-bytes ended) returns its error unchanged, and the
-        // search stops there. A trial that the run arguments' --timeout ended
-        // is the exception: a spliced schedule can leave the guest waiting for
-        // an event that never comes, so it did not reach the target, and the
-        // search goes on.
+        // search stops there. A trial that a wall-clock bound ended
+        // (--trial-timeout, or the run arguments' --timeout) is the exception:
+        // a spliced schedule can leave the guest waiting for an event that
+        // never comes, so it did not reach the target, and the search goes on.
         let test_fn = |sched: &[SchedEvent]| -> TrialOutcome {
             i += 1;
             let runname = format!("bisect_round_{:0wide$}", i, wide = 3);
@@ -924,18 +956,13 @@ impl AnalyzeOpts {
                 );
             }
 
-            if let Err(error) = newrun.launch() {
-                if error.downcast_ref::<RunTimeoutMarker>().is_none() {
-                    return Err(error);
+            let is_match = match newrun.launch_trial()? {
+                TrialEnd::Unfinished => {
+                    timed_out += 1;
+                    return Ok((true, sched.to_owned()));
                 }
-                timed_out += 1;
-                eprintln!(
-                    " => Timed out ({}); counted as the baseline condition",
-                    error.root_cause()
-                );
-                return Ok((true, sched.to_owned()));
-            }
-            let is_match = newrun.is_a_match();
+                end => end.reached_target(),
+            };
             if is_match {
                 eprintln!(" => Target condition ({})", self.display_criteria());
             } else {
@@ -1161,9 +1188,14 @@ impl AnalyzeOpts {
         critical_event_index: usize,
         expected_match: bool,
     ) -> Result<(Option<PrettyBacktrace>, Option<PrettyBacktrace>), Error> {
-        let (rundata, stack1_path, stack2_path) =
+        let (rundata, finished, stack1_path, stack2_path) =
             self.launch_for_stacktraces(runname, &final_path, critical_event_index as u64)?;
-        let res = rundata.is_a_match();
+        // A replay that a bound stopped has no outcome to check.
+        let res = if finished {
+            rundata.is_a_match()
+        } else {
+            expected_match
+        };
         eprintln!(
             "\n:: {}",
             "Final run to print stack traces completed.  Repro command:"
@@ -1198,6 +1230,7 @@ impl AnalyzeOpts {
         self.refuse_options_trials_do_not_apply()?;
         self.refuse_outputs_trials_overwrite()?;
         self.refuse_unqualified_trial_timeout()?;
+        self.refuse_unenforceable_trial_timeout()?;
         self.install_trial_pmu_config()?;
         self.admit_branch_counter(&mut crate::tracing::write_stderr_diagnostic)?;
         if let Some(notice) =
@@ -1302,7 +1335,21 @@ impl AnalyzeOpts {
         // The other endpoint of the bisection search:
         // What we thought was the final_pr can change here:
         let mut baseline_endpoint_run =
-            self.phase4_choose_baseline_sched_events(normalized_preempts)?;
+            match self.phase4_choose_baseline_sched_events(normalized_preempts) {
+                Ok(run) => run,
+                // A baseline run that did not finish gives no schedule to
+                // bisect against; the decision is still within the target
+                // schedule, which a prefix search needs alone.
+                Err(error) if error.downcast_ref::<BaselineUnfinished>().is_some() => {
+                    eprintln!(
+                        ":: {} {error}\n:: Searching within the target schedule instead \
+                         (--prefix-search); a larger --trial-timeout may let the baseline finish.",
+                        "No baseline:".yellow().bold(),
+                    );
+                    return self.prefix_search_and_report(&mut target_endpoint_run);
+                }
+                Err(error) => return Err(error),
+            };
 
         let baseline_sched_name = baseline_endpoint_run.sched_out_file_name();
         let target_sched_name = target_endpoint_run.sched_out_file_name();
@@ -1378,7 +1425,7 @@ impl AnalyzeOpts {
     /// would be unnecessary if we recorded that each time as we minimize.
     ///
     /// Argument: the last on-target run that was preemption based.
-    fn save_final_target_sched_events(&self, mut last_run: RunData) -> anyhow::Result<RunData> {
+    fn save_final_target_sched_events(&mut self, mut last_run: RunData) -> anyhow::Result<RunData> {
         let pr = last_run.preempts_out();
         if pr.contains_schedevents() {
             let path = last_run.preempts_path_out();
@@ -1400,6 +1447,8 @@ impl AnalyzeOpts {
                 .replaying_the_target_record(newrun, last_run.preempts_path_out().to_path_buf())
                 .with_schedule_recording();
             newrun.launch()?;
+            // With --run1-preemptions this is the first run of the target.
+            self.record_endpoint(&newrun);
             eprintln!("    {}", newrun.to_repro());
             if !newrun.is_a_match() {
                 bail!("Final preemption record still does not match target criteria");
@@ -1440,7 +1489,9 @@ impl AnalyzeOpts {
         yellow_msg(
             "Verify preemption record *without* latest critical preempt causes criteria non-match. Also record sched events.",
         );
-        newrun.launch()?;
+        if newrun.launch_trial()? == TrialEnd::Unfinished {
+            return Err(BaselineUnfinished("--minimize's knock-out of its last preemption").into());
+        }
         eprintln!("    {}", newrun.to_repro());
         if newrun.is_a_match() {
             eprintln!(

@@ -49,6 +49,7 @@ struct AnalyzeWorkloads {
     hello_race: PathBuf,
     racewrite_nostdlib: PathBuf,
     nanosleep_nocrash: PathBuf,
+    race_then: PathBuf,
 }
 
 fn command_output(mut command: Command, label: &str) -> Output {
@@ -145,10 +146,17 @@ fn workloads() -> &'static AnalyzeWorkloads {
             &nanosleep_nocrash,
         );
 
+        let race_then = build_root.join("analyze_race_then");
+        compile_c_pthread(
+            &repository.join("hermit-cli/tests/fixtures/analyze_race_then.c"),
+            &race_then,
+        );
+
         AnalyzeWorkloads {
             hello_race,
             racewrite_nostdlib,
             nanosleep_nocrash,
+            race_then,
         }
     })
 }
@@ -192,6 +200,11 @@ fn run_analyze(
     assert!(
         combined.contains("Stack trace for thread"),
         "{label}: hermit analyze did not print a guest stack trace\n{combined}"
+    );
+    // --trial-timeout=auto: the runs after the target run are bounded.
+    assert!(
+        combined.contains("Runs from here on are bounded at 60 s of wall-clock time"),
+        "{label}: no trial bound\n{combined}"
     );
     if !expected_output.is_empty() {
         assert!(
@@ -338,5 +351,131 @@ fn analyze_nanosleep_threads_rejects_indistinguishable_baseline() {
         "analyze nanosleep-threads baseline collision",
         &workloads().nanosleep_nocrash,
         &["--run-arg=--base-env=empty", "--target-exit-code=0"],
+    );
+}
+
+/// The first chaos seed under which `analyze_race_then THEN`, run with
+/// `run_args`, takes the order that finishes ("b-first", exit 0). A run in
+/// the other order may not end by itself, so each is bounded at 5 s.
+fn race_then_target_seed(then: &str, run_args: &[&str]) -> u64 {
+    let guest = &workloads().race_then;
+    (0..40)
+        .find(|seed| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+            command
+                .args(["run", "--chaos", "--timeout=5"])
+                .args(run_args)
+                .arg(format!("--seed={seed}"))
+                .arg("--")
+                .arg(guest)
+                .arg(then);
+            let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+            output.status.success() && output.stdout == b"b-first\n"
+        })
+        .expect("no chaos seed in 0..40 lets thread b win the race")
+}
+
+fn combined_output(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    )
+}
+
+/// `hermit analyze` over `analyze_race_then THEN` from a target seed, with
+/// `--trial-timeout=3` and more analyze options and run arguments: its
+/// output and report, if it wrote one.
+fn analyze_race_then_with(
+    then: &str,
+    analyze_opts: &[&str],
+    run_args: &[&str],
+) -> (Output, Option<serde_json::Value>) {
+    let seed = race_then_target_seed(then, run_args);
+    let _guard = analyze_lock();
+    let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
+    let report_file = report_dir.path().join("report.json");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .arg("analyze")
+        .args([
+            "--target-stdout=b-first",
+            "--target-exit-code=0",
+            "--trial-timeout=3",
+        ])
+        .args(analyze_opts)
+        .arg(format!("--run1-seed={seed}"))
+        .arg(format!("--report-file={}", report_file.display()))
+        .args(["--", "--chaos"])
+        .args(run_args)
+        .arg("--")
+        .arg(&workloads().race_then)
+        .arg(then);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    let report = fs::read_to_string(&report_file).ok().map(|text| {
+        serde_json::from_str(&text).unwrap_or_else(|error| {
+            panic!("unreadable report: {error}\n{}", combined_output(&output))
+        })
+    });
+    (output, report)
+}
+
+/// [`analyze_race_then_with`], asserting that analyze succeeded and wrote a
+/// report naming a critical event: the combined output and the report.
+fn analyze_race_then(
+    label: &str,
+    then: &str,
+    analyze_opts: &[&str],
+) -> (String, serde_json::Value) {
+    let (output, report) = analyze_race_then_with(then, analyze_opts, &[]);
+    let combined = combined_output(&output);
+    assert!(
+        output.status.success(),
+        "{label} failed: {}\n{combined}",
+        output.status
+    );
+    let report = report.unwrap_or_else(|| panic!("{label}: no report\n{combined}"));
+    assert!(
+        report["critical_event1"]["event_index"].is_u64(),
+        "{label}: {report}"
+    );
+    (combined, report)
+}
+
+const BOUND_REACHED: &str = "reached hermit analyze's bound of 3 s per run \
+                             (--trial-timeout=SECONDS raises it, --trial-timeout=off lifts it)); \
+                             counted as the baseline condition";
+
+/// Every prefix trial in which thread a wins the race spins for ever, the
+/// run without chaos (the prefix search's baseline) among them. Each is
+/// bounded by `--trial-timeout` and counts as the baseline condition, so
+/// the search still finds the deciding event. Before the bound, the first
+/// such trial never ended.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_bounds_trials_that_never_end() {
+    let label = "analyze --prefix-search analyze_race_then spin";
+    let (combined, _) = analyze_race_then(label, "spin", &["--prefix-search"]);
+    assert!(
+        combined.contains(BOUND_REACHED),
+        "{label}: no trial reached the bound\n{combined}"
+    );
+}
+
+/// The default search's baseline is the run without chaos, which here spins
+/// for ever. The bound ends it too, and with no baseline schedule analyze
+/// searches within the target schedule instead. Before, the baseline run
+/// never ended, whatever --trial-timeout said.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_searches_the_target_schedule_when_the_baseline_never_ends() {
+    let label = "analyze analyze_race_then spin";
+    let (combined, _) = analyze_race_then(label, "spin", &[]);
+    assert!(
+        combined.contains(
+            "the baseline run (non-chaos (0 extra preemptions) run) did not finish, so it \
+             recorded no schedule to bisect against"
+        ) && combined.contains("Searching within the target schedule instead"),
+        "{label}: no fallback\n{combined}"
     );
 }
