@@ -1,0 +1,1543 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Source of the Rust file `detcore/src/procfs/locks.rs`."><title>locks.rs - source</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-1ed95124.css"><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="detcore" data-themes="" data-resource-suffix="" data-rustdoc-version="1.99.0-nightly (be8e82435 2026-07-11)" data-channel="nightly" data-search-js="search-9944d736.js" data-stringdex-js="stringdex-2da4960a.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../../../static.files/src-script-813739b1.js"></script><script defer src="../../../src-files.js"></script><script defer src="../../../static.files/main-417ebf0a.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc src"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><nav class="sidebar"><div class="src-sidebar-title"><h2>Files</h2></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><h1><div class="sub-heading">detcore/procfs/</div>locks.rs</h1><rustdoc-toolbar></rustdoc-toolbar></div><div class="example-wrap digits-4"><pre class="rust"><code><a href=#1 id=1 data-nosnippet>1</a><span class="comment">/*
+<a href=#2 id=2 data-nosnippet>2</a> * Copyright (c) Meta Platforms, Inc. and affiliates.
+<a href=#3 id=3 data-nosnippet>3</a> * All rights reserved.
+<a href=#4 id=4 data-nosnippet>4</a> *
+<a href=#5 id=5 data-nosnippet>5</a> * This source code is licensed under the BSD-style license found in the
+<a href=#6 id=6 data-nosnippet>6</a> * LICENSE file in the root directory of this source tree.
+<a href=#7 id=7 data-nosnippet>7</a> */
+<a href=#8 id=8 data-nosnippet>8</a>
+<a href=#9 id=9 data-nosnippet>9</a></span><span class="doccomment">//! Which rows of the kernel's `/proc/locks` belong to the guest.
+<a href=#10 id=10 data-nosnippet>10</a>//!
+<a href=#11 id=11 data-nosnippet>11</a>//! Detcore renders `/proc/locks` from the kernel's file, read through the
+<a href=#12 id=12 data-nosnippet>12</a>//! guest's own descriptor. In the guest's PID namespace Linux hides every
+<a href=#13 id=13 data-nosnippet>13</a>//! POSIX, flock and lease row whose owner the namespace cannot see
+<a href=#14 id=14 data-nosnippet>14</a>//! (`locks_show` drops a row whose `locks_translate_pid` is 0), but it cannot
+<a href=#15 id=15 data-nosnippet>15</a>//! hide an open file description (OFD) lock: such a lock has no owning task,
+<a href=#16 id=16 data-nosnippet>16</a>//! and Linux prints it as owner `-1` from every namespace. Any process on the
+<a href=#17 id=17 data-nosnippet>17</a>//! host that holds an OFD lock, on any file, therefore added rows to the
+<a href=#18 id=18 data-nosnippet>18</a>//! guest's snapshot, at moments the host decided.
+<a href=#19 id=19 data-nosnippet>19</a>//!
+<a href=#20 id=20 data-nosnippet>20</a>//! The guest's own OFD and flock locks belong to its open file descriptions,
+<a href=#21 id=21 data-nosnippet>21</a>//! not to its tasks, and the kernel lists exactly the locks held through one
+<a href=#22 id=22 data-nosnippet>22</a>//! description in that description's `/proc/&lt;pid&gt;/fdinfo/&lt;fd&gt;` `lock:` lines,
+<a href=#23 id=23 data-nosnippet>23</a>//! spelled as `/proc/locks` spells them. After every `F_OFD_SETLK`,
+<a href=#24 id=24 data-nosnippet>24</a>//! `F_OFD_SETLKW`, `flock` and `pidfd_getfd` call, and for a descriptor
+<a href=#25 id=25 data-nosnippet>25</a>//! received over `SCM_RIGHTS` that Detcore models, Detcore reads that
+<a href=#26 id=26 data-nosnippet>26</a>//! descriptor's fdinfo through the recorder ([`held_locks_in_fdinfo`]). Its
+<a href=#27 id=27 data-nosnippet>27</a>//! global state keeps a [`LockLedger`]: which locks each such description
+<a href=#28 id=28 data-nosnippet>28</a>//! holds and which guest descriptor tables reference it, with a slot count
+<a href=#29 id=29 data-nosnippet>29</a>//! per table, kept as Linux keeps the references (close, replacement, fork,
+<a href=#30 id=30 data-nosnippet>30</a>//! `CLONE_FILES`, a successful exec, exit). A description's locks are the
+<a href=#31 id=31 data-nosnippet>31</a>//! guest's while some table it knows references it. If the fdinfo cannot be
+<a href=#32 id=32 data-nosnippet>32</a>//! opened or read (a full descriptor table, no `/proc` in a chroot, a seccomp
+<a href=#33 id=33 data-nosnippet>33</a>//! filter), the description's locks are unknown rather than taken to be none:
+<a href=#34 id=34 data-nosnippet>34</a>//! the call itself goes on as Linux runs it, and a `/proc/locks` read made
+<a href=#35 id=35 data-nosnippet>35</a>//! while a guest table still references that description stops the run by
+<a href=#36 id=36 data-nosnippet>36</a>//! name ([`LockLedger::unknown`]), since its rows could not be told from a
+<a href=#37 id=37 data-nosnippet>37</a>//! host's. A run that never reads `/proc/locks` is not stopped.
+<a href=#38 id=38 data-nosnippet>38</a>//!
+<a href=#39 id=39 data-nosnippet>39</a>//! Before the snapshot's identities are numbered, Detcore keeps only the
+<a href=#40 id=40 data-nosnippet>40</a>//! groups of rows the guest owns ([`guest_lock_rows`]). A group is a granted
+<a href=#41 id=41 data-nosnippet>41</a>//! lock and the waiters queued behind it, which share one sequence number. A
+<a href=#42 id=42 data-nosnippet>42</a>//! group stays when its granted row stays:
+<a href=#43 id=43 data-nosnippet>43</a>//! - an OFD row whose class, mode, access, object and range are, field for
+<a href=#44 id=44 data-nosnippet>44</a>//!   field, a lock a guest description some guest table references holds, at
+<a href=#45 id=45 data-nosnippet>45</a>//!   most one row per distinct such lock. An OFD row has no owning task (owner
+<a href=#46 id=46 data-nosnippet>46</a>//!   `-1` from every namespace), so this field match is the only way to tell
+<a href=#47 id=47 data-nosnippet>47</a>//!   the guest's from a host's;
+<a href=#48 id=48 data-nosnippet>48</a>//! - a row owned by a positive pid that names a process of the guest, as the
+<a href=#49 id=49 data-nosnippet>49</a>//!   container's `/proc` lists it (a live process, or a zombie until it is
+<a href=#50 id=50 data-nosnippet>50</a>//!   reaped), translated from the kernel's numbering where a backend's differs
+<a href=#51 id=51 data-nosnippet>51</a>//!   (`Scheduler::procfs_ids`). This is the ONLY rule that keeps a POSIX or a
+<a href=#52 id=52 data-nosnippet>52</a>//!   flock row: Linux prints a flock row with the pid of the process that took
+<a href=#53 id=53 data-nosnippet>53</a>//!   it, so a flock row is kept when that pid is a guest process's. This is
+<a href=#54 id=54 data-nosnippet>54</a>//!   guest-pid membership, not proof of identity: a pid says who holds that
+<a href=#55 id=55 data-nosnippet>55</a>//!   number now, not who took the lock (see the host-row cases below). A
+<a href=#56 id=56 data-nosnippet>56</a>//!   field match against a description's recorded flock is not
+<a href=#57 id=57 data-nosnippet>57</a>//!   used: that record can go stale where Detcore does not see the unlock (a
+<a href=#58 id=58 data-nosnippet>58</a>//!   copied DBT `vfork` child runs `LOCK_UN` natively), and a stale record
+<a href=#59 id=59 data-nosnippet>59</a>//!   would admit a host process's identical flock where the guest's procfs is
+<a href=#60 id=60 data-nosnippet>60</a>//!   not namespace-private (`--no-namespace`). This also hides another
+<a href=#61 id=61 data-nosnippet>61</a>//!   process's POSIX and flock rows there;
+<a href=#62 id=62 data-nosnippet>62</a>//! - TEMPORARY EXEMPTION, for KVM only in practice: a row whose object is on
+<a href=#63 id=63 data-nosnippet>63</a>//!   device `00:00`. KVM keeps a backend-local copy of `/proc/locks`, built
+<a href=#64 id=64 data-nosnippet>64</a>//!   from the supervisor's fdinfo `lock:` lines for the guest's own files, and
+<a href=#65 id=65 data-nosnippet>65</a>//!   prints every row there as `00:00:N` with owner `-1`, so no guest
+<a href=#66 id=66 data-nosnippet>66</a>//!   description's lock line (which names the real device) matches it, and
+<a href=#67 id=67 data-nosnippet>67</a>//!   this filter would otherwise drop all of them. Linux itself never prints
+<a href=#68 id=68 data-nosnippet>68</a>//!   `00:00` for a lockable object (an anonymous device's minor starts at 1),
+<a href=#69 id=69 data-nosnippet>69</a>//!   so no kernel row is kept by this rule. This is not Linux behaviour being
+<a href=#70 id=70 data-nosnippet>70</a>//!   modelled: it is an exemption for one backend's local file, to be removed
+<a href=#71 id=71 data-nosnippet>71</a>//!   when package K replaces KVM's local `/proc/locks` with Detcore's own
+<a href=#72 id=72 data-nosnippet>72</a>//!   rendering (slice K8).
+<a href=#73 id=73 data-nosnippet>73</a>//!
+<a href=#74 id=74 data-nosnippet>74</a>//! Within a group that stays, a waiter row stays only when a guest process
+<a href=#75 id=75 data-nosnippet>75</a>//! owns it. A group whose granted row goes, goes whole, as Linux drops a whole
+<a href=#76 id=76 data-nosnippet>76</a>//! group whose granted row's owner it cannot see.
+<a href=#77 id=77 data-nosnippet>77</a>//!
+<a href=#78 id=78 data-nosnippet>78</a>//! What still differs from Linux, named rather than hidden. Three cases can
+<a href=#79 id=79 data-nosnippet>79</a>//! show a host row (the first, and the two pid-identity cases right after
+<a href=#80 id=80 data-nosnippet>80</a>//! it); every other case hides a row of the guest's own, and none shows a
+<a href=#81 id=81 data-nosnippet>81</a>//! host row:
+<a href=#82 id=82 data-nosnippet>82</a>//! - a host OFD lock whose row is, field for field, an OFD lock a guest
+<a href=#83 id=83 data-nosnippet>83</a>//!   description holds now (in practice a shared read lock on the same range
+<a href=#84 id=84 data-nosnippet>84</a>//!   of the same file, or a file in another btrfs subvolume, whose rows print
+<a href=#85 id=85 data-nosnippet>85</a>//!   the one superblock device, with the same inode number, range and access)
+<a href=#86 id=86 data-nosnippet>86</a>//!   takes the place of the guest's row, at most once per distinct such lock:
+<a href=#87 id=87 data-nosnippet>87</a>//!   the row shown is the same either way;
+<a href=#88 id=88 data-nosnippet>88</a>//! - a host flock whose taker has exited, its description kept by another
+<a href=#89 id=89 data-nosnippet>89</a>//!   host process, prints the taker's freed pid under `--no-namespace`; when
+<a href=#90 id=90 data-nosnippet>90</a>//!   that number is later given to a guest process, the row is kept as the
+<a href=#91 id=91 data-nosnippet>91</a>//!   guest's. When the timing of that reuse is the host's, so is the row;
+<a href=#92 id=92 data-nosnippet>92</a>//! - on DBT, when a guest process is killed from outside and reaped
+<a href=#93 id=93 data-nosnippet>93</a>//!   automatically before Detcore retires its pid, a host process can take
+<a href=#94 id=94 data-nosnippet>94</a>//!   that number while it is still in Detcore's list of guest processes, and
+<a href=#95 id=95 data-nosnippet>95</a>//!   that host process's POSIX or flock rows are kept until it is retired;
+<a href=#96 id=96 data-nosnippet>96</a>//! - two guest descriptions holding identical shared read OFD locks (same
+<a href=#97 id=97 data-nosnippet>97</a>//!   file, range and access) show one row, where Linux shows two;
+<a href=#98 id=98 data-nosnippet>98</a>//! - the guest's own OFD waiter rows (`-&gt;` with owner -1) are not shown:
+<a href=#99 id=99 data-nosnippet>99</a>//!   fdinfo lists no waiters, so Detcore cannot tell them from a host's;
+<a href=#100 id=100 data-nosnippet>100</a>//! - an OFD lock the guest's descriptions held before Detcore read it is not
+<a href=#101 id=101 data-nosnippet>101</a>//!   shown until a call through a modelled descriptor of it: a description
+<a href=#102 id=102 data-nosnippet>102</a>//!   inherited already locked at the start; one received over `SCM_RIGHTS`
+<a href=#103 id=103 data-nosnippet>103</a>//!   where Detcore keeps no model of the receiver's descriptor (ptrace), once
+<a href=#104 id=104 data-nosnippet>104</a>//!   the sender's tables let go of it; one received through `recvmmsg`; one an
+<a href=#105 id=105 data-nosnippet>105</a>//!   in-guest backend's exec rebuilds under a new identity;
+<a href=#106 id=106 data-nosnippet>106</a>//! - a flock whose taker is not a guest process, while a guest description
+<a href=#107 id=107 data-nosnippet>107</a>//!   holds it: a taker that has exited (its descriptor was inherited), or one
+<a href=#108 id=108 data-nosnippet>108</a>//!   outside the guest from the start (a launcher that took the flock and
+<a href=#109 id=109 data-nosnippet>109</a>//!   handed the guest that description). Linux keeps the original taker's
+<a href=#110 id=110 data-nosnippet>110</a>//!   pid in the row, even after the guest itself takes the same mode on the
+<a href=#111 id=111 data-nosnippet>111</a>//!   description (a same-mode flock changes nothing), so the row names no
+<a href=#112 id=112 data-nosnippet>112</a>//!   guest process and is hidden, whatever call the guest makes. Inside a
+<a href=#113 id=113 data-nosnippet>113</a>//!   PID namespace Linux hides such a row itself (the taker is outside the
+<a href=#114 id=114 data-nosnippet>114</a>//!   namespace, or reaped), so the visible difference is only under
+<a href=#115 id=115 data-nosnippet>115</a>//!   `--no-namespace`; a zombie taker, which the guest's `/proc` still lists,
+<a href=#116 id=116 data-nosnippet>116</a>//!   stays shown;
+<a href=#117 id=117 data-nosnippet>117</a>//! - fork before lock, for OFD locks: a table that referenced a description
+<a href=#118 id=118 data-nosnippet>118</a>//!   before Detcore first read its locks (the parent of a child that then
+<a href=#119 id=119 data-nosnippet>119</a>//!   locks it) is not followed, so once the tables Detcore did see let go of
+<a href=#120 id=120 data-nosnippet>120</a>//!   it (the child exits), its lock is hidden though Linux keeps it. A flock
+<a href=#121 id=121 data-nosnippet>121</a>//!   taken that way is shown while its taker lives, by its pid; after the
+<a href=#122 id=122 data-nosnippet>122</a>//!   taker is reaped, Linux hides it too under a PID namespace;
+<a href=#123 id=123 data-nosnippet>123</a>//! - a process whose descriptor table the ledger cannot follow contributes no
+<a href=#124 id=124 data-nosnippet>124</a>//!   lock while it lives, nor does a process forked from it: one sharing its
+<a href=#125 id=125 data-nosnippet>125</a>//!   table with another process (`CLONE_FILES` without `CLONE_THREAD`, whose
+<a href=#126 id=126 data-nosnippet>126</a>//!   slots in-guest backends also count in separate per-process copies), and
+<a href=#127 id=127 data-nosnippet>127</a>//!   one with a thread that has a private table (`CLONE_THREAD` without
+<a href=#128 id=128 data-nosnippet>128</a>//!   `CLONE_FILES`), whose calls the ledger cannot tell from the leader's;
+<a href=#129 id=129 data-nosnippet>129</a>//! - once a lock or unlock goes through a descriptor whose description the
+<a href=#130 id=130 data-nosnippet>130</a>//!   ledger may know under another identity (one Detcore keeps no model of,
+<a href=#131 id=131 data-nosnippet>131</a>//!   such as a descriptor received over `SCM_RIGHTS` on ptrace, or one an
+<a href=#132 id=132 data-nosnippet>132</a>//!   in-guest backend registered on reception), no lock on that inode number,
+<a href=#133 id=133 data-nosnippet>133</a>//!   on any device, is shown again; if that descriptor's fdinfo cannot be
+<a href=#134 id=134 data-nosnippet>134</a>//!   read, no OFD or flock lock is shown again;
+<a href=#135 id=135 data-nosnippet>135</a>//! - a lease set by a process that was then reaped, under `--no-namespace`,
+<a href=#136 id=136 data-nosnippet>136</a>//!   is not shown; leases are kept by their owner's pid only;
+<a href=#137 id=137 data-nosnippet>137</a>//! - the guest's own `F_GETLK`, `F_OFD_GETLK` and conflicting lock calls still
+<a href=#138 id=138 data-nosnippet>138</a>//!   see host locks on files it shares with the host: this filter changes only
+<a href=#139 id=139 data-nosnippet>139</a>//!   what `/proc/locks` shows.
+<a href=#140 id=140 data-nosnippet>140</a>//!
+<a href=#141 id=141 data-nosnippet>141</a>//! Remaining ways a host row can still appear, until `/proc/locks` is decided
+<a href=#142 id=142 data-nosnippet>142</a>//! from the kernel's state at the snapshot: a description an in-guest
+<a href=#143 id=143 data-nosnippet>143</a>//! backend's exec rebuilds under a new identity, whose lock changes through
+<a href=#144 id=144 data-nosnippet>144</a>//! the new identity leave the old one's entry stale in a table forked before
+<a href=#145 id=145 data-nosnippet>145</a>//! the exec; and an OFD lock change the guest makes without Detcore seeing the
+<a href=#146 id=146 data-nosnippet>146</a>//! call at all. DBT refuses the one known case, a copied `vfork` child's
+<a href=#147 id=147 data-nosnippet>147</a>//! `F_OFD_SETLK`/`F_OFD_SETLKW`, at the call, and also refuses the `vfork`
+<a href=#148 id=148 data-nosnippet>148</a>//! up front while the parent's own descriptions may hold an OFD lock. A
+<a href=#149 id=149 data-nosnippet>149</a>//! flock change Detcore does not see (a copied child's native `LOCK_UN` or
+<a href=#150 id=150 data-nosnippet>150</a>//! `LOCK_NB`) can leave a description's recorded flock stale, but that record
+<a href=#151 id=151 data-nosnippet>151</a>//! admits no row: flock rows are kept by their taker's pid.
+<a href=#152 id=152 data-nosnippet>152</a>
+<a href=#153 id=153 data-nosnippet>153</a></span><span class="kw">use </span>std::collections::BTreeMap;
+<a href=#154 id=154 data-nosnippet>154</a><span class="kw">use </span>std::collections::BTreeSet;
+<a href=#155 id=155 data-nosnippet>155</a>
+<a href=#156 id=156 data-nosnippet>156</a><span class="kw">use </span>serde::Deserialize;
+<a href=#157 id=157 data-nosnippet>157</a><span class="kw">use </span>serde::Serialize;
+<a href=#158 id=158 data-nosnippet>158</a>
+<a href=#159 id=159 data-nosnippet>159</a><span class="kw">use </span><span class="kw">crate</span>::types::DetPid;
+<a href=#160 id=160 data-nosnippet>160</a><span class="kw">use </span><span class="kw">crate</span>::types::OpenFileId;
+<a href=#161 id=161 data-nosnippet>161</a>
+<a href=#162 id=162 data-nosnippet>162</a><span class="doccomment">/// One row of `/proc/locks`, split into fields:
+<a href=#163 id=163 data-nosnippet>163</a>///     `SEQ: [-&gt;] CLASS MODE RW PID MAJOR:MINOR:INODE START END`
+<a href=#164 id=164 data-nosnippet>164</a></span><span class="attr">#[derive(Clone)]
+<a href=#165 id=165 data-nosnippet>165</a></span><span class="kw">pub</span>(<span class="kw">super</span>) <span class="kw">struct </span>LockLine {
+<a href=#166 id=166 data-nosnippet>166</a>    <span class="kw">pub</span>(<span class="kw">super</span>) sequence: String,
+<a href=#167 id=167 data-nosnippet>167</a>    <span class="kw">pub</span>(<span class="kw">super</span>) waiter: bool,
+<a href=#168 id=168 data-nosnippet>168</a>    <span class="kw">pub</span>(<span class="kw">super</span>) fields: Vec&lt;String&gt;,
+<a href=#169 id=169 data-nosnippet>169</a>    <span class="kw">pub</span>(<span class="kw">super</span>) owner_index: usize,
+<a href=#170 id=170 data-nosnippet>170</a>    <span class="kw">pub</span>(<span class="kw">super</span>) object_index: usize,
+<a href=#171 id=171 data-nosnippet>171</a>}
+<a href=#172 id=172 data-nosnippet>172</a>
+<a href=#173 id=173 data-nosnippet>173</a><span class="doccomment">/// `line` as a `/proc/locks` row, or `None` when it is not one. The owner is
+<a href=#174 id=174 data-nosnippet>174</a>/// a signed integer and the object has three `:`-separated parts.
+<a href=#175 id=175 data-nosnippet>175</a></span><span class="kw">pub</span>(<span class="kw">super</span>) <span class="kw">fn </span>parse_line(line: <span class="kw-2">&amp;</span>str) -&gt; <span class="prelude-ty">Option</span>&lt;LockLine&gt; {
+<a href=#176 id=176 data-nosnippet>176</a>    <span class="kw">let </span>fields = line
+<a href=#177 id=177 data-nosnippet>177</a>        .split_whitespace()
+<a href=#178 id=178 data-nosnippet>178</a>        .map(str::to_owned)
+<a href=#179 id=179 data-nosnippet>179</a>        .collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;();
+<a href=#180 id=180 data-nosnippet>180</a>    <span class="kw">let </span>waiter = fields.get(<span class="number">1</span>).is_some_and(|field| field == <span class="string">"-&gt;"</span>);
+<a href=#181 id=181 data-nosnippet>181</a>    <span class="kw">let </span>details = usize::from(waiter) + <span class="number">1</span>;
+<a href=#182 id=182 data-nosnippet>182</a>    <span class="kw">let </span>owner_index = details + <span class="number">3</span>;
+<a href=#183 id=183 data-nosnippet>183</a>    <span class="kw">let </span>object_index = details + <span class="number">4</span>;
+<a href=#184 id=184 data-nosnippet>184</a>    <span class="kw">let </span>sequence = fields
+<a href=#185 id=185 data-nosnippet>185</a>        .first()
+<a href=#186 id=186 data-nosnippet>186</a>        .and_then(|field| field.strip_suffix(<span class="string">':'</span>))
+<a href=#187 id=187 data-nosnippet>187</a>        .filter(|field| !field.is_empty() &amp;&amp; field.bytes().all(|byte| byte.is_ascii_digit()))<span class="question-mark">?
+<a href=#188 id=188 data-nosnippet>188</a>        </span>.to_owned();
+<a href=#189 id=189 data-nosnippet>189</a>    <span class="kw">if </span>fields.len() != details + <span class="number">7
+<a href=#190 id=190 data-nosnippet>190</a>        </span>|| fields[owner_index].parse::&lt;i64&gt;().is_err()
+<a href=#191 id=191 data-nosnippet>191</a>        || fields[object_index].split(<span class="string">':'</span>).count() != <span class="number">3
+<a href=#192 id=192 data-nosnippet>192</a>    </span>{
+<a href=#193 id=193 data-nosnippet>193</a>        <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#194 id=194 data-nosnippet>194</a>    }
+<a href=#195 id=195 data-nosnippet>195</a>    <span class="prelude-val">Some</span>(LockLine {
+<a href=#196 id=196 data-nosnippet>196</a>        sequence,
+<a href=#197 id=197 data-nosnippet>197</a>        waiter,
+<a href=#198 id=198 data-nosnippet>198</a>        fields,
+<a href=#199 id=199 data-nosnippet>199</a>        owner_index,
+<a href=#200 id=200 data-nosnippet>200</a>        object_index,
+<a href=#201 id=201 data-nosnippet>201</a>    })
+<a href=#202 id=202 data-nosnippet>202</a>}
+<a href=#203 id=203 data-nosnippet>203</a>
+<a href=#204 id=204 data-nosnippet>204</a><span class="doccomment">/// One granted lock as `/proc/locks` and fdinfo spell it, its owner aside:
+<a href=#205 id=205 data-nosnippet>205</a>/// class (`OFDLCK`, `FLOCK`, `POSIX`, ...), mode (`ADVISORY`), access
+<a href=#206 id=206 data-nosnippet>206</a>/// (`READ`, `WRITE`), object (`MAJOR:MINOR:INODE`, hexadecimal device numbers
+<a href=#207 id=207 data-nosnippet>207</a>/// and a decimal inode, `%02x:%02x:%lu`) and range.
+<a href=#208 id=208 data-nosnippet>208</a></span><span class="attr">#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+<a href=#209 id=209 data-nosnippet>209</a></span><span class="kw">pub struct </span>HeldLock {
+<a href=#210 id=210 data-nosnippet>210</a>    <span class="doccomment">/// The lock's class.
+<a href=#211 id=211 data-nosnippet>211</a>    </span><span class="kw">pub </span>class: String,
+<a href=#212 id=212 data-nosnippet>212</a>    <span class="doccomment">/// The lock's mode.
+<a href=#213 id=213 data-nosnippet>213</a>    </span><span class="kw">pub </span>mode: String,
+<a href=#214 id=214 data-nosnippet>214</a>    <span class="doccomment">/// The lock's access.
+<a href=#215 id=215 data-nosnippet>215</a>    </span><span class="kw">pub </span>access: String,
+<a href=#216 id=216 data-nosnippet>216</a>    <span class="doccomment">/// The locked object, as the kernel prints it.
+<a href=#217 id=217 data-nosnippet>217</a>    </span><span class="kw">pub </span>object: String,
+<a href=#218 id=218 data-nosnippet>218</a>    <span class="doccomment">/// The range's first byte.
+<a href=#219 id=219 data-nosnippet>219</a>    </span><span class="kw">pub </span>start: String,
+<a href=#220 id=220 data-nosnippet>220</a>    <span class="doccomment">/// The range's last byte, or `EOF`.
+<a href=#221 id=221 data-nosnippet>221</a>    </span><span class="kw">pub </span>end: String,
+<a href=#222 id=222 data-nosnippet>222</a>}
+<a href=#223 id=223 data-nosnippet>223</a>
+<a href=#224 id=224 data-nosnippet>224</a><span class="kw">impl </span>HeldLock {
+<a href=#225 id=225 data-nosnippet>225</a>    <span class="kw">fn </span>from_line(row: <span class="kw-2">&amp;</span>LockLine) -&gt; <span class="self">Self </span>{
+<a href=#226 id=226 data-nosnippet>226</a>        <span class="kw">let </span>first = usize::from(row.waiter) + <span class="number">1</span>;
+<a href=#227 id=227 data-nosnippet>227</a>        <span class="kw">let </span>field = |index: usize| row.fields[index].clone();
+<a href=#228 id=228 data-nosnippet>228</a>        <span class="self">Self </span>{
+<a href=#229 id=229 data-nosnippet>229</a>            class: field(first),
+<a href=#230 id=230 data-nosnippet>230</a>            mode: field(first + <span class="number">1</span>),
+<a href=#231 id=231 data-nosnippet>231</a>            access: field(first + <span class="number">2</span>),
+<a href=#232 id=232 data-nosnippet>232</a>            object: field(row.object_index),
+<a href=#233 id=233 data-nosnippet>233</a>            start: field(row.object_index + <span class="number">1</span>),
+<a href=#234 id=234 data-nosnippet>234</a>            end: field(row.object_index + <span class="number">2</span>),
+<a href=#235 id=235 data-nosnippet>235</a>        }
+<a href=#236 id=236 data-nosnippet>236</a>    }
+<a href=#237 id=237 data-nosnippet>237</a>
+<a href=#238 id=238 data-nosnippet>238</a>    <span class="doccomment">/// Whether the object is on device `00:00`: the temporary KVM exemption
+<a href=#239 id=239 data-nosnippet>239</a>    /// (see the module comment), removed when package K slice K8 replaces
+<a href=#240 id=240 data-nosnippet>240</a>    /// KVM's local `/proc/locks`. Linux never prints that device for a
+<a href=#241 id=241 data-nosnippet>241</a>    /// lockable object.
+<a href=#242 id=242 data-nosnippet>242</a>    </span><span class="kw">fn </span>on_null_device(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool {
+<a href=#243 id=243 data-nosnippet>243</a>        <span class="kw">let </span><span class="kw-2">mut </span>parts = <span class="self">self</span>.object.split(<span class="string">':'</span>);
+<a href=#244 id=244 data-nosnippet>244</a>        <span class="kw">let </span>number = |part: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt;| part.and_then(|part| u32::from_str_radix(part, <span class="number">16</span>).ok());
+<a href=#245 id=245 data-nosnippet>245</a>        number(parts.next()) == <span class="prelude-val">Some</span>(<span class="number">0</span>) &amp;&amp; number(parts.next()) == <span class="prelude-val">Some</span>(<span class="number">0</span>)
+<a href=#246 id=246 data-nosnippet>246</a>    }
+<a href=#247 id=247 data-nosnippet>247</a>
+<a href=#248 id=248 data-nosnippet>248</a>    <span class="doccomment">/// Whether Linux ties this lock to an open file description rather than
+<a href=#249 id=249 data-nosnippet>249</a>    /// to a task: an OFD lock or a flock.
+<a href=#250 id=250 data-nosnippet>250</a>    </span><span class="kw">fn </span>belongs_to_a_description(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool {
+<a href=#251 id=251 data-nosnippet>251</a>        <span class="self">self</span>.class == <span class="string">"OFDLCK" </span>|| <span class="self">self</span>.is_flock()
+<a href=#252 id=252 data-nosnippet>252</a>    }
+<a href=#253 id=253 data-nosnippet>253</a>
+<a href=#254 id=254 data-nosnippet>254</a>    <span class="doccomment">/// Whether this is a flock, which Linux prints with its taker's pid.
+<a href=#255 id=255 data-nosnippet>255</a>    </span><span class="kw">fn </span>is_flock(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool {
+<a href=#256 id=256 data-nosnippet>256</a>        <span class="self">self</span>.class == <span class="string">"FLOCK"
+<a href=#257 id=257 data-nosnippet>257</a>    </span>}
+<a href=#258 id=258 data-nosnippet>258</a>
+<a href=#259 id=259 data-nosnippet>259</a>    <span class="doccomment">/// Whether a row of this lock is kept by matching it, field for field,
+<a href=#260 id=260 data-nosnippet>260</a>    /// against a lock a guest description holds: an OFD lock only, whose row
+<a href=#261 id=261 data-nosnippet>261</a>    /// has no owner to decide by. A flock row is kept only by its taker's pid
+<a href=#262 id=262 data-nosnippet>262</a>    /// (see the module comment).
+<a href=#263 id=263 data-nosnippet>263</a>    </span><span class="kw">fn </span>kept_by_field_match(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; bool {
+<a href=#264 id=264 data-nosnippet>264</a>        <span class="self">self</span>.belongs_to_a_description() &amp;&amp; !<span class="self">self</span>.is_flock()
+<a href=#265 id=265 data-nosnippet>265</a>    }
+<a href=#266 id=266 data-nosnippet>266</a>}
+<a href=#267 id=267 data-nosnippet>267</a>
+<a href=#268 id=268 data-nosnippet>268</a><span class="doccomment">/// The fields of one `/proc/locks` row that decide whether the guest owns it.
+<a href=#269 id=269 data-nosnippet>269</a></span><span class="attr">#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+<a href=#270 id=270 data-nosnippet>270</a></span><span class="kw">pub struct </span>LockRowFacts {
+<a href=#271 id=271 data-nosnippet>271</a>    <span class="doccomment">/// The group's sequence number, which a granted lock and its waiters share.
+<a href=#272 id=272 data-nosnippet>272</a>    </span><span class="kw">pub </span>sequence: String,
+<a href=#273 id=273 data-nosnippet>273</a>    <span class="doccomment">/// Whether this is a waiter (`-&gt;`) row.
+<a href=#274 id=274 data-nosnippet>274</a>    </span><span class="kw">pub </span>waiter: bool,
+<a href=#275 id=275 data-nosnippet>275</a>    <span class="doccomment">/// The owner field: a pid, `-1` for an OFD lock, `0` for a task the
+<a href=#276 id=276 data-nosnippet>276</a>    /// reader's PID namespace cannot see, or a remote lock's own value.
+<a href=#277 id=277 data-nosnippet>277</a>    </span><span class="kw">pub </span>owner: i64,
+<a href=#278 id=278 data-nosnippet>278</a>    <span class="doccomment">/// The lock, its owner aside.
+<a href=#279 id=279 data-nosnippet>279</a>    </span><span class="kw">pub </span>lock: HeldLock,
+<a href=#280 id=280 data-nosnippet>280</a>}
+<a href=#281 id=281 data-nosnippet>281</a>
+<a href=#282 id=282 data-nosnippet>282</a><span class="doccomment">/// The facts of every row of `contents`, in row order, or `None` when any row
+<a href=#283 id=283 data-nosnippet>283</a>/// is not a `/proc/locks` row (the sanitizer then refuses the whole snapshot).
+<a href=#284 id=284 data-nosnippet>284</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>lock_rows(contents: <span class="kw-2">&amp;</span>[u8]) -&gt; <span class="prelude-ty">Option</span>&lt;Vec&lt;LockRowFacts&gt;&gt; {
+<a href=#285 id=285 data-nosnippet>285</a>    <span class="kw">let </span>text = std::str::from_utf8(contents).ok()<span class="question-mark">?</span>;
+<a href=#286 id=286 data-nosnippet>286</a>    text.lines()
+<a href=#287 id=287 data-nosnippet>287</a>        .map(|line| {
+<a href=#288 id=288 data-nosnippet>288</a>            <span class="kw">let </span>row = parse_line(line)<span class="question-mark">?</span>;
+<a href=#289 id=289 data-nosnippet>289</a>            <span class="prelude-val">Some</span>(LockRowFacts {
+<a href=#290 id=290 data-nosnippet>290</a>                owner: row.fields[row.owner_index].parse().ok()<span class="question-mark">?</span>,
+<a href=#291 id=291 data-nosnippet>291</a>                lock: HeldLock::from_line(<span class="kw-2">&amp;</span>row),
+<a href=#292 id=292 data-nosnippet>292</a>                sequence: row.sequence,
+<a href=#293 id=293 data-nosnippet>293</a>                waiter: row.waiter,
+<a href=#294 id=294 data-nosnippet>294</a>            })
+<a href=#295 id=295 data-nosnippet>295</a>        })
+<a href=#296 id=296 data-nosnippet>296</a>        .collect()
+<a href=#297 id=297 data-nosnippet>297</a>}
+<a href=#298 id=298 data-nosnippet>298</a>
+<a href=#299 id=299 data-nosnippet>299</a><span class="doccomment">/// The OFD and flock locks a description holds, from its
+<a href=#300 id=300 data-nosnippet>300</a>/// `/proc/&lt;pid&gt;/fdinfo/&lt;fd&gt;` text: its `lock:` lines, which the kernel spells
+<a href=#301 id=301 data-nosnippet>301</a>/// as `/proc/locks` rows. Lines of other classes (a POSIX lock this process
+<a href=#302 id=302 data-nosnippet>302</a>/// took on the same file) and lines that do not parse are left out.
+<a href=#303 id=303 data-nosnippet>303</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>held_locks_in_fdinfo(contents: <span class="kw-2">&amp;</span>[u8]) -&gt; Vec&lt;HeldLock&gt; {
+<a href=#304 id=304 data-nosnippet>304</a>    <span class="kw">let </span>text = String::from_utf8_lossy(contents);
+<a href=#305 id=305 data-nosnippet>305</a>    text.lines()
+<a href=#306 id=306 data-nosnippet>306</a>        .filter_map(|line| line.strip_prefix(<span class="string">"lock:"</span>))
+<a href=#307 id=307 data-nosnippet>307</a>        .filter_map(|row| parse_line(row.trim()))
+<a href=#308 id=308 data-nosnippet>308</a>        .filter(|row| !row.waiter)
+<a href=#309 id=309 data-nosnippet>309</a>        .map(|row| HeldLock::from_line(<span class="kw-2">&amp;</span>row))
+<a href=#310 id=310 data-nosnippet>310</a>        .filter(HeldLock::belongs_to_a_description)
+<a href=#311 id=311 data-nosnippet>311</a>        .collect()
+<a href=#312 id=312 data-nosnippet>312</a>}
+<a href=#313 id=313 data-nosnippet>313</a>
+<a href=#314 id=314 data-nosnippet>314</a><span class="doccomment">/// Which of `rows` the guest owns (see the module comment). `held` is every
+<a href=#315 id=315 data-nosnippet>315</a>/// lock a guest description some guest table references holds; each distinct
+<a href=#316 id=316 data-nosnippet>316</a>/// lock admits at most one row, so a lock listed by two descriptions the
+<a href=#317 id=317 data-nosnippet>317</a>/// ledger cannot tell are one (an in-guest backend's receiver registers a
+<a href=#318 id=318 data-nosnippet>318</a>/// description it received under an identity of its own) admits no host row
+<a href=#319 id=319 data-nosnippet>319</a>/// beside the guest's. `guest_process` answers for a positive owner.
+<a href=#320 id=320 data-nosnippet>320</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>guest_lock_rows(
+<a href=#321 id=321 data-nosnippet>321</a>    rows: <span class="kw-2">&amp;</span>[LockRowFacts],
+<a href=#322 id=322 data-nosnippet>322</a>    <span class="kw-2">mut </span>guest_process: <span class="kw">impl </span>FnMut(i64) -&gt; bool,
+<a href=#323 id=323 data-nosnippet>323</a>    held: <span class="kw-2">&amp;</span>[HeldLock],
+<a href=#324 id=324 data-nosnippet>324</a>) -&gt; Vec&lt;bool&gt; {
+<a href=#325 id=325 data-nosnippet>325</a>    <span class="kw">let </span><span class="kw-2">mut </span>unclaimed: BTreeMap&lt;<span class="kw-2">&amp;</span>HeldLock, usize&gt; = BTreeMap::new();
+<a href=#326 id=326 data-nosnippet>326</a>    <span class="kw">for </span>lock <span class="kw">in </span>held {
+<a href=#327 id=327 data-nosnippet>327</a>        unclaimed.insert(lock, <span class="number">1</span>);
+<a href=#328 id=328 data-nosnippet>328</a>    }
+<a href=#329 id=329 data-nosnippet>329</a>    <span class="comment">// A granted row a guest process owns is the guest's whatever it matches,
+<a href=#330 id=330 data-nosnippet>330</a>    // and it claims its match first, so that a row another owner holds with
+<a href=#331 id=331 data-nosnippet>331</a>    // the same fields cannot claim it too. Only an OFD lock is kept by field
+<a href=#332 id=332 data-nosnippet>332</a>    // match, and an OFD row has no owner, so in practice this claims nothing;
+<a href=#333 id=333 data-nosnippet>333</a>    // it keeps the rule whole should another field-matched class appear.
+<a href=#334 id=334 data-nosnippet>334</a>    </span><span class="kw">let </span>owned = rows
+<a href=#335 id=335 data-nosnippet>335</a>        .iter()
+<a href=#336 id=336 data-nosnippet>336</a>        .map(|row| !row.waiter &amp;&amp; row.owner &gt; <span class="number">0 </span>&amp;&amp; guest_process(row.owner))
+<a href=#337 id=337 data-nosnippet>337</a>        .collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;();
+<a href=#338 id=338 data-nosnippet>338</a>    <span class="kw">for </span>(row, owned) <span class="kw">in </span>rows.iter().zip(<span class="kw-2">&amp;</span>owned) {
+<a href=#339 id=339 data-nosnippet>339</a>        <span class="kw">if </span><span class="kw-2">*</span>owned
+<a href=#340 id=340 data-nosnippet>340</a>            &amp;&amp; row.lock.kept_by_field_match()
+<a href=#341 id=341 data-nosnippet>341</a>            &amp;&amp; <span class="kw">let </span><span class="prelude-val">Some</span>(count) = unclaimed.get_mut(<span class="kw-2">&amp;</span>row.lock)
+<a href=#342 id=342 data-nosnippet>342</a>        {
+<a href=#343 id=343 data-nosnippet>343</a>            <span class="kw-2">*</span>count = count.saturating_sub(<span class="number">1</span>);
+<a href=#344 id=344 data-nosnippet>344</a>        }
+<a href=#345 id=345 data-nosnippet>345</a>    }
+<a href=#346 id=346 data-nosnippet>346</a>    <span class="kw">let </span><span class="kw-2">mut </span>kept_groups = BTreeSet::new();
+<a href=#347 id=347 data-nosnippet>347</a>    <span class="kw">let </span><span class="kw-2">mut </span>keep = <span class="macro">vec!</span>[<span class="bool-val">false</span>; rows.len()];
+<a href=#348 id=348 data-nosnippet>348</a>    <span class="kw">for </span>(index, row) <span class="kw">in </span>rows.iter().enumerate() {
+<a href=#349 id=349 data-nosnippet>349</a>        <span class="kw">if </span>row.waiter {
+<a href=#350 id=350 data-nosnippet>350</a>            <span class="kw">continue</span>;
+<a href=#351 id=351 data-nosnippet>351</a>        }
+<a href=#352 id=352 data-nosnippet>352</a>        <span class="comment">// TEMPORARY EXEMPTION for KVM's backend-local `/proc/locks`
+<a href=#353 id=353 data-nosnippet>353</a>        // (`HeldLock::on_null_device`); removed with package K slice K8.
+<a href=#354 id=354 data-nosnippet>354</a>        </span>keep[index] = row.lock.on_null_device()
+<a href=#355 id=355 data-nosnippet>355</a>            || owned[index]
+<a href=#356 id=356 data-nosnippet>356</a>            || (row.lock.kept_by_field_match()
+<a href=#357 id=357 data-nosnippet>357</a>                &amp;&amp; unclaimed.get_mut(<span class="kw-2">&amp;</span>row.lock).is_some_and(|count| {
+<a href=#358 id=358 data-nosnippet>358</a>                    <span class="kw">let </span>available = <span class="kw-2">*</span>count &gt; <span class="number">0</span>;
+<a href=#359 id=359 data-nosnippet>359</a>                    <span class="kw-2">*</span>count = count.saturating_sub(<span class="number">1</span>);
+<a href=#360 id=360 data-nosnippet>360</a>                    available
+<a href=#361 id=361 data-nosnippet>361</a>                }));
+<a href=#362 id=362 data-nosnippet>362</a>        <span class="kw">if </span>keep[index] {
+<a href=#363 id=363 data-nosnippet>363</a>            kept_groups.insert(row.sequence.as_str());
+<a href=#364 id=364 data-nosnippet>364</a>        }
+<a href=#365 id=365 data-nosnippet>365</a>    }
+<a href=#366 id=366 data-nosnippet>366</a>    <span class="kw">for </span>(index, row) <span class="kw">in </span>rows.iter().enumerate() {
+<a href=#367 id=367 data-nosnippet>367</a>        <span class="kw">if </span>row.waiter {
+<a href=#368 id=368 data-nosnippet>368</a>            keep[index] = kept_groups.contains(row.sequence.as_str())
+<a href=#369 id=369 data-nosnippet>369</a>                &amp;&amp; (row.lock.on_null_device() || (row.owner &gt; <span class="number">0 </span>&amp;&amp; guest_process(row.owner)));
+<a href=#370 id=370 data-nosnippet>370</a>        }
+<a href=#371 id=371 data-nosnippet>371</a>    }
+<a href=#372 id=372 data-nosnippet>372</a>    keep
+<a href=#373 id=373 data-nosnippet>373</a>}
+<a href=#374 id=374 data-nosnippet>374</a>
+<a href=#375 id=375 data-nosnippet>375</a><span class="doccomment">/// A descriptor table, as the ledger names it: a token it hands out, not the
+<a href=#376 id=376 data-nosnippet>376</a>/// kernel's `files_struct` or Detcore's local `FilesId`, so that nothing in
+<a href=#377 id=377 data-nosnippet>377</a>/// the ledger depends on a guest process computing a table's identity the
+<a href=#378 id=378 data-nosnippet>378</a>/// same way the global state does.
+<a href=#379 id=379 data-nosnippet>379</a></span><span class="kw">type </span>Table = u64;
+<a href=#380 id=380 data-nosnippet>380</a>
+<a href=#381 id=381 data-nosnippet>381</a><span class="doccomment">/// Which guest descriptor tables reference each open file description whose
+<a href=#382 id=382 data-nosnippet>382</a>/// OFD or flock locks Detcore has read, and which locks it holds
+<a href=#383 id=383 data-nosnippet>383</a>/// (`GlobalState::lock_ledger`).
+<a href=#384 id=384 data-nosnippet>384</a>///
+<a href=#385 id=385 data-nosnippet>385</a>/// A description's locks count for `/proc/locks` only while some table
+<a href=#386 id=386 data-nosnippet>386</a>/// references it. Every change comes from the guest's own turns:
+<a href=#387 id=387 data-nosnippet>387</a>/// - a call through a descriptor that reads its fdinfo
+<a href=#388 id=388 data-nosnippet>388</a>///   ([`LockLedger::note_locks`]) records the description's locks and how many
+<a href=#389 id=389 data-nosnippet>389</a>///   slots of the caller's table name it;
+<a href=#390 id=390 data-nosnippet>390</a>/// - a close, `dup2`/`dup3` over a slot or `close_range` of a description
+<a href=#391 id=391 data-nosnippet>391</a>///   Detcore has read the locks of reports how many slots of that table still
+<a href=#392 id=392 data-nosnippet>392</a>///   name it ([`LockLedger::release`]);
+<a href=#393 id=393 data-nosnippet>393</a>/// - a fork copies the parent's table, and `CLONE_FILES` shares it
+<a href=#394 id=394 data-nosnippet>394</a>///   ([`LockLedger::fork`]);
+<a href=#395 id=395 data-nosnippet>395</a>/// - a successful exec leaves the process's table ([`LockLedger::exec`]) and
+<a href=#396 id=396 data-nosnippet>396</a>///   then names the descriptions that survived it ([`LockLedger::exec_kept`]);
+<a href=#397 id=397 data-nosnippet>397</a>///   a failed exec changes nothing;
+<a href=#398 id=398 data-nosnippet>398</a>/// - a table any of whose processes has exited, reaped or not, is dropped
+<a href=#399 id=399 data-nosnippet>399</a>///   ([`LockLedger::prune`]).
+<a href=#400 id=400 data-nosnippet>400</a>///
+<a href=#401 id=401 data-nosnippet>401</a>/// A description whose fdinfo could not be read is followed the same way,
+<a href=#402 id=402 data-nosnippet>402</a>/// with its locks unknown ([`LockLedger::note_unknown`]) until a later read
+<a href=#403 id=403 data-nosnippet>403</a>/// succeeds or no table references it.
+<a href=#404 id=404 data-nosnippet>404</a>///
+<a href=#405 id=405 data-nosnippet>405</a>/// Where it cannot follow a reference exactly, the ledger forgets it, which
+<a href=#406 id=406 data-nosnippet>406</a>/// hides the guest's own row; it never keeps one it has not seen, which would
+<a href=#407 id=407 data-nosnippet>407</a>/// show a host's.
+<a href=#408 id=408 data-nosnippet>408</a></span><span class="attr">#[derive(Debug, Default)]
+<a href=#409 id=409 data-nosnippet>409</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">struct </span>LockLedger {
+<a href=#410 id=410 data-nosnippet>410</a>    next_table: Table,
+<a href=#411 id=411 data-nosnippet>411</a>    process_table: BTreeMap&lt;DetPid, Table&gt;,
+<a href=#412 id=412 data-nosnippet>412</a>    owners: BTreeMap&lt;Table, BTreeSet&lt;DetPid&gt;&gt;,
+<a href=#413 id=413 data-nosnippet>413</a>    references: BTreeMap&lt;OpenFileId, BTreeMap&lt;Table, u32&gt;&gt;,
+<a href=#414 id=414 data-nosnippet>414</a>    locks: BTreeMap&lt;OpenFileId, DescriptionLocks&gt;,
+<a href=#415 id=415 data-nosnippet>415</a>    after_exec: BTreeMap&lt;DetPid, BTreeMap&lt;OpenFileId, DescriptionLocks&gt;&gt;,
+<a href=#416 id=416 data-nosnippet>416</a>    <span class="doccomment">/// Processes whose descriptor table the ledger cannot follow
+<a href=#417 id=417 data-nosnippet>417</a>    /// ([`LockLedger::mark_opaque`]): a description any of their tables
+<a href=#418 id=418 data-nosnippet>418</a>    /// references contributes no lock.
+<a href=#419 id=419 data-nosnippet>419</a>    </span>opaque: BTreeSet&lt;DetPid&gt;,
+<a href=#420 id=420 data-nosnippet>420</a>    <span class="doccomment">/// Inode numbers, as `/proc/locks` prints them, on which no lock counts
+<a href=#421 id=421 data-nosnippet>421</a>    /// ([`LockLedger::alias_inode`]).
+<a href=#422 id=422 data-nosnippet>422</a>    </span>aliased_inodes: BTreeSet&lt;String&gt;,
+<a href=#423 id=423 data-nosnippet>423</a>    <span class="doccomment">/// No lock counts at all ([`LockLedger::alias_inode`] without an inode).
+<a href=#424 id=424 data-nosnippet>424</a>    </span>aliased_everything: bool,
+<a href=#425 id=425 data-nosnippet>425</a>    <span class="doccomment">/// Why no `/proc/locks` snapshot can be decided for the rest of the run
+<a href=#426 id=426 data-nosnippet>426</a>    /// ([`LockLedger::refuse`]): set once, never cleared.
+<a href=#427 id=427 data-nosnippet>427</a>    </span>refused: <span class="prelude-ty">Option</span>&lt;String&gt;,
+<a href=#428 id=428 data-nosnippet>428</a>}
+<a href=#429 id=429 data-nosnippet>429</a>
+<a href=#430 id=430 data-nosnippet>430</a><span class="doccomment">/// The locks a description holds, as its fdinfo last showed them, or why
+<a href=#431 id=431 data-nosnippet>431</a>/// that fdinfo could not be read.
+<a href=#432 id=432 data-nosnippet>432</a></span><span class="kw">type </span>DescriptionLocks = <span class="prelude-ty">Result</span>&lt;Vec&lt;HeldLock&gt;, String&gt;;
+<a href=#433 id=433 data-nosnippet>433</a>
+<a href=#434 id=434 data-nosnippet>434</a><span class="kw">impl </span>LockLedger {
+<a href=#435 id=435 data-nosnippet>435</a>    <span class="doccomment">/// The table `process` uses, made for it if it has none yet.
+<a href=#436 id=436 data-nosnippet>436</a>    </span><span class="kw">fn </span>table_of(<span class="kw-2">&amp;mut </span><span class="self">self</span>, process: DetPid) -&gt; Table {
+<a href=#437 id=437 data-nosnippet>437</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(table) = <span class="self">self</span>.process_table.get(<span class="kw-2">&amp;</span>process) {
+<a href=#438 id=438 data-nosnippet>438</a>            <span class="kw">return </span><span class="kw-2">*</span>table;
+<a href=#439 id=439 data-nosnippet>439</a>        }
+<a href=#440 id=440 data-nosnippet>440</a>        <span class="kw">let </span>table = <span class="self">self</span>.next_table;
+<a href=#441 id=441 data-nosnippet>441</a>        <span class="self">self</span>.next_table += <span class="number">1</span>;
+<a href=#442 id=442 data-nosnippet>442</a>        <span class="self">self</span>.process_table.insert(process, table);
+<a href=#443 id=443 data-nosnippet>443</a>        <span class="self">self</span>.owners.entry(table).or_default().insert(process);
+<a href=#444 id=444 data-nosnippet>444</a>        table
+<a href=#445 id=445 data-nosnippet>445</a>    }
+<a href=#446 id=446 data-nosnippet>446</a>
+<a href=#447 id=447 data-nosnippet>447</a>    <span class="kw">fn </span>set_references(<span class="kw-2">&amp;mut </span><span class="self">self</span>, open_file: OpenFileId, table: Table, slots: u32) {
+<a href=#448 id=448 data-nosnippet>448</a>        <span class="kw">let </span>references = <span class="self">self</span>.references.entry(open_file).or_default();
+<a href=#449 id=449 data-nosnippet>449</a>        <span class="kw">if </span>slots == <span class="number">0 </span>{
+<a href=#450 id=450 data-nosnippet>450</a>            references.remove(<span class="kw-2">&amp;</span>table);
+<a href=#451 id=451 data-nosnippet>451</a>        } <span class="kw">else </span>{
+<a href=#452 id=452 data-nosnippet>452</a>            references.insert(table, slots);
+<a href=#453 id=453 data-nosnippet>453</a>        }
+<a href=#454 id=454 data-nosnippet>454</a>        <span class="kw">if </span>references.is_empty() {
+<a href=#455 id=455 data-nosnippet>455</a>            <span class="self">self</span>.references.remove(<span class="kw-2">&amp;</span>open_file);
+<a href=#456 id=456 data-nosnippet>456</a>            <span class="self">self</span>.locks.remove(<span class="kw-2">&amp;</span>open_file);
+<a href=#457 id=457 data-nosnippet>457</a>        }
+<a href=#458 id=458 data-nosnippet>458</a>    }
+<a href=#459 id=459 data-nosnippet>459</a>
+<a href=#460 id=460 data-nosnippet>460</a>    <span class="doccomment">/// `open_file` holds `locks` (perhaps none), as its fdinfo showed them
+<a href=#461 id=461 data-nosnippet>461</a>    /// after a call through a descriptor of `process`'s table, `slots` of
+<a href=#462 id=462 data-nosnippet>462</a>    /// which name it.
+<a href=#463 id=463 data-nosnippet>463</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>note_locks(
+<a href=#464 id=464 data-nosnippet>464</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#465 id=465 data-nosnippet>465</a>        process: DetPid,
+<a href=#466 id=466 data-nosnippet>466</a>        open_file: OpenFileId,
+<a href=#467 id=467 data-nosnippet>467</a>        locks: Vec&lt;HeldLock&gt;,
+<a href=#468 id=468 data-nosnippet>468</a>        slots: u32,
+<a href=#469 id=469 data-nosnippet>469</a>    ) {
+<a href=#470 id=470 data-nosnippet>470</a>        <span class="self">self</span>.note(process, open_file, <span class="prelude-val">Ok</span>(locks), slots);
+<a href=#471 id=471 data-nosnippet>471</a>    }
+<a href=#472 id=472 data-nosnippet>472</a>
+<a href=#473 id=473 data-nosnippet>473</a>    <span class="doccomment">/// As [`Self::note_locks`], for a description whose fdinfo could not be
+<a href=#474 id=474 data-nosnippet>474</a>    /// read, for `reason`: which locks it holds is unknown.
+<a href=#475 id=475 data-nosnippet>475</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>note_unknown(
+<a href=#476 id=476 data-nosnippet>476</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#477 id=477 data-nosnippet>477</a>        process: DetPid,
+<a href=#478 id=478 data-nosnippet>478</a>        open_file: OpenFileId,
+<a href=#479 id=479 data-nosnippet>479</a>        reason: String,
+<a href=#480 id=480 data-nosnippet>480</a>        slots: u32,
+<a href=#481 id=481 data-nosnippet>481</a>    ) {
+<a href=#482 id=482 data-nosnippet>482</a>        <span class="self">self</span>.note(process, open_file, <span class="prelude-val">Err</span>(reason), slots);
+<a href=#483 id=483 data-nosnippet>483</a>    }
+<a href=#484 id=484 data-nosnippet>484</a>
+<a href=#485 id=485 data-nosnippet>485</a>    <span class="kw">fn </span>note(
+<a href=#486 id=486 data-nosnippet>486</a>        <span class="kw-2">&amp;mut </span><span class="self">self</span>,
+<a href=#487 id=487 data-nosnippet>487</a>        process: DetPid,
+<a href=#488 id=488 data-nosnippet>488</a>        open_file: OpenFileId,
+<a href=#489 id=489 data-nosnippet>489</a>        locks: DescriptionLocks,
+<a href=#490 id=490 data-nosnippet>490</a>        slots: u32,
+<a href=#491 id=491 data-nosnippet>491</a>    ) {
+<a href=#492 id=492 data-nosnippet>492</a>        <span class="kw">let </span>table = <span class="self">self</span>.table_of(process);
+<a href=#493 id=493 data-nosnippet>493</a>        <span class="self">self</span>.set_references(open_file, table, slots);
+<a href=#494 id=494 data-nosnippet>494</a>        <span class="kw">if </span><span class="self">self</span>.references.contains_key(<span class="kw-2">&amp;</span>open_file) {
+<a href=#495 id=495 data-nosnippet>495</a>            <span class="self">self</span>.locks.insert(open_file, locks);
+<a href=#496 id=496 data-nosnippet>496</a>        }
+<a href=#497 id=497 data-nosnippet>497</a>    }
+<a href=#498 id=498 data-nosnippet>498</a>
+<a href=#499 id=499 data-nosnippet>499</a>    <span class="doccomment">/// `remaining` slots of `process`'s table name `open_file` after a close
+<a href=#500 id=500 data-nosnippet>500</a>    /// or replacement there. A table the ledger has no record of has no
+<a href=#501 id=501 data-nosnippet>501</a>    /// reference to drop.
+<a href=#502 id=502 data-nosnippet>502</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>release(<span class="kw-2">&amp;mut </span><span class="self">self</span>, process: DetPid, open_file: OpenFileId, remaining: u32) {
+<a href=#503 id=503 data-nosnippet>503</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(table) = <span class="self">self</span>.process_table.get(<span class="kw-2">&amp;</span>process).copied() {
+<a href=#504 id=504 data-nosnippet>504</a>            <span class="self">self</span>.set_references(open_file, table, remaining);
+<a href=#505 id=505 data-nosnippet>505</a>        }
+<a href=#506 id=506 data-nosnippet>506</a>    }
+<a href=#507 id=507 data-nosnippet>507</a>
+<a href=#508 id=508 data-nosnippet>508</a>    <span class="doccomment">/// A new process `child` starts with a copy of `parent`'s table, or,
+<a href=#509 id=509 data-nosnippet>509</a>    /// with `shares_table` (`CLONE_FILES`), with that table itself. Whatever an
+<a href=#510 id=510 data-nosnippet>510</a>    /// earlier process with the same number left is not the child's.
+<a href=#511 id=511 data-nosnippet>511</a>    ///
+<a href=#512 id=512 data-nosnippet>512</a>    /// A table two processes share is one the ledger cannot follow (in-guest
+<a href=#513 id=513 data-nosnippet>513</a>    /// backends count its slots in separate per-process copies), so both
+<a href=#514 id=514 data-nosnippet>514</a>    /// become opaque, as does a child of an opaque process, whose copy may
+<a href=#515 id=515 data-nosnippet>515</a>    /// hold the wrong slots ([`Self::mark_opaque`]).
+<a href=#516 id=516 data-nosnippet>516</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>fork(<span class="kw-2">&amp;mut </span><span class="self">self</span>, parent: DetPid, child: DetPid, shares_table: bool) {
+<a href=#517 id=517 data-nosnippet>517</a>        <span class="self">self</span>.forget_process(child);
+<a href=#518 id=518 data-nosnippet>518</a>        <span class="self">self</span>.after_exec.remove(<span class="kw-2">&amp;</span>child);
+<a href=#519 id=519 data-nosnippet>519</a>        <span class="self">self</span>.opaque.remove(<span class="kw-2">&amp;</span>child);
+<a href=#520 id=520 data-nosnippet>520</a>        <span class="kw">if </span>shares_table {
+<a href=#521 id=521 data-nosnippet>521</a>            <span class="self">self</span>.opaque.insert(parent);
+<a href=#522 id=522 data-nosnippet>522</a>        }
+<a href=#523 id=523 data-nosnippet>523</a>        <span class="kw">if </span>shares_table || <span class="self">self</span>.opaque.contains(<span class="kw-2">&amp;</span>parent) {
+<a href=#524 id=524 data-nosnippet>524</a>            <span class="self">self</span>.opaque.insert(child);
+<a href=#525 id=525 data-nosnippet>525</a>        }
+<a href=#526 id=526 data-nosnippet>526</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(table) = <span class="self">self</span>.process_table.get(<span class="kw-2">&amp;</span>parent).copied() <span class="kw">else </span>{
+<a href=#527 id=527 data-nosnippet>527</a>            <span class="kw">return</span>;
+<a href=#528 id=528 data-nosnippet>528</a>        };
+<a href=#529 id=529 data-nosnippet>529</a>        <span class="kw">if </span>shares_table {
+<a href=#530 id=530 data-nosnippet>530</a>            <span class="self">self</span>.owners.entry(table).or_default().insert(child);
+<a href=#531 id=531 data-nosnippet>531</a>            <span class="self">self</span>.process_table.insert(child, table);
+<a href=#532 id=532 data-nosnippet>532</a>            <span class="kw">return</span>;
+<a href=#533 id=533 data-nosnippet>533</a>        }
+<a href=#534 id=534 data-nosnippet>534</a>        <span class="kw">let </span>copy = <span class="self">self</span>.table_of(child);
+<a href=#535 id=535 data-nosnippet>535</a>        <span class="kw">for </span>references <span class="kw">in </span><span class="self">self</span>.references.values_mut() {
+<a href=#536 id=536 data-nosnippet>536</a>            <span class="kw">if let </span><span class="prelude-val">Some</span>(slots) = references.get(<span class="kw-2">&amp;</span>table).copied() {
+<a href=#537 id=537 data-nosnippet>537</a>                references.insert(copy, slots);
+<a href=#538 id=538 data-nosnippet>538</a>            }
+<a href=#539 id=539 data-nosnippet>539</a>        }
+<a href=#540 id=540 data-nosnippet>540</a>    }
+<a href=#541 id=541 data-nosnippet>541</a>
+<a href=#542 id=542 data-nosnippet>542</a>    <span class="doccomment">/// `process` completed an exec: it leaves its table (Linux unshares it
+<a href=#543 id=543 data-nosnippet>543</a>    /// and closes its close-on-exec slots), and only the descriptions
+<a href=#544 id=544 data-nosnippet>544</a>    /// [`Self::exec_kept`] names next remain referenced through it.
+<a href=#545 id=545 data-nosnippet>545</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>exec(<span class="kw-2">&amp;mut </span><span class="self">self</span>, process: DetPid) {
+<a href=#546 id=546 data-nosnippet>546</a>        <span class="kw">let </span><span class="kw-2">mut </span>kept = BTreeMap::new();
+<a href=#547 id=547 data-nosnippet>547</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(table) = <span class="self">self</span>.process_table.get(<span class="kw-2">&amp;</span>process).copied() {
+<a href=#548 id=548 data-nosnippet>548</a>            <span class="kw">for </span>(open_file, references) <span class="kw">in </span><span class="kw-2">&amp;</span><span class="self">self</span>.references {
+<a href=#549 id=549 data-nosnippet>549</a>                <span class="kw">if </span>references.contains_key(<span class="kw-2">&amp;</span>table)
+<a href=#550 id=550 data-nosnippet>550</a>                    &amp;&amp; <span class="kw">let </span><span class="prelude-val">Some</span>(locks) = <span class="self">self</span>.locks.get(open_file)
+<a href=#551 id=551 data-nosnippet>551</a>                {
+<a href=#552 id=552 data-nosnippet>552</a>                    kept.insert(<span class="kw-2">*</span>open_file, locks.clone());
+<a href=#553 id=553 data-nosnippet>553</a>                }
+<a href=#554 id=554 data-nosnippet>554</a>            }
+<a href=#555 id=555 data-nosnippet>555</a>        }
+<a href=#556 id=556 data-nosnippet>556</a>        <span class="self">self</span>.forget_process(process);
+<a href=#557 id=557 data-nosnippet>557</a>        <span class="self">self</span>.after_exec.insert(process, kept);
+<a href=#558 id=558 data-nosnippet>558</a>    }
+<a href=#559 id=559 data-nosnippet>559</a>
+<a href=#560 id=560 data-nosnippet>560</a>    <span class="doccomment">/// The descriptions whose locks Detcore read that `process`'s table names
+<a href=#561 id=561 data-nosnippet>561</a>    /// after the exec [`Self::exec`] recorded, with their slot counts.
+<a href=#562 id=562 data-nosnippet>562</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>exec_kept(<span class="kw-2">&amp;mut </span><span class="self">self</span>, process: DetPid, surviving: <span class="kw-2">&amp;</span>[(OpenFileId, u32)]) {
+<a href=#563 id=563 data-nosnippet>563</a>        <span class="kw">let </span>kept = <span class="self">self</span>.after_exec.remove(<span class="kw-2">&amp;</span>process).unwrap_or_default();
+<a href=#564 id=564 data-nosnippet>564</a>        <span class="kw">for </span>(open_file, slots) <span class="kw">in </span>surviving {
+<a href=#565 id=565 data-nosnippet>565</a>            <span class="kw">let </span><span class="prelude-val">Some</span>(locks) = <span class="self">self
+<a href=#566 id=566 data-nosnippet>566</a>                </span>.locks
+<a href=#567 id=567 data-nosnippet>567</a>                .get(open_file)
+<a href=#568 id=568 data-nosnippet>568</a>                .or_else(|| kept.get(open_file))
+<a href=#569 id=569 data-nosnippet>569</a>                .cloned()
+<a href=#570 id=570 data-nosnippet>570</a>            <span class="kw">else </span>{
+<a href=#571 id=571 data-nosnippet>571</a>                <span class="kw">continue</span>;
+<a href=#572 id=572 data-nosnippet>572</a>            };
+<a href=#573 id=573 data-nosnippet>573</a>            <span class="kw">let </span>table = <span class="self">self</span>.table_of(process);
+<a href=#574 id=574 data-nosnippet>574</a>            <span class="self">self</span>.set_references(<span class="kw-2">*</span>open_file, table, <span class="kw-2">*</span>slots);
+<a href=#575 id=575 data-nosnippet>575</a>            <span class="kw">if </span><span class="self">self</span>.references.contains_key(open_file) {
+<a href=#576 id=576 data-nosnippet>576</a>                <span class="self">self</span>.locks.insert(<span class="kw-2">*</span>open_file, locks);
+<a href=#577 id=577 data-nosnippet>577</a>            }
+<a href=#578 id=578 data-nosnippet>578</a>        }
+<a href=#579 id=579 data-nosnippet>579</a>    }
+<a href=#580 id=580 data-nosnippet>580</a>
+<a href=#581 id=581 data-nosnippet>581</a>    <span class="doccomment">/// Drop every table one of whose processes is no longer `alive` (has
+<a href=#582 id=582 data-nosnippet>582</a>    /// exited, reaped or not; a process blocked in a call is alive). A
+<a href=#583 id=583 data-nosnippet>583</a>    /// table processes share (`CLONE_FILES`) goes when the first of them
+<a href=#584 id=584 data-nosnippet>584</a>    /// exits, which can only hide a row the survivors still hold.
+<a href=#585 id=585 data-nosnippet>585</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>prune(<span class="kw-2">&amp;mut </span><span class="self">self</span>, <span class="kw-2">mut </span>alive: <span class="kw">impl </span>FnMut(DetPid) -&gt; bool) {
+<a href=#586 id=586 data-nosnippet>586</a>        <span class="self">self</span>.opaque.retain(|process| alive(<span class="kw-2">*</span>process));
+<a href=#587 id=587 data-nosnippet>587</a>        <span class="kw">let </span>gone = <span class="self">self
+<a href=#588 id=588 data-nosnippet>588</a>            </span>.owners
+<a href=#589 id=589 data-nosnippet>589</a>            .iter()
+<a href=#590 id=590 data-nosnippet>590</a>            .filter(|(<span class="kw">_</span>, owners)| owners.iter().any(|process| !alive(<span class="kw-2">*</span>process)))
+<a href=#591 id=591 data-nosnippet>591</a>            .map(|(table, <span class="kw">_</span>)| <span class="kw-2">*</span>table)
+<a href=#592 id=592 data-nosnippet>592</a>            .collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;();
+<a href=#593 id=593 data-nosnippet>593</a>        <span class="kw">for </span>table <span class="kw">in </span>gone {
+<a href=#594 id=594 data-nosnippet>594</a>            <span class="self">self</span>.drop_table(table);
+<a href=#595 id=595 data-nosnippet>595</a>        }
+<a href=#596 id=596 data-nosnippet>596</a>        <span class="kw">let </span>processes = <span class="self">self</span>.after_exec.keys().copied().collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;();
+<a href=#597 id=597 data-nosnippet>597</a>        <span class="kw">for </span>process <span class="kw">in </span>processes {
+<a href=#598 id=598 data-nosnippet>598</a>            <span class="kw">if </span>!alive(process) {
+<a href=#599 id=599 data-nosnippet>599</a>                <span class="self">self</span>.after_exec.remove(<span class="kw-2">&amp;</span>process);
+<a href=#600 id=600 data-nosnippet>600</a>            }
+<a href=#601 id=601 data-nosnippet>601</a>        }
+<a href=#602 id=602 data-nosnippet>602</a>    }
+<a href=#603 id=603 data-nosnippet>603</a>
+<a href=#604 id=604 data-nosnippet>604</a>    <span class="kw">fn </span>forget_process(<span class="kw-2">&amp;mut </span><span class="self">self</span>, process: DetPid) {
+<a href=#605 id=605 data-nosnippet>605</a>        <span class="kw">let </span><span class="prelude-val">Some</span>(table) = <span class="self">self</span>.process_table.remove(<span class="kw-2">&amp;</span>process) <span class="kw">else </span>{
+<a href=#606 id=606 data-nosnippet>606</a>            <span class="kw">return</span>;
+<a href=#607 id=607 data-nosnippet>607</a>        };
+<a href=#608 id=608 data-nosnippet>608</a>        <span class="kw">let </span>empty = <span class="self">self</span>.owners.get_mut(<span class="kw-2">&amp;</span>table).is_none_or(|owners| {
+<a href=#609 id=609 data-nosnippet>609</a>            owners.remove(<span class="kw-2">&amp;</span>process);
+<a href=#610 id=610 data-nosnippet>610</a>            owners.is_empty()
+<a href=#611 id=611 data-nosnippet>611</a>        });
+<a href=#612 id=612 data-nosnippet>612</a>        <span class="kw">if </span>empty {
+<a href=#613 id=613 data-nosnippet>613</a>            <span class="self">self</span>.drop_table(table);
+<a href=#614 id=614 data-nosnippet>614</a>        }
+<a href=#615 id=615 data-nosnippet>615</a>    }
+<a href=#616 id=616 data-nosnippet>616</a>
+<a href=#617 id=617 data-nosnippet>617</a>    <span class="kw">fn </span>drop_table(<span class="kw-2">&amp;mut </span><span class="self">self</span>, table: Table) {
+<a href=#618 id=618 data-nosnippet>618</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(owners) = <span class="self">self</span>.owners.remove(<span class="kw-2">&amp;</span>table) {
+<a href=#619 id=619 data-nosnippet>619</a>            <span class="kw">for </span>process <span class="kw">in </span>owners {
+<a href=#620 id=620 data-nosnippet>620</a>                <span class="kw">if </span><span class="self">self</span>.process_table.get(<span class="kw-2">&amp;</span>process) == <span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span>table) {
+<a href=#621 id=621 data-nosnippet>621</a>                    <span class="self">self</span>.process_table.remove(<span class="kw-2">&amp;</span>process);
+<a href=#622 id=622 data-nosnippet>622</a>                }
+<a href=#623 id=623 data-nosnippet>623</a>            }
+<a href=#624 id=624 data-nosnippet>624</a>        }
+<a href=#625 id=625 data-nosnippet>625</a>        <span class="kw">let </span>open_files = <span class="self">self</span>.references.keys().copied().collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;();
+<a href=#626 id=626 data-nosnippet>626</a>        <span class="kw">for </span>open_file <span class="kw">in </span>open_files {
+<a href=#627 id=627 data-nosnippet>627</a>            <span class="self">self</span>.set_references(open_file, table, <span class="number">0</span>);
+<a href=#628 id=628 data-nosnippet>628</a>        }
+<a href=#629 id=629 data-nosnippet>629</a>    }
+<a href=#630 id=630 data-nosnippet>630</a>
+<a href=#631 id=631 data-nosnippet>631</a>    <span class="doccomment">/// `process`'s descriptor table cannot be followed (one of its threads
+<a href=#632 id=632 data-nosnippet>632</a>    /// has a private table, `CLONE_THREAD` without `CLONE_FILES`, whose calls
+<a href=#633 id=633 data-nosnippet>633</a>    /// the ledger counts as the leader's): while it lives, a description any
+<a href=#634 id=634 data-nosnippet>634</a>    /// of its tables references contributes no lock, which can hide the
+<a href=#635 id=635 data-nosnippet>635</a>    /// guest's row but never admits a host's.
+<a href=#636 id=636 data-nosnippet>636</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>mark_opaque(<span class="kw-2">&amp;mut </span><span class="self">self</span>, process: DetPid) {
+<a href=#637 id=637 data-nosnippet>637</a>        <span class="self">self</span>.opaque.insert(process);
+<a href=#638 id=638 data-nosnippet>638</a>    }
+<a href=#639 id=639 data-nosnippet>639</a>
+<a href=#640 id=640 data-nosnippet>640</a>    <span class="doccomment">/// A lock or unlock went through a descriptor whose description the
+<a href=#641 id=641 data-nosnippet>641</a>    /// ledger may know under another identity, on the file with inode number
+<a href=#642 id=642 data-nosnippet>642</a>    /// `inode` (from that descriptor's fdinfo), so another identity's entry
+<a href=#643 id=643 data-nosnippet>643</a>    /// may be stale: from now on no lock on that inode number counts, on any
+<a href=#644 id=644 data-nosnippet>644</a>    /// device. Without an inode (its fdinfo could not be read), no lock
+<a href=#645 id=645 data-nosnippet>645</a>    /// counts at all.
+<a href=#646 id=646 data-nosnippet>646</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>alias_inode(<span class="kw-2">&amp;mut </span><span class="self">self</span>, inode: <span class="prelude-ty">Option</span>&lt;String&gt;) {
+<a href=#647 id=647 data-nosnippet>647</a>        <span class="kw">match </span>inode {
+<a href=#648 id=648 data-nosnippet>648</a>            <span class="prelude-val">Some</span>(inode) =&gt; {
+<a href=#649 id=649 data-nosnippet>649</a>                <span class="self">self</span>.aliased_inodes.insert(inode);
+<a href=#650 id=650 data-nosnippet>650</a>            }
+<a href=#651 id=651 data-nosnippet>651</a>            <span class="prelude-val">None </span>=&gt; <span class="self">self</span>.aliased_everything = <span class="bool-val">true</span>,
+<a href=#652 id=652 data-nosnippet>652</a>        }
+<a href=#653 id=653 data-nosnippet>653</a>    }
+<a href=#654 id=654 data-nosnippet>654</a>
+<a href=#655 id=655 data-nosnippet>655</a>    <span class="doccomment">/// Every lock a description some table references holds, repeats
+<a href=#656 id=656 data-nosnippet>656</a>    /// included. A description whose locks are unknown contributes none, nor
+<a href=#657 id=657 data-nosnippet>657</a>    /// does one an opaque process's table references, nor a lock on an
+<a href=#658 id=658 data-nosnippet>658</a>    /// aliased inode.
+<a href=#659 id=659 data-nosnippet>659</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>held(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; Vec&lt;HeldLock&gt; {
+<a href=#660 id=660 data-nosnippet>660</a>        <span class="kw">if </span><span class="self">self</span>.aliased_everything {
+<a href=#661 id=661 data-nosnippet>661</a>            <span class="kw">return </span>Vec::new();
+<a href=#662 id=662 data-nosnippet>662</a>        }
+<a href=#663 id=663 data-nosnippet>663</a>        <span class="kw">let </span>opaque_tables = <span class="self">self
+<a href=#664 id=664 data-nosnippet>664</a>            </span>.owners
+<a href=#665 id=665 data-nosnippet>665</a>            .iter()
+<a href=#666 id=666 data-nosnippet>666</a>            .filter(|(<span class="kw">_</span>, owners)| owners.iter().any(|process| <span class="self">self</span>.opaque.contains(process)))
+<a href=#667 id=667 data-nosnippet>667</a>            .map(|(table, <span class="kw">_</span>)| <span class="kw-2">*</span>table)
+<a href=#668 id=668 data-nosnippet>668</a>            .collect::&lt;BTreeSet&lt;<span class="kw">_</span>&gt;&gt;();
+<a href=#669 id=669 data-nosnippet>669</a>        <span class="self">self</span>.locks
+<a href=#670 id=670 data-nosnippet>670</a>            .iter()
+<a href=#671 id=671 data-nosnippet>671</a>            .filter(|(open_file, <span class="kw">_</span>)| {
+<a href=#672 id=672 data-nosnippet>672</a>                <span class="self">self</span>.references.get(<span class="kw-2">*</span>open_file).is_some_and(|references| {
+<a href=#673 id=673 data-nosnippet>673</a>                    references
+<a href=#674 id=674 data-nosnippet>674</a>                        .keys()
+<a href=#675 id=675 data-nosnippet>675</a>                        .all(|table| !opaque_tables.contains(table))
+<a href=#676 id=676 data-nosnippet>676</a>                })
+<a href=#677 id=677 data-nosnippet>677</a>            })
+<a href=#678 id=678 data-nosnippet>678</a>            .filter_map(|(<span class="kw">_</span>, locks)| locks.as_ref().ok())
+<a href=#679 id=679 data-nosnippet>679</a>            .flat_map(|locks| locks.iter().cloned())
+<a href=#680 id=680 data-nosnippet>680</a>            .filter(|lock| {
+<a href=#681 id=681 data-nosnippet>681</a>                <span class="kw">let </span>inode = lock.object.rsplit(<span class="string">':'</span>).next().unwrap_or_default();
+<a href=#682 id=682 data-nosnippet>682</a>                !<span class="self">self</span>.aliased_inodes.contains(inode)
+<a href=#683 id=683 data-nosnippet>683</a>            })
+<a href=#684 id=684 data-nosnippet>684</a>            .collect()
+<a href=#685 id=685 data-nosnippet>685</a>    }
+<a href=#686 id=686 data-nosnippet>686</a>
+<a href=#687 id=687 data-nosnippet>687</a>    <span class="doccomment">/// A lock or unlock went through a descriptor whose description the
+<a href=#688 id=688 data-nosnippet>688</a>    /// ledger may know under another identity, and its fdinfo could not be
+<a href=#689 id=689 data-nosnippet>689</a>    /// read for `reason` (ambient or resource state): which identities it
+<a href=#690 id=690 data-nosnippet>690</a>    /// changed is unknown, so every later `/proc/locks` snapshot is refused,
+<a href=#691 id=691 data-nosnippet>691</a>    /// by the first such reason. Hiding every lock instead would make the
+<a href=#692 id=692 data-nosnippet>692</a>    /// guest's rows depend on a transient host state.
+<a href=#693 id=693 data-nosnippet>693</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>refuse(<span class="kw-2">&amp;mut </span><span class="self">self</span>, reason: String) {
+<a href=#694 id=694 data-nosnippet>694</a>        <span class="self">self</span>.refused.get_or_insert(reason);
+<a href=#695 id=695 data-nosnippet>695</a>    }
+<a href=#696 id=696 data-nosnippet>696</a>
+<a href=#697 id=697 data-nosnippet>697</a>    <span class="doccomment">/// Why a `/proc/locks` snapshot taken now cannot be decided: the run's
+<a href=#698 id=698 data-nosnippet>698</a>    /// refusal ([`Self::refuse`]), or else the reason the locks of a
+<a href=#699 id=699 data-nosnippet>699</a>    /// description some table references are unknown, for the first such
+<a href=#700 id=700 data-nosnippet>700</a>    /// description, whose rows a snapshot cannot tell from a host's. `None`
+<a href=#701 id=701 data-nosnippet>701</a>    /// when every referenced description's locks are known.
+<a href=#702 id=702 data-nosnippet>702</a>    </span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>unknown(<span class="kw-2">&amp;</span><span class="self">self</span>) -&gt; <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>str&gt; {
+<a href=#703 id=703 data-nosnippet>703</a>        <span class="kw">if let </span><span class="prelude-val">Some</span>(reason) = <span class="kw-2">&amp;</span><span class="self">self</span>.refused {
+<a href=#704 id=704 data-nosnippet>704</a>            <span class="kw">return </span><span class="prelude-val">Some</span>(reason);
+<a href=#705 id=705 data-nosnippet>705</a>        }
+<a href=#706 id=706 data-nosnippet>706</a>        <span class="self">self</span>.locks
+<a href=#707 id=707 data-nosnippet>707</a>            .iter()
+<a href=#708 id=708 data-nosnippet>708</a>            .filter(|(open_file, <span class="kw">_</span>)| <span class="self">self</span>.references.contains_key(open_file))
+<a href=#709 id=709 data-nosnippet>709</a>            .find_map(|(<span class="kw">_</span>, locks)| locks.as_ref().err())
+<a href=#710 id=710 data-nosnippet>710</a>            .map(String::as_str)
+<a href=#711 id=711 data-nosnippet>711</a>    }
+<a href=#712 id=712 data-nosnippet>712</a>}
+<a href=#713 id=713 data-nosnippet>713</a>
+<a href=#714 id=714 data-nosnippet>714</a><span class="doccomment">/// The smallest buffer a kernel `seq_file` such as `/proc/locks` fills in one
+<a href=#715 id=715 data-nosnippet>715</a>/// `read`: one page (`seq_read_iter` starts with `PAGE_SIZE` and only grows).
+<a href=#716 id=716 data-nosnippet>716</a>/// 4096 is the smallest page Linux uses, so a larger one only makes the rule
+<a href=#717 id=717 data-nosnippet>717</a>/// in [`locks_capture_without_repeats`] keep more.
+<a href=#718 id=718 data-nosnippet>718</a></span><span class="kw">const </span>SEQ_FILE_MIN_BUFFER_BYTES: usize = <span class="number">4096</span>;
+<a href=#719 id=719 data-nosnippet>719</a>
+<a href=#720 id=720 data-nosnippet>720</a><span class="doccomment">/// A `/proc/locks` capture, `contents`, without the records that the kernel
+<a href=#721 id=721 data-nosnippet>721</a>/// printed again after the end of its list, given the lengths of the
+<a href=#722 id=722 data-nosnippet>722</a>/// capture's nonzero reads, in order, each through a buffer of `chunk` bytes,
+<a href=#723 id=723 data-nosnippet>723</a>/// and the read that returned 0 after them.
+<a href=#724 id=724 data-nosnippet>724</a>///
+<a href=#725 id=725 data-nosnippet>725</a>/// After the first read whose length shows it reached the end of the
+<a href=#726 id=726 data-nosnippet>726</a>/// kernel's list in its own walk, each record a later read returned is
+<a href=#727 id=727 data-nosnippet>727</a>/// dropped, its waiter lines with it, when its granted lock is a lock already
+<a href=#728 id=728 data-nosnippet>728</a>/// in the capture ([`lock_identity`]). Every other record is kept, where it
+<a href=#729 id=729 data-nosnippet>729</a>/// came. When no read passes the length test, or the bytes after it are not
+<a href=#730 id=730 data-nosnippet>730</a>/// whole records, the capture is returned as the kernel gave it.
+<a href=#731 id=731 data-nosnippet>731</a>///
+<a href=#732 id=732 data-nosnippet>732</a>/// Why repeats appear. Each `read` of a `seq_file` restarts the walk of the
+<a href=#733 id=733 data-nosnippet>733</a>/// kernel's global lock list at the index where the last one stopped
+<a href=#734 id=734 data-nosnippet>734</a>/// (`start(m-&gt;index)`). The list is a list per CPU, walked in CPU order, each
+<a href=#735 id=735 data-nosnippet>735</a>/// newest lock first. When the host adds locks ahead of that index between
+<a href=#736 id=736 data-nosnippet>736</a>/// two reads, the restarted walk prints the records that slid past it: the
+<a href=#737 id=737 data-nosnippet>737</a>/// last records the previous read returned, renumbered, and any added lock
+<a href=#738 id=738 data-nosnippet>738</a>/// that landed between the index and them (a lock added on the same CPU as
+<a href=#739 id=739 data-nosnippet>739</a>/// the guest's, ahead of the guest's own rows). The added locks are real and
+<a href=#740 id=740 data-nosnippet>740</a>/// stay; the repeats go. A repeat need not be byte for byte the record it
+<a href=#741 id=741 data-nosnippet>741</a>/// repeats: between the reads the host can queue a waiter behind the lock or
+<a href=#742 id=742 data-nosnippet>742</a>/// give one up, a lease can start breaking, and a waiter's owner can leave
+<a href=#743 id=743 data-nosnippet>743</a>/// the reader's view. None of that moves the list's index, and it is still
+<a href=#744 id=744 data-nosnippet>744</a>/// the one lock, so a repeat is recognized by its granted lock alone, and
+<a href=#745 id=745 data-nosnippet>745</a>/// the earlier record, which one walk printed, is the one kept.
+<a href=#746 id=746 data-nosnippet>746</a>///
+<a href=#747 id=747 data-nosnippet>747</a>/// The length test. One read stops before the end of the list only when the
+<a href=#748 id=748 data-nosnippet>748</a>/// caller's buffer is full (it returns `chunk` bytes) or when the next record
+<a href=#749 id=749 data-nosnippet>749</a>/// does not fit in the kernel's buffer of at least
+<a href=#750 id=750 data-nosnippet>750</a>/// [`SEQ_FILE_MIN_BUFFER_BYTES`]. A record is a granted lock and every waiter
+<a href=#751 id=751 data-nosnippet>751</a>/// queued behind it, so it has no fixed bound; but that record is the first
+<a href=#752 id=752 data-nosnippet>752</a>/// thing the next read prints, so while the list stays still, the reads after
+<a href=#753 id=753 data-nosnippet>753</a>/// a read of `n &lt; chunk` bytes that stopped there return at least
+<a href=#754 id=754 data-nosnippet>754</a>/// `SEQ_FILE_MIN_BUFFER_BYTES - n` bytes.
+<a href=#755 id=755 data-nosnippet>755</a>///
+<a href=#756 id=756 data-nosnippet>756</a>/// Why the length test alone is not enough. The list does not stay still: the
+<a href=#757 id=757 data-nosnippet>757</a>/// record that stopped a read can lose its waiters or go between the reads,
+<a href=#758 id=758 data-nosnippet>758</a>/// and a removal ahead of the index moves the walk. The next read then
+<a href=#759 id=759 data-nosnippet>759</a>/// returns records nobody has read yet, few enough bytes to pass the length
+<a href=#760 id=760 data-nosnippet>760</a>/// test. So only repeats are dropped.
+<a href=#761 id=761 data-nosnippet>761</a>///
+<a href=#762 id=762 data-nosnippet>762</a>/// What this can still get wrong, named. A later record whose granted lock
+<a href=#763 id=763 data-nosnippet>763</a>/// prints the same identity as a lock already captured, and which is
+<a href=#764 id=764 data-nosnippet>764</a>/// genuinely another lock, is dropped, whenever the bytes after the end are
+<a href=#765 id=765 data-nosnippet>765</a>/// shorter than the length test allows: either the list changed between the
+<a href=#766 id=766 data-nosnippet>766</a>/// reads in a way the length test cannot see and the record was never read,
+<a href=#767 id=767 data-nosnippet>767</a>/// or the host added it. Identical identities of distinct locks exist
+<a href=#768 id=768 data-nosnippet>768</a>/// natively, per class:
+<a href=#769 id=769 data-nosnippet>769</a>/// - POSIX: one owner's locks on two files in two btrfs subvolumes with the
+<a href=#770 id=770 data-nosnippet>770</a>///   same inode number (every subvolume prints its one superblock device);
+<a href=#771 id=771 data-nosnippet>771</a>///   two descriptor tables of one thread group (identical shared locks);
+<a href=#772 id=772 data-nosnippet>772</a>/// - FLOCK: two descriptions under one pid holding identical shared flocks,
+<a href=#773 id=773 data-nosnippet>773</a>///   and the btrfs case;
+<a href=#774 id=774 data-nosnippet>774</a>/// - OFD: two descriptions holding identical shared ranges (the guest filter
+<a href=#775 id=775 data-nosnippet>775</a>///   already shows such a lock once), and the btrfs case;
+<a href=#776 id=776 data-nosnippet>776</a>/// - LEASE and DELEG: two descriptions under one pid holding identical
+<a href=#777 id=777 data-nosnippet>777</a>///   leases, and the btrfs case.
+<a href=#778 id=778 data-nosnippet>778</a>///
+<a href=#779 id=779 data-nosnippet>779</a>/// The snapshot then shows one of two identical rows. A record added by the
+<a href=#780 id=780 data-nosnippet>780</a>/// host that matches a guest lock is the host's, and the guest filter would
+<a href=#781 id=781 data-nosnippet>781</a>/// keep at most one row for it anyway. Content the kernel returns over
+<a href=#782 id=782 data-nosnippet>782</a>/// several reads stays exposed to the host's changes at every boundary before
+<a href=#783 id=783 data-nosnippet>783</a>/// the last, and duplicates are kept whenever no read passes the length test.
+<a href=#784 id=784 data-nosnippet>784</a>///
+<a href=#785 id=785 data-nosnippet>785</a>/// Matching only the records that could have slid past the index (the last
+<a href=#786 id=786 data-nosnippet>786</a>/// few of the capture) would narrow the residual, but it is not provably
+<a href=#787 id=787 data-nosnippet>787</a>/// enough: a removal between the reads can drop one of those records and let
+<a href=#788 id=788 data-nosnippet>788</a>/// an earlier one slide in, so the whole capture is searched.
+<a href=#789 id=789 data-nosnippet>789</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>locks_capture_without_repeats(
+<a href=#790 id=790 data-nosnippet>790</a>    contents: <span class="kw-2">&amp;</span>[u8],
+<a href=#791 id=791 data-nosnippet>791</a>    reads: <span class="kw-2">&amp;</span>[usize],
+<a href=#792 id=792 data-nosnippet>792</a>    chunk: usize,
+<a href=#793 id=793 data-nosnippet>793</a>) -&gt; Vec&lt;u8&gt; {
+<a href=#794 id=794 data-nosnippet>794</a>    <span class="kw">if </span>reads.iter().sum::&lt;usize&gt;() != contents.len() {
+<a href=#795 id=795 data-nosnippet>795</a>        <span class="kw">return </span>contents.to_vec();
+<a href=#796 id=796 data-nosnippet>796</a>    }
+<a href=#797 id=797 data-nosnippet>797</a>    <span class="kw">let </span><span class="kw-2">mut </span>later = contents.len();
+<a href=#798 id=798 data-nosnippet>798</a>    <span class="kw">let </span><span class="kw-2">mut </span>end = <span class="number">0</span>;
+<a href=#799 id=799 data-nosnippet>799</a>    <span class="kw">for </span><span class="kw-2">&amp;</span>read <span class="kw">in </span>reads {
+<a href=#800 id=800 data-nosnippet>800</a>        end += read;
+<a href=#801 id=801 data-nosnippet>801</a>        later -= read;
+<a href=#802 id=802 data-nosnippet>802</a>        <span class="kw">if </span>later &gt; <span class="number">0 </span>&amp;&amp; read &lt; chunk &amp;&amp; read + later &lt; SEQ_FILE_MIN_BUFFER_BYTES {
+<a href=#803 id=803 data-nosnippet>803</a>            <span class="kw">return </span>without_repeats(contents, end).unwrap_or_else(|| contents.to_vec());
+<a href=#804 id=804 data-nosnippet>804</a>        }
+<a href=#805 id=805 data-nosnippet>805</a>    }
+<a href=#806 id=806 data-nosnippet>806</a>    contents.to_vec()
+<a href=#807 id=807 data-nosnippet>807</a>}
+<a href=#808 id=808 data-nosnippet>808</a>
+<a href=#809 id=809 data-nosnippet>809</a><span class="doccomment">/// `contents` with each record past `end` dropped whose granted lock is one
+<a href=#810 id=810 data-nosnippet>810</a>/// an earlier record holds; `None` when the bytes are not whole records.
+<a href=#811 id=811 data-nosnippet>811</a></span><span class="kw">fn </span>without_repeats(contents: <span class="kw-2">&amp;</span>[u8], end: usize) -&gt; <span class="prelude-ty">Option</span>&lt;Vec&lt;u8&gt;&gt; {
+<a href=#812 id=812 data-nosnippet>812</a>    <span class="kw">let </span><span class="kw-2">mut </span>seen = lock_records(<span class="kw-2">&amp;</span>contents[..end])<span class="question-mark">?
+<a href=#813 id=813 data-nosnippet>813</a>        </span>.into_iter()
+<a href=#814 id=814 data-nosnippet>814</a>        .map(|(identity, <span class="kw">_</span>)| identity)
+<a href=#815 id=815 data-nosnippet>815</a>        .collect::&lt;BTreeSet&lt;<span class="kw">_</span>&gt;&gt;();
+<a href=#816 id=816 data-nosnippet>816</a>    <span class="kw">let </span><span class="kw-2">mut </span>out = contents[..end].to_vec();
+<a href=#817 id=817 data-nosnippet>817</a>    <span class="kw">for </span>(identity, bytes) <span class="kw">in </span>lock_records(<span class="kw-2">&amp;</span>contents[end..])<span class="question-mark">? </span>{
+<a href=#818 id=818 data-nosnippet>818</a>        <span class="kw">if </span>seen.insert(identity) {
+<a href=#819 id=819 data-nosnippet>819</a>            out.extend_from_slice(bytes.as_bytes());
+<a href=#820 id=820 data-nosnippet>820</a>        }
+<a href=#821 id=821 data-nosnippet>821</a>    }
+<a href=#822 id=822 data-nosnippet>822</a>    <span class="prelude-val">Some</span>(out)
+<a href=#823 id=823 data-nosnippet>823</a>}
+<a href=#824 id=824 data-nosnippet>824</a>
+<a href=#825 id=825 data-nosnippet>825</a><span class="doccomment">/// `contents` as whole `/proc/locks` records, each a granted lock's line and
+<a href=#826 id=826 data-nosnippet>826</a>/// the lines of the waiters queued behind it: the identity of the record's
+<a href=#827 id=827 data-nosnippet>827</a>/// granted lock ([`lock_identity`]) and the record's bytes. A waiter's line is
+<a href=#828 id=828 data-nosnippet>828</a>/// `SEQ: -&gt; ...`, indented between the colon and the arrow by its depth in the
+<a href=#829 id=829 data-nosnippet>829</a>/// waiter tree (`lock_get_status`). `None` when the bytes are not whole lines
+<a href=#830 id=830 data-nosnippet>830</a>/// that each begin with a sequence number, or begin with a waiter.
+<a href=#831 id=831 data-nosnippet>831</a></span><span class="kw">fn </span>lock_records(contents: <span class="kw-2">&amp;</span>[u8]) -&gt; <span class="prelude-ty">Option</span>&lt;Vec&lt;(Vec&lt;String&gt;, <span class="kw-2">&amp;</span>str)&gt;&gt; {
+<a href=#832 id=832 data-nosnippet>832</a>    <span class="kw">let </span>text = std::str::from_utf8(contents).ok()<span class="question-mark">?</span>;
+<a href=#833 id=833 data-nosnippet>833</a>    <span class="kw">if </span>!text.is_empty() &amp;&amp; !text.ends_with(<span class="string">'\n'</span>) {
+<a href=#834 id=834 data-nosnippet>834</a>        <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#835 id=835 data-nosnippet>835</a>    }
+<a href=#836 id=836 data-nosnippet>836</a>    <span class="kw">let </span><span class="kw-2">mut </span>records: Vec&lt;(Vec&lt;String&gt;, std::ops::Range&lt;usize&gt;)&gt; = Vec::new();
+<a href=#837 id=837 data-nosnippet>837</a>    <span class="kw">let </span><span class="kw-2">mut </span>offset = <span class="number">0</span>;
+<a href=#838 id=838 data-nosnippet>838</a>    <span class="kw">for </span>line <span class="kw">in </span>text.split_inclusive(<span class="string">'\n'</span>) {
+<a href=#839 id=839 data-nosnippet>839</a>        <span class="kw">let </span>(sequence, rest) = line.split_once(<span class="string">':'</span>)<span class="question-mark">?</span>;
+<a href=#840 id=840 data-nosnippet>840</a>        <span class="kw">if </span>sequence.is_empty() || !sequence.bytes().all(|byte| byte.is_ascii_digit()) {
+<a href=#841 id=841 data-nosnippet>841</a>            <span class="kw">return </span><span class="prelude-val">None</span>;
+<a href=#842 id=842 data-nosnippet>842</a>        }
+<a href=#843 id=843 data-nosnippet>843</a>        <span class="kw">let </span>span = offset..offset + line.len();
+<a href=#844 id=844 data-nosnippet>844</a>        offset = span.end;
+<a href=#845 id=845 data-nosnippet>845</a>        <span class="kw">if </span>rest.trim_start().starts_with(<span class="string">"-&gt;"</span>) {
+<a href=#846 id=846 data-nosnippet>846</a>            records.last_mut()<span class="question-mark">?</span>.<span class="number">1</span>.end = span.end;
+<a href=#847 id=847 data-nosnippet>847</a>        } <span class="kw">else </span>{
+<a href=#848 id=848 data-nosnippet>848</a>            records.push((lock_identity(rest), span));
+<a href=#849 id=849 data-nosnippet>849</a>        }
+<a href=#850 id=850 data-nosnippet>850</a>    }
+<a href=#851 id=851 data-nosnippet>851</a>    <span class="prelude-val">Some</span>(
+<a href=#852 id=852 data-nosnippet>852</a>        records
+<a href=#853 id=853 data-nosnippet>853</a>            .into_iter()
+<a href=#854 id=854 data-nosnippet>854</a>            .map(|(identity, bytes)| (identity, <span class="kw-2">&amp;</span>text[bytes]))
+<a href=#855 id=855 data-nosnippet>855</a>            .collect(),
+<a href=#856 id=856 data-nosnippet>856</a>    )
+<a href=#857 id=857 data-nosnippet>857</a>}
+<a href=#858 id=858 data-nosnippet>858</a>
+<a href=#859 id=859 data-nosnippet>859</a><span class="doccomment">/// The fields of a granted lock's `/proc/locks` line, its `SEQ:` removed,
+<a href=#860 id=860 data-nosnippet>860</a>/// that stay the same while it is the one lock: every field
+<a href=#861 id=861 data-nosnippet>861</a>/// (`CLASS MODE ACCESS PID MAJOR:MINOR:INODE START END`) for POSIX, OFD,
+<a href=#862 id=862 data-nosnippet>862</a>/// FLOCK and the rest; for a lease or delegation (`LEASE`/`DELEG`), all but
+<a href=#863 id=863 data-nosnippet>863</a>/// its state (`ACTIVE`, `BREAKING`, `BREAKER`) and its access, which a break
+<a href=#864 id=864 data-nosnippet>864</a>/// changes to the type it is breaking to (`target_leasetype`).
+<a href=#865 id=865 data-nosnippet>865</a></span><span class="kw">fn </span>lock_identity(line: <span class="kw-2">&amp;</span>str) -&gt; Vec&lt;String&gt; {
+<a href=#866 id=866 data-nosnippet>866</a>    <span class="kw">let </span><span class="kw-2">mut </span>fields = line
+<a href=#867 id=867 data-nosnippet>867</a>        .split_whitespace()
+<a href=#868 id=868 data-nosnippet>868</a>        .map(str::to_owned)
+<a href=#869 id=869 data-nosnippet>869</a>        .collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;();
+<a href=#870 id=870 data-nosnippet>870</a>    <span class="kw">if </span><span class="macro">matches!</span>(fields.first().map(String::as_str), <span class="prelude-val">Some</span>(<span class="string">"LEASE" </span>| <span class="string">"DELEG"</span>)) &amp;&amp; fields.len() &gt; <span class="number">3 </span>{
+<a href=#871 id=871 data-nosnippet>871</a>        fields.drain(<span class="number">1</span>..<span class="number">3</span>);
+<a href=#872 id=872 data-nosnippet>872</a>    }
+<a href=#873 id=873 data-nosnippet>873</a>    fields
+<a href=#874 id=874 data-nosnippet>874</a>}
+<a href=#875 id=875 data-nosnippet>875</a>
+<a href=#876 id=876 data-nosnippet>876</a><span class="doccomment">/// The rows of `contents` that `kept` keeps, in order. With no decision (a
+<a href=#877 id=877 data-nosnippet>877</a>/// snapshot whose rows do not parse, which the sanitizer refuses anyway, or a
+<a href=#878 id=878 data-nosnippet>878</a>/// caller that made none) every row is kept. A decision for a different
+<a href=#879 id=879 data-nosnippet>879</a>/// number of rows keeps none.
+<a href=#880 id=880 data-nosnippet>880</a></span><span class="kw">pub</span>(<span class="kw">crate</span>) <span class="kw">fn </span>keep_lock_rows(contents: <span class="kw-2">&amp;</span>[u8], kept: <span class="prelude-ty">Option</span>&lt;<span class="kw-2">&amp;</span>[bool]&gt;) -&gt; Vec&lt;u8&gt; {
+<a href=#881 id=881 data-nosnippet>881</a>    <span class="kw">let </span><span class="prelude-val">Some</span>(kept) = kept <span class="kw">else </span>{
+<a href=#882 id=882 data-nosnippet>882</a>        <span class="kw">return </span>contents.to_vec();
+<a href=#883 id=883 data-nosnippet>883</a>    };
+<a href=#884 id=884 data-nosnippet>884</a>    <span class="kw">let </span><span class="prelude-val">Ok</span>(text) = std::str::from_utf8(contents) <span class="kw">else </span>{
+<a href=#885 id=885 data-nosnippet>885</a>        <span class="kw">return </span>Vec::new();
+<a href=#886 id=886 data-nosnippet>886</a>    };
+<a href=#887 id=887 data-nosnippet>887</a>    <span class="kw">let </span>lines = text.lines().collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;();
+<a href=#888 id=888 data-nosnippet>888</a>    <span class="kw">if </span>lines.len() != kept.len() {
+<a href=#889 id=889 data-nosnippet>889</a>        <span class="kw">return </span>Vec::new();
+<a href=#890 id=890 data-nosnippet>890</a>    }
+<a href=#891 id=891 data-nosnippet>891</a>    <span class="kw">let </span><span class="kw-2">mut </span>out = Vec::new();
+<a href=#892 id=892 data-nosnippet>892</a>    <span class="kw">for </span>(line, keep) <span class="kw">in </span>lines.into_iter().zip(kept) {
+<a href=#893 id=893 data-nosnippet>893</a>        <span class="kw">if </span><span class="kw-2">*</span>keep {
+<a href=#894 id=894 data-nosnippet>894</a>            out.extend_from_slice(line.as_bytes());
+<a href=#895 id=895 data-nosnippet>895</a>            out.push(<span class="string">b'\n'</span>);
+<a href=#896 id=896 data-nosnippet>896</a>        }
+<a href=#897 id=897 data-nosnippet>897</a>    }
+<a href=#898 id=898 data-nosnippet>898</a>    <span class="kw">if </span>!text.ends_with(<span class="string">'\n'</span>) &amp;&amp; !out.is_empty() {
+<a href=#899 id=899 data-nosnippet>899</a>        out.pop();
+<a href=#900 id=900 data-nosnippet>900</a>    }
+<a href=#901 id=901 data-nosnippet>901</a>    out
+<a href=#902 id=902 data-nosnippet>902</a>}
+<a href=#903 id=903 data-nosnippet>903</a>
+<a href=#904 id=904 data-nosnippet>904</a><span class="attr">#[cfg(test)]
+<a href=#905 id=905 data-nosnippet>905</a></span><span class="kw">mod </span>tests {
+<a href=#906 id=906 data-nosnippet>906</a>    <span class="kw">use super</span>::<span class="kw-2">*</span>;
+<a href=#907 id=907 data-nosnippet>907</a>
+<a href=#908 id=908 data-nosnippet>908</a>    <span class="comment">// Rows as Linux prints them, from a host where a guest in a PID namespace
+<a href=#909 id=909 data-nosnippet>909</a>    // holds a POSIX lock (namespace pid 3), an OFD lock and a flock, and the
+<a href=#910 id=910 data-nosnippet>910</a>    // host holds others. `00:2a` is a btrfs superblock device.
+<a href=#911 id=911 data-nosnippet>911</a>    </span><span class="kw">const </span>SNAPSHOT: <span class="kw-2">&amp;</span>[u8] = <span class="string">b"\
+<a href=#912 id=912 data-nosnippet>912</a>1: POSIX  ADVISORY  WRITE 3 00:2a:1001 0 EOF
+<a href=#913 id=913 data-nosnippet>913</a>2: OFDLCK ADVISORY  WRITE -1 00:2a:1002 0 0
+<a href=#914 id=914 data-nosnippet>914</a>3: OFDLCK ADVISORY  WRITE -1 00:18:588084 1073741824 1073741824
+<a href=#915 id=915 data-nosnippet>915</a>4: OFDLCK ADVISORY  WRITE -1 00:2a:1002 10 10
+<a href=#916 id=916 data-nosnippet>916</a>5: FLOCK  ADVISORY  WRITE 4242 00:2a:1001 0 EOF
+<a href=#917 id=917 data-nosnippet>917</a>6: POSIX  ADVISORY  WRITE 4243 00:2a:1004 0 EOF
+<a href=#918 id=918 data-nosnippet>918</a>6: -&gt; POSIX  ADVISORY  WRITE 3 00:2a:1004 0 EOF
+<a href=#919 id=919 data-nosnippet>919</a>7: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF
+<a href=#920 id=920 data-nosnippet>920</a>7: -&gt; OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF
+<a href=#921 id=921 data-nosnippet>921</a>7: -&gt; POSIX  ADVISORY  WRITE 3 00:2a:1003 0 EOF
+<a href=#922 id=922 data-nosnippet>922</a>7: -&gt; POSIX  ADVISORY  WRITE 0 00:2a:1003 0 EOF
+<a href=#923 id=923 data-nosnippet>923</a>"</span>;
+<a href=#924 id=924 data-nosnippet>924</a>
+<a href=#925 id=925 data-nosnippet>925</a>    <span class="comment">// What fdinfo shows for the guest's descriptions: one OFD lock on inode
+<a href=#926 id=926 data-nosnippet>926</a>    // 1002 at byte 0, one flock (taken by pid 4242, since reaped) and one OFD
+<a href=#927 id=927 data-nosnippet>927</a>    // lock on inode 1003. The POSIX line is this process's own POSIX lock on
+<a href=#928 id=928 data-nosnippet>928</a>    // the same file, which fdinfo lists too.
+<a href=#929 id=929 data-nosnippet>929</a>    </span><span class="kw">const </span>FDINFO: <span class="kw-2">&amp;</span>[u8] = <span class="string">b"pos:\t0\nflags:\t02100002\nmnt_id:\t31\nino:\t1002\n\
+<a href=#930 id=930 data-nosnippet>930</a>lock:\t1: OFDLCK ADVISORY  WRITE -1 00:2a:1002 0 0\n\
+<a href=#931 id=931 data-nosnippet>931</a>lock:\t2: POSIX  ADVISORY  WRITE 3 00:2a:1002 5 5\n\
+<a href=#932 id=932 data-nosnippet>932</a>lock:\t3: FLOCK  ADVISORY  WRITE 4242 00:2a:1001 0 EOF\n\
+<a href=#933 id=933 data-nosnippet>933</a>lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n"</span>;
+<a href=#934 id=934 data-nosnippet>934</a>
+<a href=#935 id=935 data-nosnippet>935</a>    <span class="kw">fn </span>guest(owner: i64) -&gt; bool {
+<a href=#936 id=936 data-nosnippet>936</a>        owner == <span class="number">3
+<a href=#937 id=937 data-nosnippet>937</a>    </span>}
+<a href=#938 id=938 data-nosnippet>938</a>
+<a href=#939 id=939 data-nosnippet>939</a>    <span class="attr">#[test]
+<a href=#940 id=940 data-nosnippet>940</a>    </span><span class="kw">fn </span>parses_every_row_and_refuses_a_malformed_one() {
+<a href=#941 id=941 data-nosnippet>941</a>        <span class="kw">let </span>rows = lock_rows(SNAPSHOT).unwrap();
+<a href=#942 id=942 data-nosnippet>942</a>        <span class="macro">assert_eq!</span>(rows.len(), <span class="number">11</span>);
+<a href=#943 id=943 data-nosnippet>943</a>        <span class="macro">assert_eq!</span>(rows[<span class="number">2</span>].owner, -<span class="number">1</span>);
+<a href=#944 id=944 data-nosnippet>944</a>        <span class="macro">assert_eq!</span>(rows[<span class="number">2</span>].lock.object, <span class="string">"00:18:588084"</span>);
+<a href=#945 id=945 data-nosnippet>945</a>        <span class="macro">assert_eq!</span>(rows[<span class="number">2</span>].lock.start, <span class="string">"1073741824"</span>);
+<a href=#946 id=946 data-nosnippet>946</a>        <span class="macro">assert!</span>(rows[<span class="number">6</span>].waiter &amp;&amp; rows[<span class="number">6</span>].sequence == <span class="string">"6" </span>&amp;&amp; rows[<span class="number">6</span>].lock.class == <span class="string">"POSIX"</span>);
+<a href=#947 id=947 data-nosnippet>947</a>        <span class="macro">assert_eq!</span>(rows[<span class="number">10</span>].owner, <span class="number">0</span>);
+<a href=#948 id=948 data-nosnippet>948</a>        <span class="macro">assert!</span>(lock_rows(<span class="string">b"1: POSIX ADVISORY WRITE 3 00:2a:1001 0 EOF\nnot a row\n"</span>).is_none());
+<a href=#949 id=949 data-nosnippet>949</a>        <span class="macro">assert!</span>(lock_rows(<span class="string">b""</span>).unwrap().is_empty());
+<a href=#950 id=950 data-nosnippet>950</a>    }
+<a href=#951 id=951 data-nosnippet>951</a>
+<a href=#952 id=952 data-nosnippet>952</a>    <span class="attr">#[test]
+<a href=#953 id=953 data-nosnippet>953</a>    </span><span class="kw">fn </span>fdinfo_names_the_descriptions_ofd_and_flock_locks() {
+<a href=#954 id=954 data-nosnippet>954</a>        <span class="kw">let </span>held = held_locks_in_fdinfo(FDINFO);
+<a href=#955 id=955 data-nosnippet>955</a>        <span class="macro">assert_eq!</span>(
+<a href=#956 id=956 data-nosnippet>956</a>            held.iter()
+<a href=#957 id=957 data-nosnippet>957</a>                .map(|lock| (
+<a href=#958 id=958 data-nosnippet>958</a>                    lock.class.as_str(),
+<a href=#959 id=959 data-nosnippet>959</a>                    lock.object.as_str(),
+<a href=#960 id=960 data-nosnippet>960</a>                    lock.start.as_str()
+<a href=#961 id=961 data-nosnippet>961</a>                ))
+<a href=#962 id=962 data-nosnippet>962</a>                .collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;(),
+<a href=#963 id=963 data-nosnippet>963</a>            [
+<a href=#964 id=964 data-nosnippet>964</a>                (<span class="string">"OFDLCK"</span>, <span class="string">"00:2a:1002"</span>, <span class="string">"0"</span>),
+<a href=#965 id=965 data-nosnippet>965</a>                (<span class="string">"FLOCK"</span>, <span class="string">"00:2a:1001"</span>, <span class="string">"0"</span>),
+<a href=#966 id=966 data-nosnippet>966</a>                (<span class="string">"OFDLCK"</span>, <span class="string">"00:2a:1003"</span>, <span class="string">"0"</span>),
+<a href=#967 id=967 data-nosnippet>967</a>            ]
+<a href=#968 id=968 data-nosnippet>968</a>        );
+<a href=#969 id=969 data-nosnippet>969</a>        <span class="macro">assert!</span>(held_locks_in_fdinfo(<span class="string">b"pos:\t0\nflags:\t02\n"</span>).is_empty());
+<a href=#970 id=970 data-nosnippet>970</a>        <span class="macro">assert!</span>(held_locks_in_fdinfo(<span class="string">b"lock:\tnot a lock\n"</span>).is_empty());
+<a href=#971 id=971 data-nosnippet>971</a>    }
+<a href=#972 id=972 data-nosnippet>972</a>
+<a href=#973 id=973 data-nosnippet>973</a>    <span class="attr">#[test]
+<a href=#974 id=974 data-nosnippet>974</a>    </span><span class="kw">fn </span>host_rows_are_dropped_and_the_guests_are_kept() {
+<a href=#975 id=975 data-nosnippet>975</a>        <span class="kw">let </span>rows = lock_rows(SNAPSHOT).unwrap();
+<a href=#976 id=976 data-nosnippet>976</a>        <span class="kw">let </span>held = held_locks_in_fdinfo(FDINFO);
+<a href=#977 id=977 data-nosnippet>977</a>        <span class="macro">assert_eq!</span>(
+<a href=#978 id=978 data-nosnippet>978</a>            guest_lock_rows(<span class="kw-2">&amp;</span>rows, guest, <span class="kw-2">&amp;</span>held),
+<a href=#979 id=979 data-nosnippet>979</a>            [
+<a href=#980 id=980 data-nosnippet>980</a>                <span class="bool-val">true</span>,  <span class="comment">// the guest's POSIX lock, by its pid
+<a href=#981 id=981 data-nosnippet>981</a>                </span><span class="bool-val">true</span>,  <span class="comment">// the guest's OFD lock on 1002 at byte 0
+<a href=#982 id=982 data-nosnippet>982</a>                </span><span class="bool-val">false</span>, <span class="comment">// a host OFD lock on another file
+<a href=#983 id=983 data-nosnippet>983</a>                </span><span class="bool-val">false</span>, <span class="comment">// a host OFD lock on the guest's own file, another range
+<a href=#984 id=984 data-nosnippet>984</a>                // The flock a guest description holds, whose taker (4242) is
+<a href=#985 id=985 data-nosnippet>985</a>                // gone: hidden, since a flock row is kept only by its taker's
+<a href=#986 id=986 data-nosnippet>986</a>                // pid. A declared residual (module comment); Linux hides it too
+<a href=#987 id=987 data-nosnippet>987</a>                // under a PID namespace once the taker is reaped.
+<a href=#988 id=988 data-nosnippet>988</a>                </span><span class="bool-val">false</span>, <span class="comment">// that flock
+<a href=#989 id=989 data-nosnippet>989</a>                </span><span class="bool-val">false</span>, <span class="comment">// a host POSIX lock
+<a href=#990 id=990 data-nosnippet>990</a>                </span><span class="bool-val">false</span>, <span class="comment">// the guest's waiter behind it: the group goes whole
+<a href=#991 id=991 data-nosnippet>991</a>                </span><span class="bool-val">true</span>,  <span class="comment">// the guest's OFD lock on 1003
+<a href=#992 id=992 data-nosnippet>992</a>                </span><span class="bool-val">false</span>, <span class="comment">// an OFD waiter, which fdinfo cannot attribute
+<a href=#993 id=993 data-nosnippet>993</a>                </span><span class="bool-val">true</span>,  <span class="comment">// the guest's POSIX waiter behind its own lock
+<a href=#994 id=994 data-nosnippet>994</a>                </span><span class="bool-val">false</span>, <span class="comment">// a waiter the namespace cannot see
+<a href=#995 id=995 data-nosnippet>995</a>            </span>]
+<a href=#996 id=996 data-nosnippet>996</a>        );
+<a href=#997 id=997 data-nosnippet>997</a>    }
+<a href=#998 id=998 data-nosnippet>998</a>
+<a href=#999 id=999 data-nosnippet>999</a>    <span class="attr">#[test]
+<a href=#1000 id=1000 data-nosnippet>1000</a>    </span><span class="kw">fn </span>with_no_description_locks_only_guest_processes_rows_stay() {
+<a href=#1001 id=1001 data-nosnippet>1001</a>        <span class="kw">let </span>rows = lock_rows(SNAPSHOT).unwrap();
+<a href=#1002 id=1002 data-nosnippet>1002</a>        <span class="macro">assert_eq!</span>(
+<a href=#1003 id=1003 data-nosnippet>1003</a>            guest_lock_rows(<span class="kw-2">&amp;</span>rows, guest, <span class="kw-2">&amp;</span>[]),
+<a href=#1004 id=1004 data-nosnippet>1004</a>            [
+<a href=#1005 id=1005 data-nosnippet>1005</a>                <span class="bool-val">true</span>, <span class="bool-val">false</span>, <span class="bool-val">false</span>, <span class="bool-val">false</span>, <span class="bool-val">false</span>, <span class="bool-val">false</span>, <span class="bool-val">false</span>, <span class="bool-val">false</span>, <span class="bool-val">false</span>, <span class="bool-val">false</span>, <span class="bool-val">false
+<a href=#1006 id=1006 data-nosnippet>1006</a>            </span>]
+<a href=#1007 id=1007 data-nosnippet>1007</a>        );
+<a href=#1008 id=1008 data-nosnippet>1008</a>        <span class="macro">assert!</span>(
+<a href=#1009 id=1009 data-nosnippet>1009</a>            guest_lock_rows(<span class="kw-2">&amp;</span>rows, |<span class="kw">_</span>| <span class="bool-val">false</span>, <span class="kw-2">&amp;</span>[])
+<a href=#1010 id=1010 data-nosnippet>1010</a>                .iter()
+<a href=#1011 id=1011 data-nosnippet>1011</a>                .all(|keep| !keep)
+<a href=#1012 id=1012 data-nosnippet>1012</a>        );
+<a href=#1013 id=1013 data-nosnippet>1013</a>    }
+<a href=#1014 id=1014 data-nosnippet>1014</a>
+<a href=#1015 id=1015 data-nosnippet>1015</a>    <span class="attr">#[test]
+<a href=#1016 id=1016 data-nosnippet>1016</a>    </span><span class="kw">fn </span>a_distinct_lock_admits_one_row() {
+<a href=#1017 id=1017 data-nosnippet>1017</a>        <span class="comment">// Two shared read locks with the same range on the same file: one the
+<a href=#1018 id=1018 data-nosnippet>1018</a>        // guest's, one a host's. Linux prints the same row twice.
+<a href=#1019 id=1019 data-nosnippet>1019</a>        </span><span class="kw">let </span>contents = <span class="string">b"\
+<a href=#1020 id=1020 data-nosnippet>1020</a>1: OFDLCK ADVISORY READ -1 00:18:7 0 EOF
+<a href=#1021 id=1021 data-nosnippet>1021</a>2: OFDLCK ADVISORY READ -1 00:18:7 0 EOF
+<a href=#1022 id=1022 data-nosnippet>1022</a>"</span>;
+<a href=#1023 id=1023 data-nosnippet>1023</a>        <span class="kw">let </span>rows = lock_rows(contents).unwrap();
+<a href=#1024 id=1024 data-nosnippet>1024</a>        <span class="kw">let </span>held = held_locks_in_fdinfo(<span class="string">b"lock:\t1: OFDLCK ADVISORY READ -1 00:18:7 0 EOF\n"</span>);
+<a href=#1025 id=1025 data-nosnippet>1025</a>        <span class="macro">assert_eq!</span>(guest_lock_rows(<span class="kw-2">&amp;</span>rows, guest, <span class="kw-2">&amp;</span>held), [<span class="bool-val">true</span>, <span class="bool-val">false</span>]);
+<a href=#1026 id=1026 data-nosnippet>1026</a>        <span class="comment">// Listed twice (two guest descriptions, or one the ledger knows under
+<a href=#1027 id=1027 data-nosnippet>1027</a>        // two identities), it still admits one row: never a host's beside it,
+<a href=#1028 id=1028 data-nosnippet>1028</a>        // at the cost of hiding a second identical guest lock.
+<a href=#1029 id=1029 data-nosnippet>1029</a>        </span><span class="kw">let </span>twice = [held.clone(), held].concat();
+<a href=#1030 id=1030 data-nosnippet>1030</a>        <span class="macro">assert_eq!</span>(guest_lock_rows(<span class="kw-2">&amp;</span>rows, guest, <span class="kw-2">&amp;</span>twice), [<span class="bool-val">true</span>, <span class="bool-val">false</span>]);
+<a href=#1031 id=1031 data-nosnippet>1031</a>    }
+<a href=#1032 id=1032 data-nosnippet>1032</a>
+<a href=#1033 id=1033 data-nosnippet>1033</a>    <span class="attr">#[test]
+<a href=#1034 id=1034 data-nosnippet>1034</a>    </span><span class="kw">fn </span>a_lock_on_another_device_with_the_same_inode_is_not_the_guests() {
+<a href=#1035 id=1035 data-nosnippet>1035</a>        <span class="kw">let </span>contents = <span class="string">b"\
+<a href=#1036 id=1036 data-nosnippet>1036</a>1: OFDLCK ADVISORY WRITE -1 00:18:7 0 EOF
+<a href=#1037 id=1037 data-nosnippet>1037</a>2: OFDLCK ADVISORY WRITE -1 00:2a:7 0 EOF
+<a href=#1038 id=1038 data-nosnippet>1038</a>"</span>;
+<a href=#1039 id=1039 data-nosnippet>1039</a>        <span class="kw">let </span>rows = lock_rows(contents).unwrap();
+<a href=#1040 id=1040 data-nosnippet>1040</a>        <span class="kw">let </span>held = held_locks_in_fdinfo(<span class="string">b"lock:\t1: OFDLCK ADVISORY WRITE -1 00:18:7 0 EOF\n"</span>);
+<a href=#1041 id=1041 data-nosnippet>1041</a>        <span class="macro">assert_eq!</span>(guest_lock_rows(<span class="kw-2">&amp;</span>rows, guest, <span class="kw-2">&amp;</span>held), [<span class="bool-val">true</span>, <span class="bool-val">false</span>]);
+<a href=#1042 id=1042 data-nosnippet>1042</a>        <span class="comment">// Once the guest unlocks, nothing of its own remains to claim either.
+<a href=#1043 id=1043 data-nosnippet>1043</a>        </span><span class="macro">assert_eq!</span>(guest_lock_rows(<span class="kw-2">&amp;</span>rows, guest, <span class="kw-2">&amp;</span>[]), [<span class="bool-val">false</span>, <span class="bool-val">false</span>]);
+<a href=#1044 id=1044 data-nosnippet>1044</a>    }
+<a href=#1045 id=1045 data-nosnippet>1045</a>
+<a href=#1046 id=1046 data-nosnippet>1046</a>    <span class="attr">#[test]
+<a href=#1047 id=1047 data-nosnippet>1047</a>    </span><span class="kw">fn </span>rows_a_backend_rendered_on_the_null_device_are_kept() {
+<a href=#1048 id=1048 data-nosnippet>1048</a>        <span class="comment">// KVM's backend-local copy of the file (the temporary exemption,
+<a href=#1049 id=1049 data-nosnippet>1049</a>        // removed with package K slice K8).
+<a href=#1050 id=1050 data-nosnippet>1050</a>        </span><span class="kw">let </span>contents = <span class="string">b"\
+<a href=#1051 id=1051 data-nosnippet>1051</a>1: OFDLCK ADVISORY WRITE -1 00:00:1 0 EOF
+<a href=#1052 id=1052 data-nosnippet>1052</a>2: FLOCK ADVISORY WRITE 98765 00:00:2 0 EOF
+<a href=#1053 id=1053 data-nosnippet>1053</a>"</span>;
+<a href=#1054 id=1054 data-nosnippet>1054</a>        <span class="kw">let </span>rows = lock_rows(contents).unwrap();
+<a href=#1055 id=1055 data-nosnippet>1055</a>        <span class="macro">assert_eq!</span>(guest_lock_rows(<span class="kw-2">&amp;</span>rows, |<span class="kw">_</span>| <span class="bool-val">false</span>, <span class="kw-2">&amp;</span>[]), [<span class="bool-val">true</span>, <span class="bool-val">true</span>]);
+<a href=#1056 id=1056 data-nosnippet>1056</a>    }
+<a href=#1057 id=1057 data-nosnippet>1057</a>
+<a href=#1058 id=1058 data-nosnippet>1058</a>    <span class="attr">#[test]
+<a href=#1059 id=1059 data-nosnippet>1059</a>    </span><span class="kw">fn </span>dropped_rows_shift_no_remaining_identity() {
+<a href=#1060 id=1060 data-nosnippet>1060</a>        <span class="kw">let </span>rows = lock_rows(SNAPSHOT).unwrap();
+<a href=#1061 id=1061 data-nosnippet>1061</a>        <span class="kw">let </span>kept = guest_lock_rows(<span class="kw-2">&amp;</span>rows, guest, <span class="kw-2">&amp;</span>[]);
+<a href=#1062 id=1062 data-nosnippet>1062</a>        <span class="kw">let </span><span class="kw-2">mut </span>file =
+<a href=#1063 id=1063 data-nosnippet>1063</a>            <span class="kw">super</span>::<span class="kw">super</span>::ProcfsFile::from_path(std::path::Path::new(<span class="string">"/proc/locks"</span>)).unwrap();
+<a href=#1064 id=1064 data-nosnippet>1064</a>        file.initialize(
+<a href=#1065 id=1065 data-nosnippet>1065</a>            SNAPSHOT.to_vec(),
+<a href=#1066 id=1066 data-nosnippet>1066</a>            <span class="kw">super</span>::<span class="kw">super</span>::ProcfsSnapshotContext {
+<a href=#1067 id=1067 data-nosnippet>1067</a>                lock_rows_kept: <span class="prelude-val">Some</span>(kept),
+<a href=#1068 id=1068 data-nosnippet>1068</a>                ..Default::default()
+<a href=#1069 id=1069 data-nosnippet>1069</a>            },
+<a href=#1070 id=1070 data-nosnippet>1070</a>        );
+<a href=#1071 id=1071 data-nosnippet>1071</a>        <span class="kw">let </span>rendered = file.take(usize::MAX).unwrap();
+<a href=#1072 id=1072 data-nosnippet>1072</a>        <span class="comment">// Exactly what the guest's one row alone renders: the host's rows,
+<a href=#1073 id=1073 data-nosnippet>1073</a>        // gone, numbered nothing.
+<a href=#1074 id=1074 data-nosnippet>1074</a>        </span><span class="macro">assert_eq!</span>(
+<a href=#1075 id=1075 data-nosnippet>1075</a>            rendered,
+<a href=#1076 id=1076 data-nosnippet>1076</a>            <span class="kw">super</span>::<span class="kw">super</span>::sanitize_locks(<span class="string">b"1: POSIX  ADVISORY  WRITE 3 00:2a:1001 0 EOF\n"</span>)
+<a href=#1077 id=1077 data-nosnippet>1077</a>        );
+<a href=#1078 id=1078 data-nosnippet>1078</a>        <span class="macro">assert_eq!</span>(
+<a href=#1079 id=1079 data-nosnippet>1079</a>            String::from_utf8(rendered).unwrap(),
+<a href=#1080 id=1080 data-nosnippet>1080</a>            <span class="string">"1: POSIX ADVISORY WRITE 1 00:00:1 0 EOF\n"
+<a href=#1081 id=1081 data-nosnippet>1081</a>        </span>);
+<a href=#1082 id=1082 data-nosnippet>1082</a>    }
+<a href=#1083 id=1083 data-nosnippet>1083</a>
+<a href=#1084 id=1084 data-nosnippet>1084</a>    <span class="attr">#[test]
+<a href=#1085 id=1085 data-nosnippet>1085</a>    </span><span class="kw">fn </span>a_guest_processs_row_claims_its_match_before_another_owners() {
+<a href=#1086 id=1086 data-nosnippet>1086</a>        <span class="comment">// Two shared flocks on one file, the guest's (pid 3) and a host
+<a href=#1087 id=1087 data-nosnippet>1087</a>        // process's (pid 4242), which `--no-namespace` shows both of.
+<a href=#1088 id=1088 data-nosnippet>1088</a>        </span><span class="kw">let </span>held = held_locks_in_fdinfo(<span class="string">b"lock:\t1: FLOCK ADVISORY READ 3 00:2a:5 0 EOF\n"</span>);
+<a href=#1089 id=1089 data-nosnippet>1089</a>        <span class="kw">for </span>(contents, want) <span class="kw">in </span>[
+<a href=#1090 id=1090 data-nosnippet>1090</a>            (
+<a href=#1091 id=1091 data-nosnippet>1091</a>                <span class="kw-2">&amp;</span><span class="string">b"1: FLOCK ADVISORY READ 3 00:2a:5 0 EOF\n2: FLOCK ADVISORY READ 4242 00:2a:5 0 EOF\n"</span>[..],
+<a href=#1092 id=1092 data-nosnippet>1092</a>                [<span class="bool-val">true</span>, <span class="bool-val">false</span>],
+<a href=#1093 id=1093 data-nosnippet>1093</a>            ),
+<a href=#1094 id=1094 data-nosnippet>1094</a>            (
+<a href=#1095 id=1095 data-nosnippet>1095</a>                <span class="kw-2">&amp;</span><span class="string">b"1: FLOCK ADVISORY READ 4242 00:2a:5 0 EOF\n2: FLOCK ADVISORY READ 3 00:2a:5 0 EOF\n"</span>[..],
+<a href=#1096 id=1096 data-nosnippet>1096</a>                [<span class="bool-val">false</span>, <span class="bool-val">true</span>],
+<a href=#1097 id=1097 data-nosnippet>1097</a>            ),
+<a href=#1098 id=1098 data-nosnippet>1098</a>        ] {
+<a href=#1099 id=1099 data-nosnippet>1099</a>            <span class="kw">let </span>rows = lock_rows(contents).unwrap();
+<a href=#1100 id=1100 data-nosnippet>1100</a>            <span class="macro">assert_eq!</span>(guest_lock_rows(<span class="kw-2">&amp;</span>rows, guest, <span class="kw-2">&amp;</span>held), want);
+<a href=#1101 id=1101 data-nosnippet>1101</a>        }
+<a href=#1102 id=1102 data-nosnippet>1102</a>    }
+<a href=#1103 id=1103 data-nosnippet>1103</a>
+<a href=#1104 id=1104 data-nosnippet>1104</a>    <span class="doccomment">/// A description's recorded flock does not admit a row by its fields: a
+<a href=#1105 id=1105 data-nosnippet>1105</a>    /// copied DBT `vfork` child can release it natively, leaving the record
+<a href=#1106 id=1106 data-nosnippet>1106</a>    /// stale, and a host process's identical shared flock (shown under
+<a href=#1107 id=1107 data-nosnippet>1107</a>    /// `--no-namespace`) would then pass for the guest's. Only the taker's
+<a href=#1108 id=1108 data-nosnippet>1108</a>    /// pid keeps a flock row.
+<a href=#1109 id=1109 data-nosnippet>1109</a>    </span><span class="attr">#[test]
+<a href=#1110 id=1110 data-nosnippet>1110</a>    </span><span class="kw">fn </span>a_recorded_flock_admits_no_row_whose_taker_is_not_the_guests() {
+<a href=#1111 id=1111 data-nosnippet>1111</a>        <span class="kw">let </span>held = held_locks_in_fdinfo(<span class="string">b"lock:\t1: FLOCK ADVISORY READ 3 00:2a:5 0 EOF\n"</span>);
+<a href=#1112 id=1112 data-nosnippet>1112</a>        <span class="comment">// The guest's lock is gone (released natively); the host's remains.
+<a href=#1113 id=1113 data-nosnippet>1113</a>        </span><span class="kw">let </span>rows = lock_rows(<span class="string">b"1: FLOCK ADVISORY READ 4242 00:2a:5 0 EOF\n"</span>).unwrap();
+<a href=#1114 id=1114 data-nosnippet>1114</a>        <span class="macro">assert_eq!</span>(guest_lock_rows(<span class="kw-2">&amp;</span>rows, guest, <span class="kw-2">&amp;</span>held), [<span class="bool-val">false</span>]);
+<a href=#1115 id=1115 data-nosnippet>1115</a>        <span class="comment">// A flock its guest taker holds is shown whether or not it was recorded.
+<a href=#1116 id=1116 data-nosnippet>1116</a>        </span><span class="kw">let </span>rows = lock_rows(<span class="string">b"1: FLOCK ADVISORY READ 3 00:2a:5 0 EOF\n"</span>).unwrap();
+<a href=#1117 id=1117 data-nosnippet>1117</a>        <span class="macro">assert_eq!</span>(guest_lock_rows(<span class="kw-2">&amp;</span>rows, guest, <span class="kw-2">&amp;</span>held), [<span class="bool-val">true</span>]);
+<a href=#1118 id=1118 data-nosnippet>1118</a>        <span class="macro">assert_eq!</span>(guest_lock_rows(<span class="kw-2">&amp;</span>rows, guest, <span class="kw-2">&amp;</span>[]), [<span class="bool-val">true</span>]);
+<a href=#1119 id=1119 data-nosnippet>1119</a>    }
+<a href=#1120 id=1120 data-nosnippet>1120</a>
+<a href=#1121 id=1121 data-nosnippet>1121</a>    <span class="kw">fn </span>lock(start: <span class="kw-2">&amp;</span>str) -&gt; HeldLock {
+<a href=#1122 id=1122 data-nosnippet>1122</a>        held_locks_in_fdinfo(
+<a href=#1123 id=1123 data-nosnippet>1123</a>            <span class="macro">format!</span>(<span class="string">"lock:\t1: OFDLCK ADVISORY READ -1 00:18:7 {start} {start}\n"</span>).as_bytes(),
+<a href=#1124 id=1124 data-nosnippet>1124</a>        )
+<a href=#1125 id=1125 data-nosnippet>1125</a>        .remove(<span class="number">0</span>)
+<a href=#1126 id=1126 data-nosnippet>1126</a>    }
+<a href=#1127 id=1127 data-nosnippet>1127</a>
+<a href=#1128 id=1128 data-nosnippet>1128</a>    <span class="kw">fn </span>description(sequence: u64) -&gt; OpenFileId {
+<a href=#1129 id=1129 data-nosnippet>1129</a>        OpenFileId::new(DetPid::from_raw(<span class="number">3</span>), sequence)
+<a href=#1130 id=1130 data-nosnippet>1130</a>    }
+<a href=#1131 id=1131 data-nosnippet>1131</a>
+<a href=#1132 id=1132 data-nosnippet>1132</a>    <span class="attr">#[test]
+<a href=#1133 id=1133 data-nosnippet>1133</a>    </span><span class="kw">fn </span>a_description_counts_while_a_table_references_it() {
+<a href=#1134 id=1134 data-nosnippet>1134</a>        <span class="kw">let </span>[parent, child] = [<span class="number">3</span>, <span class="number">4</span>].map(DetPid::from_raw);
+<a href=#1135 id=1135 data-nosnippet>1135</a>        <span class="kw">let </span><span class="kw-2">mut </span>ledger = LockLedger::default();
+<a href=#1136 id=1136 data-nosnippet>1136</a>        ledger.note_locks(parent, description(<span class="number">0</span>), <span class="macro">vec!</span>[lock(<span class="string">"0"</span>)], <span class="number">1</span>);
+<a href=#1137 id=1137 data-nosnippet>1137</a>        <span class="macro">assert_eq!</span>(ledger.held(), [lock(<span class="string">"0"</span>)]);
+<a href=#1138 id=1138 data-nosnippet>1138</a>        <span class="comment">// An unlock keeps the description referenced, holding nothing.
+<a href=#1139 id=1139 data-nosnippet>1139</a>        </span>ledger.note_locks(parent, description(<span class="number">0</span>), Vec::new(), <span class="number">1</span>);
+<a href=#1140 id=1140 data-nosnippet>1140</a>        <span class="macro">assert!</span>(ledger.held().is_empty());
+<a href=#1141 id=1141 data-nosnippet>1141</a>        ledger.note_locks(parent, description(<span class="number">0</span>), <span class="macro">vec!</span>[lock(<span class="string">"0"</span>)], <span class="number">2</span>);
+<a href=#1142 id=1142 data-nosnippet>1142</a>        <span class="comment">// One of two slots closed: still referenced.
+<a href=#1143 id=1143 data-nosnippet>1143</a>        </span>ledger.release(parent, description(<span class="number">0</span>), <span class="number">1</span>);
+<a href=#1144 id=1144 data-nosnippet>1144</a>        <span class="macro">assert_eq!</span>(ledger.held(), [lock(<span class="string">"0"</span>)]);
+<a href=#1145 id=1145 data-nosnippet>1145</a>        <span class="comment">// The fork's copy keeps it after the parent's last close...
+<a href=#1146 id=1146 data-nosnippet>1146</a>        </span>ledger.fork(parent, child, <span class="bool-val">false</span>);
+<a href=#1147 id=1147 data-nosnippet>1147</a>        ledger.release(parent, description(<span class="number">0</span>), <span class="number">0</span>);
+<a href=#1148 id=1148 data-nosnippet>1148</a>        <span class="macro">assert_eq!</span>(ledger.held(), [lock(<span class="string">"0"</span>)]);
+<a href=#1149 id=1149 data-nosnippet>1149</a>        <span class="comment">// ...until the child has exited, reaped or not.
+<a href=#1150 id=1150 data-nosnippet>1150</a>        </span>ledger.prune(|process| process != child);
+<a href=#1151 id=1151 data-nosnippet>1151</a>        <span class="macro">assert!</span>(ledger.held().is_empty());
+<a href=#1152 id=1152 data-nosnippet>1152</a>        <span class="comment">// A release from a table the ledger never saw changes nothing.
+<a href=#1153 id=1153 data-nosnippet>1153</a>        </span>ledger.release(DetPid::from_raw(<span class="number">9</span>), description(<span class="number">0</span>), <span class="number">1</span>);
+<a href=#1154 id=1154 data-nosnippet>1154</a>        <span class="macro">assert!</span>(ledger.held().is_empty());
+<a href=#1155 id=1155 data-nosnippet>1155</a>    }
+<a href=#1156 id=1156 data-nosnippet>1156</a>
+<a href=#1157 id=1157 data-nosnippet>1157</a>    <span class="attr">#[test]
+<a href=#1158 id=1158 data-nosnippet>1158</a>    </span><span class="kw">fn </span>a_shared_table_closes_for_every_process_that_shares_it() {
+<a href=#1159 id=1159 data-nosnippet>1159</a>        <span class="kw">let </span>[parent, sibling] = [<span class="number">3</span>, <span class="number">4</span>].map(DetPid::from_raw);
+<a href=#1160 id=1160 data-nosnippet>1160</a>        <span class="kw">let </span><span class="kw-2">mut </span>ledger = LockLedger::default();
+<a href=#1161 id=1161 data-nosnippet>1161</a>        ledger.note_locks(parent, description(<span class="number">0</span>), <span class="macro">vec!</span>[lock(<span class="string">"0"</span>)], <span class="number">1</span>);
+<a href=#1162 id=1162 data-nosnippet>1162</a>        ledger.fork(parent, sibling, <span class="bool-val">true</span>);
+<a href=#1163 id=1163 data-nosnippet>1163</a>        ledger.release(sibling, description(<span class="number">0</span>), <span class="number">0</span>);
+<a href=#1164 id=1164 data-nosnippet>1164</a>        <span class="macro">assert!</span>(ledger.held().is_empty());
+<a href=#1165 id=1165 data-nosnippet>1165</a>        <span class="comment">// A shared table goes when the first process sharing it exits.
+<a href=#1166 id=1166 data-nosnippet>1166</a>        </span>ledger.note_locks(parent, description(<span class="number">1</span>), <span class="macro">vec!</span>[lock(<span class="string">"1"</span>)], <span class="number">1</span>);
+<a href=#1167 id=1167 data-nosnippet>1167</a>        ledger.prune(|process| process != sibling);
+<a href=#1168 id=1168 data-nosnippet>1168</a>        <span class="macro">assert!</span>(ledger.held().is_empty());
+<a href=#1169 id=1169 data-nosnippet>1169</a>    }
+<a href=#1170 id=1170 data-nosnippet>1170</a>
+<a href=#1171 id=1171 data-nosnippet>1171</a>    <span class="attr">#[test]
+<a href=#1172 id=1172 data-nosnippet>1172</a>    </span><span class="kw">fn </span>an_exec_keeps_only_the_descriptions_that_survive_it() {
+<a href=#1173 id=1173 data-nosnippet>1173</a>        <span class="kw">let </span>process = DetPid::from_raw(<span class="number">3</span>);
+<a href=#1174 id=1174 data-nosnippet>1174</a>        <span class="kw">let </span><span class="kw-2">mut </span>ledger = LockLedger::default();
+<a href=#1175 id=1175 data-nosnippet>1175</a>        ledger.note_locks(process, description(<span class="number">0</span>), <span class="macro">vec!</span>[lock(<span class="string">"0"</span>)], <span class="number">1</span>);
+<a href=#1176 id=1176 data-nosnippet>1176</a>        ledger.note_locks(process, description(<span class="number">1</span>), <span class="macro">vec!</span>[lock(<span class="string">"1"</span>)], <span class="number">1</span>);
+<a href=#1177 id=1177 data-nosnippet>1177</a>        ledger.exec(process);
+<a href=#1178 id=1178 data-nosnippet>1178</a>        <span class="macro">assert!</span>(ledger.held().is_empty());
+<a href=#1179 id=1179 data-nosnippet>1179</a>        <span class="comment">// Description 1 was close-on-exec.
+<a href=#1180 id=1180 data-nosnippet>1180</a>        </span>ledger.exec_kept(process, <span class="kw-2">&amp;</span>[(description(<span class="number">0</span>), <span class="number">1</span>)]);
+<a href=#1181 id=1181 data-nosnippet>1181</a>        <span class="macro">assert_eq!</span>(ledger.held(), [lock(<span class="string">"0"</span>)]);
+<a href=#1182 id=1182 data-nosnippet>1182</a>        <span class="comment">// An exec that names nothing surviving leaves nothing.
+<a href=#1183 id=1183 data-nosnippet>1183</a>        </span>ledger.exec(process);
+<a href=#1184 id=1184 data-nosnippet>1184</a>        ledger.exec_kept(process, <span class="kw-2">&amp;</span>[]);
+<a href=#1185 id=1185 data-nosnippet>1185</a>        <span class="macro">assert!</span>(ledger.held().is_empty());
+<a href=#1186 id=1186 data-nosnippet>1186</a>    }
+<a href=#1187 id=1187 data-nosnippet>1187</a>
+<a href=#1188 id=1188 data-nosnippet>1188</a>    <span class="attr">#[test]
+<a href=#1189 id=1189 data-nosnippet>1189</a>    </span><span class="kw">fn </span>a_reused_process_number_starts_with_nothing() {
+<a href=#1190 id=1190 data-nosnippet>1190</a>        <span class="kw">let </span>[parent, child] = [<span class="number">3</span>, <span class="number">4</span>].map(DetPid::from_raw);
+<a href=#1191 id=1191 data-nosnippet>1191</a>        <span class="kw">let </span><span class="kw-2">mut </span>ledger = LockLedger::default();
+<a href=#1192 id=1192 data-nosnippet>1192</a>        ledger.note_locks(child, description(<span class="number">0</span>), <span class="macro">vec!</span>[lock(<span class="string">"0"</span>)], <span class="number">1</span>);
+<a href=#1193 id=1193 data-nosnippet>1193</a>        <span class="comment">// A new process takes the number of one that held a lock; its parent
+<a href=#1194 id=1194 data-nosnippet>1194</a>        // has no table the ledger knows.
+<a href=#1195 id=1195 data-nosnippet>1195</a>        </span>ledger.fork(parent, child, <span class="bool-val">false</span>);
+<a href=#1196 id=1196 data-nosnippet>1196</a>        <span class="macro">assert!</span>(ledger.held().is_empty());
+<a href=#1197 id=1197 data-nosnippet>1197</a>    }
+<a href=#1198 id=1198 data-nosnippet>1198</a>
+<a href=#1199 id=1199 data-nosnippet>1199</a>    <span class="attr">#[test]
+<a href=#1200 id=1200 data-nosnippet>1200</a>    </span><span class="kw">fn </span>a_reference_taken_before_any_lock_is_not_followed() {
+<a href=#1201 id=1201 data-nosnippet>1201</a>        <span class="comment">// The parent opened the file before forking and never called through
+<a href=#1202 id=1202 data-nosnippet>1202</a>        // it; the child locks it and exits. Linux keeps the lock while the
+<a href=#1203 id=1203 data-nosnippet>1203</a>        // parent's slot stays open; the ledger never saw that slot, so the
+<a href=#1204 id=1204 data-nosnippet>1204</a>        // lock is hidden (a named residual).
+<a href=#1205 id=1205 data-nosnippet>1205</a>        </span><span class="kw">let </span>[parent, child] = [<span class="number">3</span>, <span class="number">4</span>].map(DetPid::from_raw);
+<a href=#1206 id=1206 data-nosnippet>1206</a>        <span class="kw">let </span><span class="kw-2">mut </span>ledger = LockLedger::default();
+<a href=#1207 id=1207 data-nosnippet>1207</a>        ledger.fork(parent, child, <span class="bool-val">false</span>);
+<a href=#1208 id=1208 data-nosnippet>1208</a>        ledger.note_locks(child, description(<span class="number">0</span>), <span class="macro">vec!</span>[lock(<span class="string">"0"</span>)], <span class="number">1</span>);
+<a href=#1209 id=1209 data-nosnippet>1209</a>        <span class="macro">assert_eq!</span>(ledger.held(), [lock(<span class="string">"0"</span>)]);
+<a href=#1210 id=1210 data-nosnippet>1210</a>        ledger.prune(|process| process != child);
+<a href=#1211 id=1211 data-nosnippet>1211</a>        <span class="macro">assert!</span>(ledger.held().is_empty());
+<a href=#1212 id=1212 data-nosnippet>1212</a>    }
+<a href=#1213 id=1213 data-nosnippet>1213</a>
+<a href=#1214 id=1214 data-nosnippet>1214</a>    <span class="attr">#[test]
+<a href=#1215 id=1215 data-nosnippet>1215</a>    </span><span class="kw">fn </span>a_table_the_ledger_cannot_follow_contributes_no_lock() {
+<a href=#1216 id=1216 data-nosnippet>1216</a>        <span class="kw">let </span>[parent, sibling, child, other] = [<span class="number">3</span>, <span class="number">4</span>, <span class="number">5</span>, <span class="number">6</span>].map(DetPid::from_raw);
+<a href=#1217 id=1217 data-nosnippet>1217</a>        <span class="kw">let </span><span class="kw-2">mut </span>ledger = LockLedger::default();
+<a href=#1218 id=1218 data-nosnippet>1218</a>        <span class="comment">// CLONE_FILES before any lock: both sharers are opaque.
+<a href=#1219 id=1219 data-nosnippet>1219</a>        </span>ledger.fork(parent, sibling, <span class="bool-val">true</span>);
+<a href=#1220 id=1220 data-nosnippet>1220</a>        ledger.note_locks(parent, description(<span class="number">0</span>), <span class="macro">vec!</span>[lock(<span class="string">"0"</span>)], <span class="number">1</span>);
+<a href=#1221 id=1221 data-nosnippet>1221</a>        <span class="macro">assert!</span>(ledger.held().is_empty());
+<a href=#1222 id=1222 data-nosnippet>1222</a>        <span class="comment">// So is a child forked from an opaque process.
+<a href=#1223 id=1223 data-nosnippet>1223</a>        </span>ledger.fork(parent, child, <span class="bool-val">false</span>);
+<a href=#1224 id=1224 data-nosnippet>1224</a>        ledger.note_locks(child, description(<span class="number">1</span>), <span class="macro">vec!</span>[lock(<span class="string">"1"</span>)], <span class="number">1</span>);
+<a href=#1225 id=1225 data-nosnippet>1225</a>        <span class="macro">assert!</span>(ledger.held().is_empty());
+<a href=#1226 id=1226 data-nosnippet>1226</a>        <span class="comment">// A process with a private-table thread is opaque until it exits.
+<a href=#1227 id=1227 data-nosnippet>1227</a>        </span>ledger.note_locks(other, description(<span class="number">2</span>), <span class="macro">vec!</span>[lock(<span class="string">"2"</span>)], <span class="number">1</span>);
+<a href=#1228 id=1228 data-nosnippet>1228</a>        <span class="macro">assert_eq!</span>(ledger.held(), [lock(<span class="string">"2"</span>)]);
+<a href=#1229 id=1229 data-nosnippet>1229</a>        ledger.mark_opaque(other);
+<a href=#1230 id=1230 data-nosnippet>1230</a>        <span class="macro">assert!</span>(ledger.held().is_empty());
+<a href=#1231 id=1231 data-nosnippet>1231</a>        <span class="comment">// A reused number starts transparent.
+<a href=#1232 id=1232 data-nosnippet>1232</a>        </span>ledger.prune(|process| process != other);
+<a href=#1233 id=1233 data-nosnippet>1233</a>        ledger.fork(DetPid::from_raw(<span class="number">9</span>), other, <span class="bool-val">false</span>);
+<a href=#1234 id=1234 data-nosnippet>1234</a>        ledger.note_locks(other, description(<span class="number">3</span>), <span class="macro">vec!</span>[lock(<span class="string">"3"</span>)], <span class="number">1</span>);
+<a href=#1235 id=1235 data-nosnippet>1235</a>        <span class="macro">assert_eq!</span>(ledger.held(), [lock(<span class="string">"3"</span>)]);
+<a href=#1236 id=1236 data-nosnippet>1236</a>    }
+<a href=#1237 id=1237 data-nosnippet>1237</a>
+<a href=#1238 id=1238 data-nosnippet>1238</a>    <span class="attr">#[test]
+<a href=#1239 id=1239 data-nosnippet>1239</a>    </span><span class="kw">fn </span>an_aliased_inode_contributes_no_lock() {
+<a href=#1240 id=1240 data-nosnippet>1240</a>        <span class="kw">let </span>process = DetPid::from_raw(<span class="number">3</span>);
+<a href=#1241 id=1241 data-nosnippet>1241</a>        <span class="kw">let </span><span class="kw-2">mut </span>ledger = LockLedger::default();
+<a href=#1242 id=1242 data-nosnippet>1242</a>        ledger.note_locks(process, description(<span class="number">0</span>), <span class="macro">vec!</span>[lock(<span class="string">"0"</span>)], <span class="number">1</span>);
+<a href=#1243 id=1243 data-nosnippet>1243</a>        ledger.alias_inode(<span class="prelude-val">Some</span>(<span class="string">"8"</span>.to_string()));
+<a href=#1244 id=1244 data-nosnippet>1244</a>        <span class="macro">assert_eq!</span>(ledger.held(), [lock(<span class="string">"0"</span>)]);
+<a href=#1245 id=1245 data-nosnippet>1245</a>        ledger.alias_inode(<span class="prelude-val">Some</span>(<span class="string">"7"</span>.to_string()));
+<a href=#1246 id=1246 data-nosnippet>1246</a>        <span class="macro">assert!</span>(ledger.held().is_empty());
+<a href=#1247 id=1247 data-nosnippet>1247</a>        <span class="kw">let </span><span class="kw-2">mut </span>ledger = LockLedger::default();
+<a href=#1248 id=1248 data-nosnippet>1248</a>        ledger.note_locks(process, description(<span class="number">0</span>), <span class="macro">vec!</span>[lock(<span class="string">"0"</span>)], <span class="number">1</span>);
+<a href=#1249 id=1249 data-nosnippet>1249</a>        ledger.alias_inode(<span class="prelude-val">None</span>);
+<a href=#1250 id=1250 data-nosnippet>1250</a>        <span class="macro">assert!</span>(ledger.held().is_empty());
+<a href=#1251 id=1251 data-nosnippet>1251</a>    }
+<a href=#1252 id=1252 data-nosnippet>1252</a>
+<a href=#1253 id=1253 data-nosnippet>1253</a>    <span class="attr">#[test]
+<a href=#1254 id=1254 data-nosnippet>1254</a>    </span><span class="kw">fn </span>a_refusal_holds_for_the_rest_of_the_run_by_its_first_reason() {
+<a href=#1255 id=1255 data-nosnippet>1255</a>        <span class="kw">let </span>process = DetPid::from_raw(<span class="number">3</span>);
+<a href=#1256 id=1256 data-nosnippet>1256</a>        <span class="kw">let </span><span class="kw-2">mut </span>ledger = LockLedger::default();
+<a href=#1257 id=1257 data-nosnippet>1257</a>        ledger.note_locks(process, description(<span class="number">0</span>), <span class="macro">vec!</span>[lock(<span class="string">"0"</span>)], <span class="number">1</span>);
+<a href=#1258 id=1258 data-nosnippet>1258</a>        <span class="macro">assert_eq!</span>(ledger.unknown(), <span class="prelude-val">None</span>);
+<a href=#1259 id=1259 data-nosnippet>1259</a>        ledger.refuse(<span class="string">"ENFILE"</span>.to_string());
+<a href=#1260 id=1260 data-nosnippet>1260</a>        ledger.refuse(<span class="string">"EIO"</span>.to_string());
+<a href=#1261 id=1261 data-nosnippet>1261</a>        <span class="macro">assert_eq!</span>(ledger.unknown(), <span class="prelude-val">Some</span>(<span class="string">"ENFILE"</span>));
+<a href=#1262 id=1262 data-nosnippet>1262</a>        <span class="comment">// Neither a later successful read nor the end of every table clears it.
+<a href=#1263 id=1263 data-nosnippet>1263</a>        </span>ledger.note_locks(process, description(<span class="number">0</span>), Vec::new(), <span class="number">1</span>);
+<a href=#1264 id=1264 data-nosnippet>1264</a>        ledger.prune(|<span class="kw">_</span>| <span class="bool-val">false</span>);
+<a href=#1265 id=1265 data-nosnippet>1265</a>        <span class="macro">assert_eq!</span>(ledger.unknown(), <span class="prelude-val">Some</span>(<span class="string">"ENFILE"</span>));
+<a href=#1266 id=1266 data-nosnippet>1266</a>        <span class="comment">// It does not hide what the ledger knows: the decision is refused.
+<a href=#1267 id=1267 data-nosnippet>1267</a>        </span>ledger.note_locks(process, description(<span class="number">1</span>), <span class="macro">vec!</span>[lock(<span class="string">"1"</span>)], <span class="number">1</span>);
+<a href=#1268 id=1268 data-nosnippet>1268</a>        <span class="macro">assert_eq!</span>(ledger.held(), [lock(<span class="string">"1"</span>)]);
+<a href=#1269 id=1269 data-nosnippet>1269</a>    }
+<a href=#1270 id=1270 data-nosnippet>1270</a>
+<a href=#1271 id=1271 data-nosnippet>1271</a>    <span class="attr">#[test]
+<a href=#1272 id=1272 data-nosnippet>1272</a>    </span><span class="kw">fn </span>unknown_locks_count_while_a_table_references_them() {
+<a href=#1273 id=1273 data-nosnippet>1273</a>        <span class="kw">let </span>[parent, child] = [<span class="number">3</span>, <span class="number">4</span>].map(DetPid::from_raw);
+<a href=#1274 id=1274 data-nosnippet>1274</a>        <span class="kw">let </span><span class="kw-2">mut </span>ledger = LockLedger::default();
+<a href=#1275 id=1275 data-nosnippet>1275</a>        ledger.note_unknown(parent, description(<span class="number">0</span>), <span class="string">"EMFILE"</span>.to_string(), <span class="number">1</span>);
+<a href=#1276 id=1276 data-nosnippet>1276</a>        <span class="macro">assert_eq!</span>(ledger.unknown(), <span class="prelude-val">Some</span>(<span class="string">"EMFILE"</span>));
+<a href=#1277 id=1277 data-nosnippet>1277</a>        <span class="macro">assert!</span>(ledger.held().is_empty());
+<a href=#1278 id=1278 data-nosnippet>1278</a>        <span class="comment">// A fork's copy references it too; the parent's close leaves it
+<a href=#1279 id=1279 data-nosnippet>1279</a>        // unknown until the child's table goes as well.
+<a href=#1280 id=1280 data-nosnippet>1280</a>        </span>ledger.fork(parent, child, <span class="bool-val">false</span>);
+<a href=#1281 id=1281 data-nosnippet>1281</a>        ledger.release(parent, description(<span class="number">0</span>), <span class="number">0</span>);
+<a href=#1282 id=1282 data-nosnippet>1282</a>        <span class="macro">assert_eq!</span>(ledger.unknown(), <span class="prelude-val">Some</span>(<span class="string">"EMFILE"</span>));
+<a href=#1283 id=1283 data-nosnippet>1283</a>        ledger.prune(|process| process != child);
+<a href=#1284 id=1284 data-nosnippet>1284</a>        <span class="macro">assert_eq!</span>(ledger.unknown(), <span class="prelude-val">None</span>);
+<a href=#1285 id=1285 data-nosnippet>1285</a>        <span class="comment">// A later read that succeeds makes the locks known again.
+<a href=#1286 id=1286 data-nosnippet>1286</a>        </span>ledger.note_unknown(parent, description(<span class="number">1</span>), <span class="string">"EIO"</span>.to_string(), <span class="number">1</span>);
+<a href=#1287 id=1287 data-nosnippet>1287</a>        ledger.note_locks(parent, description(<span class="number">1</span>), <span class="macro">vec!</span>[lock(<span class="string">"0"</span>)], <span class="number">1</span>);
+<a href=#1288 id=1288 data-nosnippet>1288</a>        <span class="macro">assert_eq!</span>(ledger.unknown(), <span class="prelude-val">None</span>);
+<a href=#1289 id=1289 data-nosnippet>1289</a>        <span class="macro">assert_eq!</span>(ledger.held(), [lock(<span class="string">"0"</span>)]);
+<a href=#1290 id=1290 data-nosnippet>1290</a>        <span class="comment">// An exec keeps an unknown description its table still names.
+<a href=#1291 id=1291 data-nosnippet>1291</a>        </span>ledger.note_unknown(parent, description(<span class="number">1</span>), <span class="string">"ENFILE"</span>.to_string(), <span class="number">1</span>);
+<a href=#1292 id=1292 data-nosnippet>1292</a>        ledger.exec(parent);
+<a href=#1293 id=1293 data-nosnippet>1293</a>        <span class="macro">assert_eq!</span>(ledger.unknown(), <span class="prelude-val">None</span>);
+<a href=#1294 id=1294 data-nosnippet>1294</a>        ledger.exec_kept(parent, <span class="kw-2">&amp;</span>[(description(<span class="number">1</span>), <span class="number">1</span>)]);
+<a href=#1295 id=1295 data-nosnippet>1295</a>        <span class="macro">assert_eq!</span>(ledger.unknown(), <span class="prelude-val">Some</span>(<span class="string">"ENFILE"</span>));
+<a href=#1296 id=1296 data-nosnippet>1296</a>    }
+<a href=#1297 id=1297 data-nosnippet>1297</a>
+<a href=#1298 id=1298 data-nosnippet>1298</a>    <span class="attr">#[test]
+<a href=#1299 id=1299 data-nosnippet>1299</a>    </span><span class="kw">fn </span>kept_rows_preserve_order_and_the_final_newline() {
+<a href=#1300 id=1300 data-nosnippet>1300</a>        <span class="kw">let </span>contents = <span class="string">b"1: A\n2: B\n3: C\n"</span>;
+<a href=#1301 id=1301 data-nosnippet>1301</a>        <span class="macro">assert_eq!</span>(
+<a href=#1302 id=1302 data-nosnippet>1302</a>            keep_lock_rows(contents, <span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span>[<span class="bool-val">true</span>, <span class="bool-val">false</span>, <span class="bool-val">true</span>][..])),
+<a href=#1303 id=1303 data-nosnippet>1303</a>            <span class="string">b"1: A\n3: C\n"
+<a href=#1304 id=1304 data-nosnippet>1304</a>        </span>);
+<a href=#1305 id=1305 data-nosnippet>1305</a>        <span class="macro">assert_eq!</span>(
+<a href=#1306 id=1306 data-nosnippet>1306</a>            keep_lock_rows(<span class="string">b"1: A\n2: B"</span>, <span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span>[<span class="bool-val">false</span>, <span class="bool-val">true</span>][..])),
+<a href=#1307 id=1307 data-nosnippet>1307</a>            <span class="string">b"2: B"
+<a href=#1308 id=1308 data-nosnippet>1308</a>        </span>);
+<a href=#1309 id=1309 data-nosnippet>1309</a>        <span class="macro">assert_eq!</span>(keep_lock_rows(contents, <span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span>[<span class="bool-val">false</span>; <span class="number">3</span>][..])), <span class="string">b""</span>);
+<a href=#1310 id=1310 data-nosnippet>1310</a>        <span class="macro">assert_eq!</span>(keep_lock_rows(contents, <span class="prelude-val">None</span>), contents);
+<a href=#1311 id=1311 data-nosnippet>1311</a>        <span class="macro">assert_eq!</span>(keep_lock_rows(contents, <span class="prelude-val">Some</span>(<span class="kw-2">&amp;</span>[<span class="bool-val">true</span>][..])), <span class="string">b""</span>);
+<a href=#1312 id=1312 data-nosnippet>1312</a>    }
+<a href=#1313 id=1313 data-nosnippet>1313</a>
+<a href=#1314 id=1314 data-nosnippet>1314</a>    <span class="doccomment">/// `rows` rows of 50 bytes each, as a host's OFD locks print, numbered
+<a href=#1315 id=1315 data-nosnippet>1315</a>    /// from `first`: the part of a capture other tests do not care about.
+<a href=#1316 id=1316 data-nosnippet>1316</a>    </span><span class="kw">fn </span>filler(first: usize, rows: usize) -&gt; String {
+<a href=#1317 id=1317 data-nosnippet>1317</a>        <span class="kw">let </span><span class="kw-2">mut </span>out = String::new();
+<a href=#1318 id=1318 data-nosnippet>1318</a>        <span class="kw">for </span>sequence <span class="kw">in </span>first..first + rows {
+<a href=#1319 id=1319 data-nosnippet>1319</a>            <span class="kw">let </span>base = <span class="macro">format!</span>(<span class="string">"{sequence}: OFDLCK ADVISORY  WRITE -1 00:2a: 0 EOF\n"</span>).len();
+<a href=#1320 id=1320 data-nosnippet>1320</a>            out.push_str(<span class="kw-2">&amp;</span><span class="macro">format!</span>(
+<a href=#1321 id=1321 data-nosnippet>1321</a>                <span class="string">"{sequence}: OFDLCK ADVISORY  WRITE -1 00:2a:{inode:0width$} 0 EOF\n"</span>,
+<a href=#1322 id=1322 data-nosnippet>1322</a>                inode = <span class="number">7000 </span>+ sequence,
+<a href=#1323 id=1323 data-nosnippet>1323</a>                width = <span class="number">50 </span>- base,
+<a href=#1324 id=1324 data-nosnippet>1324</a>            ));
+<a href=#1325 id=1325 data-nosnippet>1325</a>        }
+<a href=#1326 id=1326 data-nosnippet>1326</a>        <span class="macro">assert_eq!</span>(out.len(), rows * <span class="number">50</span>);
+<a href=#1327 id=1327 data-nosnippet>1327</a>        out
+<a href=#1328 id=1328 data-nosnippet>1328</a>    }
+<a href=#1329 id=1329 data-nosnippet>1329</a>
+<a href=#1330 id=1330 data-nosnippet>1330</a>    <span class="kw">const </span>CHUNK: usize = <span class="number">64 </span>* <span class="number">1024</span>;
+<a href=#1331 id=1331 data-nosnippet>1331</a>
+<a href=#1332 id=1332 data-nosnippet>1332</a>    <span class="doccomment">/// What the capture keeps of `parts`, each part one read.
+<a href=#1333 id=1333 data-nosnippet>1333</a>    </span><span class="kw">fn </span>kept(parts: <span class="kw-2">&amp;</span>[<span class="kw-2">&amp;</span>str]) -&gt; String {
+<a href=#1334 id=1334 data-nosnippet>1334</a>        <span class="kw">let </span>contents = parts.concat();
+<a href=#1335 id=1335 data-nosnippet>1335</a>        <span class="kw">let </span>reads = parts.iter().map(|part| part.len()).collect::&lt;Vec&lt;<span class="kw">_</span>&gt;&gt;();
+<a href=#1336 id=1336 data-nosnippet>1336</a>        String::from_utf8(locks_capture_without_repeats(
+<a href=#1337 id=1337 data-nosnippet>1337</a>            contents.as_bytes(),
+<a href=#1338 id=1338 data-nosnippet>1338</a>            <span class="kw-2">&amp;</span>reads,
+<a href=#1339 id=1339 data-nosnippet>1339</a>            CHUNK,
+<a href=#1340 id=1340 data-nosnippet>1340</a>        ))
+<a href=#1341 id=1341 data-nosnippet>1341</a>        .expect(<span class="string">"the capture stays text"</span>)
+<a href=#1342 id=1342 data-nosnippet>1342</a>    }
+<a href=#1343 id=1343 data-nosnippet>1343</a>
+<a href=#1344 id=1344 data-nosnippet>1344</a>    <span class="doccomment">/// The guest's own rows, in one read.
+<a href=#1345 id=1345 data-nosnippet>1345</a>    </span><span class="kw">const </span>GUEST: <span class="kw-2">&amp;</span>str = <span class="string">"\
+<a href=#1346 id=1346 data-nosnippet>1346</a>238: OFDLCK ADVISORY  WRITE -1 00:2a:3843038210 0 EOF
+<a href=#1347 id=1347 data-nosnippet>1347</a>239: POSIX  ADVISORY  WRITE 3 00:2a:3843038209 0 EOF
+<a href=#1348 id=1348 data-nosnippet>1348</a>"</span>;
+<a href=#1349 id=1349 data-nosnippet>1349</a>    <span class="doccomment">/// The guest's POSIX row printed again by a closing read, renumbered.
+<a href=#1350 id=1350 data-nosnippet>1350</a>    </span><span class="kw">const </span>REPEAT: <span class="kw-2">&amp;</span>str = <span class="string">"243: POSIX  ADVISORY  WRITE 3 00:2a:3843038209 0 EOF\n"</span>;
+<a href=#1351 id=1351 data-nosnippet>1351</a>    <span class="doccomment">/// A lock the host added between the reads.
+<a href=#1352 id=1352 data-nosnippet>1352</a>    </span><span class="kw">const </span>ADDED: <span class="kw-2">&amp;</span>str = <span class="string">"241: OFDLCK ADVISORY  WRITE -1 00:2a:3843038208 0 0\n"</span>;
+<a href=#1353 id=1353 data-nosnippet>1353</a>
+<a href=#1354 id=1354 data-nosnippet>1354</a>    <span class="attr">#[test]
+<a href=#1355 id=1355 data-nosnippet>1355</a>    </span><span class="kw">fn </span>the_race_repeats_are_dropped_and_an_added_lock_stays() {
+<a href=#1356 id=1356 data-nosnippet>1356</a>        <span class="comment">// The shape the pinned host_locks test caught (reads of 107 and 159
+<a href=#1357 id=1357 data-nosnippet>1357</a>        // bytes): the host added four locks on the guest's CPU, ahead of the
+<a href=#1358 id=1358 data-nosnippet>1358</a>        // guest's rows; the closing read printed the one visible added lock
+<a href=#1359 id=1359 data-nosnippet>1359</a>        // and both guest rows again, renumbered.
+<a href=#1360 id=1360 data-nosnippet>1360</a>        </span><span class="kw">let </span>closing =
+<a href=#1361 id=1361 data-nosnippet>1361</a>            <span class="macro">format!</span>(<span class="string">"{ADDED}242: OFDLCK ADVISORY  WRITE -1 00:2a:3843038210 0 EOF\n{REPEAT}"</span>);
+<a href=#1362 id=1362 data-nosnippet>1362</a>        <span class="macro">assert_eq!</span>((GUEST.len(), closing.len()), (<span class="number">107</span>, <span class="number">159</span>));
+<a href=#1363 id=1363 data-nosnippet>1363</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[GUEST, <span class="kw-2">&amp;</span>closing]), <span class="macro">format!</span>(<span class="string">"{GUEST}{ADDED}"</span>));
+<a href=#1364 id=1364 data-nosnippet>1364</a>        <span class="comment">// One addition behind the guest's rows: the last row again; or
+<a href=#1365 id=1365 data-nosnippet>1365</a>        // several closing reads, several times.
+<a href=#1366 id=1366 data-nosnippet>1366</a>        </span><span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[GUEST, REPEAT]), GUEST);
+<a href=#1367 id=1367 data-nosnippet>1367</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[GUEST, REPEAT, REPEAT, REPEAT]), GUEST);
+<a href=#1368 id=1368 data-nosnippet>1368</a>        <span class="comment">// An added lock repeated by a later closing read goes too.
+<a href=#1369 id=1369 data-nosnippet>1369</a>        </span><span class="macro">assert_eq!</span>(
+<a href=#1370 id=1370 data-nosnippet>1370</a>            kept(<span class="kw-2">&amp;</span>[GUEST, ADDED, REPEAT, ADDED]),
+<a href=#1371 id=1371 data-nosnippet>1371</a>            <span class="macro">format!</span>(<span class="string">"{GUEST}{ADDED}"</span>)
+<a href=#1372 id=1372 data-nosnippet>1372</a>        );
+<a href=#1373 id=1373 data-nosnippet>1373</a>        <span class="comment">// Nothing after the read: nothing to drop.
+<a href=#1374 id=1374 data-nosnippet>1374</a>        </span><span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[GUEST]), GUEST);
+<a href=#1375 id=1375 data-nosnippet>1375</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[]), <span class="string">""</span>);
+<a href=#1376 id=1376 data-nosnippet>1376</a>    }
+<a href=#1377 id=1377 data-nosnippet>1377</a>
+<a href=#1378 id=1378 data-nosnippet>1378</a>    <span class="attr">#[test]
+<a href=#1379 id=1379 data-nosnippet>1379</a>    </span><span class="kw">fn </span>a_row_nobody_read_is_kept_although_the_lengths_pass() {
+<a href=#1380 id=1380 data-nosnippet>1380</a>        <span class="comment">// Codex's case: a 3000-byte read stops at a guest lock whose host
+<a href=#1381 id=1381 data-nosnippet>1381</a>        // waiters need at least 1096 bytes; they cancel before the next read,
+<a href=#1382 id=1382 data-nosnippet>1382</a>        // which returns the guest's root row alone, 80 bytes. The lengths
+<a href=#1383 id=1383 data-nosnippet>1383</a>        // pass (3000 + 80 &lt; 4096), but the row was never read, so it stays.
+<a href=#1384 id=1384 data-nosnippet>1384</a>        </span><span class="kw">let </span>prefix = filler(<span class="number">1</span>, <span class="number">60</span>);
+<a href=#1385 id=1385 data-nosnippet>1385</a>        <span class="kw">let </span>shrunk = <span class="macro">format!</span>(<span class="string">"61: POSIX  ADVISORY  WRITE 1 00:2a:{:038} 0 EOF\n"</span>, <span class="number">1002</span>);
+<a href=#1386 id=1386 data-nosnippet>1386</a>        <span class="macro">assert_eq!</span>((prefix.len(), shrunk.len()), (<span class="number">3000</span>, <span class="number">80</span>));
+<a href=#1387 id=1387 data-nosnippet>1387</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[<span class="kw-2">&amp;</span>prefix, <span class="kw-2">&amp;</span>shrunk]), <span class="macro">format!</span>(<span class="string">"{prefix}{shrunk}"</span>));
+<a href=#1388 id=1388 data-nosnippet>1388</a>        <span class="comment">// DS's case: a 4050-byte read stops at a host record the host then
+<a href=#1389 id=1389 data-nosnippet>1389</a>        // releases, and the next read returns the guest's last POSIX row,
+<a href=#1390 id=1390 data-nosnippet>1390</a>        // about 40 bytes (4050 + 41 &lt; 4096).
+<a href=#1391 id=1391 data-nosnippet>1391</a>        </span><span class="kw">let </span>prefix = filler(<span class="number">1</span>, <span class="number">81</span>);
+<a href=#1392 id=1392 data-nosnippet>1392</a>        <span class="kw">let </span>row = <span class="string">"82: POSIX  ADVISORY  WRITE 1 00:2a:1 0 0\n"</span>;
+<a href=#1393 id=1393 data-nosnippet>1393</a>        <span class="macro">assert_eq!</span>((prefix.len(), row.len()), (<span class="number">4050</span>, <span class="number">41</span>));
+<a href=#1394 id=1394 data-nosnippet>1394</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[<span class="kw-2">&amp;</span>prefix, row]), <span class="macro">format!</span>(<span class="string">"{prefix}{row}"</span>));
+<a href=#1395 id=1395 data-nosnippet>1395</a>        <span class="comment">// A row nobody read beside a repeat: the row stays, the repeat goes.
+<a href=#1396 id=1396 data-nosnippet>1396</a>        </span><span class="kw">let </span>new = <span class="string">"4: FLOCK  ADVISORY  WRITE 1 00:2a:1003 0 EOF\n"</span>;
+<a href=#1397 id=1397 data-nosnippet>1397</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[GUEST, REPEAT, new]), <span class="macro">format!</span>(<span class="string">"{GUEST}{new}"</span>));
+<a href=#1398 id=1398 data-nosnippet>1398</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[GUEST, new, REPEAT]), <span class="macro">format!</span>(<span class="string">"{GUEST}{new}"</span>));
+<a href=#1399 id=1399 data-nosnippet>1399</a>    }
+<a href=#1400 id=1400 data-nosnippet>1400</a>
+<a href=#1401 id=1401 data-nosnippet>1401</a>    <span class="attr">#[test]
+<a href=#1402 id=1402 data-nosnippet>1402</a>    </span><span class="kw">fn </span>an_identical_row_is_dropped_only_as_a_repeat_after_a_provable_end() {
+<a href=#1403 id=1403 data-nosnippet>1403</a>        <span class="comment">// Two identical shared OFD rows exist natively (two descriptions, one
+<a href=#1404 id=1404 data-nosnippet>1404</a>        // range of one file). When the second stopped the first read by not
+<a href=#1405 id=1405 data-nosnippet>1405</a>        // fitting in the page, the reads after it return at least what the
+<a href=#1406 id=1406 data-nosnippet>1406</a>        // page had left, so the lengths keep it though it repeats the first.
+<a href=#1407 id=1407 data-nosnippet>1407</a>        </span><span class="kw">let </span>row = <span class="string">"OFDLCK ADVISORY  READ  -1 00:2a:1009 0 EOF\n"</span>;
+<a href=#1408 id=1408 data-nosnippet>1408</a>        <span class="kw">let </span>second = <span class="macro">format!</span>(<span class="string">"82: {row}"</span>);
+<a href=#1409 id=1409 data-nosnippet>1409</a>        <span class="kw">let </span>first_read = <span class="macro">format!</span>(<span class="string">"{}81: {row}"</span>, filler(<span class="number">1</span>, <span class="number">80</span>));
+<a href=#1410 id=1410 data-nosnippet>1410</a>        <span class="comment">// Widen one filler row so that the first read and the second row
+<a href=#1411 id=1411 data-nosnippet>1411</a>        // together are exactly a page: the second row did not fit.
+<a href=#1412 id=1412 data-nosnippet>1412</a>        </span><span class="kw">let </span>pad = <span class="number">4096 </span>- first_read.len() - second.len();
+<a href=#1413 id=1413 data-nosnippet>1413</a>        <span class="kw">let </span>widened = <span class="macro">format!</span>(
+<a href=#1414 id=1414 data-nosnippet>1414</a>            <span class="string">"{}80: OFDLCK ADVISORY  WRITE -1 00:2a:{:0width$} 0 EOF\n81: {row}"</span>,
+<a href=#1415 id=1415 data-nosnippet>1415</a>            filler(<span class="number">1</span>, <span class="number">79</span>),
+<a href=#1416 id=1416 data-nosnippet>1416</a>            <span class="number">1</span>,
+<a href=#1417 id=1417 data-nosnippet>1417</a>            width = <span class="number">50 </span>+ pad - <span class="string">"80: OFDLCK ADVISORY  WRITE -1 00:2a: 0 EOF\n"</span>.len(),
+<a href=#1418 id=1418 data-nosnippet>1418</a>        );
+<a href=#1419 id=1419 data-nosnippet>1419</a>        <span class="macro">assert_eq!</span>(widened.len() + second.len(), <span class="number">4096</span>);
+<a href=#1420 id=1420 data-nosnippet>1420</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[<span class="kw-2">&amp;</span>widened, <span class="kw-2">&amp;</span>second]), <span class="macro">format!</span>(<span class="string">"{widened}{second}"</span>));
+<a href=#1421 id=1421 data-nosnippet>1421</a>        <span class="comment">// Below the page, the same row after the same prefix can only be a
+<a href=#1422 id=1422 data-nosnippet>1422</a>        // repeat past the end, which is what the closing read prints: dropped.
+<a href=#1423 id=1423 data-nosnippet>1423</a>        // Were it genuine, the list changed between the reads (the residual
+<a href=#1424 id=1424 data-nosnippet>1424</a>        // the function documents): the snapshot shows one of the two rows.
+<a href=#1425 id=1425 data-nosnippet>1425</a>        </span><span class="macro">assert!</span>(first_read.len() + second.len() &lt; <span class="number">4096</span>);
+<a href=#1426 id=1426 data-nosnippet>1426</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[<span class="kw-2">&amp;</span>first_read, <span class="kw-2">&amp;</span>second]), first_read);
+<a href=#1427 id=1427 data-nosnippet>1427</a>    }
+<a href=#1428 id=1428 data-nosnippet>1428</a>
+<a href=#1429 id=1429 data-nosnippet>1429</a>    <span class="attr">#[test]
+<a href=#1430 id=1430 data-nosnippet>1430</a>    </span><span class="kw">fn </span>a_repeat_is_its_granted_lock_whatever_its_waiters() {
+<a href=#1431 id=1431 data-nosnippet>1431</a>        <span class="kw">let </span>tree = <span class="string">"\
+<a href=#1432 id=1432 data-nosnippet>1432</a>5: POSIX  ADVISORY  WRITE 3 00:2a:1004 0 EOF
+<a href=#1433 id=1433 data-nosnippet>1433</a>5: -&gt; POSIX  ADVISORY  WRITE 0 00:2a:1004 0 EOF
+<a href=#1434 id=1434 data-nosnippet>1434</a>5:  -&gt; POSIX  ADVISORY  WRITE 0 00:2a:1004 0 EOF
+<a href=#1435 id=1435 data-nosnippet>1435</a>"</span>;
+<a href=#1436 id=1436 data-nosnippet>1436</a>        <span class="comment">// The tree again, renumbered.
+<a href=#1437 id=1437 data-nosnippet>1437</a>        </span><span class="kw">let </span>repeat = tree.replace(<span class="string">"5:"</span>, <span class="string">"9:"</span>);
+<a href=#1438 id=1438 data-nosnippet>1438</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[tree, <span class="kw-2">&amp;</span>repeat]), tree);
+<a href=#1439 id=1439 data-nosnippet>1439</a>        <span class="comment">// The same granted lock with fewer waiters (one gave up between the
+<a href=#1440 id=1440 data-nosnippet>1440</a>        // reads), or none, or more: still the one lock, so a repeat, and the
+<a href=#1441 id=1441 data-nosnippet>1441</a>        // tree one walk printed is the one kept.
+<a href=#1442 id=1442 data-nosnippet>1442</a>        </span><span class="kw">let </span>fewer = <span class="string">"9: POSIX  ADVISORY  WRITE 3 00:2a:1004 0 EOF\n\
+<a href=#1443 id=1443 data-nosnippet>1443</a>                     9: -&gt; POSIX  ADVISORY  WRITE 0 00:2a:1004 0 EOF\n"</span>;
+<a href=#1444 id=1444 data-nosnippet>1444</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[tree, fewer]), tree);
+<a href=#1445 id=1445 data-nosnippet>1445</a>        <span class="kw">let </span>root = <span class="string">"9: POSIX  ADVISORY  WRITE 3 00:2a:1004 0 EOF\n"</span>;
+<a href=#1446 id=1446 data-nosnippet>1446</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[tree, root]), tree);
+<a href=#1447 id=1447 data-nosnippet>1447</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[root, tree]), root);
+<a href=#1448 id=1448 data-nosnippet>1448</a>        <span class="comment">// A repeated tree beside a lock nobody read: the tree goes, the new
+<a href=#1449 id=1449 data-nosnippet>1449</a>        // lock stays.
+<a href=#1450 id=1450 data-nosnippet>1450</a>        </span><span class="kw">let </span>other = <span class="string">"10: POSIX  ADVISORY  WRITE 3 00:2a:1005 0 EOF\n"</span>;
+<a href=#1451 id=1451 data-nosnippet>1451</a>        <span class="macro">assert_eq!</span>(
+<a href=#1452 id=1452 data-nosnippet>1452</a>            kept(<span class="kw-2">&amp;</span>[tree, <span class="kw-2">&amp;</span><span class="macro">format!</span>(<span class="string">"{fewer}{other}"</span>)]),
+<a href=#1453 id=1453 data-nosnippet>1453</a>            <span class="macro">format!</span>(<span class="string">"{tree}{other}"</span>)
+<a href=#1454 id=1454 data-nosnippet>1454</a>        );
+<a href=#1455 id=1455 data-nosnippet>1455</a>        <span class="comment">// A different range, access or owner is another lock: kept.
+<a href=#1456 id=1456 data-nosnippet>1456</a>        </span><span class="kw">for </span>changed <span class="kw">in </span>[
+<a href=#1457 id=1457 data-nosnippet>1457</a>            <span class="string">"9: POSIX  ADVISORY  WRITE 3 00:2a:1004 0 9\n"</span>,
+<a href=#1458 id=1458 data-nosnippet>1458</a>            <span class="string">"9: POSIX  ADVISORY  READ  3 00:2a:1004 0 EOF\n"</span>,
+<a href=#1459 id=1459 data-nosnippet>1459</a>            <span class="string">"9: POSIX  ADVISORY  WRITE 4 00:2a:1004 0 EOF\n"</span>,
+<a href=#1460 id=1460 data-nosnippet>1460</a>            <span class="string">"9: FLOCK  ADVISORY  WRITE 3 00:2a:1004 0 EOF\n"</span>,
+<a href=#1461 id=1461 data-nosnippet>1461</a>        ] {
+<a href=#1462 id=1462 data-nosnippet>1462</a>            <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[tree, changed]), <span class="macro">format!</span>(<span class="string">"{tree}{changed}"</span>));
+<a href=#1463 id=1463 data-nosnippet>1463</a>        }
+<a href=#1464 id=1464 data-nosnippet>1464</a>        <span class="comment">// A tail that begins with a waiter is not whole records: all kept.
+<a href=#1465 id=1465 data-nosnippet>1465</a>        </span><span class="kw">let </span>orphan = <span class="string">"9: -&gt; POSIX  ADVISORY  WRITE 0 00:2a:1004 0 EOF\n"</span>;
+<a href=#1466 id=1466 data-nosnippet>1466</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[tree, orphan]), <span class="macro">format!</span>(<span class="string">"{tree}{orphan}"</span>));
+<a href=#1467 id=1467 data-nosnippet>1467</a>    }
+<a href=#1468 id=1468 data-nosnippet>1468</a>
+<a href=#1469 id=1469 data-nosnippet>1469</a>    <span class="attr">#[test]
+<a href=#1470 id=1470 data-nosnippet>1470</a>    </span><span class="kw">fn </span>a_lease_that_started_breaking_is_a_repeat() {
+<a href=#1471 id=1471 data-nosnippet>1471</a>        <span class="comment">// A host open of the file starts a break between the reads: the
+<a href=#1472 id=1472 data-nosnippet>1472</a>        // lease prints BREAKING, the access it breaks to, and the breaker
+<a href=#1473 id=1473 data-nosnippet>1473</a>        // queued behind it. It is the same lease.
+<a href=#1474 id=1474 data-nosnippet>1474</a>        </span><span class="kw">let </span>active = <span class="string">"7: LEASE  ACTIVE    WRITE 3 00:2a:1006 0 EOF\n"</span>;
+<a href=#1475 id=1475 data-nosnippet>1475</a>        <span class="kw">let </span>breaking = <span class="string">"\
+<a href=#1476 id=1476 data-nosnippet>1476</a>11: LEASE  BREAKING  READ  3 00:2a:1006 0 EOF
+<a href=#1477 id=1477 data-nosnippet>1477</a>11: -&gt; LEASE  BREAKER   UNLCK 0 00:2a:1006 0 EOF
+<a href=#1478 id=1478 data-nosnippet>1478</a>"</span>;
+<a href=#1479 id=1479 data-nosnippet>1479</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[active, breaking]), active);
+<a href=#1480 id=1480 data-nosnippet>1480</a>        <span class="comment">// Another file's lease is another lease.
+<a href=#1481 id=1481 data-nosnippet>1481</a>        </span><span class="kw">let </span>elsewhere = <span class="string">"11: LEASE  ACTIVE    WRITE 3 00:2a:1007 0 EOF\n"</span>;
+<a href=#1482 id=1482 data-nosnippet>1482</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[active, elsewhere]), <span class="macro">format!</span>(<span class="string">"{active}{elsewhere}"</span>));
+<a href=#1483 id=1483 data-nosnippet>1483</a>    }
+<a href=#1484 id=1484 data-nosnippet>1484</a>
+<a href=#1485 id=1485 data-nosnippet>1485</a>    <span class="attr">#[test]
+<a href=#1486 id=1486 data-nosnippet>1486</a>    </span><span class="kw">fn </span>a_guest_root_whose_host_waiters_gave_up_shows_once_through_the_filter() {
+<a href=#1487 id=1487 data-nosnippet>1487</a>        <span class="comment">// Codex's round-2 case: read 1 reaches the end with the guest's POSIX
+<a href=#1488 id=1488 data-nosnippet>1488</a>        // root (pid 3) and two host waiters (pid 0, outside the namespace);
+<a href=#1489 id=1489 data-nosnippet>1489</a>        // the waiters give up and the host adds hidden locks ahead of the
+<a href=#1490 id=1490 data-nosnippet>1490</a>        // root, so the closing read prints the root again without them.
+<a href=#1491 id=1491 data-nosnippet>1491</a>        </span><span class="kw">let </span>first = <span class="string">"\
+<a href=#1492 id=1492 data-nosnippet>1492</a>239: POSIX  ADVISORY  WRITE 3 00:2a:1004 0 EOF
+<a href=#1493 id=1493 data-nosnippet>1493</a>239: -&gt; POSIX  ADVISORY  WRITE 0 00:2a:1004 0 EOF
+<a href=#1494 id=1494 data-nosnippet>1494</a>239:  -&gt; POSIX  ADVISORY  WRITE 0 00:2a:1004 0 EOF
+<a href=#1495 id=1495 data-nosnippet>1495</a>"</span>;
+<a href=#1496 id=1496 data-nosnippet>1496</a>        <span class="kw">let </span>closing = <span class="string">"243: POSIX  ADVISORY  WRITE 3 00:2a:1004 0 EOF\n"</span>;
+<a href=#1497 id=1497 data-nosnippet>1497</a>        <span class="kw">let </span>capture = kept(<span class="kw-2">&amp;</span>[first, closing]);
+<a href=#1498 id=1498 data-nosnippet>1498</a>        <span class="kw">let </span>rows = lock_rows(capture.as_bytes()).expect(<span class="string">"the capture parses"</span>);
+<a href=#1499 id=1499 data-nosnippet>1499</a>        <span class="kw">let </span>keep = guest_lock_rows(<span class="kw-2">&amp;</span>rows, guest, <span class="kw-2">&amp;</span>[]);
+<a href=#1500 id=1500 data-nosnippet>1500</a>        <span class="kw">let </span>shown = String::from_utf8(keep_lock_rows(capture.as_bytes(), <span class="prelude-val">Some</span>(keep.as_slice())))
+<a href=#1501 id=1501 data-nosnippet>1501</a>            .expect(<span class="string">"the rows stay text"</span>);
+<a href=#1502 id=1502 data-nosnippet>1502</a>        <span class="macro">assert_eq!</span>(shown, <span class="string">"239: POSIX  ADVISORY  WRITE 3 00:2a:1004 0 EOF\n"</span>);
+<a href=#1503 id=1503 data-nosnippet>1503</a>    }
+<a href=#1504 id=1504 data-nosnippet>1504</a>
+<a href=#1505 id=1505 data-nosnippet>1505</a>    <span class="attr">#[test]
+<a href=#1506 id=1506 data-nosnippet>1506</a>    </span><span class="kw">fn </span>only_a_short_read_below_a_page_can_end_the_capture() {
+<a href=#1507 id=1507 data-nosnippet>1507</a>        <span class="kw">let </span>capture = |contents: <span class="kw-2">&amp;</span>str, reads: <span class="kw-2">&amp;</span>[usize], chunk: usize| {
+<a href=#1508 id=1508 data-nosnippet>1508</a>            String::from_utf8(locks_capture_without_repeats(
+<a href=#1509 id=1509 data-nosnippet>1509</a>                contents.as_bytes(),
+<a href=#1510 id=1510 data-nosnippet>1510</a>                reads,
+<a href=#1511 id=1511 data-nosnippet>1511</a>                chunk,
+<a href=#1512 id=1512 data-nosnippet>1512</a>            ))
+<a href=#1513 id=1513 data-nosnippet>1513</a>            .expect(<span class="string">"the capture stays text"</span>)
+<a href=#1514 id=1514 data-nosnippet>1514</a>        };
+<a href=#1515 id=1515 data-nosnippet>1515</a>        <span class="comment">// A read that filled the caller's buffer may have stopped anywhere.
+<a href=#1516 id=1516 data-nosnippet>1516</a>        </span><span class="kw">let </span>contents = <span class="macro">format!</span>(<span class="string">"{GUEST}{REPEAT}"</span>);
+<a href=#1517 id=1517 data-nosnippet>1517</a>        <span class="macro">assert_eq!</span>(
+<a href=#1518 id=1518 data-nosnippet>1518</a>            capture(<span class="kw-2">&amp;</span>contents, <span class="kw-2">&amp;</span>[GUEST.len(), REPEAT.len()], GUEST.len()),
+<a href=#1519 id=1519 data-nosnippet>1519</a>            contents
+<a href=#1520 id=1520 data-nosnippet>1520</a>        );
+<a href=#1521 id=1521 data-nosnippet>1521</a>        <span class="comment">// A host list over several pages, each read stopping at a page, whose
+<a href=#1522 id=1522 data-nosnippet>1522</a>        // last read reached the end, followed by a repeat of its last row.
+<a href=#1523 id=1523 data-nosnippet>1523</a>        </span><span class="kw">let </span>(one, two) = (filler(<span class="number">1</span>, <span class="number">81</span>), filler(<span class="number">82</span>, <span class="number">81</span>));
+<a href=#1524 id=1524 data-nosnippet>1524</a>        <span class="kw">let </span>three = <span class="macro">format!</span>(<span class="string">"{}{GUEST}"</span>, filler(<span class="number">163</span>, <span class="number">70</span>));
+<a href=#1525 id=1525 data-nosnippet>1525</a>        <span class="kw">let </span>all = <span class="macro">format!</span>(<span class="string">"{one}{two}{three}"</span>);
+<a href=#1526 id=1526 data-nosnippet>1526</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[<span class="kw-2">&amp;</span>one, <span class="kw-2">&amp;</span>two, <span class="kw-2">&amp;</span>three, REPEAT]), all);
+<a href=#1527 id=1527 data-nosnippet>1527</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[<span class="kw-2">&amp;</span>one, <span class="kw-2">&amp;</span>two, <span class="kw-2">&amp;</span>three]), all);
+<a href=#1528 id=1528 data-nosnippet>1528</a>        <span class="comment">// A burst of additions too large for the length test, in one closing
+<a href=#1529 id=1529 data-nosnippet>1529</a>        // read with the repeat: all kept.
+<a href=#1530 id=1530 data-nosnippet>1530</a>        </span><span class="kw">let </span>burst = <span class="macro">format!</span>(<span class="string">"{}{REPEAT}"</span>, filler(<span class="number">400</span>, <span class="number">80</span>));
+<a href=#1531 id=1531 data-nosnippet>1531</a>        <span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[GUEST, <span class="kw-2">&amp;</span>burst]), <span class="macro">format!</span>(<span class="string">"{GUEST}{burst}"</span>));
+<a href=#1532 id=1532 data-nosnippet>1532</a>        <span class="comment">// Lengths that disagree with the bytes decide nothing.
+<a href=#1533 id=1533 data-nosnippet>1533</a>        </span><span class="macro">assert_eq!</span>(capture(<span class="kw-2">&amp;</span>contents, <span class="kw-2">&amp;</span>[GUEST.len()], CHUNK), contents);
+<a href=#1534 id=1534 data-nosnippet>1534</a>        <span class="comment">// Bytes that are not whole lock rows are never dropped.
+<a href=#1535 id=1535 data-nosnippet>1535</a>        </span><span class="macro">assert_eq!</span>(kept(<span class="kw-2">&amp;</span>[GUEST, <span class="string">"garbage\n"</span>]), <span class="macro">format!</span>(<span class="string">"{GUEST}garbage\n"</span>));
+<a href=#1536 id=1536 data-nosnippet>1536</a>        <span class="kw">let </span>unterminated = REPEAT.trim_end();
+<a href=#1537 id=1537 data-nosnippet>1537</a>        <span class="macro">assert_eq!</span>(
+<a href=#1538 id=1538 data-nosnippet>1538</a>            kept(<span class="kw-2">&amp;</span>[GUEST, unterminated]),
+<a href=#1539 id=1539 data-nosnippet>1539</a>            <span class="macro">format!</span>(<span class="string">"{GUEST}{unterminated}"</span>)
+<a href=#1540 id=1540 data-nosnippet>1540</a>        );
+<a href=#1541 id=1541 data-nosnippet>1541</a>    }
+<a href=#1542 id=1542 data-nosnippet>1542</a>}
+</code></pre></div></section></main></body></html>

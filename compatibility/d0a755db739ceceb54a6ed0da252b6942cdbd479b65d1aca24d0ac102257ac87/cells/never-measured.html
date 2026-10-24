@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Hermit test results and backend comparisons">
+  <title>Never measured · Hermit compatibility</title>
+  <link rel="icon" type="image/svg+xml" href="../assets/favicon.svg">
+  <link rel="stylesheet" href="../assets/site.css?v=8d1300d1b6968066">
+  <script src="../assets/site.js?v=5c0c6d6a039c57dc" defer></script>
+</head>
+<body data-page-kind="never-list" data-site-root="../index.html" data-site-manifest="../data/site-manifest.json.gz">
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+  <header class="site-header">
+    
+    
+    <p class="site-feedback"><a class="external-link" href="https://github.com/rrnewton/hermit/issues" aria-label="Questions or feedback? Visit Hermit issues on GitHub (external link)">Questions or feedback? Visit Hermit issues<span class="external-link-indicator" aria-hidden="true">↗</span></a></p>
+    <div class="site-navigation"><p class="site-name">Hermit compatibility</p>
+    <nav class="primary-navigation" aria-label="Primary navigation"><a href="../index.html">Overview</a><a href="index.html">Cells</a><a href="../tests/index.html">Tests</a><a href="../runs/index.html">Validation runs</a></nav></div>
+  </header>
+  <nav class="breadcrumbs" aria-label="Breadcrumb"><ol><li><a href="../index.html">Overview</a></li><li aria-current="page">Never measured</li></ol></nav>
+  <main id="main-content" tabindex="-1">
+    <header class="page-heading"><h1>Never measured</h1><p>Runnable cells with no usable test result.</p></header>
+    
+    <p class="data-status" data-load-status data-load-state="loading" role="status">Loading verified local data…</p>
+    <section id="cell-filters"><h2>Search and filter</h2><p><a href="index.html#all-cells">Results</a>. The table updates immediately as you type or choose a filter.</p><p><strong>State:</strong> Never measured.</p>
+    <form class="cell-filters" data-cell-filter-form hidden>
+      <fieldset><legend>Find cells</legend>
+        <label class="search-control">Search cells (updates as you type) <input name="q" type="search" maxlength="256" aria-controls="cell-results"></label>
+        <input name="page" type="hidden" value="1">
+        <label>Lane <select name="lane"><option value="">All</option></select></label>
+        <label>Category <select name="category"><option value="">All</option></select></label>
+        <label>Mode <select name="mode"><option value="">All</option></select></label>
+        <label>Backend <select name="backend"><option value="">All</option></select></label>
+        <input name="state" type="hidden" value="never-measured">
+        <label>Latest result <select name="result"><option value="">All</option><option value="pass">Pass</option><option value="product_failure">Fail</option><option value="timeout">Timeout</option></select></label>
+        <label>Reference population <select name="reference"><option value="">All</option><option value="in">In the reference population</option><option value="out">Outside the reference population</option></select></label>
+        <label>Determinism comparison <select name="determinism"><option value="">All</option><option value="matched">Matched</option><option value="diverged">Diverged</option><option value="unavailable">No accepted comparison</option></select></label>
+        <label>Determinism number <select name="headline"><option value="">All</option><option value="counted">Counted in a backend&#x27;s determinism number</option><option value="not-counted">Not counted</option></select></label>
+        <label>Selected by path <select name="selected_by_path"><option value="">All</option><option value="full">full</option><option value="only-hosted-portable">only-hosted-portable</option><option value="recorded">recorded</option></select></label>
+        <label>Current main ancestry <select name="current_main_ancestry"><option value="">All</option><option value="true">True</option><option value="false">False</option></select></label>
+        <label>Host capability <select name="host_capability"><option value="">All</option><option value="cpuid-faulting">cpuid-faulting</option><option value="kvm">kvm</option></select></label>
+        <label>Host capability present <select name="host_capability_present"><option value="">All</option><option value="true">Present</option><option value="false">Not present</option></select></label>
+        <label>Population <select name="population"><option value="in_manifest">In the manifest</option><option value="not_in_current_manifest">Recorded identity outside current manifest</option></select></label>
+        <select name="evidence" hidden><option value=""></option><option value="complete">Recorded</option></select>
+      </fieldset>
+      <div class="mobile-table-order">
+        <label>Order <select name="sort" aria-label="Sort"><option value="manifest">Manifest order</option><option value="cell">Cell</option><option value="test">TestName</option><option value="lane">Lane</option><option value="category">Category</option><option value="mode">Mode</option><option value="backend">Backend</option><option value="selected_by_path">Selected by path</option><option value="state">State</option><option value="result">Latest result</option><option value="latest_result_time">Latest result time</option><option value="latest_result_tree">Latest result tree</option><option value="physical_row_count">Physical rows</option><option value="represented_run_count">Represented Hermit runs</option></select></label>
+        <label>Direction <select name="direction" aria-label="Sort direction"><option value="asc">Ascending</option><option value="desc">Descending</option></select></label>
+      </div>
+      <div class="filter-actions"><button type="button" data-clear-cell-filters>Clear filters</button></div>
+      <output class="filter-live-summary" data-cell-filter-live-summary role="status" aria-live="polite" aria-atomic="true">Loading filterable results…</output>
+    </form>
+      <p id="cell-filter-error" class="notice" hidden></p><p id="cell-filter-empty" hidden>No rows match these filters.</p>
+      <p id="cell-filter-counts" hidden><strong data-matching-count>0</strong> <span data-matching-label>matching cells</span>; <span data-evidence-label>those cells have</span> <strong data-physical-count>0</strong> physical rows representing <strong data-represented-count>0</strong> Hermit runs.</p>
+    </section>
+    <section id="test-matrix"><h2>Test Matrix</h2>
+      <nav class="list-pagination matrix-pagination" data-cell-pagination data-page-size="50" aria-label="Cell result pages" hidden>
+        <button type="button" data-cell-previous>Previous</button>
+        <span aria-live="polite" data-cell-page-summary>Showing all cells.</span>
+        <button type="button" data-cell-next>Next</button>
+      </nav>
+      <div id="all-cells" data-in-manifest-listing>
+        <p>11,286 cells are in the manifest; this table has 0 rows. Each row is a runnable cell with no usable test result. 7,451 unsupported or disabled combinations with no usable result are excluded. Their test pages explain why.</p>
+        <div class="table-scroll"><table class="responsive-record-table"><caption>Runnable cells with no usable test result.</caption><thead><tr><th scope="col" aria-sort="none"><button type="button" class="table-sort" data-cell-sort="category" title="The group containing this test." aria-label="Sort by Category. The group containing this test."><span>Category</span><span class="sort-indicator" aria-hidden="true"></span></button></th><th scope="col" aria-sort="none"><button type="button" class="table-sort" data-cell-sort="test" title="The test identifier with its Category prefix omitted; the link opens this test, mode, and backend cell." aria-label="Sort by TestName. The test identifier with its Category prefix omitted; the link opens this test, mode, and backend cell."><span>TestName</span><span class="sort-indicator" aria-hidden="true"></span></button></th><th scope="col" aria-sort="none"><button type="button" class="table-sort" data-cell-sort="mode" title="The Hermit action used for this cell." aria-label="Sort by Mode. The Hermit action used for this cell."><span>Mode</span><span class="sort-indicator" aria-hidden="true"></span></button></th><th scope="col" aria-sort="none"><button type="button" class="table-sort" data-cell-sort="backend" title="The execution backend used for this cell." aria-label="Sort by Backend. The execution backend used for this cell."><span>Backend</span><span class="sort-indicator" aria-hidden="true"></span></button></th><th scope="col" aria-sort="none"><button type="button" class="table-sort" data-cell-sort="lane" title="The validation group that runs this test." aria-label="Sort by Lane. The validation group that runs this test."><span>Lane</span><span class="sort-indicator" aria-hidden="true"></span></button></th><th scope="col" aria-sort="none"><button type="button" class="table-sort" data-cell-sort="result" title="The latest recorded result: Pass, Fail, or Timeout. Never measured means no qualifying result is recorded. Missing or conflicting results are listed in the data audit." aria-label="Sort by Latest result. The latest recorded result: Pass, Fail, or Timeout. Never measured means no qualifying result is recorded. Missing or conflicting results are listed in the data audit."><span>Latest result</span><span class="sort-indicator" aria-hidden="true"></span></button></th><th scope="col" aria-sort="none"><button type="button" class="table-sort" data-cell-sort="latest_result_time" title="When the latest result was recorded, in Eastern Time." aria-label="Sort by Latest result time. When the latest result was recorded, in Eastern Time."><span>Latest result time</span><span class="sort-indicator" aria-hidden="true"></span></button></th><th scope="col" aria-sort="none"><button type="button" class="table-sort" data-cell-sort="latest_result_tree" title="The Hermit commit used for the latest result." aria-label="Sort by Latest result tree. The Hermit commit used for the latest result."><span>Latest result tree</span><span class="sort-indicator" aria-hidden="true"></span></button></th><th scope="col" aria-sort="none"><button type="button" class="table-sort" data-cell-sort="physical_row_count" title="History records for this cell, including records that cannot determine its latest result." aria-label="Sort by Physical rows. History records for this cell, including records that cannot determine its latest result."><span>Physical rows</span><span class="sort-indicator" aria-hidden="true"></span></button></th><th scope="col" aria-sort="none"><button type="button" class="table-sort" data-cell-sort="represented_run_count" title="Recorded test attempts, including repetitions and retries. One verification attempt runs the program twice." aria-label="Sort by Represented Hermit runs. Recorded test attempts, including repetitions and retries. One verification attempt runs the program twice."><span>Represented Hermit runs</span><span class="sort-indicator" aria-hidden="true"></span></button></th></tr></thead><tbody id="cell-results"></tbody></table></div>
+      </div>
+      
+    <div id="recorded-not-in-current-manifest" hidden>
+      <h3>Recorded cell identities outside the current manifest</h3>
+      <p><a href="../data/outside-manifest.json.gz"><code>data/outside-manifest.json.gz</code></a> publishes every recorded row of these identities.</p>
+      <div class="table-scroll"><table class="responsive-record-table"><caption>Recorded evidence whose cell identity is outside the current manifest.</caption><thead><tr><th scope="col" aria-sort="none"><button type="button" class="table-sort" data-cell-sort="cell" title="The complete recorded test, mode, and backend identity, which is not in the current manifest." aria-label="Sort by Cell. The complete recorded test, mode, and backend identity, which is not in the current manifest."><span>Cell</span><span class="sort-indicator" aria-hidden="true"></span></button></th><th scope="col" aria-sort="none"><button type="button" class="table-sort" data-cell-sort="physical_row_count" title="The number of admitted stress-series/v3 observation rows retained for this identity." aria-label="Sort by Physical rows. The number of admitted stress-series/v3 observation rows retained for this identity."><span>Physical rows</span><span class="sort-indicator" aria-hidden="true"></span></button></th><th scope="col" aria-sort="none"><button type="button" class="table-sort" data-cell-sort="represented_run_count" title="The sum of num_runs across those rows; exactly equal repeated observations may share one row." aria-label="Sort by Represented Hermit runs. The sum of num_runs across those rows; exactly equal repeated observations may share one row."><span>Represented Hermit runs</span><span class="sort-indicator" aria-hidden="true"></span></button></th></tr></thead><tbody id="recorded-not-in-current-manifest-results"><tr data-recorded-not-in-manifest-row="1" data-cell="c-programs/environment-and-workdir/custom/ptrace" data-search="c-programs/environment-and-workdir/custom/ptrace" data-physical-row-count="1250" data-represented-run-count="1250"><th scope="row"><code>c-programs/environment-and-workdir/custom/ptrace</code></th><td>1,250</td><td>1,250</td></tr><tr data-recorded-not-in-manifest-row="1" data-cell="c-programs/io-uring-fallback/custom/dbt" data-search="c-programs/io-uring-fallback/custom/dbt" data-physical-row-count="1167" data-represented-run-count="1167"><th scope="row"><code>c-programs/io-uring-fallback/custom/dbt</code></th><td>1,167</td><td>1,167</td></tr><tr data-recorded-not-in-manifest-row="1" data-cell="c-programs/io-uring-fallback/custom/ptrace" data-search="c-programs/io-uring-fallback/custom/ptrace" data-physical-row-count="1167" data-represented-run-count="1168"><th scope="row"><code>c-programs/io-uring-fallback/custom/ptrace</code></th><td>1,167</td><td>1,168</td></tr><tr data-recorded-not-in-manifest-row="1" data-cell="c-programs/random-device-spellings/custom/ptrace" data-search="c-programs/random-device-spellings/custom/ptrace" data-physical-row-count="58" data-represented-run-count="58"><th scope="row"><code>c-programs/random-device-spellings/custom/ptrace</code></th><td>58</td><td>58</td></tr><tr data-recorded-not-in-manifest-row="1" data-cell="system-utils/clock-determinism/custom/liteinst" data-search="system-utils/clock-determinism/custom/liteinst" data-physical-row-count="152" data-represented-run-count="152"><th scope="row"><code>system-utils/clock-determinism/custom/liteinst</code></th><td>152</td><td>152</td></tr><tr data-recorded-not-in-manifest-row="1" data-cell="system-utils/clock-determinism/custom/ptrace" data-search="system-utils/clock-determinism/custom/ptrace" data-physical-row-count="1250" data-represented-run-count="1250"><th scope="row"><code>system-utils/clock-determinism/custom/ptrace</code></th><td>1,250</td><td>1,250</td></tr></tbody></table></div>
+    </div>
+    </section>
+    <section id="series-rows" data-in-manifest-listing><h2>Recorded evidence</h2><p>2,221,640 admitted physical rows representing 2,227,686 Hermit runs. Each cell row reports its qualifying count separately.</p></section>
+  </main>
+  <footer><p>Generated from recorded test results.</p></footer>
+</body>
+</html>

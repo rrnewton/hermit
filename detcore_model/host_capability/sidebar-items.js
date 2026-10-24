@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["ASSUME_PRESENT_ENV"],"enum":["HostCapability"],"fn":["cpuid_faulting_absent","kvm_absent","probe_host_capabilities","probe_host_capability"],"struct":["CapabilityVerdict","HostCapabilitiesReport"],"type":["HostCapabilities"]};

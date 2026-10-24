@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["INITIAL_HEADER_LEN","MAGIC","MAX_PACKET_LEN","SUCCESSOR_HEADER_LEN","VERSION"],"enum":["BindingMismatch","Image","Kind","PacketError"],"fn":["decode","encode","encode_into"],"struct":["ExpectedBindings","Packet"]};
