@@ -2394,7 +2394,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         mut checkpoint: Option<preemptions::callback_history::Origin>,
         check_in: CheckIn,
     ) {
-        let chaos = guest.config().chaos;
+        let chaos = guest.config().chaos_draws_schedule();
         loop {
             let thread_state = guest.thread_state();
             let dettid = thread_state.dettid;
