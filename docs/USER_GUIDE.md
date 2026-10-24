@@ -708,6 +708,17 @@ Run `hermit analyze --help` before using this workflow. Search, minimization,
 and schedule replay can perform many guest executions and require a reliably
 reproducible target condition.
 
+A replayed or spliced schedule can leave the guest spinning or waiting for an
+event that never comes, so once the target run has been measured, every later
+run is bounded: by default at max(60 s, 10 times the slowest endpoint run),
+which analyze prints (`--trial-timeout=SECONDS|auto|off`). With
+`--run1-preemptions` there is no target run to measure, so pass an explicit
+`--trial-timeout`; on a backend that does not enforce `--timeout`, bound the
+whole analysis from outside. A trial that reaches the
+bound counts as not reaching the target, and a baseline run that reaches it
+makes analyze search within the target schedule instead, as `--prefix-search`
+does.
+
 By default analyze bisects between the failing schedule and a passing one from
 another run. When the two runs differ in events only one of them executed (for
 example timeslices that end at other points, or extra iterations of a polling
