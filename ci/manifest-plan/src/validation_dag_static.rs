@@ -2894,7 +2894,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And package K slice A+'s two proc_stat_lifecycle tests: every spelling
     // of a task's comm stays the kernel's under a tracer, and stat, cgroup
     // and comm take only RWF_HIPRI in a vectored read: 159.
-    ("test.detcore_misc", 159),
+    // And scm_rights' seven tests of descriptors received over SCM_RIGHTS
+    // (recvmsg and recvmmsg, in-process and from a child, a random device, a
+    // rendered procfs file, MSG_CMSG_CLOEXEC): 166.
+    ("test.detcore_misc", 166),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -3347,7 +3350,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b): 218.
     // And https://github.com/rrnewton/hermit/issues/4262: record_exec_discards_posix_timer_copies_as_on_linux and
     // record_replay_posix_timer_rows_replay_but_diverge_from_linux: 220.
-    ("test.record_replay", 220),
+    // And record_replay_registers_descriptors_received_over_scm_rights: 221.
+    // And record_replay_receives_descriptors_over_a_guests_own_unix_listener: 222.
+    // And record_replay_keeps_eventfds_received_over_scm_rights_coherent: 223.
+    // And record_replay_shares_memory_between_mappings_of_one_memfd: 224.
+    ("test.record_replay", 224),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -4565,7 +4572,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two 4213 cpuinfo-session tests: 137.
     // And the same twenty D4c-1 proc_stat_lifecycle tests: 157.
     // And the same two A+ tests: 159.
-    ("test.detcore_misc_on_host", 159),
+    // And the same seven SCM_RIGHTS descriptor tests: 166.
+    ("test.detcore_misc_on_host", 166),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).

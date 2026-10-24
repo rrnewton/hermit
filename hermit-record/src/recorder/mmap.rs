@@ -26,6 +26,7 @@ use super::Recorder;
 use crate::event::MadviseEvent;
 use crate::event::MadviseRefill;
 use crate::event::MmapEvent;
+use crate::event::SharedMapping;
 use crate::event::SyscallEvent;
 
 const PAGE_SIZE: usize = 4096;
@@ -197,6 +198,19 @@ fn read_readable_runs(mem: &std::fs::File, start: usize, end: usize) -> Vec<(usi
     runs
 }
 
+/// The file a `MAP_SHARED` mapping of descriptor `fd` of thread `tid` maps,
+/// and the mapping's `offset` in it. `/proc/<tid>` shows that thread's own
+/// descriptor table, which is not the leader's for a thread cloned without
+/// `CLONE_FILES`.
+fn shared_mapping(tid: i32, fd: i32, offset: i64) -> Option<SharedMapping> {
+    let metadata = std::fs::metadata(format!("/proc/{tid}/fd/{fd}")).ok()?;
+    Some(SharedMapping {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        offset: u64::try_from(offset).ok()?,
+    })
+}
+
 impl Recorder {
     pub(super) async fn handle_mmap<G: Guest<Self>>(
         &self,
@@ -210,6 +224,13 @@ impl Recorder {
         }
 
         let len = syscall.len();
+        // Read before the call: the descriptor names the same file then, and a
+        // sibling thread could not have closed it, as the call holds the turn.
+        let shared = if syscall.flags().contains(MapFlags::MAP_SHARED) {
+            shared_mapping(guest.tid().as_raw(), syscall.fd(), syscall.offset())
+        } else {
+            None
+        };
 
         // Do the injection. We need to record the pointer the mapping is at and
         // all of the bytes contained in the mapping. This is very inefficient
@@ -241,6 +262,7 @@ impl Recorder {
                     Ok(SyscallEvent::Mmap(MmapEvent {
                         addr: addr.as_raw(),
                         buf,
+                        shared,
                     }))
                 }
                 Err(errno) => Err(errno),

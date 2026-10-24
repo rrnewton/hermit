@@ -1217,6 +1217,9 @@ fresh work directory. Save logs from both runs when narrowing the difference.
 - Keep the captured directory unchanged and use a compatible Hermit revision.
 - Record/replay support is experimental; some system calls and ancillary file
   descriptor behavior remain incomplete.
+- Replay maps recorded copies of file contents. `MAP_SHARED` mappings of one
+  file share memory in replay when one process maps it; mappings made by
+  different processes become separate copies.
 
 ### CPUID Or Hardware Warnings
 

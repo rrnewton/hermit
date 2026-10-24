@@ -2006,6 +2006,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_scm_rights.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_scm_rights.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and checks that descriptors received over SCM_RIGHTS, pipe ends sent within the process and a memfd and pipe end sent by a forked child, keep the blocking state and contents Linux gives them under record and under replay, which holds placeholders where the recording held them, and that a blocking read through a received pipe end waits for its writer; and that threads receiving pipe ends in blocking recvmsg calls over connections to the guest's own abstract AF_UNIX listener, while the sender opens eventfds between sends, replay to the same output, including an infinite poll on a received pipe end and such a socket; and that eventfds received over SCM_RIGHTS, within the process, from a sender that closed its copy, and from a forked child, read back the counts Linux gives them under record and under replay; and that MAP_SHARED mappings of one memfd in one process, including one through a received descriptor at an offset and one a thread makes, share memory under record and under replay."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/record_replay_select.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_select.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this workload and checks that select and pselect6 replay the recorded result, fd sets, and remaining timeout for ready pipes, timeouts, partial copy-out, and invalid nfds."

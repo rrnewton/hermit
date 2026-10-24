@@ -388,6 +388,20 @@ pub struct MmapEvent {
     /// The contents of the memory map. Note that this may be less than the
     /// requested `length`.
     pub buf: Vec<u8>,
+    /// For a `MAP_SHARED` mapping, the file it maps and where, so that replay
+    /// makes the mappings of one file share memory as they did here.
+    pub shared: Option<SharedMapping>,
+}
+/// The file a `MAP_SHARED` mapping maps, by its identity during recording,
+/// and the mapping's offset in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedMapping {
+    /// `st_dev` of the mapped file.
+    pub device: u64,
+    /// `st_ino` of the mapped file.
+    pub inode: u64,
+    /// Offset of the mapping in the file.
+    pub offset: u64,
 }
 
 /// Recorded outcome of a guest-semantic `madvise`.

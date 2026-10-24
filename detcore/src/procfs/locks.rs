@@ -128,8 +128,8 @@
 //!   `CLONE_FILES`), whose calls the ledger cannot tell from the leader's;
 //! - once a lock or unlock goes through a descriptor whose description the
 //!   ledger may know under another identity (one Detcore keeps no model of,
-//!   such as a descriptor received over `SCM_RIGHTS` on ptrace, or one an
-//!   in-guest backend registered on reception), no lock on that inode number,
+//!   such as one received over `SCM_RIGHTS` that ptrace leaves untracked, or
+//!   one registered on reception), no lock on that inode number,
 //!   on any device, is shown again; if that descriptor's fdinfo cannot be
 //!   read, no OFD or flock lock is shown again;
 //! - a lease set by a process that was then reaped, under `--no-namespace`,
