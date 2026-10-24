@@ -238,10 +238,7 @@ where
             let maximum_enabled = guest.config().max_timeslice.is_some();
             let thread = guest.thread_state_mut();
             let deadline = thread.thread_logical_time.as_nanos() + duration;
-            thread.end_of_timeslice = Some(deadline);
-            if maximum_enabled {
-                thread.max_timeslice_end = Some(deadline);
-            }
+            thread.install_schedule_deadline(deadline, maximum_enabled);
         }
         // The continuation's slice end, just installed, takes the grant's
         // deadline cap like any other
