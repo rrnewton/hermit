@@ -581,7 +581,12 @@ impl PreemptionRecord {
         Ok(())
     }
 
-    /// Normalize priorities for readibility.
+    /// Normalize priorities for readability: renumber them from
+    /// `DEFAULT_PRIORITY` up, and drop the threads that keep the default
+    /// priority. For display only: the renumbered record does not replay the
+    /// same, because the scheduler compares these priorities with fixed ones
+    /// (the default priority of a thread the record does not name, among
+    /// others) and derives others from them.
     pub fn normalize(&self) -> PreemptionRecord {
         let mut clone = self.clone();
 
@@ -605,16 +610,21 @@ impl PreemptionRecord {
         }
 
         // One more pass to remove anything that just has default priority its whole lifetime.
-        let mut finalmap = BTreeMap::new();
-        for (tid, history) in clone.per_thread.into_iter() {
-            if history.final_prio != DEFAULT_PRIORITY
+        clone.without_default_threads()
+    }
+
+    /// The same record without the threads that keep the default priority
+    /// their whole lifetime, with no priority change or chaos epoch. Replay
+    /// gives a thread the record does not name that same priority, so the
+    /// record replays the same (Detcore warns once per such thread); unlike
+    /// [`Self::normalize`], no priority is renumbered.
+    pub fn without_default_threads(&self) -> PreemptionRecord {
+        let mut clone = self.clone();
+        clone.per_thread.retain(|_, history| {
+            history.final_prio != DEFAULT_PRIORITY
                 || !history.prio_changes.is_empty()
                 || !history.chaos_epochs.is_empty()
-            {
-                assert!(finalmap.insert(tid, history).is_none());
-            }
-        }
-        clone.per_thread = finalmap;
+        });
         clone
     }
 

@@ -110,6 +110,35 @@ impl std::fmt::Display for BaselineUnfinished {
 
 impl std::error::Error for BaselineUnfinished {}
 
+/// `--minimize`'s knock-outs removed every intervention and the replay still
+/// meets the target, so there is no baseline schedule to bisect against.
+#[derive(Debug)]
+pub struct NothingToKnockOut;
+
+impl std::fmt::Display for NothingToKnockOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "--minimize knocked out every intervention and the run still meets the target, so \
+             there is no baseline schedule to bisect against"
+        )
+    }
+}
+
+impl std::error::Error for NothingToKnockOut {}
+
+/// `record` with its latest intervention knocked out, for `--minimize`'s
+/// baseline; `None` when it has none left. Threads at the default priority
+/// with no change are dropped first: replay gives a thread the record does
+/// not name that same priority, and a knock-out that removes a whole thread
+/// (once no priority change is left) must not pick one of them, which would
+/// change nothing.
+fn knock_out_latest(record: &PreemptionRecord) -> Option<PreemptionRecord> {
+    let pruned = record.without_default_threads();
+    let knocked_out = pruned.with_latest_preempt_removed();
+    (knocked_out != pruned).then_some(knocked_out)
+}
+
 /// The result of `--prefix-search`: replaying the first `decision` events of
 /// `schedule` and then scheduling without chaos, with timeslices of
 /// `continuation`, misses the target, while replaying event `decision` too
@@ -1534,9 +1563,12 @@ impl AnalyzeOpts {
             let mut pr = matching_pr;
             let mut ix = 1;
             loop {
+                let Some(knocked_out) = knock_out_latest(&pr) else {
+                    return Err(NothingToKnockOut.into());
+                };
                 let runname = format!("run2_baseline_try{:03}", ix);
                 let (still_matching, mut newrun) =
-                    self.save_nearby_non_matching_sched_events(&runname, &pr)?;
+                    self.save_nearby_non_matching_sched_events(&runname, &knocked_out)?;
                 if still_matching {
                     pr = newrun.preempts_out().clone();
                     ix += 1;
@@ -2019,12 +2051,18 @@ impl AnalyzeOpts {
         let mut min_run = self.phase2_minimize(global, run1data)?;
         self.phase3_strict_preempt_replay_check(global, &mut min_run)?;
 
-        min_run.normalize_preempts_out();
-        let normalized_preempts = min_run.preempts_out().clone();
+        // The record the target endpoint replays, and the one --minimize's
+        // baseline knocks a preemption out of, is the record that met the
+        // target: a normalized copy renumbers its priorities across the
+        // scheduler's fixed ones (the default priority, among others), and
+        // can run another schedule.
+        let (normalized_path, normalized) = min_run.write_normalized_preempts();
         eprintln!(
             ":: {}\n {}",
             format!(
-                "Normalized, that preemption record ({}) becomes:",
+                "Normalized for reading ({}; analyze uses {}), that preemption record \
+                 becomes:",
+                normalized_path.file_name().unwrap().to_string_lossy(),
                 min_run
                     .preempts_path_out()
                     .file_name()
@@ -2035,10 +2073,10 @@ impl AnalyzeOpts {
             .bold(),
             truncated(
                 1000,
-                serde_json::to_string_pretty(&normalized_preempts.clone_preemptions_only())
-                    .unwrap()
+                serde_json::to_string_pretty(&normalized.clone_preemptions_only()).unwrap()
             )
         );
+        let target_preempts = min_run.preempts_out().clone();
 
         // One endpoint of the bisection search:
         let mut target_endpoint_run = self.save_final_target_sched_events(min_run)?;
@@ -2050,15 +2088,24 @@ impl AnalyzeOpts {
         // The other endpoint of the bisection search:
         // What we thought was the final_pr can change here:
         let mut baseline_endpoint_run =
-            match self.phase4_choose_baseline_sched_events(normalized_preempts) {
+            match self.phase4_choose_baseline_sched_events(target_preempts) {
                 Ok(run) => run,
-                // A baseline run that did not finish gives no schedule to
-                // bisect against; the decision is still within the target
-                // schedule, which a prefix search needs alone.
-                Err(error) if error.downcast_ref::<BaselineUnfinished>().is_some() => {
+                // A baseline run that did not finish, or no knock-out left,
+                // gives no schedule to bisect against; the decision is still
+                // within the target schedule, which a prefix search needs
+                // alone.
+                Err(error)
+                    if error.downcast_ref::<BaselineUnfinished>().is_some()
+                        || error.downcast_ref::<NothingToKnockOut>().is_some() =>
+                {
+                    let hint = if error.downcast_ref::<BaselineUnfinished>().is_some() {
+                        "; a larger --trial-timeout may let the baseline finish"
+                    } else {
+                        ""
+                    };
                     eprintln!(
                         ":: {} {error}\n:: Searching within the target schedule instead \
-                         (--prefix-search); a larger --trial-timeout may let the baseline finish.",
+                         (--prefix-search){hint}.",
                         "No baseline:".yellow().bold(),
                     );
                     return self.prefix_search_and_report(&mut target_endpoint_run);
@@ -2176,13 +2223,12 @@ impl AnalyzeOpts {
     fn save_nearby_non_matching_sched_events(
         &self,
         runname: &str,
-        matching_preempts: &PreemptionRecord,
+        non_matching_preempts: &PreemptionRecord,
     ) -> anyhow::Result<(bool, RunData)> {
         // Given preemptions that hermit analyze has determined are critical to match the criteria
-        // (most commonly, a failing execution), removing the last critical preemption should
-        // cause the minimal execution change to now no longer match the criteria (most commonly,
-        // an execution that now passes).
-        let non_matching_preempts = matching_preempts.with_latest_preempt_removed();
+        // (most commonly, a failing execution), removing the last critical preemption
+        // ([`knock_out_latest`]) should cause the minimal execution change to now no longer match
+        // the criteria (most commonly, an execution that now passes).
 
         // Validate the preemption record
         if let Err(e) = non_matching_preempts.validate() {
@@ -2196,7 +2242,7 @@ impl AnalyzeOpts {
         }
 
         let mut newrun = RunData::new_baseline(self, runname.to_string())?
-            .with_preempts_in(non_matching_preempts)
+            .with_preempts_in(non_matching_preempts.clone())
             .with_schedule_recording();
 
         // Verify that the new preemption record does in fact now cause a non-matching execution,
@@ -2790,6 +2836,51 @@ mod tests {
             ),
             None,
             "no target run output (hermit bisect): no comparison"
+        );
+    }
+
+    /// `--minimize`'s baseline knock-out removes a real intervention each
+    /// time: the latest priority change, then whole threads, never a thread
+    /// left at the default priority (which would change nothing), and gives
+    /// up when none is left. Before, the records later knock-outs start
+    /// from (recorded runs) named every thread, and once no priority change
+    /// was left a knock-out could remove one of those, changing nothing.
+    #[test]
+    fn the_baseline_knock_out_removes_a_real_intervention_until_none_is_left() {
+        use std::collections::BTreeMap;
+
+        use detcore::types::LogicalTime;
+        let at = LogicalTime::from_nanos;
+        let record = PreemptionRecord::from_vecs(&BTreeMap::from([
+            (DetTid::from_raw(3), vec![(at(0), 4923), (at(500), 1200)]),
+            (DetTid::from_raw(5), vec![(at(0), 352)]),
+            (DetTid::from_raw(9), vec![]),
+        ]));
+        let threads = |record: &PreemptionRecord| -> Vec<u32> {
+            record
+                .extract_all()
+                .keys()
+                .map(|tid| tid.as_raw() as u32)
+                .collect()
+        };
+        let first = knock_out_latest(&record).unwrap();
+        assert_eq!(threads(&first), [3, 5], "thread 9 had nothing to knock out");
+        assert_ne!(
+            first,
+            record.without_default_threads(),
+            "the knock-out changed the record"
+        );
+        let mut knocked = first;
+        let mut steps = 1;
+        while let Some(next) = knock_out_latest(&knocked) {
+            assert!(!threads(&next).contains(&9));
+            knocked = next;
+            steps += 1;
+            assert!(steps < 10, "the knock-outs do not end");
+        }
+        assert_eq!(
+            threads(&knocked.without_default_threads()),
+            Vec::<u32>::new()
         );
     }
 
