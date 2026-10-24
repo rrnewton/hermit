@@ -1402,6 +1402,21 @@ pub struct Scheduler {
     /// to that deadline, as an empty run queue does, rather than letting the
     /// poll crawl there one turn charge at a time (`unblock_guest`).
     fast_forward_for_alone_poller: bool,
+    /// The sequence number of the latest committed turn that was not a
+    /// fruitless polling retry: a retry that repeats its call after an
+    /// attempt that moved nothing (`retries_its_call_without_progress`).
+    /// How many such retries a waiting guest makes depends on host timing,
+    /// for instance on how long a process outside the container takes to
+    /// write what it polls, so they are not progress here, and in `hermit
+    /// run` they are charged scheduler time at most once per progress
+    /// (`polling_retry_charge_withheld`).
+    deterministic_progress: u64,
+    /// The sequence number of each thread's latest fruitless polling retry
+    /// that was charged scheduler time (`polling_retry_charge_withheld`).
+    poll_charged_at: BTreeMap<DetTid, u64>,
+    /// When the run queue last became spinning pollers only while a host
+    /// could still end one of their waits (`fast_forward_idle_pollers`).
+    idle_pollers_since: Option<std::time::Instant>,
 
     /// Run-queue *removals* requested by a global-request handler
     /// (`reconnect_after_exec` -> `logically_kill_thread`), deferred to the same
@@ -3778,6 +3793,7 @@ pub async fn do_a_turn_blocking(
                             if state.replay_waits_before_maintenance() {
                                 return Err(SkipTurn);
                             }
+                            state.fast_forward_idle_pollers(&global_time);
                             if !timed_event_processed {
                                 timed_event_processed = state.step2b_process_timed(&global_time);
                             }
@@ -4228,6 +4244,9 @@ impl Scheduler {
             guest_state_polled_at: Default::default(),
             last_commit_at: Default::default(),
             fast_forward_for_alone_poller: false,
+            deterministic_progress: 0,
+            poll_charged_at: Default::default(),
+            idle_pollers_since: None,
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
             models_signal_targets: cfg.models_signal_targets(),
@@ -8022,6 +8041,7 @@ impl Scheduler {
         if std::mem::take(&mut self.fast_forward_for_alone_poller) {
             self.fast_forward_to_next_finite_deadline(global_time);
         }
+        self.fast_forward_idle_pollers(global_time);
         self.step2b_process_timed(global_time);
         self.step2b_restore_due_pollers();
         // A timed signal that just armed a background thread is followed by an
@@ -8060,6 +8080,129 @@ impl Scheduler {
             );
             gt.add_extra_time(deadline.duration_since(now));
         }
+    }
+
+    /// `hermit run`: whether the scheduler charge for the polling turn just
+    /// committed is withheld, recording the charge when it is not.
+    ///
+    /// A retry that repeats its call after an attempt that moved nothing
+    /// (`retries_its_call_without_progress`) is charged once after each
+    /// deterministic progress (`deterministic_progress`), and not again
+    /// until another turn makes progress. While other guest work runs,
+    /// every such retry follows progress and is charged, as before. Only a
+    /// poller that spins with nothing else happening stops being charged,
+    /// and how many times it spins is host timing: how long a process
+    /// outside the container takes to write what it polls, for instance.
+    /// Charging every spin put that host time on the guest's clock, about
+    /// 9.5 virtual seconds per host second of waiting on an outside FIFO.
+    /// Finite deadlines still arrive, through `fast_forward_idle_pollers`.
+    /// Record and replay keep their charges, so a recording's time stream
+    /// does not change.
+    fn polling_retry_charge_withheld(&mut self, resources: &Resources) -> bool {
+        if self.recordreplay_modes || !Self::retries_its_call_without_progress(resources) {
+            return false;
+        }
+        if self
+            .poll_charged_at
+            .get(&resources.tid)
+            .is_some_and(|&charged| charged >= self.deterministic_progress)
+        {
+            return true;
+        }
+        self.poll_charged_at
+            .insert(resources.tid, self.progress_epoch);
+        false
+    }
+
+    /// The earliest finite deadline the guest is waiting for, when every
+    /// queued thread's request is a polling retry that has retried, and been
+    /// charged, since
+    /// the latest deterministic progress (`polling_retry_charge_withheld`),
+    /// so no turn can move virtual time on until a deadline or a host acts.
+    /// The deadlines are the timed waiters' and the queued polls' own
+    /// timeouts. The flag says whether a host can still end a wait: a queued
+    /// poll whose outcome a host can change
+    /// (`Resources::polls_guest_state_only` unset), or a call running in the
+    /// background on external IO.
+    fn idle_poller_deadline(&self) -> Option<(LogicalTime, bool)> {
+        // Judged from each queued thread's request, not from the run queue's
+        // poller band: between its committed retry and the skip that moves it
+        // to that band, a spinning poller is queued as ordinary work, and that
+        // pass must not end the host-time wait (`fast_forward_idle_pollers`).
+        if self.run_queue.is_empty() {
+            return None;
+        }
+        let mut host_can_act = !self.blocked.external_io_blockers.is_empty();
+        let mut deadline = self
+            .blocked
+            .timed_waiters
+            .next_deadline()
+            .filter(|deadline| !deadline.is_indefinite());
+        for tid in self.run_queue.tids() {
+            let request = self.next_turns.get(tid)?.req.try_read()?;
+            let resources = request.as_ref().ok()?;
+            if !Self::is_polling_turn(resources)
+                || !Self::retries_its_call_without_progress(resources)
+                || !self
+                    .poll_charged_at
+                    .get(tid)
+                    .is_some_and(|&charged| charged >= self.deterministic_progress)
+            {
+                return None;
+            }
+            host_can_act |= !resources.polls_guest_state_only;
+            if let Some(poll_deadline) = resources
+                .poll_deadline
+                .filter(|deadline| !deadline.is_indefinite())
+            {
+                deadline =
+                    Some(deadline.map_or(poll_deadline, |earliest| earliest.min(poll_deadline)));
+            }
+        }
+        deadline.map(|deadline| (deadline, host_can_act))
+    }
+
+    /// `hermit run`: move global time to the earliest finite deadline when
+    /// only spinning pollers remain (`idle_poller_deadline`), as an empty
+    /// run queue does, since their retries are no longer charged.
+    ///
+    /// If no host can end a wait, the move is made at once: nothing but the
+    /// deadline can change what any thread sees. If a host can, the
+    /// scheduler first waits for it, in host time, up to the time left
+    /// before the deadline, retrying the polls meanwhile without charge.
+    /// Outside input that arrives within the guest's own timeout is then
+    /// seen at the same virtual time whatever its host latency, and a
+    /// timeout fires at its deadline; only input that arrives at about the
+    /// moment of the timeout itself races it, as it would on Linux.
+    fn fast_forward_idle_pollers(&mut self, global_time: &Arc<Mutex<GlobalTime>>) {
+        if self.recordreplay_modes {
+            return;
+        }
+        let Some((deadline, host_can_act)) = self.idle_poller_deadline() else {
+            self.idle_pollers_since = None;
+            return;
+        };
+        let mut gt = global_time.lock().unwrap();
+        let now = gt.as_nanos();
+        if deadline <= now {
+            self.idle_pollers_since = None;
+            return;
+        }
+        let ahead = deadline.duration_since(now);
+        if host_can_act {
+            let since = *self
+                .idle_pollers_since
+                .get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() < ahead {
+                return;
+            }
+        }
+        info!(
+            "[scheduler] Only spinning pollers can run; skipping global time ahead to {}.",
+            deadline
+        );
+        gt.add_extra_time(ahead);
+        self.idle_pollers_since = None;
     }
 
     /// How long the release barrier waits for an armed thread's continuation
@@ -14662,6 +14805,14 @@ impl Scheduler {
                 trace!(
                     "[scheduler] skipping scheduler time advance because just-finished turn delivered a signal to the thread already running"
                 );
+            } else if last_turn_was_polling
+                && last_turn
+                    .as_ref()
+                    .is_ok_and(|resources| self.polling_retry_charge_withheld(resources))
+            {
+                trace!(
+                    "[scheduler] skipping scheduler time advance because just-finished turn retried a poll that nothing has moved since its last charge"
+                );
             } else {
                 let newtime = match gtime.add_scheduler_time() {
                     Ok(newtime) => newtime,
@@ -14808,7 +14959,7 @@ impl Scheduler {
         }
         let fatal_alarm = self.in_guest_fatal_alarm_pending(dtid);
         let futex_timed_out = self.blocked.timed_out_futex_waiters.remove(&dtid);
-        let (guest_state_poll, fruitless, wants_alone) = match self
+        let (guest_state_poll, fruitless, wants_alone, fruitless_poll) = match self
             .next_turns
             .get(&dtid)
             .and_then(|turn| turn.req.try_read())
@@ -14817,8 +14968,9 @@ impl Scheduler {
                 Self::is_polling_turn(&rs) && rs.polls_guest_state_only,
                 Self::retries_its_call_without_progress(&rs),
                 rs.waits_until_nothing_else_can_run,
+                Self::is_polling_turn(&rs) && Self::retries_its_call_without_progress(&rs),
             ),
-            _ => (false, false, false),
+            _ => (false, false, false, false),
         };
         // The committed request, read before `clear_nextturn` empties it.
         let work_span_request = self
@@ -14833,6 +14985,9 @@ impl Scheduler {
             .flatten();
         self.progress_epoch += 1;
         self.last_commit_at.insert(dtid, self.progress_epoch);
+        if !fruitless_poll {
+            self.deterministic_progress = self.progress_epoch;
+        }
         let previous_grant = self.guest_state_polled_at.remove(&dtid);
         if guest_state_poll {
             // This thread's previous grant moved something unless this request
