@@ -426,10 +426,14 @@ for seed in $(seq 0 63); do
 done
 ```
 
-Each seed draws its maximum log-uniformly from 1000 to 200000000 virtual
-nanoseconds, so a sweep spends about a fifth of its seeds in each decade, and
-prints it: `[hermit] --chaos-seeded-timeslice: scheduler seed 7 drew
---max-timeslice=...`. Rerunning the seed reproduces the run, and so does
+Two in five seeds draw their maximum from 1000 to 2000 virtual nanoseconds
+(slices of about 100 to 200 branches, for windows of a few dozen branches), two
+in five from 1000000 to 200000000 (for races whose other thread must first run
+far), and one in five from the decades between, each log-uniformly within its
+range. The races measured so far needed one end or the other: a 46-branch
+window in a multithreaded C++ test binary failed in 9 of 32 seeds at 1000 and
+in none at 10000 or more. Hermit prints the value: `[hermit]
+--chaos-seeded-timeslice: scheduler seed 7 drew --max-timeslice=...`. Rerunning the seed reproduces the run, and so does
 passing the printed value as `--max-timeslice` instead of the flag. The draw is
 part of what a seed selects, so a Hermit release that changed it would change
 every seed's schedule; the printed value pins it. Seeds that draw small values
@@ -677,7 +681,7 @@ reproducible target condition.
 | `--no-deterministic-io` | Disables Hermit's deterministic short-I/O completion behavior. |
 | `--chaos` | Uses seeded randomized deterministic scheduling. |
 | `--sched-seed=N` | Selects a reproducible chaos schedule. |
-| `--chaos-seeded-timeslice` | With `--chaos`, draws `--max-timeslice` from the scheduler seed, log-uniformly from 1000 to 200000000 virtual nanoseconds, and prints the value. |
+| `--chaos-seeded-timeslice` | With `--chaos`, draws `--max-timeslice` from the scheduler seed (two in five seeds 1000 to 2000 virtual nanoseconds, two in five 1000000 to 200000000, one in five between) and prints the value. |
 | `--target-timeslice=N` | Ends a logical turn at the first syscall boundary after N virtual nanoseconds. |
 | `--max-timeslice=N` | Sets the maximum virtual time slice (minimum one scaled RCB) and requires PMU support. |
 | `--max-timeslice=disabled` | Disables PMU timer preemption. |
