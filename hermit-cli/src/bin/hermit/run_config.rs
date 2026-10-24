@@ -954,6 +954,10 @@ mod tests {
             &["--chaos-slowdown-max-factor=4.0"],
         ),
         ("chaos-epoch-length-ns", &["--chaos-epoch-length-ns=100"]),
+        (
+            "chaos-timed-wait-spread",
+            &["--chaos-timed-wait-spread=2.5"],
+        ),
         ("record-preemptions", &["--record-preemptions"]),
         (
             "strict-schedule-boundaries",
