@@ -2299,6 +2299,16 @@ pub struct Scheduler {
     /// thread over since its last committed turn
     /// ([`Self::bound_chaos_starvation`]).
     chaos_passed_over: BTreeMap<DetTid, u32>,
+    /// Where change points are bounded (`chaos_bounds_starvation`), each
+    /// thread's committed turns, host-timed polling retries aside, since its
+    /// last priority change point (`chaos_slice_spent_in_turns`). An entry
+    /// goes when its thread retires (a last turn committed after that may
+    /// leave one behind, which nothing reads unless the thread ID returns).
+    chaos_turns_in_slice: BTreeMap<DetTid, u64>,
+    /// How many committed turns end a chaos slice: as many as charge one
+    /// maximum timeslice of virtual time, but at least
+    /// `MIN_CHAOS_TURNS_PER_SLICE`; `None` when either is zero or unset.
+    chaos_turns_per_slice: Option<u64>,
 
     /// Happens-before enforcement state, present only when the run carries a
     /// `HappensBeforeProgram`. Holds AFTER anchors until their BEFORE anchors
@@ -4231,9 +4241,19 @@ pub type MaybePrintStack = Option<Option<PathBuf>>;
 /// How many chaos timer-slice change points may pass a runnable thread over,
 /// since its last committed turn, before the changing thread moves behind it
 /// ([`Scheduler::bound_chaos_starvation`]). Each pass ends a slice, capped by
-/// `--max-timeslice`, so a passed-over thread waits at most this many slices
-/// of a thread that never blocks.
+/// `--max-timeslice` of the thread's own time and, for a thread that takes
+/// many turns, by `chaos_turns_per_slice` of its turns
+/// (`Scheduler::chaos_slice_spent_in_turns`), so a passed-over thread waits
+/// at most this many slices of a thread that never blocks.
 const CHAOS_PASSOVER_BOUND: u32 = 2;
+
+/// The fewest committed turns that end a chaos slice
+/// (`Scheduler::chaos_slice_spent_in_turns`), 200 ms of turn charges at the
+/// default charge, whatever the maximum timeslice. With a small maximum,
+/// own-time slices already end every few turns of a thread that hands off
+/// the CPU, and counting its turns would add a change point every turn or
+/// two.
+const MIN_CHAOS_TURNS_PER_SLICE: u64 = 400;
 
 enum ThreadStatus {
     // Not present in scheduler structures.
@@ -4642,6 +4662,16 @@ impl Scheduler {
                 && cfg.sched_heuristic == crate::config::SchedHeuristic::None
                 && cfg.replay_preemptions_from.is_none(),
             chaos_passed_over: Default::default(),
+            chaos_turns_in_slice: Default::default(),
+            chaos_turns_per_slice: cfg
+                .max_timeslice
+                .map(std::num::NonZeroU64::get)
+                .zip(
+                    cfg.scheduler_turn_charge()
+                        .ok()
+                        .filter(|charge| *charge > 0),
+                )
+                .map(|(slice, charge)| slice.div_ceil(charge).max(MIN_CHAOS_TURNS_PER_SLICE)),
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
             post_fork_prng: Pcg64Mcg::seed_from_u64(cfg.sched_seed() ^ 0x706f_7374_666f_726b),
             happens_before: cfg.happens_before.clone().map(HbRuntime::new),
@@ -5599,6 +5629,7 @@ impl Scheduler {
         self.deschedule_or_defer(*dtid);
         // Remove from all non-runnable pools:
         self.remove_blocking_entries(dtid);
+        self.chaos_turns_in_slice.remove(dtid);
         self.retire_sigalrm_thread(*dtid, *detpid);
         // The process's last thread: its shared queue goes with it.
         let last_of_process = self
@@ -15206,6 +15237,7 @@ impl Scheduler {
         chaos_epochs: &[crate::resources::ChaosEpochTransition],
     ) -> Result<(), SkipTurn> {
         assert!(runqueue::is_ordinary_priority(new_priority));
+        self.chaos_turns_in_slice.remove(&dettid);
         let new_priority = self.bound_chaos_starvation(dettid, new_priority);
         // Alter the threads priority and requeue.
         let old_priority = self.priorities.insert(dettid, new_priority);
@@ -15623,6 +15655,9 @@ impl Scheduler {
         {
             self.previous_turn_tid = Some(resources.tid);
             self.previous_turn_expired_wait = expired_wait;
+            if self.chaos_bounds_starvation && !self.has_schedule_replay() {
+                *self.chaos_turns_in_slice.entry(resources.tid).or_insert(0) += 1;
+            }
         }
 
         match snapshot.cmp(&self.committed_time) {
@@ -15880,7 +15915,7 @@ impl Scheduler {
                 SchedResponse::Go(as_schedvalue)
             }
         };
-        match self.deadline_remaining_from(dtid, self.committed_time) {
+        match self.grant_deadline_hint(dtid) {
             Some(remaining) => self.deadline_hints.insert(dtid, remaining),
             None => self.deadline_hints.remove(&dtid),
         };
@@ -15889,6 +15924,82 @@ impl Scheduler {
         self.boundary_budgets.committed_grant(dtid);
         resp.put(answer);
         Ok(())
+    }
+
+    /// The deadline hint a grant to `granted` carries: zero once its turns
+    /// have spent its chaos slice (`chaos_slice_spent_in_turns`), else the
+    /// time left before the earliest pending deadline
+    /// (`deadline_remaining_from`).
+    fn grant_deadline_hint(&self, granted: DetTid) -> Option<Duration> {
+        if self.chaos_slice_spent_in_turns(granted) {
+            Some(Duration::ZERO)
+        } else {
+            self.deadline_remaining_from(granted, self.committed_time)
+        }
+    }
+
+    /// Whether `granted` has taken `chaos_turns_per_slice` committed turns
+    /// since its last chaos change point (`chaos_turns_in_slice`): at the
+    /// default settings 400 turns, as many as charge one maximum timeslice
+    /// of virtual time. If so, its grant carries a zero deadline hint
+    /// (`grant_deadline_hint`), so the thread ends its slice at its next
+    /// check-in once it has run the minimum slice, one turn charge of its own
+    /// time (`cap_timeslice_at_deadline`), and the slice end is a change
+    /// point like any other. A change point therefore comes at the latest
+    /// 400 turns plus one turn charge of the thread's own time into a slice
+    /// (about 100 more turns of 5 us syscalls), unless the thread's own time
+    /// ends it sooner.
+    ///
+    /// Chaos draws a new priority, and the starvation bound
+    /// (`bound_chaos_starvation`) acts, only at a change point. A change point
+    /// comes when a thread's slice ends, and a slice is measured in the
+    /// thread's own time. Threads that pass the CPU back and forth (a condition
+    /// variable hand-off, a `sched_yield` loop beside a short sleeper) spend
+    /// microseconds of their own time per turn while each turn charges half a
+    /// millisecond of virtual time. A futex call or `sched_yield` costs 5 us
+    /// of a thread's own time, so a 200 ms slice could take up to 40,000 of
+    /// them (about 30,000 were seen), many seconds of virtual time, without
+    /// a change point. A
+    /// thread that drew a worse band waited that long for its first turn,
+    /// and a guest's own watchdogs fired.
+    ///
+    /// Any thread that takes that many turns within one slice is affected,
+    /// not only one that hands off the CPU: a thread making turn-taking
+    /// syscalls back to back now gets a change point every 400 turns, where
+    /// its own-time slice could have lasted 20,000 to 40,000 syscalls (10 us
+    /// for most, 5 us for a futex call or `sched_yield`).
+    /// The count is of turns, not of virtual time, so it keeps counting
+    /// across a sleep. The threshold uses the maximum timeslice, the bound
+    /// on a slice, not the mean a chaos slice is drawn with
+    /// (`--target-timeslice`), because it bounds how long a slice can last.
+    ///
+    /// Only where change points are bounded (`chaos_bounds_starvation`: chaos
+    /// with timer preemption and the default heuristic, not replaying
+    /// preemptions), and neither under a schedule replay nor under `hermit
+    /// record`/`hermit replay` (`recordreplay_modes`), as for every deadline
+    /// hint. The count is of committed turns, host-timed polling retries
+    /// aside, as for `previous_turn_tid`: background calls and skipped turns
+    /// do not commit, and host-timed admissions and signals change only which
+    /// pass a turn falls in, not how many turns a thread has taken. Both runs
+    /// of --verify therefore end the same slices. A preemption recording
+    /// records the slice end it causes like any other change point, and a
+    /// preemption or schedule replay follows its recorded slice ends and
+    /// applies no hint (`cap_timeslice_at_deadline`), so a replay needs none.
+    /// Such a slice ends at a syscall check-in, and a preemption replay ends
+    /// a slice recorded there at the same branch count, which can fall just
+    /// before the syscall rather than after it; until
+    /// <https://github.com/rrnewton/hermit/pull/4597> lands, its virtual times
+    /// can then differ from the recording's by a few microseconds.
+    /// No clock moves: only the software end of the thread's slice does.
+    fn chaos_slice_spent_in_turns(&self, granted: DetTid) -> bool {
+        self.chaos_bounds_starvation
+            && !self.recordreplay_modes
+            && !self.has_schedule_replay()
+            && self.chaos_turns_per_slice.is_some_and(|turns| {
+                self.chaos_turns_in_slice
+                    .get(&granted)
+                    .is_some_and(|spent| *spent >= turns)
+            })
     }
 
     /// The virtual time left, from `now`, before the earliest deadline a turn
@@ -21077,6 +21188,86 @@ mod test {
         assert!(
             sched.run_queue.tentative_pop_in_progress(),
             "a proceeding turn must keep its tentative selection open for step4"
+        );
+    }
+
+    /// Where chaos change points are bounded, a thread's committed turns since
+    /// its last change point count toward its slice: once they have charged a
+    /// maximum timeslice (400 turns of 0.5 ms against 200 ms), its next grant
+    /// ends the slice (`chaos_slice_spent_in_turns`). A polling retry and a
+    /// skipped turn do not count, a change point restarts the count, and
+    /// nothing counts without chaos or under `hermit record`/`hermit replay`.
+    #[test]
+    fn a_chaos_slice_is_spent_after_a_timeslice_of_turn_charges() {
+        let thread = DetTid::from_raw(13);
+        let chaos = Config {
+            chaos: true,
+            ..Config::default()
+        };
+        let setup = |config: &Config| {
+            let mut sched = Scheduler::new(config);
+            register_known_thread_for(&mut sched, thread);
+            sched.runqueue_push_back(thread);
+            (sched, Mutex::new(GlobalTime::new(config)))
+        };
+        let commit = |sched: &mut Scheduler, time: &Mutex<GlobalTime>, turns: u64| {
+            for _ in 0..turns {
+                sched.bump_global_time(time, &Ok(Resources::new(thread)));
+            }
+        };
+
+        let (mut sched, time) = setup(&chaos);
+        assert_eq!(sched.chaos_turns_per_slice, Some(400));
+        commit(&mut sched, &time, 399);
+        assert!(!sched.chaos_slice_spent_in_turns(thread), "399 turns");
+        let mut retry = Resources::new(thread);
+        retry.insert(ResourceID::InternalIOPolling, Permission::W);
+        retry.poll_attempt = 1;
+        sched.bump_global_time(&time, &Ok(retry));
+        sched.bump_global_time(&time, &Err(SkipTurn));
+        assert!(
+            !sched.chaos_slice_spent_in_turns(thread),
+            "a polling retry and a skipped turn do not count"
+        );
+        commit(&mut sched, &time, 1);
+        assert!(sched.chaos_slice_spent_in_turns(thread), "400 turns");
+        assert_eq!(
+            sched.grant_deadline_hint(thread),
+            Some(Duration::ZERO),
+            "the grant ends the slice at the next check-in"
+        );
+        sched.recordreplay_modes = true;
+        assert!(
+            !sched.chaos_slice_spent_in_turns(thread),
+            "under hermit record/replay"
+        );
+        sched.recordreplay_modes = false;
+        assert_eq!(sched.run_queue.tentative_pop_next(), Some(thread));
+        let _ = sched.perform_priority_changepoint(
+            thread,
+            DEFAULT_PRIORITY,
+            LogicalTime::from_nanos(1),
+            1,
+            &[],
+        );
+        assert!(
+            !sched.chaos_slice_spent_in_turns(thread),
+            "a change point restarts the count"
+        );
+
+        let (mut plain, time) = setup(&Config::default());
+        commit(&mut plain, &time, 400);
+        assert!(!plain.chaos_slice_spent_in_turns(thread), "without chaos");
+
+        let small = Config {
+            chaos: true,
+            max_timeslice: std::num::NonZeroU64::new(1_000_000),
+            ..Config::default()
+        };
+        assert_eq!(
+            Scheduler::new(&small).chaos_turns_per_slice,
+            Some(400),
+            "a 1 ms timeslice still takes 400 turns"
         );
     }
 
