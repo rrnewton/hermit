@@ -3242,7 +3242,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds 21
     // sync-edge and access-trace units: 3363 + 21 = 3384, measured by the
     // 216dbc929a full validate.
-    ("test.detcore_unit", 3384),
+    // And the three bounded SIGCHLD-deferral units
+    // (https://github.com/rrnewton/hermit/issues/4132): 3384 + 3 = 3387, listed.
+    ("test.detcore_unit", 3387),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4610,7 +4612,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // = 780, measured by nextest list.
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds seven cli
     // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
-    ("test.cli", 787),
+    // And a_parents_sigchld_is_not_held_behind_a_sibling_that_never_blocks
+    // (https://github.com/rrnewton/hermit/issues/4132), which needs no PMU;
+    // its PMU sibling runs in privileged-test.pmu_cli_cases: 787 + 1 = 788, listed.
+    ("test.cli", 788),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4700,7 +4705,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write,
     // which only a PMU preemption can end, joins them: 21 + 1 = 22,
     // re-measured at fd59b85c73 (22 passed).
-    ("privileged-test.pmu_cli_cases", 22),
+    // a_parent_reaps_its_sigkilled_child_beside_a_contender_that_never_blocks
+    // (https://github.com/rrnewton/hermit/issues/4132), whose child spins with
+    // no syscall, joins them: 22 + 1 = 23, listed.
+    ("privileged-test.pmu_cli_cases", 23),
     // The six x86-64-v3 CLI cases that run a guest, with
     // HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 so that a refusal fails
     // (https://github.com/rrnewton/hermit/issues/4243): 6, listed with this
@@ -5238,7 +5246,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same K8-d cli case: 698 + 1 = 699, measured by nextest list.
     // Train 1 recount (measured by the 216dbc929a full validate, same
     // growth as test.cli): 699 + 7 = 706.
-    ("test.cli_on_host", 706),
+    // a_parents_sigchld_is_not_held_behind_a_sibling_that_never_blocks needs
+    // neither a PMU nor CPUID faulting: 706 + 1 = 707, listed.
+    ("test.cli_on_host", 707),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5791,7 +5801,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The pipe retry identity regression adds one unit: 3362 + 1 = 3363,
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
-    ("test.detcore_unit_on_host", 3384),
+    // And the same three bounded SIGCHLD-deferral units: 3384 + 3 = 3387, listed.
+    ("test.detcore_unit_on_host", 3387),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
