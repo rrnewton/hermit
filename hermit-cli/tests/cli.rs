@@ -5184,6 +5184,158 @@ fn timerless_backends_refuse_explicit_preemption_before_starting_the_guest() {
     }
 }
 
+/// A preemption record with one callback checkpoint, for refusals decided
+/// before any guest starts: dtid 3's single row ends at a PMU timer stop at
+/// progress 0. Its epoch is `ANNOTATED_FIXTURE_EPOCH`.
+/// A synthetic callback-annotated priority history, stating the qualified
+/// RCB metric explicitly in the identity envelope, so a qualified host admits
+/// its identity and the annotated-replay checks that follow decide. It
+/// records no run.
+fn write_annotated_history_fixture(directory: &Path) -> PathBuf {
+    let record = directory.join("annotated-history.json");
+    let recording = serde_json::json!({
+        "global": [],
+        "per_thread": {
+            "3": {
+                "final_prio": 1,
+                "prio_changes": [[1_767_225_600_000_001_000u64, 2]],
+                "preemption_rcbs": [100],
+                "chaos_epochs": []
+            }
+        },
+        "epoch": ANNOTATED_FIXTURE_EPOCH,
+        "signal_state_copy": true,
+        "callback_checkpoints": {
+            "3": [{
+                "history_index": 0,
+                "origin": {
+                    "callback": "PmuTimer",
+                    "site": "Prehook",
+                    "progress": 0,
+                    "last_op": null,
+                    "time": 1_767_225_600_000_001_000u64,
+                    "rcbs": 100
+                }
+            }]
+        }
+    });
+    let json = serde_json::json!({
+        "rcb_history": {
+            "format": 2,
+            "identity": "rcb:cond-retired:user:v1",
+            "recording": recording
+        }
+    });
+    fs::write(&record, serde_json::to_vec(&json).unwrap()).unwrap();
+    record
+}
+
+const ANNOTATED_FIXTURE_EPOCH: &str = "2026-01-01T00:00:00Z";
+
+/// Plain replay of a callback-annotated priority history without
+/// sequentialized threads is refused by name before the guest starts. Its
+/// row ends need the scheduler that grants each history and acknowledges each
+/// row; admitting it started an unsequentialized guest whose callbacks
+/// assert serialization.
+#[test]
+fn an_annotated_history_without_sequentialized_threads_is_refused_before_the_guest_starts() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let record = write_annotated_history_fixture(directory.path());
+    let replay = format!("--replay-preemptions-from={}", record.display());
+    let epoch = format!("--epoch={ANNOTATED_FIXTURE_EPOCH}");
+    let args = [
+        "run",
+        "--base-env=empty",
+        epoch.as_str(),
+        "--no-sequentialize-threads",
+        replay.as_str(),
+        "--",
+        "/bin/echo",
+        "annotated-guest-must-not-start",
+    ];
+    let output = hermit(&args);
+    let stderr = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: {stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE: --replay-preemptions-from names a \
+             record with callback checkpoints"
+        ) && stderr.contains(
+            "--backend=ptrace does not sequentialize threads (--no-sequentialize-threads)"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("annotated-guest-must-not-start"),
+        "the guest ran"
+    );
+}
+
+/// A library caller's configuration reaches the launch without a command
+/// line, so the launch itself judges an annotated one: without sequentialized
+/// threads, or without RCB time, both launch families refuse by name before
+/// any backend starts, and nothing in the configuration is changed.
+#[test]
+fn a_library_launch_refuses_an_unqualified_annotated_configuration() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let record = write_annotated_history_fixture(directory.path());
+    let annotated = hermit::DetConfig {
+        annotated_priority_replay: true,
+        sequentialize_threads: true,
+        replay_preemptions_from: Some(record),
+        epoch: ANNOTATED_FIXTURE_EPOCH.parse().unwrap(),
+        ..Default::default()
+    };
+    for (config, setting) in [
+        (
+            hermit::DetConfig {
+                sequentialize_threads: false,
+                ..annotated.clone()
+            },
+            "does not sequentialize threads (--no-sequentialize-threads)",
+        ),
+        (
+            hermit::DetConfig {
+                no_rcb_time: true,
+                ..annotated.clone()
+            },
+            "requests logical time without RCBs (--no-rcb-time)",
+        ),
+    ] {
+        let expected = format!(
+            "HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE: --replay-preemptions-from names a \
+             record with callback checkpoints, which replay only with precise PMU preemption \
+             timer events; the launch configuration {setting}; the guest has not started"
+        );
+        let status = hermit::run(
+            reverie::process::Command::new("/bin/echo"),
+            config.clone(),
+            false,
+            &None,
+        )
+        .expect_err("the library launched an unqualified annotated replay");
+        assert_eq!(format!("{status:#}"), expected);
+        let output = hermit::run_with_output(
+            reverie::process::Command::new("/bin/echo"),
+            config,
+            false,
+            &None,
+        )
+        .expect_err("the library launched an unqualified annotated replay");
+        assert_eq!(format!("{output:#}"), expected);
+    }
+}
+
 fn assert_timerless_default_and_disabled_maximum_run(backend: &str) {
     let _guard = hermit_run_guard();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -33179,7 +33331,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x186, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x187, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];

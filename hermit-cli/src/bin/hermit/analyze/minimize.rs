@@ -241,7 +241,11 @@ impl AnalyzeOpts {
                             }
                             Ok(())
                         })?;
-                    self.stamp_trial_record(PreemptionRecord::from_vecs(&btmap))
+                    // A subset of the input's own coordinates keeps its identity.
+                    self.stamp_trial_record(PreemptionRecord::from_vecs(
+                        &btmap,
+                        init_schedule.identity().cloned(),
+                    ))
                 };
                 if let Err(e) = pr_new.validate() {
                     bail!(
@@ -336,7 +340,7 @@ mod tests {
         let history: Vec<(LogicalTime, Priority)> = (1..=8)
             .map(|k| (LogicalTime::from_nanos(k * 1000), FIRST_PRIORITY + k))
             .collect();
-        PreemptionRecord::from_vecs(&BTreeMap::from([(DetTid::from_raw(3), history)]))
+        PreemptionRecord::from_vecs(&BTreeMap::from([(DetTid::from_raw(3), history)]), None)
             .write_to_disk(&preempts_path)
             .unwrap();
         let options =
@@ -377,6 +381,65 @@ mod tests {
                 trials, failing_trial,
                 "minimization ran more trials after trial {failing_trial} failed"
             );
+        }
+    }
+
+    /// Every trial file, and the minimized record, states exactly the input's
+    /// identity: a qualified one stays that metric, an unqualified or absent
+    /// one is not promoted, and the current host is never consulted. Each
+    /// trial's interventions are the input's own, per thread and in order.
+    #[test]
+    fn minimize_trials_keep_the_input_identity() {
+        use detcore::preemptions::HistoryIdentity;
+        use detcore::preemptions::boundary_recording::Recording;
+
+        let history: Vec<(LogicalTime, Priority)> = (1..=8)
+            .map(|k| (LogicalTime::from_nanos(k * 1000), FIRST_PRIORITY + k))
+            .collect();
+        let input = BTreeMap::from([(DetTid::from_raw(3), history)]);
+        for identity in [
+            Some(HistoryIdentity::Known(
+                reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1,
+            )),
+            Some(HistoryIdentity::Unqualified("claim-unset".to_owned())),
+            None,
+        ] {
+            let workspace = tempfile::tempdir().unwrap();
+            let preempts_path = workspace.path().join("target.preempts");
+            PreemptionRecord::from_vecs(&input, identity.clone())
+                .write_to_disk(&preempts_path)
+                .unwrap();
+            let source = PreemptionReader::new(&preempts_path).load_all().as_vecs();
+            let options =
+                AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
+                    .unwrap();
+            let mut trials = 0;
+            let (minimized, _, _) = options
+                .minimize_with(&preempts_path, |_runname, trial_preempts| {
+                    trials += 1;
+                    let bytes = std::fs::read(trial_preempts).unwrap();
+                    assert_eq!(
+                        Recording::decode(&bytes).unwrap().identity(),
+                        identity.as_ref()
+                    );
+                    let trial = PreemptionReader::new(trial_preempts).load_all();
+                    // The first entry is the thread's initial priority, not
+                    // an intervention.
+                    for (tid, kept) in trial.as_vecs() {
+                        let mut original = source[&tid].iter().skip(1);
+                        assert!(
+                            kept.iter()
+                                .skip(1)
+                                .all(|intervention| original.any(|from| from == intervention)),
+                            "{kept:?} is not a subsequence of {:?}",
+                            source[&tid]
+                        );
+                    }
+                    Ok(true)
+                })
+                .unwrap();
+            assert_eq!(trials, 3);
+            assert_eq!(minimized.identity(), identity.as_ref());
         }
     }
 }

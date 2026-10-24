@@ -18,7 +18,84 @@ use detcore_model::schedule::boundary::Schedule;
 use serde::Deserialize;
 use serde::Serialize;
 
+use super::HistoryIdentity;
 use super::PreemptionRecord;
+
+/// The only format of a history that states the identity of its RCB
+/// coordinates. Its sole top-level key replaces the required legacy
+/// `per_thread`/`global` and the `slice_boundary_recording` marker, so a
+/// reader built before it refuses the file instead of reading coordinates
+/// in another unit.
+const RCB_HISTORY_FORMAT: u32 = 2;
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityEnvelope<R> {
+    rcb_history: IdentityBody<R>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityBody<R> {
+    format: u32,
+    identity: IdentityWire,
+    /// The legacy record, or the `slice_boundary_recording` envelope.
+    recording: R,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum IdentityWire {
+    Known(String),
+    Unqualified(UnqualifiedWire),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UnqualifiedWire {
+    unqualified: String,
+}
+
+impl From<&HistoryIdentity> for IdentityWire {
+    fn from(identity: &HistoryIdentity) -> Self {
+        match identity {
+            HistoryIdentity::Known(metric) => Self::Known(metric.id().to_owned()),
+            HistoryIdentity::Unqualified(reason) => Self::Unqualified(UnqualifiedWire {
+                unqualified: reason.clone(),
+            }),
+        }
+    }
+}
+
+impl TryFrom<IdentityWire> for HistoryIdentity {
+    type Error = anyhow::Error;
+
+    fn try_from(wire: IdentityWire) -> anyhow::Result<Self> {
+        match wire {
+            IdentityWire::Known(id) => reverie::pmu_config::RcbMetric::from_id(&id)
+                .map(Self::Known)
+                .ok_or_else(|| anyhow::anyhow!("unknown RCB coordinate identity {id:?}")),
+            IdentityWire::Unqualified(UnqualifiedWire { unqualified }) => {
+                Ok(Self::Unqualified(unqualified))
+            }
+        }
+    }
+}
+
+/// Serializes `record` alone: in the `rcb_history` envelope if it states an
+/// identity, otherwise in the legacy format.
+pub(super) fn encode_record(record: &PreemptionRecord) -> serde_json::Result<String> {
+    match record.identity() {
+        None => serde_json::to_string(record),
+        Some(identity) => serde_json::to_string(&IdentityEnvelope {
+            rcb_history: IdentityBody {
+                format: RCB_HISTORY_FORMAT,
+                identity: identity.into(),
+                recording: record,
+            },
+        }),
+    }
+}
 
 /// Keep the preemption history and every existing run setting alongside the
 /// complete boundary stream. No public access returns its legacy component:
@@ -50,6 +127,8 @@ struct MetadataProbe {
     // A present null must not look like an absent protocol marker.
     #[serde(default, deserialize_with = "present_boundary")]
     slice_boundary_recording: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "present_boundary")]
+    rcb_history: Option<serde_json::Value>,
 }
 
 fn present_boundary<'de, D: serde::Deserializer<'de>>(
@@ -61,15 +140,24 @@ fn present_boundary<'de, D: serde::Deserializer<'de>>(
 pub(super) fn read_settings<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     let bytes = std::fs::read(path)
         .map_err(|e| format!("cannot read preemption record {}: {}", path.display(), e))?;
-    let probe: MetadataProbe = serde_json::from_slice(&bytes)
+    settings_in(path, &bytes)
+}
+
+/// [`read_settings`] over `bytes` already read from `path`, which only names
+/// them in errors.
+pub(super) fn settings_in<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<T, String> {
+    let probe: MetadataProbe = serde_json::from_slice(bytes)
         .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
-    if probe.slice_boundary_recording.is_none() {
+    if probe.slice_boundary_recording.is_none() && probe.rcb_history.is_none() {
         // Each old metadata reader still deserializes only its own field,
         // from the original bytes, preserving its legacy acceptance contract.
-        return serde_json::from_slice(&bytes)
+        return serde_json::from_slice(bytes)
             .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e));
     }
-    let recording = Recording::decode(&bytes)
+    let recording = Recording::decode(bytes)
         .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
     serde_json::from_value(serde_json::to_value(recording.metadata()).map_err(|e| e.to_string())?)
         .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))
@@ -152,6 +240,25 @@ impl Recording {
         // Inspect only to dispatch. Deserialize the ORIGINAL bytes again so
         // duplicate fields in the envelope are rejected, not overwritten by
         // Value. A malformed new recording never falls back to legacy.
+        if value.get("rcb_history").is_some() {
+            let envelope: IdentityEnvelope<Box<serde_json::value::RawValue>> =
+                serde_json::from_slice(bytes)?;
+            let body = envelope.rcb_history;
+            if body.format != RCB_HISTORY_FORMAT {
+                anyhow::bail!("unsupported rcb_history format {}", body.format);
+            }
+            let identity = HistoryIdentity::try_from(body.identity)?;
+            let inner = body.recording.get().as_bytes();
+            if serde_json::from_slice::<serde_json::Value>(inner)?
+                .get("rcb_history")
+                .is_some()
+            {
+                anyhow::bail!("nested rcb_history envelope");
+            }
+            let mut recording = Self::decode(inner)?;
+            recording.metadata_mut().identity = Some(identity);
+            return Ok(recording);
+        }
         if value.get("slice_boundary_recording").is_some() {
             let envelope: Envelope = serde_json::from_slice(bytes)?;
             Ok(Self::Boundaries(envelope.slice_boundary_recording))
@@ -164,20 +271,49 @@ impl Recording {
 
     /// Read a complete recording, preserving errors as failures.
     pub fn read(path: &Path) -> anyhow::Result<Self> {
-        Self::decode(&std::fs::read(path).with_context(|| format!("reading {}", path.display()))?)
-            .with_context(|| format!("reading schedule {}", path.display()))
+        Self::decode_from(
+            path,
+            &std::fs::read(path).with_context(|| format!("reading {}", path.display()))?,
+        )
+    }
+
+    /// Decode `bytes` already read from `path`, which names them in errors as
+    /// [`Self::read`] does.
+    pub fn decode_from(path: &Path, bytes: &[u8]) -> anyhow::Result<Self> {
+        Self::decode(bytes).with_context(|| format!("reading schedule {}", path.display()))
     }
 
     /// Serialize the same format with the conventional terminal newline.
     pub fn encode(&self) -> anyhow::Result<Vec<u8>> {
-        let mut bytes = match self {
-            Self::Legacy(record) => serde_json::to_vec(record)?,
-            Self::Boundaries(record) => serde_json::to_vec(&Envelope {
+        let mut bytes = match (self, self.metadata().identity()) {
+            (Self::Legacy(record), _) => encode_record(record)?.into_bytes(),
+            (Self::Boundaries(record), None) => serde_json::to_vec(&Envelope {
                 slice_boundary_recording: record.clone(),
+            })?,
+            (Self::Boundaries(record), Some(identity)) => serde_json::to_vec(&IdentityEnvelope {
+                rcb_history: IdentityBody {
+                    format: RCB_HISTORY_FORMAT,
+                    identity: identity.into(),
+                    recording: Envelope {
+                        slice_boundary_recording: record.clone(),
+                    },
+                },
             })?,
         };
         bytes.push(b'\n');
         Ok(bytes)
+    }
+
+    /// The same recording, stating `identity` for its coordinates.
+    pub fn with_identity(mut self, identity: Option<HistoryIdentity>) -> Self {
+        self.metadata_mut().identity = identity;
+        self
+    }
+
+    /// The identity of the recording's RCB coordinates; `None` for a legacy
+    /// file, whose producer is unknown.
+    pub fn identity(&self) -> Option<&HistoryIdentity> {
+        self.metadata().identity()
     }
 
     /// Write the complete serialized recording, without changing its format.
@@ -230,6 +366,13 @@ impl Recording {
             Self::Boundaries(record) => &record.preemptions,
         }
     }
+
+    fn metadata_mut(&mut self) -> &mut PreemptionRecord {
+        match self {
+            Self::Legacy(record) => record,
+            Self::Boundaries(record) => &mut record.preemptions,
+        }
+    }
 }
 
 /// Runtime access to recorded priorities/RCB history, retaining its complete
@@ -248,6 +391,11 @@ impl HistoryReader {
         self.0.require_strict_mode(false)
     }
 
+    /// The recording this history reads, for admission.
+    pub(crate) fn recording(&self) -> &Recording {
+        &self.0
+    }
+
     pub(crate) fn thread_initial_priority(
         &self,
         tid: &crate::types::DetTid,
@@ -264,6 +412,15 @@ impl HistoryReader {
         tid: &crate::types::DetTid,
     ) -> Option<super::ThreadHistory> {
         self.0.metadata().per_thread.get(tid).cloned()
+    }
+
+    /// The validated callback checkpoints of this history, per thread, in
+    /// row order (`PreemptionRecord::validate`).
+    pub(crate) fn callback_checkpoints(
+        &self,
+    ) -> &std::collections::BTreeMap<crate::types::DetTid, Vec<super::callback_history::Checkpoint>>
+    {
+        self.0.metadata().callback_checkpoints()
     }
 }
 
@@ -293,7 +450,7 @@ mod tests {
     use crate::types::LogicalTime;
     use crate::types::SchedEvent;
 
-    fn sample(markers: bool) -> Recording {
+    pub(super) fn sample(markers: bool) -> Recording {
         let metadata: PreemptionRecord = serde_json::from_str(
             &PreemptionWriter::new(None)
                 .with_epoch("2001-02-03T04:05:06Z".parse().unwrap())
@@ -438,17 +595,21 @@ mod tests {
 
     #[test]
     fn a_second_event_stream_is_not_accepted_as_metadata() {
-        let metadata =
-            PreemptionRecord::from_sched_events(vec![SchedEvent::branches(DetTid::from_raw(3), 1)]);
+        let metadata = PreemptionRecord::from_sched_events(
+            vec![SchedEvent::branches(DetTid::from_raw(3), 1)],
+            None,
+        );
         assert!(BoundaryRecording::new(metadata, Schedule::new(vec![]).unwrap()).is_err());
     }
 
     #[test]
     fn legacy_bytes_and_editor_access_remain_legacy() {
-        let legacy =
-            PreemptionRecord::from_sched_events(vec![SchedEvent::branches(DetTid::from_raw(3), 2)])
-                .with_pipe_wake_latency(Some(7))
-                .with_signal_state_copy(Some(true));
+        let legacy = PreemptionRecord::from_sched_events(
+            vec![SchedEvent::branches(DetTid::from_raw(3), 2)],
+            None,
+        )
+        .with_pipe_wake_latency(Some(7))
+        .with_signal_state_copy(Some(true));
         let mut expected = serde_json::to_vec(&legacy).unwrap();
         expected.push(b'\n');
         let record = Recording::Legacy(legacy.clone());
@@ -552,7 +713,7 @@ mod tests {
         writer.insert_schedevent(event.clone());
         assert_eq!(
             writer.into_string(),
-            PreemptionRecord::from_sched_events(vec![event]).to_string()
+            PreemptionRecord::from_sched_events(vec![event], None).to_string()
         );
     }
 
@@ -615,5 +776,251 @@ mod explicit_mode_tests {
             };
             assert!(std::panic::catch_unwind(|| crate::GlobalState::for_tests(&cfg)).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::tests::sample;
+    use super::*;
+    use crate::types::DetTid;
+    use crate::types::SchedEvent;
+
+    fn known() -> HistoryIdentity {
+        HistoryIdentity::Known(reverie::pmu_config::RcbMetric::ConditionalBranchesRetiredUserV1)
+    }
+
+    /// The legacy reader of the base build: `PreemptionRecord`'s own serde
+    /// shape, and the boundary dispatch that falls back to it.
+    fn base_build_decode(bytes: &[u8]) -> anyhow::Result<()> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)?;
+        if value.get("slice_boundary_recording").is_some() {
+            serde_json::from_slice::<Envelope>(bytes)?;
+        } else {
+            serde_json::from_slice::<PreemptionRecord>(bytes)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn an_identity_recording_round_trips_with_its_identity() {
+        for identity in [known(), HistoryIdentity::Unqualified("claim-unset".into())] {
+            let legacy = PreemptionRecord::from_sched_events(
+                vec![SchedEvent::branches(DetTid::from_raw(3), 7)],
+                Some(identity.clone()),
+            )
+            .with_pipe_wake_latency(Some(0));
+            let encoded = legacy.to_string();
+            assert!(
+                encoded.starts_with("{\"rcb_history\":{\"format\":2,"),
+                "{encoded}"
+            );
+            let decoded = Recording::decode(encoded.as_bytes()).unwrap();
+            assert_eq!(decoded.identity(), Some(&identity));
+            assert_eq!(decoded, Recording::Legacy(legacy.clone()));
+            assert_eq!(
+                decoded.encode().unwrap(),
+                format!("{encoded}\n").into_bytes()
+            );
+
+            let Recording::Boundaries(mut boundaries) = sample(true) else {
+                unreachable!()
+            };
+            boundaries.preemptions.identity = Some(identity.clone());
+            let boundaries = Recording::Boundaries(boundaries);
+            let bytes = boundaries.encode().unwrap();
+            let again = Recording::decode(&bytes).unwrap();
+            assert_eq!(again.identity(), Some(&identity));
+            assert_eq!(again, boundaries);
+            assert!(again.require_strict_mode(true).is_ok());
+        }
+    }
+
+    #[test]
+    fn the_base_builds_reader_refuses_every_identity_recording() {
+        let empty = PreemptionRecord::from_sched_events(vec![], Some(known()));
+        let Recording::Boundaries(mut boundaries) = sample(false) else {
+            unreachable!()
+        };
+        boundaries.preemptions.identity = Some(known());
+        for bytes in [
+            empty.to_string().into_bytes(),
+            Recording::Boundaries(boundaries).encode().unwrap(),
+        ] {
+            assert!(
+                base_build_decode(&bytes).is_err(),
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+            assert!(Recording::decode(&bytes).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_legacy_file_states_no_identity() {
+        for recording in [
+            Recording::Legacy(PreemptionRecord::from_sched_events(vec![], None)),
+            sample(true),
+        ] {
+            let decoded = Recording::decode(&recording.encode().unwrap()).unwrap();
+            assert_eq!(decoded.identity(), None);
+        }
+    }
+
+    #[test]
+    fn a_malformed_identity_recording_never_falls_back_to_legacy() {
+        let good: serde_json::Value = serde_json::from_str(
+            &PreemptionRecord::from_sched_events(vec![], Some(known())).to_string(),
+        )
+        .unwrap();
+        let mutate = |f: &dyn Fn(&mut serde_json::Value)| {
+            let mut value = good.clone();
+            f(&mut value);
+            serde_json::to_vec(&value).unwrap()
+        };
+        for bytes in [
+            mutate(&|v| v["rcb_history"]["format"] = 3.into()),
+            mutate(&|v| v["rcb_history"]["identity"] = "rcb:cond-retired:user:v2".into()),
+            mutate(&|v| v["rcb_history"]["identity"] = serde_json::json!({"unqualified": 1})),
+            mutate(&|v| v["rcb_history"]["extra"] = 1.into()),
+            mutate(&|v| v["per_thread"] = serde_json::json!({})),
+            mutate(&|v| {
+                let inner = v["rcb_history"].clone();
+                v["rcb_history"]["recording"] = serde_json::json!({ "rcb_history": inner });
+            }),
+            mutate(&|v| v["rcb_history"]["recording"] = serde_json::json!({"global": []})),
+        ] {
+            assert!(
+                Recording::decode(&bytes).is_err(),
+                "{}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+        let text = PreemptionRecord::from_sched_events(vec![], Some(known())).to_string();
+        let duplicated = text.replacen("\"format\":2,", "\"format\":2,\"format\":2,", 1);
+        assert_ne!(duplicated, text);
+        assert!(Recording::decode(duplicated.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn transformations_keep_the_identity() {
+        let record = PreemptionRecord::from_sched_events(
+            vec![SchedEvent::branches(DetTid::from_raw(3), 7)],
+            Some(known()),
+        );
+        assert_eq!(record.clone_preemptions_only().identity(), Some(&known()));
+        assert_eq!(record.normalize().identity(), Some(&known()));
+        assert_eq!(
+            record.with_latest_preempt_removed().identity(),
+            Some(&known())
+        );
+        let mut recording = Recording::Legacy(record);
+        recording.strip_times();
+        let reread = Recording::decode(&recording.encode().unwrap()).unwrap();
+        assert_eq!(reread.identity(), Some(&known()));
+        assert_eq!(reread, recording);
+    }
+
+    /// A record with two priority rows of tid 7, the second ended by a write
+    /// prehook checkpoint at the retained SPR record's coordinates, and
+    /// RCB-bearing events, as a writer emits it with or without `identity`.
+    fn with_rows_and_checkpoint(identity: Option<HistoryIdentity>) -> PreemptionRecord {
+        use detcore_model::schedule::Op;
+        use reverie::syscalls::Sysno;
+
+        use crate::DEFAULT_PRIORITY;
+        use crate::preemptions::PreemptionWriter;
+        use crate::preemptions::callback_history::Origin;
+        use crate::preemptions::callback_history::Site;
+        use crate::slice_boundary::callbacks::Callback;
+        use crate::types::LogicalTime;
+
+        let tid = DetTid::from_raw(7);
+        let mut writer = PreemptionWriter::new(None);
+        if let Some(identity) = identity {
+            writer = writer.with_identity(identity);
+        }
+        writer.register_thread(tid, DEFAULT_PRIORITY);
+        writer.insert_schedevent(SchedEvent::branches(tid, 2_459_579));
+        let first = LogicalTime::from_nanos(1_792_852_217_000_000_000);
+        writer.insert_reprioritization(tid, first, 2_459_579, DEFAULT_PRIORITY, DEFAULT_PRIORITY);
+        writer.insert_schedevent(SchedEvent::branches(tid, 8_299_750));
+        // Progress counts events, so the write prehook's endpoint is 154
+        // past the raw RCB count.
+        writer.insert_schedevent(SchedEvent {
+            op: Op::OtherInstructions,
+            count: 154,
+            ..SchedEvent::branches(tid, 0)
+        });
+        let second = LogicalTime::from_nanos(1_792_852_217_684_087_955);
+        writer.insert_reprioritization(tid, second, 10_759_329, DEFAULT_PRIORITY, DEFAULT_PRIORITY);
+        writer.insert_callback_checkpoint(
+            tid,
+            Origin {
+                callback: Callback::Syscall(Sysno::write),
+                site: Site::Prehook,
+                progress: 10_759_483,
+                last_op: Some(Op::OtherInstructions),
+                time: second,
+                rcbs: 10_759_329,
+            },
+        );
+        Recording::decode(writer.into_string().as_bytes())
+            .unwrap()
+            .into_legacy("test")
+            .unwrap()
+    }
+
+    /// Every transformation carries the identity and otherwise produces
+    /// exactly what it produces from the same record without one: every
+    /// per-thread row, callback checkpoint, event and RCB is unchanged.
+    #[test]
+    fn transformations_change_nothing_but_carry_the_identity() {
+        let with = with_rows_and_checkpoint(Some(known()));
+        let without = with_rows_and_checkpoint(None);
+        let tid = DetTid::from_raw(7);
+        assert_eq!(with.per_thread[&tid].prio_changes.len(), 2);
+        assert_eq!(with.callback_checkpoints[&tid].len(), 1);
+        assert_eq!(with.global.len(), 3);
+        assert_eq!(with.identity(), Some(&known()));
+        assert_eq!(with.clone().with_identity(None), without);
+        type Transformation = fn(&PreemptionRecord) -> PreemptionRecord;
+        let transformations: [(&str, Transformation); 3] = [
+            (
+                "clone_preemptions_only",
+                PreemptionRecord::clone_preemptions_only,
+            ),
+            ("normalize", PreemptionRecord::normalize),
+            (
+                "with_latest_preempt_removed",
+                PreemptionRecord::with_latest_preempt_removed,
+            ),
+        ];
+        for (name, transform) in transformations {
+            let carried = transform(&with);
+            assert_eq!(carried.identity(), Some(&known()), "{name}");
+            assert_eq!(carried.with_identity(None), transform(&without), "{name}");
+        }
+        let reloaded = |record: &PreemptionRecord| {
+            let mut recording = Recording::Legacy(record.clone());
+            recording.strip_times();
+            Recording::decode(&recording.encode().unwrap()).unwrap()
+        };
+        let carried = reloaded(&with);
+        assert_eq!(carried.identity(), Some(&known()));
+        assert_eq!(carried.with_identity(None), reloaded(&without));
+        let Recording::Boundaries(sampled) = sample(true) else {
+            panic!("not a boundary recording")
+        };
+        let wrapped = |record: &PreemptionRecord| {
+            let recording = Recording::Boundaries(
+                BoundaryRecording::new(record.clone_preemptions_only(), sampled.schedule().clone())
+                    .unwrap(),
+            );
+            Recording::decode(&recording.encode().unwrap()).unwrap()
+        };
+        let carried = wrapped(&with);
+        assert_eq!(carried.identity(), Some(&known()));
+        assert_eq!(carried.with_identity(None), wrapped(&without));
     }
 }

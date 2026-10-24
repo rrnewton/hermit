@@ -2069,6 +2069,15 @@ pub struct Scheduler {
     >,
     callback_checkpoint_desyncs: Vec<String>,
     pub(crate) callback_progress: BTreeMap<DetTid, crate::preemptions::callback_history::Progress>,
+    /// `Config::annotated_priority_replay`: the priority history replayed
+    /// carries callback checkpoints, consumed per thread in row order.
+    pub(crate) annotated_priority_replay: bool,
+    /// Under `annotated_priority_replay`, the next recorded row of each
+    /// thread whose priority-change request has not been selected yet.
+    priority_rows: BTreeMap<DetTid, u64>,
+    /// Under `annotated_priority_replay`, the threads whose start this run has
+    /// granted. A thread's history replays from its first row once only.
+    priority_births: BTreeSet<DetTid>,
 
     // New-format construction remains disabled until actual callback and
     // lifecycle integration is complete. Controller tests install it directly.
@@ -4061,29 +4070,135 @@ fn validate_strict_boundary_config(cfg: &Config) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// An admitted `replay_schedule_from` recording, with its
+/// `--stacktrace-event` selections already resolved against its complete
+/// stream (`AdmittedSchedule::new`), before the run is committed.
+pub(crate) struct AdmittedSchedule {
+    pub(crate) recording: Recording,
+    pub(crate) stacks: ReplayStacks,
+}
+
+/// The `--stacktrace-event` selections of an admitted schedule replay.
+#[derive(Debug, PartialEq)]
+pub(crate) enum ReplayStacks {
+    /// A legacy schedule's event at each selected index.
+    Legacy(Vec<(u64, Option<SchedEvent>, Option<PathBuf>)>),
+    /// A slice-boundary schedule's selected record indices.
+    Boundaries(BTreeMap<usize, Option<PathBuf>>),
+}
+
+impl AdmittedSchedule {
+    /// Resolves `cfg`'s stack selections against `recording`'s complete
+    /// stream. In a slice-boundary schedule an index outside it, or one given
+    /// twice, is a policy refusal; in a legacy schedule an index outside it
+    /// panics, as indexing its events always has.
+    pub(crate) fn new(cfg: &Config, recording: Recording) -> Result<Self, &'static str> {
+        let stacks = match &recording {
+            Recording::Legacy(record) => {
+                let vec = record.schedevents();
+                ReplayStacks::Legacy(
+                    cfg.stacktrace_event
+                        .iter()
+                        .map(|(ix, path)| (*ix, Some(vec[*ix as usize].clone()), path.clone()))
+                        .collect(),
+                )
+            }
+            Recording::Boundaries(record) => {
+                let mut events = BTreeMap::new();
+                for (index, path) in &cfg.stacktrace_event {
+                    let index = usize::try_from(*index)
+                        .ok()
+                        .filter(|index| *index < record.schedule().records().len())
+                        .ok_or(
+                            "slice-boundary protocol refusal: stack index is outside the complete stream",
+                        )?;
+                    if events.insert(index, path.clone()).is_some() {
+                        return Err("slice-boundary protocol refusal: duplicate stack index");
+                    }
+                }
+                ReplayStacks::Boundaries(events)
+            }
+        };
+        Ok(Self { recording, stacks })
+    }
+}
+
+/// The refusal of a run whose replayed priority history's callback
+/// checkpoints (`None` when it replays none) disagree with the launch
+/// decision `annotated` (`Config::annotated_priority_replay`), or `None`.
+pub(crate) fn priority_checkpoint_mode_refusal(
+    annotated: bool,
+    checkpoints: Option<&BTreeMap<DetTid, Vec<crate::preemptions::callback_history::Checkpoint>>>,
+) -> Option<String> {
+    let Some(checkpoints) = checkpoints else {
+        return annotated.then(|| {
+            "HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE: the run was prepared to replay a \
+             callback-annotated priority history, but names no --replay-preemptions-from"
+                .to_owned()
+        });
+    };
+    let carries = checkpoints.values().any(|points| !points.is_empty());
+    (carries != annotated).then(|| {
+        format!(
+            "HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE: the replayed preemption record {} \
+             callback checkpoints, but the run was prepared as if it {}",
+            if carries { "carries" } else { "carries no" },
+            if annotated {
+                "carried them"
+            } else {
+                "carried none"
+            },
+        )
+    })
+}
+
+/// Ends the run with a policy refusal for an invalid strict-boundary
+/// configuration, before anything else is prepared.
+pub(crate) fn refuse_invalid_strict_boundary_config(cfg: &Config) {
+    if let Err(reason) = validate_strict_boundary_config(cfg) {
+        exit_on_scheduler_refusal(&anyhow::anyhow!(reason));
+    }
+}
+
 impl Scheduler {
-    /// Create a new scheduler based on the configuration.
+    /// Create a new scheduler based on the configuration, preparing the
+    /// run's RCB clock and admitting its replay inputs first
+    /// (`crate::clock_identity::prepare_run`). The crate builds its own
+    /// scheduler through `GlobalState`, which runs the same phases.
+    #[cfg(test)]
     pub fn new(cfg: &Config) -> Self {
-        if let Err(reason) = validate_strict_boundary_config(cfg) {
-            exit_on_scheduler_refusal(&anyhow::anyhow!(reason));
-        }
+        refuse_invalid_strict_boundary_config(cfg);
+        // A scheduler alone reads no priority history, so neither admits one
+        // nor checks its checkpoints against the launch decision;
+        // `GlobalState` does both with the same preparation.
+        let prepared = crate::clock_identity::prepare_run(&Config {
+            replay_preemptions_from: None,
+            annotated_priority_replay: false,
+            ..cfg.clone()
+        });
+        Self::new_admitted(cfg, prepared.schedule, &prepared.clock)
+    }
+
+    /// Phase 4 of `crate::clock_identity`: a scheduler built from the admitted
+    /// `replay_schedule_from` recording and its resolved stack selections,
+    /// whose writer states `clock`'s committed identity. The caller has
+    /// refused an invalid strict-boundary configuration and prepared the run.
+    pub(crate) fn new_admitted(
+        cfg: &Config,
+        schedule: Option<AdmittedSchedule>,
+        clock: &crate::clock_identity::CommittedClock,
+    ) -> Self {
         let mut callback_checkpoints: BTreeMap<
             DetTid,
             std::collections::VecDeque<crate::preemptions::callback_history::Checkpoint>,
         > = BTreeMap::new();
         let mut boundary_replayer = None;
         let mut boundary_stacktrace_events = BTreeMap::new();
-        let (replayer, m_vec) = match &cfg.replay_schedule_from {
-            Some(path) => {
-                trace!("Scheduler loading trace from path {}", path.display());
-                // File/JSON failures retain the ordinary loader's panic class.
-                // Only explicit format-policy mismatches below are refusals.
-                let recording = Recording::read(path).unwrap();
-                recording
-                    .require_strict_mode(cfg.strict_schedule_boundaries)
-                    .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
-                match recording {
-                    Recording::Legacy(record) => {
+        let (replayer, m_vec) = match schedule {
+            Some(AdmittedSchedule { recording, stacks }) => {
+                trace!("Scheduler loading its admitted trace");
+                match (recording, stacks) {
+                    (Recording::Legacy(record), ReplayStacks::Legacy(toprint)) => {
                         callback_checkpoints = record
                             .callback_checkpoints()
                             .iter()
@@ -4091,38 +4206,19 @@ impl Scheduler {
                             .collect();
                         let vec = record.into_global();
                         trace!("Trace loaded, length {}", vec.len());
-                        let toprint = cfg
-                            .stacktrace_event
-                            .iter()
-                            .map(|(ix, path)| (*ix, Some(vec[*ix as usize].clone()), path.clone()))
-                            .collect();
                         let mut replayer = Replayer::new(vec);
                         replayer.replay_exhausted_panic = cfg.replay_exhausted_panic;
                         replayer.die_on_desync = cfg.die_on_desync;
                         (Some(replayer), Some(toprint))
                     }
-                    Recording::Boundaries(record) => {
-                        for (index, path) in &cfg.stacktrace_event {
-                            let index = usize::try_from(*index)
-                                .ok()
-                                .filter(|index| *index < record.schedule().records().len())
-                                .unwrap_or_else(|| exit_on_scheduler_refusal(&anyhow::anyhow!(
-                                    "slice-boundary protocol refusal: stack index is outside the complete stream"
-                                )));
-                            if boundary_stacktrace_events
-                                .insert(index, path.clone())
-                                .is_some()
-                            {
-                                exit_on_scheduler_refusal(&anyhow::anyhow!(
-                                    "slice-boundary protocol refusal: duplicate stack index"
-                                ));
-                            }
-                        }
+                    (Recording::Boundaries(record), ReplayStacks::Boundaries(stacks)) => {
+                        boundary_stacktrace_events = stacks;
                         boundary_replayer = Some(boundary_replayer::BoundaryReplayer::new(
                             record.schedule().clone(),
                         ));
                         (None, None)
                     }
+                    _ => unreachable!("stack selections resolved for another recording kind"),
                 }
             }
             None => (
@@ -4144,6 +4240,7 @@ impl Scheduler {
         let boundaries = cfg.strict_schedule_boundaries;
         let preemption_writer = cfg.record_preemptions.then(|| {
             let writer = PreemptionWriter::new(cfg.record_preemptions_to.clone())
+                .with_identity(clock.history_identity())
                 .with_epoch(cfg.epoch)
                 .with_pipe_wake_latency(cfg.pipe_wake_latency_in_effect())
                 .with_signal_state_copy(cfg.signal_state_copy);
@@ -4165,12 +4262,16 @@ impl Scheduler {
         Self {
             preemption_writer,
             callback_history_active: crate::preemptions::callback_history::recording_enabled(cfg)
+                || cfg.annotated_priority_replay
                 || callback_checkpoints
                     .values()
                     .any(|points| !points.is_empty()),
             callback_checkpoints,
             callback_checkpoint_desyncs: Vec::new(),
             callback_progress: BTreeMap::new(),
+            annotated_priority_replay: cfg.annotated_priority_replay,
+            priority_rows: BTreeMap::new(),
+            priority_births: BTreeSet::new(),
             replayer,
             boundary_replayer,
             boundary_stacktrace_events,
@@ -13525,6 +13626,21 @@ impl Scheduler {
         rs: &Resources,
         resp: &Ivar<SchedResponse>,
     ) -> Result<(), SkipTurn> {
+        if rs.priority_row.is_some() {
+            assert!(
+                rs.resources.len() == 1
+                    && matches!(
+                        rs.resources.keys().next(),
+                        Some(ResourceID::PriorityChangePoint(..))
+                    ),
+                "a priority row rides only a singleton priority-change request"
+            );
+            // Selected now, once: acknowledge the recorded row it ends.
+            if let Err(refusal) = self.acknowledge_priority_row(dettid, rs) {
+                self.callback_checkpoint_desyncs.push(refusal.clone());
+                exit_on_scheduler_refusal(&refusal);
+            }
+        }
         if let Some(origin) = rs.callback_checkpoint.as_deref() {
             assert_eq!(
                 rs.resources.len(),
@@ -15820,6 +15936,151 @@ impl Scheduler {
         self.per_thread_syscalls.insert(dettid, total);
     }
 
+    /// Take custody of the callback checkpoints of the priority history this
+    /// run replays (`Config::annotated_priority_replay`), from the same
+    /// validated record the threads' histories come from, before any thread
+    /// starts. Refuses a record whose checkpoints disagree with the launch
+    /// decision, in either direction: the configuration and the input are
+    /// one identity.
+    pub(crate) fn install_priority_checkpoints(
+        &mut self,
+        checkpoints: &BTreeMap<DetTid, Vec<crate::preemptions::callback_history::Checkpoint>>,
+    ) -> Result<(), String> {
+        if let Some(refusal) =
+            priority_checkpoint_mode_refusal(self.annotated_priority_replay, Some(checkpoints))
+        {
+            return Err(refusal);
+        }
+        if self.annotated_priority_replay {
+            self.callback_checkpoints = checkpoints
+                .iter()
+                .map(|(tid, points)| (*tid, points.iter().cloned().collect()))
+                .collect();
+        }
+        Ok(())
+    }
+
+    /// Grant a thread's start under `annotated_priority_replay` only as its
+    /// birth: its history then replays from row 0 with every checkpoint
+    /// unconsumed. A second start of a thread ID (a reused ID, or a fresh
+    /// runtime after exec), or a start after rows or progress were consumed,
+    /// would restart a history a cursor has already consumed, and is refused.
+    pub(crate) fn authenticate_priority_birth(&mut self, dettid: DetTid) -> Result<(), String> {
+        if !self.annotated_priority_replay {
+            return Ok(());
+        }
+        let consumed_rows = self.priority_rows.get(&dettid).copied().unwrap_or(0);
+        let progressed = self.callback_progress.get(&dettid).is_some_and(|progress| {
+            *progress != crate::preemptions::callback_history::Progress::default()
+        });
+        if !self.priority_births.insert(dettid) || consumed_rows != 0 || progressed {
+            return Err(format!(
+                "HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_RESUME: dtid {dettid} starts again after \
+                 its priority history began replaying ({consumed_rows} rows acknowledged); a \
+                 callback-annotated history replays from its first row only at a thread's birth"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Acknowledge, at the selection of a priority-change request under
+    /// `annotated_priority_replay`, the recorded row it ends: exactly the
+    /// thread's next row, whose checkpoint, if it has one, must be the origin
+    /// the request carries. Rows count once each, here, for annotated and
+    /// unannotated rows alike. An attached origin for a row without a
+    /// checkpoint is the recorder's own annotation and consumes nothing.
+    pub(crate) fn acknowledge_priority_row(
+        &mut self,
+        dettid: DetTid,
+        rs: &Resources,
+    ) -> Result<(), String> {
+        use crate::preemptions::callback_history::Refusal;
+        if !self.annotated_priority_replay {
+            return Ok(());
+        }
+        let Some(row) = rs.priority_row else {
+            return Ok(());
+        };
+        let next = self.priority_rows.get(&dettid).copied().unwrap_or(0);
+        if row != next {
+            return Err(format!(
+                "{}: dtid {dettid} ends recorded row {row}, but its next unacknowledged row is \
+                 {next}",
+                Refusal::Skipped.name()
+            ));
+        }
+        let front = self
+            .callback_checkpoints
+            .get(&dettid)
+            .and_then(|points| points.front());
+        let index = usize::try_from(row).expect("row index fits in usize");
+        match front {
+            Some(front) if front.history_index < index => {
+                return Err(format!(
+                    "{}: dtid {dettid} ends row {row} with the checkpoint of row {} unconsumed",
+                    Refusal::Skipped.name(),
+                    front.history_index
+                ));
+            }
+            Some(front) if front.history_index == index => {
+                match rs.callback_checkpoint.as_deref() {
+                    Some(origin) if *origin == front.origin => {
+                        self.callback_checkpoints
+                            .get_mut(&dettid)
+                            .and_then(|points| points.pop_front());
+                    }
+                    Some(origin) => {
+                        return Err(format!(
+                            "{}: dtid {dettid} ends row {row} at {origin:?}, not at its recorded \
+                             endpoint {:?}",
+                            Refusal::Incompatible.name(),
+                            front.origin
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "{}: dtid {dettid} ends row {row} without reaching its recorded \
+                             endpoint {:?}",
+                            Refusal::Skipped.name(),
+                            front.origin
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        self.priority_rows.insert(dettid, next + 1);
+        Ok(())
+    }
+
+    /// Under `annotated_priority_replay`, the refusal of a run that ended
+    /// with recorded callback checkpoints unconsumed, naming each thread's
+    /// count; `None` when every checkpoint was consumed.
+    pub(crate) fn priority_history_incomplete(&self) -> Option<String> {
+        if !self.annotated_priority_replay {
+            return None;
+        }
+        let remaining: Vec<String> = self
+            .callback_checkpoints
+            .iter()
+            .filter(|(_, points)| !points.is_empty())
+            .map(|(tid, points)| {
+                format!(
+                    "dtid {tid}: {} unconsumed from row {}",
+                    points.len(),
+                    points.front().unwrap().history_index
+                )
+            })
+            .collect();
+        (!remaining.is_empty()).then(|| {
+            format!(
+                "{}: the run ended with recorded callback checkpoints unconsumed ({})",
+                crate::preemptions::callback_history::Refusal::Incomplete.name(),
+                remaining.join("; ")
+            )
+        })
+    }
+
     /// Report a checkpoint mismatch without inserting an event or moving the
     /// legacy cursor, its resynchronization state, priorities, or virtual time.
     pub(crate) fn callback_checkpoint_mismatch(
@@ -15833,6 +16094,23 @@ impl Scheduler {
             .callback_checkpoints
             .get_mut(&tid)
             .and_then(|points| points.pop_front());
+        // A thread past the checkpoint it reports is refused as overshot by
+        // name, even when this custody no longer holds that checkpoint first.
+        // Any other custody disagreement stays an internal error.
+        if expected.as_ref() != Some(checkpoint)
+            && (actual.progress > checkpoint.origin.progress
+                || actual.rcbs > checkpoint.origin.rcbs)
+        {
+            exit_on_scheduler_refusal(&format!(
+                "{}: {tid} went past callback checkpoint {} (expected {:?}, observed {:?}); the \
+                 scheduler's custody holds {:?} first",
+                crate::preemptions::callback_history::Refusal::Overshot.name(),
+                checkpoint.history_index,
+                checkpoint.origin,
+                actual,
+                expected,
+            ));
+        }
         assert_eq!(
             expected.as_ref(),
             Some(checkpoint),
@@ -15997,6 +16275,13 @@ impl Scheduler {
             timeslice_stats.merge(st);
         }
         let syscalls = self.per_thread_syscalls.values().copied().sum();
+
+        // After the record is flushed and each thread's DESYNC line is
+        // logged above: the re-recorded history survives as evidence, and the
+        // run still ends as a refusal, not a summary.
+        if let Some(refusal) = self.priority_history_incomplete() {
+            return Err(crate::PriorityHistoryRefusal(refusal).into());
+        }
 
         Ok((
             RunSummary {

@@ -60,8 +60,20 @@ pub const DEFAULT_BACKEND_CAPABILITIES: BackendCapabilities = {
     backend.delivers_preemption_timer_events = false;
     backend.runs_guest_code_between_injections = false;
     backend.reports_sigreturns = false;
+    // Nor does it know which counter the run's RCB clock is.
+    backend.rcb_clock_contract = None;
     backend
 };
+
+/// The RCB clock a [`Config`] was prepared for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RcbClockClaim {
+    /// Nobody prepared the configuration for a qualified clock.
+    #[default]
+    Unset,
+    /// Prepared for this qualified clock key.
+    Known(reverie::pmu_config::ClockKey),
+}
 
 /// Sets `supports_blocked_wait_signal_interruption` and the four capabilities
 /// Detcore read from it until A5 step 3c.0 split them out
@@ -265,6 +277,15 @@ pub struct Config {
     #[serde(default = "default_backend_capabilities")]
     #[clap(skip = DEFAULT_BACKEND_CAPABILITIES)]
     pub backend: BackendCapabilities,
+
+    /// The RCB clock the host prepared this run for
+    /// (`hermit_cli::prepare_backend_config`). Detcore checks it against the
+    /// clock it actually finds before it records or replays a history, and
+    /// never trusts it alone. It is not serialized: a configuration read from
+    /// JSON or bincode has none, and its histories are unqualified.
+    #[serde(skip)]
+    #[clap(skip)]
+    pub rcb_clock_claim: RcbClockClaim,
 
     /// The guest may start with a terminal: one of the launcher's standard
     /// descriptors is a terminal, the launcher has a controlling terminal that
@@ -1193,6 +1214,26 @@ pub struct Config {
     #[serde(default)]
     #[clap(skip)]
     pub in_guest_signal_delivery: bool,
+
+    /// Whether `--replay-preemptions-from` names a record that carries
+    /// callback checkpoints, so priority-history replay ends each annotated
+    /// row at its recorded callback endpoint instead of at the first stop that
+    /// reaches the row's RCB count
+    /// (<https://github.com/rrnewton/hermit/issues/4082>).
+    ///
+    /// The host sets it, not a flag, from the validated record before the
+    /// scheduler or any Tool reads the configuration, and refuses a
+    /// configuration it does not qualify for such a record
+    /// (`preemption_admission::refuse_unqualified_annotated_replay`). Preparing
+    /// any run sets it from the record, so a caller's configuration cannot
+    /// carry it in; Detcore refuses a record whose checkpoints disagree with
+    /// it. A record so annotated was made with `--record-preemptions`, so the
+    /// replay observes schedule events as its recording did
+    /// (`observes_schedevents`). False, the default, changes nothing. Like
+    /// `in_guest_signal_delivery`, it has no legacy key.
+    #[serde(default)]
+    #[clap(skip)]
+    pub annotated_priority_replay: bool,
 }
 
 /// Where and how much [`Config::fatal_core_capture`] may write.
@@ -1494,6 +1535,42 @@ impl Config {
     /// This applies to both record and replay for scheduled events.
     pub fn should_trace_schedevent(&self) -> bool {
         self.record_preemptions || self.replay_schedule_from.is_some()
+    }
+
+    /// Whether this run produces and traces schedule events: the decision
+    /// `should_trace_schedevent` makes for recording and schedule replay, and
+    /// also replay of a callback-annotated priority history
+    /// (`annotated_priority_replay`). Such a record was made with
+    /// `--record-preemptions`, so its replay makes every decision this gates
+    /// as its recording did, whether or not it writes a record, and its
+    /// callback checkpoints compare against the progress those events count.
+    pub fn observes_schedevents(&self) -> bool {
+        self.should_trace_schedevent() || self.annotated_priority_replay
+    }
+
+    /// Why this effective configuration cannot replay a callback-annotated
+    /// priority history, or `None` when it can. Its row ends are actual
+    /// callback endpoints at exact RCB counts, guarded one RCB past each: that
+    /// needs the backend's own Detcore preemption timer events
+    /// (`delivers_preemption_timer_events`), sequentialized threads (the
+    /// scheduler that grants each history and acknowledges each row), an
+    /// active maximum timeslice, precise timers and RCB time. The answer
+    /// names the first unmet requirement. It reads capabilities, never a
+    /// backend's name, and never changes the configuration.
+    pub fn annotated_priority_replay_unqualified(&self) -> Option<&'static str> {
+        if !self.backend.delivers_preemption_timer_events {
+            Some("cannot deliver Detcore preemption timer events")
+        } else if !self.sequentialize_threads {
+            Some("does not sequentialize threads (--no-sequentialize-threads)")
+        } else if self.max_timeslice.is_none() {
+            Some("has its preemption timer disabled (--max-timeslice=disabled)")
+        } else if self.imprecise_timers {
+            Some("requests imprecise timers (--imprecise-timers)")
+        } else if self.no_rcb_time {
+            Some("requests logical time without RCBs (--no-rcb-time)")
+        } else {
+            None
+        }
     }
 
     /// Returns manual interuption points for a given thread
@@ -2166,19 +2243,26 @@ fn config_wire_default() -> Config {
     config.sched_seed = None;
     // `BackendCapabilities` is defined in Reverie, outside
     // `CONFIG_DEFINITION_SOURCES`, so the source domain cannot see a change to
-    // it; only its encoding can. Every field is a bool, so any constant
-    // carries every field's width (see
+    // it; only its encoding can. Every field but one is a bool, so any
+    // constant carries its width. The optional `rcb_clock_contract` carries
+    // its width only when set, and KVM states none, so it is set here to
+    // ptrace's (see
     // `config_fingerprint_sees_the_width_of_every_backend_capability`). KVM's
     // is kept, as it was when one field was optional and only KVM's set it.
     config.backend = BackendCapabilities::KVM;
+    config.backend.rcb_clock_contract = BackendCapabilities::PTRACE.rcb_clock_contract;
     config
 }
 
 pub fn config_wire_fingerprint() -> String {
-    let config = config_wire_default();
-    let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy())
+    wire_fingerprint_of(&config_wire_default())
+}
+
+/// [`config_wire_fingerprint`] with `config` in place of the canonical default.
+fn wire_fingerprint_of(config: &Config) -> String {
+    let wire = bincode::serde::encode_to_vec(config, bincode::config::legacy())
         .expect("canonical Config wire default must encode with Reverie's bincode configuration");
-    let named_shape = serde_json::to_string(&config)
+    let named_shape = serde_json::to_string(config)
         .expect("canonical Config wire default must encode as JSON for field-name checking");
     fingerprint_of_config_material(&wire, &named_shape, CONFIG_DEFINITION_SOURCES)
 }
@@ -2520,7 +2604,7 @@ pub fn decode_backend_config_json(json: &str) -> serde_json::Result<Config> {
     }
     // Deserialize the original bytes, not a Value map that would erase
     // duplicate keys before the typed deserializers can reject them.
-    let envelope: VersionedBackendConfig<'_> = serde_json::from_str(json)?;
+    let envelope: VersionedBackendConfigInput<'_> = serde_json::from_str(json)?;
     if envelope.dbt_config_version != 1 {
         return Err(<serde_json::Error as serde::de::Error>::custom(
             format_args!(
@@ -2530,17 +2614,48 @@ pub fn decode_backend_config_json(json: &str) -> serde_json::Result<Config> {
         ));
     }
     let mut config = from_legacy_backend_json(envelope.config.get())?;
-    config.backend = envelope.backend;
+    config.backend = backend_with_every_capability(envelope.backend.get())?;
     Ok(config)
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// The typed capabilities in `json`, each of which must be present.
+///
+/// Reverie defaults a missing `rcb_clock_contract` to `None` so that its own
+/// older serialized values still read. The envelope states every capability
+/// it carries, so a missing key here is an error like any other missing
+/// capability, not an unqualified clock.
+fn backend_with_every_capability(json: &str) -> serde_json::Result<BackendCapabilities> {
+    let backend: BackendCapabilities = serde_json::from_str(json)?;
+    let present: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json)?;
+    let expected = serde_json::to_value(backend)?;
+    match expected
+        .as_object()
+        .and_then(|fields| fields.keys().find(|key| !present.contains_key(*key)))
+    {
+        Some(missing) => Err(<serde_json::Error as serde::de::Error>::custom(
+            format_args!("missing field `{missing}`"),
+        )),
+        None => Ok(backend),
+    }
+}
+
+#[derive(Serialize)]
 struct VersionedBackendConfig<'a> {
+    dbt_config_version: u32,
+    config: &'a serde_json::value::RawValue,
+    backend: BackendCapabilities,
+}
+
+/// [`VersionedBackendConfig`] as read. The backend object stays as written so
+/// that [`backend_with_every_capability`] can see which keys it names.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionedBackendConfigInput<'a> {
     dbt_config_version: u32,
     #[serde(borrow)]
     config: &'a serde_json::value::RawValue,
-    backend: BackendCapabilities,
+    #[serde(borrow)]
+    backend: &'a serde_json::value::RawValue,
 }
 
 /// The names of the fifteen legacy backend keys, in the order
@@ -2614,6 +2729,9 @@ impl LegacyBackendKeys {
     /// constant contributes nothing a key decides.
     fn capabilities(&self) -> BackendCapabilities {
         let mut backend = BackendCapabilities::PTRACE;
+        // The legacy form predates the key and serves only DBT, whose RCB
+        // clock is not a qualified contract.
+        backend.rcb_clock_contract = None;
         backend.tool_shares_guest_descriptor_table = self.discover_live_file_metadata;
         backend.rediscovers_descriptors_after_exec = self.discover_live_file_metadata;
         backend.loopback_pollers_yield_to_peers = self.discover_live_file_metadata;
@@ -2747,7 +2865,11 @@ mod legacy_backend_json {
     /// as unset.
     /// `signal_at` came after the form froze; the scheduler acts on it, not
     /// the runtime, so it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 25] = [
+    /// `annotated_priority_replay` came after it too, and is false for every
+    /// backend that reads the legacy form: priority replay needs a preemption
+    /// timer, which none of them delivers, so it is never written and reads
+    /// as false.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 26] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -2773,6 +2895,7 @@ mod legacy_backend_json {
         "work_span_report",
         "signal_at",
         "in_guest_signal_delivery",
+        "annotated_priority_replay",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -2908,6 +3031,7 @@ mod legacy_backend_json {
                     | "in_guest_site_patching_off"
                     | "in_guest_refuses_host_timed_producers"
                     | "in_guest_signal_delivery"
+                    | "annotated_priority_replay"
                     | "target_timeslice_syscalls_only"
                     | "futex_wake_yields"
                     | "replaying"
@@ -3217,7 +3341,8 @@ mod legacy_backend_json {
                 | "signal_delivery_check_fatal"
                 | "work_span_report"
                 | "signal_at"
-                | "in_guest_signal_delivery" => Ok(()),
+                | "in_guest_signal_delivery"
+                | "annotated_priority_replay" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -3239,7 +3364,18 @@ mod legacy_backend_json {
 
 #[cfg(test)]
 mod tests {
+    use reverie::RcbClockContract;
+
     use super::*;
+
+    /// Every value `BackendCapabilities::rcb_clock_contract` takes today.
+    /// Reverie's enum is non-exhaustive, so no match here fails on a new
+    /// variant; `every_backend_constant_states_a_listed_rcb_clock_contract`
+    /// checks that every backend constant's value is listed.
+    const RCB_CLOCK_CONTRACTS: [Option<RcbClockContract>; 2] = [
+        None,
+        Some(RcbClockContract::PerfCounterOnTargetThreadUserOnly),
+    ];
 
     /// The four capabilities split out of
     /// `supports_blocked_wait_signal_interruption` in A5 step 3c.0 equal it
@@ -3348,6 +3484,8 @@ mod tests {
         assert!(!config.backend.host_timed_signals_are_physical);
         assert!(!config.backend.delivers_preemption_timer_events);
         assert!(!config.backend.runs_guest_code_between_injections);
+        assert!(config.backend.rcb_clock_contract.is_none());
+        assert_eq!(config.rcb_clock_claim, RcbClockClaim::Unset);
         assert!(!config.guest_may_inherit_a_terminal);
         assert!(config.in_guest_detlog_forward_policy.is_none());
         assert!(!config.in_guest_site_patching_off);
@@ -3422,6 +3560,8 @@ mod tests {
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
         backend.reports_sigreturns = false;
+        // The legacy form names no RCB clock contract: it reads back as none.
+        backend.rcb_clock_contract = None;
         backend.reports_kernel_child_exit_signals = backend.reports_child_exit_publication;
         // The legacy discover_live_file_metadata bit couples three facts.
         backend.rediscovers_descriptors_after_exec = backend.tool_shares_guest_descriptor_table;
@@ -3517,11 +3657,7 @@ mod tests {
 
     #[test]
     fn backend_config_json_round_trips_each_independent_capability() {
-        let baseline = serde_json::to_value(BackendCapabilities::DBT).unwrap();
-        for (name, value) in baseline.as_object().unwrap() {
-            let mut edited = baseline.clone();
-            edited[name] = serde_json::Value::Bool(!value.as_bool().unwrap());
-            let backend = serde_json::from_value(edited).unwrap();
+        let round_trip = |backend: BackendCapabilities, name: &str| {
             let sent = Config {
                 backend,
                 ..Config::default()
@@ -3530,19 +3666,53 @@ mod tests {
             let encoded = encode_backend_config_json(legacy, backend).unwrap();
             let received = decode_backend_config_json(&encoded).unwrap();
             assert_eq!(received.backend, backend, "{name}");
+        };
+        let baseline = serde_json::to_value(BackendCapabilities::DBT).unwrap();
+        for (name, value) in baseline.as_object().unwrap() {
+            if name == "rcb_clock_contract" {
+                // The typed capability takes each value it can, not a flip.
+                for contract in RCB_CLOCK_CONTRACTS {
+                    let mut backend = BackendCapabilities::DBT;
+                    backend.rcb_clock_contract = contract;
+                    round_trip(backend, &format!("{name} = {contract:?}"));
+                }
+                continue;
+            }
+            let mut edited = baseline.clone();
+            let value = value
+                .as_bool()
+                .unwrap_or_else(|| panic!("{name} is neither a bool nor the RCB clock contract"));
+            edited[name] = serde_json::Value::Bool(!value);
+            round_trip(serde_json::from_value(edited).unwrap(), name);
         }
     }
 
     #[test]
     fn backend_config_json_requires_each_typed_capability_once() {
+        for contract in RCB_CLOCK_CONTRACTS {
+            let mut backend = BackendCapabilities::LITEINST_IN_GUEST;
+            backend.rcb_clock_contract = contract;
+            requires_each_typed_capability_once(backend);
+        }
+    }
+
+    fn requires_each_typed_capability_once(backend: BackendCapabilities) {
         let sent = Config {
-            backend: BackendCapabilities::LITEINST_IN_GUEST,
+            backend,
             ..Config::default()
         };
         let encoded =
             encode_backend_config_json(to_legacy_backend_json(&sent).unwrap(), sent.backend)
                 .unwrap();
         let envelope: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            decode_backend_config_json(&encoded).unwrap().backend,
+            backend
+        );
+        // A contract no Reverie names is refused, not read as none.
+        let mut unnamed = envelope.clone();
+        unnamed["backend"]["rcb_clock_contract"] = "PerfCounterOnSomeOtherThread".into();
+        assert!(decode_backend_config_json(&unnamed.to_string()).is_err());
         for (name, value) in envelope["backend"].as_object().unwrap() {
             let mut missing = envelope.clone();
             missing["backend"].as_object_mut().unwrap().remove(name);
@@ -3940,7 +4110,8 @@ mod tests {
                 | "signal_delivery_check_fatal"
                 | "work_span_report"
                 | "signal_at"
-                | "in_guest_signal_delivery" => {}
+                | "in_guest_signal_delivery"
+                | "annotated_priority_replay" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -3959,11 +4130,12 @@ mod tests {
         // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`, `cpu_profile_source`,
         // `signal_state_copy`, `container_mount_table`,
         // `mountinfo_mount_namespace`, `signal_delivery_check_fatal`,
-        // `work_span_report`, `signal_at` and `in_guest_signal_delivery`
-        // and `strict_schedule_boundaries` none: fourteen more keys and
-        // twenty-four fewer, so ten keys fewer than fields.
+        // `work_span_report`, `signal_at`, `in_guest_signal_delivery`,
+        // `annotated_priority_replay` and `strict_schedule_boundaries` none:
+        // fourteen more keys and twenty-five fewer, so eleven keys fewer than
+        // fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 10);
+        assert_eq!(fields.len(), keys.len() + 11);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -4045,6 +4217,8 @@ mod tests {
         on.backend.delivers_preemption_timer_events = true;
         on.backend.runs_guest_code_between_injections = true;
         on.backend.reports_sigreturns = true;
+        assert_eq!(off.backend.rcb_clock_contract, None);
+        on.backend.rcb_clock_contract = Some(RcbClockContract::PerfCounterOnTargetThreadUserOnly);
         let json = to_legacy_backend_json(&on).unwrap();
         assert_eq!(json, to_legacy_backend_json(&off).unwrap());
         for key in [
@@ -4056,6 +4230,7 @@ mod tests {
             "delivers_preemption_timer_events",
             "runs_guest_code_between_injections",
             "reports_sigreturns",
+            "rcb_clock_contract",
         ] {
             assert!(!json.contains(key), "{json}");
         }
@@ -4074,6 +4249,7 @@ mod tests {
             assert!(!backend.delivers_preemption_timer_events);
             assert!(!backend.runs_guest_code_between_injections);
             assert!(!backend.reports_sigreturns);
+            assert_eq!(backend.rcb_clock_contract, None);
             assert_eq!(backend, legacy_expressible(BackendCapabilities::DBT));
         }
     }
@@ -4837,6 +5013,152 @@ mod tests {
         assert!(!decoded.in_guest_signal_delivery);
     }
 
+    /// `annotated_priority_replay` never enters the legacy form, and reads
+    /// back as false from both its object and array forms; it crosses
+    /// Reverie's positional bincode and JSON unchanged, and a JSON
+    /// configuration without the key reads as off.
+    #[test]
+    fn annotated_priority_replay_never_enters_the_legacy_form_and_round_trips() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            annotated_priority_replay: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("annotated_priority_replay"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .annotated_priority_replay
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .annotated_priority_replay
+        );
+        for annotated in [false, true] {
+            let config = Config {
+                annotated_priority_replay: annotated,
+                ..Config::default()
+            };
+            let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(decoded.annotated_priority_replay, annotated);
+            let json: Config =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            assert_eq!(json.annotated_priority_replay, annotated);
+        }
+        let mut encoded = serde_json::to_value(Config::default()).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("annotated_priority_replay")
+            .expect("the field is serialized");
+        let decoded: Config = serde_json::from_value(encoded).unwrap();
+        assert!(!decoded.annotated_priority_replay);
+    }
+
+    /// Schedule events are observed exactly where they are traced, and also
+    /// in replay of a callback-annotated priority history, whose recording
+    /// traced them, whether or not that replay records.
+    #[test]
+    fn annotated_priority_replay_observes_schedule_events() {
+        let plain = Config::default();
+        assert!(!plain.should_trace_schedevent() && !plain.observes_schedevents());
+        let recording = Config {
+            record_preemptions: true,
+            ..Config::default()
+        };
+        assert!(recording.should_trace_schedevent() && recording.observes_schedevents());
+        let replay = Config {
+            replay_preemptions_from: Some("history.json".into()),
+            ..Config::default()
+        };
+        assert!(!replay.observes_schedevents(), "an unannotated history");
+        let annotated = Config {
+            annotated_priority_replay: true,
+            ..replay
+        };
+        assert!(!annotated.should_trace_schedevent());
+        assert!(annotated.observes_schedevents());
+    }
+
+    /// An annotated priority history replays only on an effective
+    /// configuration with the backend's own preemption timer events,
+    /// sequentialized threads, an active maximum, precise timers and RCB time.
+    /// A configuration nobody prepared for a backend has no timer events and
+    /// is refused; each other unmet requirement is named in turn, and the
+    /// answer never changes the configuration.
+    #[test]
+    fn annotated_priority_replay_requires_a_qualified_effective_configuration() {
+        let unprepared = Config {
+            annotated_priority_replay: true,
+            replay_preemptions_from: Some("history.json".into()),
+            ..Config::default()
+        };
+        assert_eq!(
+            unprepared.annotated_priority_replay_unqualified(),
+            Some("cannot deliver Detcore preemption timer events")
+        );
+        let qualified = Config {
+            backend: BackendCapabilities::PTRACE,
+            sequentialize_threads: true,
+            max_timeslice: NonZeroU64::new(1_000_000),
+            imprecise_timers: false,
+            no_rcb_time: false,
+            ..unprepared.clone()
+        };
+        assert_eq!(qualified.annotated_priority_replay_unqualified(), None);
+        let before = serde_json::to_value(&qualified).unwrap();
+        for (config, setting) in [
+            (
+                Config {
+                    sequentialize_threads: false,
+                    ..qualified.clone()
+                },
+                "does not sequentialize threads (--no-sequentialize-threads)",
+            ),
+            (
+                Config {
+                    max_timeslice: None,
+                    ..qualified.clone()
+                },
+                "has its preemption timer disabled (--max-timeslice=disabled)",
+            ),
+            (
+                Config {
+                    imprecise_timers: true,
+                    ..qualified.clone()
+                },
+                "requests imprecise timers (--imprecise-timers)",
+            ),
+            (
+                Config {
+                    no_rcb_time: true,
+                    ..qualified.clone()
+                },
+                "requests logical time without RCBs (--no-rcb-time)",
+            ),
+        ] {
+            assert_eq!(
+                config.annotated_priority_replay_unqualified(),
+                Some(setting)
+            );
+        }
+        assert_eq!(serde_json::to_value(&qualified).unwrap(), before);
+    }
+
     /// `--signal-at` takes `turn=N:SIGNAL` with SIGNAL a name or a number.
     /// SIGKILL and SIGSTOP are refused, by name or number: the kernel acts on
     /// them at once, outside the scheduler's protocols for them.
@@ -5394,18 +5716,30 @@ mod tests {
         let config = config_wire_default();
         let fields = serde_json::to_value(config.backend).unwrap();
         let fields = fields.as_object().unwrap();
+        // One field is typed: the optional RCB clock contract, which the
+        // encoded default sets (`config_wire_default`). Every other is a bool,
+        // and any other non-bool fails here.
+        let contract = &fields["rcb_clock_contract"];
+        assert!(contract.is_string(), "{fields:?}");
+        let bools: Vec<&String> = fields
+            .keys()
+            .filter(|name| name.as_str() != "rcb_clock_contract")
+            .collect();
         assert!(
-            fields.values().all(serde_json::Value::is_boolean),
+            bools.iter().all(|name| fields[name.as_str()].is_boolean()),
             "{fields:?}"
         );
+        assert_eq!(bools.len() + 1, fields.len());
         let encode = |config: &Config| {
             bincode::serde::encode_to_vec(config, bincode::config::legacy()).unwrap()
         };
+        // A bool is one byte; the set contract is its `Some` tag and its
+        // four-byte variant index, so its width is in the encoded default.
         assert_eq!(
             bincode::serde::encode_to_vec(config.backend, bincode::config::legacy())
                 .unwrap()
                 .len(),
-            fields.len()
+            bools.len() + 1 + 4
         );
         // The backend's values are part of the encoded default.
         let flipped = config
@@ -5413,6 +5747,53 @@ mod tests {
             .with_backend(|backend| backend.supports_madvise = !backend.supports_madvise);
         assert_eq!(encode(&flipped).len(), encode(&config).len());
         assert_ne!(encode(&flipped), encode(&config));
+        // Every representable change to a capability changes the fingerprint:
+        // each bool flipped, and each other value of the contract.
+        let ours = wire_fingerprint_of(&config);
+        assert_eq!(ours, config_wire_fingerprint());
+        for name in bools {
+            let mut edited = fields.clone();
+            edited[name.as_str()] =
+                serde_json::Value::Bool(!fields[name.as_str()].as_bool().unwrap());
+            let backend: BackendCapabilities =
+                serde_json::from_value(serde_json::Value::Object(edited)).unwrap();
+            let changed = config.clone().with_backend(|b| *b = backend);
+            assert_ne!(wire_fingerprint_of(&changed), ours, "{name}");
+        }
+        let mut seen = BTreeSet::new();
+        for value in RCB_CLOCK_CONTRACTS {
+            let changed = config
+                .clone()
+                .with_backend(|backend| backend.rcb_clock_contract = value);
+            let fingerprint = wire_fingerprint_of(&changed);
+            assert_eq!(
+                fingerprint == ours,
+                value == config.backend.rcb_clock_contract,
+                "{value:?}"
+            );
+            assert!(seen.insert(fingerprint), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn every_backend_constant_states_a_listed_rcb_clock_contract() {
+        for backend in [
+            BackendCapabilities::PTRACE,
+            BackendCapabilities::E9PATCH,
+            BackendCapabilities::LITEINST_IN_GUEST,
+            BackendCapabilities::SABRE,
+            BackendCapabilities::DBT,
+            BackendCapabilities::KVM,
+        ] {
+            assert!(
+                RCB_CLOCK_CONTRACTS.contains(&backend.rcb_clock_contract),
+                "{backend:?}"
+            );
+        }
+        assert_eq!(
+            BackendCapabilities::PTRACE.rcb_clock_contract,
+            Some(RcbClockContract::PerfCounterOnTargetThreadUserOnly)
+        );
     }
 
     #[test]

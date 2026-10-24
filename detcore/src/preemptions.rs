@@ -34,6 +34,27 @@ use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::SchedEvent;
 
+/// The RCB-coordinate identity a stored history declares. Only a history
+/// written in the `rcb_history` envelope (`boundary_recording`) has one; a
+/// legacy file states none, so where it was produced is unknown.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum HistoryIdentity {
+    /// Its RCB coordinates count this metric.
+    Known(reverie::pmu_config::RcbMetric),
+    /// Its producer's RCB clock was not a qualified contract, for the reason
+    /// it states. Never executable.
+    Unqualified(String),
+}
+
+impl std::fmt::Display for HistoryIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Known(metric) => f.write_str(metric.id()),
+            Self::Unqualified(reason) => write!(f, "unqualified ({reason})"),
+        }
+    }
+}
+
 /// A record of all the preemptions and other scheduling events that occur during execution.
 #[derive(PartialEq, Default, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
 pub struct PreemptionRecord {
@@ -71,18 +92,26 @@ pub struct PreemptionRecord {
     /// Absent in old/edited recordings; never inferred from time or branch counts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
+    /// The identity of this record's RCB coordinates, carried by the
+    /// `rcb_history` envelope around the record rather than inside it.
+    /// `None` for a legacy file, and for a record built without one.
+    #[serde(skip)]
+    identity: Option<HistoryIdentity>,
 }
 
 impl std::fmt::Display for PreemptionRecord {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let str = serde_json::to_string(&self).unwrap();
+        let str = boundary_recording::encode_record(self).unwrap();
         write!(f, "{}", str)
     }
 }
 
 impl PreemptionRecord {
     /// TODO: This is not ideal because PreemptionRecord shouldn't be doing double duty as an eventlog.
-    pub fn from_sched_events(events: Vec<SchedEvent>) -> Self {
+    /// `identity` is that of the events' RCB coordinates: the admitted
+    /// source's for events taken from another history, `None` where it is
+    /// unknown.
+    pub fn from_sched_events(events: Vec<SchedEvent>, identity: Option<HistoryIdentity>) -> Self {
         Self {
             per_thread: Default::default(),
             global: events,
@@ -90,7 +119,19 @@ impl PreemptionRecord {
             pipe_wake_latency: None,
             signal_state_copy: None,
             callback_checkpoints: BTreeMap::new(),
+            identity,
         }
+    }
+
+    /// The identity of this record's RCB coordinates, if it states one.
+    pub fn identity(&self) -> Option<&HistoryIdentity> {
+        self.identity.as_ref()
+    }
+
+    /// The same record, stating `identity` for its coordinates.
+    pub fn with_identity(mut self, identity: Option<HistoryIdentity>) -> Self {
+        self.identity = identity;
+        self
     }
 
     /// The same record, stating the `--pipe-wake-latency` of the trials it
@@ -194,6 +235,7 @@ impl PreemptionRecord {
             pipe_wake_latency: self.pipe_wake_latency,
             signal_state_copy: self.signal_state_copy,
             callback_checkpoints: BTreeMap::new(),
+            identity: self.identity.clone(),
         }
     }
 
@@ -209,7 +251,12 @@ impl PreemptionRecord {
 
     /// Convert from a flat vector representation (Time,Priority_AFTER_Time) into the internal representation.
     /// The very first timeslice should have a zero timestamp, but it is ignored if nonzero.
-    pub fn from_vecs(bt: &BTreeMap<DetTid, Vec<(LogicalTime, Priority)>>) -> Self {
+    /// `identity` is that of the coordinates: the admitted source's for
+    /// coordinates taken from another history, `None` where it is unknown.
+    pub fn from_vecs(
+        bt: &BTreeMap<DetTid, Vec<(LogicalTime, Priority)>>,
+        identity: Option<HistoryIdentity>,
+    ) -> Self {
         let mut bt2 = BTreeMap::new();
         for (tid, vec) in bt {
             let th = if vec.is_empty() {
@@ -254,6 +301,7 @@ impl PreemptionRecord {
             pipe_wake_latency: None,
             signal_state_copy: None,
             callback_checkpoints: BTreeMap::new(),
+            identity,
         }
     }
 
@@ -681,6 +729,13 @@ impl ThreadHistoryIterator {
             )
         })
     }
+
+    /// How many recorded rows have been installed as slice ends. The row the
+    /// current slice ends is the last of them: `next_with_rcbs` advances past
+    /// a row as it installs it, before that row's priority request is filed.
+    pub fn installed_rows(&self) -> usize {
+        self.ix
+    }
 }
 
 impl Iterator for ThreadHistoryIterator {
@@ -713,7 +768,7 @@ mod tests {
     /// (https://github.com/rrnewton/hermit/issues/4380).
     #[test]
     fn the_pipe_wake_latency_round_trips_and_is_compared_exactly() {
-        let off = PreemptionRecord::from_sched_events(Vec::new());
+        let off = PreemptionRecord::from_sched_events(Vec::new(), None);
         assert!(
             !serde_json::to_string(&off)
                 .unwrap()
@@ -721,14 +776,14 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         for latency in [Some(0), Some(3_000_000)] {
-            let record =
-                PreemptionRecord::from_sched_events(Vec::new()).with_pipe_wake_latency(latency);
+            let record = PreemptionRecord::from_sched_events(Vec::new(), None)
+                .with_pipe_wake_latency(latency);
             let json = serde_json::to_string(&record).unwrap();
             let back: PreemptionRecord = serde_json::from_str(&json).unwrap();
             assert_eq!(back.pipe_wake_latency(), latency);
             assert_eq!(record.clone_preemptions_only().pipe_wake_latency(), latency);
             let minimized =
-                PreemptionRecord::from_vecs(&BTreeMap::new()).with_pipe_wake_latency(latency);
+                PreemptionRecord::from_vecs(&BTreeMap::new(), None).with_pipe_wake_latency(latency);
             assert_eq!(minimized.pipe_wake_latency(), latency);
             let path = dir.path().join("record.json");
             std::fs::write(&path, &json).unwrap();
@@ -761,7 +816,7 @@ mod tests {
     /// refused; a record that does not say (older, or synthesized) is not.
     #[test]
     fn the_signal_state_copy_setting_round_trips_and_is_compared() {
-        let unsaid = PreemptionRecord::from_sched_events(Vec::new());
+        let unsaid = PreemptionRecord::from_sched_events(Vec::new(), None);
         assert_eq!(unsaid.signal_state_copy(), None);
         assert!(
             !serde_json::to_string(&unsaid)
@@ -988,7 +1043,7 @@ mod tests {
 [946684799001171285,8408],[946684799001171295,4493],[946684799001192845,3481]]}},"global":[]}"#;
         let pr: PreemptionRecord = serde_json::from_str(str).unwrap();
         let vecs = pr.as_vecs();
-        let pr2 = PreemptionRecord::from_vecs(&vecs);
+        let pr2 = PreemptionRecord::from_vecs(&vecs, None);
         assert_eq!(pr, pr2);
     }
 
@@ -1084,7 +1139,8 @@ mod tests {
 
         use crate::slice_boundary::callbacks::Callback;
         let tid = DetTid::from_raw(3);
-        let mut record = PreemptionRecord::from_sched_events(vec![SchedEvent::branches(tid, 10)]);
+        let mut record =
+            PreemptionRecord::from_sched_events(vec![SchedEvent::branches(tid, 10)], None);
         let time = LogicalTime::from_nanos(100);
         let mut history = ThreadHistory::new();
         history.prio_changes.push((time, 1000));
@@ -1145,7 +1201,7 @@ mod tests {
         let encoded = serde_json::to_string(&record).unwrap();
         let decoded: PreemptionRecord = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, record);
-        let empty = PreemptionRecord::from_sched_events(Vec::new());
+        let empty = PreemptionRecord::from_sched_events(Vec::new(), None);
         assert_eq!(
             serde_json::to_string(&empty).unwrap(),
             r#"{"per_thread":{},"global":[]}"#
@@ -1284,6 +1340,13 @@ impl PreemptionWriter {
     /// (`Config::signal_state_copy`).
     pub fn with_signal_state_copy(mut self, on: bool) -> Self {
         self.inner.signal_state_copy = Some(on);
+        self
+    }
+
+    /// The identity of the coordinates this writer records: the run's
+    /// validated producer clock.
+    pub fn with_identity(mut self, identity: HistoryIdentity) -> Self {
+        self.inner.identity = Some(identity);
         self
     }
 
@@ -1518,12 +1581,16 @@ pub fn read_trace(path: &Path) -> Vec<SchedEvent> {
 fn read_preemption_record(path: &Path) -> PreemptionRecord {
     let string = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("Error reading file {:?}:\n {}", path, e));
-    let pr: PreemptionRecord = serde_json::from_str(&string).unwrap_or_else(|e| {
-        panic!(
-            "Error parsing PreemptionRecord from JSON: {}\nJSON contents:\n{}",
-            e, string
-        )
-    });
+    // The identity envelope is read with its identity; a boundary recording
+    // is refused, as its legacy parse always failed.
+    let pr: PreemptionRecord = boundary_recording::Recording::decode(string.as_bytes())
+        .and_then(|recording| recording.into_legacy("legacy preemption reader"))
+        .unwrap_or_else(|e| {
+            panic!(
+                "Error parsing PreemptionRecord from JSON: {}\nJSON contents:\n{}",
+                e, string
+            )
+        });
     if let Err(e) = pr.validate() {
         panic!(
             "Invalid PreemptionRecord when loading from path {}. Error:\n {}",
@@ -1552,12 +1619,19 @@ pub fn read_recorded_epoch(path: &Path) -> Result<Option<DateTime<Utc>>, String>
 /// [`read_recorded_epoch`] reads the epoch. `Ok(None)` means the record was
 /// made with the option off, or before the field existed.
 pub fn read_recorded_pipe_wake_latency(path: &Path) -> Result<Option<u64>, String> {
-    #[derive(Deserialize)]
-    struct LatencyOnly {
-        #[serde(default)]
-        pipe_wake_latency: Option<u64>,
-    }
     Ok(boundary_recording::read_settings::<LatencyOnly>(path)?.pipe_wake_latency)
+}
+
+/// [`read_recorded_pipe_wake_latency`] over `bytes` already read from `path`,
+/// which only names them in errors.
+pub fn recorded_pipe_wake_latency_in(path: &Path, bytes: &[u8]) -> Result<Option<u64>, String> {
+    Ok(boundary_recording::settings_in::<LatencyOnly>(path, bytes)?.pipe_wake_latency)
+}
+
+#[derive(Deserialize)]
+struct LatencyOnly {
+    #[serde(default)]
+    pipe_wake_latency: Option<u64>,
 }
 
 /// The refusal of a replay whose `--pipe-wake-latency` differs from the one a
@@ -1588,12 +1662,56 @@ pub fn pipe_wake_latency_mismatch(
 /// preemption record file, as [`read_recorded_epoch`] reads the epoch.
 /// `Ok(None)` for a record written before the field existed.
 pub fn read_recorded_signal_state_copy(path: &Path) -> Result<Option<bool>, String> {
-    #[derive(Deserialize)]
-    struct CopyOnly {
-        #[serde(default)]
-        signal_state_copy: Option<bool>,
-    }
     Ok(boundary_recording::read_settings::<CopyOnly>(path)?.signal_state_copy)
+}
+
+/// [`read_recorded_signal_state_copy`] over `bytes` already read from
+/// `path`, which only names them in errors.
+pub fn recorded_signal_state_copy_in(path: &Path, bytes: &[u8]) -> Result<Option<bool>, String> {
+    Ok(boundary_recording::settings_in::<CopyOnly>(path, bytes)?.signal_state_copy)
+}
+
+#[derive(Deserialize)]
+struct CopyOnly {
+    #[serde(default)]
+    signal_state_copy: Option<bool>,
+}
+
+/// Read only whether a preemption record file carries callback checkpoints
+/// (`Config::annotated_priority_replay`), as [`read_recorded_epoch`] reads
+/// the epoch. A record without the field, older or made without chaos
+/// recording, carries none. Detcore validates the whole record, checkpoints
+/// included, when it loads it for the run.
+pub fn read_recorded_callback_checkpoints(path: &Path) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct CheckpointsOnly {
+        #[serde(default)]
+        callback_checkpoints: BTreeMap<String, Vec<serde_json::Value>>,
+    }
+    Ok(boundary_recording::read_settings::<CheckpointsOnly>(path)?
+        .callback_checkpoints
+        .values()
+        .any(|points| !points.is_empty()))
+}
+
+/// Detcore's own refusal of a run prepared to replay a callback-annotated
+/// priority history (`Config::annotated_priority_replay`) on an effective
+/// configuration that cannot honor its row ends
+/// (`Config::annotated_priority_replay_unqualified`), checked before the
+/// scheduler or any history exists. Hosts refuse earlier, by name; this
+/// backstop holds for every configuration that reaches Detcore, whoever
+/// prepared it. `None` for an unannotated run or a qualified one.
+pub fn annotated_replay_mode_refusal(cfg: &crate::Config) -> Option<String> {
+    if !cfg.annotated_priority_replay {
+        return None;
+    }
+    cfg.annotated_priority_replay_unqualified().map(|setting| {
+        format!(
+            "HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE: the run was prepared to replay a \
+             callback-annotated priority history, but its configuration {setting}; no thread \
+             has started"
+        )
+    })
 }
 
 /// The refusal of a replay whose signal-state copy setting differs from the

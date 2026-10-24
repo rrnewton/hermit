@@ -4419,7 +4419,58 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // sets, from the final configuration and the process's PID-namespace
     // ownership (`in_guest_signal_delivery_gate`, A5 step 3c.1, D35 and D52).
     config.in_guest_signal_delivery = false;
+    // The RCB clock this run is prepared for, which Detcore checks against the
+    // clock it finds before recording or replaying a history.
+    config.rcb_clock_claim = rcb_clock_claim(&config);
     config
+}
+
+/// The qualified RCB clock `config` is prepared for: the backend's clock
+/// contract and this host's qualified profile, whether or not Detcore
+/// consumes the counter. Reads CPUID only; it installs no PMU configuration,
+/// so a `--skid-margin` recorded later still applies.
+fn rcb_clock_claim(config: &DetConfig) -> detcore_model::config::RcbClockClaim {
+    use detcore_model::config::RcbClockClaim;
+    match (
+        config.backend.rcb_clock_contract,
+        reverie::pmu_config::resolve_host_clock(),
+    ) {
+        (Some(_), Ok(host)) => RcbClockClaim::Known(host.key()),
+        _ => RcbClockClaim::Unset,
+    }
+}
+
+/// The RCB clock identity refusal Detcore's replay admission would give a
+/// run prepared with `config` ([`prepare_backend_config`]) for the histories
+/// in `inputs`, each an option and a path, or `None` when its effective RCB
+/// clock admits their identities. An early diagnostic of identity only: it
+/// does not check a history's strict or legacy mode, which Detcore checks
+/// when the run starts, as it checks identity again. It reads CPUID and the
+/// process's PMU state, installs and pins nothing, so a `--skid-margin`
+/// recorded later still applies. An unreadable history is an error, not a
+/// refusal.
+pub fn rcb_history_refusal(
+    config: &DetConfig,
+    inputs: &[(&str, &Path)],
+) -> anyhow::Result<Option<String>> {
+    if inputs.is_empty() {
+        return Ok(None);
+    }
+    let sources = detcore::clock_identity::ClockSources {
+        host: reverie::pmu_config::resolve_host_clock(),
+        state: reverie::pmu_config::pmu_state(),
+    };
+    let validated = match detcore::clock_identity::validate_run_clock(config, &sources) {
+        Ok(validated) => validated,
+        Err(refusal) => return Ok(Some(refusal)),
+    };
+    for (option, path) in inputs {
+        let recording = detcore::preemptions::boundary_recording::Recording::read(path)?;
+        if let Err(refusal) = validated.admit(&format!("{option} {}", path.display()), &recording) {
+            return Ok(Some(refusal));
+        }
+    }
+    Ok(None)
 }
 
 /// The configuration of an in-guest run on the loader route (the exec-stop,
@@ -4680,6 +4731,7 @@ async fn dispatch_backend(
 ) -> Result<ExitStatus, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
+    crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;
     config.launch_image = launched_image(&command);
     if backend == Backend::Kvm {
         return Ok(run_kvm(
@@ -5024,6 +5076,7 @@ async fn dispatch_output_backend(
 ) -> Result<Output, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
+    crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;
     config.launch_image = launched_image(&command);
     if backend == Backend::Kvm {
         return run_kvm(
@@ -8796,6 +8849,13 @@ mod tests {
             // trampolines keep the original syscall instruction), whose
             // rt_sigreturns reach the seccomp stop that reports them.
             "reports_sigreturns": matches!(backend, Backend::Ptrace | Backend::E9patch),
+            // Only ptrace's counter is a qualified RCB clock, and e9patch
+            // preprocessing runs on it.
+            "rcb_clock_contract": if matches!(backend, Backend::Ptrace | Backend::E9patch) {
+                serde_json::json!("PerfCounterOnTargetThreadUserOnly")
+            } else {
+                serde_json::Value::Null
+            },
         })
     }
 
@@ -8811,11 +8871,27 @@ mod tests {
             Backend::Dbt,
         ] {
             let config = prepare_backend_config(super::DetConfig::default(), backend);
-            assert_eq!(
-                serde_json::to_value(config.backend).unwrap(),
-                golden_backend_capabilities(backend),
-                "{backend:?}"
-            );
+            let actual = serde_json::to_value(config.backend).unwrap();
+            let golden = golden_backend_capabilities(backend);
+            assert_eq!(actual, golden, "{backend:?}");
+            // The table names the contract: a wrong or missing one differs.
+            let mut missing = golden.clone();
+            missing
+                .as_object_mut()
+                .unwrap()
+                .remove("rcb_clock_contract");
+            assert_ne!(actual, missing, "{backend:?}");
+            for wrong in [
+                serde_json::Value::Null,
+                serde_json::json!("PerfCounterOnTargetThreadUserOnly"),
+                serde_json::json!("PerfCounterOnSomeOtherThread"),
+            ] {
+                if wrong != golden["rcb_clock_contract"] {
+                    let mut edited = golden.clone();
+                    edited["rcb_clock_contract"] = wrong;
+                    assert_ne!(actual, edited, "{backend:?}");
+                }
+            }
         }
     }
 

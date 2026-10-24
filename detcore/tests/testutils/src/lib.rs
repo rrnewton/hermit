@@ -110,6 +110,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         in_guest_reserved_signals: 0,
         in_guest_refuses_host_timed_producers: false,
         in_guest_signal_delivery: false,
+        annotated_priority_replay: false,
         launch_image: None,
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
         virtualize_time: false,
@@ -195,6 +196,7 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| {
         chaos_per_thread_slowdown: false,
         chaos_slowdown_max_factor: 10.0,
         chaos_epoch_length_ns: 0,
+        rcb_clock_claim: Default::default(),
     }
     .with_backend(|backend| {
         detcore::set_kernel_signal_facts(backend, false);
@@ -218,6 +220,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         in_guest_reserved_signals: 0,
         in_guest_refuses_host_timed_producers: false,
         in_guest_signal_delivery: false,
+        annotated_priority_replay: false,
         launch_image: None,
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
         virtualize_time: true, // stat* could depends on this
@@ -303,6 +306,7 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| {
         chaos_per_thread_slowdown: false,
         chaos_slowdown_max_factor: 10.0,
         chaos_epoch_length_ns: 0,
+        rcb_clock_claim: Default::default(),
     }
     .with_backend(|backend| {
         detcore::set_kernel_signal_facts(backend, false);
@@ -326,6 +330,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         in_guest_reserved_signals: 0,
         in_guest_refuses_host_timed_producers: false,
         in_guest_signal_delivery: false,
+        annotated_priority_replay: false,
         launch_image: None,
         inherited_seccomp: detcore::InheritedSeccomp::measure(),
         virtualize_time: true,
@@ -411,6 +416,7 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| {
         chaos_per_thread_slowdown: false,
         chaos_slowdown_max_factor: 10.0,
         chaos_epoch_length_ns: 0,
+        rcb_clock_claim: Default::default(),
     }
     .with_backend(|backend| {
         detcore::set_kernel_signal_facts(backend, false);
