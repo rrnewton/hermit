@@ -28,6 +28,8 @@ use serde::Serialize;
 use crate::cpu_set::CpuSet;
 use crate::machine::MachineDescription;
 use crate::syscalls::VIRTUAL_CPUSET_BYTES;
+use crate::types::DetTid;
+use crate::types::LogicalTime;
 
 pub(crate) mod fd_directory;
 mod fixed;
@@ -102,7 +104,10 @@ enum ProcfsKind {
     /// file depending on which route it asks through.
     Maps,
     Pressure,
-    SelfSchedstat,
+    /// A task's `schedstat` (`proc_pid_schedstat`, fs/proc/base.c:511-523
+    /// at v6.16, prints the one task its path names, a process's leader for
+    /// `/proc/<pid>`), by the path it was opened through.
+    TaskSchedstat,
     SoftnetStat,
     Protocols,
     BtrfsBytesReserved,
@@ -930,6 +935,15 @@ impl MapsTarget {
     }
 }
 
+/// The one task a `schedstat` opened at `path`, Detcore's spelling of it
+/// (`Detcore::procfs_spelling_at`, which names a directory descriptor's task
+/// as its open found it), describes, where the caller's process is `pid` and
+/// the caller `tid` ([`ProcfsTask::described_task`]).
+pub(crate) fn schedstat_task_at(path: &Path, pid: i32, tid: i32) -> Option<i32> {
+    let normalized = normalize_observed_path(path)?;
+    ProcfsTask::parse(normalized.to_str()?, "schedstat")?.described_task(pid, tid)
+}
+
 pub(crate) fn maps_task_at(path: &Path, pid: i32, tid: i32) -> Option<BoundTask> {
     let normalized = normalize_observed_path(path)?;
     let path = normalized.to_str()?;
@@ -998,6 +1012,16 @@ impl ProcfsTask {
             other => other,
         });
         Self { process, thread }
+    }
+
+    /// The one task this spelling names, by its number, where the caller's
+    /// process is `pid` and the caller `tid`: the thread below `task/`, else
+    /// the task at the top of `/proc` (a process's leader, or the thread a
+    /// `/proc/<tid>` names). `None` for a spelling that names no task.
+    pub(crate) fn described_task(self, pid: i32, tid: i32) -> Option<i32> {
+        self.bound_to(pid, tid)
+            .bound()
+            .map(|task| task.thread.unwrap_or(task.process))
     }
 
     /// The task, once every name is a number; `None` while a name is the
@@ -1137,6 +1161,10 @@ pub(crate) struct ProcfsFile {
     maps_target: Option<MapsTarget>,
     target_fd: Option<i32>,
     bound_thread_identity: Option<(i32, i32, i32)>,
+    /// For a task's `schedstat`, the task it describes, found when it was
+    /// opened ([`ProcfsFile::bind_schedstat_thread`]); `None` where none was.
+    #[serde(default)]
+    schedstat_thread: Option<DetTid>,
     #[serde(default)]
     timer_slack_identity: Option<(u64, u64)>,
     /// Detcore renders this file without the backend opening it: the guest's
@@ -1490,6 +1518,10 @@ pub(crate) struct ProcfsSnapshotContext {
     pub(crate) virtual_cpuinfo: Option<Vec<u8>>,
     /// The machine the fixed files describe.
     pub(crate) machine: MachineDescription,
+    /// For a task's `schedstat`, its runtime, where it is a thread of the
+    /// reader's own process; built by the caller from the reader's CPU
+    /// accounting (`Detcore::same_process_task_runtime`).
+    pub(crate) schedstat_runtime: Option<LogicalTime>,
     /// For a status snapshot, the guest's own signal mask that the thread it
     /// describes published while Detcore holds that thread under a private
     /// blocking mask (`Scheduler::published_guest_sigmask`): reported as
@@ -1548,7 +1580,7 @@ impl ProcfsFile {
                 | ProcfsKind::Fixed(FixedProcfsFile::Interrupts | FixedProcfsFile::Softirqs)
                 | ProcfsKind::ProcessStat
                 | ProcfsKind::ProcessStatus
-                | ProcfsKind::SelfSchedstat
+                | ProcfsKind::TaskSchedstat
                 | ProcfsKind::BlockStat
         )
     }
@@ -1632,7 +1664,7 @@ impl ProcfsFile {
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-922): Review per-process host scheduler normalization.
-            other if is_process_schedstat_path(other) => ProcfsKind::SelfSchedstat,
+            other if ProcfsTask::parse(other, "schedstat").is_some() => ProcfsKind::TaskSchedstat,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-909): Review softnet counter normalization.
             "/proc/net/softnet_stat" => ProcfsKind::SoftnetStat,
@@ -1714,6 +1746,7 @@ impl ProcfsFile {
             maps_target: None,
             target_fd,
             bound_thread_identity: None,
+            schedstat_thread: None,
             timer_slack_identity: None,
             rendered: false,
             guest_numbers: None,
@@ -2368,6 +2401,23 @@ impl ProcfsFile {
         )
     }
 
+    /// Whether this is a task's `schedstat`.
+    pub(crate) fn is_task_schedstat(&self) -> bool {
+        self.kind == ProcfsKind::TaskSchedstat
+    }
+
+    /// Bind a task's `schedstat` to the task it describes, found when it was
+    /// opened.
+    pub(crate) fn bind_schedstat_thread(&mut self, thread: Option<DetTid>) {
+        assert!(self.is_task_schedstat(), "only a schedstat binds a task");
+        self.schedstat_thread = thread;
+    }
+
+    /// The task a `schedstat` describes, as its open found it.
+    pub(crate) fn schedstat_thread(&self) -> Option<DetTid> {
+        self.schedstat_thread
+    }
+
     /// Binds a thread-self procfs inode to its opener's process identity.
     // TODO-HUMAN-REVIEW(PR-964): Review open-time procfs thread binding.
     pub(crate) fn bind_thread_identity(&mut self, tgid: i32, tid: i32, ppid: i32) {
@@ -2470,6 +2520,7 @@ impl ProcfsFile {
             mountinfo,
             virtual_cpuinfo,
             machine,
+            schedstat_runtime,
             published_sigblk,
             status_hides_ignored,
             status_held_ignored,
@@ -2615,7 +2666,7 @@ impl ProcfsFile {
                 rendered
             }
             ProcfsKind::Pressure => sanitize_pressure(&contents),
-            ProcfsKind::SelfSchedstat => sanitize_self_schedstat(&contents),
+            ProcfsKind::TaskSchedstat => sanitize_task_schedstat(&contents, schedstat_runtime),
             ProcfsKind::SoftnetStat => sanitize_softnet_stat(machine.cpus),
             ProcfsKind::Protocols => sanitize_protocols(&contents),
             ProcfsKind::BtrfsBytesReserved => sanitize_btrfs_bytes_reserved(&contents),
@@ -2782,8 +2833,22 @@ impl ProcfsFile {
     /// Updates the shared cursor used by all aliases of this open file.
     pub(crate) fn set_offset(&mut self, offset: usize) {
         self.offset = offset;
-        if matches!(self.kind, ProcfsKind::TimerSlack(_)) && offset == 0 {
+        if matches!(
+            self.kind,
+            ProcfsKind::TimerSlack(_) | ProcfsKind::TaskSchedstat
+        ) && offset == 0
+        {
             // seq_file regenerates its single-record snapshot after rewind.
+            self.contents = None;
+        }
+    }
+
+    /// Drop a task's `schedstat` snapshot before a read at 0, by the cursor
+    /// or positioned, where Linux's `seq_read_iter` starts the record again
+    /// (fs/seq_file.c:184-191 at v6.16), so the read shows the task's runtime
+    /// now. Nothing for any other file or position.
+    pub(crate) fn drop_schedstat_snapshot_for_read_at(&mut self, position: u64) {
+        if self.kind == ProcfsKind::TaskSchedstat && position == 0 {
             self.contents = None;
         }
     }
@@ -2953,20 +3018,6 @@ fn is_process_io_path(path: &str) -> bool {
             .strip_prefix("/proc/")
             .and_then(|path| path.strip_suffix("/io"))
             .is_some_and(|pid| !pid.is_empty() && pid.bytes().all(|byte| byte.is_ascii_digit()))
-}
-
-fn is_process_schedstat_path(path: &str) -> bool {
-    let Some(relative) = path.strip_prefix("/proc/") else {
-        return false;
-    };
-    let components = relative.split('/').collect::<Vec<_>>();
-    match components.as_slice() {
-        [task, "schedstat"] => is_proc_task_name(task),
-        [process, "task", thread, "schedstat"] => {
-            is_proc_process_name(process) && is_numeric_id(thread)
-        }
-        _ => false,
-    }
 }
 
 fn is_proc_task_name(name: &str) -> bool {
@@ -5418,7 +5469,12 @@ fn sanitize_random_uuid(contents: &[u8], mut random: [u8; 16]) -> Vec<u8> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-922): Review the /proc/self/schedstat field policy.
-fn sanitize_self_schedstat(contents: &[u8]) -> Vec<u8> {
+/// A task's `schedstat` (`proc_pid_schedstat`, fs/proc/base.c:511-523 at
+/// v6.16): its runtime, `runtime` (`se.sum_exec_runtime`, in nanoseconds),
+/// where Detcore knows it, else 0; and 0 for the time it waited on a run
+/// queue and the times it ran (`sched_info.run_delay`, `pcount`), which
+/// Detcore does not model, as `getrusage`'s context-switch counts stay 0.
+fn sanitize_task_schedstat(contents: &[u8], runtime: Option<LogicalTime>) -> Vec<u8> {
     let Ok(text) = std::str::from_utf8(contents) else {
         return contents.to_vec();
     };
@@ -5426,12 +5482,9 @@ fn sanitize_self_schedstat(contents: &[u8]) -> Vec<u8> {
     if fields.len() != 3 || fields.iter().any(|field| field.parse::<u64>().is_err()) {
         return contents.to_vec();
     }
-
-    if text.ends_with('\n') {
-        b"0 0 0\n".to_vec()
-    } else {
-        b"0 0 0".to_vec()
-    }
+    let runtime = runtime.map_or(0, |runtime| runtime.as_nanos());
+    let newline = if text.ends_with('\n') { "\n" } else { "" };
+    format!("{runtime} 0 0{newline}").into_bytes()
 }
 
 // TODO-HUMAN-REVIEW(PR-909): Review the single-CPU softnet policy.
@@ -6095,18 +6148,29 @@ mod tests {
             ProcfsKind::UnixSockets
         );
         assert!(ProcfsFile::from_path(Path::new("/proc/net/packet")).is_none());
-        for path in [
-            "/proc/self/schedstat",
-            "/proc/thread-self/schedstat",
-            "/proc/123/schedstat",
-            "/proc/self/task/456/schedstat",
-            "/proc/123/task/456/schedstat",
+        // Each spelling describes one task, the caller's process (by its
+        // leader, 7) and thread (9) resolved as Linux resolves them.
+        for (path, described) in [
+            ("/proc/self/schedstat", 7),
+            ("/proc/thread-self/schedstat", 9),
+            ("/proc/123/schedstat", 123),
+            ("/proc/self/task/456/schedstat", 456),
+            ("/proc/123/task/456/schedstat", 456),
         ] {
+            let file = ProcfsFile::from_path(Path::new(path)).unwrap();
+            assert_eq!(file.kind, ProcfsKind::TaskSchedstat, "{path}");
+            assert!(file.is_task_schedstat(), "{path}");
             assert_eq!(
-                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
-                ProcfsKind::SelfSchedstat
+                schedstat_task_at(Path::new(path), 7, 9),
+                Some(described),
+                "{path}"
             );
         }
+        assert!(
+            !ProcfsFile::from_path(Path::new("/proc/self/stat"))
+                .unwrap()
+                .is_task_schedstat()
+        );
         assert!(ProcfsFile::from_path(Path::new("/proc/self/task/nope/schedstat")).is_none());
         // `/proc/self/maps` USED TO BE ASSERTED UNRECOGNIZED HERE, which is how
         // the defect was codified: the file carries a device and an inode for
@@ -8297,21 +8361,40 @@ RAW 1008 0 -1 NI 0 yes kernel y y\n"
     }
 
     #[test]
-    fn self_schedstat_hides_host_scheduler_accounting() {
+    fn task_schedstat_hides_host_scheduler_accounting() {
         assert_eq!(
-            sanitize_self_schedstat(b"3029609 1559338 150\n"),
+            sanitize_task_schedstat(b"3029609 1559338 150\n", None),
             b"0 0 0\n"
         );
-        assert_eq!(sanitize_self_schedstat(b"3029609 1559338 150"), b"0 0 0");
+        assert_eq!(
+            sanitize_task_schedstat(b"3029609 1559338 150", None),
+            b"0 0 0"
+        );
+    }
+
+    /// The runtime is the task's CPU time in nanoseconds, where Detcore
+    /// knows it; the run-queue wait and the run count stay 0.
+    #[test]
+    fn task_schedstat_shows_the_tasks_runtime() {
+        let runtime = Some(LogicalTime::from_nanos(41_250_370));
+        assert_eq!(
+            sanitize_task_schedstat(b"3029609 1559338 150\n", runtime),
+            b"41250370 0 0\n"
+        );
+        assert_eq!(sanitize_task_schedstat(b"0 0 0", runtime), b"41250370 0 0");
     }
 
     #[test]
-    fn self_schedstat_leaves_unknown_formats_untouched() {
+    fn task_schedstat_leaves_unknown_formats_untouched() {
+        let runtime = Some(LogicalTime::from_nanos(7));
         let extra_field = b"3029609 1559338 150 4\n";
-        assert_eq!(sanitize_self_schedstat(extra_field), extra_field);
+        assert_eq!(sanitize_task_schedstat(extra_field, runtime), extra_field);
 
         let invalid_counter = b"3029609 waiting 150\n";
-        assert_eq!(sanitize_self_schedstat(invalid_counter), invalid_counter);
+        assert_eq!(
+            sanitize_task_schedstat(invalid_counter, runtime),
+            invalid_counter
+        );
     }
 
     #[test]
@@ -9765,6 +9848,7 @@ total_commit_ms 0\n"
             ppid: 1,
             rsslim: task_stat::RLIM_INFINITY,
             processor: 0,
+            cpu: task_stat::TaskCpuTimes::default(),
         }
     }
 

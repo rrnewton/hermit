@@ -23,7 +23,10 @@ use crate::tool_local::ResourceLimit;
 const CLOCK_TICKS_PER_SECOND: u64 = 100;
 const NANOS_PER_CLOCK_TICK: u64 = 1_000_000_000 / CLOCK_TICKS_PER_SECOND;
 
-fn clock_ticks(duration: crate::types::LogicalTime) -> u64 {
+/// `duration` in clock ticks (`USER_HZ`), truncated, as Linux's
+/// `nsec_to_clock_t` converts the CPU times `times(2)` and a process's `stat`
+/// report (kernel/time/time.c:733-736 at v6.16).
+pub(crate) fn clock_ticks(duration: crate::types::LogicalTime) -> u64 {
     duration.as_nanos() / NANOS_PER_CLOCK_TICK
 }
 

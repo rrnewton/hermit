@@ -5297,6 +5297,17 @@ impl<T> ThreadState<T> {
             .thread_time(thread)
     }
 
+    /// The own (user, system) time of `thread`, this thread or another of
+    /// its process: this thread's now ([`Self::thread_cpu_time`]), another's
+    /// as of its last accounting ([`Self::sibling_cpu_time`]).
+    pub(crate) fn task_cpu_time(&self, thread: DetTid) -> (LogicalTime, LogicalTime) {
+        if thread == self.dettid {
+            self.thread_cpu_time()
+        } else {
+            self.sibling_cpu_time(thread)
+        }
+    }
+
     /// Decide whether the syscall this thread is making now charges its cost
     /// to `thread_logical_time`. `in_backend_runtime_bootstrap` is the
     /// backend's `Guest::is_backend_runtime_bootstrap()` answer for this

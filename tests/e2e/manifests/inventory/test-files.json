@@ -1730,6 +1730,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/proc_cpu_times.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/proc_cpu_times.c is owned by hermit-cli/tests/cli.rs: proc_cpu_times_agree_with_every_cpu_time_view runs it natively and under hermit run --strict and requires equal stdout, one result line for each of 17 checks that /proc/<pid>/stat and /proc/<pid>/task/<tid>/stat CPU times and /proc/<pid>/schedstat runtimes agree with times(), getrusage() and the CPU-time clocks, and requires bitwise parity under --verify --verify-strict for its values mode, which prints the times; it stays a fixture because a generic manifest cannot compare a run with the same program's native output."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/proc_directory_alias_level.c",
       "runner": "hermit-cli/tests/procfs_determinism.rs",
       "why": "tests/c/proc_directory_alias_level.c is owned by hermit-cli/tests/procfs_determinism.rs: a_name_outside_the_level_through_a_directory_alias_is_refused_before_its_turn records it with --proc=minimal under record start --verify --verify-strict and requires openat(<a /proc descriptor reopened through /proc/self/fd/N or /dev/fd/N>, \"kallsyms\") to fail with ENOENT (in the root process, in a thread of a process created with CLONE_FILES, and in a thread of an image a non-leader thread executed), the recording to replay with bitwise parity, and the recording's log to show no scheduler turn for the name (which the guest's --control shows the log check can see), the change behind RECORD_VERSION 0x164 (https://github.com/rrnewton/hermit/issues/4213); a generic manifest cannot pass the record options or inspect the log, and natively /proc/kallsyms exists."

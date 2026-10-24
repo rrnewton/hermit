@@ -2978,6 +2978,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///   ([`Self::getppid_numbered_parent`]).
     /// - `rsslim`: the described process's virtual `RLIMIT_RSS`, whoever
     ///   reads it (`procfs::task_stat::TaskStatFacts::rsslim`).
+    /// - The CPU times, for the reader's own process's file
+    ///   ([`Self::stat_cpu_times`]).
     pub(super) async fn rendered_task_stat<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3025,6 +3027,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             Self::getppid_numbered_parent(guest, facts.parent.unwrap_or(0)).await
         };
+        let cpu = if own && file.is_task_stat() {
+            Self::stat_cpu_times(guest, task)
+        } else {
+            crate::procfs::task_stat::TaskCpuTimes::default()
+        };
         Ok(Some(crate::procfs::task_stat::TaskStat {
             pid: described,
             comm,
@@ -3033,7 +3040,36 @@ impl<T: RecordOrReplay> Detcore<T> {
             ppid,
             rsslim: facts.rsslim,
             processor: facts.cpus.current(guest.config().virtual_cpu_count()),
+            cpu,
         }))
+    }
+
+    /// The CPU times the `stat` of `task`, a task of the reader's own
+    /// process, shows now (`procfs::task_stat::TaskCpuTimes`): the process's
+    /// for its top-level file, which counts every thread, exited ones
+    /// included (`thread_group_cputime_adjusted`), and one thread's for a
+    /// file below `task/` (`task_cputime_adjusted`): the reader's own, or a
+    /// sibling's as of its last accounting, where it last stopped running
+    /// (`ThreadState::task_cpu_time`). The children's are the process's in
+    /// both. The same accounting `times(2)`, `getrusage(2)` and the CPU-time
+    /// clocks read, so every view agrees.
+    fn stat_cpu_times<G: Guest<Self>>(
+        guest: &mut G,
+        task: crate::procfs::BoundTask,
+    ) -> crate::procfs::task_stat::TaskCpuTimes {
+        let process = guest.thread_state_mut().process_cpu_time();
+        let (user, system) = match task.thread {
+            None => (process.user, process.system),
+            Some(thread) => guest
+                .thread_state()
+                .task_cpu_time(crate::types::DetTid::from_raw(thread)),
+        };
+        crate::procfs::task_stat::TaskCpuTimes {
+            user,
+            system,
+            children_user: process.children_user,
+            children_system: process.children_system,
+        }
     }
 
     /// One plain read of the rendered `/proc/<pid>/cmdline` open as `fd`, of

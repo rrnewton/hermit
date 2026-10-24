@@ -2558,6 +2558,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        // A task's `schedstat` shows the runtime anew at a positioned read at
+        // 0 (`ProcfsFile::drop_schedstat_snapshot_for_read_at`).
+        if offset.is_some() {
+            guest.thread_state().with_detfd(fd, |detfd| {
+                detfd.procfs_drop_schedstat_snapshot_for_read_at(position as u64)
+            })?;
+        }
         // A file the kernel opened takes its snapshot at its first read.
         if guest
             .thread_state()
@@ -4924,6 +4931,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // by its link below.
                 let cpus = self.cfg.virtual_cpu_count();
                 let mut procfs = ProcfsFile::of_kernel_open(&observed_path, cpus);
+                // Whether the guest's own spelling classified the open, not the
+                // descriptor's link, whose numbers are the kernel's.
+                let classified_by_spelling = procfs.is_some();
                 // Under record and replay the link is read for every open,
                 // also one whose spelling classifies: a spelling through `..`
                 // (`/proc/self/../self/io`) classifies as the file it reaches,
@@ -5075,6 +5085,28 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .as_mut()
                         .expect("thread identity request lost its procfs file")
                         .bind_thread_identity(tgid, tid, ppid);
+                }
+                // A task's `schedstat` describes the task its path named at
+                // the open, `self` and `thread-self` resolved then, as Linux
+                // resolves them at lookup, and a directory descriptor's task as
+                // its open found it (`procfs_spelling`). Only by a spelling,
+                // whose numbers are Detcore's, and outside a nested PID
+                // namespace (`Detcore::procfs_caller_ids`), where Linux reads
+                // the numbers in the namespace of the procfs mount
+                // (`proc_pid_lookup`), not the caller's: no task otherwise, and
+                // the file shows no runtime.
+                if procfs.as_ref().is_some_and(ProcfsFile::is_task_schedstat) {
+                    let thread = self
+                        .procfs_caller_ids(guest)
+                        .filter(|_| classified_by_spelling)
+                        .and_then(|(pid, tid)| {
+                            crate::procfs::schedstat_task_at(&procfs_spelling, pid, tid)
+                        })
+                        .map(crate::types::DetTid::from_raw);
+                    procfs
+                        .as_mut()
+                        .expect("a classified procfs file disappeared")
+                        .bind_schedstat_thread(thread);
                 }
                 if procfs
                     .as_ref()
@@ -6873,6 +6905,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             ),
             _ => None,
         };
+        // A task's `schedstat` shows its runtime where it is a thread of the
+        // reader's own process (`Detcore::same_process_task_runtime`).
+        let schedstat_thread = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_schedstat_thread())?;
+        let schedstat_runtime = match schedstat_thread {
+            Some(thread) => self.same_process_task_runtime(guest, thread).await,
+            None => None,
+        };
         // A process's `stat` or `comm` Detcore opened renders its task's
         // record in the process table as of this read (`procfs::task_stat`).
         let task_stat = self
@@ -6894,6 +6935,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     random_uuid,
                     virtual_cpuinfo: virtual_cpuinfo.clone(),
                     machine: machine.clone(),
+                    schedstat_runtime,
                     published_sigblk: mask_facts.sigblk,
                     // A5 step 3c.1d, design D37: the pending ignored signals
                     // the guest's mask lets in are left out, under the gate
@@ -6958,6 +7000,33 @@ impl<T: RecordOrReplay> Detcore<T> {
                 table.mounts(&guest.config().mountinfo_root_rewrites)
             }
         }))
+    }
+
+    /// The runtime of `thread`, its user plus system time, where it is the
+    /// reader or another thread of the reader's own process
+    /// (`ThreadState::task_cpu_time`, the accounting the CPU-time clocks
+    /// read), and Detcore renders the reader's own `stat`, so that the two
+    /// files agree: `None` under record and replay, after `chroot` and in a
+    /// nested PID namespace, where the kernel serves `stat` with its CPU
+    /// times zeroed, and for a thread of another process, whose accounting
+    /// Detcore keeps in that process's own threads.
+    async fn same_process_task_runtime<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        thread: crate::types::DetTid,
+    ) -> Option<crate::types::LogicalTime> {
+        if !self.renders_procfs(guest) || guest.thread_state().nested_pid_namespace {
+            return None;
+        }
+        if thread != guest.thread_state().dettid {
+            let own = guest.thread_state().detpid?;
+            let process = crate::tool_global::signal_target_process(guest, thread).await;
+            if process != Some(own) {
+                return None;
+            }
+        }
+        let (user, system) = guest.thread_state().task_cpu_time(thread);
+        Some(user + system)
     }
 
     /// Whether the process's `mountinfo` or `mounts` the kernel opened as
@@ -7174,6 +7243,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        // A task's `schedstat` shows the runtime anew at a read at 0
+        // (`ProcfsFile::drop_schedstat_snapshot_for_read_at`).
+        guest.thread_state().with_detfd(call.fd(), |detfd| {
+            let cursor = detfd.procfs_position().map_or(0, |(offset, _)| offset);
+            detfd.procfs_drop_schedstat_snapshot_for_read_at(cursor as u64)
+        })?;
         let needs_procfs_snapshot = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_snapshot())?;
@@ -7537,6 +7612,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.procfs_drop_stale_task_snapshot(offset)
             })?;
         }
+        // A task's `schedstat` shows the runtime anew at a read at 0
+        // (`ProcfsFile::drop_schedstat_snapshot_for_read_at`).
+        guest.thread_state().with_detfd(call.fd(), |detfd| {
+            detfd.procfs_drop_schedstat_snapshot_for_read_at(offset as u64)
+        })?;
         let needs_procfs_snapshot = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_snapshot())?;

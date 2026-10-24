@@ -238,6 +238,7 @@ static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_TIME_CLOCKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PROC_CPU_TIMES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DATAGRAM_READ_SHUTDOWN_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SELECT_TIMEOUT_NORMALIZATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -36582,6 +36583,72 @@ fn cpu_time_clocks_read_the_logical_cpu_accounting() {
     assert!(
         values.contains("\nvalue clock ")
             && values.ends_with("cpu_time_clocks: 24 checks, 0 failed\n"),
+        "{values}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+            .expect("the verdict must be JSON");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+}
+
+/// A task's CPU time in /proc agrees with every other view of it: the
+/// process's and a thread's stat (utime, stime, cutime, cstime) with times()
+/// and getrusage(), a thread's schedstat runtime with its CPU clock (also
+/// read again from the start), a sleeping sibling's stat and schedstat and
+/// the sleeping leader's /proc/self/schedstat with their CPU clocks, the
+/// process's stat with an exited thread, and a reaped child's time in the
+/// process's and the thread's stat with times() and
+/// getrusage(RUSAGE_CHILDREN). The guest prints only whether each of 17
+/// checks held, natively and under Hermit, and the two outputs must be equal;
+/// its `values` mode also prints the times, which two strict runs print the
+/// same (bitwise parity). The runs pass `--proc=standard`, the level whose
+/// process directories list `schedstat`. User time counts retired branches,
+/// so the PMU is this test's subject: privileged-test.pmu_cli_cases runs it,
+/// and test.cli skips it. Before, stat's CPU times and schedstat's runtime
+/// read 0, and 13 of the 17 checks failed.
+#[test]
+fn proc_cpu_times_agree_with_every_cpu_time_view() {
+    let guest = futex_c_guest(&PROC_CPU_TIMES_GUEST, "proc_cpu_times")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let native = Command::new(&guest).output().unwrap();
+    assert!(native.status.success(), "{native:?}");
+    let native = String::from_utf8(native.stdout).unwrap();
+    assert_eq!(native.lines().count(), 17, "{native}");
+    assert!(!native.contains("NO"), "{native}");
+    let args = [
+        "run",
+        "--strict",
+        "--proc=standard",
+        "--base-env=minimal",
+        "--",
+        guest.as_str(),
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), native);
+
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        verdict.to_str().unwrap(),
+        "--proc=standard",
+        "--base-env=minimal",
+        "--",
+        guest.as_str(),
+        "values",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let values = stdout(&output);
+    assert!(
+        values.contains("value process-stat-utime ") && !values.contains("NO"),
         "{values}"
     );
     let report: serde_json::Value =
