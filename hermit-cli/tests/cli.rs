@@ -235,6 +235,7 @@ static TIMER_RT_SIGNAL_PENDING_OBSERVED_GUEST: OnceLock<PathBuf> = OnceLock::new
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SYSCALL_SLICE_END_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_AFTER_WNOHANG_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_SHARED_MASK_REWRITE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -2674,6 +2675,37 @@ fn stdio_inode_identity_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "stdio-inode fixture compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// A sleeper's pending timed wait caps a computing worker's chaos slices,
+/// which then end at the prehook of its next write; see
+/// `tests/c/preemption_replay_syscall_slice_end.c`.
+fn syscall_slice_end_guest() -> &'static Path {
+    SYSCALL_SLICE_END_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("syscall-slice-end");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create syscall-slice-end build directory");
+        let guest = build_root.join("preemption_replay_syscall_slice_end");
+        let output = Command::new("cc")
+            .args([
+                "-O0", "-g", "-pthread", "-std=c11", "-Wall", "-Wextra", "-Werror",
+            ])
+            .arg(repository.join("tests/c/preemption_replay_syscall_slice_end.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the syscall-slice-end guest");
+        assert!(
+            output.status.success(),
+            "syscall-slice-end guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -19194,6 +19226,93 @@ fn happens_before_posthook_anchor_with_replay_schedule_is_refused() {
             assert!(!refused, "{phase}: {log}");
         }
     }
+}
+
+/// A schedule replay ends a slice that a check-in ended in the recording at
+/// that check-in, and so keeps the recording's virtual clock.
+///
+/// Under `--chaos` a pending timed wait of the sleeper caps the worker's
+/// slices, and a capped end is observed only at the worker's next syscall, so
+/// those slices end at the syscall's prehook. The recorded schedule shows such
+/// an end as the worker's branches, then its OtherInstructions (the prehook's
+/// check-in), then another thread's event. The replay took that shape for a
+/// timer preemption and stopped the worker on the branch count, before the
+/// syscall: the slice ended there with a scheduler turn the recording does not
+/// have, and the guest's last clock reading came out later than recorded,
+/// with no desync reported.
+///
+/// PMU SUBJECT: the stop needs the PMU's retired-branch counter. test.cli and
+/// test.cli_on_host skip it by exact name; privileged-test.pmu_cli_cases runs
+/// it after privileged-pmu.preemption has shown the PMU works.
+#[test]
+fn run_schedule_replay_ends_check_in_slices_where_the_record_did() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let record = directory.path().join("recorded.json");
+    let guest = syscall_slice_end_guest().to_str().unwrap();
+    let record_arg = format!("--record-preemptions-to={}", record.display());
+    let replay_arg = format!("--replay-schedule-from={}", record.display());
+    let recording_args = [
+        "run",
+        "--base-env=minimal",
+        "--chaos",
+        "--seed=2",
+        "--epoch=2026-01-01T00:00:00Z",
+        &record_arg,
+        "--",
+        guest,
+    ];
+    let recorded = hermit_test::hermit_output(
+        "chaos schedule record",
+        hermit_command(&recording_args)
+            .env_remove("HERMIT_EPOCH")
+            .stdin(Stdio::null()),
+    );
+    assert_success(&recorded, &recording_args);
+    // The premise: slices that ended at a check-in, recorded as a thread's
+    // branches, then its OtherInstructions, then another thread's event.
+    let json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+    let events = json["global"].as_array().expect("recorded schedule");
+    let check_in_ends = events
+        .windows(3)
+        .filter(|shape| {
+            shape[0]["op"] == "Branch"
+                && shape[1]["op"] == "OtherInstructions"
+                && shape[1]["dettid"] == shape[0]["dettid"]
+                && shape[2]["dettid"] != shape[0]["dettid"]
+        })
+        .count();
+    assert!(
+        check_in_ends > 0,
+        "the recorded schedule has no slice that ended at a check-in, so this \
+         case cannot reach the shape: {} events",
+        events.len()
+    );
+
+    // The schedule decides every turn, so the replay takes no `--seed`; only
+    // the guest's randomness, which `--seed` set when recording, is given.
+    let replay_args = [
+        "run",
+        "--base-env=minimal",
+        "--rng-seed=2",
+        "--epoch=2026-01-01T00:00:00Z",
+        &replay_arg,
+        "--",
+        guest,
+    ];
+    let replayed = hermit_test::hermit_output(
+        "schedule replay",
+        hermit_command(&replay_args)
+            .env_remove("HERMIT_EPOCH")
+            .stdin(Stdio::null()),
+    );
+    assert_success(&replayed, &replay_args);
+    assert_eq!(
+        stdout(&replayed),
+        stdout(&recorded),
+        "the replay's virtual clock left the recording's"
+    );
 }
 
 /// A `--replay-schedule-from` run that has left its recorded schedule (a hard
