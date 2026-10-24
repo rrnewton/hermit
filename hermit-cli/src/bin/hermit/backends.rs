@@ -1587,7 +1587,7 @@ impl DbtExecution {
             test_workdir && !options.mounts_tmpfs_at(Path::new(hermit_test_workdir::WORKDIR));
         let options = if test_workdir {
             let workdir = format!("type=tmpfs,target={}", hermit_test_workdir::WORKDIR)
-                .parse::<reverie::process::Mount>()
+                .parse::<crate::run::MountArg>()
                 .expect("a tmpfs mount at the test workdir parses");
             options.with_guest_mount(workdir)
         } else {
