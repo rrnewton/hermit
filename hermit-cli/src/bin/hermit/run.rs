@@ -1023,6 +1023,15 @@ fn bind_dap_supervisor_socket() -> Result<(std::os::unix::net::UnixListener, Str
 /// was given `--dap-listen` (on its command line or in a `--config` file).
 /// Any other parent, a shell that set the variable to its own ID for one, is
 /// not a supervisor.
+/// Where `RunOpts::main` sends an invocation once its prelude is settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunDispatch {
+    /// `--dap-listen` without a supervisor marker: supervise a child run.
+    DapSupervisor,
+    /// The run itself (also the child a DAP supervisor started).
+    Run,
+}
+
 fn started_by_a_dap_supervisor(owner: &OsStr) -> bool {
     let parent = std::os::unix::process::parent_id();
     let Some((pid, token)) = owner.to_str().and_then(|owner| owner.split_once(':')) else {
@@ -5124,6 +5133,209 @@ fn strict_rejects_strace_only() {
     assert!(message.contains("--strace-only"));
 }
 
+/// The options `--strace-only`'s help says it is shorthand for.
+#[cfg(test)]
+const STRACE_ONLY_EXPANSION: [&str; 8] = [
+    "--tmp=/tmp",
+    "--network=host",
+    "--no-virtualize-cpuid",
+    "--no-virtualize-time",
+    "--no-virtualize-metadata",
+    "--no-sequentialize-threads",
+    "--no-deterministic-io",
+    "--no-rcb-time",
+];
+
+/// Validates `--strace-only SHORT_EXTRA fakeprog` and the documented expansion
+/// with `LONG_EXTRA`, and lists every way the two resolved runs differ: a
+/// refusal, thread pinning, network, `/tmp`, each top-level Detcore
+/// configuration field, and the rendered command. Empty when they are the same
+/// run. Collected rather than asserted one by one, so a failure names every
+/// difference at once.
+#[cfg(test)]
+fn strace_only_differences(
+    short_extra: &[&str],
+    long_extra: &[&str],
+) -> (RunOpts, RunOpts, Vec<String>) {
+    let resolve = |options: &[&str], extra: &[&str]| {
+        let mut args = vec!["fakehermit"];
+        args.extend_from_slice(options);
+        args.extend_from_slice(extra);
+        args.push("fakeprog");
+        let mut opts = RunOpts::parse_from(args);
+        let validated = opts.validate_args_with_perf_support(true);
+        (opts, validated.map_err(|error| format!("{error:#}")))
+    };
+    let (shorthand, shorthand_validated) = resolve(&["--strace-only"], short_extra);
+    let (expansion, expansion_validated) = resolve(&STRACE_ONLY_EXPANSION, long_extra);
+    let mut differences = Vec::new();
+    if let Err(error) = &shorthand_validated {
+        differences.push(format!("--strace-only is refused: {error}"));
+    }
+    if let Err(error) = &expansion_validated {
+        differences.push(format!("the expansion is refused: {error}"));
+    }
+    if !differences.is_empty() {
+        return (shorthand, expansion, differences);
+    }
+    let mut differ = |what: &str, short: String, long: String| {
+        if short != long {
+            differences.push(format!("{what}: --strace-only {short}, expansion {long}"));
+        }
+    };
+    differ(
+        "pin_threads",
+        shorthand.pin_threads.to_string(),
+        expansion.pin_threads.to_string(),
+    );
+    differ(
+        "network",
+        format!("{:?}", shorthand.network),
+        format!("{:?}", expansion.network),
+    );
+    differ(
+        "tmp",
+        format!("{:?}", shorthand.tmp),
+        format!("{:?}", expansion.tmp),
+    );
+    let fields = |opts: &RunOpts| match serde_json::to_value(&opts.det_opts.det_config).unwrap() {
+        serde_json::Value::Object(fields) => fields,
+        other => panic!("the Detcore configuration serialized as {other}"),
+    };
+    let (short_fields, long_fields) = (fields(&shorthand), fields(&expansion));
+    for (name, long) in &long_fields {
+        let short = short_fields.get(name).cloned().unwrap_or_default();
+        differ(
+            &format!("Detcore {name}"),
+            short.to_string(),
+            long.to_string(),
+        );
+    }
+    // A validated `--strace-only` used to reach the rendering's
+    // `assert!(dop.deterministic_io)` with deterministic I/O cleared. A panic
+    // on either side is a difference of its own, so two panics never compare
+    // equal; only two successful renderings are compared.
+    let render = |opts: &RunOpts| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| opts.to_string()))
+    };
+    match (render(&shorthand), render(&expansion)) {
+        (Ok(short), Ok(long)) => differ("rendered command", short, long),
+        (short, long) => {
+            if short.is_err() {
+                differences.push("rendering --strace-only panicked".to_owned());
+            }
+            if long.is_err() {
+                differences.push("rendering the expansion panicked".to_owned());
+            }
+        }
+    }
+    (shorthand, expansion, differences)
+}
+
+#[test]
+fn strace_only_resolves_like_its_documented_expansion() {
+    // `--strace-only`'s help names the options it is shorthand for. Resolved,
+    // the two spellings must be the same run: the same Detcore configuration,
+    // thread pinning, network and `/tmp`, and the same rendered command, also
+    // with an extra option whose handling reads the lowered ones. Applied
+    // after those readers, the shorthand pinned every guest thread to one CPU
+    // (the pin decision still saw sequentialized threads), was refused with
+    // `--no-virtualize-time` (the time/metadata check still saw virtualized
+    // metadata), and kept the options `Config::validate` drops without
+    // sequentialized threads.
+    let cases: [(&[&str], &[&str]); 5] = [
+        (&[], &[]),
+        // Already part of the expansion, which clap refuses to repeat.
+        (&["--no-virtualize-time"], &[]),
+        (&["--stop-after-turn=5"], &["--stop-after-turn=5"]),
+        (&["--stop-after-iter=5"], &["--stop-after-iter=5"]),
+        (
+            &["--debug-externalize-sockets"],
+            &["--debug-externalize-sockets"],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (short_extra, long_extra) in cases {
+        let (shorthand, expansion, differences) = strace_only_differences(short_extra, long_extra);
+        if !differences.is_empty() {
+            failures.push(format!("{short_extra:?}: {differences:#?}"));
+            continue;
+        }
+        let config = &shorthand.det_opts.det_config;
+        assert!(!shorthand.pin_threads, "{short_extra:?}");
+        assert!(config.max_timeslice.is_some(), "{short_extra:?}");
+        assert!(!config.sequentialize_threads, "{short_extra:?}");
+        assert!(config.stop_after_turn.is_none(), "{short_extra:?}");
+        assert!(config.stop_after_iter.is_none(), "{short_extra:?}");
+        assert!(!config.debug_externalize_sockets, "{short_extra:?}");
+        assert_eq!(shorthand.tmp.as_deref(), Some(Path::new(TMP_DIR)));
+        assert_eq!(expansion.network, NetworkingMode::Host);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn dap_supervisor_maps_guest_paths_like_the_strace_only_expansion() {
+    // `--dap-listen` supervises the run from `main`, before `validate_args`,
+    // and checks the host file it names to the debugger through the guest-path
+    // mapping. With `--strace-only` that mapping must see the lowered
+    // `--tmp=/tmp`, as the expansion does; otherwise a program under /tmp is
+    // treated as hidden and the supervisor ends the run. A path a source-less
+    // mount hides must stay hidden in both spellings.
+    let settle = |options: &[&str]| {
+        let mut args = vec!["fakehermit"];
+        args.extend_from_slice(options);
+        args.extend([
+            "--dap-listen=127.0.0.1:0",
+            "--gdbserver-port=1234",
+            "--mount=type=tmpfs,target=/hidden",
+            "/tmp/guest",
+        ]);
+        let mut opts = RunOpts::parse_from(args);
+        // The prelude `main` runs; without a supervisor marker it hands off
+        // to the supervisor, which uses these options from here on.
+        assert_eq!(
+            opts.dispatch_before_validation(None, None).unwrap(),
+            RunDispatch::DapSupervisor
+        );
+        opts
+    };
+    let shorthand = settle(&["--strace-only"]);
+    let expansion = settle(&STRACE_ONLY_EXPANSION);
+    assert_eq!(shorthand.tmp.as_deref(), Some(Path::new(TMP_DIR)));
+    assert_eq!(shorthand.tmp, expansion.tmp);
+    assert_eq!(shorthand.network, NetworkingMode::Host);
+    assert_eq!(shorthand.network, expansion.network);
+    assert!(shorthand.no_sequentialize_threads && expansion.no_sequentialize_threads);
+    assert!(shorthand.no_deterministic_io && expansion.no_deterministic_io);
+    assert!(shorthand.det_opts.det_config.gdbserver);
+    assert_eq!(
+        serde_json::to_value(&shorthand.det_opts.det_config).unwrap(),
+        serde_json::to_value(&expansion.det_opts.det_config).unwrap()
+    );
+    for path in ["/tmp/guest", "/hidden/guest", "/usr/bin/true"] {
+        let path = Path::new(path);
+        assert_eq!(
+            shorthand.mapped_host_program(path),
+            expansion.mapped_host_program(path),
+            "{}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        shorthand.mapped_or_visible_host_program(Path::new("/tmp/guest")),
+        Some(PathBuf::from("/tmp/guest"))
+    );
+    assert_eq!(
+        shorthand.mapped_host_program(Path::new("/hidden/guest")),
+        GuestPathMapping::Hidden
+    );
+    assert_eq!(
+        shorthand.mapped_or_visible_host_program(Path::new("/hidden/guest")),
+        None
+    );
+}
+
 #[test]
 fn strict_rejects_every_route_to_host_networking() {
     // Explicit, and the two routes that reach host networking as a side effect
@@ -6307,6 +6519,62 @@ impl RunOpts {
         self.backend = backend;
     }
 
+    /// Lower `--strace-only` onto exactly the options its help names: `--tmp=/tmp
+    /// --network=host --no-virtualize-cpuid --no-virtualize-time
+    /// --no-virtualize-metadata --no-sequentialize-threads --no-deterministic-io
+    /// --no-rcb-time` (a `--tmp` given explicitly is kept). Every reader of those
+    /// options then sees the spelled-out configuration: thread pinning, Detcore's
+    /// own flag implications in `Config::validate`, the time/metadata check, and
+    /// the `--dap-listen` supervisor's guest-path mapping, which runs before
+    /// validation. Applied late, after the pin decision, the shorthand used to pin
+    /// every guest thread to one CPU, which the expansion does not do.
+    ///
+    /// Idempotent, and a no-op without `--strace-only`.
+    pub(crate) fn lower_strace_only(&mut self) {
+        if !self.strace_only {
+            return;
+        }
+        self.tmp.get_or_insert_with(|| PathBuf::from(TMP_DIR));
+        self.network = NetworkingMode::Host;
+        self.no_sequentialize_threads = true;
+        self.no_deterministic_io = true;
+        let config = &mut self.det_opts.det_config;
+        config.virtualize_cpuid = false;
+        config.virtualize_time = false;
+        config.virtualize_metadata = false;
+        config.no_rcb_time = true;
+    }
+
+    /// `main`'s prelude: what it settles before it can dispatch anywhere, and
+    /// where it dispatches. The `--dap-listen` supervisor never reaches
+    /// `validate_args`, so the global backend, the `--strace-only` lowering,
+    /// the exec-stop admission, and the `--gdbserver` a DAP listener implies
+    /// (set before validation, so every `--gdbserver` refusal applies) are all
+    /// settled before the choice is made. `inner` is the value of
+    /// `DAP_LISTEN_INNER_ENV`, which marks the run a supervisor started.
+    fn dispatch_before_validation(
+        &mut self,
+        backend: Option<Backend>,
+        inner: Option<std::ffi::OsString>,
+    ) -> Result<RunDispatch, Error> {
+        self.set_backend(backend);
+        self.lower_strace_only();
+        self.refuse_unready_exec_stop()?;
+        if self.dap_listen.is_none() {
+            return Ok(RunDispatch::Run);
+        }
+        self.det_opts.det_config.gdbserver = true;
+        match inner {
+            None => Ok(RunDispatch::DapSupervisor),
+            // The run a supervising `hermit run --dap-listen` started.
+            Some(owner) if started_by_a_dap_supervisor(&owner) => Ok(RunDispatch::Run),
+            Some(owner) => anyhow::bail!(
+                "{DAP_LISTEN_INNER_ENV}={owner:?} is set, but its parent did not start this \
+                 hermit run --dap-listen; unset {DAP_LISTEN_INNER_ENV}"
+            ),
+        }
+    }
+
     /// The global `--backend` option that selected this run's backend, rendered
     /// for the position before the subcommand (`hermit{this} run ...`). Empty
     /// when no backend was requested explicitly.
@@ -6848,20 +7116,11 @@ impl RunOpts {
 
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         // Admission must see the actual global backend before any launch.
-        self.set_backend(global.backend);
-        self.refuse_unready_exec_stop()?;
-        if self.dap_listen.is_some() {
-            // Before validation, so every --gdbserver refusal applies.
-            self.det_opts.det_config.gdbserver = true;
-            match std::env::var_os(DAP_LISTEN_INNER_ENV) {
-                None => return self.serve_dap(),
-                // The run a supervising `hermit run --dap-listen` started.
-                Some(owner) if started_by_a_dap_supervisor(&owner) => {}
-                Some(owner) => anyhow::bail!(
-                    "{DAP_LISTEN_INNER_ENV}={owner:?} is set, but its parent did not start this \
-                     hermit run --dap-listen; unset {DAP_LISTEN_INNER_ENV}"
-                ),
-            }
+        match self
+            .dispatch_before_validation(global.backend, std::env::var_os(DAP_LISTEN_INNER_ENV))?
+        {
+            RunDispatch::DapSupervisor => return self.serve_dap(),
+            RunDispatch::Run => {}
         }
         let result = self.main_without_core_cleanup(global);
         if let Ok(status) = &result {
@@ -7345,6 +7604,9 @@ impl RunOpts {
         &mut self,
         timer: Result<(), TimerUnavailable>,
     ) -> Result<(), Error> {
+        // Callers other than `main` (analyze, oci, tests) reach validation
+        // without `dispatch_before_validation`; lowering again is a no-op.
+        self.lower_strace_only();
         self.refuse_unready_exec_stop()?;
         self.resolve_preemption_settings()?;
         let backend = self.selected_backend();
@@ -7710,19 +7972,6 @@ impl RunOpts {
         // we're expecting full determinstic execution (sequentialize_threads).
         if config.max_timeslice.is_some() && config.sequentialize_threads {
             self.pin_threads = true;
-        }
-
-        if self.strace_only {
-            config.virtualize_cpuid = false;
-            config.virtualize_metadata = false;
-            config.virtualize_time = false;
-            config.deterministic_io = false;
-            self.network = NetworkingMode::Host;
-            config.sequentialize_threads = false;
-            config.no_rcb_time = true;
-            if self.tmp.is_none() {
-                self.tmp = Some(PathBuf::from("/tmp"));
-            }
         }
 
         // Happens-before enforcement parks the "after" thread until its "before"
