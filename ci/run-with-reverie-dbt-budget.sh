@@ -2647,7 +2647,7 @@ fi
 # reverie-dbt/vendor/dynamorio, and third-party/dynamorio. Existing budget
 # values and limits are unchanged. This is source-identity carry only;
 # it supplies no new calibration, build, runtime, or landing evidence.
-expected_pin=dc7f689c32c4789f801444ca012db6fec73bc4e5
+expected_pin=5076ebd0622c09398c89a25f6787965afd2690bc
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
@@ -2737,3 +2737,6 @@ if [[ -n ${HERMIT_CARGO_TIMINGS_DIR:-} && ${1:-} == cargo && ${2:-} == build ]];
     exit "$timings_status"
 fi
 exec "$ROOT_DIR/ci/retry-on-compiler-crash.sh" "$@"
+# CARRY TO 5076ebd0622c09398c89a25f6787965afd2690bc (2026-10-24): reviewed feature repair rebased on current Reverie main.
+# Compared with dc7f689c32c4789f801444ca012db6fec73bc4e5, all eight recorded DBT Git input objects are identical.
+# Existing calibration budgets/source recipes carry without a new timing or runtime claim.

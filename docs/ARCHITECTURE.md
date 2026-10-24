@@ -140,11 +140,25 @@ time) stays in the hermit process.
 | **e9patch** | Ahead-of-time empty rewrite of the main ELF's candidate sites, then the ordinary ptrace path | In the tracer, as ptrace | Experimental; see below |
 | **kvm** | The guest runs in a KVM virtual machine and traps by VM exit (`reverie-kvm`) | In the hermit process, driven by the KVM executor | Experimental; the executor implements part of the Linux personality itself, including an allowlisted `/proc`, contrary to principles 2 and 3 |
 
-in-guest-trap and liteinst are one runtime with a switch: Hermit sets
-`REVERIE_LITEINST_SITE_PATCHING=0` for in-guest-trap and refuses a run whose
-statistics show a patched site. A patcher changes only how a syscall reaches
-the dispatcher, never what the dispatcher does with it, so by design liteinst
-should never pass a test that fails on in-guest-trap.
+in-guest-trap and liteinst share the Tool host, seccomp dispatcher, RPC and
+Detcore policy. The build-time `in-guest-trap` feature retains that base without
+`liteinst2`; the `liteinst` feature adds the patcher. Reverie retains LiteInst
+in its default build. Hermit selects the dependency features explicitly.
+At launch, Hermit binds `REVERIE_LITEINST_SITE_PATCHING=0` for in-guest-trap and
+refuses a run whose statistics show a patched site. LiteInst binds `1` when
+the caller leaves the selector unset, before the authenticated bootstrap is
+created, so an OFF runtime refuses instead of silently substituting traps.
+Explicit selectors, including `0`, retain their existing behavior. A patcher
+changes only how a syscall reaches the dispatcher, never what the dispatcher
+does with it, so by design liteinst should never pass a test that fails on
+in-guest-trap.
+
+The private-static startup archive is deliberately built without default
+features or LiteInst, including in an enabled outer build: its fixed-gate
+startup contract uses traps, not site patching. The ordinary/native final
+runtime still follows the selected feature configuration and its existing
+qualification checks. Building a native bundle does not by itself demonstrate
+guest execution.
 
 **ptrace.** seccomp selects which syscalls trap; ptrace delivers the stops to an
 out-of-process tracer that holds all Detcore state. It is complete (it sees

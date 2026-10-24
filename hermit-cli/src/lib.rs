@@ -1151,8 +1151,9 @@ fn refuse_in_guest_liteinst_run(
 /// The value of `REVERIE_LITEINST_SITE_PATCHING` (`reverie_liteinst::SITE_PATCHING_ENV`)
 /// that the guest sees under `backend`, when Hermit decides it: `0` for
 /// `in-guest-trap`, which exists to run with no syscall site patched, and
-/// `None` for `liteinst`, which leaves the variable to the guest environment
-/// (unset means patching on).
+/// `None` for `liteinst`, which preserves explicit guest selectors. When its
+/// selector is unset, the launch path binds an explicit `1` before creating
+/// the authenticated preload bootstrap.
 pub fn forced_site_patching_value(backend: Backend) -> Option<&'static str> {
     match backend {
         Backend::InGuestTrap => Some("0"),
@@ -1796,15 +1797,23 @@ fn in_guest_trap_site_patching_conflict(command: &Command, backend: Backend) -> 
 }
 
 /// Sets the guest's `REVERIE_LITEINST_SITE_PATCHING` to the value Hermit
-/// forces for `backend` ([`forced_site_patching_value`]), leaving the
-/// environment unchanged for a backend that forces none. The guest's
-/// descendants inherit it unless the guest changes its own environment; a
-/// descendant that turns patching back on shows in the run's dispatch record
-/// as patched sites.
+/// forces for `backend` ([`forced_site_patching_value`]). LiteInst requests
+/// patching explicitly when the caller leaves it unset, so a runtime built
+/// without the patcher refuses that request instead of silently running traps.
+/// Every explicit LiteInst selector is preserved, including `0`. The launcher
+/// captures it in the authenticated bootstrap and removes the control variable
+/// before guest code starts; later environment changes do not replace that
+/// captured selection.
 #[cfg(feature = "in-guest-trap")]
 fn force_in_guest_site_patching(command: &mut Command, backend: Backend) {
     if let Some(value) = forced_site_patching_value(backend) {
         command.env(reverie_liteinst::SITE_PATCHING_ENV, value);
+    } else if backend == Backend::Liteinst
+        && command
+            .get_env(reverie_liteinst::SITE_PATCHING_ENV)
+            .is_none()
+    {
+        command.env(reverie_liteinst::SITE_PATCHING_ENV, "1");
     }
 }
 
@@ -7383,7 +7392,8 @@ mod tests {
         assert_eq!(Backend::InGuestTrap.as_str(), "in-guest-trap");
         assert_eq!(Backend::InGuestTrap.runtime_name(), "liteinst");
         assert_eq!(Backend::Liteinst.runtime_name(), "liteinst");
-        // liteinst leaves the variable to the guest environment.
+        // LiteInst preserves explicit selectors; its unset default is bound
+        // separately before the authenticated bootstrap is constructed.
         assert_eq!(forced_site_patching_value(Backend::Liteinst), None);
         assert_eq!(forced_site_patching_value(Backend::InGuestTrap), Some("0"));
         // The CLI spelling parses to the variant and back.
@@ -7403,8 +7413,8 @@ mod tests {
     /// in-guest-trap sets `REVERIE_LITEINST_SITE_PATCHING=0` on the guest
     /// command when the guest environment leaves it unset or already `0`, and
     /// refuses, before anything starts, an environment that sets any other
-    /// value; the refusal names the value and both ways out. liteinst neither
-    /// refuses nor changes the variable.
+    /// value; the refusal names the value and both ways out. LiteInst preserves
+    /// every explicit selector.
     #[test]
     #[cfg(feature = "in-guest-trap")]
     fn in_guest_trap_refuses_a_guest_environment_that_turns_site_patching_on() {
@@ -7464,6 +7474,29 @@ mod tests {
             );
             force_in_guest_site_patching(&mut liteinst, Backend::Liteinst);
             assert_eq!(liteinst.get_env(name).as_deref(), Some(OsStr::new(value)));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "in-guest-trap")]
+    fn liteinst_binds_its_unset_default_but_preserves_explicit_selectors() {
+        use std::ffi::OsStr;
+
+        let name = reverie_liteinst::SITE_PATCHING_ENV;
+        for clear_environment in [false, true] {
+            let mut command = Command::new("/bin/true");
+            if clear_environment {
+                command.env_clear();
+            }
+            command.env_remove(name);
+            force_in_guest_site_patching(&mut command, Backend::Liteinst);
+            assert_eq!(command.get_env(name).as_deref(), Some(OsStr::new("1")));
+        }
+        for value in ["0", "1", "", "invalid"] {
+            let mut command = Command::new("/bin/true");
+            command.env(name, value);
+            force_in_guest_site_patching(&mut command, Backend::Liteinst);
+            assert_eq!(command.get_env(name).as_deref(), Some(OsStr::new(value)));
         }
     }
 

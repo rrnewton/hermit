@@ -44,6 +44,31 @@ features plus separately supplied runtime artifacts. DBT is available through
 release. KVM requires read/write access to `/dev/kvm`, compatible CPU features
 and performance counters; ptrace is the default execution path.
 
+### Source-build feature compatibility
+
+The source features `native-exec` and `mm-cancellation-test-support` enable
+`in-guest-trap` without enabling LiteInst site patching. Builds that previously
+relied on either feature to pull in the patcher must also select `liteinst`.
+`--backend=liteinst` refuses when that feature is absent; `--backend=in-guest-trap`
+uses the shared Tool/Detcore runtime with patching disabled. An enabled CLI
+requests patching explicitly when no selector was supplied, so an OFF runtime
+cannot silently substitute trap-only execution. An explicit selector `0` is
+still supported by the enabled CLI.
+
+The full/portable OFF validation cohort reuses one exclusively locked work
+directory for Cargo, installation and guest builds. Per-run logs and result
+records stay under `ignored/`, outside the build cache. Its wall time is
+recorded on success and failure; the added critical-path cost is unmeasured
+until a real run. If that measurement exceeds 180 seconds, the cohort must
+share more build work or move to a separate periodic schedule while keeping
+its required cases and assertions.
+
+The existing source-qualified allocator fixture producer still retains its
+fresh build targets and original qualification inputs with each fixture.
+Those primary inputs are separate from the reusable CLI, installation,
+standalone-runtime and E2E build work; reusing that work does not assert a
+bound on all retained qualification evidence or caches.
+
 ### Ubuntu AppArmor and user namespaces
 
 Ubuntu 24.04 restricts unprivileged user namespaces through AppArmor. A first

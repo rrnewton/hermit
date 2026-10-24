@@ -1,7 +1,8 @@
 #!/usr/bin/env -S rust-script --force
 //! Exercise the complete trap backend with the patching engine absent.
 //! This official validation producer keeps its Cargo targets, installation,
-//! command logs and three typed result records separate from the enabled cohort.
+//! command logs and three OFF result records separate from the enabled cohort.
+//! A fourth record belongs only to the mixed ON-CLI/OFF-runtime control.
 //! ```cargo
 //! [dependencies]
 //! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "bfd648864b74d14b96cd3af9e36f04186aca7075" }
@@ -18,6 +19,7 @@ use std::fs;
 use std::fs::File;
 use std::io::Read;
 use std::io::Write;
+use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -42,6 +44,8 @@ type Result<T> = std::result::Result<T, String>;
 const FEATURES: &str = "in-guest-trap,exec-stop-launcher,native-exec";
 const MANIFEST_TEST_COUNT: usize = 303;
 const ISOLATION_TEST_COUNT: usize = 150;
+const MIXED_RUNTIME_CASE: &str =
+    "liteinst_cli_refuses_an_off_runtime_unless_patching_is_explicitly_disabled";
 const ALLOCATOR_TESTS: &[&str] = &[
     "genuine_detcore_leaf_keeps_scope_free_work_private",
     "source_copy::compiled_source_transaction_closes_both_result_paths",
@@ -596,7 +600,42 @@ fn check_report_population(
     )
 }
 
-fn merge_reports(reports: [TestResults; 3]) -> Result<TestResults> {
+fn mixed_runtime_inventory(bytes: &[u8]) -> Result<BTreeSet<String>> {
+    let value: Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let mut ids = BTreeSet::new();
+    for (suite_id, suite) in value["rust-suites"]
+        .as_object()
+        .ok_or("mixed-runtime Nextest suites missing")?
+    {
+        for (name, case) in suite["testcases"]
+            .as_object()
+            .ok_or("mixed-runtime Nextest cases missing")?
+        {
+            if case["filter-match"]["status"] != "matches" {
+                continue;
+            }
+            require(
+                suite["package-name"] == "hermit-run"
+                    && suite["binary-name"] == "liteinst_mixed_runtime"
+                    && suite["kind"] == "test"
+                    && suite_id == "hermit-run::liteinst_mixed_runtime"
+                    && suite["binary-id"] == suite_id.as_str()
+                    && suite["status"] == "listed"
+                    && name == MIXED_RUNTIME_CASE
+                    && case["ignored"] == false,
+                "mixed-runtime inventory selected a foreign, ignored or substituted case",
+            )?;
+            require(
+                ids.insert(format!("{suite_id}${name}")),
+                "duplicate mixed-runtime identity",
+            )?;
+        }
+    }
+    require(ids.len() == 1, "mixed-runtime inventory must select exactly one case")?;
+    Ok(ids)
+}
+
+fn merge_reports<const N: usize>(reports: [TestResults; N]) -> Result<TestResults> {
     let mut executed = 0u64;
     let mut filtered = 0u64;
     let mut rows = Vec::new();
@@ -617,7 +656,7 @@ fn merge_reports(reports: [TestResults; 3]) -> Result<TestResults> {
     TestResults::current(executed, filtered, rows)
 }
 
-fn require_test_success(runners: [bool; 3], report: &TestResults) -> Result<()> {
+fn require_test_success<const N: usize>(runners: [bool; N], report: &TestResults) -> Result<()> {
     require(
         runners.into_iter().all(|ok| ok),
         "a test runner failed; preserved terminal rows cannot erase infrastructure failure",
@@ -629,8 +668,35 @@ fn require_test_success(runners: [bool; 3], report: &TestResults) -> Result<()> 
             .ok_or("terminal rows missing")?
             .iter()
             .all(|row| row.passed),
-        "the trap-only cohort contains failing tests",
+        "an OFF cohort or the separate mixed ON/OFF control contains failing tests",
     )
+}
+
+// Keep build/install/program state in one reusable directory. The lock is never
+// unlinked: every invocation opens the same inode and holds it through terminal
+// reporting. Command/result evidence has its own retained generation outside
+// target, so reusing the Cargo cache does not erase that evidence.
+struct WorkDirectory {
+    _lock: File,
+    started: Instant,
+    evidence: PathBuf,
+    reuse: Value,
+}
+
+impl Drop for WorkDirectory {
+    fn drop(&mut self) {
+        let record = json!({
+            "wall_seconds": self.started.elapsed().as_secs_f64(),
+            "reuse": self.reuse,
+        });
+        if let Err(error) = fs::write(
+            self.evidence.join("resources.json"),
+            format!("{record}\n"),
+        ) {
+            eprintln!("cannot retain OFF resource measurement: {error}");
+        }
+        eprintln!("in-guest-trap OFF resource measurement: {record}");
+    }
 }
 
 fn run(writer: &Path) -> Result<()> {
@@ -645,11 +711,39 @@ fn run(writer: &Path) -> Result<()> {
         .map_err(|e| e.to_string())?
         .as_nanos();
     let generation = root.join(format!(
-        "target/ci/in-guest-trap/no-liteinst/{}-{serial}",
+        "ignored/in-guest-trap-no-liteinst/{}-{serial}",
         std::process::id()
     ));
     fs::create_dir_all(&generation).map_err(|e| e.to_string())?;
-    let target = generation.join("target");
+    let work = root.join("target/ci/in-guest-trap/no-liteinst/work");
+    fs::create_dir_all(&work).map_err(|e| e.to_string())?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(work.join("lock"))
+        .map_err(|e| e.to_string())?;
+    // SAFETY: lock owns a live descriptor for the complete script invocation.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        return Err(format!(
+            "OFF work directory is already owned or cannot be locked: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let target = work.join("target");
+    let _work = WorkDirectory {
+        _lock: lock,
+        started: Instant::now(),
+        evidence: generation.clone(),
+        reuse: json!({
+            "work_directory": work,
+            "cargo_target_existed": target.is_dir(),
+            "standalone_target_existed": work.join("standalone-target").is_dir(),
+            "mixed_on_target_existed": work.join("mixed-on-target").is_dir(),
+            "programs_existed": work.join("programs").is_dir(),
+        }),
+    };
     let installation = target.join("install_pkg");
     let hermit = target.join("validate/hermit");
     let mut runner = Runner {
@@ -660,7 +754,7 @@ fn run(writer: &Path) -> Result<()> {
             ("HERMIT_INSTALL_DIR".into(), installation.clone()),
             ("HERMIT_BIN".into(), hermit.clone()),
             ("HERMIT_LITEINST_TEST_BINARY".into(), hermit.clone()),
-            ("E2E_BUILD_ROOT".into(), generation.join("programs")),
+            ("E2E_BUILD_ROOT".into(), work.join("programs")),
             ("E2E_RESULT_ROOT".into(), generation.join("e2e")),
             (
                 "E2E_RUN_ID".into(),
@@ -774,7 +868,7 @@ fn run(writer: &Path) -> Result<()> {
     command
         .arg("release")
         .arg(&standalone)
-        .arg(generation.join("standalone-target"))
+        .arg(work.join("standalone-target"))
         .arg("--without-liteinst");
     runner.checked("stage-standalone", &mut command)?;
     let mut command = runner.command("./ci/build-liteinst-allocator-fixtures.rs");
@@ -938,14 +1032,55 @@ fn run(writer: &Path) -> Result<()> {
         .arg(&isolation_directory)
         .env("DAGRUN_TEST_COUNTS_PATH", &isolation_report);
     let (isolation_status, _) = runner.run("isolation-run", &mut command)?;
+    // This ON control consumes the actual OFF installation just verified
+    // above. A separate target prevents ON features from unifying with any
+    // OFF producer; the same work lock spans both configurations and reporting.
+    let mixed_target = work.join("mixed-on-target");
+    let mixed_hermit = mixed_target.join("validate/hermit");
+    let mixed_report = generation.join("mixed-on-results.json");
+    let mixed_arguments = [
+        "--locked",
+        "--offline",
+        "--cargo-profile",
+        "validate",
+        "-p",
+        "hermit-run",
+        "--no-default-features",
+        "--features",
+        "liteinst,mixed-runtime-test-support",
+        "--test",
+        "liteinst_mixed_runtime",
+        "-E",
+        "test(=liteinst_cli_refuses_an_off_runtime_unless_patching_is_explicitly_disabled)",
+    ];
+    let mut command = runner.command("cargo");
+    command
+        .args(["nextest", "list"])
+        .args(mixed_arguments)
+        .args(["--message-format", "json"])
+        .env("CARGO_TARGET_DIR", &mixed_target);
+    let inventory = runner.checked("mixed-on-inventory", &mut command)?;
+    let mixed_ids = mixed_runtime_inventory(&fs::read(inventory).map_err(|e| e.to_string())?)?;
+    let mut command = runner.command("./ci/run-nextest-counted.sh");
+    command
+        .args(mixed_arguments)
+        .env("CARGO_TARGET_DIR", &mixed_target)
+        .env("HERMIT_BIN", &mixed_hermit)
+        .env("HERMIT_LITEINST_TEST_BINARY", &mixed_hermit)
+        .env("HERMIT_MIXED_LITEINST_OFF_INSTALLATION", &installation)
+        .env("NEXTEST_EXPECTED_EXECUTED", "1")
+        .env("DAGRUN_TEST_COUNTS_PATH", &mixed_report);
+    let (mixed_status, _) = runner.run("mixed-on-run", &mut command)?;
     let nextest_report = read_report(&nextest_report)?;
     let e2e_report = read_report(&e2e_report)?;
     let isolation_report = read_report(&isolation_report)?;
+    let mixed_report = read_report(&mixed_report)?;
     let nextest_population = check_report_population("Nextest", &nextest_report, &nextest_ids);
     let manifest_population = check_report_population("manifest", &e2e_report, &manifest_ids);
     let isolation_population =
         check_report_population("isolation", &isolation_report, &isolation_ids);
-    let report = merge_reports([nextest_report, e2e_report, isolation_report])?;
+    let mixed_population = check_report_population("mixed ON/OFF", &mixed_report, &mixed_ids);
+    let report = merge_reports([nextest_report, e2e_report, isolation_report, mixed_report])?;
     let mut command = runner.command(writer);
     command
         .arg(report.executed_tests.to_string())
@@ -966,14 +1101,16 @@ fn run(writer: &Path) -> Result<()> {
             nextest_status.success(),
             e2e_status.success(),
             isolation_status.success(),
+            mixed_status.success(),
         ],
         &report,
     )?;
     nextest_population?;
     manifest_population?;
     isolation_population?;
+    mixed_population?;
     println!(
-        "in-guest-trap without liteinst: {} tests; retained evidence {}",
+        "in-guest-trap OFF cohorts plus mixed ON/OFF control: {} tests; retained evidence {}",
         report.executed_tests,
         generation.display()
     );
@@ -1079,6 +1216,72 @@ mod tests {
         ])
         .unwrap();
         assert!(require_test_success([true; 3], &failing).is_err());
+    }
+
+    #[test]
+    fn mixed_on_control_keeps_its_own_verdict_identity_and_runner_status() {
+        let merged = merge_reports([
+            report("cli$case", true, 1),
+            report("e2e/case", true, 1),
+            report("isolation/case", true, 1),
+            report("mixed-on$case", false, 2),
+        ])
+        .unwrap();
+        assert_eq!(merged.executed_tests, 4);
+        assert_eq!(merged.results.as_ref().unwrap()[3].id, "mixed-on$case");
+        assert_eq!(merged.results.as_ref().unwrap()[3].attempts, 2);
+        assert!(require_test_success([true; 4], &merged).is_err());
+        let passing = merge_reports([
+            report("cli$case", true, 1),
+            report("e2e/case", true, 1),
+            report("isolation/case", true, 1),
+            report("mixed-on$case", true, 1),
+        ])
+        .unwrap();
+        assert!(require_test_success([true, true, true, false], &passing).is_err());
+        assert!(merge_reports([
+            report("cli$case", true, 1),
+            report("e2e/case", true, 1),
+            report("isolation/case", true, 1),
+            TestResults::current(0, 0, vec![]).unwrap(),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn mixed_on_inventory_refuses_substitution_extra_cases_and_ignored_controls() {
+        let suite = "hermit-run::liteinst_mixed_runtime";
+        let inventory = json!({"rust-suites": {(suite): {
+            "package-name": "hermit-run", "binary-name": "liteinst_mixed_runtime",
+            "binary-id": suite, "kind": "test", "status": "listed",
+            "testcases": {(MIXED_RUNTIME_CASE): {
+                "ignored": false, "filter-match": {"status": "matches"}
+            }}
+        }}});
+        let check = |value: &Value| mixed_runtime_inventory(&serde_json::to_vec(value).unwrap());
+        assert_eq!(
+            check(&inventory).unwrap(),
+            BTreeSet::from([format!("{suite}${MIXED_RUNTIME_CASE}")])
+        );
+        for (field, value) in [
+            ("package-name", "another-package"),
+            ("binary-name", "cli"),
+            ("binary-id", "hermit-run::cli"),
+            ("kind", "lib"),
+            ("status", "skipped"),
+        ] {
+            let mut changed = inventory.clone();
+            changed["rust-suites"][suite][field] = json!(value);
+            assert!(check(&changed).is_err());
+        }
+        let mut ignored = inventory.clone();
+        ignored["rust-suites"][suite]["testcases"][MIXED_RUNTIME_CASE]["ignored"] = json!(true);
+        assert!(check(&ignored).is_err());
+        let mut extra = inventory.clone();
+        extra["rust-suites"][suite]["testcases"]["extra"] =
+            inventory["rust-suites"][suite]["testcases"][MIXED_RUNTIME_CASE].clone();
+        assert!(check(&extra).is_err());
+        assert!(check(&json!({"rust-suites": {}})).is_err());
     }
 
     #[test]

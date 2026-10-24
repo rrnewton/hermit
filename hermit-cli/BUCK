@@ -15,7 +15,7 @@ hermit_build_env = {
     "CARGO_PKG_VERSION": "0.5.1",
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "dc7f689c32c4789f801444ca012db6fec73bc4e5",
+    "HERMIT_REVERIE_PIN": "5076ebd0622c09398c89a25f6787965afd2690bc",
 }
 
 # The shadow release entrypoint supplies these values from Git/Cargo metadata
@@ -116,6 +116,7 @@ rust_library(
                 "kvm-native-test-support": ["reverie-kvm/native-test-support"],
                 "mm-cancellation-test-support": ["exec-stop-launcher", "in-guest-trap", "detcore/physical-mm-test-support"],
                 "kvm-execution-tests": [],
+                "mixed-runtime-test-support": [],
             },
         },
     },
@@ -130,10 +131,9 @@ rust_library(
     ),
     crate = "hermit",
     env = hermit_build_env,
-    # Existing labels retain LiteInst site patching and the exec-stop loader.
-    # Native-exec also needs the qualified Cargo-produced embedded bundle; no
-    # Buck producer exists for that bundle yet, so this target does not claim it.
-    features = ["in-guest-trap", "exec-stop-launcher", "liteinst"],
+    # Existing labels retain the ordinary LiteInst runtime and site patching.
+    # Exec-stop/native runtime variants belong to the explicit trap-only labels.
+    features = ["in-guest-trap", "liteinst"],
     # iced-x86 decoder tables are process-lifetime globals.
     test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
     deps = [
@@ -166,10 +166,9 @@ rust_library(
         "//hermetic_infra/hermit/hermit-run-ptrace:hermit-run-ptrace",
         "//hermetic_infra/hermit/hermit-resources:hermit-resources",
         "//hermetic_infra/reverie:reverie",
-        "//hermetic_infra/reverie:reverie-inguest-native",
-        "//hermetic_infra/reverie:reverie-loader",
+        "//hermetic_infra/reverie:reverie-inguest",
         "//hermetic_infra/reverie:reverie-kvm",
-        "//hermetic_infra/reverie:reverie-liteinst-native",
+        "//hermetic_infra/reverie:reverie-liteinst",
         "//hermetic_infra/reverie:reverie-ptrace",
         "//hermetic_infra/reverie:reverie-rpc-transport",
         "//hermetic_infra/reverie:reverie-sabre-stats",
@@ -227,12 +226,13 @@ rust_binary(
                 "kvm-native-test-support": ["reverie-kvm/native-test-support"],
                 "mm-cancellation-test-support": ["exec-stop-launcher", "in-guest-trap", "detcore/physical-mm-test-support"],
                 "kvm-execution-tests": [],
+                "mixed-runtime-test-support": [],
             },
         },
     },
     srcs = glob(["src/bin/**/*.rs"]),
     env = hermit_build_env,
-    features = ["in-guest-trap", "exec-stop-launcher", "liteinst"],
+    features = ["in-guest-trap", "liteinst"],
     # Signal-handler messages intentionally live for the process lifetime.
     test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
     test_srcs = glob([
@@ -274,9 +274,8 @@ rust_binary(
         "//hermetic_infra/hermit/detcore-model:detcore-model",
         "//hermetic_infra/hermit/hermit-resources:hermit-resources",
         "//hermetic_infra/reverie:reverie",
-        "//hermetic_infra/reverie:reverie-inguest-native",
-        "//hermetic_infra/reverie:reverie-loader",
-        "//hermetic_infra/reverie:reverie-liteinst-native",
+        "//hermetic_infra/reverie:reverie-inguest",
+        "//hermetic_infra/reverie:reverie-liteinst",
         "//hermetic_infra/reverie:reverie-ptrace",
         "//hermetic_infra/reverie:reverie-rpc-transport",
     ],

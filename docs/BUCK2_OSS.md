@@ -50,8 +50,9 @@ non-host platform targets that the default Hermit binary does not use.
 ### In-guest runtime artifacts
 
 The existing `//hermit-cli:libhermit` and `//hermit-cli:hermit` targets retain
-LiteInst site patching: both select `in-guest-trap`, `exec-stop-launcher` and
-`liteinst`, with the patching-enabled Reverie runtime. Explicit trap-only builds
+LiteInst site patching: both select `in-guest-trap` and `liteinst`, with the
+ordinary `reverie-inguest` and `reverie-liteinst` dependencies. They do not
+enable exec-stop or the native runtime variants. Explicit trap-only builds
 use `//hermit-cli:libhermit-trap-only` and `//hermit-cli:hermit-trap-only`. Those
 select `in-guest-trap` and `exec-stop-launcher`, with
 `reverie//:reverie-liteinst-native-trap-only`; their dependency closures retain
@@ -71,6 +72,13 @@ generates that bundle, so the ordinary Buck target does not advertise
 an artifact producer and declared inputs for those existing qualification
 checks. Cargo's trap-only configuration retains both artifact producers with
 `--no-default-features`.
+
+The pin validator requires the named `libhermit`/`hermit` pair to consume the
+one canonical build environment. The explicit `libhermit-trap-only` and
+`hermit-trap-only` pair is optional only as a complete pair; when present, both
+must consume that same environment. This replaces the old two-consumer count
+with target identity and call-boundary checks, rather than accepting arbitrary
+additional consumers. Pin, reassignment, mutation and alias checks remain.
 
 ## Shadow release parity
 

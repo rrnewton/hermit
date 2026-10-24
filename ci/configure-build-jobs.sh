@@ -2723,8 +2723,8 @@ fi
 # reverie-dbt/vendor/dynamorio, and third-party/dynamorio. Existing budget
 # values and limits are unchanged. This is source-identity carry only;
 # it supplies no new calibration, build, runtime, or landing evidence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != dc7f689c32c4789f801444ca012db6fec73bc4e5 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie dc7f689c32c4789f801444ca012db6fec73bc4e5 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 5076ebd0622c09398c89a25f6787965afd2690bc ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 5076ebd0622c09398c89a25f6787965afd2690bc (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
@@ -3266,3 +3266,6 @@ export REVERIE_DBT_MAX_PARALLEL_JOBS
 export REVERIE_DBT_EFFECTIVE_BUILD_JOBS
 export REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS
 export REVERIE_DBT_MAX_BUILD_SECONDS
+# CARRY TO 5076ebd0622c09398c89a25f6787965afd2690bc (2026-10-24): reviewed feature repair rebased on current Reverie main.
+# Compared with dc7f689c32c4789f801444ca012db6fec73bc4e5, all eight recorded DBT Git input objects are identical.
+# Existing calibration budgets/source recipes carry without a new timing or runtime claim.
