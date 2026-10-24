@@ -5057,6 +5057,43 @@ impl Scheduler {
         result
     }
 
+    /// Under `--replay-schedule-from`, wake the thread the trace switches to
+    /// now if it is still in a timed wait whose deadline has passed, so it is
+    /// runnable when the next turn is chosen.
+    ///
+    /// A scheduler pass wakes at most one due timed waiter
+    /// (`step2b_process_timed`), so how many due waiters are runnable when a
+    /// turn is chosen depends on how many passes ran since their deadlines
+    /// passed. The recording's passes include its chaos change points and
+    /// slice ends, which the replay does not repeat, so a timed waiter the
+    /// recording had woken in an extra pass could still be waiting when the
+    /// replay switched to it. The switch then fell through to another
+    /// runnable thread, a desync ("expected to be running thread 5, but
+    /// running 7"). This was rare while every turn charged half a millisecond
+    /// and deadlines passed several passes early. Since a run of expired
+    /// timed waits is charged one turn, deadlines pass as committed time
+    /// creeps forward between the turns of that run, often at the last turn
+    /// before the switch. Waking the target at its passed deadline is what the
+    /// next pass would do anyway, just ahead of the other due waiters, which
+    /// the following passes wake as before.
+    fn wake_due_replay_target(&mut self, target: DetTid) {
+        if self.run_queue.contains_tid(target) {
+            return;
+        }
+        let Some(deadline) = self.blocked.timed_waiters.thread_deadline(target) else {
+            return;
+        };
+        if deadline > self.committed_time || deadline.is_indefinite() {
+            return;
+        }
+        self.blocked.timed_waiters.remove(target);
+        trace!(
+            "[replay] dtid {} woken at its passed deadline {} (committed {}) for the trace's switch",
+            target, deadline, self.committed_time
+        );
+        self.wake_timed_event(deadline, target);
+    }
+
     /// Verify that the event we're replaying matches what just happened.  Set up the next
     /// (replayed) event to run.  Return true if the current thread will keep running and false if
     /// it needs to be descheduled.
@@ -5095,6 +5132,7 @@ impl Scheduler {
                 replayer::ReplayAction::ContextSwitch(is_now, new_tid, timeslice_remaining) => {
                     self.requeue_with_new_priority(mytid, REPLAY_DEFERRED_PRIORITY);
                     self.requeue_with_new_priority(new_tid, REPLAY_FOREGROUND_PRIORITY);
+                    self.wake_due_replay_target(new_tid);
                     if !self.run_queue.contains_tid(new_tid) {
                         // If it is not yet in next_turns, that is because it was JUST spawned and
                         // hasn't showed up yet, but it will by the next scheduler turn.

@@ -4016,7 +4016,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And liteinst_in_guest_programs::in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name
     // (A5 step 3c slice 0g): 601, listed.
     // And short_timed_wait_pollers_do_not_inflate_a_cpu_bound_threads_time: 602.
-    ("test.cli", 602),
+    // And a_chaos_recording_of_short_timed_waits_replays_its_schedule_without_desync: 603.
+    ("test.cli", 603),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4508,7 +4509,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in-guest runtime too and joins the hosted exclusions: unchanged at 520.
     // And short_timed_wait_pollers_do_not_inflate_a_cpu_bound_threads_time,
     // which is not among them: 521.
-    ("test.cli_on_host", 521),
+    // And a_chaos_recording_of_short_timed_waits_replays_its_schedule_without_desync,
+    // which is not among them either: 522.
+    ("test.cli_on_host", 522),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

@@ -40044,6 +40044,50 @@ fn short_timed_wait_pollers_do_not_inflate_a_cpu_bound_threads_time() {
     }
 }
 
+/// A chaos run of six pollers in 100 us `pthread_cond_timedwait` loops beside
+/// a CPU-bound thread (tests/c/timed_wait_pollers.c), recorded with
+/// `--record-preemptions-to`, replays under `--replay-schedule-from` without
+/// a desync at seeds 1 and 2. Since a run of expired timed waits is charged
+/// one turn, the pollers' deadlines pass as committed time creeps forward
+/// within such a run. A scheduler pass wakes one due timed waiter, and the
+/// recording's passes include chaos change points the replay does not
+/// repeat, so the poller the trace switched to could still be waiting: the
+/// replay ran another thread and desynced twice at both seeds ("expected to
+/// be running thread 5, but running 7"). The switch now wakes its target at
+/// its passed deadline (`wake_due_replay_target`).
+#[test]
+fn a_chaos_recording_of_short_timed_waits_replays_its_schedule_without_desync() {
+    let guest = futex_c_guest(&TIMED_WAIT_POLLERS_GUEST, "timed_wait_pollers")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for seed in ["1", "2"] {
+        let schedule = directory.path().join(format!("schedule-{seed}.json"));
+        let record = format!("--record-preemptions-to={}", schedule.display());
+        let guest_args = [guest.as_str(), "condwait", "6", "100", "2000000"];
+        let mut args = vec!["run", "--strict", "--chaos", "--seed", seed, &record, "--"];
+        args.extend_from_slice(&guest_args);
+        let recorded = hermit(&args);
+        assert!(recorded.status.success(), "{args:?}: {}", stderr(&recorded));
+
+        let replay = format!("--replay-schedule-from={}", schedule.display());
+        let mut args = vec!["--log=info", "run", "--strict", &replay, "--"];
+        args.extend_from_slice(&guest_args);
+        let replayed = hermit(&args);
+        let log = stderr(&replayed);
+        assert!(replayed.status.success(), "{args:?}: {log}");
+        assert!(
+            log.contains("(0 desynced)") && !log.contains("in a desynced state"),
+            "seed {seed}: the replay left its recorded schedule:\n{}",
+            log.lines()
+                .filter(|line| line.contains("desync") || line.contains("expected to be running"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+}
+
 /// Run tests/c/scheduler_signal_waiting.c under `run --strict` in each mode
 /// with the scheduler signal from `source` (`chld` or `alrm`), requiring the
 /// line Linux prints, then record and replay the `replayed` mode.
