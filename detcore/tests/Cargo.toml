@@ -37,6 +37,8 @@ pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features 
 raw-cpuid = "10.7.0"
 reverie = { package = "reverie-core", version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "1c22faddc3d240837d2d13ab3cadd9bb7b1dfe05" }
 reverie-ptrace = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "1c22faddc3d240837d2d13ab3cadd9bb7b1dfe05" }
+reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "77e4e4f43802b57101e3087ebf768351b36dd97d" }
+reverie-ptrace = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "77e4e4f43802b57101e3087ebf768351b36dd97d" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 tempfile = "3.27.0"
 test-allocator = { version = "0.5.4", path = "../../common/test-allocator" }

@@ -30403,6 +30403,7 @@
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "NEXTEST_EXPECTED_EXECUTED": "1965",
         "NEXTEST_EXPECTED_EXECUTED": "1852",
+        "NEXTEST_EXPECTED_EXECUTED": "1853",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit-detcore-tests\",\"--exclude\",\"hermit-run\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -58813,6 +58814,7 @@
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "NEXTEST_EXPECTED_EXECUTED": "1951",
         "NEXTEST_EXPECTED_EXECUTED": "1838",
+        "NEXTEST_EXPECTED_EXECUTED": "1839",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit-detcore-tests\",\"--exclude\",\"hermit-run\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,

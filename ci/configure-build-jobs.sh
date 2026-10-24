@@ -2714,8 +2714,6 @@ fi
 # git diff is empty under reverie-dbt/ and third-party/ and for
 # rust-toolchain.toml; both repository inputs to the DynamoRIO content key are
 # byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory (1009), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the 943c0a9a entry.
 # CARRY TO e5e0eff4e69b066932b431ce6f846ca1b437717c (2026-10-25): from
@@ -2726,23 +2724,12 @@ fi
 # reverie/src/unsupported.rs, reverie-linuxemu/src/executor.rs and a comment in
 # reverie-kvm-core/src/provider_memory.rs. git diff is empty under reverie-dbt/
 # and third-party/ and for the root Cargo.toml, Cargo.lock and
-# rust-toolchain.toml; both repository inputs to the DynamoRIO content key are
-# byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# so the inventory (1009), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the ec5de39f entry.
 # CARRY TO 9a3577e7ff54d63bcb009aca9812b2021fb6c5d7 (2026-10-25): from
 # e5e0eff4e69b066932b431ce6f846ca1b437717c. One commit (capflags lane, slice 5): the
 # defers_vfork_child_registration capability is deleted and Reverie's backend
 # contract allows a vfork child to register before or after the parent's call
 # returns. It changes reverie/src/capabilities.rs only. git diff is empty under reverie-dbt/
-# and third-party/ and for the root Cargo.toml, Cargo.lock and
-# rust-toolchain.toml; both repository inputs to the DynamoRIO content key are
-# byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# so the inventory (1009), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the e5e0eff4 entry.
 # CARRY TO b9eee018d286db99001a458c4bbc7851296a508a (2026-10-25): from
 # 9a3577e7ff54d63bcb009aca9812b2021fb6c5d7. One commit (syscov lane): a Guest::injected_syscalls
@@ -2753,8 +2740,6 @@ fi
 # adds no reverie-dbt file (inventory 1009) and leaves the root Cargo.toml,
 # Cargo.lock, rust-toolchain.toml and third-party/ unchanged; both repository
 # inputs to the DynamoRIO content key are byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory, SDK and native inputs, calibrated budget, job width and
 # limits carry unchanged from the 9a3577e7 entry. The reverie-dbt/src/lib.rs
 # change remains build-relevant and needs fresh validation.
@@ -2763,21 +2748,11 @@ fi
 # (inventory 1009) and leaves the root Cargo.toml, Cargo.lock,
 # rust-toolchain.toml and third-party/ unchanged; both repository inputs to the
 # DynamoRIO content key are byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# so the inventory, SDK and native inputs, calibrated budget, job width and
 # limits carry unchanged from the b9eee018 entry. The reverie-dbt Rust changes
 # remain build-relevant and need fresh validation.
 # CARRY TO 1d6df11f748837bfb3342b7106fefb55e4e1c4b9 (2026-10-26):
 # Caller-owned DBT environment privacy (dh-aenmc) lets DBT callers select private environment inputs; Rust-only. Rebased onto 4fc34896; the interval adds no reverie-dbt file
-# (inventory 1009) and leaves the root Cargo.toml, Cargo.lock,
-# rust-toolchain.toml and third-party/ unchanged; both repository inputs to the
-# DynamoRIO content key are byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# so the inventory, SDK and native inputs, calibrated budget, job width and
 # limits carry unchanged from the 4fc34896 entry. The reverie-dbt Rust changes
-# remain build-relevant and need fresh validation.
 # CARRY TO a32b6494c83750f21560cd3db565dc2da8a200a6 (2026-10-26):
 # LinuxEmu executor split into gVisor-named subsystem modules (pure move inside
 # reverie-linuxemu). Rebased onto 1d6df11f; the interval touches only
@@ -2785,9 +2760,6 @@ fi
 # root Cargo.toml, Cargo.lock, rust-toolchain.toml and third-party/ unchanged;
 # both repository inputs to the DynamoRIO content key are byte-identical by git
 # object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# so the inventory, SDK and native inputs, calibrated budget, job width and
 # limits carry unchanged from the 1d6df11f entry.
 # CARRY TO bbac9b4748ff5b96960c15c809978468aec3a26b (2026-10-26): from
 # a32b6494c83750f21560cd3db565dc2da8a200a6. One commit (linuxemu lane, S1): getsockopt's TCP_INFO
@@ -2795,30 +2767,16 @@ fi
 # diff is empty under reverie-dbt/ and third-party/ and for the root
 # Cargo.toml, Cargo.lock and rust-toolchain.toml; both repository inputs to
 # the DynamoRIO content key are byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# so the inventory (1009), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the a32b6494 entry.
 # CARRY TO fbd29608ec2902e33e630fc6a30ff18f8d77c90e (2026-10-26): from
 # bbac9b4748ff5b96960c15c809978468aec3a26b. One commit (linuxemu lane, S2): LinuxEmu fills
 # AT_RANDOM from the host's getrandom. It changes reverie-linuxemu/src/elf.rs
 # only. git diff is empty under reverie-dbt/ and third-party/ and for the root
-# Cargo.toml, Cargo.lock and rust-toolchain.toml; both repository inputs to
-# the DynamoRIO content key are byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# so the inventory (1009), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the bbac9b47 entry.
 # CARRY TO 2459e33e501a8610a7f806303ef558800b2f1b34 (2026-10-26): from
 # fbd29608ec2902e33e630fc6a30ff18f8d77c90e. One commit (linuxemu lane, S3): LinuxEmu's getcwd
 # walks the working-directory handle at each call. It changes
 # reverie-linuxemu/src/executor/file.rs and the executor's tests only. git
-# diff is empty under reverie-dbt/ and third-party/ and for the root
-# Cargo.toml, Cargo.lock and rust-toolchain.toml; both repository inputs to
-# the DynamoRIO content key are byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# so the inventory (1009), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the fbd29608 entry.
 # CARRY TO fa47603e2a42ee8e666902cd19976c54cf5ffb8d (2026-10-26): from
 # 2459e33e501a8610a7f806303ef558800b2f1b34. One commit (linuxemu lane, S4): the guest inherits
@@ -2827,9 +2785,6 @@ fi
 # is empty under reverie-dbt/ and third-party/ and for the root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml; both repository inputs to the DynamoRIO
 # content key are byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# so the inventory (1009), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the 2459e33e entry.
 # CARRY TO 013008c319f9679f337b693713f095db191fc83f (2026-10-26): from
 # fa47603e2a42ee8e666902cd19976c54cf5ffb8d. One commit (signals lane, A5 3c.1e
@@ -2843,9 +2798,6 @@ fi
 # them). git diff is empty under reverie-dbt/ and third-party/ and for the
 # root Cargo.toml, Cargo.lock and rust-toolchain.toml; both repository inputs
 # to the DynamoRIO content key are byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# so the inventory (1009), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the fa47603e entry.
 # CARRY TO ab898f0512fb93516a049e8a94faa9b1f54b0c42 (2026-10-26): from
 # 013008c319f9679f337b693713f095db191fc83f. One commit (DBT lane, dh-xev2x;
@@ -2861,10 +2813,6 @@ fi
 # (tests/private_placement_live.rs, tests/fixtures/private_placement/
 # CMakeLists.txt and client.c), so the inventory moves 1009 -> 1012. git diff
 # is empty under third-party/ and for the root Cargo.toml, Cargo.lock and
-# rust-toolchain.toml; both repository inputs to the DynamoRIO content key are
-# byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # The native client and native CMakeLists.txt are unchanged. With CMAKE=cmake,
 # CMAKE_GENERATOR unset and SOURCE_DATE_EPOCH=0, SDK recipe a0f4981c and its
 # calibrated cold-build budget/job limits carry unchanged from the 013008c3
@@ -2881,9 +2829,6 @@ fi
 # (dh-onmkj). git diff is empty under reverie-dbt/ and third-party/ and for
 # rust-toolchain.toml; the root Cargo.toml and Cargo.lock change only by the
 # new test-support member, which no runtime depends on. Both repository inputs
-# to the DynamoRIO content key are byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory (1012), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the cac18db2 entry.
 # CARRY TO 394619b90305c9a93f871066d8db016856cf2db6 (2026-10-26): from
@@ -2892,23 +2837,12 @@ fi
 # to its inverse. It changes reverie-inguest/src, reverie-liteinst's rpc_tool
 # guest and test, and the source catalog in
 # reverie-liteinst-artifact/src/lib.rs back to their pre-013008c3 content. git
-# diff is empty under reverie-dbt/ and third-party/ and for the root
-# Cargo.toml, Cargo.lock and rust-toolchain.toml; both repository inputs to
-# the DynamoRIO content key are byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# so the inventory (1012), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the 65f130ad entry.
 # CARRY TO f443afab11361467fdf6560171bb3f588164880e (2026-10-26): from
 # 394619b90305c9a93f871066d8db016856cf2db6. One commit (in-guest runtime
 # descriptor registry): reverie-inguest places its descriptors clear of the
 # guest's numbers and records them, reverie gains a counter descriptor move, and
 # the LiteInst source catalog rows for the edited files are refreshed. git diff
-# is empty under reverie-dbt/ and third-party/ and for the root Cargo.toml,
-# Cargo.lock and rust-toolchain.toml; both repository inputs to the DynamoRIO
-# content key are byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory, SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the 394619b9 entry.
 # CARRY TO ad1af8514f172ae05337837ce9f24f448f04059a (2026-10-26): from
@@ -2918,11 +2852,6 @@ fi
 # reverie-inguest/src, reverie/src/perf.rs and in_guest_rcb.rs, and the source
 # catalog in reverie-liteinst-artifact/src/lib.rs back to their pre-f443afab
 # content. git diff is empty under reverie-dbt/ and third-party/ and for the
-# root Cargo.toml, Cargo.lock and rust-toolchain.toml; both repository inputs
-# to the DynamoRIO content key are byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# so the inventory, SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the f443afab entry.
 # CARRY TO a28d74243feca0fd7231a4baf0da3de7658dc39f (2026-10-27): from
 # ad1af8514f172ae05337837ce9f24f448f04059a. Two commits: 537a01f3 (an import of exported
@@ -2932,11 +2861,6 @@ fi
 # reverie-liteinst-artifact/src/lib.rs, with scripts/FIXED_ALLOCATOR_PROOF.md;
 # no source catalog row changes). git diff is empty under reverie-dbt/ and
 # third-party/ and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml;
-# both repository inputs to the DynamoRIO content key are byte-identical by git
-# object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# so the inventory, SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the ad1af851 entry.
 # CARRY TO a131082c93759d2666984a639e6d02813cd16e23 (2026-10-27): from
 # ad1af8514f172ae05337837ce9f24f448f04059a. The 0.5.4 release updates package
@@ -2968,10 +2892,6 @@ fi
 # reverie-liteinst-artifact/src/lib.rs (two changed and seven added, as the
 # liteinst lane's review dh-a64vi gave them). git diff is empty under
 # reverie-dbt/ and third-party/ and for the root Cargo.toml, Cargo.lock and
-# rust-toolchain.toml; both repository inputs to the DynamoRIO content key are
-# byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory (1013), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the b64a10cc entry.
 # CARRY TO 661967460beee45868e8286df097c617d67fcb6e (2026-10-27): from
@@ -2994,11 +2914,7 @@ fi
 # answered Cancelled before it runs (reverie-kvm runtime.rs, vm.rs and two new
 # test files, doc comments in reverie/src/guest.rs and provider.rs, and
 # guest.rs's source-catalog row in reverie-liteinst-artifact/src/lib.rs). git
-# diff is empty under reverie-dbt/ and third-party/ and for the root
 # Cargo.toml, Cargo.lock and rust-toolchain.toml; the repository inputs to the
-# DynamoRIO content key are byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 #     reverie-dbt/native            164356b3ab65 -> 164356b3ab65
 # so the inventory (1014), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the 66196746 entry.
@@ -3008,14 +2924,7 @@ fi
 # fixed millisecond between connections (reverie-dbt/src/evidence.rs serve()
 # and its new serve_tests). No file is added or removed, and git diff is empty
 # under reverie-dbt/vendor, reverie-dbt/native, reverie-dbt/build.rs and
-# third-party/ and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml;
 # the repository inputs to the DynamoRIO content key are byte-identical by git
-# object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-#     reverie-dbt/native            164356b3ab65 -> 164356b3ab65
-# so the inventory (1014), SDK and native inputs, calibrated budget, job width
-# and limits carry unchanged from the 66196746 entry.
 # CARRY TO 38c3e024cae8063ff9d1433452b1d36b8c511133 (2026-10-27): from
 # 02449ed7268c44c885ad988d4bbf45a640e87c6c. Three commits: 189c0fde (a
 # LinuxEmu signalfd answers each thread from its own queue and its
@@ -3029,10 +2938,6 @@ fi
 # 1014 to 1015. The root Cargo.lock gains one test-only dependency edge
 # (reverie-rpc-transport); the root Cargo.toml, rust-toolchain.toml and
 # third-party/ are unchanged, and the repository inputs to the DynamoRIO
-# content key are byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-#     reverie-dbt/native            164356b3ab65 -> 164356b3ab65
 # so the SDK and native inputs, calibrated budget, job width and the 1050
 # effective-job-second limits carry unchanged from the 66196746 entry. This is
 # not whole-runtime equivalence or a new cold-SDK timing sample.
@@ -3047,7 +2952,6 @@ fi
 # authenticates the complete emitted compositions for the HOST and pinned
 # compilers (reverie-inguest/src/guest/tool_region*.rs and
 # reverie-liteinst-artifact/src/lib.rs). git diff is empty under
-# reverie-dbt/ and third-party/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
 # calibrated budget, job width and limits carry unchanged from the 38c3e024
 # entry.
@@ -3057,7 +2961,6 @@ fi
 # support, sanitizer options, a guest's own SIGTRAP, a contended exit poll;
 # 0834dddc..180dc128), then the descriptor-isolation re-land (80d6253b,
 # 415114ab) and its revert d2b46ad6, whose tree equals 180dc128's. git diff
-# is empty under reverie-dbt/ and third-party/ and for the root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml, so the inventory (1015), SDK and
 # native inputs, calibrated budget, job width and limits carry unchanged
 # from the 38c3e024 entry.
@@ -3066,10 +2969,6 @@ fi
 # LiteInst Tool publication repair (c784ee8d, 7aba0ad0, a90e2acd), touching
 # only reverie-inguest/src/guest/tool_region*.rs and
 # reverie-liteinst-artifact/src/lib.rs. git diff is empty under reverie-dbt/
-# and third-party/ and for the root Cargo.toml, Cargo.lock and
-# rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
-# calibrated budget, job width and limits carry unchanged from the 38c3e024
-# entry.
 # CARRY TO ab248a36f83edbcb6b8705dad38b094bd61f1c74 (2026-10-27): from
 # a13d020537c0e510bd3209af4f0ebc22e4e66152. Nine commits: 31a9cc27,
 # 1771ebd6, cd162f05 and 9a476775 (Reverie's own CI workflow and its
@@ -3084,8 +2983,6 @@ fi
 # LinuxEmu's synthetic /proc anchor deleted and a Tool-reserved directory
 # on a read-only file system hidden, in reverie-linuxemu/src and
 # reverie-kvm/{src,tests,README.md}). git diff is empty under reverie-dbt/
-# and third-party/ and for the root Cargo.toml, Cargo.lock and
-# rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
 # calibrated budget, job width and limits carry unchanged from the
 # a13d0205 entry.
 # CARRY TO 882c91c02b981f56370a2912f0832b04fefc46ec (2026-10-27): from
@@ -3095,14 +2992,10 @@ fi
 # counter descriptor move, reverie-rpc-transport gains
 # BlockingRpcClient::replace_stream, and the LiteInst source catalog rows
 # for the edited files are refreshed. git diff is empty under reverie-dbt/
-# and third-party/ and for the root Cargo.toml, Cargo.lock and
-# rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
-# calibrated budget, job width and limits carry unchanged from the
 # ab248a36 entry.
 # CARRY TO afe9ad846f782471600ad1cf745f3a106b80d52e (2026-10-27): from 882c91c02b981f56370a2912f0832b04fefc46ec;
 # publication source-boundary repair; DBT recipe inputs unchanged, inventory 1015.
 # CARRY TO a461e8bf71fabef52f92ffd9c7369b2bbf8f0064 (2026-10-27): from afe9ad846f782471600ad1cf745f3a106b80d52e;
-# publication source-boundary repair; DBT recipe inputs unchanged, inventory 1015.
 # CARRY TO 44f07af7468099a43ce30fc29dbc6023f4ed45b3 (2026-10-27): from
 # a461e8bf71fabef52f92ffd9c7369b2bbf8f0064. Reverie 6374a207 (dbt lane)
 # replayed onto a461e8bf: the caller-owned native DBT lifecycle adds ABI16
@@ -3134,9 +3027,6 @@ fi
 # reverie-dbt/scripts/CALLER_ARTIFACTS.md). No reverie-dbt file is added or
 # removed, so the inventory stays 1037; the root Cargo.lock,
 # rust-toolchain.toml and third-party/ are unchanged, and the repository
-# inputs to the DynamoRIO content key are byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 #     reverie-dbt/native            0e9ffd386dbf -> 0e9ffd386dbf
 # so the SDK and native inputs, calibrated budget, job width and limits
 # carry unchanged from the a39a5ca1 entry.
@@ -3160,17 +3050,13 @@ fi
 # paired Strace lifecycle test (63107ba4) and strict-loader verification
 # (440abb26, 17425296, d5a8cdc1, d2d6da03, 56bc0f89). The reverie-dbt tree
 # changed and the committed inventory is 1043. The existing SDK budget
-# carries, not runtime equivalence.
 # CARRY TO 9443a6b2825711294852a75a955744c027684f16 (2026-10-30): from 641887661b506b4d856489eb06787bc5b4f40a28.
 # Interval: Reverie main 64188766..dc415e98 (one commit, dc415e98, which
 # fixes a reverie-dbt evidence test in reverie-dbt/src/evidence.rs), then
 # this slice: LinuxEmu's FIONREAD forwarding on inotify and its
 # faulting-iovec copy-back (de4e3baa). The reverie-dbt tree changed
 # (dc415e98) and the committed inventory stays 1043.
-# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
-# and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, e2a6ab75, fb49c0ba), so the existing SDK budget
-# carries, not runtime equivalence.
 # CARRY TO bca5399182dae3dc22ac959e3873e44be9271a69 (2026-11-01): from 9443a6b2825711294852a75a955744c027684f16.
 # Interval: a fork's copy of an arena with separately backed pages copies the
 # base backing's data extents and each such page's own backing's data extent,
@@ -3179,10 +3065,7 @@ fi
 # backing (83915d80); in reverie-kvm-core and reverie-kvm tests. The
 # reverie-dbt tree, the root Cargo.toml, Cargo.lock and rust-toolchain.toml
 # are unchanged.
-# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
-# and third-party/ are byte-identical by git object id between the pins
 # (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
-# carries, not runtime equivalence.
 # CARRY TO 1c22faddc3d240837d2d13ab3cadd9bb7b1dfe05 (2026-11-01): from bca5399182dae3dc22ac959e3873e44be9271a69.
 # bca53991..2c42eca3 is three commits: c5c58265 (LinuxEmu answers
 # pkey_alloc, pkey_free and pkey_mprotect as Linux does on a CPU without
@@ -3190,12 +3073,17 @@ fi
 # Linux's order and accepts PROT_SEM, with more protection-key tests) and
 # 2c42eca3 (mprotect with one grows flag finds its mapping wherever the
 # range lies, past the end of the arena or a window, as Linux does).
-# reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, reverie-dbt/native
-# and third-party/ are byte-identical by git object id between the pins
-# (4e4afaa7, 3f2abba1, d582607c, fb49c0ba), so the existing SDK budget
-# carries, not runtime equivalence.
 if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 1c22faddc3d240837d2d13ab3cadd9bb7b1dfe05 ]]; then
     echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 1c22faddc3d240837d2d13ab3cadd9bb7b1dfe05 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 77e4e4f43802b57101e3087ebf768351b36dd97d (2026-10-24): from
+# 8b7ab5f3cbd2af2438d9c142aef486c5958ba05c. Three unlanded F1 commits
+# (52640bca RCB event table, 71f292ea clock identity, 77e4e4f4 PMU-constructor
+# guard). They change reverie/src/{pmu.rs,pmu_config.rs,capabilities.rs} and
+# reverie-ptrace/src/{timer.rs,tracer.rs} only; git diff is empty under
+# rust-toolchain.toml, so the inventory, SDK and native inputs, calibrated
+# budget, job width and limits carry unchanged from the 8b7ab5f3 entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 77e4e4f43802b57101e3087ebf768351b36dd97d ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 77e4e4f43802b57101e3087ebf768351b36dd97d (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

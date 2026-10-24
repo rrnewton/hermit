@@ -91,6 +91,15 @@ reverie-inguest = { version = "0.5.4", git = "https://github.com/rrnewton/reveri
 reverie-rpc-transport = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "1c22faddc3d240837d2d13ab3cadd9bb7b1dfe05", optional = true }
 reverie-sabre-stats = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "1c22faddc3d240837d2d13ab3cadd9bb7b1dfe05", optional = true }
 safeptrace = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "1c22faddc3d240837d2d13ab3cadd9bb7b1dfe05" }
+reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "77e4e4f43802b57101e3087ebf768351b36dd97d" }
+reverie-dbt = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "77e4e4f43802b57101e3087ebf768351b36dd97d", default-features = false, optional = true }
+reverie-kvm = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "77e4e4f43802b57101e3087ebf768351b36dd97d" }
+reverie-ptrace = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "77e4e4f43802b57101e3087ebf768351b36dd97d" }
+reverie-liteinst = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "77e4e4f43802b57101e3087ebf768351b36dd97d", default-features = false, optional = true }
+reverie-inguest = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "77e4e4f43802b57101e3087ebf768351b36dd97d", default-features = false, optional = true }
+reverie-rpc-transport = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "77e4e4f43802b57101e3087ebf768351b36dd97d", optional = true }
+reverie-sabre-stats = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "77e4e4f43802b57101e3087ebf768351b36dd97d", optional = true }
+safeptrace = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "77e4e4f43802b57101e3087ebf768351b36dd97d" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 serde_yaml = "0.9.34"
@@ -113,6 +122,10 @@ reverie-loader = { version = "0.5.4", git = "https://github.com/rrnewton/reverie
 # Same exact host source pin as the shared physical launcher and codec consumer.
 # Keep the shared physical-launcher regression in the ordinary unit gate.
 reverie-inguest = { version = "0.5.4", git = "https://github.com/rrnewton/reverie.git", rev = "1c22faddc3d240837d2d13ab3cadd9bb7b1dfe05", default-features = false, features = ["exec-stop"] }
+reverie-loader = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "77e4e4f43802b57101e3087ebf768351b36dd97d", optional = true }
+reverie-liteinst-artifact = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "77e4e4f43802b57101e3087ebf768351b36dd97d", default-features = false }
+reverie-loader = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "77e4e4f43802b57101e3087ebf768351b36dd97d" }
+reverie-inguest = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "77e4e4f43802b57101e3087ebf768351b36dd97d", default-features = false, features = ["exec-stop"] }
 # Exact token locations and digests bind the complete source inventory.
 proc-macro2 = { version = "1.0.107", features = ["span-locations"] }
 quote = "1.0.47"

@@ -9630,6 +9630,11 @@ mod tests {
             // LiteInst runtime never return a stack.
             "provides_guest_backtraces":
                 matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Sabre | Backend::Dbt),
+            // Only ptrace's counter is a qualified RCB clock, and e9patch
+            // preprocessing runs on it.
+            "rcb_clock_contract": if matches!(backend, Backend::Ptrace | Backend::E9patch) {
+                serde_json::json!("PerfCounterOnTargetThreadUserOnly")
+                serde_json::Value::Null
         })
     }
 
@@ -9645,11 +9650,27 @@ mod tests {
             Backend::Dbt,
         ] {
             let config = prepare_backend_config(super::DetConfig::default(), backend);
-            assert_eq!(
-                serde_json::to_value(config.backend).unwrap(),
-                golden_backend_capabilities(backend),
-                "{backend:?}"
-            );
+            let actual = serde_json::to_value(config.backend).unwrap();
+            let golden = golden_backend_capabilities(backend);
+            assert_eq!(actual, golden, "{backend:?}");
+            // The table names the contract: a wrong or missing one differs.
+            let mut missing = golden.clone();
+            missing
+                .as_object_mut()
+                .unwrap()
+                .remove("rcb_clock_contract");
+            assert_ne!(actual, missing, "{backend:?}");
+            for wrong in [
+                serde_json::Value::Null,
+                serde_json::json!("PerfCounterOnTargetThreadUserOnly"),
+                serde_json::json!("PerfCounterOnSomeOtherThread"),
+            ] {
+                if wrong != golden["rcb_clock_contract"] {
+                    let mut edited = golden.clone();
+                    edited["rcb_clock_contract"] = wrong;
+                    assert_ne!(actual, edited, "{backend:?}");
+                }
+            }
         }
     }
 
