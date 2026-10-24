@@ -5102,6 +5102,45 @@ impl Scheduler {
         self.retire_exited_leader(leader, mm)
     }
 
+    /// `sender`, in its delivery turn, is about to take a signal whose action
+    /// is the default and whose default action ends the process. Linux ends
+    /// the whole thread group at that delivery: `get_signal` carries out the
+    /// default action with `do_group_exit` (or `do_coredump` first), which
+    /// queues SIGKILL to every other thread before any of them runs another
+    /// user instruction. Two exceptions decide nothing here: a PID
+    /// namespace's init, for which `get_signal` skips the default action
+    /// (`SIGNAL_UNKILLABLE`), and a process with an exec in flight, whose
+    /// `de_thread` kills the other threads instead (`do_group_exit` and
+    /// `zap_threads` defer to `group_exec_task`).
+    ///
+    /// The process is recorded doomed (`record_committed_fatal_signal`), and
+    /// on a backend that retires a kill's victims at the kill turn (ptrace)
+    /// its other threads are retired here, as committed victims
+    /// (`retire_fatal_delivery_victims`). Before, each left at its own
+    /// host-timed exit report, and a report that came after the sender's let
+    /// the empty run queue read as a deadlock of the threads still parked in
+    /// futex waits. Returns whether any thread was retired: the sender then
+    /// files nothing more, since turn selection now waits for the victims'
+    /// deaths, which only its delivery causes.
+    pub(crate) fn commit_fatal_delivery(&mut self, sender: DetTid) -> bool {
+        let Some(process) = self.registered_process(sender) else {
+            return false;
+        };
+        if self.thread_tree.is_pid_namespace_init(process)
+            || self.exec_teardowns.contains_key(&process)
+        {
+            return false;
+        }
+        self.record_committed_fatal_signal(process);
+        if !self.holds_serial_grant(sender) {
+            tracing::warn!(
+                "[scheduler] dettid {sender} reported a fatal delivery without holding the serial grant; its process's other threads stay"
+            );
+            return false;
+        }
+        !self.retire_fatal_delivery_victims(sender).is_empty()
+    }
+
     /// Whether a committed SIGKILL doomed `process`, and whether one with an
     /// unnamed victim was seen (test observation of the record above).
     #[cfg(test)]
@@ -35748,6 +35787,194 @@ mod test {
             .insert(LogicalTime::INDEFINITE, child);
         assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
         assert!(scheduler.take_terminal_deadlock().is_some());
+    }
+
+    /// Process 3 at a fatal delivery: its leader and thread 5 parked in futex
+    /// waits on one word, and thread 7 holding the turn that delivers.
+    fn fatal_delivery_scheduler(config: &Config) -> (Scheduler, MmId) {
+        let mut scheduler = Scheduler::new(config);
+        let [leader, parked, sender] = [3, 5, 7].map(DetTid::from_raw);
+        let mm = MmId::initial(leader);
+        scheduler.thread_tree.add_child(leader, leader, true);
+        for thread in [parked, sender] {
+            scheduler.thread_tree.add_child(leader, thread, false);
+        }
+        for tid in [leader, parked, sender] {
+            register_known_thread(&mut scheduler, tid);
+            scheduler.record_thread_mm(tid, mm);
+        }
+        let waiters = scheduler
+            .blocked
+            .futex_waiters
+            .entry(FutexID::private(mm, 0x404100))
+            .or_default();
+        waiters.push(futex_waiter(3, u32::MAX));
+        waiters.push(futex_waiter(5, u32::MAX));
+        scheduler.set_running_for_test(sender);
+        (scheduler, mm)
+    }
+
+    /// A delivery whose default action ends the process retires the
+    /// process's other threads in the delivering turn, as Linux kills them at
+    /// that delivery (`do_group_exit`): their requests are never answered
+    /// again, their exit reports only account them, and turn selection waits
+    /// until every one is in. When the sender's own exit report then comes,
+    /// nothing is left. Without the retirement, the threads parked in futex
+    /// waits outlive the sender's report, and the empty run queue reads as a
+    /// deadlock: Hermit ended a guest's abort with its internal-failure
+    /// status, and no recording.
+    #[test]
+    fn a_fatal_delivery_retires_the_threads_parked_in_futex_waits() {
+        let config = Config::default();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let [leader, parked, sender] = [3, 5, 7].map(DetTid::from_raw);
+        let process = DetPid::from_raw(3);
+
+        // The sender's exit reported first, with nothing committed.
+        let (mut scheduler, mm) = fatal_delivery_scheduler(&config);
+        scheduler.logically_kill_thread(&sender, &process, mm);
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        let report = scheduler
+            .take_terminal_deadlock()
+            .expect("futex waiters that outlive the sender read as a deadlock");
+        assert!(report.contains("waiting on futex"), "{report}");
+
+        let (mut scheduler, mm) = fatal_delivery_scheduler(&config);
+        assert!(scheduler.commit_fatal_delivery(sender));
+        assert_eq!(
+            scheduler.next_turns.keys().copied().collect::<Vec<_>>(),
+            [sender]
+        );
+        assert!(scheduler.blocked.no_futex_waiters());
+        assert!(scheduler.fatal_signal_doomed.contains(&process));
+        for tid in [leader, parked] {
+            assert!(scheduler.is_unaccounted_sigkill_victim(tid), "{tid}");
+        }
+        assert!(scheduler.sigkill_fence_holds());
+        // ptrace reports the leader's exit after its siblings'.
+        for tid in [parked, leader] {
+            assert_eq!(
+                scheduler.route_sigkill_receipt(tid),
+                sigkill_retirement::SigkillReceipt::Committed,
+                "{tid}"
+            );
+        }
+        assert!(!scheduler.sigkill_fence_holds());
+        // The sender's report ends the process; nothing waits.
+        scheduler.logically_kill_thread(&sender, &process, mm);
+        assert!(scheduler.next_turns.is_empty());
+        assert!(scheduler.step2d_handle_empty_queue(&global_time).is_err());
+        assert!(scheduler.take_terminal_deadlock().is_none());
+    }
+
+    /// The thread tree never drops an edge, so a thread id that a thread of
+    /// the dying process once had, and another process now reuses, is still
+    /// listed under the dying process. The delivery retires the dying
+    /// process's own threads only: the reused thread stays registered, is
+    /// no victim, and holds no fence.
+    #[test]
+    fn a_fatal_delivery_does_not_take_a_reused_thread_id_from_another_process() {
+        let config = Config::default();
+        let (mut scheduler, _) = fatal_delivery_scheduler(&config);
+        let [leader, parked, sender] = [3, 5, 7].map(DetTid::from_raw);
+        let reused = DetTid::from_raw(9);
+        let other = DetTid::from_raw(11);
+        scheduler.thread_tree.add_child(leader, reused, false);
+        scheduler.thread_tree.add_child(other, other, true);
+        scheduler.thread_tree.add_child(other, reused, false);
+        for tid in [other, reused] {
+            register_known_thread(&mut scheduler, tid);
+            scheduler.record_thread_mm(tid, MmId::initial(other));
+        }
+        assert!(
+            scheduler
+                .thread_tree
+                .my_thread_group(&DetPid::from_raw(3))
+                .contains(&reused),
+            "the stale edge this test is about must exist"
+        );
+
+        assert!(scheduler.commit_fatal_delivery(sender));
+        for tid in [leader, parked] {
+            assert!(scheduler.is_unaccounted_sigkill_victim(tid), "{tid}");
+        }
+        assert!(scheduler.next_turns.contains_key(&reused));
+        assert!(!scheduler.is_unaccounted_sigkill_victim(reused));
+        for tid in [parked, leader] {
+            scheduler.route_sigkill_receipt(tid);
+        }
+        assert!(!scheduler.sigkill_fence_holds());
+    }
+
+    /// Nothing is retired where Linux does not end the group at the delivery
+    /// (a PID namespace's init, `SIGNAL_UNKILLABLE`; an exec in flight, whose
+    /// `de_thread` kills the others), on a backend that does not retire a
+    /// kill's victims at the kill turn (DBT ends the group with its own
+    /// `Exit` grant), for a sender that does not hold the turn, or, under
+    /// record, beside a thread with a background operation in flight, whose
+    /// recorded result's rejoin must still be consumed.
+    #[test]
+    fn a_fatal_delivery_retires_nothing_where_it_cannot_commit_the_group_end() {
+        let process = DetPid::from_raw(3);
+        let sender = DetTid::from_raw(7);
+        let parked = DetTid::from_raw(5);
+        let plain = Config::default();
+        let dbt = Config::default().with_backend(|backend| {
+            *backend = reverie::BackendCapabilities::DBT;
+        });
+        type Setup = fn(&mut Scheduler);
+        let cases: [(&str, &Config, Setup, bool); 5] = [
+            (
+                "namespace init",
+                &plain,
+                |s| s.thread_tree.mark_pid_namespace_init(DetPid::from_raw(3)),
+                false,
+            ),
+            (
+                "exec in flight",
+                &plain,
+                |s| {
+                    let leader = DetPid::from_raw(3);
+                    s.exec_teardowns.insert(
+                        leader,
+                        ExecTeardown {
+                            caller: leader,
+                            mm: MmId::initial(leader),
+                            siblings: Default::default(),
+                            observed: Default::default(),
+                        },
+                    );
+                },
+                false,
+            ),
+            ("DBT", &dbt, |_| {}, true),
+            ("turn not held", &plain, |s| s.parked.running = None, true),
+            (
+                "background operation under record",
+                &plain,
+                |s| {
+                    let parked = DetTid::from_raw(5);
+                    s.recordreplay_modes = true;
+                    s.blocked
+                        .external_io_blockers
+                        .insert(parked, crate::resources::ExternalOpId::new(parked, 1));
+                },
+                true,
+            ),
+        ];
+        for (case, config, setup, doomed) in cases {
+            let (mut scheduler, _) = fatal_delivery_scheduler(config);
+            setup(&mut scheduler);
+            assert!(!scheduler.commit_fatal_delivery(sender), "{case}");
+            assert_eq!(scheduler.next_turns.len(), 3, "{case}");
+            assert!(!scheduler.is_unaccounted_sigkill_victim(parked), "{case}");
+            assert!(!scheduler.sigkill_fence_holds(), "{case}");
+            assert_eq!(
+                scheduler.fatal_signal_doomed.contains(&process),
+                doomed,
+                "{case}"
+            );
+        }
     }
 
     /// A namespace whose init exited, with its member `child` in `pause(2)`

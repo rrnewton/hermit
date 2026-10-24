@@ -30,6 +30,11 @@
 //!    in state 3 ([`Scheduler::sigkill_fence_holds`]), so the physical death is
 //!    settled before the next guest instruction; host timing decides only how
 //!    long the pause lasts.
+//!
+//! A thread's own delivery of a signal whose default action ends its process
+//! kills the process's other threads the same way, so they are retired as
+//! committed victims in that delivery turn
+//! ([`Scheduler::retire_fatal_delivery_victims`]).
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -278,48 +283,28 @@ impl Scheduler {
             }
             let own = self.registered_process(sender) == Some(*target);
             includes_sender |= own;
-            let mut threads: Vec<DetTid> = self.live_process_threads(*target).collect();
-            if threads.is_empty() {
-                return Err(SigkillRefusal::NoTarget);
-            }
-            // The sender's own thread is not a victim: its send does not
-            // return, and its death is covered as an `exit_group` caller's.
-            threads.retain(|tid| *tid != sender);
-            threads.sort();
-            for tid in threads {
-                if self.sigkill.reserved.contains_key(&tid) {
-                    return Err(SigkillRefusal::AlreadyReserved(tid));
+            match self.kill_victims(sender, *target) {
+                Ok(of_target) => victims.extend(of_target),
+                Err(refusal) => {
+                    match refusal {
+                        // A recording made now could not replay this kill: the
+                        // victim's operation may have a recorded result whose
+                        // rejoin will never be consumed. Replay refuses it
+                        // before starting the guest.
+                        SigkillRefusal::BackgroundOperation(tid) => {
+                            crate::detlog::record_replay_refusal(&format!(
+                                "a SIGKILL victim, thread {tid}, had a background operation in flight during record or replay, so its death is retired at its host-timed deregistration (https://github.com/rrnewton/hermit/issues/3994)"
+                            ))
+                        }
+                        SigkillRefusal::UnknownAddressSpace(tid) => {
+                            crate::detlog::write_loss_notice(&format!(
+                                "a SIGKILL victim, thread {tid}, has no recorded address-space identity, so its death is retired at its host-timed deregistration (https://github.com/rrnewton/hermit/issues/3994)"
+                            ))
+                        }
+                        _ => {}
+                    }
+                    return Err(refusal);
                 }
-                // A vfork parent whose child has not reached a release edge is
-                // still in the kernel's vfork wait: its vfork has not returned,
-                // so no result was or will be recorded for it, and the kill
-                // replays as it recorded.
-                let in_unreturned_vfork = self.vfork_barriers.contains_key(&tid)
-                    && !self.released_vfork_barriers.contains(&tid);
-                if self.recordreplay_modes
-                    && self.blocked.external_io_blockers.contains_key(&tid)
-                    && !in_unreturned_vfork
-                {
-                    // A recording made now could not replay this kill: the
-                    // victim's operation may have a recorded result whose
-                    // rejoin will never be consumed. Replay refuses it before
-                    // starting the guest.
-                    crate::detlog::record_replay_refusal(&format!(
-                        "a SIGKILL victim, thread {tid}, had a background operation in flight during record or replay, so its death is retired at its host-timed deregistration (https://github.com/rrnewton/hermit/issues/3994)"
-                    ));
-                    return Err(SigkillRefusal::BackgroundOperation(tid));
-                }
-                let Some(mm) = self.thread_mm(tid) else {
-                    crate::detlog::write_loss_notice(&format!(
-                        "a SIGKILL victim, thread {tid}, has no recorded address-space identity, so its death is retired at its host-timed deregistration (https://github.com/rrnewton/hermit/issues/3994)"
-                    ));
-                    return Err(SigkillRefusal::UnknownAddressSpace(tid));
-                };
-                victims.push(SigkillVictim {
-                    tid,
-                    process: *target,
-                    mm,
-                });
             }
         }
         let token = self.sigkill.next_token;
@@ -339,6 +324,106 @@ impl Scheduler {
             token,
             includes_sender,
         })
+    }
+
+    /// The live threads of `target` other than `sender` that a kill of
+    /// `target` retires, in tid order, each with the address-space identity
+    /// it registered with. The sender's own thread is never a victim: a
+    /// SIGKILL it sends to its own process does not return, and its death is
+    /// covered as an `exit_group` caller's; at a fatal delivery it leaves at
+    /// its own exit report. A thread that cannot be retired at the committed
+    /// turn refuses the whole kill, which keeps the host-timed path.
+    fn kill_victims(
+        &self,
+        sender: DetTid,
+        target: DetPid,
+    ) -> Result<Vec<SigkillVictim>, SigkillRefusal> {
+        // `live_process_threads`, not the bare thread tree: it names the
+        // threads whose recorded leader is `target`, so a thread id that a
+        // thread of `target` once had and another process now reuses (its
+        // leader is that process) is not retired with `target`.
+        let mut threads: Vec<DetTid> = self.live_process_threads(target).collect();
+        if threads.is_empty() {
+            return Err(SigkillRefusal::NoTarget);
+        }
+        threads.retain(|tid| *tid != sender);
+        let mut victims = Vec::with_capacity(threads.len());
+        for tid in threads {
+            if self.sigkill.reserved.contains_key(&tid) {
+                return Err(SigkillRefusal::AlreadyReserved(tid));
+            }
+            // A vfork parent whose child has not reached a release edge is
+            // still in the kernel's vfork wait: its vfork has not returned, so
+            // no result was or will be recorded for it, and the kill replays
+            // as it recorded.
+            let in_unreturned_vfork = self.vfork_barriers.contains_key(&tid)
+                && !self.released_vfork_barriers.contains(&tid);
+            if self.recordreplay_modes
+                && self.blocked.external_io_blockers.contains_key(&tid)
+                && !in_unreturned_vfork
+            {
+                return Err(SigkillRefusal::BackgroundOperation(tid));
+            }
+            let Some(mm) = self.thread_mm(tid) else {
+                return Err(SigkillRefusal::UnknownAddressSpace(tid));
+            };
+            victims.push(SigkillVictim {
+                tid,
+                process: target,
+                mm,
+            });
+        }
+        Ok(victims)
+    }
+
+    /// Retire, in `sender`'s delivery turn of a signal whose default action
+    /// ends its process, the process's other live threads as committed
+    /// victims (states 2 to 4 above, with no reservation: the kernel kills
+    /// none of them before the delivering thread resumes). Each is retired in
+    /// tid order, its late requests are never answered, its deregistration is
+    /// only accounted, and turn selection waits until every one is accounted.
+    /// The process itself still ends at `sender`'s own exit report, which
+    /// keeps the parent's notification on its existing path. Returns the
+    /// victims; none where the kill would be refused, which keeps the
+    /// host-timed retirement and, when a thread is the reason, names it as a
+    /// determinism loss.
+    pub(crate) fn retire_fatal_delivery_victims(&mut self, sender: DetTid) -> Vec<SigkillVictim> {
+        let Some(process) = self.registered_process(sender) else {
+            return Vec::new();
+        };
+        if !retires_sigkill_at_the_kill_turn(&self.backend) {
+            return Vec::new();
+        }
+        let victims = match self.kill_victims(sender, process) {
+            Ok(victims) => victims,
+            Err(refusal) => {
+                let held = match refusal {
+                    SigkillRefusal::BackgroundOperation(tid) => Some((
+                        tid,
+                        "had a background operation in flight during record or replay",
+                    )),
+                    SigkillRefusal::UnknownAddressSpace(tid) => {
+                        Some((tid, "has no recorded address-space identity"))
+                    }
+                    _ => None,
+                };
+                if let Some((tid, why)) = held {
+                    crate::detlog::write_loss_notice(&format!(
+                        "a fatal signal's delivery ends process {process}, whose thread {tid} {why}, so the process's threads leave at their host-timed exit reports"
+                    ));
+                }
+                return Vec::new();
+            }
+        };
+        for victim in &victims {
+            info!(
+                "[scheduler] retiring dettid {} of process {} at its fatal signal's delivery",
+                victim.tid, victim.process
+            );
+            self.sigkill.unaccounted.insert(victim.tid);
+            self.logically_kill_thread(&victim.tid, &victim.process, victim.mm);
+        }
+        victims
     }
 
     /// Route a consuming receipt of `tid` (its deregistration, after its final

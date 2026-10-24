@@ -4349,13 +4349,11 @@ impl GlobalState {
             GlobalRequest::HandOffTurn => {
                 R::HandOffTurn(self.lock_rpc_scheduler(false).await.hand_off_turn(dtid))
             }
-            GlobalRequest::RecordFatalSignal => {
-                let mut scheduler = self.lock_rpc_scheduler(false).await;
-                if let Some(process) = scheduler.registered_process(dtid) {
-                    scheduler.record_committed_fatal_signal(process);
-                }
-                R::RecordFatalSignal(())
-            }
+            GlobalRequest::CommitFatalDelivery => R::CommitFatalDelivery(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .commit_fatal_delivery(dtid),
+            ),
             GlobalRequest::TouchFile(ino) => R::TouchFile(self.recv_touch_file(from, ino).await),
             GlobalRequest::SetFileMtime(ino, mtime) => {
                 R::SetFileMtime(self.recv_set_file_mtime(from, ino, mtime).await)
@@ -7128,8 +7126,8 @@ pub enum GlobalRequest {
     /// (`Scheduler::hand_off_turn`).
     HandOffTurn,
     /// The calling thread is delivering a signal whose default action ends
-    /// its process (`Scheduler::record_committed_fatal_signal`).
-    RecordFatalSignal,
+    /// its process (`Scheduler::commit_fatal_delivery`).
+    CommitFatalDelivery,
 
     /// Bump mtime
     TouchFile(RawInode),
@@ -7687,7 +7685,8 @@ pub enum GlobalResponse {
     DirectorySnapshotMark(SnapshotMark),
     ReadyChannel(crate::pipe_wake::ReadyOutcome),
     HandOffTurn(bool),
-    RecordFatalSignal(()),
+    /// Whether the process's other threads were retired.
+    CommitFatalDelivery(bool),
     TouchFile(()),
     SetFileMtime(()),
     GlobalTimeLowerBound(LogicalTime),
@@ -9822,14 +9821,20 @@ where
     }
 }
 
-/// Record that the calling thread is delivering a signal whose default action
-/// ends its process (`Scheduler::record_committed_fatal_signal`).
-pub async fn record_fatal_signal<G, T>(guest: &mut G)
+/// Commit that the calling thread is delivering a signal whose default action
+/// ends its process (`Scheduler::commit_fatal_delivery`). Returns whether the
+/// process's other threads were retired.
+pub async fn commit_fatal_delivery<G, T>(guest: &mut G) -> bool
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let _ = send_and_update_time(guest, GlobalRequest::RecordFatalSignal).await;
+    matches!(
+        send_and_update_time(guest, GlobalRequest::CommitFatalDelivery)
+            .await
+            .1,
+        GlobalResponse::CommitFatalDelivery(true)
+    )
 }
 
 /// [`determinize_inode`] for an entry of a directory snapshot taken at

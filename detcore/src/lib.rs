@@ -2005,22 +2005,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             mycount,
             boundary_token,
         } = turn;
-        // Under `--pipe-wake-latency`, a delivery that ends the process
-        // dooms its threads at this committed turn, before their
-        // host-timed removal (`scheduler::pipe_wake`).
-        if self.cfg.pipe_wake_latency_in_effect().is_some()
+        // A delivery that ends the process is committed in this turn
+        // (`Scheduler::commit_fatal_delivery`). Where the kernel's signal
+        // state is the guest's own (ptrace), the dispositions read here are
+        // the ones the kernel acts on, and the process's other threads leave
+        // the scheduler now, as Linux kills them at this delivery, instead of
+        // at their host-timed exit reports. Under `--pipe-wake-latency` the
+        // doom also feeds the hand-off scan (`scheduler::pipe_wake`).
+        let commits_fatal_delivery = self.cfg.pipe_wake_latency_in_effect().is_some()
+            || (self.cfg.sequentialize_threads && self.cfg.backend.kernel_signal_state_is_guests);
+        let retired_the_others = commits_fatal_delivery
             && match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal.raw()) {
                 Some(copied) => crate::syscalls::default_action_ends_process(
                     copied.ignored,
                     copied.caught,
                     signal.raw(),
                 ),
-                None => crate::syscalls::read_kernel_signal_state(guest.pid(), guest.tid())
+                None => crate::syscalls::read_thread_signal_state(guest.pid(), guest.tid())
                     .is_ok_and(|state| state.default_action_ends_process(signal.raw())),
             }
-        {
-            tool_global::record_fatal_signal(guest).await;
-        }
+            && tool_global::commit_fatal_delivery(guest).await;
         // A timer entry's siginfo, with its overrun counted now that the
         // delivery's turn is granted, where the handler's time begins.
         if timer_entry {
@@ -2069,6 +2073,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             "[dtid {}] finish delivering signal (#{}) {}",
             dettid, mycount, signal
         );
+        if retired_the_others {
+            // As an exit_group does after its grant, file nothing more: turn
+            // selection waits for the retired threads' deaths
+            // (`Scheduler::sigkill_fence_holds`), which only this delivery
+            // causes, so a request filed here would never be granted.
+            return Ok(Some(signal));
+        }
         self.record_handler_restore_mask(guest, signal).await;
 
         self.post_handler_hook_observed(guest, CheckIn::Event, boundary_token)
