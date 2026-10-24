@@ -242,6 +242,7 @@ static TIMER_RT_SIGNAL_PENDING_OBSERVED_GUEST: OnceLock<PathBuf> = OnceLock::new
 static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SYSCALL_SLICE_END_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_AFTER_WNOHANG_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGSUSPEND_SHARED_MASK_REWRITE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -2831,6 +2832,37 @@ fn stdio_inode_identity_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "stdio-inode fixture compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// A sleeper's pending timed wait caps a computing worker's chaos slices,
+/// which then end at the prehook of its next write; see
+/// `tests/c/preemption_replay_syscall_slice_end.c`.
+fn syscall_slice_end_guest() -> &'static Path {
+    SYSCALL_SLICE_END_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("syscall-slice-end");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create syscall-slice-end build directory");
+        let guest = build_root.join("preemption_replay_syscall_slice_end");
+        let output = Command::new("cc")
+            .args([
+                "-O0", "-g", "-pthread", "-std=c11", "-Wall", "-Wextra", "-Werror",
+            ])
+            .arg(repository.join("tests/c/preemption_replay_syscall_slice_end.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the syscall-slice-end guest");
+        assert!(
+            output.status.success(),
+            "syscall-slice-end guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -17102,6 +17134,93 @@ fn run_chaos_preemption_replay_reuses_the_recorded_epoch() {
             .count(),
         8
     );
+}
+
+/// A preemption replay ends each slice at the callback its record says ended
+/// it.
+///
+/// Under `--chaos` a pending timed wait of the sleeper caps the worker's
+/// slices, and a capped end is observed only at the worker's next syscall, so
+/// those slices end at the prehook of the syscall after the cap. The prehook
+/// shares its RCB count and its logical time with a PMU stop after the
+/// worker's last branch before the syscall. A replay that armed an exact PMU
+/// stop on that count ended the slice at the stop instead: the re-recorded
+/// callback checkpoints named the PMU timer where the record named the
+/// syscall, and the extra scheduler turn moved the virtual clock the guest
+/// prints last. The replay re-records its own record here, checkpoints
+/// included.
+///
+/// PMU SUBJECT: the exact stop needs the PMU's retired-branch counter. test.cli
+/// and test.cli_on_host skip it by exact name; privileged-test.pmu_cli_cases
+/// runs it after privileged-pmu.preemption has shown the PMU works.
+#[test]
+fn run_chaos_preemption_replay_ends_syscall_slices_where_the_record_did() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let record = directory.path().join("recorded.json");
+    let rerecord = directory.path().join("replayed.json");
+    let guest = syscall_slice_end_guest().to_str().unwrap();
+    let record_arg = format!("--record-preemptions-to={}", record.display());
+    let replay_arg = format!("--replay-preemptions-from={}", record.display());
+    let rerecord_arg = format!("--record-preemptions-to={}", rerecord.display());
+    let common = [
+        "run",
+        "--base-env=minimal",
+        "--chaos",
+        "--seed=2",
+        "--epoch=2026-01-01T00:00:00Z",
+    ];
+    let recording_args: Vec<&str> = common
+        .iter()
+        .copied()
+        .chain([record_arg.as_str(), "--", guest])
+        .collect();
+    let recorded = hermit_test::hermit_output(
+        "chaos preemption record",
+        hermit_command(&recording_args)
+            .env_remove("HERMIT_EPOCH")
+            .stdin(Stdio::null()),
+    );
+    assert_success(&recorded, &recording_args);
+    let replay_args: Vec<&str> = common
+        .iter()
+        .copied()
+        .chain([replay_arg.as_str(), rerecord_arg.as_str(), "--", guest])
+        .collect();
+    let replayed = hermit_test::hermit_output(
+        "chaos preemption replay",
+        hermit_command(&replay_args)
+            .env_remove("HERMIT_EPOCH")
+            .stdin(Stdio::null()),
+    );
+    assert_success(&replayed, &replay_args);
+    assert_eq!(stdout(&replayed), stdout(&recorded));
+
+    let read = |path: &Path| -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    };
+    let (recorded, replayed) = (read(&record), read(&rerecord));
+    let syscall_prehooks = recorded["callback_checkpoints"]
+        .as_object()
+        .into_iter()
+        .flat_map(|threads| threads.values())
+        .flat_map(|checkpoints| checkpoints.as_array().unwrap())
+        .filter(|checkpoint| {
+            checkpoint["origin"]["site"] == "Prehook"
+                && checkpoint["origin"]["callback"].get("Syscall").is_some()
+        })
+        .count();
+    assert!(
+        syscall_prehooks > 0,
+        "the recording has no slice that a syscall's prehook ended, so this \
+         case cannot reach the shared branch count: {recorded}"
+    );
+    assert_eq!(
+        replayed["callback_checkpoints"], recorded["callback_checkpoints"],
+        "the replay ended a slice at another callback than the record"
+    );
+    assert_eq!(replayed["per_thread"], recorded["per_thread"]);
+    assert_eq!(replayed["global"], recorded["global"]);
 }
 
 #[test]

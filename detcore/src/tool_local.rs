@@ -47,6 +47,7 @@ use crate::config::Config;
 use crate::detlog;
 use crate::fd::*;
 use crate::memory::MemoryMetadata;
+use crate::preemptions::RecordedSliceEnd;
 use crate::preemptions::ThreadHistoryIterator;
 use crate::record_or_replay::NoopTool;
 use crate::record_or_replay::RecordOrReplay;
@@ -4785,6 +4786,12 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub replay_rcb_end: Option<u64>,
 
+    /// Whether the recorded slice the active preemption-replay slice follows
+    /// ended at a check-in ([`RecordedSliceEnd::at_check_in`]), so that it ends
+    /// at one, never at a PMU stop.
+    #[serde(default)]
+    pub replay_ends_at_check_in: bool,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     /// Deterministic chaos epoch this thread was in at its last `next_timeslice`.
@@ -4892,6 +4899,7 @@ impl<T> std::fmt::Debug for ThreadState<T> {
             .field("committed_clock_value", &self.committed_clock_value)
             .field("end_of_timeslice", &self.end_of_timeslice)
             .field("replay_rcb_end", &self.replay_rcb_end)
+            .field("replay_ends_at_check_in", &self.replay_ends_at_check_in)
             .field("chaos_epoch", &self.chaos_epoch)
             .field("chaos_slowdown_factor", &self.chaos_slowdown_factor)
             .field("chaos_slowdown_active", &self.chaos_slowdown_active)
@@ -5515,6 +5523,7 @@ impl<T> ThreadState<T> {
             scheduler_grants: 0,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
+            replay_ends_at_check_in: false,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1151)
             chaos_epoch: chaos_epoch_sentinel(),
@@ -6680,10 +6689,14 @@ impl<T> ThreadState<T> {
     /// its branch count with every check-in since the thread's last branch (no
     /// branch runs between two syscalls, or between a branch-exact timer stop
     /// and the next syscall), and only the logical time, which a syscall
-    /// advances by far more than one RCB, tells which of them it was. The one
-    /// RCB of slack keeps a PMU check-in that lands a little short of the
-    /// recorded time ending its slice at the exact count. Past the recorded
-    /// count the slice has ended whatever the time says.
+    /// advances by far more than one RCB, tells which of them it was. The time
+    /// does not tell a syscall's prehook from a PMU stop after the last branch
+    /// before it, so a slice the record says ended at a check-in is never
+    /// given an exact stop on its count
+    /// (`replay_slice_can_end_on_a_branch`). The one RCB of slack keeps a PMU
+    /// check-in that lands a little short of the recorded time ending its
+    /// slice at the exact count. Past the recorded count the slice has ended
+    /// whatever the time says.
     pub(crate) fn timeslice_expired(&self) -> bool {
         let current_time = self.thread_logical_time.as_nanos();
         if let Some(replay_rcb_end) = self.replay_rcb_end {
@@ -6709,7 +6722,18 @@ impl<T> ThreadState<T> {
     /// syscall-heavy guest's slices that ended at syscalls several times slower
     /// than recording it. Outside replay, and once the count is passed, there
     /// is no recorded count to stop on.
+    ///
+    /// A slice the record says ended at a check-in (`replay_ends_at_check_in`)
+    /// never ends on a branch either, even when the time agrees. A syscall's
+    /// prehook shares the branch count and the logical time of the last
+    /// branch before it, so an exact stop there lands on the instructions
+    /// between that branch and the syscall, and ended the slice at that stop,
+    /// a check-in the recording did not have: the extra scheduler turn moved
+    /// the virtual time every later turn reads.
     pub(crate) fn replay_slice_can_end_on_a_branch(&self, use_rcb_time: bool) -> bool {
+        if self.replay_ends_at_check_in {
+            return false;
+        }
         let (Some(target), Some(end)) = (self.replay_rcb_end, self.end_of_timeslice) else {
             return false;
         };
@@ -6844,6 +6868,7 @@ impl<T> ThreadState<T> {
 
             let mut result = None;
             self.replay_rcb_end = None;
+            self.replay_ends_at_check_in = false;
             let replay_controls_deadline =
                 self.preemption_points.is_some() || cfg.replay_schedule_from.is_some();
 
@@ -6851,7 +6876,13 @@ impl<T> ThreadState<T> {
             if let Some(thi) = &mut self.preemption_points {
                 if self.stats.last_recorded_slice.is_none() {
                     // We have not tapped out the recording yet.
-                    if let Some((end_time, prio, replay_rcb_end)) = thi.next_with_rcbs() {
+                    if let Some(RecordedSliceEnd {
+                        time: end_time,
+                        priority: prio,
+                        rcbs: replay_rcb_end,
+                        at_check_in,
+                    }) = thi.next_slice_end()
+                    {
                         debug!(
                             "[dtid {}] next timeslice (T{}), set by recording to {:?} (current {}), priority {}",
                             self.dettid,
@@ -6888,6 +6919,7 @@ impl<T> ThreadState<T> {
                         }
                         self.end_of_timeslice = Some(end_time);
                         self.replay_rcb_end = replay_rcb_end;
+                        self.replay_ends_at_check_in = at_check_in;
                         result = Some(prio);
                     } else {
                         let max = LogicalTime::MAX;
@@ -7027,6 +7059,7 @@ impl<T> ThreadState<T> {
         } else {
             self.end_of_timeslice = None;
             self.replay_rcb_end = None;
+            self.replay_ends_at_check_in = false;
             self.max_timeslice_end = None;
             self.last_rcb_timer = None;
             self.last_rcb_timer_is_max = false;
@@ -7071,6 +7104,7 @@ mod timeslice_tests {
     use super::*;
     use crate::DEFAULT_PRIORITY;
     use crate::preemptions::ThreadHistory;
+    use crate::slice_boundary::callbacks::Callback;
 
     /// Once an exit_group is filed on DBT (`OwnerDeathPath::Barrier`), an
     /// exiting thread's head stays registered for the exit_group's walk, but
@@ -8115,6 +8149,51 @@ mod timeslice_tests {
         let mut live = ThreadState::new(DetPid::from_raw(3), &config, ());
         live.next_timeslice(&config);
         assert!(!live.replay_slice_can_end_on_a_branch(true));
+    }
+
+    /// A syscall's prehook shares its branch count and its logical time with
+    /// a PMU stop after the last branch before the syscall. A slice the record
+    /// says the prehook ended therefore gets no exact stop on its count, and
+    /// still ends at the prehook's check-in; one the PMU timer ended keeps its
+    /// exact stop.
+    #[test]
+    fn a_replayed_slice_a_check_in_ended_gets_no_exact_stop() {
+        let config = Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            ..Default::default()
+        };
+        let state_with = |callback: Callback| {
+            let mut state = ThreadState::new(DetPid::from_raw(3), &config, ());
+            // 100 RCBs are 1,000ns: the branches alone reach the recorded end.
+            let end = state.thread_logical_time.as_nanos() + Duration::from_nanos(1_000);
+            let checkpoint = crate::preemptions::callback_history::Checkpoint {
+                history_index: 0,
+                origin: crate::preemptions::callback_history::Origin {
+                    callback,
+                    site: crate::preemptions::callback_history::Site::Prehook,
+                    progress: 0,
+                    last_op: None,
+                    time: end,
+                    rcbs: 100,
+                },
+            };
+            state.preemption_points = Some(
+                ThreadHistory::new()
+                    .with_prio_changes(vec![(end, DEFAULT_PRIORITY)])
+                    .with_preemption_rcbs(vec![100])
+                    .into_iter()
+                    .with_callback_checkpoints(&[checkpoint]),
+            );
+            state.next_timeslice(&config);
+            state
+        };
+        let mut at_prehook = state_with(Callback::Syscall(Sysno::write));
+        assert!(!at_prehook.replay_slice_can_end_on_a_branch(true));
+        at_prehook.thread_logical_time.add_rcbs(100);
+        at_prehook.committed_clock_value = 100;
+        assert!(at_prehook.timeslice_expired(), "the prehook's check-in");
+        assert!(state_with(Callback::PmuTimer).replay_slice_can_end_on_a_branch(true));
     }
 
     /// Past its recorded branch count a replayed slice has ended, whatever the

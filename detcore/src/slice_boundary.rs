@@ -372,6 +372,7 @@ pub(crate) fn adopt_owner<T>(
     thread.slice_boundary = Some(candidate);
     // A previous image's precise target cannot govern the replacement image.
     thread.replay_rcb_end = None;
+    thread.replay_ends_at_check_in = false;
     Ok(())
 }
 
