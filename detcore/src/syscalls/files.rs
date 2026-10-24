@@ -804,6 +804,68 @@ fn is_inherited_container_output(resource: Option<ResourceID>) -> bool {
     )
 }
 
+/// The one-time notice for a guest's bind of the abstract `AF_UNIX` name
+/// `name` (without its leading NUL) in a `--network=host` run
+/// ([`Config::notice_host_network_abstract_binds`]): `in_use` when the bind
+/// failed with `EADDRINUSE`.
+fn host_network_abstract_bind_notice(name: &[u8], in_use: bool) -> String {
+    let what = if in_use {
+        "the guest's bind of the abstract unix socket"
+    } else {
+        "the guest bound the abstract unix socket"
+    };
+    let outcome = if in_use {
+        " failed with EADDRINUSE: another program on the host, possibly a concurrent Hermit run, \
+         holds that name"
+    } else {
+        ""
+    };
+    format!(
+        "hermit: NOTICE: {what} \"@{name}\" under --network=host{outcome}. Abstract names \
+         belong to the network namespace, here the host's, and every Hermit run reuses the same \
+         pids and autobind names, so concurrent runs that bind the same name collide with \
+         EADDRINUSE. --network=local (the default) gives each run its own names. (Shown once \
+         per run.)",
+        name = name.escape_ascii()
+    )
+}
+
+/// Print [`host_network_abstract_bind_notice`] for a bind of `name` that
+/// returned `result`, on Hermit's own standard error, the first time this
+/// process sees one that succeeded or failed with `EADDRINUSE`. Any other
+/// failure is the guest's own mistake and prints nothing. Only set where
+/// Detcore runs in Hermit's process, so the guest never sees the line;
+/// Hermit's diagnostics share the container's output, whose offset the guest
+/// is never shown ([`is_inherited_container_output`]).
+fn notice_host_network_abstract_bind(name: &[u8], result: &Result<i64, Errno>) {
+    static NOTICED: AtomicBool = AtomicBool::new(false);
+    let in_use = match result {
+        Ok(_) => false,
+        Err(Errno::EADDRINUSE) => true,
+        Err(_) => return,
+    };
+    if !NOTICED.swap(true, Ordering::Relaxed) {
+        use std::io::Write as _;
+        let _ = writeln!(
+            crate::util::RetryingStderr,
+            "{}",
+            host_network_abstract_bind_notice(name, in_use)
+        );
+    }
+}
+
+/// The name, without its leading NUL, of the abstract `AF_UNIX` address
+/// `bytes` holds: the first `addrlen` bytes of a `sockaddr_un`. `None` for a
+/// path name, a bare family (an autobind), or an address too short to hold a
+/// name.
+fn abstract_unix_name(bytes: &[u8]) -> Option<&[u8]> {
+    let path = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    match bytes.get(path..)? {
+        [0, name @ ..] => Some(name),
+        _ => None,
+    }
+}
+
 fn unix_autobind_addrlen() -> i32 {
     (std::mem::offset_of!(libc::sockaddr_un, sun_path) + UNIX_AUTOBIND_NAME_LEN) as i32
 }
@@ -12381,6 +12443,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_detfd(sock_fd, |detfd| detfd.open_file_id())?;
 
         let sockaddr_family = guest.memory().read_value(addr.cast::<u16>())?;
+        // The abstract name to notice once the bind returns. Read only to word
+        // the notice: the bind itself is unchanged, and an unreadable address
+        // is left to fail as Linux fails it.
+        let notice_abstract_name = if sockaddr_family == libc::AF_UNIX as u16
+            && guest.config().notice_host_network_abstract_binds
+        {
+            let mut bytes = [0u8; std::mem::size_of::<libc::sockaddr_un>()];
+            let length = usize::try_from(call.addrlen())
+                .unwrap_or(0)
+                .min(bytes.len());
+            guest
+                .memory()
+                .read_exact(addr.cast::<u8>(), &mut bytes[..length])
+                .ok()
+                .and_then(|_| abstract_unix_name(&bytes[..length]).map(<[u8]>::to_vec))
+        } else {
+            None
+        };
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-872): Review deterministic AF_UNIX autobind identity.
         if sockaddr_family == libc::AF_UNIX as u16
@@ -12395,16 +12475,25 @@ impl<T: RecordOrReplay> Detcore<T> {
                 _ => unreachable!(),
             };
 
+            let autobind_address = unix_autobind_address(port);
             let mut stack = guest.stack().await;
             let autobind_addr: AddrMut<libc::sockaddr_un> = stack.reserve();
             let _stack_guard = stack.commit()?;
             guest
                 .memory()
-                .write_value(autobind_addr, &unix_autobind_address(port))?;
+                .write_value(autobind_addr, &autobind_address)?;
             let deterministic_bind = call
                 .with_umyaddr(Some(autobind_addr.cast()))
                 .with_addrlen(unix_autobind_addrlen());
-            return Ok(self.record_or_replay(guest, deterministic_bind).await?);
+            let result = self.record_or_replay(guest, deterministic_bind).await;
+            if guest.config().notice_host_network_abstract_binds {
+                let mut name = [0u8; UNIX_AUTOBIND_NAME_LEN - 1];
+                for (byte, source) in name.iter_mut().zip(&autobind_address.sun_path[1..]) {
+                    *byte = *source as u8;
+                }
+                notice_host_network_abstract_bind(&name, &result);
+            }
+            return Ok(result?);
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-880): Review deterministic Netlink autobind identities.
         } else if sockaddr_family == libc::AF_NETLINK as u16
@@ -12517,9 +12606,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
         }
-        let res = self.record_or_replay(guest, call).await?;
+        let res = self.record_or_replay(guest, call).await;
+        if let Some(name) = &notice_abstract_name {
+            notice_host_network_abstract_bind(name, &res);
+        }
 
-        Ok(res)
+        Ok(res?)
     }
 
     /// Create and register an event notification counter.
@@ -16313,8 +16405,10 @@ mod test {
     use super::Errno;
     use super::TimerSlackBinding;
     use super::UNIX_AUTOBIND_NAME_LEN;
+    use super::abstract_unix_name;
     use super::canonicalize_tcp_info;
     use super::classify_timer_slack_binding;
+    use super::host_network_abstract_bind_notice;
     use super::is_inherited_container_output;
     use super::parse_timer_slack_write;
     use super::pipe_capacity_failure;
@@ -16561,6 +16655,40 @@ mod test {
             Device::ContainerStdin
         ))));
         assert!(!is_inherited_container_output(None));
+    }
+
+    #[test]
+    fn host_network_notice_names_only_abstract_unix_addresses() {
+        let path = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+        let family = (libc::AF_UNIX as u16).to_ne_bytes();
+        let address = |sun_path: &[u8]| [&family[..], sun_path].concat();
+        assert_eq!(
+            abstract_unix_name(&address(b"\0myapp:3")),
+            Some(&b"myapp:3"[..])
+        );
+        // A leading NUL alone is an abstract name of length zero.
+        assert_eq!(abstract_unix_name(&address(b"\0")), Some(&b""[..]));
+        // A path name, and a bare family (an autobind, which Hermit names
+        // itself), are not.
+        assert_eq!(abstract_unix_name(&address(b"/tmp/socket")), None);
+        assert_eq!(abstract_unix_name(&family), None);
+        assert_eq!(address(b"").len(), path);
+
+        let bound = host_network_abstract_bind_notice(b"x\0y\"z", false);
+        assert!(
+            bound.starts_with("hermit: NOTICE: the guest bound "),
+            "{bound}"
+        );
+        assert!(
+            bound.contains("\"@x\\x00y\\\"z\" under --network=host."),
+            "{bound}"
+        );
+        assert!(bound.contains("--network=local"), "{bound}");
+        let in_use = host_network_abstract_bind_notice(b"myapp:3", true);
+        assert!(
+            in_use.contains("\"@myapp:3\" under --network=host failed with EADDRINUSE"),
+            "{in_use}"
+        );
     }
 
     #[test]

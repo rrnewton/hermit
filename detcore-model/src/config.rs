@@ -418,6 +418,14 @@ pub struct Config {
     /// The stable default here is for library callers and wire-format fixtures;
     /// the `hermit run` and `hermit oci run` commands replace an omitted CLI
     /// default with one host wall-clock sample taken before backend dispatch.
+    ///
+    /// A guest that checks TLS certificates over the host network (`--network=host` or
+    /// `--record-networking`) checks them against this clock, so an epoch outside a server
+    /// certificate's validity fails the HTTPS connections to that server: curl exits 60 with "SSL
+    /// certificate problem: certificate is not yet valid" (or "certificate has expired"), and a
+    /// libcurl caller sees "SSL peer certificate or SSH remote key was not OK". For such a run omit
+    /// `--epoch`: `hermit run` then starts the clock at the current time and saves it in the run's
+    /// manifest, and `hermit run --from last-run` repeats the run with that epoch.
     #[clap(
         long,
         env = "HERMIT_EPOCH",
@@ -793,6 +801,17 @@ pub struct Config {
     // FIXME: This can be removed once spawn_fn-based tests support namespaces.
     #[clap(skip)]
     pub has_uts_namespace: bool,
+
+    /// **Internal:** Print a one-time notice on Hermit's standard error when the guest binds an
+    /// abstract `AF_UNIX` name, or fails to with `EADDRINUSE`. `hermit run` sets it for a run that
+    /// asked for `--network=host` on the ptrace backend: the guest then shares the host's network
+    /// namespace, and with it the abstract names of every program on the host, other Hermit runs
+    /// included, and Detcore runs in Hermit's own process, so the notice reaches Hermit's stderr
+    /// and never the guest's. Nothing the guest observes depends on it. The DBT backend's runtime
+    /// reads the frozen legacy form ([`to_legacy_backend_json`]), which leaves this field out.
+    #[serde(default)]
+    #[clap(skip)]
+    pub notice_host_network_abstract_binds: bool,
 
     /// **Internal:** Path to the replay data folder.
     #[clap(skip)]
@@ -2364,7 +2383,9 @@ impl Default for Config {
 /// DBT (it is set only for in-guest runs), which reads back as empty, and
 /// [`Config::in_guest_refuses_host_timed_producers`] and
 /// [`Config::in_guest_signal_delivery`], false for DBT, which read back as
-/// false. Every
+/// false. So is [`Config::notice_host_network_abstract_binds`], added after this form
+/// froze, which reads back as false: DBT's runtime then prints no notice for
+/// an abstract `AF_UNIX` bind. Every
 /// other field is serialized exactly as `serde_json::to_string(config)`
 /// serializes it.
 ///
@@ -2896,7 +2917,10 @@ mod legacy_backend_json {
     /// backend that reads the legacy form: priority replay needs a preemption
     /// timer, which none of them delivers, so it is never written and reads
     /// as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 28] = [
+    /// `notice_host_network_abstract_binds` came after it too. It is never written and
+    /// reads as false, so the DBT runtime prints no notice for an abstract
+    /// `AF_UNIX` bind under host networking.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 29] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -2925,6 +2949,7 @@ mod legacy_backend_json {
         "signal_at",
         "in_guest_signal_delivery",
         "annotated_priority_replay",
+        "notice_host_network_abstract_binds",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3065,7 +3090,8 @@ mod legacy_backend_json {
                     | "futex_wake_yields"
                     | "replaying"
                     | "signal_delivery_check_fatal"
-                    | "container_procfs",
+                    | "container_procfs"
+                    | "notice_host_network_abstract_binds",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is.
                 Some("in_guest_reserved_signals") => {
@@ -3375,7 +3401,8 @@ mod legacy_backend_json {
                 | "work_span_report"
                 | "signal_at"
                 | "in_guest_signal_delivery"
-                | "annotated_priority_replay" => Ok(()),
+                | "annotated_priority_replay"
+                | "notice_host_network_abstract_binds" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -4106,7 +4133,8 @@ mod tests {
                 | "work_span_report"
                 | "signal_at"
                 | "in_guest_signal_delivery"
-                | "annotated_priority_replay" => {}
+                | "annotated_priority_replay"
+                | "notice_host_network_abstract_binds" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -4117,21 +4145,21 @@ mod tests {
             .collect();
         assert_eq!(keys, expected);
         // `backend` becomes fifteen keys; `record_host_inputs`,
-        // `guest_may_inherit_a_terminal`,
-        // `in_guest_detlog_forward_policy`, `in_guest_site_patching_off`,
-        // `in_guest_reserved_signals`, `in_guest_refuses_host_timed_producers`,
-        // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
+        // `guest_may_inherit_a_terminal`, `in_guest_detlog_forward_policy`,
+        // `in_guest_site_patching_off`, `in_guest_reserved_signals`,
+        // `in_guest_refuses_host_timed_producers`, `launch_image`,
+        // `target_timeslice_syscalls_only`, `futex_wake_yields`,
         // `pipe_wake_latency`, `replaying`, `scheduler_turn_cost`,
-        // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`, `cpu_profile_source`,
-        // `signal_state_copy`, `container_mount_table`,
+        // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`,
+        // `cpu_profile_source`, `signal_state_copy`, `container_mount_table`,
         // `mountinfo_mount_namespace`, `directory_placeholder`,
         // `container_procfs`, `signal_delivery_check_fatal`,
         // `work_span_report`, `signal_at`, `in_guest_signal_delivery`,
-        // `annotated_priority_replay` and `strict_schedule_boundaries` none:
-        // fourteen more keys and twenty-seven fewer, so thirteen keys fewer
-        // than fields.
+        // `annotated_priority_replay`, `notice_host_network_abstract_binds` and
+        // `strict_schedule_boundaries` none: fourteen more keys and
+        // twenty-eight fewer, so fourteen keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 13);
+        assert_eq!(fields.len(), keys.len() + 14);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -4772,6 +4800,62 @@ mod tests {
                 bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
             assert_eq!(read, wire.len());
             assert_eq!(decoded.signal_at, signal_at);
+        }
+    }
+
+    /// `notice_host_network_abstract_binds` came after the legacy form froze, so it never
+    /// enters it, and both the object and the array form read it back as
+    /// false.
+    #[test]
+    fn notice_host_network_abstract_binds_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            notice_host_network_abstract_binds: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(
+            !json.contains("notice_host_network_abstract_binds"),
+            "{json}"
+        );
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .notice_host_network_abstract_binds
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .notice_host_network_abstract_binds
+        );
+    }
+
+    /// `Config` crosses Reverie RPC as positional legacy bincode, so
+    /// `notice_host_network_abstract_binds` is encoded whether set or not.
+    #[test]
+    fn notice_host_network_abstract_binds_round_trips_through_reverie_bincode() {
+        for notice_host_network_abstract_binds in [false, true] {
+            let config = Config {
+                notice_host_network_abstract_binds,
+                ..Config::default()
+            };
+            let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(
+                decoded.notice_host_network_abstract_binds,
+                notice_host_network_abstract_binds
+            );
         }
     }
 

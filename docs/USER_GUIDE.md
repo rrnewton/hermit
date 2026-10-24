@@ -745,7 +745,7 @@ the default equal-priority policy.
 | --- | --- |
 | `--seed=N` | Sets the fallback random seed. |
 | `--rng-seed=N` | Sets only guest random-data generation. |
-| `--epoch=TIMESTAMP` | Sets the virtual clock's RFC 3339 starting time. When omitted, `hermit run` and `hermit oci run` capture the host wall clock once at invocation start, print the resolved value, and use it as an immutable input for the whole run (including both `--verify` executions). Bypass modes such as `--namespace-only` and `--strace-only` neither capture nor report a virtual epoch. Pass a printed value explicitly to reproduce the same virtual-time trajectory. |
+| `--epoch=TIMESTAMP` | Sets the virtual clock's RFC 3339 starting time. When omitted, `hermit run` and `hermit oci run` capture the host wall clock once at invocation start, print the resolved value, and use it as an immutable input for the whole run (including both `--verify` executions). Bypass modes such as `--namespace-only` and `--strace-only` neither capture nor report a virtual epoch. Pass a printed value explicitly to reproduce the same virtual-time trajectory. A guest that checks TLS certificates over the host network (`--network=host` or `--record-networking`) checks them against this clock, so an epoch outside a server certificate's validity fails the HTTPS connections to that server (curl exits 60 with "SSL certificate problem: certificate is not yet valid" or "certificate has expired"; a libcurl caller sees "SSL peer certificate or SSH remote key was not OK"). For those runs omit `--epoch`: the run then starts the clock at the current time and saves it in its manifest, and `hermit run --from last-run` repeats it with that epoch. |
 | `--clock-multiplier=F` | Changes the rate of virtual time. |
 | `--no-virtualize-time` | Uses host time; also requires `--no-virtualize-metadata`. |
 | `--no-virtualize-cpuid` | Exposes host CPUID behavior. |
@@ -906,9 +906,30 @@ runtime mappings absent from the supplied ownership facts.
 
 Network modes are:
 
-- `--network=local` (default): isolated loopback networking.
+- `--network=local` (default): isolated loopback networking. Each run has its
+  own network namespace, so its ports and abstract unix socket names are its
+  own.
 - `--network=host`: host networking. External responses and port state become
-  nondeterministic inputs.
+  nondeterministic inputs, and the guest shares the host's ports and abstract
+  unix socket names with every other program, other Hermit runs included.
+
+Prefer `--network=local` unless the guest must reach the host's network. An
+abstract unix socket name (`@name`, a `sun_path` that starts with a NUL byte)
+belongs to the network namespace, not the file system. Every Hermit guest's
+first process is pid 3, and Hermit picks autobind names (`@` and five hex
+digits) the same way in every run. So two concurrent `--network=host` runs
+whose guests bind the same abstract name, for instance one built from the pid,
+collide: the second bind fails with `EADDRINUSE`, although natively each
+process would have used its own name. On the ptrace backend, when a
+`--network=host` guest binds an abstract name, or fails to with `EADDRINUSE`,
+Hermit prints one notice per run on stderr:
+
+```text
+hermit: NOTICE: the guest bound the abstract unix socket "@myapp:3" under --network=host. Abstract names belong to the network namespace, ...
+```
+
+The bind itself is unchanged. Run such guests with `--network=local`, or one at
+a time when they need the host's network.
 
 `hermit run --gdbserver` serves the guest to one gdb client and waits for it
 before the guest runs. Attach from another terminal with
