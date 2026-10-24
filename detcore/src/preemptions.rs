@@ -681,6 +681,13 @@ impl ThreadHistoryIterator {
             )
         })
     }
+
+    /// How many recorded rows have been installed as slice ends. The row the
+    /// current slice ends is the last of them: `next_with_rcbs` advances past
+    /// a row as it installs it, before that row's priority request is filed.
+    pub fn installed_rows(&self) -> usize {
+        self.ix
+    }
 }
 
 impl Iterator for ThreadHistoryIterator {
@@ -1594,6 +1601,43 @@ pub fn read_recorded_signal_state_copy(path: &Path) -> Result<Option<bool>, Stri
         signal_state_copy: Option<bool>,
     }
     Ok(boundary_recording::read_settings::<CopyOnly>(path)?.signal_state_copy)
+}
+
+/// Read only whether a preemption record file carries callback checkpoints
+/// (`Config::annotated_priority_replay`), as [`read_recorded_epoch`] reads
+/// the epoch. A record without the field, older or made without chaos
+/// recording, carries none. Detcore validates the whole record, checkpoints
+/// included, when it loads it for the run.
+pub fn read_recorded_callback_checkpoints(path: &Path) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct CheckpointsOnly {
+        #[serde(default)]
+        callback_checkpoints: BTreeMap<String, Vec<serde_json::Value>>,
+    }
+    Ok(boundary_recording::read_settings::<CheckpointsOnly>(path)?
+        .callback_checkpoints
+        .values()
+        .any(|points| !points.is_empty()))
+}
+
+/// Detcore's own refusal of a run prepared to replay a callback-annotated
+/// priority history (`Config::annotated_priority_replay`) on an effective
+/// configuration that cannot honor its row ends
+/// (`Config::annotated_priority_replay_unqualified`), checked before the
+/// scheduler or any history exists. Hosts refuse earlier, by name; this
+/// backstop holds for every configuration that reaches Detcore, whoever
+/// prepared it. `None` for an unannotated run or a qualified one.
+pub fn annotated_replay_mode_refusal(cfg: &crate::Config) -> Option<String> {
+    if !cfg.annotated_priority_replay {
+        return None;
+    }
+    cfg.annotated_priority_replay_unqualified().map(|setting| {
+        format!(
+            "HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE: the run was prepared to replay a \
+             callback-annotated priority history, but its configuration {setting}; no thread \
+             has started"
+        )
+    })
 }
 
 /// The refusal of a replay whose signal-state copy setting differs from the
