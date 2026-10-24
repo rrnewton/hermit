@@ -1543,9 +1543,12 @@ pub struct RunOpts {
     /// for every seed. Chaos ends each timeslice after a random number of retired conditional
     /// branches whose mean is the maximum timeslice; a race whose window is a few branches long
     /// needs a mean of about a hundred branches, and a race whose other thread must first run far
-    /// needs a mean that lets it get there. Each seed draws its maximum log-uniformly from 1000 to
-    /// 200000000 virtual nanoseconds (the `--max-timeslice` default; raised to one RCB where
-    /// `--clock-multiplier` makes that longer), so a sweep over seeds tries every scale. A seed
+    /// needs a mean that lets it get there. Two in five seeds draw their maximum from 1000 to 2000
+    /// virtual nanoseconds (slices of about 100 to 200 branches), two in five from 1000000 to
+    /// 200000000 (the `--max-timeslice` default), and one in five from the decades between, each
+    /// log-uniformly within its range (raised to one RCB where `--clock-multiplier` makes that
+    /// longer), so a sweep over seeds tries every scale and most often the two that races have
+    /// needed. A seed
     /// (`--sched-seed`, else `--seed`) always draws the same value, and the run is the run with
     /// that value given as `--max-timeslice`, except that the guest can read Hermit's own command
     /// line as PID 1's. Hermit prints the drawn value on stderr, and `--summary` reports it. The
