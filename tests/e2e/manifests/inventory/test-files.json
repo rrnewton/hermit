@@ -1951,10 +1951,16 @@
       "why": "tests/c/random_device_host_no_rdrand.cpp is owned by hermit-cli/tests/cli.rs: cpu_profile_host_no_rdrand_random_device_has_bitwise_parity requires sixteen std::random_device samples and nonempty INFO events to repeat under --cpu-profile host-no-rdrand, or the named host-qualification refusal. It stays a fixture because the CLI test asserts the exact sample format and strict comparison result (https://github.com/rrnewton/hermit/issues/4534)."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/random_device_independent_opens.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/random_device_independent_opens.c is owned by hermit-cli/tests/cli.rs: separate_random_device_opens_read_distinct_bytes_at_bitwise_parity requires two threads' /dev/urandom draws to elect one leader over an AF_UNIX socket and a thread's two opens and a fork's parent and child opens to read distinct bytes, with bitwise strict --verify parity. It stays a fixture because the CLI test asserts the exact check lines and the strict comparison result."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/random_device_spellings.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
-      "why": "tests/c/random_device_spellings.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Reads /dev/urandom through every spelling a guest can use and checks each open reads Hermit's stream from its start, on every backend, as Detcore classifies random devices by device number"
+      "why": "tests/c/random_device_spellings.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Reads /dev/urandom through every spelling a guest can use and checks each open reads a canonical Hermit stream of its own, on every backend, as Detcore classifies random devices by device number"
     },
     {
       "disposition": "manifest-test",

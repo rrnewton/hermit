@@ -5137,9 +5137,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .await
                     {
                         Ok(true) => {
-                            guest
-                                .thread_state()
-                                .with_detfd(fd, |detfd| detfd.set_type(FdType::Rng))?;
+                            guest.thread_state().classify_random_device(fd)?;
                             FdType::Rng
                         }
                         Ok(false) => fd_type,
@@ -7800,11 +7798,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Rng => {
                 trace!("Read call RNG fd {}, simulating...", call.fd());
                 let status_flags = descriptor.status_flags();
+                let stream = descriptor.random_device_stream();
                 descriptor
                     .with_random_device_stream(|offset| {
                         require_random_device_read_access(status_flags)?;
                         let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-                        self.fill_random_device_bytes(guest, remote_buf, call.len(), offset)
+                        self.fill_random_device_bytes(guest, stream, remote_buf, call.len(), offset)
                     })
                     .map(|n| n as i64)
             }
@@ -8159,9 +8158,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(copied as i64);
         }
 
-        let (fd_type, resource, status_flags) =
+        let (fd_type, resource, status_flags, stream) =
             guest.thread_state_mut().with_detfd(call.fd(), |detfd| {
-                (detfd.ty(), detfd.resource(), detfd.status_flags())
+                (
+                    detfd.ty(),
+                    detfd.resource(),
+                    detfd.status_flags(),
+                    detfd.random_device_stream(),
+                )
             })?;
 
         if let Some(resource) = resource {
@@ -8177,8 +8181,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // checks FMODE_READ first; read and readv already check.
                 require_random_device_read_access(status_flags)?;
                 let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-                let n =
-                    self.fill_random_device_bytes(guest, remote_buf, call.len(), offset as u64)?;
+                let n = self.fill_random_device_bytes(
+                    guest,
+                    stream,
+                    remote_buf,
+                    call.len(),
+                    offset as u64,
+                )?;
                 Ok(n as i64)
             })(),
             FdType::Regular if guest.config().deterministic_io => {
@@ -9278,11 +9287,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         )?;
         let total = iovecs.iter().map(|iov| iov.len).sum();
         validate_random_vector_read(request.offset, total, request.flags)?;
+        let stream = detfd.random_device_stream();
         let written = if let Some(offset) = request.offset {
-            self.fill_random_device_iovecs(guest, &iovecs, offset)?
+            self.fill_random_device_iovecs(guest, stream, &iovecs, offset)?
         } else {
             detfd.with_random_device_stream(|offset| {
-                self.fill_random_device_iovecs(guest, &iovecs, offset)
+                self.fill_random_device_iovecs(guest, stream, &iovecs, offset)
             })?
         };
         if written > 0 && self.cfg.detlog_io_buffers && crate::detlog_observed!() {

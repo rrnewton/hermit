@@ -41,6 +41,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::random::splitmix64;
+
 /// The variable that enables race probes and lists their settings.
 pub const RACE_PROBE_ENV: &str = "HERMIT_RACE_PROBE";
 
@@ -220,7 +222,7 @@ impl Probes {
             return Some(Perturbation::Hold(self.hold_dir.as_ref()?.join(point)));
         }
         let visit = self.counter.fetch_add(1, Ordering::Relaxed);
-        let r = splitmix(self.seed ^ splitmix(visit));
+        let r = splitmix64(self.seed ^ splitmix64(visit));
         let unit = (r >> 11) as f64 / (1u64 << 53) as f64;
         if unit >= spec.probability {
             return None;
@@ -230,7 +232,7 @@ impl Probes {
             + if span == 0 {
                 0
             } else {
-                splitmix(r) % (span + 1)
+                splitmix64(r) % (span + 1)
             };
         Some(Perturbation::Wait(Duration::from_millis(ms)))
     }
@@ -252,13 +254,6 @@ fn probes() -> Option<&'static Probes> {
             Some(probes)
         })
         .as_ref()
-}
-
-fn splitmix(mut z: u64) -> u64 {
-    z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    z ^ (z >> 31)
 }
 
 fn choose(point: &str) -> Option<Perturbation> {

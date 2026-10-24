@@ -837,7 +837,14 @@ impl RecordVersion {
 // --chaos --seed=N`), and replay follows it. An older reader would replay a
 // chaos recording under the default schedule and fall out of step, so it is
 // refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x187);
+// 0x187 -> 0x188 (provisional: 0x188 is HIGHEST_SHIPPED + 1 at this base; the
+// lander re-checks HIGHEST_SHIPPED + 1 at land): each open file description of
+// a random device reads a stream of its own, named by its opener and its
+// table's count of random-device opens, where every one read the run seed's
+// single stream from its start. An older recording's guest read the old
+// bytes, while this replayer serves the new ones and falls out of step, so it
+// is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x188);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -862,7 +869,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x187);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x187;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x188;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -2317,6 +2324,14 @@ mod tests {
     #[test]
     fn record_version_rejects_path_classified_random_device_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x184)));
+    }
+
+    /// A 0x187 recording's guest read one random-device stream through every
+    /// open; this replayer gives each open file its own stream, so the version
+    /// gate must refuse it.
+    #[test]
+    fn record_version_rejects_single_stream_random_device_recordings() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
     }
 
     #[test]

@@ -137,10 +137,11 @@ mod user_access_event_tests {
             generator.fill(&mut bytes);
         } else if matches!(call, Call::Preadv | Call::Preadv2) {
             // Explicit offset19 is distinct from the shared cursor7.
-            bytes = [148, 221, 38, 111, 184, 1, 74, 147];
+            bytes = [54, 74, 0, 152, 31, 135, 94, 224];
         } else {
-            // Literal seed0 stream offsets7..15, not production byte helpers.
-            bytes = [40, 113, 186, 3, 76, 149, 222, 39];
+            // Literal offsets7..15 of the fixture's stream (the default stream
+            // at run seed 0), not production byte helpers.
+            bytes = [143, 247, 174, 112, 238, 2, 248, 208];
         }
         (bytes, generator)
     }

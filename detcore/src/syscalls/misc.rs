@@ -24,9 +24,11 @@ use reverie::syscalls::Sysno;
 
 use crate::consts::DEFAULT_HOSTNAME;
 use crate::detlog;
+use crate::fd::RandomDeviceStream;
 use crate::random::RANDOM_FILL_CHUNK_BYTES;
 #[cfg(test)]
 use crate::random::getrandom_request_len;
+use crate::random::splitmix64;
 #[cfg(test)]
 use crate::random::validate_getrandom_flags;
 use crate::random::write_random_chunk;
@@ -344,6 +346,16 @@ fn canonical_random_device_byte(seed: u64, index: u64) -> u8 {
         .wrapping_mul(RANDOM_DEVICE_BYTE_STRIDE)
         .wrapping_add(RANDOM_DEVICE_FIRST_BYTE)
         ^ seed_byte
+}
+
+/// The seed of `stream`'s bytes in a run seeded `run_seed`. Distinct streams
+/// of a run, like distinct run seeds, almost surely get distinct seeds, so two
+/// open files of a random device read different bytes
+/// (`crate::fd::RandomDeviceStream`).
+fn random_device_stream_seed(run_seed: u64, stream: RandomDeviceStream) -> u64 {
+    [stream.creator.as_raw() as u32 as u64, stream.sequence]
+        .into_iter()
+        .fold(run_seed, |seed, word| splitmix64(seed ^ splitmix64(word)))
 }
 
 /// Scatter one stream through an already-imported array. Scratch space is
@@ -812,17 +824,19 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1096): Review the backend-independent random-device stream.
-    /// Fill guest memory from the canonical stream used by every backend's
-    /// `/dev/random` and `/dev/urandom` virtualization.
+    /// Fill guest memory from `stream`, one of the canonical streams that every
+    /// backend's `/dev/random` and `/dev/urandom` virtualization reads.
     pub(super) fn fill_random_device_bytes<G: Guest<Self>>(
         &self,
         guest: &mut G,
+        stream: RandomDeviceStream,
         remote_buf: AddrMut<u8>,
         len: usize,
         stream_offset: u64,
     ) -> Result<usize, Error> {
         self.fill_random_device_iovecs(
             guest,
+            stream,
             &[crate::iovecs::ImportedIovec {
                 base: remote_buf.as_raw(),
                 len,
@@ -834,10 +848,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub(super) fn fill_random_device_iovecs<G: Guest<Self>>(
         &self,
         guest: &mut G,
+        stream: RandomDeviceStream,
         iovecs: &[crate::iovecs::ImportedIovec],
         stream_offset: u64,
     ) -> Result<usize, Error> {
-        let seed = guest.config().rng_seed();
+        let seed = random_device_stream_seed(guest.config().rng_seed(), stream);
         let mut hasher = DefaultHasher::new();
         let written = fill_canonical_random_iovecs(
             &mut guest.memory(),
@@ -848,9 +863,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         )?;
         if cfg!(debug_assertions) {
             detlog!(
-                "[dtid {}] USER RAND [/dev/[u]random] Filled guest memory with {} canonical random bytes at offset {}, hash of bytes: {}",
+                "[dtid {}] USER RAND [/dev/[u]random] Filled guest memory with {} canonical random bytes of {:?} at offset {}, hash of bytes: {}",
                 guest.thread_state().dettid,
                 written,
+                stream,
                 stream_offset,
                 hasher.finish()
             );
@@ -2011,6 +2027,51 @@ mod tests {
             ]
         );
         assert_ne!(seeded, [first, continued].concat());
+    }
+
+    /// Distinct random-device open files read distinct bytes, and each one's
+    /// bytes depend only on the run seed and its name. The pinned seeds catch
+    /// an accidental change to the derivation, which would change every
+    /// guest's random-device bytes and stop older recordings replaying.
+    #[test]
+    fn random_device_streams_are_distinct_per_open_file_and_pinned() {
+        let named = |creator, sequence| RandomDeviceStream {
+            creator: DetPid::from_raw(creator),
+            sequence,
+        };
+        assert_eq!(
+            random_device_stream_seed(0, named(3, 0)),
+            0x0581_cd8e_1945_b98c
+        );
+        assert_eq!(
+            random_device_stream_seed(0, named(3, 1)),
+            0xbd1c_08a3_03e1_67c7
+        );
+        assert_eq!(
+            random_device_stream_seed(17, named(3, 0)),
+            0x149b_5f6d_a3c3_0dbc
+        );
+        let first_bytes = |run_seed, stream| -> Vec<u8> {
+            let seed = random_device_stream_seed(run_seed, stream);
+            (0..8)
+                .map(|index| canonical_random_device_byte(seed, index))
+                .collect()
+        };
+        assert_eq!(
+            first_bytes(0, named(3, 0)),
+            [165, 203, 254, 29, 195, 91, 94, 45]
+        );
+        let mut seen = std::collections::BTreeSet::new();
+        for run_seed in [0, 1, 17] {
+            for creator in [3, 5, 7] {
+                for sequence in 0..4 {
+                    assert!(
+                        seen.insert(first_bytes(run_seed, named(creator, sequence))),
+                        "seed {run_seed}, creator {creator}, sequence {sequence}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
