@@ -27,6 +27,7 @@ use serde::ser::SerializeMap;
 
 use super::HostObservedCount;
 use super::PreemptionRecord;
+use super::RecordedTimedWaitSpread;
 use super::ReservedInputMetadata;
 use super::ThreadHistory;
 use super::TimeSkip;
@@ -61,6 +62,8 @@ struct RawRecord {
     reserved_input: ReservedInputMetadata,
     #[serde(skip)]
     replay_departed_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    timed_wait_spread: Option<RecordedTimedWaitSpread>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
