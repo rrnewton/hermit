@@ -9,7 +9,8 @@
 // exit, which can end and restart it more than once.
 // "storm": a child sends 40 SIGWINCH, which is ignored by default and which
 // ptrace still queues, 20 ms apart while the parent polls an empty pipe for
-// 100 ms: the poll must time out long before the storm ends.
+// 100 ms: the poll must time out long before the storm ends. The child exits
+// only after the poll has returned.
 // "alrm": five 100 ms polls that a 30 ms ITIMER_REAL interrupts; SIGALRM has a
 // handler.
 #define _GNU_SOURCE
@@ -76,8 +77,8 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (argc > 1 && strcmp(argv[1], "storm") == 0) {
-    int done[2];
-    if (pipe(done) != 0) {
+    int done[2], release[2];
+    if (pipe(done) != 0 || pipe(release) != 0) {
       perror("pipe");
       return 2;
     }
@@ -88,11 +89,19 @@ int main(int argc, char **argv) {
         nanosleep(&gap, NULL);
         kill(parent, SIGWINCH);
       }
-      _exit(write(done[1], "x", 1) == 1 ? 0 : 1);
+      char c;
+      // The sender exits only once the parent's poll has returned, so its
+      // SIGCHLD never reaches the poll.
+      int ok = write(done[1], "x", 1) == 1 && read(release[0], &c, 1) == 1;
+      _exit(ok ? 0 : 1);
     }
     int r = poll(&fds, 1, 100);
     struct pollfd storm_done = {done[0], POLLIN, 0};
     int over = poll(&storm_done, 1, 0);
+    if (write(release[1], "x", 1) != 1) {
+      perror("write");
+      return 2;
+    }
     printf("storm: poll %d; the storm was still running when it returned: %s; "
            "%d children\n",
            r, over == 0 ? "yes" : "no", reap());
