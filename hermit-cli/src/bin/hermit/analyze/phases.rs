@@ -2237,8 +2237,8 @@ impl AnalyzeOpts {
         );
         let crit_sched = match self.phase5_bisect_traces(target, baseline) {
             Ok(crit_sched) => crit_sched,
-            // The two endpoints differ in events only the failing run executed:
-            // the decision is still within the failing schedule, and a prefix
+            // The two endpoints differ in events only one run executed: the
+            // decision is still within the failing schedule, and a prefix
             // search needs no baseline to find it.
             Err(error) if error.downcast_ref::<NoSingleSwap>().is_some() => {
                 eprintln!(

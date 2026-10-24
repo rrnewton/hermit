@@ -77,26 +77,53 @@ struct EventLevelSearchResult {
     failing_schedule: Vec<SchedEvent>,
 }
 
-/// The bisection between a passing and a failing schedule ended one swap
-/// apart, but the failing schedule's failure depends on events only it
-/// executed, so no single adjacent swap separates the outcomes.
+/// The bisection between a passing and a failing schedule cannot separate
+/// them by a single adjacent swap: the outcome depends on events only one of
+/// the two runs executed.
 #[derive(Debug)]
 pub struct NoSingleSwap {
-    /// How many events the failing schedule has that the passing one lacks.
-    pub failing_only_events: usize,
+    /// How many events only one of the two schedules has, counting both
+    /// sides.
+    pub unshared_events: usize,
+    /// How many reorderings of shared events are left between the two: 1
+    /// when the search stopped one swap apart, 0 when the two run their
+    /// shared events in the same order from the start.
+    pub swaps_left: usize,
+    /// Whether a trial of the failing schedule without the events the
+    /// passing one lacks ran, and passed.
+    pub trimmed_failing_passed: bool,
 }
 
 impl std::fmt::Display for NoSingleSwap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.swaps_left == 0 {
+            write!(
+                f,
+                "the passing and failing schedules run the events they share in the same order \
+                 and differ only in {} events that one of them lacks, so no reordering of events \
+                 separates the two outcomes: the failure depends on events only one run executed \
+                 (often branch events whose preemption points differ).",
+                self.unshared_events
+            )?;
+        } else {
+            write!(
+                f,
+                "the search stopped one swap from the passing schedule, but the two schedules \
+                 still differ in {} events that only one of them has{}. The failure depends on \
+                 events only one run executed (often branch events whose preemption points \
+                 differ), so no single adjacent swap separates the two outcomes.",
+                self.unshared_events,
+                if self.trimmed_failing_passed {
+                    ", and the failing schedule without the events only it has no longer fails"
+                } else {
+                    ""
+                }
+            )?;
+        }
         write!(
             f,
-            "the search stopped one swap from the passing schedule, but the failing schedule \
-             still has {} events the passing one lacks, and without them it no longer fails. \
-             The failure depends on events only the failing run executed (often branch events \
-             whose preemption points differ), so no single adjacent swap separates the two \
-             outcomes. `hermit analyze --prefix-search` needs no baseline schedule and finds the \
-             scheduling decision within the failing one.",
-            self.failing_only_events
+            " `hermit analyze --prefix-search` needs no baseline schedule and finds the \
+             scheduling decision within the failing one."
         )
     }
 }
@@ -565,12 +592,20 @@ where
             );
         }
 
-        if swap_dist == 0 {
-            anyhow::bail!(
-                "aborting search: opposite-outcome schedules have no remaining reorderable event \
-                 distance (edit distance {})",
-                edit_dist,
+        if swap_dist == 0 && edit_dist == 0 {
+            bail!(
+                "the passing and failing schedules are the same sequence of events, yet their \
+                 replays have opposite outcomes: the outcome does not follow the schedule. Check \
+                 that the target replays the same (--selfcheck), and look for inputs Hermit does \
+                 not make deterministic."
             );
+        }
+        if swap_dist == 0 {
+            return Err(anyhow::Error::new(NoSingleSwap {
+                unshared_events: edit_dist,
+                swaps_left: 0,
+                trimmed_failing_passed: false,
+            }));
         }
 
         if swap_dist == 1 && edit_dist == 1 {
@@ -587,6 +622,7 @@ where
             // pair if it still fails. It is selected like every other midpoint:
             // within the jitter bound, or stable across replays, and the trace it
             // selects is what the search reports.
+            let mut trimmed_failing_passed = false;
             if let Some(trimmed) = events_shared_with(&failing_schedule, &passing_schedule) {
                 eprintln!(
                     ":: Schedules are one swap apart; testing the failing schedule without its {} events the passing one lacks",
@@ -600,9 +636,12 @@ where
                         failing_schedule: selected,
                     });
                 }
+                trimmed_failing_passed = true;
             }
             return Err(anyhow::Error::new(NoSingleSwap {
-                failing_only_events: edit_dist - swap_dist,
+                unshared_events: edit_dist - swap_dist,
+                swaps_left: 1,
+                trimmed_failing_passed,
             }));
         }
 
@@ -1209,8 +1248,65 @@ mod tests {
         let no_swap = error
             .downcast_ref::<NoSingleSwap>()
             .unwrap_or_else(|| panic!("not NoSingleSwap: {error:#}"));
-        assert_eq!(no_swap.failing_only_events, 1);
-        assert!(error.to_string().contains("--prefix-search"), "{error}");
+        assert_eq!((no_swap.unshared_events, no_swap.swaps_left), (1, 1));
+        // The failing schedule without its own event ran, and passed.
+        assert!(no_swap.trimmed_failing_passed);
+        let message = error.to_string();
+        assert!(
+            message.contains("without the events only it has no longer fails")
+                && message.contains("--prefix-search"),
+            "{message}"
+        );
+    }
+
+    /// Schedules that run their shared events in the same order, and differ
+    /// only in events one of them lacks, end the search with the same typed
+    /// error, whose fallback is the prefix search, once the two endpoints are
+    /// replayed. Before, the search stopped with an untyped "no remaining
+    /// reorderable event distance" error, and analyze ended there.
+    #[test]
+    fn schedules_without_a_reordering_end_with_no_single_swap() {
+        let a = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook);
+        let b = SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook);
+        let c = SchedEvent::syscall(DetTid::from_raw(3), Sysno::getpid, SyscallPhase::Prehook);
+        let extra = SchedEvent::syscall(DetTid::from_raw(7), Sysno::close, SyscallPhase::Prehook);
+        let passing = vec![a.clone(), b.clone(), c.clone()];
+        let failing = vec![a, b, extra.clone(), c];
+        let tester = |schedule: &[SchedEvent]| -> TrialOutcome {
+            Ok((!schedule.contains(&extra), schedule.to_vec()))
+        };
+        let error =
+            search_for_critical_schedule(tester, passing, failing, &Config::default()).unwrap_err();
+        let no_swap = error
+            .downcast_ref::<NoSingleSwap>()
+            .unwrap_or_else(|| panic!("not NoSingleSwap: {error:#}"));
+        assert_eq!((no_swap.unshared_events, no_swap.swaps_left), (1, 0));
+        let message = error.to_string();
+        assert!(
+            message.contains("run the events they share in the same order")
+                && message.contains("--prefix-search"),
+            "{message}"
+        );
+
+        // The same schedule with opposite outcomes is not a schedule
+        // difference at all: no prefix search, an error naming the cause.
+        let schedule = vec![
+            SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook),
+            SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook),
+        ];
+        let mut replays = 0;
+        let flaky = |schedule: &[SchedEvent]| -> TrialOutcome {
+            replays += 1;
+            Ok((replays % 2 == 1, schedule.to_vec()))
+        };
+        let error =
+            search_for_critical_schedule(flaky, schedule.clone(), schedule, &Config::default())
+                .unwrap_err();
+        assert!(error.downcast_ref::<NoSingleSwap>().is_none(), "{error:#}");
+        assert!(
+            error.to_string().contains("same sequence of events"),
+            "{error:#}"
+        );
     }
 
     /// A control schedule whose replays never agree ends the search with an
