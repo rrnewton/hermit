@@ -608,6 +608,20 @@ pub struct Config {
     #[clap(long)]
     pub imprecise_timers: bool,
 
+    /// Stop the guest at every timeslice end, including one where no other
+    /// guest thread could run. By default Hermit does not stop a thread that
+    /// is the only one able to run before it next enters Detcore (every other
+    /// thread waits on a futex without a timeout, on a child or in
+    /// `rt_sigsuspend`; no timer, sleeper, poll deadline or host call is
+    /// pending): it processes those timeslice ends when the thread next
+    /// enters Detcore, at the same branch counts and in the same order, so the
+    /// schedule, the virtual clock and the chaos draws are the same either
+    /// way and only the stops are saved. This option turns that off, for
+    /// comparison.
+    #[serde(default)]
+    #[clap(long)]
+    pub eager_lone_preemptions: bool,
+
     /// Turn off Detcore's own copy of each guest thread's signal dispositions
     /// and masks (A5, docs/SIGNAL_STATE_CHECK.md). The copy is on by default
     /// where it can run (ptrace with serialized threads): it is checked
@@ -1557,6 +1571,39 @@ impl Config {
         self.max_timeslice.is_some() && self.backend.delivers_preemption_timer_events
     }
 
+    /// Whether a thread that is the only one able to run may skip its
+    /// timeslice-end stops and have them processed when it next enters
+    /// Detcore (see [`Config::eager_lone_preemptions`]). Only where a
+    /// timeslice end reads nothing from the guest but its branch count, and
+    /// nothing but the thread's next entry could act before the next one:
+    /// precise PMU timers keyed to retired branches at one virtual-time rate,
+    /// no recorded or replayed schedule or preemptions (they capture guest
+    /// state at each end), no slice-boundary protocol, no stack traces at
+    /// preemptions or events, no turn-numbered triggers (`--stop-after-turn`,
+    /// `--stop-after-iter`, `--signal-at`), no happens-before program, no
+    /// manual interrupt points and no syscall-boundary deadline
+    /// (`--target-timeslice`).
+    pub fn replays_lone_preemptions(&self) -> bool {
+        !self.eager_lone_preemptions
+            && self.use_preemption_timer()
+            && self.use_rcb_time()
+            && self.sequentialize_threads
+            && !self.imprecise_timers
+            && !self.chaos_per_thread_slowdown
+            && !self.record_preemptions
+            && !self.strict_schedule_boundaries
+            && self.replay_preemptions_from.is_none()
+            && self.replay_schedule_from.is_none()
+            && self.target_timeslice.is_none()
+            && !self.preemption_stacktrace
+            && self.stacktrace_event.is_empty()
+            && self.stop_after_turn.is_none()
+            && self.stop_after_iter.is_none()
+            && self.signal_at.is_none()
+            && self.happens_before.is_none()
+            && self.interrupt_at.is_empty()
+    }
+
     /// Should we use RCB in computing logical time?
     ///
     /// The answer is NO either if `--no-rcb-time` is specified or if HW counters are disabled by
@@ -1782,6 +1829,9 @@ impl fmt::Display for Config {
         }
         if self.imprecise_timers {
             write!(f, " --imprecise-timers")?;
+        }
+        if self.eager_lone_preemptions {
+            write!(f, " --eager-lone-preemptions")?;
         }
         if !self.signal_state_copy {
             write!(f, " --no-signal-state-copy")?;
@@ -2527,7 +2577,9 @@ impl Default for Config {
 /// [`Config::in_guest_signal_delivery`], false for DBT, which read back as
 /// false. So is [`Config::notice_host_network_abstract_binds`], added after this form
 /// froze, which reads back as false: DBT's runtime then prints no notice for
-/// an abstract `AF_UNIX` bind. Every
+/// an abstract `AF_UNIX` bind. So is [`Config::eager_lone_preemptions`], added
+/// after this form froze, which has no effect without a PMU timer and reads
+/// back as false. Every
 /// other field is serialized exactly as `serde_json::to_string(config)`
 /// serializes it.
 ///
@@ -3066,7 +3118,10 @@ mod legacy_backend_json {
     /// `notice_host_network_abstract_binds` came after it too. It is never written and
     /// reads as false, so the DBT runtime prints no notice for an abstract
     /// `AF_UNIX` bind under host networking.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 32] = [
+    /// `eager_lone_preemptions` came after it too. DBT has no PMU timer, so
+    /// the option has no effect there; it is never written and reads as
+    /// false.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 33] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3099,6 +3154,7 @@ mod legacy_backend_json {
         "annotated_priority_replay",
         "virtual_cpus",
         "notice_host_network_abstract_binds",
+        "eager_lone_preemptions",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3242,7 +3298,8 @@ mod legacy_backend_json {
                     | "replaying"
                     | "signal_delivery_check_fatal"
                     | "container_procfs"
-                    | "notice_host_network_abstract_binds",
+                    | "notice_host_network_abstract_binds"
+                    | "eager_lone_preemptions",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is.
                 Some("in_guest_reserved_signals") => {
@@ -3558,7 +3615,8 @@ mod legacy_backend_json {
                 | "in_guest_signal_delivery"
                 | "annotated_priority_replay"
                 | "virtual_cpus"
-                | "notice_host_network_abstract_binds" => Ok(()),
+                | "notice_host_network_abstract_binds"
+                | "eager_lone_preemptions" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -4293,7 +4351,8 @@ mod tests {
                 | "in_guest_signal_delivery"
                 | "annotated_priority_replay"
                 | "virtual_cpus"
-                | "notice_host_network_abstract_binds" => {}
+                | "notice_host_network_abstract_binds"
+                | "eager_lone_preemptions" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -4316,11 +4375,12 @@ mod tests {
         // `container_procfs`, `signal_delivery_check_fatal`,
         // `work_span_report`, `signal_at`, `in_guest_signal_delivery`,
         // `annotated_priority_replay`, `virtual_cpus`,
-        // `notice_host_network_abstract_binds` and `strict_schedule_boundaries`
-        // none: fourteen more keys and thirty-one fewer, so seventeen keys fewer
+        // `notice_host_network_abstract_binds`, `eager_lone_preemptions` and
+        // `strict_schedule_boundaries`
+        // none: fourteen more keys and thirty-two fewer, so eighteen keys fewer
         // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 17);
+        assert_eq!(fields.len(), keys.len() + 18);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -5043,6 +5103,39 @@ mod tests {
         assert_eq!(Config::default().virtual_cpus, None);
         assert_eq!(Config::default().virtual_cpu_count(), 1);
         assert!(!Config::default().to_string().contains("virtual-cpus"));
+    }
+
+    /// `eager_lone_preemptions` came after the legacy form froze, so it never
+    /// enters it (DBT has no PMU timer, where it would act), and both the
+    /// object and the array form read it back as false.
+    #[test]
+    fn eager_lone_preemptions_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            eager_lone_preemptions: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("eager_lone_preemptions"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .eager_lone_preemptions
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .eager_lone_preemptions
+        );
     }
 
     /// `Config` crosses Reverie RPC as positional legacy bincode, so
@@ -5900,6 +5993,155 @@ mod tests {
         assert!(restored.mountinfo_mount_namespace.is_none());
         assert!(restored.directory_placeholder.is_none());
         assert!(!restored.container_procfs);
+    }
+
+    /// Lone slice ends are processed without stops only where a slice end
+    /// reads nothing from the guest but its branch count: each listed option
+    /// turns it off.
+    #[test]
+    fn lone_preemptions_are_replayed_only_where_a_slice_end_reads_nothing_else() {
+        let base = Config {
+            sequentialize_threads: true,
+            backend: reverie::BackendCapabilities::PTRACE,
+            ..Config::parse_from(["detcore"])
+        };
+        assert!(base.replays_lone_preemptions());
+        let off: Vec<(&str, Config)> = vec![
+            (
+                "--eager-lone-preemptions",
+                Config {
+                    eager_lone_preemptions: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "no sequentialization",
+                Config {
+                    sequentialize_threads: false,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--max-timeslice=disabled",
+                Config {
+                    max_timeslice: None,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--no-rcb-time",
+                Config {
+                    no_rcb_time: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--imprecise-timers",
+                Config {
+                    imprecise_timers: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--chaos-per-thread-slowdown",
+                Config {
+                    chaos_per_thread_slowdown: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--record-preemptions",
+                Config {
+                    record_preemptions: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--strict-schedule-boundaries",
+                Config {
+                    strict_schedule_boundaries: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--replay-preemptions-from",
+                Config {
+                    replay_preemptions_from: Some("p".into()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "--replay-schedule-from",
+                Config {
+                    replay_schedule_from: Some("s".into()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "--target-timeslice",
+                Config {
+                    target_timeslice: NonZeroU64::new(1_000),
+                    ..base.clone()
+                },
+            ),
+            (
+                "--preemption-stacktrace",
+                Config {
+                    preemption_stacktrace: true,
+                    ..base.clone()
+                },
+            ),
+            (
+                "--stacktrace-event",
+                Config {
+                    stacktrace_event: vec![(1, None)],
+                    ..base.clone()
+                },
+            ),
+            (
+                "--stop-after-turn",
+                Config {
+                    stop_after_turn: Some(1),
+                    ..base.clone()
+                },
+            ),
+            (
+                "--stop-after-iter",
+                Config {
+                    stop_after_iter: Some(1),
+                    ..base.clone()
+                },
+            ),
+            (
+                "--interrupt-at",
+                Config {
+                    interrupt_at: vec![(DetTid::from_raw(3), 1)],
+                    ..base.clone()
+                },
+            ),
+            (
+                "--signal-at",
+                Config {
+                    signal_at: Some(parse_signal_at("turn=1:SIGUSR1").unwrap()),
+                    ..base.clone()
+                },
+            ),
+            (
+                "--happens-before",
+                Config {
+                    happens_before: Some(crate::happens_before::HappensBeforeProgram {
+                        version: 1,
+                        anchors: Default::default(),
+                        edges: Vec::new(),
+                        max_hold_ns: None,
+                    }),
+                    ..base.clone()
+                },
+            ),
+        ];
+        for (option, config) in off {
+            assert!(!config.replays_lone_preemptions(), "{option}");
+        }
     }
 
     #[test]

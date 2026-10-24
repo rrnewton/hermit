@@ -444,6 +444,66 @@ fn rcb_timer_overshot(delta_rcbs: u64, last_timer: u64) -> bool {
 /// timer for: `armed` branches past `committed`, that handler's clock value
 /// (`keep_timer_across_dropped_signal`). At least one: a stop at or past the
 /// point fires the event at once, where the backend records any overshoot.
+/// Timeslice ends processed without a stop (`Detcore::catch_up_lone_slice_ends`),
+/// counted for the run summary (`PreemptionSummary::stopless_slice_ends`).
+/// Process-wide: a run reports its growth since it started, so two runs in
+/// one process at the same time would each count both.
+pub(crate) static STOPLESS_SLICE_ENDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How far ahead, in retired conditional branches, the backstop timer of a
+/// thread running alone fires at the earliest (`arm_lone_backstop`): 20 ms of
+/// virtual time at the default clock multiplier. A stop this rare costs
+/// nothing next to the slice ends it replaces at small `--max-timeslice`
+/// values, and it bounds how long a host input waits for a scheduler turn.
+const LONE_BACKSTOP_RCBS: u64 = 2_000_000;
+
+/// Arm the timer of a thread running alone: an imprecise one, at least
+/// [`LONE_BACKSTOP_RCBS`] ahead and never before the pending slice end
+/// (`rcbs_to_end` away), so it adds no stop a stop at every end would not.
+/// It ends no slice. Its event processes the slice ends the thread ran past
+/// (`Detcore::catch_up_lone_slice_ends`) and arms the next timer, so a long
+/// stretch without a syscall still enters Detcore now and then. Where it
+/// lands does not matter: each end is processed at its own branch count.
+fn arm_lone_backstop<G, T>(guest: &mut G, rcbs_to_end: u64)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    guest
+        .set_timer(TimerSchedule::Rcbs(LONE_BACKSTOP_RCBS.max(rcbs_to_end)))
+        .expect("Failed to set timer");
+}
+
+/// Stop skipping the pending slice end of a thread that no longer runs
+/// alone (a reply without `GlobalResponse::WithLoneGrant`): arm the precise
+/// timer for it, as the post-hook arms it for a thread that never ran alone.
+/// The counter has not passed it: every callback first processes the ends
+/// the thread ran past.
+pub(crate) fn stop_skipping_lone_slice_end<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let Some(end) = guest.thread_state_mut().lone_slice_end.take() else {
+        return;
+    };
+    let now = guest.read_clock().expect("Couldn't read clock");
+    assert!(
+        end > now,
+        "a slice end at branch {end} that the counter ({now}) passed was not processed"
+    );
+    {
+        let thread_state = guest.thread_state_mut();
+        let committed = thread_state.committed_clock_value;
+        thread_state.last_rcb_timer = Some(end - committed);
+        thread_state.last_rcb_timer_is_max = true;
+    }
+    guest
+        .set_timer_precise(TimerSchedule::Rcbs(end - now))
+        .expect("Failed to set timer");
+}
+
 fn kept_timer_rcbs(committed: u64, armed: u64, now: u64) -> u64 {
     committed.saturating_add(armed).saturating_sub(now).max(1)
 }
@@ -1261,6 +1321,181 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// A precise timer event, or a skipped slice end of a lone thread
+    /// processed at its own branch count (`catch_up_lone_slice_ends`, with
+    /// `ThreadState::replaying_lone_slice_end` set): the same code either way.
+    async fn take_timer_event<G: Guest<Self>>(&self, guest: &mut G) {
+        // A preemption stops the guest in user code (A5 step 3.2).
+        guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::NotInSyscall);
+
+        info!(
+            "[detcore, dtid {}] inbound timer preemption event",
+            guest.thread_state().dettid
+        );
+        if guest.config().preemption_stacktrace {
+            let mut file_writer: Box<dyn Write> =
+                match &guest.config().preemption_stacktrace_log_file {
+                    Some(path) => Box::new(
+                        File::create(path).expect("Failed to open preemption stacktrace log file"),
+                    ),
+                    // Under --max-log-bytes a full stderr must not stop the
+                    // run before the cap; see `util::DroppingStderr`.
+                    None if crate::nonwaiting_write::diagnostics_must_not_wait() => {
+                        Box::new(crate::util::DroppingStderr)
+                    }
+                    None => Box::new(std::io::stderr()),
+                };
+            let ts = guest.thread_state();
+            writeln!(
+                file_writer,
+                "\n>>> Guest tid {} preempted at thread time {} with stack trace:",
+                ts.dettid,
+                ts.thread_logical_time.as_nanos(),
+            )
+            .unwrap();
+            if let Some(backtrace) = guest.backtrace() {
+                if let Ok(pbt) = backtrace.pretty() {
+                    writeln!(file_writer, "{}", pbt).unwrap();
+                } else {
+                    writeln!(file_writer, "{}", backtrace).unwrap();
+                }
+            } else {
+                warn!("Could not read backtrace!");
+            }
+        }
+        // This may LOOK like a noop, but actually all of the logic for ending the timeslice is in
+        // the prehook.  All the timer has to do is interrupt the guest and generate an extra call
+        // to this prehook.
+        let boundary_entry = if guest.config().no_rcb_time {
+            slice_boundary::callbacks::Callback::NoRcbTimer
+        } else {
+            slice_boundary::callbacks::Callback::PmuTimer
+        };
+        let boundary_token = self
+            .pre_handler_hook_observed(guest, true, CheckIn::Event, Some(boundary_entry))
+            .await;
+        if guest.config().no_rcb_time && guest.thread_state().last_rcb_timer_is_max {
+            let max_timeslice_end = guest
+                .thread_state()
+                .max_timeslice_end
+                .expect("PMU maximum timer requires a deadline");
+            guest
+                .thread_state_mut()
+                .thread_logical_time
+                .advance_to(max_timeslice_end);
+            if self.cfg.observes_schedevents() {
+                let dettid = guest.thread_state().dettid;
+                let ev = with_guest_time(
+                    guest,
+                    SchedEvent {
+                        dettid,
+                        op: Op::OtherInstructions,
+                        count: 1,
+                        start_rip: None,
+                        end_rip: None,
+                        end_time: None,
+                    },
+                );
+                let ev = with_guest_rip(guest, ev).await;
+                trace_schedevent(guest, ev, false).await;
+            }
+            if guest.thread_state().follows_replayed_schedule(&self.cfg)
+                && guest.thread_state().slice_boundary.is_none()
+            {
+                let fallback_deadline = max_timeslice_end
+                    + Duration::from_nanos(u64::from(
+                        self.cfg
+                            .max_timeslice
+                            .expect("PMU maximum must be configured"),
+                    ));
+                let thread_state = guest.thread_state_mut();
+                let replay_deadline = thread_state
+                    .end_of_timeslice
+                    .filter(|deadline| *deadline > max_timeslice_end)
+                    .unwrap_or(fallback_deadline);
+                thread_state.end_of_timeslice = Some(replay_deadline);
+                thread_state.max_timeslice_end = Some(replay_deadline);
+                thread_state.last_rcb_timer = None;
+                thread_state.last_rcb_timer_is_max = false;
+                thread_state.stats.reset_timeslice();
+            } else if guest.thread_state().own_signal_turn_hold.is_none() {
+                slice_boundary::no_rcb_maximum(guest.thread_state_mut())
+                    .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
+                self.end_timeslice(guest).await;
+            }
+        }
+        self.post_handler_hook_observed(guest, CheckIn::Event, boundary_token)
+            .await;
+    }
+
+    /// Process, in order, every slice end a lone thread ran past without a
+    /// stop (`ThreadState::lone_slice_end`), each at its own branch count and
+    /// through the same code as a timer event there (`take_timer_event`).
+    /// Called first in every callback that sees the guest stopped, before
+    /// that callback changes anything, so these ends come where the stops
+    /// would have put them: before what the guest did next.
+    ///
+    /// Equivalent to the stops: the scheduler marked each grant lone
+    /// (`Scheduler::runs_alone_until_it_enters_detcore`), so until now nothing
+    /// but this thread's own requests could change what any pass decides; a
+    /// slice end reads nothing from the guest but its branch count, which
+    /// the clock update takes from the end itself; and the next end follows
+    /// from the same deadline arithmetic in the post-hook. Afterwards the
+    /// thread keeps running alone, or, if the last grant was not marked
+    /// lone, gets the precise timer for its next end.
+    async fn catch_up_lone_slice_ends<G: Guest<Self>>(&self, guest: &mut G) {
+        let Some(mut end) = guest.thread_state().lone_slice_end else {
+            return;
+        };
+        let reached = guest.read_clock().expect("Couldn't read clock");
+        while end <= reached {
+            {
+                let thread_state = guest.thread_state_mut();
+                thread_state.lone_slice_end = None;
+                thread_state.replaying_lone_slice_end = Some(end);
+            }
+            self.take_timer_event(guest).await;
+            STOPLESS_SLICE_ENDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if std::mem::take(&mut guest.thread_state_mut().lone_replay_unsound) {
+                // Another thread could run at an end this thread had already
+                // run past: the run is no longer the one a stop gives.
+                let reason = format!(
+                    "HERMIT_LONE_SLICE_END_UNSOUND: thread {} was granted at a skipped slice end \
+                     (branch {end}) while another thread could run; that end was processed \
+                     after the thread reached branch {reached}",
+                    guest.thread_state().dettid
+                );
+                tracing::error!("{reason}");
+                crate::detlog::record_determinism_loss(&reason);
+            }
+            let thread_state = guest.thread_state_mut();
+            thread_state.replaying_lone_slice_end = None;
+            end = thread_state
+                .lone_slice_end
+                .expect("a processed slice end notes the next one");
+        }
+        if !guest.thread_state().lone_grant {
+            stop_skipping_lone_slice_end(guest);
+        }
+    }
+
+    /// Whether the post-hook may leave the slice end it is about to arm
+    /// without a stop (`Config::replays_lone_preemptions`): the latest grant
+    /// found the thread alone, the timer is for the maximum (not a manual
+    /// interrupt), and the thread replays nothing, holds no turn for a
+    /// signal to its own process and owes no pipe hand-off.
+    fn skips_lone_slice_end<G: Guest<Self>>(&self, guest: &G, timer_is_max: bool) -> bool {
+        let thread_state = guest.thread_state();
+        self.cfg.replays_lone_preemptions()
+            && thread_state.lone_grant
+            && timer_is_max
+            && thread_state.replay_rcb_end.is_none()
+            && thread_state.preemption_points.is_none()
+            && thread_state.slice_boundary.is_none()
+            && thread_state.own_signal_turn_hold.is_none()
+            && thread_state.pipe_handoff_due.is_none()
+    }
+
     /// Update logical thread time with any outstanding ticks of the Reverie clock.  Returns a list
     /// of corresponding Branch/OtherInstructions events if schedule recording is enabled.
     ///
@@ -1276,7 +1511,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             let precise_timers = !guest.config().imprecise_timers;
             // TODO(T86591083): we might need to not always increment as a hack fix
             // for deterministic virtual time without sequentialize threads.
-            let clock_value = guest.read_clock().expect("Couldn't read clock");
+            // A skipped slice end of a lone thread is processed at its own
+            // branch count (`catch_up_lone_slice_ends`), not the counter's.
+            let clock_value = match guest.thread_state().replaying_lone_slice_end {
+                Some(end) => end,
+                None => guest.read_clock().expect("Couldn't read clock"),
+            };
             // N.B. clock_value does not yet include any updates for the inbound
             // syscall/instruction because this function is the very first thing that
             // happens in each type of handler.
@@ -1901,6 +2141,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !self.cfg.use_preemption_timer() {
             return;
         }
+        if let Some(end) = guest.thread_state().lone_slice_end {
+            let now = guest.read_clock().expect("Couldn't read clock");
+            arm_lone_backstop(guest, end.saturating_sub(now));
+            return;
+        }
         let thread_state = guest.thread_state();
         let Some(armed) = thread_state.last_rcb_timer else {
             return;
@@ -2021,7 +2266,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         let dettid = guest.thread_state().dettid;
         let evs = self.update_logical_time_rcbs(guest, precise_branch).await;
 
-        if guest.thread_state().guest_past_first_execve() {
+        if guest.thread_state().replaying_lone_slice_end.is_some() {
+            // The guest is stopped later, not at this end: its registers are
+            // not this end's.
+            detlog_debug!(
+                "(pre) registers [dtid {}][rcbs {}]. not read: slice end taken without a stop",
+                dettid,
+                guest.thread_state().thread_logical_time.rcbs(),
+            );
+        } else if guest.thread_state().guest_past_first_execve() {
             detlog_debug!(
                 "(pre) registers [dtid {}][rcbs {}]. {}",
                 dettid,
@@ -2605,20 +2858,36 @@ impl<T: RecordOrReplay> Detcore<T> {
                     rcbs_remaining,
                     guest.thread_state().thread_logical_time.rcbs()
                 );
-                {
+                let replaying = guest.thread_state().replaying_lone_slice_end.is_some();
+                if replaying || self.skips_lone_slice_end(guest, timer_is_max) {
+                    // No stop at this slice end: the thread's next entry into
+                    // Detcore processes it at this branch count. While a
+                    // skipped end is processed, the next one is only noted;
+                    // the counter has already passed it or the caller arms.
                     let thread_state = guest.thread_state_mut();
-                    thread_state.last_rcb_timer = Some(rcbs_remaining);
-                    thread_state.last_rcb_timer_is_max = timer_is_max;
-                }
-
-                if guest.config().imprecise_timers {
-                    guest
-                        .set_timer(TimerSchedule::Rcbs(rcbs_remaining))
-                        .expect("Failed to set timer");
+                    thread_state.lone_slice_end = Some(current_pmu_rcbs + rcbs_remaining);
+                    thread_state.last_rcb_timer = None;
+                    thread_state.last_rcb_timer_is_max = false;
+                    if !replaying {
+                        arm_lone_backstop(guest, rcbs_remaining);
+                    }
                 } else {
-                    guest
-                        .set_timer_precise(TimerSchedule::Rcbs(rcbs_remaining))
-                        .expect("Failed to set timer");
+                    {
+                        let thread_state = guest.thread_state_mut();
+                        thread_state.lone_slice_end = None;
+                        thread_state.last_rcb_timer = Some(rcbs_remaining);
+                        thread_state.last_rcb_timer_is_max = timer_is_max;
+                    }
+
+                    if guest.config().imprecise_timers {
+                        guest
+                            .set_timer(TimerSchedule::Rcbs(rcbs_remaining))
+                            .expect("Failed to set timer");
+                    } else {
+                        guest
+                            .set_timer_precise(TimerSchedule::Rcbs(rcbs_remaining))
+                            .expect("Failed to set timer");
+                    }
                 }
             } else {
                 guest.thread_state_mut().last_rcb_timer = None;
@@ -2630,7 +2899,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest.thread_state_mut().last_rcb_timer_is_max = false;
         }
 
-        if guest.thread_state().guest_past_first_execve() {
+        if guest.thread_state().replaying_lone_slice_end.is_some() {
+            detlog_debug!(
+                "(post) registers [dtid {}][rcbs {}]. not read: slice end taken without a stop",
+                guest.thread_state().dettid,
+                guest.thread_state().thread_logical_time.rcbs(),
+            );
+        } else if guest.thread_state().guest_past_first_execve() {
             detlog_debug!(
                 "(post) registers [dtid {}][rcbs {}]. {}",
                 dettid,
@@ -3633,6 +3908,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         eax: u32,
         ecx: u32,
     ) -> Result<CpuIdResult, Errno> {
+        self.catch_up_lone_slice_ends(guest).await;
         trace!("handle_cpuid_event: eax: {}, ecx: {}", eax, ecx);
         // A trapped instruction stops the guest in user code (A5 step 3.2).
         guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::NotInSyscall);
@@ -3705,6 +3981,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         request: Rdtsc,
     ) -> Result<RdtscResult, Errno> {
+        self.catch_up_lone_slice_ends(guest).await;
         trace!("handle_rdtsc_event: {:?}", request);
         // A trapped instruction stops the guest in user code (A5 step 3.2).
         guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::NotInSyscall);
@@ -3769,6 +4046,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         signal: Signal,
     ) -> Result<Option<Signal>, Errno> {
+        self.catch_up_lone_slice_ends(guest).await;
         let delivered = self
             .handle_inbound_signal(guest, SigWrapper::from(signal))
             .await?;
@@ -3796,6 +4074,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         signal: i32,
     ) -> Result<Option<i32>, Errno> {
+        self.catch_up_lone_slice_ends(guest).await;
         let delivered = self
             .handle_inbound_signal(guest, SigWrapper(signal))
             .await?;
@@ -3822,6 +4101,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         signal: i32,
     ) -> Result<Option<reverie::SignalAnnouncement>, Errno> {
+        self.catch_up_lone_slice_ends(guest).await;
         if !(1..=64).contains(&signal) {
             return Err(Errno::EINVAL);
         }
@@ -3901,6 +4181,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         announcement: reverie::SignalAnnouncement,
     ) -> Result<(), Errno> {
+        self.catch_up_lone_slice_ends(guest).await;
         let Some(index) = guest
             .thread_state()
             .signal_announcements
@@ -3997,6 +4278,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         status: ExitStatus,
     ) -> Result<(), Errno> {
+        self.catch_up_lone_slice_ends(guest).await;
         if !matches!(
             status,
             ExitStatus::Signaled(..) | ExitStatus::SignaledRaw(..)
@@ -4483,6 +4765,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     published_runtime_private_memory: None,
                     last_rcb_timer: None,
                     last_rcb_timer_is_max: false,
+                    lone_grant: false,
+                    lone_slice_end: None,
+                    replaying_lone_slice_end: None,
+                    lone_replay_unsound: false,
 
                     record_or_replay,
                     preemption_points: None,
@@ -4608,6 +4894,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     }
 
     async fn handle_post_exec<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), Errno> {
+        // The exec's own entry processed the ends the old image ran past; the
+        // new image's first slice is installed fresh, by the exec continuation.
+        guest.thread_state_mut().lone_slice_end = None;
         // The new image's first stop is at the exit of the exec Detcore did not
         // finish (A5 step 3.2). The old image's delivery counts are logged
         // under the identity they were taken under, and the new image counts
@@ -4854,106 +5143,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
     /// A timer fires to preempt the guest and give other threads a turn.
     async fn handle_timer_event<G: Guest<Self>>(&self, guest: &mut G) {
-        // A preemption stops the guest in user code (A5 step 3.2).
-        guest.thread_state_mut().delivery_interruption = Some(reverie::Interruption::NotInSyscall);
-        info!(
-            "[detcore, dtid {}] inbound timer preemption event",
-            guest.thread_state().dettid
-        );
-        if guest.config().preemption_stacktrace {
-            let mut file_writer: Box<dyn Write> =
-                match &guest.config().preemption_stacktrace_log_file {
-                    Some(path) => Box::new(
-                        File::create(path).expect("Failed to open preemption stacktrace log file"),
-                    ),
-                    // Under --max-log-bytes a full stderr must not stop the
-                    // run before the cap; see `util::DroppingStderr`.
-                    None if crate::nonwaiting_write::diagnostics_must_not_wait() => {
-                        Box::new(crate::util::DroppingStderr)
-                    }
-                    None => Box::new(std::io::stderr()),
-                };
-            let ts = guest.thread_state();
-            writeln!(
-                file_writer,
-                "\n>>> Guest tid {} preempted at thread time {} with stack trace:",
-                ts.dettid,
-                ts.thread_logical_time.as_nanos(),
-            )
-            .unwrap();
-            if let Some(backtrace) = guest.backtrace() {
-                if let Ok(pbt) = backtrace.pretty() {
-                    writeln!(file_writer, "{}", pbt).unwrap();
-                } else {
-                    writeln!(file_writer, "{}", backtrace).unwrap();
-                }
-            } else {
-                warn!("Could not read backtrace!");
+        if guest.thread_state().lone_slice_end.is_some() {
+            // While a thread runs alone the only timer armed is the backstop
+            // (`arm_lone_backstop`): no slice ends here. Process the ends it
+            // ran past, and keep running alone or arm the next end.
+            self.catch_up_lone_slice_ends(guest).await;
+            if let Some(end) = guest.thread_state().lone_slice_end {
+                let now = guest.read_clock().expect("Couldn't read clock");
+                arm_lone_backstop(guest, end.saturating_sub(now));
             }
+            return;
         }
-        // This may LOOK like a noop, but actually all of the logic for ending the timeslice is in
-        // the prehook.  All the timer has to do is interrupt the guest and generate an extra call
-        // to this prehook.
-        let boundary_entry = if guest.config().no_rcb_time {
-            slice_boundary::callbacks::Callback::NoRcbTimer
-        } else {
-            slice_boundary::callbacks::Callback::PmuTimer
-        };
-        let boundary_token = self
-            .pre_handler_hook_observed(guest, true, CheckIn::Event, Some(boundary_entry))
-            .await;
-        if guest.config().no_rcb_time && guest.thread_state().last_rcb_timer_is_max {
-            let max_timeslice_end = guest
-                .thread_state()
-                .max_timeslice_end
-                .expect("PMU maximum timer requires a deadline");
-            guest
-                .thread_state_mut()
-                .thread_logical_time
-                .advance_to(max_timeslice_end);
-            if self.cfg.observes_schedevents() {
-                let dettid = guest.thread_state().dettid;
-                let ev = with_guest_time(
-                    guest,
-                    SchedEvent {
-                        dettid,
-                        op: Op::OtherInstructions,
-                        count: 1,
-                        start_rip: None,
-                        end_rip: None,
-                        end_time: None,
-                    },
-                );
-                let ev = with_guest_rip(guest, ev).await;
-                trace_schedevent(guest, ev, false).await;
-            }
-            if guest.thread_state().follows_replayed_schedule(&self.cfg)
-                && guest.thread_state().slice_boundary.is_none()
-            {
-                let fallback_deadline = max_timeslice_end
-                    + Duration::from_nanos(u64::from(
-                        self.cfg
-                            .max_timeslice
-                            .expect("PMU maximum must be configured"),
-                    ));
-                let thread_state = guest.thread_state_mut();
-                let replay_deadline = thread_state
-                    .end_of_timeslice
-                    .filter(|deadline| *deadline > max_timeslice_end)
-                    .unwrap_or(fallback_deadline);
-                thread_state.end_of_timeslice = Some(replay_deadline);
-                thread_state.max_timeslice_end = Some(replay_deadline);
-                thread_state.last_rcb_timer = None;
-                thread_state.last_rcb_timer_is_max = false;
-                thread_state.stats.reset_timeslice();
-            } else if guest.thread_state().own_signal_turn_hold.is_none() {
-                slice_boundary::no_rcb_maximum(guest.thread_state_mut())
-                    .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
-                self.end_timeslice(guest).await;
-            }
-        }
-        self.post_handler_hook_observed(guest, CheckIn::Event, boundary_token)
-            .await;
+        self.take_timer_event(guest).await;
     }
 
     async fn handle_syscall_event<G: Guest<Self>>(
@@ -4961,6 +5162,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
+        // Before anything this callback changes: the slice ends a lone thread
+        // ran past came first (`catch_up_lone_slice_ends`).
+        self.catch_up_lone_slice_ends(guest).await;
         #[cfg(feature = "dispatch-observer")]
         if let Some(observer) = dispatch_observer::installed() {
             // This is the genuine incoming event. An entry record does not

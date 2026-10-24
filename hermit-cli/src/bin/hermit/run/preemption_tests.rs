@@ -152,6 +152,7 @@ fn ptrace_and_e9patch_preprocessing_preserve_positive_maximums() {
                     detcore_model::summary::PreemptionSummary {
                         max_timeslice_ns: expected_maximum.map(|maximum| maximum.get()),
                         timer_enabled: Some(timer_supported),
+                        stopless_slice_ends: None,
                     }
                 );
                 let expected_display = if timer_supported {

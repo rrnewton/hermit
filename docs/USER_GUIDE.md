@@ -455,6 +455,30 @@ depending on the processor) of every slice. The option needs the PMU timer of
 the ptrace backend; on other backends, set chaos's cooperative deadline with
 `--target-timeslice`.
 
+Most of that cost comes from stopping the guest at the end of every slice,
+and much of it is saved where no other thread could run. When every other
+thread waits on a futex without a timeout, on a child or in `rt_sigsuspend`,
+and no timer, sleeper, poll deadline or host call is pending, a slice end
+cannot hand the turn to anyone, so Hermit lets the thread run on and processes
+each end it skipped when the thread next enters Hermit (a system call, a
+signal, a trapped instruction), at the same retired-branch count and in the
+same order. The schedule, the virtual clock and the chaos draws are what a stop
+at every end gives; `--eager-lone-preemptions` restores those stops, for
+comparison, and `--summary` reports how many ends were taken without a stop.
+Inputs from the host are the exception, as they are timed by the host either
+way: a signal sent from outside (which can also wake a thread asleep in
+`rt_sigsuspend`, a call that waits in the kernel) is seen at the next scheduler
+turn, which may come later than a stop would have; a thread killed from outside
+with `SIGKILL` never has its skipped ends processed; and a debugger that stops
+the thread between skipped ends sees Hermit's slice bookkeeping behind its
+program counter.
+Slice ends while two threads can run still stop the guest. This applies to the
+ptrace backend's precise timer, and not where the run records or replays
+preemptions or schedules, or uses `--target-timeslice`,
+`--chaos-per-thread-slowdown`, `--imprecise-timers`, turn-numbered triggers
+(`--stop-after-turn`, `--stop-after-iter`, `--signal-at`), stack traces at
+preemptions or events, manual interrupt points or a happens-before program.
+
 Every scheduler turn adds a fixed charge to the guest-visible clock
 (`--scheduler-turn-cost`, 500000 virtual nanoseconds by default), including
 the turn that ends a timeslice. With slices far shorter than the charge,

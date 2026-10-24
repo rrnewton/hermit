@@ -55,6 +55,7 @@ static PARENT_CONTINUE: OnceLock<PathBuf> = OnceLock::new();
 static SLEEPY_SIBLING: OnceLock<PathBuf> = OnceLock::new();
 static ITIMER_LOOP: OnceLock<PathBuf> = OnceLock::new();
 static ITIMER_STORM: OnceLock<PathBuf> = OnceLock::new();
+static LONE_SPIN: OnceLock<PathBuf> = OnceLock::new();
 
 /// Compile `hermit-cli/tests/fixtures/<name>.c` once.
 fn fixture(cell: &'static OnceLock<PathBuf>, name: &str) -> &'static Path {
@@ -1061,4 +1062,137 @@ fn itimer_a_recorded_schedule_replays() {
         results[0], results[1],
         "the replay did not reproduce the record"
     );
+}
+
+/// The INFO log lines in `stderr`, without their wall-clock prefixes.
+fn info_lines(stderr: &str) -> Vec<&str> {
+    stderr
+        .lines()
+        .filter(|line| line.contains(" INFO "))
+        .map(|line| line.split_once(' ').map_or(line, |(_, rest)| rest))
+        .collect()
+}
+
+/// What a run of the `lone_spin_then_race` fixture printed and logged.
+struct LoneRun {
+    stdout: String,
+    info: Vec<String>,
+    /// `PreemptionSummary::stopless_slice_ends` from `--summary-json`.
+    stopless: Option<u64>,
+}
+
+/// Run the fixture in `mode` under `--strict --chaos --seed=3` at
+/// `max_timeslice`, skipping a lone thread's slice-end stops (the default)
+/// or taking them (`eager`).
+fn lone_run(mode: &str, max_timeslice: &str, eager: bool) -> LoneRun {
+    let guest = fixture(&LONE_SPIN, "lone_spin_then_race");
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("lone-slice-ends-{}", std::process::id()));
+    fs::create_dir_all(&dir).expect("failed to create the summary directory");
+    let summary = dir.join(format!("{mode}-{max_timeslice}-{eager}.json"));
+    let mut run_args = vec![
+        "--chaos".to_owned(),
+        "--seed=3".to_owned(),
+        format!("--max-timeslice={max_timeslice}"),
+        format!("--summary-json={}", summary.display()),
+    ];
+    if eager {
+        run_args.push("--eager-lone-preemptions".to_owned());
+    }
+    let run_args: Vec<&str> = run_args.iter().map(String::as_str).collect();
+    let (stdout, stderr) = run_strict_with(guest, &[mode], &["--log=info"], &run_args);
+    let text = fs::read_to_string(&summary)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", summary.display()));
+    let json: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("{} is not JSON: {error}", summary.display()));
+    LoneRun {
+        stdout,
+        info: info_lines(&stderr).into_iter().map(str::to_owned).collect(),
+        stopless: json["preemption"]["stopless_slice_ends"].as_u64(),
+    }
+}
+
+/// Run `mode` both ways and require the same output and the same INFO log,
+/// line for line; return how many ends the skipping run took without a stop.
+/// `--eager-lone-preemptions` takes every stop and reports no count.
+fn lone_and_eager_agree(mode: &str, max_timeslice: &str) -> u64 {
+    let lazy = lone_run(mode, max_timeslice, false);
+    let eager = lone_run(mode, max_timeslice, true);
+    assert!(lazy.stdout.contains("sum="), "{mode}: {}", lazy.stdout);
+    assert_eq!(lazy.stdout, eager.stdout, "{mode}: outputs differ");
+    assert!(!lazy.info.is_empty(), "{mode}: no INFO lines");
+    if let Some((index, (lazy, eager))) = lazy
+        .info
+        .iter()
+        .zip(&eager.info)
+        .enumerate()
+        .find(|(_, (lazy, eager))| lazy != eager)
+    {
+        panic!("{mode}: INFO line {index} differs:\n  skipping: {lazy}\n  eager:    {eager}");
+    }
+    assert_eq!(
+        lazy.info.len(),
+        eager.info.len(),
+        "{mode}: INFO line counts"
+    );
+    assert_eq!(
+        eager.stopless, None,
+        "{mode}: --eager-lone-preemptions skips no stop"
+    );
+    lazy.stopless
+        .unwrap_or_else(|| panic!("{mode}: the skipping run reports no count"))
+}
+
+/// A slice end where no other thread could run is taken without a stop and
+/// processed when the thread next enters Detcore. Under chaos at 1000 ns, a
+/// main thread computing 25000 iterations alone while its worker waits on a
+/// condition variable, then racing it on a counter, prints the same output
+/// and the same INFO log as with a stop at every slice end, and takes some
+/// ends without a stop.
+#[test]
+fn slice_ends_taken_without_a_stop_leave_the_run_unchanged() {
+    let skipped = lone_and_eager_agree("wait", "1000");
+    assert!(skipped > 0, "no slice end was taken without a stop");
+}
+
+/// A worker in a timed wait could run at any slice end, so main's loop keeps
+/// its stops; with the worker in an untimed wait it skips them. At 1000 ns
+/// the 25000-iteration loop alone is about 500 slice ends.
+#[test]
+fn a_timed_waiter_keeps_the_stops_an_untimed_waiter_does_not() {
+    let napping = lone_and_eager_agree("sleep", "1000");
+    let waiting = lone_run("wait", "1000", false)
+        .stopless
+        .expect("the skipping run reports a count");
+    assert!(
+        napping + 300 < waiting,
+        "ends taken without a stop: {napping} beside a napping worker, {waiting} beside a waiting one"
+    );
+}
+
+/// Ends skipped before a trapped instruction (rdtsc) are processed before
+/// Detcore handles the instruction.
+#[test]
+fn skipped_slice_ends_come_before_a_trapped_instruction() {
+    let skipped = lone_and_eager_agree("rdtsc", "1000");
+    assert!(skipped > 0, "no slice end was taken without a stop");
+}
+
+/// Ends skipped before a signal (a SIGSEGV the guest handles) are processed
+/// before Detcore handles the signal.
+#[test]
+fn skipped_slice_ends_come_before_a_signal() {
+    let skipped = lone_and_eager_agree("segv", "1000");
+    assert!(skipped > 0, "no slice end was taken without a stop");
+}
+
+/// A lone stretch longer than the backstop timer of a thread running alone
+/// (at 1000000 ns, about 60 slice ends in 6M branches), and an exec right
+/// after a lone stretch, leave the run unchanged.
+#[test]
+fn skipped_slice_ends_survive_the_backstop_and_exec() {
+    let skipped = lone_and_eager_agree("long", "1000000");
+    assert!(skipped > 20, "long: {skipped} ends taken without a stop");
+    let skipped = lone_and_eager_agree("exec", "1000");
+    assert!(skipped > 0, "exec: no slice end was taken without a stop");
 }

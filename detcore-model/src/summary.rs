@@ -113,6 +113,11 @@ pub struct PreemptionSummary {
     /// `None` means an older producer did not record that fact.
     #[serde(default)]
     pub timer_enabled: Option<bool>,
+    /// Timeslice ends processed without stopping the guest because no other
+    /// thread could run (`Config::eager_lone_preemptions`), or `None` where
+    /// that is off or does not apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopless_slice_ends: Option<u64>,
 }
 
 impl fmt::Display for PreemptionSummary {
@@ -126,7 +131,14 @@ impl fmt::Display for PreemptionSummary {
             Some(true) => "enabled",
             None => "unknown",
         };
-        write!(f, "; timer: {timer}")
+        write!(f, "; timer: {timer}")?;
+        if let Some(ends) = self.stopless_slice_ends {
+            write!(
+                f,
+                "; slice ends taken without a stop (no other thread could run): {ends}"
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -499,6 +511,7 @@ mod tests {
             Some(PreemptionSummary {
                 max_timeslice_ns: Some(200_000_000),
                 timer_enabled: None,
+                stopless_slice_ends: None,
             })
         );
 
@@ -536,6 +549,7 @@ mod tests {
                 preemption: Some(PreemptionSummary {
                     max_timeslice_ns,
                     timer_enabled,
+                    stopless_slice_ends: None,
                 }),
                 ..Default::default()
             };
@@ -584,6 +598,7 @@ mod tests {
             let preemption = PreemptionSummary {
                 max_timeslice_ns,
                 timer_enabled,
+                stopless_slice_ends: None,
             };
             assert_eq!(preemption.to_string(), expected);
             let summary = RunSummary {
@@ -593,5 +608,31 @@ mod tests {
             assert!(summary.to_string().contains(expected));
             assert_eq!(summary.info(None).to_string(), baseline_info);
         }
+    }
+
+    #[test]
+    fn a_count_of_slice_ends_without_a_stop_is_shown_when_known() {
+        let preemption = PreemptionSummary {
+            max_timeslice_ns: Some(1000),
+            timer_enabled: Some(true),
+            stopless_slice_ends: Some(42),
+        };
+        assert_eq!(
+            preemption.to_string(),
+            "Configured maximum timeslice: 1000 virtual ns; timer: enabled; \
+             slice ends taken without a stop (no other thread could run): 42"
+        );
+        let value = serde_json::to_value(preemption).unwrap();
+        assert_eq!(value["stopless_slice_ends"], 42);
+        let unknown = PreemptionSummary {
+            stopless_slice_ends: None,
+            ..preemption
+        };
+        assert!(
+            serde_json::to_value(unknown)
+                .unwrap()
+                .get("stopless_slice_ends")
+                .is_none()
+        );
     }
 }

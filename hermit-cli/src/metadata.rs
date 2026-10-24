@@ -1253,6 +1253,9 @@ fn record_or_replay_config_with_timer_support(
         seed: default_config.seed,
         rng_seed: default_config.rng_seed,
         imprecise_timers: false,
+        // Record and replay make the same timeslice decisions either way: a
+        // lone thread's skipped stops are processed at the same branch counts.
+        eager_lone_preemptions: false,
         // Off in record and replay, a constant like the rest: replay rebuilds
         // this configuration and must decide every signal question as the
         // recording did, and recordings made before the copy was on by
