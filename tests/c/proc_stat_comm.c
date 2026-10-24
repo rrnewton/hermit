@@ -26,9 +26,13 @@
  * session) as comparisons with the system calls that report them. It prints
  * the outcome of every /proc/<pid>/comm read and write and of the execveat
  * as it is, an errno included, and keeps going, so one program describes
- * every backend: a backend that refuses /proc/<pid>/comm or descriptor
- * execs shows those errnos on those lines. Standard output is the oracle;
- * the program exits 0 when every step it requires ran.
+ * every backend: a backend that refuses /proc/<pid>/comm writes or
+ * descriptor execs shows those errnos on those lines. It compares the comm
+ * file with stat's name and with PR_GET_NAME wherever it checks a name, the
+ * root image (stage0) included, and reads a comm file in parts, by pread and
+ * after a rewind across renames (fs/seq_file.c seq_read_iter and
+ * seq_lseek). Standard output is the oracle; the program exits 0 when every
+ * step it requires ran.
  */
 
 #include <errno.h>
@@ -289,8 +293,138 @@ static void check_comm_is(const char* label, const char* expected) {
   }
   int file = (size_t)n == strlen(expected) + 1 &&
              memcmp(comm, expected, strlen(expected)) == 0;
-  printf("%s prctl=%d stat=%d comm-file=%d\n", label,
-         strcmp(name, expected) == 0, in_stat, file);
+  /* The comm file's name (before its newline) against stat's. */
+  struct stat_line again;
+  ssize_t s = read_path("/proc/self/stat", text, sizeof(text));
+  int comm_is_stat = n > 0 && comm[n - 1] == '\n' && s > 0 &&
+                     parse_stat(text, (size_t)s, &again) == 0 &&
+                     again.comm_len == (size_t)n - 1 &&
+                     memcmp(again.comm, comm, again.comm_len) == 0;
+  printf("%s prctl=%d stat=%d comm-file=%d comm-is-stat=%d\n", label,
+         strcmp(name, expected) == 0, in_stat, file, comm_is_stat);
+}
+
+/* The root image, which Hermit launched: its name by PR_GET_NAME, its comm
+ * file and its stat, compared, since the name itself depends on the path
+ * that started the program. Linux names all three from that path
+ * (kbasename(bprm->filename)). */
+static void root_names(void) {
+  char name[17] = {0};
+  if (prctl(PR_GET_NAME, name, 0, 0, 0) != 0) {
+    printf("root image PR_GET_NAME errno=%d\n", errno);
+    failures++;
+    return;
+  }
+  char comm[64];
+  ssize_t n = read_path("/proc/self/comm", comm, sizeof(comm));
+  if (n < 0) {
+    printf("root image comm-file errno=%d\n", errno);
+    return;
+  }
+  char text[2048];
+  struct stat_line line;
+  ssize_t s = read_path("/proc/self/stat", text, sizeof(text));
+  int newline = n > 0 && comm[n - 1] == '\n';
+  size_t length = newline ? (size_t)n - 1 : 0;
+  int prctl_is_comm = newline && strlen(name) == length &&
+                      memcmp(name, comm, length) == 0;
+  int stat_is_comm = newline && s > 0 &&
+                     parse_stat(text, (size_t)s, &line) == 0 &&
+                     line.comm_len == length &&
+                     memcmp(line.comm, comm, length) == 0;
+  printf("root image prctl-is-comm-file=%d stat-is-comm-file=%d\n",
+         prctl_is_comm, stat_is_comm);
+}
+
+/* preadv2 of the file at `path` at 0 with flags 0, RWF_HIPRI, RWF_DSYNC,
+ * RWF_SYNC and RWF_APPEND: a comm and a stat file have seq_read and no
+ * read_iter (fs/proc/base.c proc_pid_set_comm_operations,
+ * proc_single_file_operations), so do_loop_readv_writev takes RWF_HIPRI
+ * alone and refuses the others with EOPNOTSUPP. Prints the byte count where
+ * `lengths`, else ok, and the errno of a refusal. */
+static void preadv2_flags(const char* label, const char* path, int lengths) {
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    printf("%s preadv2 open errno=%d\n", label, errno);
+    return;
+  }
+  static const struct {
+    const char* name;
+    int flags;
+  } FLAGS[] = {{"0", 0},
+               {"hipri", RWF_HIPRI},
+               {"dsync", RWF_DSYNC},
+               {"sync", RWF_SYNC},
+               {"append", RWF_APPEND}};
+  printf("%s preadv2:", label);
+  for (size_t i = 0; i < sizeof(FLAGS) / sizeof(FLAGS[0]); i++) {
+    char text[1024];
+    struct iovec vector = {text, sizeof(text)};
+    ssize_t got = preadv2(fd, &vector, 1, 0, FLAGS[i].flags);
+    if (got < 0) {
+      printf(" %s=errno%d", FLAGS[i].name, errno);
+    } else if (lengths) {
+      printf(" %s=%zd", FLAGS[i].name, got);
+    } else {
+      printf(" %s=%s", FLAGS[i].name, got > 0 ? "ok" : "empty");
+    }
+  }
+  putchar('\n');
+  close(fd);
+}
+
+/* A comm file is a seq_file opened with single_open (fs/proc/base.c
+ * comm_open): a read renders the name once and later reads continue that
+ * rendering, a rename between them notwithstanding; a pread at 0, and a read
+ * after a rewind, render it again (fs/seq_file.c seq_read_iter, seq_lseek). */
+static void comm_positions(void) {
+  if (prctl(PR_SET_NAME, "first-name", 0, 0, 0) != 0) {
+    fail("PR_SET_NAME first-name");
+  }
+  int fd = open("/proc/self/comm", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    printf("comm positions errno=%d\n", errno);
+    return;
+  }
+  char text[64];
+  ssize_t first = read(fd, text, 3);
+  if (prctl(PR_SET_NAME, "second-name", 0, 0, 0) != 0) {
+    fail("PR_SET_NAME second-name");
+  }
+  ssize_t rest = first < 0 ? -1 : read(fd, text + first, 32);
+  if (first < 0 || rest < 0) {
+    printf("comm read in parts errno=%d\n", errno);
+  } else {
+    printf("comm read in parts: %zd+%zd bytes=", first, rest);
+    put_bytes(text, (size_t)(first + rest));
+    putchar('\n');
+  }
+  ssize_t again = pread(fd, text, 32, 0);
+  if (again < 0) {
+    printf("comm pread at 0 errno=%d\n", errno);
+  } else {
+    printf("comm pread at 0 after a rename: bytes=");
+    put_bytes(text, (size_t)again);
+    putchar('\n');
+  }
+  if (prctl(PR_SET_NAME, "third-name", 0, 0, 0) != 0) {
+    fail("PR_SET_NAME third-name");
+  }
+  if (lseek(fd, 0, SEEK_SET) != 0) {
+    printf("comm rewind errno=%d\n", errno);
+  } else {
+    ssize_t rewound = read(fd, text, 32);
+    if (rewound < 0) {
+      printf("comm read after a rewind errno=%d\n", errno);
+    } else {
+      printf("comm read after a rewind and a rename: bytes=");
+      put_bytes(text, (size_t)rewound);
+      putchar('\n');
+    }
+  }
+  close(fd);
+  preadv2_flags("comm", "/proc/self/comm", 1);
+  preadv2_flags("stat", "/proc/self/stat", 0);
 }
 
 /* comm writes: comm_write copies at most 15 bytes, raw, and returns the
@@ -534,6 +668,7 @@ static void stage1(const char* started_as) {
   show_comm_file("comm with raw bytes", "/proc/self/comm");
   show_stat("stat with raw bytes", "/proc/self/stat", getpid());
 
+  comm_positions();
   comm_writes();
   if (prctl(PR_SET_NAME, "probe-main", 0, 0, 0) != 0) {
     fail("PR_SET_NAME probe-main");
@@ -547,6 +682,8 @@ int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IOLBF, 0);
   const char* stage = argc > 1 ? argv[1] : "stage0";
   if (strcmp(stage, "stage0") == 0) {
+    root_names();
+    fflush(stdout);
     /* By the path that started this program: KVM keeps no executable for
      * /proc/self/exe to name in an image Hermit loaded itself. */
     char* const next[] = {"stat-comm-probe", "stage1", argv[0], NULL};

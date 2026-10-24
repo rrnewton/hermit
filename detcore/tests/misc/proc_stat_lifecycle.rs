@@ -1190,3 +1190,114 @@ fn a_pid_namespace_child_reads_its_parents_inherited_stat() {
         });
     });
 }
+
+/// Under a tracer every spelling of the caller's own `comm` stays the
+/// kernel's, as before package K slice A+, which renders a `comm` from
+/// Detcore's record only where that record is the name's source (KVM): a
+/// write through any spelling renames the task, a `pread` at 0 of the same
+/// descriptor reads the new name back, and every spelling, `PR_GET_NAME`
+/// and the rendered `stat` show it; the file's inode is the kernel's, not one
+/// of Detcore's per-process numbers (bit 63 set).
+#[test]
+fn every_comm_spelling_stays_the_kernels_under_a_tracer() {
+    natively_and_under_detcore(|| {
+        // SAFETY: plain identity calls.
+        let (pid, tid) = unsafe { (libc::getpid(), libc::syscall(libc::SYS_gettid)) };
+        let spellings = [
+            "/proc/self/comm".to_owned(),
+            "/proc/thread-self/comm".to_owned(),
+            format!("/proc/{pid}/comm"),
+            format!("/proc/self/task/{tid}/comm"),
+            format!("/proc/{pid}/task/{tid}/comm"),
+        ];
+        for (index, spelling) in spellings.iter().enumerate() {
+            let name = format!("kernel-name-{index}");
+            let path = std::ffi::CString::new(spelling.as_str()).unwrap();
+            // SAFETY: a NUL-terminated path.
+            let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR) };
+            assert!(
+                fd >= 0,
+                "open {spelling} for writing: {}",
+                std::io::Error::last_os_error()
+            );
+            write_all(fd, name.as_bytes());
+            let line = format!("{name}\n").into_bytes();
+            assert_eq!(pread_all(fd, 0), line, "{spelling}");
+            // SAFETY: a stat buffer this guest owns.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fd, &mut stat) }, 0);
+            assert_eq!(stat.st_ino >> 63, 0, "{spelling}: {:#x}", stat.st_ino);
+            // SAFETY: the descriptor opened above.
+            unsafe { libc::close(fd) };
+            for other in &spellings {
+                let fd = open_stat(other);
+                assert_eq!(read_rest(fd), line, "{other} after {spelling}");
+                // SAFETY: the descriptor opened just above.
+                unsafe { libc::close(fd) };
+            }
+            let mut named = [0_u8; 16];
+            // SAFETY: PR_GET_NAME writes 16 bytes into a buffer this guest
+            // owns.
+            assert_eq!(
+                unsafe { libc::prctl(libc::PR_GET_NAME, named.as_mut_ptr()) },
+                0
+            );
+            assert_eq!(&named[..name.len()], name.as_bytes(), "{spelling}");
+            let stat = open_stat("/proc/self/stat");
+            assert_eq!(field(&read_rest(stat), 2), format!("({name})"));
+            // SAFETY: the descriptor opened just above.
+            unsafe { libc::close(stat) };
+        }
+    });
+}
+
+/// A process's `stat` and `cgroup` (`ONE()` entries,
+/// `proc_single_file_operations`) and a task's `comm`
+/// (`proc_pid_set_comm_operations`) have `.read = seq_read` and no
+/// `.read_iter`, so a vectored read goes through `do_loop_readv_writev`:
+/// `preadv2` takes flags 0 and `RWF_HIPRI` and refuses `RWF_DSYNC`,
+/// `RWF_SYNC` and `RWF_APPEND` with EOPNOTSUPP, natively and under Detcore,
+/// whose dispatch serves the rendered `stat` and `cgroup` here (the `comm`
+/// files stay the kernel's under a tracer).
+#[test]
+fn vectored_reads_of_stat_cgroup_and_comm_take_only_rwf_hipri() {
+    natively_and_under_detcore(|| {
+        for path in [
+            "/proc/self/stat",
+            "/proc/thread-self/stat",
+            "/proc/self/cgroup",
+            "/proc/self/comm",
+            "/proc/thread-self/comm",
+        ] {
+            let fd = open_stat(path);
+            for (flags, refused) in [
+                (0, false),
+                (libc::RWF_HIPRI, false),
+                (libc::RWF_DSYNC, true),
+                (libc::RWF_SYNC, true),
+                (libc::RWF_APPEND, true),
+            ] {
+                let mut buffer = [0_u8; 1024];
+                let vector = libc::iovec {
+                    iov_base: buffer.as_mut_ptr().cast(),
+                    iov_len: buffer.len(),
+                };
+                // SAFETY: one vector over a buffer this guest owns, at
+                // position 0 (pos_l, pos_h).
+                let got = unsafe { libc::syscall(libc::SYS_preadv2, fd, &vector, 1, 0, 0, flags) };
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if refused {
+                    assert_eq!(
+                        (got, errno),
+                        (-1, Some(libc::EOPNOTSUPP)),
+                        "{path} flags {flags:#x}"
+                    );
+                } else {
+                    assert!(got > 0, "{path} flags {flags:#x}: {got} {errno:?}");
+                }
+            }
+            // SAFETY: the descriptor opened above.
+            unsafe { libc::close(fd) };
+        }
+    });
+}

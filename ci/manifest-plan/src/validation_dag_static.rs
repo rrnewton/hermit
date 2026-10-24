@@ -2795,7 +2795,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // /proc/<pid>/stat (procfs::task_stat seven, procfs five, the
     // scheduler's task-name, parent and RSS-limit unit, rendered_procfs's
     // comm-authentication unit and misc's PR_SET_NAME unit): 2515, listed.
-    ("test.detcore_unit", 2515),
+    // And package K slice A+'s eight units for the rendered /proc/<pid>/comm
+    // on KVM (procfs::task_stat two, procfs two, the scheduler's comm-record
+    // unit, rendered_procfs's write-open and mode unit, its write-open
+    // refusal unit and its `..` alias walk unit, and tool_global's four
+    // comm_alias_open_tests through handle_openat): 2527, listed.
+    ("test.detcore_unit", 2527),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -2886,7 +2891,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And package K slice D4c-1's twenty proc_stat_lifecycle tests of the
     // rendered /proc/<pid>/stat under a real tracer (the exec helper
     // a_syncfs_run_after_an_exec counted among them): 157.
-    ("test.detcore_misc", 157),
+    // And package K slice A+'s two proc_stat_lifecycle tests: every spelling
+    // of a task's comm stays the kernel's under a tracer, and stat, cgroup
+    // and comm take only RWF_HIPRI in a vectored read: 159.
+    ("test.detcore_misc", 159),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -4556,7 +4564,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same record-mode tight-stack open: 135.
     // And the two 4213 cpuinfo-session tests: 137.
     // And the same twenty D4c-1 proc_stat_lifecycle tests: 157.
-    ("test.detcore_misc_on_host", 157),
+    // And the same two A+ tests: 159.
+    ("test.detcore_misc_on_host", 159),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -4908,7 +4917,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the nineteen callback-history units of
     // https://github.com/rrnewton/hermit/pull/4582: 2500.
     // And the same fifteen D4c-1 units: 2515, listed.
-    ("test.detcore_unit_on_host", 2515),
+    // And the same twelve A+ units: 2527, listed.
+    ("test.detcore_unit_on_host", 2527),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

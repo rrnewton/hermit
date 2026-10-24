@@ -33140,6 +33140,82 @@ mod test {
         assert_eq!(scheduler.task_comm(worker), Some(probe));
     }
 
+    /// A rendered `comm` (package K slice A+) reads the record the facts of
+    /// its task carry, so every spelling of the reader's own process's comm
+    /// shows the described task's name and a newline: a new task's is its
+    /// creator's, `PR_SET_NAME` changes only the renamed task's, and an exec
+    /// names the image by its `AT_EXECFN`, after a thread's exec under the
+    /// leader's tid. The source is the record only where the backend's
+    /// guest threads are not host tasks the tool can name (KVM); elsewhere
+    /// Detcore renders no `comm`, whatever the record holds.
+    #[test]
+    fn a_rendered_comm_reads_the_record_after_renames_clones_and_execs() {
+        use crate::procfs::task_stat::CommSource;
+        use crate::procfs::task_stat::TaskComm;
+        use crate::procfs::task_stat::render_comm;
+        use crate::procfs::task_stat::renders_task_comm;
+        let mut scheduler = Scheduler::new(&Config::default());
+        let (leader, worker, child) = (
+            DetTid::from_raw(3),
+            DetTid::from_raw(4),
+            DetTid::from_raw(5),
+        );
+        scheduler.thread_tree.add_child(leader, leader, true);
+        register_known_thread(&mut scheduler, leader);
+        // The root before its first image: nothing to render, so the
+        // kernel beneath answers (the executor's EACCES on KVM).
+        let unnamed = scheduler.task_stat_facts(leader, None);
+        assert!(!renders_task_comm(&unnamed, 3, CommSource::Record));
+        // The root's image, launched as /path/to/probe.
+        scheduler.set_task_comm(leader, TaskComm::of_exec_filename(b"/path/to/probe"));
+        let comm = |scheduler: &Scheduler, named: DetTid, thread: Option<DetTid>| {
+            let facts = scheduler.task_stat_facts(named, thread);
+            render_comm(&facts.comm.expect("a recorded name"))
+        };
+        // `self`, its pid and `thread-self` of the leader name one task.
+        assert_eq!(comm(&scheduler, leader, None), b"probe\n");
+        assert_eq!(comm(&scheduler, leader, Some(leader)), b"probe\n");
+        let own = scheduler.task_stat_facts(leader, None);
+        assert!(renders_task_comm(&own, 3, CommSource::Record));
+        assert!(
+            !renders_task_comm(&own, 3, CommSource::Kernel),
+            "ptrace, DBT, SaBRe and LiteInst leave every comm to the kernel"
+        );
+        assert!(
+            !renders_task_comm(&own, 9, CommSource::Record),
+            "another process's comm is the kernel beneath's"
+        );
+        // PR_SET_NAME (15 bytes kept) by the leader.
+        scheduler.set_task_comm(leader, TaskComm::new(b"0123456789abcdefghij"));
+        assert_eq!(comm(&scheduler, leader, None), b"0123456789abcde\n");
+        // A thread starts with its creator's name, then renames itself;
+        // `task/<tid>/comm` (and its own `thread-self/comm`) show its own.
+        scheduler.thread_tree.add_child(leader, worker, false);
+        register_known_thread(&mut scheduler, worker);
+        assert_eq!(comm(&scheduler, leader, Some(worker)), b"0123456789abcde\n");
+        scheduler.set_task_comm(worker, TaskComm::new(b"worker-thread"));
+        assert_eq!(comm(&scheduler, leader, Some(worker)), b"worker-thread\n");
+        assert_eq!(comm(&scheduler, leader, None), b"0123456789abcde\n");
+        // A forked child starts with its creator's name.
+        scheduler.thread_tree.add_child(leader, child, true);
+        register_known_thread(&mut scheduler, child);
+        assert_eq!(comm(&scheduler, child, None), b"0123456789abcde\n");
+        assert!(renders_task_comm(
+            &scheduler.task_stat_facts(child, None),
+            5,
+            CommSource::Record
+        ));
+        // An exec by the worker: it keeps its own name under the leader's
+        // tid, then the exec's edge names the image by its AT_EXECFN.
+        scheduler
+            .thread_tree
+            .transfer_exec_parent_death(worker, leader);
+        assert_eq!(comm(&scheduler, leader, None), b"worker-thread\n");
+        scheduler.set_task_comm(leader, TaskComm::of_exec_filename(b"/proc/self/exe"));
+        assert_eq!(comm(&scheduler, leader, None), b"exe\n");
+        assert_eq!(comm(&scheduler, child, None), b"0123456789abcde\n");
+    }
+
     /// A parent-death signal follows Linux's `forget_original_parent`
     /// (https://github.com/rrnewton/hermit/issues/4440): a child's
     /// parent-death parent is the thread that created it; when that thread

@@ -1684,7 +1684,7 @@
       "disposition": "manifest-test",
       "path": "tests/c/proc_stat_comm.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
-      "why": "tests/c/proc_stat_comm.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Reads its own /proc/<pid>/stat (52 fields) by every spelling, a thread's task stat, a fork child's and a descriptor kept across an exec, and checks the name stat shows after PR_SET_NAME, comm writes, pthread_setname_np, an exec through a long symbolic link and execveat(AT_EMPTY_PATH) (c-programs/proc-stat-comm); Detcore renders a process's own stat"
+      "why": "tests/c/proc_stat_comm.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Reads its own /proc/<pid>/stat (52 fields) by every spelling, a thread's task stat, a fork child's and a descriptor kept across an exec, and checks the name stat shows after PR_SET_NAME, comm writes, pthread_setname_np, an exec through a long symbolic link and execveat(AT_EMPTY_PATH), comparing the comm file with stat and PR_GET_NAME and reading it by seq_file positions (c-programs/proc-stat-comm); Detcore renders a process's own stat, and on KVM its own comm reads"
     },
     {
       "disposition": "guest-fixture",
@@ -4162,13 +4162,13 @@
       "disposition": "support-data",
       "path": "tests/e2e/system-utils/stat-alias",
       "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
-      "why": "tests/e2e/system-utils/stat-alias is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: A symbolic link to /usr/bin/bash through which system-utils/stat-alias-root launches its root image, so the run's root is an ELF executed by an alias name; Detcore's stat names it by the link on ptrace and KVM; the KVM row records the executor's canonical naming, and the DBT row DynamoRIO's naming by the link's target"
+      "why": "tests/e2e/system-utils/stat-alias is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: A symbolic link to /usr/bin/bash through which system-utils/stat-alias-root launches its root image, so the run's root is an ELF executed by an alias name; Detcore's stat, and on KVM its comm reads, name it by the link on ptrace and KVM; the KVM row records the executor's canonical naming, and the DBT row DynamoRIO's naming by the link's target"
     },
     {
       "disposition": "manifest-test",
       "path": "tests/e2e/system-utils/stat-root.sh",
       "runner": "target/debug/test-harness via tests/e2e/manifests/system-utils.yaml",
-      "why": "tests/e2e/system-utils/stat-root.sh is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: The run's root image is this #!/usr/bin/bash script, which prints the name its own /proc/<pid>/stat, status Name: and comm show (system-utils/stat-script-root); Detcore renders the stat, and the KVM row records the executor's interpreter naming of a script root, the DBT row DynamoRIO's"
+      "why": "tests/e2e/system-utils/stat-root.sh is owned by target/debug/test-harness via tests/e2e/manifests/system-utils.yaml: The run's root image is this #!/usr/bin/bash script, which prints the name its own /proc/<pid>/stat, status Name: and comm show (system-utils/stat-script-root); Detcore renders the stat, and on KVM the comm reads; the KVM row records the executor's interpreter naming of a script root, the DBT row DynamoRIO's"
     },
     {
       "disposition": "manifest-test",

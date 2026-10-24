@@ -171,6 +171,14 @@ enum ProcfsKind {
     /// A system-wide file with one fixed value, rendered by Detcore (see
     /// [`FixedProcfsFile`]).
     Fixed(FixedProcfsFile),
+    /// `/proc/<pid>/comm`, by every spelling of a task's directory: the
+    /// task's name and a newline (`procfs::task_stat::render_comm`). Only
+    /// rendered, from Detcore's record, where that record is the name's
+    /// source (package K slice A+), and only for reading; a file the kernel
+    /// opens keeps the kernel's bytes, unclassified
+    /// (`ProcfsFile::kernel_served`), as before. Appended last, so every
+    /// other kind keeps its serialized number.
+    ProcessComm,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1589,6 +1597,7 @@ impl ProcfsFile {
             other if is_process_file_path(other, "cgroup") => ProcfsKind::ProcessCgroup,
             other if is_process_file_path(other, "auxv") => ProcfsKind::ProcessAuxv,
             other if is_process_file_path(other, "cmdline") => ProcfsKind::ProcessCmdline,
+            other if is_process_file_path(other, "comm") => ProcfsKind::ProcessComm,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-949): Review per-mapping memory accounting normalization.
             other if is_process_file_path(other, "smaps") => ProcfsKind::Smaps,
@@ -1755,18 +1764,26 @@ impl ProcfsFile {
     /// and `mounts` only in a session with a container mount table
     /// ([`RenderedFiles::mounts`]). A name's index numbers its files' inodes
     /// (`procfs_inode::per_process_inode`), so a new name goes last.
-    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 6] = [
+    const PER_PROCESS_KINDS: [(ProcfsKind, &'static str); 7] = [
         (ProcfsKind::ProcessCgroup, "cgroup"),
         (ProcfsKind::ProcessAuxv, "auxv"),
         (ProcfsKind::Mountinfo, "mountinfo"),
         (ProcfsKind::ProcessMounts, "mounts"),
         (ProcfsKind::ProcessCmdline, "cmdline"),
         (ProcfsKind::ProcessStat, "stat"),
+        (ProcfsKind::ProcessComm, "comm"),
     ];
 
     /// The names of the per-process files Detcore renders.
-    pub(crate) const PER_PROCESS_NAMES: [&'static str; 6] =
-        ["cgroup", "auxv", "mountinfo", "mounts", "cmdline", "stat"];
+    pub(crate) const PER_PROCESS_NAMES: [&'static str; 7] = [
+        "cgroup",
+        "auxv",
+        "mountinfo",
+        "mounts",
+        "cmdline",
+        "stat",
+        "comm",
+    ];
 
     /// Pin which view of the mounts this kernel-opened `mountinfo` or `mounts`
     /// reads: the kernel's (`kernel`, its task's root had changed when it was
@@ -1804,8 +1821,13 @@ impl ProcfsFile {
     ///
     /// A process's `stat` the kernel opened is classified, and sanitized, as
     /// before Detcore rendered it.
+    ///
+    /// Nor a task's `comm`, which Detcore renders only from its record where
+    /// that is the name's source: a descriptor the kernel opened (on ptrace
+    /// and DBT every one, on KVM another process's) keeps the kernel's file,
+    /// unclassified, as before Detcore rendered it.
     pub(crate) fn kernel_served(&self) -> bool {
-        !self.is_plain_process_file()
+        !self.is_plain_process_file() && !self.is_task_comm()
     }
 
     /// Whether this is a per-process file Linux serves with a plain `read`
@@ -1854,13 +1876,22 @@ impl ProcfsFile {
         )
     }
 
-    /// Whether this is a process's `stat` that Detcore opened as rendered,
-    /// whose snapshot is rendered from the task's facts (`procfs::task_stat`)
-    /// at the first read, and again whenever a read or a seek moves to a
-    /// position other than where the last read left the sequence
-    /// ([`Self::drop_stale_task_snapshot`]).
+    /// Whether this is a task's `comm`, by any spelling.
+    pub(crate) fn is_task_comm(&self) -> bool {
+        self.kind == ProcfsKind::ProcessComm
+    }
+
+    /// Whether this is a process's `stat`, or a task's `comm`, that Detcore
+    /// opened as rendered, whose snapshot is rendered from the task's facts
+    /// (`procfs::task_stat`) at the first read, and again whenever a read or
+    /// a seek moves to a position other than where the last read left the
+    /// sequence ([`Self::drop_stale_task_snapshot`]). Linux opens both with
+    /// `single_open` and serves them with `seq_read` and `seq_lseek`
+    /// (`proc_single_file_operations`, `proc_pid_set_comm_operations`,
+    /// fs/proc/base.c:823-828 and 1772-1778 in 6.17), so both follow the same
+    /// positioning.
     pub(crate) fn renders_task_record(&self) -> bool {
-        self.rendered && self.is_task_stat()
+        self.rendered && (self.is_task_stat() || self.is_task_comm())
     }
 
     /// Where this rendered `stat`'s sequence is (Linux's `m->read_pos`): the
@@ -2039,6 +2070,17 @@ impl ProcfsFile {
             // `auxv_read` and `proc_pid_cmdline_read` are plain `read`s
             // (RWF_NOWAIT is EOPNOTSUPP).
             ProcfsKind::ProcessAuxv | ProcfsKind::ProcessCmdline => false,
+            // A process's `stat` and `cgroup` are `ONE()` entries, served by
+            // `proc_single_file_operations`, and a task's `comm` by
+            // `proc_pid_set_comm_operations`: `.read = seq_read`, no
+            // `.read_iter` (fs/proc/base.c:823-828 and 1772-1778 in 6.17), so
+            // a vectored read of any of them goes through
+            // `do_loop_readv_writev`, which refuses every flag but RWF_HIPRI.
+            ProcfsKind::Stat
+            | ProcfsKind::ThreadStat
+            | ProcfsKind::ProcessStat
+            | ProcfsKind::ProcessCgroup
+            | ProcfsKind::ProcessComm => false,
             _ => true,
         }
     }
@@ -2120,7 +2162,10 @@ impl ProcfsFile {
             ProcfsKind::ProcessCmdline => b"",
             // The bytes are the task's facts in Detcore's process table,
             // which the first read supplies (`procfs::task_stat`).
-            ProcfsKind::Stat | ProcfsKind::ThreadStat | ProcfsKind::ProcessStat => b"",
+            ProcfsKind::Stat
+            | ProcfsKind::ThreadStat
+            | ProcfsKind::ProcessStat
+            | ProcfsKind::ProcessComm => b"",
             // The bytes are the session's container mount table, which the
             // first read supplies (`Detcore::mount_table_snapshot`).
             ProcfsKind::Mountinfo | ProcfsKind::ProcessMounts => b"",
@@ -2384,12 +2429,16 @@ impl ProcfsFile {
             task_stat,
         } = context;
         let mapping_identities = &mapping_identities;
-        // A process's `stat` Detcore opened is rendered from the task's
-        // facts, which the caller looked up for this read; the template
-        // stands in for nothing.
+        // A process's `stat`, or a task's `comm`, Detcore opened is rendered
+        // from the task's facts, which the caller looked up for this read;
+        // the template stands in for nothing.
         if self.renders_task_record() {
             let task_stat = task_stat.expect("a rendered stat read without its task's facts");
-            self.contents = Some(task_stat::render_stat(&task_stat));
+            self.contents = Some(if self.is_task_comm() {
+                task_stat::render_comm(&task_stat.comm)
+            } else {
+                task_stat::render_stat(&task_stat)
+            });
             return;
         }
         self.contents = Some(match &self.kind {
@@ -2465,8 +2514,12 @@ impl ProcfsFile {
             ProcfsKind::SmapsRollup => sanitize_smaps_rollup(&contents),
             ProcfsKind::ArchStatus => sanitize_arch_status(&contents),
             ProcfsKind::ProcessCgroup => sanitize_process_cgroup(&contents),
-            // Binary, and Detcore's own record: kept as it is.
-            ProcfsKind::ProcessAuxv | ProcfsKind::ProcessCmdline => contents.to_vec(),
+            // Binary, and Detcore's own record: kept as it is. A `comm` the
+            // kernel opened is never classified (`Self::kernel_served`), so
+            // only a rendered one is initialized, above.
+            ProcfsKind::ProcessAuxv | ProcfsKind::ProcessCmdline | ProcfsKind::ProcessComm => {
+                contents.to_vec()
+            }
             ProcfsKind::CpuidleCounter => sanitize_cpuidle_counter(&contents),
             ProcfsKind::Smaps => sanitize_smaps(&contents, mapping_identities),
             ProcfsKind::Maps => {
@@ -8737,6 +8790,8 @@ total_commit_ms 0\n"
         let bound = |spelling: &str| {
             let mut file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
             assert_eq!(file.per_process_name(), Some("cgroup"), "{spelling}");
+            // `ONE("cgroup")`: `seq_read` without `read_iter`.
+            assert!(!file.has_read_iter(), "{spelling}");
             file.bind_task(3, 5);
             file.rendered_path(RenderedFiles::WITHOUT_CPUINFO)
         };
@@ -9062,11 +9117,11 @@ total_commit_ms 0\n"
     /// `cmdline` so the other files keep their inode numbers. It is a
     /// `single_open` seq file whose `show` runs at a read, like `cgroup`. A
     /// `stat` the kernel opened is classified and sanitized as before.
-    /// `comm` stays the kernel's (no per-process name), and `/proc/stat` and
-    /// `/proc/self/statm` are neither.
+    /// `/proc/stat` and `/proc/self/statm` are neither (`comm`, named after
+    /// it, is the next test's).
     #[test]
     fn a_process_stat_is_a_rendered_per_process_seq_file() {
-        assert_eq!(ProcfsFile::PER_PROCESS_NAMES.last(), Some(&"stat"));
+        assert_eq!(ProcfsFile::PER_PROCESS_NAMES[5], "stat");
         for spelling in [
             "/proc/self/stat",
             "/proc/thread-self/stat",
@@ -9080,17 +9135,12 @@ total_commit_ms 0\n"
             assert!(file.kernel_served(), "{spelling}");
             assert!(file.shows_at_read(), "{spelling}");
             assert!(file.snapshot_at_first_read(), "{spelling}");
-            assert!(file.has_read_iter(), "{spelling}");
+            // `seq_read` without `read_iter` (`proc_single_file_operations`).
+            assert!(!file.has_read_iter(), "{spelling}");
             // Not rendered: a kernel-opened descriptor keeps its sanitizer.
             assert!(!file.renders_task_record(), "{spelling}");
         }
-        for other in [
-            "/proc/stat",
-            "/proc/self/statm",
-            "/proc/self/stat/x",
-            "/proc/self/comm",
-            "/proc/self/task/8/comm",
-        ] {
+        for other in ["/proc/stat", "/proc/self/statm", "/proc/self/stat/x"] {
             assert!(
                 ProcfsFile::from_path(Path::new(other))
                     .is_none_or(|file| file.per_process_name().is_none()),
@@ -9118,6 +9168,117 @@ total_commit_ms 0\n"
             thread: file.bound_task().unwrap().thread.map(|_| 1),
         });
         file.into_rendered()
+    }
+
+    /// A task's `comm` is a per-process file Detcore renders (package K slice
+    /// A+), by every spelling of a task's directory, named last so every
+    /// other file keeps its inode number. Linux opens it with `single_open`
+    /// (`comm_open`) and serves it with `seq_read` and `seq_lseek`, so it is
+    /// a seq file whose `show` runs at a read, rendered and positioned as a
+    /// rendered `stat` is. A `comm` the kernel opened is never classified
+    /// (not `kernel_served`): it keeps the kernel's bytes, as before.
+    #[test]
+    fn a_task_comm_is_a_rendered_per_process_seq_file_only_when_rendered() {
+        assert_eq!(ProcfsFile::PER_PROCESS_NAMES.last(), Some(&"comm"));
+        for spelling in [
+            "/proc/self/comm",
+            "/proc/thread-self/comm",
+            "/proc/7/comm",
+            "/proc/7/task/8/comm",
+            "/proc/self/task/8/comm",
+        ] {
+            let file = ProcfsFile::from_path(Path::new(spelling)).unwrap();
+            assert_eq!(file.per_process_name(), Some("comm"), "{spelling}");
+            assert!(file.is_task_comm(), "{spelling}");
+            assert!(!file.is_task_stat(), "{spelling}");
+            assert!(!file.kernel_served(), "{spelling}");
+            assert!(file.shows_at_read(), "{spelling}");
+            assert!(file.snapshot_at_first_read(), "{spelling}");
+            // `seq_read` without `read_iter` (`proc_pid_set_comm_operations`).
+            assert!(!file.has_read_iter(), "{spelling}");
+            assert!(!file.renders_task_record(), "{spelling}");
+        }
+        for other in [
+            "/proc/comm",
+            "/proc/self/comm/x",
+            "/proc/thread-self/task/8/comm",
+            "/proc/7/task/self/comm",
+            "/proc/7/task/8/comm/x",
+        ] {
+            assert!(
+                ProcfsFile::from_path(Path::new(other))
+                    .is_none_or(|file| file.per_process_name().is_none()),
+                "{other}"
+            );
+        }
+        for (spelling, path) in [
+            ("/proc/self/comm", "/proc/3/comm"),
+            ("/proc/thread-self/comm", "/proc/3/task/5/comm"),
+            ("/proc/3/task/5/comm", "/proc/3/task/5/comm"),
+        ] {
+            let rendered = bound_rendered_stat(spelling);
+            assert_eq!(rendered.opened_path(), Some(Path::new(path)), "{spelling}");
+            assert!(rendered_path_is_seq_file(Path::new(path)), "{spelling}");
+            assert!(rendered.rendering_template().is_empty(), "{spelling}");
+            assert!(rendered.renders_task_record(), "{spelling}");
+        }
+    }
+
+    /// A rendered `comm`'s snapshot is the task's name in the record the
+    /// caller looked up, and a newline (`comm_show`); a rename the caller
+    /// looks up for a later read at 0 renders again, while a sequential read
+    /// keeps the buffered name, as `seq_read_iter` does.
+    #[test]
+    fn a_rendered_comm_snapshot_is_the_recorded_name_and_follows_seq_file() {
+        let named = |name: &[u8]| task_stat::TaskStat {
+            comm: task_stat::TaskComm::new(name),
+            ..stat_record(1)
+        };
+        let render = |file: &mut ProcfsFile, position, name: &[u8]| {
+            file.initialize(
+                Vec::new(),
+                ProcfsSnapshotContext {
+                    task_stat: Some(named(name)),
+                    ..ProcfsSnapshotContext::default()
+                },
+            );
+            file.note_task_record_rendered(position, true);
+        };
+        let mut comm = bound_rendered_stat("/proc/self/comm");
+        comm.drop_stale_task_snapshot(0);
+        assert!(comm.needs_snapshot());
+        render(&mut comm, 0, b"probe");
+        assert_eq!(
+            comm.rendered_snapshot(),
+            Some(
+                &b"probe
+"[..]
+            )
+        );
+        comm.commit_read(0, 2);
+        // A sequential read continues the buffered name.
+        comm.drop_stale_task_snapshot(2);
+        assert!(!comm.needs_snapshot());
+        // A pread at 0 after a rename renders the new name.
+        comm.drop_stale_task_snapshot(0);
+        assert!(comm.needs_snapshot());
+        render(&mut comm, 0, b"0123456789abcdefghij");
+        assert_eq!(comm.rendered_snapshot(), Some(&b"0123456789abcde\n"[..]));
+        // A seek elsewhere renders at the seek; to 0, at the next read.
+        assert!(comm.seek_task_record(3));
+        assert!(comm.needs_snapshot());
+        render(&mut comm, 3, b"a)b\n\\c");
+        assert_eq!(comm.rendered_snapshot(), Some(&b"a)b\n\\c\n"[..]));
+        assert!(!comm.seek_task_record(0));
+        assert!(comm.needs_snapshot());
+        // A rendered `stat` of the same task still renders its 52 fields.
+        let mut stat = bound_rendered_stat("/proc/self/stat");
+        stat.drop_stale_task_snapshot(0);
+        render(&mut stat, 0, b"probe");
+        assert_eq!(
+            stat.rendered_snapshot(),
+            Some(&task_stat::render_stat(&named(b"probe"))[..])
+        );
     }
 
     fn stat_record(num_threads: i32) -> task_stat::TaskStat {

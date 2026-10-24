@@ -41,9 +41,28 @@
 //! thread writes `/proc/self/task/<tid>/comm`), and after
 //! `execveat(fd, "", AT_EMPTY_PATH)` on Linux 6.14 and later (named by the
 //! file's dentry, the record by `/dev/fd/<fd>`). Neither can happen where the
-//! record is used: the KVM executor refuses a `comm` file open (EACCES) and
-//! that exec (ENOTSUP). The `comm` files themselves stay the kernel's (the
-//! executor's on KVM).
+//! record is used: Detcore refuses an open of the reader's own `comm` for
+//! writing (EACCES, below), and the KVM executor refuses that exec
+//! (ENOTSUP).
+//!
+//! The `comm` files (package K slice A+): where the name's source is the
+//! record (KVM), Detcore also renders the reader's own process's
+//! `/proc/<pid>/comm`, by every spelling (`self`, its pid, `thread-self`,
+//! `task/<tid>`), from the same record ([`render_comm`],
+//! [`renders_task_comm`]), with the `stat` file's seq_file positioning and
+//! failure policy. Detcore does not write a name: it refuses an open of a
+//! rendered `comm` for writing itself, with EACCES and no injected call
+//! (`syscalls::files::rendered_procfs::asks_to_write_comm`), by its path,
+//! through a descriptor link, and through a `..` spelling, which Detcore
+//! walks itself where it models every component, checking each task it
+//! passes (`walk_comm_alias`), and refuses by name for writing where it does
+//! not (<https://github.com/rrnewton/hermit/issues/4263>), so the record
+//! cannot fall behind a write and the answer depends on neither the host nor
+//! the kernel beneath.
+//! DECLARED: Linux renames the task (`comm_write`). Another process's
+//! `comm` stays the kernel beneath's (the executor's). Where the source is
+//! the kernel (ptrace, DBT, SaBRe, LiteInst), every `comm` file stays the
+//! kernel's, as before, unclassified.
 //!
 //! DECLARED, KVM: for the run's root image, the record (from `AT_EXECFN`,
 //! the path the root was launched by) names the task as Linux does, while
@@ -57,10 +76,18 @@
 //! the executor's naming is the executor's
 //! (<https://github.com/rrnewton/reverie/issues/1106>; cells
 //! `system-utils/stat-script-root` and `system-utils/stat-alias-root` record
-//! it). On ptrace and DBT all three are the kernel's.
+//! it). On ptrace and DBT all three are the kernel's. The rendered `comm`
+//! file follows the record, so on KVM it agrees with `stat` and disagrees
+//! with `PR_GET_NAME` and `status` for those two roots in the same way, and
+//! in every descendant that has not renamed itself or exec'd since. The same
+//! split can follow a guest exec by a spelling the executor canonicalizes: a
+//! slashless `execve("alias", ...)` of a symbolic link `alias -> actual` can
+//! be named `actual` by the executor while the record, `stat` and `comm` say
+//! `alias`, as Linux does. After `PR_SET_NAME`, both follow the same rule.
 //!
 //! The rules are Linux 6.17's (fs/proc/array.c `do_task_stat`, fs/exec.c
-//! `begin_new_exec`, kernel/sys.c `PR_SET_NAME`).
+//! `begin_new_exec`, kernel/sys.c `PR_SET_NAME`, fs/proc/base.c
+//! `comm_show`).
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -215,6 +242,15 @@ impl CommSource {
     /// read succeeds through a tracer's own `/proc`, and where the tool
     /// shares the guest's root, not at all: the read of `stat` is refused by
     /// name (`Detcore::kernel_task_comm`).
+    ///
+    /// NOTE: `tool_can_name_guest_descriptors` is today the inverse of
+    /// `provides_process_signal_control`, which only KVM declares, so the
+    /// record is the source exactly where the backend owns signal delivery.
+    /// That capability describes signal ownership, not the absence of a host
+    /// task name: a future backend that owns signals but runs guest threads
+    /// as host tasks would need its own capability here. Writes do not depend
+    /// on this choice: Detcore refuses a write open of every `comm` it
+    /// renders.
     pub(crate) fn of_backend(tool_can_name_guest_descriptors: bool) -> Self {
         if tool_can_name_guest_descriptors {
             Self::Kernel
@@ -250,6 +286,28 @@ pub(crate) fn stat_comm(
 /// EACCES on KVM.
 pub(crate) fn renders_task_stat(facts: &TaskStatFacts, own: i32, source: CommSource) -> bool {
     facts.process == Some(own) && (source == CommSource::Kernel || facts.comm.is_some())
+}
+
+/// Whether Detcore renders the `comm` of the task `facts` describe for a
+/// reader in process `own`, whose name comes from `source` (package K slice
+/// A+): only where the source is Detcore's record (the same capability that
+/// chooses `stat`'s name, never a backend's identity), only the reader's own
+/// process's, and only once a name is recorded. Elsewhere the file is the
+/// kernel beneath's: the host kernel's own name on ptrace and DBT, which
+/// Detcore leaves unclassified, and on KVM another process's, or an unnamed
+/// task's, the executor's EACCES.
+pub(crate) fn renders_task_comm(facts: &TaskStatFacts, own: i32, source: CommSource) -> bool {
+    source == CommSource::Record && facts.process == Some(own) && facts.comm.is_some()
+}
+
+/// A task's `comm` file (fs/proc/base.c:1750-1765 `comm_show` in 6.17): its
+/// name as `proc_task_name(m, p, false)` prints it, raw, through its first
+/// NUL (fs/proc/array.c:99-118, `seq_printf(m, "%.64s", tcomm)`), and a
+/// newline.
+pub(crate) fn render_comm(comm: &TaskComm) -> Vec<u8> {
+    let mut line = comm.as_bytes().to_vec();
+    line.push(b'\n');
+    line
 }
 
 /// One rendering of a `stat` file, with what its reader adds to the
@@ -615,6 +673,45 @@ mod tests {
             ..own
         };
         assert!(!renders_task_stat(&gone, 7, Kernel), "no such process");
+    }
+
+    /// A `comm` file is the name, raw, and a newline (`comm_show`): the
+    /// bytes a `PR_SET_NAME` of 15 bytes, of raw bytes, or of nothing left,
+    /// as the kernel's file shows them (measured on Linux 7.1: `a)b\n\c`
+    /// reads back as `a)b\n\c\n`, 7 bytes; an empty name as `\n`).
+    #[test]
+    fn a_comm_file_is_the_name_and_a_newline() {
+        assert_eq!(render_comm(&TaskComm::new(b"probe")), b"probe\n");
+        assert_eq!(
+            render_comm(&TaskComm::new(b"0123456789abcdefghij")),
+            b"0123456789abcde\n"
+        );
+        assert_eq!(render_comm(&TaskComm::new(b"a)b\n\\c")), b"a)b\n\\c\n");
+        assert_eq!(render_comm(&TaskComm::new(b"")), b"\n");
+        // What the kernel's file holds is the name back.
+        let comm = TaskComm::new(b"w1\n");
+        assert_eq!(TaskComm::from_comm_file(&render_comm(&comm)), comm);
+    }
+
+    /// Detcore renders a `comm` file only where the name's source is its
+    /// record, only the reader's own process's, and only once a name is
+    /// recorded; where the source is the kernel, never (the kernel's file,
+    /// unclassified, as before).
+    #[test]
+    fn only_the_readers_own_named_comms_are_rendered_and_only_from_the_record() {
+        use CommSource::Kernel;
+        use CommSource::Record;
+        let own = facts();
+        assert!(renders_task_comm(&own, 7, Record));
+        assert!(!renders_task_comm(&own, 7, Kernel), "the kernel's file");
+        assert!(!renders_task_comm(&own, 8, Record), "another process's");
+        let unnamed = TaskStatFacts { comm: None, ..own };
+        assert!(!renders_task_comm(&unnamed, 7, Record), "no name at all");
+        let gone = TaskStatFacts {
+            process: None,
+            ..own
+        };
+        assert!(!renders_task_comm(&gone, 7, Record), "no such process");
     }
 
     /// The source is the backend's declared capability, and a source that

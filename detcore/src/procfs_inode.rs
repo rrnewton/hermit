@@ -137,7 +137,9 @@ const INCARNATION_BITS: u32 = 8;
 const PID_BITS: u32 = 22;
 
 /// Bits of a per-process inode number for the file's index among the
-/// per-process files Detcore renders, from 1.
+/// per-process files Detcore renders, from 1. Full since `comm` took index 7
+/// (package K slice A+): the next per-process file needs a new layout, which
+/// renumbers every per-process inode.
 const INDEX_BITS: u32 = 3;
 
 const _: () = assert!(

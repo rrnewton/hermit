@@ -4231,10 +4231,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         resource_request(guest, request).await;
         // An empty path names nothing to `openat`, which has no
         // `AT_EMPTY_PATH`: the kernel's ENOENT.
+        // A writable open of a `..` spelling that may name a `comm` Detcore
+        // renders, which it cannot resolve, is refused by name rather than
+        // forwarded (`Detcore::refuse_undetermined_comm_write`).
         let rendered = match if path.as_os_str().is_empty() {
             Ok(None)
         } else {
-            self.rendered_procfs_at(guest, &procfs_spelling).await
+            match self
+                .refuse_undetermined_comm_write(guest, &procfs_spelling, call.flags())
+                .await
+            {
+                Ok(()) => self.rendered_procfs_at(guest, &procfs_spelling).await,
+                Err(error) => Err(error),
+            }
         } {
             Ok(rendered) => rendered,
             Err(error) => {
@@ -4246,7 +4255,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         };
         // `O_PATH|O_NOFOLLOW` opens a descriptor link itself, which the
-        // kernel has.
+        // kernel has. Every other open of a rendered file is Detcore's, an
+        // open of a rendered `comm` for writing included, which it refuses
+        // with no injected call (`open_rendered_procfs`,
+        // `rendered_procfs::asks_to_write_comm`).
         if let Some(target) = rendered.filter(|target| {
             !(target.via_link && call.flags().contains(OFlag::O_PATH | OFlag::O_NOFOLLOW))
         }) {
@@ -13661,11 +13673,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     b".." => within.parent().unwrap_or(&within).to_path_buf(),
                     name => within.join(std::ffi::OsStr::from_bytes(name)),
                 };
-                // A file Detcore renders exists whatever the kernel has.
+                // A file Detcore renders exists whatever the kernel has. (Not
+                // a task's `comm` where the kernel serves every one.)
                 let rendered = crate::procfs::ProcfsFile::from_path(
                     &Path::new("/proc").join(entry.strip_prefix("/").unwrap_or(&entry)),
                 )
-                .is_some_and(|file| file.rendered_path(session_files).is_some());
+                .is_some_and(|file| {
+                    !self.kernel_serves_every_comm(&file)
+                        && file.rendered_path(session_files).is_some()
+                });
                 // On a backend's own /proc (KVM), what a lookup finds is the
                 // backend's, at a moment the host decides (a process's
                 // directory goes when its executor learns of the exit), so

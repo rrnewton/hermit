@@ -11227,6 +11227,7 @@ mod tests {
     }
 
     mod backend_failure_tests;
+    mod comm_alias_open_tests;
     mod exec_identity_tests;
     mod exec_teardown_tests;
     mod gated_wait_turn_tests;
