@@ -15257,6 +15257,97 @@ mod tests {
         (vec![first_time, next_time], queue, next_random)
     }
 
+    /// A5 step 3c.1d (review round 4, lane ruling 1): a clock observation
+    /// (`GlobalTimeLowerBound`, what `thread_observe_time` sends) grants no
+    /// turn and moves no time. With threads sequentialized, the thread holding
+    /// the turn observes the clock twice while a sibling's request is filed and
+    /// waiting: both answers are the same time, neither is a hand-off
+    /// (`GlobalResponse::Granted`), the scheduler commits no turn, and the
+    /// sibling's request stays pending. So a temporary-mask wait that takes its
+    /// deadline after its first probe and check reads the time it would have
+    /// read at entry; only a sibling running concurrently (a background call)
+    /// can move global time meanwhile, as for the base's own timed waits, which
+    /// observe through the same RPC.
+    #[tokio::test]
+    async fn a_clock_observation_grants_no_turn_and_moves_no_time() {
+        let (config, state, holder, detpid) = cancellation_test_state();
+        let sibling = DetTid::from_raw(holder.as_raw() + 1);
+        let mm = MmId::initial(detpid);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(holder, sibling, false);
+        install_test_registration(&state, holder, Ivar::new());
+        install_test_registration(&state, sibling, Ivar::new());
+        let mut clock = DetTime::new(&config);
+        let epoch = clock.as_nanos();
+        clock.advance_to(epoch + LogicalTime::from_nanos(1_000));
+        let sibling_clock = clock.clone_for_child();
+        let request = |tid: DetTid| {
+            let mut resources = Resources::new(tid);
+            resources.insert(ResourceID::MemAddrSpace(tid), Permission::RW);
+            GlobalRequest::RequestResources(resources, detpid)
+        };
+        let mut holder_turn = Box::pin(state.receive_rpc(
+            Tid::from_raw(holder.as_raw()),
+            (clock.clone(), mm, request(holder)),
+        ));
+        assert!(futures::poll!(&mut holder_turn).is_pending());
+        let mut sibling_turn = Box::pin(state.receive_rpc(
+            Tid::from_raw(sibling.as_raw()),
+            (sibling_clock, mm, request(sibling)),
+        ));
+        assert!(futures::poll!(&mut sibling_turn).is_pending());
+        let committed = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await
+        .expect("one of the two requests is granted");
+        // The granted thread holds the turn; the other one's request waits.
+        let (granted, granted_turn, mut waiting, granted_clock) = if committed.tid == holder {
+            (holder, holder_turn, sibling_turn, clock.clone())
+        } else {
+            (sibling, sibling_turn, holder_turn, clock.clone_for_child())
+        };
+        assert!(matches!(granted_turn.await.1, GlobalResponse::Granted(_)));
+        let turn = state.sched.lock().unwrap().turn;
+        let before = state.global_time.lock().unwrap().as_nanos();
+        let mut answers = Vec::new();
+        for _ in 0..2 {
+            let (_, answer) = state
+                .receive_rpc(
+                    Tid::from_raw(granted.as_raw()),
+                    (
+                        granted_clock.clone(),
+                        mm,
+                        GlobalRequest::GlobalTimeLowerBound,
+                    ),
+                )
+                .await;
+            answers.push(answer);
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+            assert!(
+                futures::poll!(&mut waiting).is_pending(),
+                "the waiting thread gets no turn"
+            );
+        }
+        let after = state.global_time.lock().unwrap().as_nanos();
+        assert_eq!(answers[0], answers[1], "the same time twice");
+        assert!(
+            matches!(answers[0], GlobalResponse::GlobalTimeLowerBound(_)),
+            "a plain answer, not a hand-off: {:?}",
+            answers[0]
+        );
+        assert_eq!(after, before, "no time moved");
+        assert_eq!(state.sched.lock().unwrap().turn, turn, "no turn committed");
+    }
+
     #[tokio::test]
     async fn child_start_clock_is_independent_of_first_rpc_arrival() {
         for child_first in [true, false] {
