@@ -21921,6 +21921,77 @@ fn unused_local_port() -> u16 {
         .port()
 }
 
+/// What a run's stderr says when the gdbserver port it was given is taken:
+/// "failed to start GDB server ... Address already in use (os error 98)".
+const GDBSERVER_PORT_TAKEN: &str = "Address already in use (os error 98)";
+
+/// How many ports [`spawn_gdbserver_run`] tries before a taken port fails the
+/// test like any other exit.
+const GDBSERVER_PORT_ATTEMPTS: usize = 5;
+
+/// A background `hermit run` with its own gdbserver port, started by
+/// [`spawn_gdbserver_run`] and ready by the caller's measure.
+struct GdbserverRun {
+    run: KillOnDrop,
+    port: u16,
+    stderr: String,
+}
+
+/// Starts the `hermit run` that `command` builds for a gdbserver port, and
+/// waits until `deadline` for its stderr (written to `stderr_path`) to satisfy
+/// `ready`.
+///
+/// [`unused_local_port`] names a port that was free when it looked, and then
+/// releases it, because Hermit binds the port itself. `--gdbserver` gives the
+/// run host networking, so any process on the host can bind that port first;
+/// the run then exits naming [`GDBSERVER_PORT_TAKEN`]. Only that exit, before
+/// `ready`, is retried, on a fresh port, at most [`GDBSERVER_PORT_ATTEMPTS`]
+/// times. Every other exit, and the deadline, fails with `context` and the
+/// run's stderr, exactly as a single attempt would.
+fn spawn_gdbserver_run(
+    stderr_path: &Path,
+    deadline: Instant,
+    mut command: impl FnMut(u16) -> Command,
+    ready: impl Fn(&str) -> bool,
+    context: &str,
+) -> GdbserverRun {
+    for attempt in 1..=GDBSERVER_PORT_ATTEMPTS {
+        let port = unused_local_port();
+        let mut run = KillOnDrop(
+            command(port)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(fs::File::create(stderr_path).expect("failed to create stderr file"))
+                .spawn()
+                .expect("failed to run hermit"),
+        );
+        loop {
+            let stderr = fs::read_to_string(stderr_path).unwrap_or_default();
+            if ready(&stderr) {
+                return GdbserverRun { run, port, stderr };
+            }
+            let exited = run.0.try_wait().ok().flatten().is_some();
+            // Read again once the run has exited: everything it wrote is there.
+            let stderr = if exited {
+                fs::read_to_string(stderr_path).unwrap_or_default()
+            } else {
+                stderr
+            };
+            if exited && attempt < GDBSERVER_PORT_ATTEMPTS && stderr.contains(GDBSERVER_PORT_TAKEN)
+            {
+                eprintln!(
+                    "gdbserver port {port} was taken before hermit bound it \
+                     (attempt {attempt} of {GDBSERVER_PORT_ATTEMPTS}); trying another"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline && !exited, "{context}:\n{stderr}");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    unreachable!("the last attempt either returns or fails its assertion")
+}
+
 /// Whether anything in this network namespace listens on TCP `port`.
 ///
 /// Read from /proc rather than by connecting: Hermit's gdbserver accepts one
@@ -23278,36 +23349,28 @@ fn hermit_run_dap_listen_killed_supervisor_leaves_no_run_or_adapter() {
         .expect("failed to create the hermit-dap work dir");
     let (_source, program) = dap_guest(work.path());
     let program_arg = program.to_str().expect("guest path should be UTF-8");
-    let gdbserver_port = unused_local_port();
-    let gdbserver_arg = format!("--gdbserver-port={gdbserver_port}");
     let stderr_path = work.path().join("hermit-run.stderr");
-    let mut run = KillOnDrop(
-        hermit_command(&[
-            "run",
-            &gdbserver_arg,
-            "--dap-listen",
-            "127.0.0.1:0",
-            "--",
-            program_arg,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(fs::File::create(&stderr_path).expect("failed to create stderr file"))
-        .spawn()
-        .expect("failed to run hermit"),
-    );
     let deadline = Instant::now() + Duration::from_secs(40);
-    while !fs::read_to_string(&stderr_path)
-        .unwrap_or_default()
-        .contains("hermit-dap: listening on ")
-    {
-        assert!(
-            Instant::now() < deadline && run.0.try_wait().ok().flatten().is_none(),
-            "hermit-dap never listened:\n{}",
-            fs::read_to_string(&stderr_path).unwrap_or_default()
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
+    let GdbserverRun {
+        mut run,
+        port: gdbserver_port,
+        ..
+    } = spawn_gdbserver_run(
+        &stderr_path,
+        deadline,
+        |port| {
+            hermit_command(&[
+                "run",
+                &format!("--gdbserver-port={port}"),
+                "--dap-listen",
+                "127.0.0.1:0",
+                "--",
+                program_arg,
+            ])
+        },
+        |stderr| stderr.contains("hermit-dap: listening on "),
+        "hermit-dap never listened",
+    );
     let supervisor = run.0.id();
     let adapters = children_named(supervisor, "hermit-dap");
     let runs = children_named(supervisor, "hermit");
@@ -23490,34 +23553,31 @@ fn hermit_run_dap_listen_names_the_file_a_guest_symlink_reaches() {
     ] {
         let link = case;
         let program_arg = program.expect("program path should be UTF-8");
-        let gdbserver_arg = format!("--gdbserver-port={}", unused_local_port());
         let stderr_path = work.path().join("hermit-run.stderr");
-        let mut argv = vec!["run", gdbserver_arg.as_str()];
-        argv.extend(options);
-        argv.extend(["--dap-listen", "127.0.0.1:0", "--", program_arg]);
-        let mut run = KillOnDrop(
-            hermit_command(&argv)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(fs::File::create(&stderr_path).expect("failed to create stderr file"))
-                .spawn()
-                .expect("failed to run hermit"),
-        );
         let deadline = Instant::now() + Duration::from_secs(40);
-        let hint = loop {
-            let text = fs::read_to_string(&stderr_path).unwrap_or_default();
-            if let Some(line) = text
-                .lines()
-                .find(|line| line.contains("starting hermit-dap"))
-            {
-                break line.to_owned();
-            }
-            assert!(
-                Instant::now() < deadline && run.0.try_wait().ok().flatten().is_none(),
-                "{link}: hermit run never named the program:\n{text}"
-            );
-            thread::sleep(Duration::from_millis(20));
-        };
+        let GdbserverRun {
+            run, stderr: text, ..
+        } = spawn_gdbserver_run(
+            &stderr_path,
+            deadline,
+            |port| {
+                let gdbserver_arg = format!("--gdbserver-port={port}");
+                let mut argv = vec!["run", gdbserver_arg.as_str()];
+                argv.extend(&options);
+                argv.extend(["--dap-listen", "127.0.0.1:0", "--", program_arg]);
+                hermit_command(&argv)
+            },
+            |text| {
+                text.lines()
+                    .any(|line| line.contains("starting hermit-dap"))
+            },
+            &format!("{link}: hermit run never named the program"),
+        );
+        let hint = text
+            .lines()
+            .find(|line| line.contains("starting hermit-dap"))
+            .expect("spawn_gdbserver_run returns once the line is written")
+            .to_owned();
         let expected = format!("\"program\": {:?}", mounted.display().to_string());
         assert!(
             hint.contains(&expected),
@@ -23540,43 +23600,32 @@ fn hermit_run_dap_listen_serves_a_run_config() {
         .expect("failed to create the hermit-dap work dir");
     let (_source, program) = dap_guest(work.path());
     let config = work.path().join("run.yaml");
-    fs::write(
-        &config,
-        format!(
-            "schema: hermit-run-config/v1\nrun:\n  gdbserver-port: {}\n  dap-listen: \
-             127.0.0.1:0\nprogram: {}\n",
-            unused_local_port(),
-            program.display()
-        ),
-    )
-    .expect("failed to write the run config");
     let config_arg = config.to_str().expect("config path should be UTF-8");
     let stderr_path = work.path().join("hermit-run.stderr");
-    let mut run = KillOnDrop(
-        hermit_command(&["run", "--config", config_arg])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(fs::File::create(&stderr_path).expect("failed to create stderr file"))
-            .spawn()
-            .expect("failed to run hermit"),
-    );
     let expected = format!("\"program\": {:?}", program.display().to_string());
     let deadline = Instant::now() + Duration::from_secs(40);
-    loop {
-        let text = fs::read_to_string(&stderr_path).unwrap_or_default();
-        if text
-            .lines()
-            .any(|line| line.contains("starting hermit-dap") && line.contains(&expected))
-            && text.contains("hermit-dap: listening on ")
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline && run.0.try_wait().ok().flatten().is_none(),
-            "hermit run --config with dap-listen must start the adapter naming {expected}:\n{text}"
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
+    let GdbserverRun { run, .. } = spawn_gdbserver_run(
+        &stderr_path,
+        deadline,
+        |port| {
+            fs::write(
+                &config,
+                format!(
+                    "schema: hermit-run-config/v1\nrun:\n  gdbserver-port: {port}\n  dap-listen: \
+                     127.0.0.1:0\nprogram: {}\n",
+                    program.display()
+                ),
+            )
+            .expect("failed to write the run config");
+            hermit_command(&["run", "--config", config_arg])
+        },
+        |text| {
+            text.lines()
+                .any(|line| line.contains("starting hermit-dap") && line.contains(&expected))
+                && text.contains("hermit-dap: listening on ")
+        },
+        &format!("hermit run --config with dap-listen must start the adapter naming {expected}"),
+    );
     drop(run);
 }
 
