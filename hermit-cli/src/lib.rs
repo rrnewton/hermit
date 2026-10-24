@@ -29,6 +29,7 @@ pub mod e9patch;
 mod error;
 use hermit_record_format::event;
 use hermit_record_format::event_stream;
+pub mod gdbserver;
 pub mod happens_before;
 pub mod host_input_change;
 mod id;
@@ -5235,7 +5236,10 @@ async fn dispatch_backend(
     let tracer = hermit_run_ptrace::spawn_tracer(
         command,
         config.clone(),
-        config.gdbserver.then_some(config.gdbserver_port),
+        config
+            .gdbserver
+            .then(|| gdbserver::connection(config.gdbserver_port))
+            .transpose()?,
         config.sequentialize_threads,
         stats_request,
     )
@@ -5586,7 +5590,10 @@ async fn dispatch_output_backend(
     let tracer = hermit_run_ptrace::spawn_tracer(
         command,
         config.clone(),
-        config.gdbserver.then_some(config.gdbserver_port),
+        config
+            .gdbserver
+            .then(|| gdbserver::connection(config.gdbserver_port))
+            .transpose()?,
         config.sequentialize_threads,
         stats_request,
     )
