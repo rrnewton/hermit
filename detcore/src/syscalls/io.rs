@@ -3620,7 +3620,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<(Vec<crate::types::OpenFileId>, bool), Result<i64, Error>>
     where
         G: Guest<Self>,
-        C: SyscallInfo + Into<Syscall> + Copy,
+        C: NonblockableSyscall + Into<Syscall> + Copy,
     {
         // Without sequentialized threads no thread has a turn: every check
         // Detcore makes may race the guest's other threads, that mode's named

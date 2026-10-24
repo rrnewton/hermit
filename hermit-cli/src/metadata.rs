@@ -837,7 +837,16 @@ impl RecordVersion {
 // --chaos --seed=N`), and replay follows it. An older reader would replay a
 // chaos recording under the default schedule and fall out of step, so it is
 // refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x187);
+// 0x187 -> 0x18b (provisional: reserving 0x188-0x18a for #4592, #4593 and
+// #4603; main's 0x187 is the record-start chaos schedule; the lander re-checks
+// HIGHEST_SHIPPED + 1 at land): a send or receive with MSG_DONTWAIT on a
+// socketpair end the guest left blocking runs once, as on Linux, where Detcore
+// polled it until it stopped failing with EAGAIN. A recording of such a call
+// that polled until another thread wrote holds those retries and the data,
+// while this build returns the first EAGAIN to the guest and falls out of step.
+// One that succeeded at once also took a polling turn that this build no longer
+// takes, so its schedule differs. Both are refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18b);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -862,7 +871,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x187);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x187;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x18b;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -2303,6 +2312,14 @@ mod tests {
     #[test]
     fn record_version_rejects_path_classified_random_device_streams() {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x184)));
+    }
+
+    /// A 0x187 recording polled a MSG_DONTWAIT send or receive on a
+    /// socketpair end until it stopped failing with EAGAIN; this replayer runs
+    /// it once, so the version gate must refuse it.
+    #[test]
+    fn record_version_rejects_polled_dontwait_socketpair_recordings() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
     }
 
     #[test]
