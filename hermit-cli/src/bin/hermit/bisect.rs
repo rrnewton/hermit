@@ -128,6 +128,10 @@ impl BisectOpts {
             max_log_bytes: global.max_log_bytes,
             log_budget: global.log_budget(),
             inexact_branch_counter: self.inexact_branch_counter,
+            // Bisect runs no endpoint to measure: its replays are bounded by
+            // the run arguments' --timeout alone.
+            trial_timeout: crate::analyze::TrialTimeout::Off,
+            endpoints: Default::default(),
         };
         // Before the schedules are read: a refused cap or counter reads and
         // starts nothing.
