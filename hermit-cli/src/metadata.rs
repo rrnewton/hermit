@@ -925,9 +925,9 @@ pub struct Metadata {
     /// Whether the recording ran in an isolated network namespace with only
     /// loopback (`record start --network local`). `None` means the recorder
     /// did not say, which is every recording made before this field existed;
-    /// those recordings ran on the host network. An autopilot replay uses the
-    /// same network, so syscalls the replayer re-executes see the same
-    /// interfaces and ports they were recorded against.
+    /// those recordings ran on the host network. A replay, served to gdb or
+    /// not, uses the same network, so syscalls the replayer re-executes see the
+    /// same interfaces and ports they were recorded against.
     #[serde(default)]
     pub local_networking: Option<bool>,
     /// The `/proc` level the recording ran at (`record start --proc`, or the

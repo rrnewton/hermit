@@ -3194,6 +3194,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/debugger/test_gdb_strict_gdbserver.py",
+      "runner": "tests/debugger/run_debugger_tests.sh",
+      "why": "tests/debugger/test_gdb_strict_gdbserver.py is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `test_gdb_strict_gdbserver.py` is a debugger-specific Python case requiring a live gdbserver and GDB/LLDB client. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/debugger/test_lldb_replay_gdbserver.py",
       "runner": "tests/debugger/run_debugger_tests.sh",
       "why": "tests/debugger/test_lldb_replay_gdbserver.py is owned by tests/debugger/run_debugger_tests.sh: The debugger asset `test_lldb_replay_gdbserver.py` is a debugger-specific Python case requiring a live gdbserver and GDB/LLDB client. The driver owns ports, process cleanup, and replay assertions that a standalone manifest program cannot supply."
