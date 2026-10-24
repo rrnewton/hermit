@@ -24,6 +24,7 @@ mod readdir_order;
 mod subreaper;
 mod tight_stack_openat;
 mod tight_stack_received_inotify;
+mod untraced_clone;
 mod vfork;
 
 use std::io::Read;

@@ -2080,12 +2080,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, resources).await;
         }
 
-        let call = Syscall::from(clone_family);
-        let sysno = call.number();
-        let maybe_res = guest.inject(call).await;
+        let sysno = Syscall::from(clone_family).number();
+        let (maybe_res, untraced_refusal) =
+            match inject_traced_clone(guest, clone_family, flags).await {
+                CloneInjection::Ran(result) => (result, None),
+                // No call ran. ENOMEM is what the guest gets with
+                // --allow-unsupported-syscalls: a clone Linux could not complete.
+                CloneInjection::Refused(reason) => (Err(Errno::ENOMEM), Some(reason)),
+            };
         // Ask before anything else is injected: the next injection replaces
         // the backend's record.
-        let refusal = if maybe_res.is_err() {
+        let refusal = if maybe_res.is_err() && untraced_refusal.is_none() {
             guest.take_unsupported_refusal()
         } else {
             None
@@ -2123,16 +2128,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         // guest with the refusal's errno would be an error Linux never gives
         // a valid clone, so the run is refused instead, as for an exec the
         // backend cannot perform.
-        if let (Some(refusal), Err(errno)) = (refusal, &maybe_res) {
-            tracing::error!(
-                "[detcore, dtid {parent_dettid}] {}; no child was created",
-                refusal.diagnostic
-            );
+        let diagnostic = refusal
+            .map(|refusal| refusal.diagnostic.to_string())
+            .or(untraced_refusal);
+        if let (Some(diagnostic), Err(errno)) = (diagnostic, &maybe_res) {
+            tracing::error!("[detcore, dtid {parent_dettid}] {diagnostic}; no child was created");
             if !self.cfg.panic_on_unsupported_syscalls {
                 crate::tool_global::report_unsupported_syscall(guest, sysno).await;
             }
             return self
-                .refuse_unserviceable_operation_because(guest, sysno, *errno, refusal.diagnostic)
+                .refuse_unserviceable_operation_because(guest, sysno, *errno, &diagnostic)
                 .await;
         }
 
@@ -4020,7 +4025,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         // would give for these arguments. `struct clone_args` gained `set_tid`
         // (offset 64) and `set_tid_size` (offset 72) with its second version,
         // 80 bytes.
-        const CLONE_ARGS_SIZE_VER1: usize = 80;
         // The kernel's limit on PID namespace nesting (MAX_PID_NS_LEVEL).
         const MAX_SET_TID: u64 = 32;
         let size = clone.size();
@@ -8016,6 +8020,185 @@ pub(crate) fn real_uid(tid: i32) -> Option<u32> {
         .ok()
 }
 
+/// The sizes of the three versions of `struct clone_args`
+/// (`CLONE_ARGS_SIZE_VER0` to `_VER2`, include/uapi/linux/sched.h): the
+/// smallest `clone3` accepts, the one with `set_tid`, and the one v6.16 reads.
+const CLONE_ARGS_SIZE_VER0: usize = 64;
+const CLONE_ARGS_SIZE_VER1: usize = 80;
+const CLONE_ARGS_SIZE_VER2: usize = 88;
+
+/// The most bytes of a `struct clone_args` [`inject_traced_clone3`] stages,
+/// within the guest stack scratch's capacity.
+const CLONE3_STAGED_MAX: usize = 512;
+
+/// What [`inject_traced_clone`] did with a clone-family call.
+enum CloneInjection {
+    /// The call ran, with this result.
+    Ran(Result<i64, Errno>),
+    /// The call did not run: the reason it cannot be made traced.
+    Refused(String),
+}
+
+/// Injects the guest's `clone_family` call with `CLONE_UNTRACED` cleared.
+///
+/// `CLONE_UNTRACED` keeps a tracer from attaching to the child
+/// (`kernel_clone`, kernel/fork.c). No guest task has a tracer of its own:
+/// Detcore answers every guest `ptrace` with `EPERM`
+/// (`is_privileged_observation_refused_syscall`), and natively an untraced
+/// program has none either, so for the guest the flag changes nothing. Under
+/// a tracing backend every guest task must be traced: Detcore admits the
+/// child to its scheduler as the clone returns and waits for it to take its
+/// first turn, which an untraced child never does, so the run waited forever.
+/// Cleared, the child is traced like every other and runs as it would
+/// natively. A backend that does not trace children ignores the flag, so the
+/// call is the same there. `flags` are the call's, as
+/// [`Detcore::handle_clone_family`] read them.
+async fn inject_traced_clone<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    clone_family: syscalls::family::CloneFamily,
+    flags: CloneFlags,
+) -> CloneInjection {
+    use syscalls::family::CloneFamily;
+    if !flags.contains(CloneFlags::CLONE_UNTRACED) {
+        return CloneInjection::Ran(guest.inject(Syscall::from(clone_family)).await);
+    }
+    match clone_family {
+        CloneFamily::Clone(clone) => {
+            let traced = clone.with_flags(clone.flags() - nix::sched::CloneFlags::CLONE_UNTRACED);
+            CloneInjection::Ran(guest.inject(Syscall::Clone(traced)).await)
+        }
+        CloneFamily::Clone3(clone) => inject_traced_clone3(guest, clone).await,
+        #[cfg(not(target_arch = "aarch64"))]
+        CloneFamily::Fork(_) | CloneFamily::Vfork(_) => {
+            unreachable!("fork and vfork take no flags")
+        }
+    }
+}
+
+/// [`inject_traced_clone`] of a `clone3` call, whose flags are in the guest's
+/// `struct clone_args`. That struct is left as it is: a copy without
+/// `CLONE_UNTRACED` is staged in the guest stack scratch, with the bytes under
+/// it saved and put back after the call, as Detcore stages a pre-call lookup
+/// buffer there. On ptrace that is below the red zone; a child that does not
+/// share the caller's memory keeps the copy there, below its stack pointer,
+/// where the ABI lets a signal frame write. Other backends lend an arena of
+/// their own.
+///
+/// The copy holds every byte up to the guest's last nonzero one, and at
+/// least those the kernel reads, so the kernel judges it as it would the
+/// guest's struct (`copy_clone_args_from_user`, kernel/fork.c). A call the
+/// kernel fails before reading the struct (no struct, one it cannot read, a
+/// size it refuses) is injected as the guest made it and fails as natively.
+/// Two calls are refused by name rather than run untraced: one whose nonzero
+/// bytes do not fit the scratch, and one whose pointers lead into it.
+async fn inject_traced_clone3<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    clone: syscalls::Clone3,
+) -> CloneInjection {
+    let size = clone.size();
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096);
+    let mut bytes = vec![0_u8; size];
+    let readable = clone.args().is_some_and(|args| {
+        (CLONE_ARGS_SIZE_VER0..=page).contains(&size)
+            && crate::syscalls::read_guest_exact(&guest.memory(), args.cast(), &mut bytes).is_ok()
+    });
+    if !readable {
+        return CloneInjection::Ran(guest.inject(Syscall::Clone3(clone)).await);
+    }
+    let refused = |why: &str| {
+        CloneInjection::Refused(format!(
+            "clone3 with CLONE_UNTRACED: hermit must trace the child, so it clears the flag in a \
+             copy of clone_args staged below the stack pointer, but {why}"
+        ))
+    };
+    let nonzero = bytes
+        .iter()
+        .rposition(|byte| *byte != 0)
+        .map_or(0, |last| last + 1);
+    let len = nonzero.max(size.min(CLONE_ARGS_SIZE_VER2));
+    if len > CLONE3_STAGED_MAX {
+        return refused(&format!(
+            "its nonzero bytes run past the {CLONE3_STAGED_MAX} that can be staged"
+        ));
+    }
+    let mut copy = [0_u8; CLONE3_STAGED_MAX];
+    copy[..len].copy_from_slice(&bytes[..len]);
+    let field = |copy: &[u8], offset: usize| {
+        u64::from_ne_bytes(copy[offset..offset + 8].try_into().unwrap())
+    };
+    let traced = field(&copy, 0) & !CloneFlags::CLONE_UNTRACED.bits();
+    copy[..8].copy_from_slice(&traced.to_ne_bytes());
+
+    // `GuestStack` starts its allocations 128 bytes below the stack pointer.
+    let rsp = guest.regs().await.rsp as usize;
+    let Some(start) = rsp.checked_sub(128 + CLONE3_STAGED_MAX) else {
+        return refused("the stack pointer is too low to stage it");
+    };
+    let staged = start..start + CLONE3_STAGED_MAX;
+    // What the kernel writes through the struct's pointers (pidfd, child_tid,
+    // parent_tid) or reads through set_tid, which the restore below would
+    // erase or the copy has already overwritten.
+    let set_tid_bytes = if len >= CLONE_ARGS_SIZE_VER1 {
+        field(&copy, 72).saturating_mul(4)
+    } else {
+        0
+    };
+    let pointed = [
+        (field(&copy, 8), 4),
+        (field(&copy, 16), 4),
+        (field(&copy, 24), 4),
+        (field(&copy, 64), set_tid_bytes),
+    ];
+    if pointed.iter().any(|&(address, bytes)| {
+        let address = address as usize;
+        bytes > 0 && address < staged.end && address.saturating_add(bytes as usize) > staged.start
+    }) {
+        return refused("one of its pointers leads into the staged copy");
+    }
+
+    let mut stack = guest.stack().await;
+    let scratch: Addr<[u8; CLONE3_STAGED_MAX]> = stack.push(copy);
+    let mut saved = [0_u8; CLONE3_STAGED_MAX];
+    if let Err(errno) = crate::syscalls::read_guest_exact(
+        &guest.memory(),
+        AddrMut::from_raw(scratch.as_raw()).expect("a nonzero address"),
+        &mut saved,
+    ) {
+        return refused(&format!("the stack below it cannot be read ({errno})"));
+    }
+    let guard = match stack.commit() {
+        Ok(guard) => guard,
+        Err(errno) => {
+            restore_staged_clone_args(guest, scratch, &saved);
+            return refused(&format!("the stack below it cannot be written ({errno})"));
+        }
+    };
+    let result = guest
+        .inject(Syscall::Clone3(
+            clone
+                .with_args(AddrMut::from_raw(scratch.as_raw()))
+                .with_size(len),
+        ))
+        .await;
+    restore_staged_clone_args(guest, scratch, &saved);
+    drop(guard);
+    CloneInjection::Ran(result)
+}
+
+/// Puts back the guest bytes that [`inject_traced_clone3`] staged its copy
+/// over.
+fn restore_staged_clone_args<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    scratch: Addr<[u8; CLONE3_STAGED_MAX]>,
+    saved: &[u8; CLONE3_STAGED_MAX],
+) {
+    let restored = AddrMut::<u8>::from_raw(scratch.as_raw())
+        .is_some_and(|scratch| guest.memory().write_exact(scratch, saved).is_ok());
+    if !restored {
+        info!("Could not restore the guest bytes under a staged clone_args.");
+    }
+}
+
 /// The 8-byte field at `offset` of a clone3 call's `struct clone_args`,
 /// which may be any size the kernel accepts from 64 bytes (its first
 /// version) up: read alone, so that a shorter struct at the end of a mapping
@@ -8026,7 +8209,6 @@ fn clone3_field<M: MemoryAccess>(
     clone: &syscalls::Clone3,
     offset: usize,
 ) -> Option<u64> {
-    const CLONE_ARGS_SIZE_VER0: usize = 64;
     if clone.size() < CLONE_ARGS_SIZE_VER0 || offset + 8 > clone.size() {
         return None;
     }

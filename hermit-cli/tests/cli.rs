@@ -272,6 +272,7 @@ static FLOCK_EXCLUSION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE3_SET_TID_REUSE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PARENT_DEATH_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_PIDFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static UNTRACED_CLONE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHILD_WAIT_DEADLOCK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_THEN_SIBLING_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_PERMITS_PER_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -3237,6 +3238,32 @@ fn clone_pidfd_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "clone-pidfd guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn untraced_clone_guest() -> &'static Path {
+    UNTRACED_CLONE_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("untraced-clone");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the untraced-clone guest directory");
+        let guest = build_root.join("untraced_clone");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-std=gnu11", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/untraced_clone.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the untraced-clone guest");
+        assert!(
+            output.status.success(),
+            "untraced-clone guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -39572,6 +39599,64 @@ fn clone3_set_tid_is_refused_for_an_id_a_task_already_had() {
         Some(true),
         "fresh: no bitwise parity over equal, nonzero INFO counts:\n{log}"
     );
+}
+
+/// Runs `tests/c/untraced_clone.c` in `mode` natively and under `hermit run`
+/// (ptrace), and requires the same output and a zero exit from both. Before,
+/// a child made with `CLONE_UNTRACED` ran untraced, Detcore waited for its
+/// first turn, and the clone never returned.
+fn untraced_clone_runs_as_natively(mode: &str) {
+    let guest = untraced_clone_guest();
+    let guest_arg = guest.to_str().expect("the guest path is UTF-8");
+    let native = Command::new(guest)
+        .arg(mode)
+        .output()
+        .expect("failed to run the untraced-clone guest natively");
+    assert!(native.status.success(), "native {mode}: {native:?}");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&["run", "--timeout", "30", "--", guest_arg, mode]),
+        directory.path(),
+        Duration::from_secs(45),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "{mode}: hermit run did not end as the native run did:\n{log}"
+    );
+    assert_eq!(
+        stdout,
+        String::from_utf8_lossy(&native.stdout),
+        "{mode}: the guest printed other than natively:\n{log}"
+    );
+}
+
+/// LeakSanitizer's helper shape: shares memory, files and fs, has no exit
+/// signal, and is waited for with `__WALL`.
+#[test]
+fn an_untraced_helper_runs_as_natively() {
+    untraced_clone_runs_as_natively("helper");
+}
+
+/// A fork-like child that exits 7.
+#[test]
+fn an_untraced_process_runs_as_natively() {
+    untraced_clone_runs_as_natively("process");
+}
+
+/// A thread joined through `CLONE_CHILD_CLEARTID`.
+#[test]
+fn an_untraced_thread_runs_as_natively() {
+    untraced_clone_runs_as_natively("thread");
+}
+
+/// `clone3`'s fork-like child.
+#[test]
+fn an_untraced_clone3_child_runs_as_natively() {
+    untraced_clone_runs_as_natively("clone3");
 }
 
 /// A pidfd from `clone(CLONE_PIDFD)` or `clone3`'s pidfd field is a pidfd
