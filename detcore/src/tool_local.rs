@@ -470,6 +470,10 @@ struct PosixTimer {
     /// for a timer created with no `sigevent` (`do_timer_create`).
     #[serde(default)]
     value: u64,
+    /// Created on a CPU clock (`crate::cpu_clock`). Its relative armings
+    /// count down on the virtual clock like any other timer's.
+    #[serde(default)]
+    cpu_clock: bool,
 }
 
 /// The set of POSIX timers owned by a *process*.
@@ -492,12 +496,14 @@ impl PosixTimers {
     /// Allocate a new (disarmed) timer, returning its deterministic id.
     /// `thread` is the thread a `SIGEV_THREAD_ID` timer notifies, and
     /// `value` its `sigev_value`, or `None` for a timer created with no
-    /// `sigevent`, whose `si_value` is its id.
+    /// `sigevent`, whose `si_value` is its id. `cpu_clock` says the timer was
+    /// created on a CPU clock.
     pub(crate) fn create(
         &mut self,
         signal: Option<i32>,
         thread: Option<DetTid>,
         value: Option<u64>,
+        cpu_clock: bool,
     ) -> i32 {
         let id = self.next_id;
         self.next_id += 1;
@@ -509,9 +515,15 @@ impl PosixTimers {
                 signal,
                 thread,
                 value: value.unwrap_or(id as u32 as u64),
+                cpu_clock,
             },
         );
         id
+    }
+
+    /// Whether timer `id` exists and was created on a CPU clock.
+    pub(crate) fn on_cpu_clock(&self, id: i32) -> bool {
+        self.timers.get(&id).is_some_and(|timer| timer.cpu_clock)
     }
 
     /// The `si_value` of timer `id`'s signal.
@@ -1929,15 +1941,15 @@ mod posix_timers_tests {
     #[test]
     fn ids_are_deterministic_and_sequential() {
         let mut timers = PosixTimers::default();
-        assert_eq!(timers.create(None, None, None), 0);
-        assert_eq!(timers.create(Some(libc::SIGALRM), None, None), 1);
-        assert_eq!(timers.create(None, None, None), 2);
+        assert_eq!(timers.create(None, None, None, false), 0);
+        assert_eq!(timers.create(Some(libc::SIGALRM), None, None, false), 1);
+        assert_eq!(timers.create(None, None, None, false), 2);
     }
 
     #[test]
     fn settime_reports_previous_arming_and_remaining_uses_virtual_clock() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(None, None, None);
+        let id = timers.create(None, None, None, false);
 
         // Arm a one-shot timer for 100ns at t=0. A freshly created timer was
         // disarmed, so the reported old value is zero.
@@ -1953,7 +1965,7 @@ mod posix_timers_tests {
     #[test]
     fn resetting_reports_old_remaining() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(None, None, None);
+        let id = timers.create(None, None, None, false);
         timers.settime(id, 0, Some(t(100)), t(0));
         // Re-arm at t=30 (70ns remained) with a periodic 50ns timer.
         let old = timers
@@ -1968,7 +1980,7 @@ mod posix_timers_tests {
     #[test]
     fn periodic_remaining_advances_past_each_deadline() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(Some(libc::SIGALRM), None, None);
+        let id = timers.create(Some(libc::SIGALRM), None, None, false);
         timers.settime(id, 50, Some(t(100)), t(0));
 
         assert_eq!(timers.gettime(id, t(100)), Some((50, 50)));
@@ -1980,7 +1992,7 @@ mod posix_timers_tests {
     #[test]
     fn disarm_and_unknown_ids() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(None, None, None);
+        let id = timers.create(None, None, None, false);
         timers.settime(id, 0, Some(t(100)), t(0));
         // Disarm: value of 0 -> deadline None -> remaining 0.
         timers.settime(id, 0, None, t(10));
@@ -1995,7 +2007,7 @@ mod posix_timers_tests {
     #[test]
     fn delete_removes_timer() {
         let mut timers = PosixTimers::default();
-        let id = timers.create(None, None, None);
+        let id = timers.create(None, None, None, false);
         assert!(timers.contains(id));
         assert!(timers.remove(id));
         assert!(!timers.contains(id));
@@ -4099,6 +4111,13 @@ impl ChildCpuPublication {
 pub(crate) struct ProcessCpuTime {
     snapshot: ProcessCpuSnapshot,
     exited_children: BTreeMap<DetPid, ProcessCpuSnapshot>,
+    /// Each thread's own (user, system) time as of its last accounting, which
+    /// another thread's CPU clock of it reads (`crate::cpu_clock`). An entry
+    /// leaves once its thread has exited and left the scheduler, unless the
+    /// thread leads the process: a leader that exits before its threads stays
+    /// a zombie whose clock still reads its final time, as on Linux.
+    #[serde(default)]
+    threads: BTreeMap<DetTid, (LogicalTime, LogicalTime)>,
     // Runtime ownership, not record-format state. ThreadState clones retain the
     // same parent accounting Arc; notification tokens also retain their identity.
     #[serde(skip)]
@@ -4118,6 +4137,27 @@ impl ProcessCpuTime {
     fn add_thread_delta(&mut self, user: LogicalTime, system: LogicalTime) {
         self.snapshot.user = self.snapshot.user + user;
         self.snapshot.system = self.snapshot.system + system;
+    }
+
+    /// Record `thread`'s own (user, system) time, which its process total now
+    /// includes.
+    fn record_thread(&mut self, thread: DetTid, own: (LogicalTime, LogicalTime)) {
+        self.threads.insert(thread, own);
+    }
+
+    /// `thread`'s own (user, system) time as of its last accounting. A thread
+    /// that has not been accounted yet has not run, and has used none.
+    fn thread_time(&self, thread: DetTid) -> (LogicalTime, LogicalTime) {
+        self.threads
+            .get(&thread)
+            .copied()
+            .unwrap_or((LogicalTime::ZERO, LogicalTime::ZERO))
+    }
+
+    /// `thread` exited: its time stays in the process total, as an exited
+    /// thread's stays in Linux's (`thread_group_cputime`).
+    fn forget_thread(&mut self, thread: DetTid) {
+        self.threads.remove(&thread);
     }
 
     fn record_exited_child(&mut self, pid: DetPid, child: ProcessCpuSnapshot) {
@@ -5225,12 +5265,36 @@ impl<T> ThreadState<T> {
         let system = self.thread_logical_time.system_cpu_time();
         let user_delta = user - self.last_accounted_user_time;
         let system_delta = system - self.last_accounted_system_time;
+        let own = self.thread_cpu_time();
+        let mut process = self
+            .process_cpu_time
+            .lock()
+            .expect("process CPU time mutex poisoned");
+        process.add_thread_delta(user_delta, system_delta);
+        process.record_thread(self.dettid, own);
+        drop(process);
+        self.last_accounted_user_time = user;
+        self.last_accounted_system_time = system;
+    }
+
+    /// Drop this exited thread's entry from its process's per-thread table,
+    /// once its final time is accounted: a thread other than the leader is
+    /// gone for good, and its id names no thread's clock any more.
+    pub(crate) fn forget_thread_cpu_time(&self) {
         self.process_cpu_time
             .lock()
             .expect("process CPU time mutex poisoned")
-            .add_thread_delta(user_delta, system_delta);
-        self.last_accounted_user_time = user;
-        self.last_accounted_system_time = system;
+            .forget_thread(self.dettid);
+    }
+
+    /// Another thread of this process's own (user, system) time, as of that
+    /// thread's last accounting, which happens at each of its syscalls and
+    /// each RCB commit: with threads sequentialized, where it last stopped.
+    pub(crate) fn sibling_cpu_time(&self, thread: DetTid) -> (LogicalTime, LogicalTime) {
+        self.process_cpu_time
+            .lock()
+            .expect("process CPU time mutex poisoned")
+            .thread_time(thread)
     }
 
     /// Decide whether the syscall this thread is making now charges its cost
