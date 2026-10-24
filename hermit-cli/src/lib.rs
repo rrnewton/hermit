@@ -4198,11 +4198,10 @@ mod dbt_detconfig_tests {
     }
 
     #[test]
-    fn current_dbt_uses_exact_descriptor_facts_without_host_timed_turns() {
+    fn current_dbt_uses_exact_descriptor_facts() {
         let config = prepare_backend_config(default_config(), Backend::Dbt);
         assert!(config.backend.tool_shares_guest_descriptor_table);
         assert!(config.backend.rediscovers_descriptors_after_exec);
-        assert!(!config.backend.internal_pipe_turns_are_host_timed);
         assert!(!config.backend.loopback_pollers_yield_to_peers);
         let encoded = dbt_detconfig_json(&config).unwrap();
         assert!(detcore::from_legacy_backend_json(&encoded).is_err());
@@ -4215,17 +4214,16 @@ mod dbt_detconfig_tests {
     fn dbt_detconfig_keeps_descriptor_facts_independent() {
         // Exercise the real CLI encoder and the admitted standalone JSON
         // reader. In particular, descriptor discovery must not silently
-        // opt into host-timed turns or loopback poller yielding.
-        for mask in 0_u8..16 {
+        // opt into loopback poller yielding.
+        for mask in 0_u8..8 {
             let mut config = prepare_backend_config(default_config(), Backend::Dbt);
             config.backend.tool_shares_guest_descriptor_table = mask & 1 != 0;
             config.backend.rediscovers_descriptors_after_exec = mask & 2 != 0;
-            config.backend.internal_pipe_turns_are_host_timed = mask & 4 != 0;
-            config.backend.loopback_pollers_yield_to_peers = mask & 8 != 0;
+            config.backend.loopback_pollers_yield_to_peers = mask & 4 != 0;
             let encoded = dbt_detconfig_json(&config).unwrap();
             assert_eq!(
                 detcore::from_legacy_backend_json(&encoded).is_ok(),
-                mask == 0 || mask == 15,
+                mask == 0 || mask == 7,
                 "only coupled facts fit the legacy form: mask {mask}"
             );
             let decoded = detcore::decode_backend_config_json(&encoded).unwrap();
@@ -4244,7 +4242,6 @@ mod dbt_detconfig_tests {
             let mut config = prepare_backend_config(rich_config(), Backend::Dbt);
             config.backend.tool_shares_guest_descriptor_table = discover;
             config.backend.rediscovers_descriptors_after_exec = discover;
-            config.backend.internal_pipe_turns_are_host_timed = discover;
             config.backend.loopback_pollers_yield_to_peers = discover;
             let legacy = detcore::to_legacy_backend_json(&config).unwrap();
             assert_eq!(
@@ -9013,13 +9010,11 @@ mod tests {
         let sabre = prepare_backend_config(config.clone(), Backend::Sabre).backend;
         assert!(sabre.tool_shares_guest_descriptor_table);
         assert!(sabre.rediscovers_descriptors_after_exec);
-        assert!(sabre.internal_pipe_turns_are_host_timed);
         assert!(sabre.loopback_pollers_yield_to_peers);
         assert!(sabre.guest_clock_reads_bypass_backend);
         assert!(sabre.virtualizes_syscall_clobbers);
         assert!(sabre.needs_killed_thread_rpc_cancellation);
         assert!(sabre.reports_physical_process_exits);
-        assert!(sabre.signal_interrupts_external_syscalls);
         assert!(sabre.tracks_process_children);
         assert!(!sabre.runs_exit_robust_list);
         assert!(!sabre.requires_thread_directed_process_signals);
@@ -9027,13 +9022,11 @@ mod tests {
         let ptrace = prepare_backend_config(config, Backend::Ptrace).backend;
         assert!(!ptrace.tool_shares_guest_descriptor_table);
         assert!(!ptrace.rediscovers_descriptors_after_exec);
-        assert!(!ptrace.internal_pipe_turns_are_host_timed);
         assert!(!ptrace.loopback_pollers_yield_to_peers);
         assert!(!ptrace.guest_clock_reads_bypass_backend);
         assert!(!ptrace.virtualizes_syscall_clobbers);
         assert!(!ptrace.needs_killed_thread_rpc_cancellation);
         assert!(!ptrace.reports_physical_process_exits);
-        assert!(!ptrace.signal_interrupts_external_syscalls);
         assert!(ptrace.tracks_process_children);
         assert!(ptrace.runs_exit_robust_list);
         assert!(!ptrace.requires_thread_directed_process_signals);
@@ -9136,11 +9129,10 @@ mod tests {
     /// refusal (Reverie d78f770f), `failed_gettimeofday_may_store_host_time`
     /// the guest's storable-memory report (Reverie 8bfb450e) and
     /// `user_address_limit` the guest's user address limit query (Reverie
-    /// 6f75cc4c). Four fields are newer than that transcription:
+    /// 6f75cc4c). Three fields are newer than that transcription:
     /// `process_exits_complete_asynchronously` (Reverie 056c8cac), true only
     /// for in-guest LiteInst, whose process exits complete some time after the
-    /// tool grants them, `supports_madv_dontneed` (Reverie 8d8697aa), true for
-    /// every backend, and `reports_child_exit_publication` (Reverie 9cb6f7b7),
+    /// tool grants them, `reports_child_exit_publication` (Reverie 9cb6f7b7),
     /// true for ptrace and e9patch, whose tracer reports when the kernel
     /// publishes a process's exit to its parent, and
     /// `virtualizes_guest_sigalrm` (Reverie 7142ff8c), true only for in-guest
@@ -9149,8 +9141,7 @@ mod tests {
     /// which changes how a syscall reaches the Tool and nothing the Tool host
     /// can do, so it has exactly in-guest LiteInst's row.
     /// DBT now also shares the guest descriptor table and rediscovers it after
-    /// exec (Reverie 15374907); its host-timed-turn and poller-yield
-    /// capabilities remain false. `reports_sigreturns` (A5 step 2) is true
+    /// exec (Reverie 15374907); its poller-yield capability remains false. `reports_sigreturns` (A5 step 2) is true
     /// for ptrace, and so for e9patch preprocessing, whose guest Hermit runs
     /// on ptrace. `reports_kernel_child_exit_signals` is true for ptrace,
     /// e9patch and SaBRe, whose signal callbacks see the kernel's child-exit
@@ -9168,7 +9159,6 @@ mod tests {
         serde_json::json!({
             "tool_shares_guest_descriptor_table": sabre || dbt,
             "rediscovers_descriptors_after_exec": sabre || dbt,
-            "internal_pipe_turns_are_host_timed": sabre,
             "loopback_pollers_yield_to_peers": sabre,
             "guest_clock_reads_bypass_backend": sabre,
             "virtualizes_syscall_clobbers": sabre || kvm,
@@ -9176,7 +9166,6 @@ mod tests {
             "reports_physical_process_exits": sabre,
             "process_exits_complete_asynchronously": in_guest_liteinst,
             "virtualizes_guest_sigalrm": in_guest_liteinst,
-            "signal_interrupts_external_syscalls": sabre,
             "tracks_process_children": !dbt,
             "runs_exit_robust_list": matches!(backend, Backend::Ptrace | Backend::E9patch),
             "requires_thread_directed_process_signals": dbt,
@@ -9184,7 +9173,6 @@ mod tests {
                 matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Kvm),
             "defers_vfork_child_registration": kvm,
             "supports_madvise": !kvm,
-            "supports_madv_dontneed": true,
             "reports_child_exit_publication":
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "reports_kernel_child_exit_signals":
@@ -9328,7 +9316,7 @@ mod tests {
     /// described on `dbt_detconfig_tests::GOLDEN`. Preserve the historical DBT
     /// descriptor capabilities here as well as the historical bytes. Current
     /// DBT's independent descriptor facts require the typed envelope, whose
-    /// exact round trip and all sixteen coupled-flag combinations are checked
+    /// exact round trip and all eight coupled-flag combinations are checked
     /// by `dbt_detconfig_tests`.
     #[test]
     fn historical_dbt_capabilities_preserve_legacy_detconfig_bytes() {

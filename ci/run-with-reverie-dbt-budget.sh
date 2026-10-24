@@ -2579,7 +2579,14 @@ fi
 # third-party/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so the inventory, SDK and native inputs, calibrated
 # budget, job width and limits carry unchanged from the 42ba7f0f entry.
-expected_pin=1b894c0cd804589bc1366338df720fef40391a0c
+# CARRY TO 0e2bf15a2ca0ce02beb4c15532def254a629bc2e (2026-10-24): from
+# 1b894c0cd804589bc1366338df720fef40391a0c. One commit (capflags lane, slice 1:
+# delete three backend capability fields that change nothing). It changes
+# reverie/src/capabilities.rs only; git diff is empty under reverie-dbt/ and
+# third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory, SDK and native inputs, calibrated
+# budget, job width and limits carry unchanged from the 1b894c0c entry.
+expected_pin=0e2bf15a2ca0ce02beb4c15532def254a629bc2e
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

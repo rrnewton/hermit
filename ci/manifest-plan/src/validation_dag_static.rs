@@ -2804,7 +2804,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // units (rendered_entry's record/replay gate, determinize_stat's mode and
     // epoch read without copying the configuration, and its placeholder
     // gate): 2530, listed.
-    ("test.detcore_unit", 2530),
+    // And -1 from 979f3fed: 2529.
+    ("test.detcore_unit", 2529),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4923,7 +4924,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fifteen D4c-1 units: 2515, listed.
     // And the same twelve A+ units: 2527, listed.
     // And the same three slice 7d determinize_stat_tests units: 2530, listed.
-    ("test.detcore_unit_on_host", 2530),
+    // And -1 from 979f3fed: 2529.
+    ("test.detcore_unit_on_host", 2529),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

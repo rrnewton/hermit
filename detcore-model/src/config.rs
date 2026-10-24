@@ -2370,11 +2370,8 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// replaced a read of it, so a decoded configuration behaves as the same JSON
 /// did before:
 ///
-/// - `discover_live_file_metadata` supplies the four descriptor and loopback
+/// - `discover_live_file_metadata` supplies the three descriptor and loopback
 ///   facts that were each a read of it;
-/// - `backend_reports_physical_process_exits` supplies
-///   `reports_physical_process_exits` and
-///   `signal_interrupts_external_syscalls`;
 /// - `backend_is_kvm` supplies the two behaviours it selected that remain
 ///   capabilities, `provides_process_signal_control` and
 ///   `emulates_child_waits` (the other three are now answered by the backend
@@ -2383,6 +2380,11 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 ///   `time(2)` probe and `Guest::storable_memory_ranges`, and the user
 ///   address limit is each guest's own `Guest::user_address_limit` report);
 /// - every other key supplies the one capability of the same meaning.
+///
+/// One input behaves differently since `supports_madv_dontneed` was deleted
+/// (every backend forwards `MADV_DONTNEED`): `backend_supports_madvise` false
+/// with `backend_is_kvm` false, a pair no writer produces, used to refuse that
+/// advice with ENOSYS and now forwards it.
 ///
 /// This inverts [`to_legacy_backend_json`] for every capability value the keys
 /// can express, which includes every backend's own constant except for
@@ -2614,7 +2616,6 @@ impl LegacyBackendKeys {
         let mut backend = BackendCapabilities::PTRACE;
         backend.tool_shares_guest_descriptor_table = self.discover_live_file_metadata;
         backend.rediscovers_descriptors_after_exec = self.discover_live_file_metadata;
-        backend.internal_pipe_turns_are_host_timed = self.discover_live_file_metadata;
         backend.loopback_pollers_yield_to_peers = self.discover_live_file_metadata;
         backend.guest_clock_reads_bypass_backend = self.detect_host_clock_futex_timeouts;
         backend.virtualizes_syscall_clobbers = self.syscall_clobbers_virtualized_by_backend;
@@ -2629,7 +2630,6 @@ impl LegacyBackendKeys {
         // the form's only reader), so it is read back the same way.
         backend.reports_kernel_child_exit_signals = backend.reports_child_exit_publication;
         backend.reports_physical_process_exits = self.backend_reports_physical_process_exits;
-        backend.signal_interrupts_external_syscalls = self.backend_reports_physical_process_exits;
         backend.tracks_process_children = self.backend_tracks_process_children;
         backend.runs_exit_robust_list = self.backend_runs_exit_robust_list;
         backend.requires_thread_directed_process_signals =
@@ -2638,9 +2638,6 @@ impl LegacyBackendKeys {
             self.backend_supports_parked_write_signal_interruption;
         backend.defers_vfork_child_registration = self.backend_defers_vfork_child_registration;
         backend.supports_madvise = self.backend_supports_madvise;
-        // A legacy encoding predates this key: every backend that supports
-        // madvise supports MADV_DONTNEED, and KVM implements it alone.
-        backend.supports_madv_dontneed = self.backend_supports_madvise || self.backend_is_kvm;
         backend.provides_process_signal_control = self.backend_is_kvm;
         backend.emulates_child_waits = self.backend_is_kvm;
         // A legacy encoding predates this key. DBT, the form's only reader,
@@ -3426,13 +3423,12 @@ mod tests {
         backend.runs_guest_code_between_injections = false;
         backend.reports_sigreturns = false;
         backend.reports_kernel_child_exit_signals = backend.reports_child_exit_publication;
-        // The legacy discover_live_file_metadata bit couples four facts.
+        // The legacy discover_live_file_metadata bit couples three facts.
         backend.rediscovers_descriptors_after_exec = backend.tool_shares_guest_descriptor_table;
         // The legacy form derives promotion from the thread-directed signal
         // bit, which only DBT, the form's only reader, sets.
         backend.promotes_open_files_before_native_lifecycle =
             backend.requires_thread_directed_process_signals;
-        backend.internal_pipe_turns_are_host_timed = backend.tool_shares_guest_descriptor_table;
         backend.loopback_pollers_yield_to_peers = backend.tool_shares_guest_descriptor_table;
         backend
     }
@@ -3745,14 +3741,10 @@ mod tests {
                     assert!(error.to_string().contains(key), "{error}");
                     continue;
                 }
-                "backend_supports_madvise" => {
-                    expected.supports_madvise = false;
-                    expected.supports_madv_dontneed = false;
-                }
+                "backend_supports_madvise" => expected.supports_madvise = false,
                 "discover_live_file_metadata" => {
                     expected.tool_shares_guest_descriptor_table = true;
                     expected.rediscovers_descriptors_after_exec = true;
-                    expected.internal_pipe_turns_are_host_timed = true;
                     expected.loopback_pollers_yield_to_peers = true;
                 }
                 "detect_host_clock_futex_timeouts" => {
@@ -3767,8 +3759,7 @@ mod tests {
                     expected.reports_kernel_child_exit_signals = false;
                 }
                 "backend_reports_physical_process_exits" => {
-                    expected.reports_physical_process_exits = true;
-                    expected.signal_interrupts_external_syscalls = true;
+                    expected.reports_physical_process_exits = true
                 }
                 "backend_tracks_process_children" => expected.tracks_process_children = false,
                 "backend_runs_exit_robust_list" => expected.runs_exit_robust_list = false,

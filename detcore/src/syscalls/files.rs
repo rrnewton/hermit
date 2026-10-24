@@ -67,7 +67,6 @@ use crate::procfs_inode::ProcfsDirectory;
 use crate::procfs_inode::ProcfsName;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Device;
-use crate::resources::HOST_TIMED_INTERNAL_PIPE_IO_FYI;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -671,18 +670,6 @@ fn pipe_capacity_failure(
         Err(error) => error,
     };
     Some(PipeCapacityFailure { created_fds, error })
-}
-
-fn should_tag_host_timed_internal_pipe_io(
-    internal_pipe_turns_are_host_timed: bool,
-    fd_type: FdType,
-    physically_nonblocking: bool,
-    logically_nonblocking: bool,
-) -> bool {
-    internal_pipe_turns_are_host_timed
-        && fd_type == FdType::Pipe
-        && physically_nonblocking
-        && !logically_nonblocking
 }
 
 fn random_device_lseek_result(status_flags: i32, whence: Whence) -> Result<i64, Errno> {
@@ -6966,27 +6953,13 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         self.fifo_polls_if_a_guest_holds_its_peer(guest, call.fd(), FifoPeer::Writer)
             .await;
-        let (fd_type, physically_nonblocking, logically_nonblocking, resource, descriptor) =
+        let (fd_type, resource, descriptor) =
             guest.thread_state_mut().with_detfd(call.fd(), |detfd| {
-                (
-                    detfd.ty(),
-                    detfd.physically_nonblocking(),
-                    detfd.is_nonblocking(),
-                    detfd.resource(),
-                    detfd.clone(),
-                )
+                (detfd.ty(), detfd.resource(), detfd.clone())
             })?;
 
         if let Some(resource) = resource {
-            let mut request = guest.thread_state().mk_request(resource, Permission::R);
-            if should_tag_host_timed_internal_pipe_io(
-                guest.config().backend.internal_pipe_turns_are_host_timed,
-                fd_type,
-                physically_nonblocking,
-                logically_nonblocking,
-            ) {
-                request.fyi(HOST_TIMED_INTERNAL_PIPE_IO_FYI);
-            }
+            let request = guest.thread_state().mk_request(resource, Permission::R);
             resource_request(guest, request).await;
         }
 
@@ -7866,15 +7839,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if let Some(resource) = resource {
             let container_output = crate::sigalrm_phase1::is_container_output(&resource);
-            let mut request = guest.thread_state().mk_request(resource, Permission::W);
-            if should_tag_host_timed_internal_pipe_io(
-                guest.config().backend.internal_pipe_turns_are_host_timed,
-                fd_type,
-                physically_nonblocking,
-                logically_nonblocking,
-            ) {
-                request.fyi(HOST_TIMED_INTERNAL_PIPE_IO_FYI);
-            }
+            let request = guest.thread_state().mk_request(resource, Permission::W);
             resource_request(guest, request).await;
             // Signal phase 1, design closure 1: a write to inherited stdout or
             // stderr may sleep with no scheduler admission. Once the grant is
@@ -8087,15 +8052,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         })?;
 
         if let Some(resource) = resource {
-            let mut request = guest.thread_state().mk_request(resource, Permission::W);
-            if should_tag_host_timed_internal_pipe_io(
-                guest.config().backend.internal_pipe_turns_are_host_timed,
-                fd_type,
-                physically_nonblocking,
-                logically_nonblocking,
-            ) {
-                request.fyi(HOST_TIMED_INTERNAL_PIPE_IO_FYI);
-            }
+            let request = guest.thread_state().mk_request(resource, Permission::W);
             resource_request(guest, request).await;
         }
 
@@ -8493,27 +8450,18 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         self.fifo_polls_if_a_guest_holds_its_peer(guest, call.fd(), FifoPeer::Writer)
             .await;
-        let (fd_type, physically_nonblocking, logically_nonblocking, resource, detfd) =
+        let (fd_type, physically_nonblocking, resource, detfd) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
                     detfd.ty(),
                     detfd.physically_nonblocking(),
-                    detfd.is_nonblocking(),
                     detfd.resource(),
                     detfd.clone(),
                 )
             })?;
 
         if let Some(resource) = resource {
-            let mut request = guest.thread_state().mk_request(resource, Permission::R);
-            if should_tag_host_timed_internal_pipe_io(
-                guest.config().backend.internal_pipe_turns_are_host_timed,
-                fd_type,
-                physically_nonblocking,
-                logically_nonblocking,
-            ) {
-                request.fyi(HOST_TIMED_INTERNAL_PIPE_IO_FYI);
-            }
+            let request = guest.thread_state().mk_request(resource, Permission::R);
             resource_request(guest, request).await;
         }
 
@@ -15873,11 +15821,9 @@ mod test {
     use super::parse_timer_slack_write;
     use super::pipe_capacity_failure;
     use super::random_device_lseek_result;
-    use super::should_tag_host_timed_internal_pipe_io;
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
     use super::vectored_offset;
-    use crate::fd::FdType;
     use crate::resources::Device;
     use crate::resources::ResourceID;
 
@@ -15953,40 +15899,6 @@ mod test {
             assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
             assert_eq!(Errno::last(), Errno::EBADF);
         }
-    }
-
-    #[test]
-    fn sabre_pipe_marker_requires_nonblockize_retry_semantics() {
-        assert!(should_tag_host_timed_internal_pipe_io(
-            true,
-            FdType::Pipe,
-            true,
-            false
-        ));
-        assert!(!should_tag_host_timed_internal_pipe_io(
-            true,
-            FdType::Pipe,
-            true,
-            true
-        ));
-        assert!(!should_tag_host_timed_internal_pipe_io(
-            true,
-            FdType::Pipe,
-            false,
-            false
-        ));
-        assert!(!should_tag_host_timed_internal_pipe_io(
-            false,
-            FdType::Pipe,
-            true,
-            false
-        ));
-        assert!(!should_tag_host_timed_internal_pipe_io(
-            true,
-            FdType::Regular,
-            true,
-            false
-        ));
     }
 
     #[test]

@@ -27,14 +27,6 @@ use crate::types::MmId;
 use crate::types::RcbTimeMultiplier;
 use crate::types::SigWrapper;
 
-/// Names the outer resource turn for a physically nonblocking, guest-internal pipe
-/// operation on a backend whose internal pipe turns are host-timed
-/// (`BackendCapabilities::internal_pipe_turns_are_host_timed`; today only SaBRe). Such a
-/// backend reports these inherited stdio pipes as device resources before Detcore's
-/// `InternalIOPolling` turn. The name is descriptive only: the log comparison counts these
-/// turns like any other.
-pub(crate) const HOST_TIMED_INTERNAL_PIPE_IO_FYI: &str = "sabre-internal-pipe-io";
-
 /// Identifies the strong one-turn yield issued before a task with a loopback peer performs
 /// a zero-timeout poll, on a backend whose loopback pollers yield to their peers
 /// (`BackendCapabilities::loopback_pollers_yield_to_peers`; today only SaBRe). The scheduler

@@ -108,7 +108,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Reclaim and asynchronous VM-policy advice receives fixed success without exposing host memory pressure. Resource-
     /// dependent, backing-store, and hardware-failure operations receive fixed errors.
     /// KVM accepts pure hints as no-ops, implements MADV_DONTNEED in its executor
-    /// (`supports_madv_dontneed`), and reports ENOSYS for the other guest-visible
+    /// (as every backend does), and reports ENOSYS for the other guest-visible
     /// semantics it cannot provide.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#548): Recheck advice policy and record/replay boundaries.
@@ -149,9 +149,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(0)
             }
             MadviseAction::ForwardSemantic
-                if self.cfg.backend.supports_madvise
-                    || (advice == libc::MADV_DONTNEED
-                        && self.cfg.backend.supports_madv_dontneed) =>
+                if self.cfg.backend.supports_madvise || advice == libc::MADV_DONTNEED =>
             {
                 Ok(self.record_or_replay(guest, call).await?)
             }

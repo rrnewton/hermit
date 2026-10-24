@@ -3461,12 +3461,11 @@ mod tests {
 
     #[test]
     fn versioned_config_preserves_independent_descriptor_facts_in_the_runtime() {
-        for mask in 0_u8..16 {
+        for mask in 0_u8..8 {
             let (mut sent, _) = hermit_run_dbt_detconfig();
             sent.backend.tool_shares_guest_descriptor_table = mask & 1 != 0;
             sent.backend.rediscovers_descriptors_after_exec = mask & 2 != 0;
-            sent.backend.internal_pipe_turns_are_host_timed = mask & 4 != 0;
-            sent.backend.loopback_pollers_yield_to_peers = mask & 8 != 0;
+            sent.backend.loopback_pollers_yield_to_peers = mask & 4 != 0;
             let json = detcore::encode_backend_config_json(
                 detcore::to_legacy_backend_json(&sent).unwrap(),
                 sent.backend,

@@ -10617,19 +10617,17 @@ impl Scheduler {
         if self.models_signal_targets && !has_external_blocker {
             self.note_signaled_sigsuspend_request(dettid, signal);
         }
-        let await_external_continuation =
-            self.backend.signal_interrupts_external_syscalls && has_external_blocker;
         // Where the scheduler models signal targets (`models_signal_targets`),
-        // such a thread awaits its own continuation too. Its request was
-        // consumed when it was backgrounded, so nothing may be counterfeited
-        // for it; the scheduler orders the continuation the signal provokes
-        // instead.
-        if self.models_signal_targets && has_external_blocker && !await_external_continuation {
+        // a thread running its call outside the scheduler awaits its own
+        // continuation. Its request was consumed when it was backgrounded, so
+        // nothing may be counterfeited for it; the scheduler orders the
+        // continuation the signal provokes instead.
+        if self.models_signal_targets && has_external_blocker {
             self.arm_signaled_background(dettid, signal);
             return;
         }
         // A scheduler that does not model signal targets (in-guest LiteInst,
-        // DBT, KVM) has nothing to arm, and the thread still runs its call
+        // SaBRe, DBT, KVM) has nothing to arm, and the thread still runs its call
         // outside the scheduler. Its request was consumed when it was
         // backgrounded, so nothing may be counterfeited for it either: it
         // rejoins through its own continuation (`BlockedExternalContinue`),
@@ -10643,7 +10641,7 @@ impl Scheduler {
         if has_external_blocker {
             return;
         }
-        if cfg!(debug_assertions) && !await_external_continuation {
+        if cfg!(debug_assertions) {
             let nxtturn = self
                 .next_turns
                 .get(&dettid)
@@ -10653,7 +10651,7 @@ impl Scheduler {
                 "signal_guest: thread should be parked in the scheduler"
             );
         }
-        if await_external_continuation || discarded {
+        if discarded {
             return;
         }
 
@@ -27110,7 +27108,6 @@ mod test {
         for vfork in [false, true] {
             let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
             scheduler.models_signal_targets = false;
-            assert!(!scheduler.backend.signal_interrupts_external_syscalls);
             let op = ExternalOpId::new(creator, 1);
             let rid = if vfork {
                 ResourceID::BlockingVfork(op)
@@ -27637,14 +27634,13 @@ mod test {
 
     /// Only a backend whose blocked waits are interrupted by the kernel's
     /// signal state (`supports_blocked_wait_signal_interruption`)
-    /// arms an `rt_sigsuspend` waiter to await its report. On SaBRe, where a
-    /// signal interrupts an external syscall through its own continuation
-    /// RPC, the waiter stays in its pool, unarmed, with its request empty.
+    /// arms an `rt_sigsuspend` waiter to await its report. On SaBRe, where
+    /// the interrupted thread rejoins through its own continuation RPC, the
+    /// waiter stays in its pool, unarmed, with its request empty.
     #[test]
     fn signal_leaves_rt_sigsuspend_in_its_pool_on_a_backend_without_a_guaranteed_report() {
         let config = Config::default().with_backend(|backend| {
             backend.reports_physical_process_exits = true;
-            backend.signal_interrupts_external_syscalls = true;
         });
         let mut scheduler = Scheduler::new(&config);
         assert!(!scheduler.models_signal_targets);
@@ -29929,7 +29925,6 @@ mod test {
     fn physical_exit_barrier_precedes_empty_queue_timer_fast_forward() {
         let config = Config::default().with_backend(|backend| {
             backend.reports_physical_process_exits = true;
-            backend.signal_interrupts_external_syscalls = true;
         });
         let mut scheduler = Scheduler::new(&config);
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
@@ -29979,7 +29974,6 @@ mod test {
     fn physical_wait_handoff_queue(completion_before_wait: bool) -> Vec<DetTid> {
         let config = Config::default().with_backend(|backend| {
             backend.reports_physical_process_exits = true;
-            backend.signal_interrupts_external_syscalls = true;
         });
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         let mut scheduler = Scheduler::new(&config);
@@ -30819,7 +30813,6 @@ mod test {
     fn physical_exit_barrier_begins_when_last_process_thread_is_logically_dead() {
         let config = Config::default().with_backend(|backend| {
             backend.reports_physical_process_exits = true;
-            backend.signal_interrupts_external_syscalls = true;
         });
         let mut scheduler = Scheduler::new(&config);
         let leader = DetTid::from_raw(100);
@@ -30853,7 +30846,6 @@ mod test {
     fn final_root_and_orphan_exits_release_exact_pid_barriers() {
         let config = Config::default().with_backend(|backend| {
             backend.reports_physical_process_exits = true;
-            backend.signal_interrupts_external_syscalls = true;
         });
         let mut scheduler = Scheduler::new(&config);
         let root = DetPid::from_raw(100);
@@ -31585,7 +31577,6 @@ mod test {
     fn final_child_exit_does_not_block_parent_timer() {
         let config = Config::default().with_backend(|backend| {
             backend.reports_physical_process_exits = true;
-            backend.signal_interrupts_external_syscalls = true;
         });
         let mut scheduler = Scheduler::new(&config);
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
@@ -31849,7 +31840,6 @@ mod test {
         }
         let config = Config::default().with_backend(|backend| {
             backend.reports_physical_process_exits = true;
-            backend.signal_interrupts_external_syscalls = true;
         });
         let root = DetTid::from_raw(3);
         let mut runs = Vec::new();
