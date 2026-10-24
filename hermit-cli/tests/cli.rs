@@ -193,6 +193,7 @@ static LAST_BAND_BACKGROUND_CALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_POLLER_BESIDE_SLEEPERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMED_WAIT_POLLERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SOCKET_READER_BESIDE_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static HANDOFF_BESIDE_NEWCOMER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SCHEDULER_SIGNAL_WAITING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_WAITING_BESIDE_BACKGROUND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAIT_UNREADABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -44555,6 +44556,176 @@ fn a_socket_reader_beside_a_spinner_is_retried_within_a_poll_upgrade_period() {
             .filter(|line| line.contains("desync") || line.contains("expected to be running"))
             .collect::<Vec<_>>()
             .join("\n")
+    );
+}
+
+/// Two threads hand a turn back and forth through a condition variable, with
+/// no timeout, while main creates a third thread and joins it
+/// (tests/c/handoff_beside_newcomer.c). Each hand-off is a turn charged half
+/// a millisecond of virtual time but costs its thread microseconds of its
+/// own, and chaos change points came only when a thread's own-time slice
+/// ended. On main 46be6638, at `--chaos --seed=1` and `--seed=6` the new
+/// thread drew a worse band than both players and waited 13.3 s and 7.6 s
+/// of virtual time for its first instruction, and at seeds 2 and 4 main
+/// itself waited through 17,000-26,000 hand-offs to create it. Turns now
+/// count toward a chaos slice, so a change point comes within about 400
+/// turns and the starvation bound acts: on this head the new thread waits at
+/// most 0.45 s and a run takes at most 2,051 hand-offs. Each seed must give
+/// it its first turn within 1 s and finish in fewer than 10,000 hand-offs. A
+/// chaos run also verifies at bitwise parity, and the seed-6 recording
+/// replays as recorded under `--chaos --replay-schedule-from` (as analyze
+/// trials run) and, under another seed, `--chaos --replay-preemptions-from`.
+/// Seed 6 is used because its preemption replay is exact on main's replay
+/// code: at some other seeds a slice that ended at a syscall check-in
+/// replays a few microseconds early until
+/// https://github.com/rrnewton/hermit/pull/4597 lands.
+#[test]
+fn chaos_change_points_come_within_a_timeslice_of_turn_charges() {
+    let _guard = hermit_run_guard();
+    let guest = futex_c_guest(&HANDOFF_BESIDE_NEWCOMER_GUEST, "handoff_beside_newcomer")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let measure = |stdout: &str| -> (u64, u64) {
+        let mut words = stdout.split_whitespace();
+        let waited = words.nth(2).and_then(|w| w.parse().ok());
+        let handoffs = words.nth(1).and_then(|w| w.parse().ok());
+        waited
+            .zip(handoffs)
+            .unwrap_or_else(|| panic!("unexpected output {stdout:?}"))
+    };
+    for seed in ["1", "2", "3", "4", "5", "6"] {
+        let output = hermit(&[
+            "run",
+            "--strict",
+            "--timeout",
+            "120",
+            "--chaos",
+            "--seed",
+            seed,
+            "--",
+            &guest,
+        ]);
+        let out = stdout(&output);
+        assert!(output.status.success(), "seed {seed}: {}", stderr(&output));
+        let (waited_us, handoffs) = measure(&out);
+        assert!(
+            waited_us < 1_000_000 && handoffs < 10_000,
+            "seed {seed}: the new thread waited {waited_us} us for its first turn, after \
+             {handoffs} hand-offs in all"
+        );
+    }
+
+    let verdict = directory.path().join("verify.json");
+    let verdict_arg = verdict.to_str().unwrap().to_owned();
+    let verified = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "1",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        &verdict_arg,
+        "--",
+        &guest,
+    ]);
+    assert!(verified.status.success(), "{}", stderr(&verified));
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&verdict).expect("failed to read the verify verdict"),
+    )
+    .expect("the verify verdict is not JSON");
+    assert_eq!(report["verdict"], "matched", "{report}");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+            "no INFO messages compared: {report}"
+        );
+    }
+
+    let schedule = directory.path().join("schedule.json");
+    let record = format!("--record-preemptions-to={}", schedule.display());
+    let recorded = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "6",
+        &record,
+        "--",
+        &guest,
+    ]);
+    assert!(recorded.status.success(), "{}", stderr(&recorded));
+    let replay = format!("--replay-schedule-from={}", schedule.display());
+    let replayed = hermit(&[
+        "--log=info",
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "6",
+        &replay,
+        "--",
+        &guest,
+    ]);
+    let log = stderr(&replayed);
+    assert!(
+        replayed.status.success() && log.contains("(0 desynced)"),
+        "the schedule replay must not desync:\n{}",
+        log.lines()
+            .filter(|line| line.contains("desync") || line.contains("expected to be running"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    assert_eq!(
+        stdout(&replayed),
+        stdout(&recorded),
+        "the schedule replay must print what the recording printed"
+    );
+    let fresh = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "7",
+        "--",
+        &guest,
+    ]);
+    assert!(fresh.status.success(), "{}", stderr(&fresh));
+    assert_ne!(
+        stdout(&fresh),
+        stdout(&recorded),
+        "seed 7 must schedule differently for the replay below to show anything"
+    );
+    let preemptions = format!("--replay-preemptions-from={}", schedule.display());
+    let preempted = hermit(&[
+        "run",
+        "--strict",
+        "--timeout",
+        "120",
+        "--chaos",
+        "--seed",
+        "7",
+        &preemptions,
+        "--",
+        &guest,
+    ]);
+    assert!(preempted.status.success(), "{}", stderr(&preempted));
+    assert_eq!(
+        stdout(&preempted),
+        stdout(&recorded),
+        "the preemption replay must print what the recording printed"
     );
 }
 
