@@ -2805,7 +2805,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // epoch read without copying the configuration, and its placeholder
     // gate): 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit", 2529),
+    // And procfs::tests::status_shows_no_tracer: 2530, listed.
+    ("test.detcore_unit", 2530),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4012,7 +4013,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (A5 step 3c slice 0c): 600, listed.
     // And liteinst_in_guest_programs::in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name
     // (A5 step 3c slice 0g): 601, listed.
-    ("test.cli", 601),
+    // And procfs_status_shows_no_tracer_on_any_path and
+    // a_death_test_that_looks_for_a_debugger_dies_as_it_does_natively: 603,
+    // listed.
+    ("test.cli", 603),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4502,7 +4506,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unchanged at 520.
     // The in-guest unsequentialized-handler refusal test (slice 0g) starts the
     // in-guest runtime too and joins the hosted exclusions: unchanged at 520.
-    ("test.cli_on_host", 520),
+    // And the same two TracerPid tests: 522, listed.
+    ("test.cli_on_host", 522),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4925,7 +4930,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twelve A+ units: 2527, listed.
     // And the same three slice 7d determinize_stat_tests units: 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit_on_host", 2529),
+    // And the same TracerPid unit: 2530, listed.
+    ("test.detcore_unit_on_host", 2530),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
