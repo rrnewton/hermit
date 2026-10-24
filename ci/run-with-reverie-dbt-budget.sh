@@ -2586,7 +2586,18 @@ fi
 # third-party/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so the inventory, SDK and native inputs, calibrated
 # budget, job width and limits carry unchanged from the 1b894c0c entry.
-expected_pin=0e2bf15a2ca0ce02beb4c15532def254a629bc2e
+# CARRY TO 6f8fc22eea171058f135b47bc8dc515554e613f2 (2026-10-24): from
+# 0e2bf15a2ca0ce02beb4c15532def254a629bc2e. Three commits: 223fa0e3 changes only
+# reverie-ptrace/src/tracer.rs (its held timer-step test fixture now retires
+# conditional branches), 6c55cdbe adds only the root AGENTS.md and CLAUDE.md,
+# and the kvm lane's per-call slice 7e (reverie-kvm
+# lends each syscall callback's registers and counted interval's CPU pin
+# instead of copying them, and allocates nothing for the fstat path's
+# descriptor checks) changes only reverie-kvm/src. git diff is empty under
+# reverie-dbt/ and third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory, SDK and native inputs, calibrated
+# budget, job width and limits carry unchanged from the 0e2bf15a entry.
+expected_pin=6f8fc22eea171058f135b47bc8dc515554e613f2
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
