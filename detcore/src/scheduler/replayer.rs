@@ -22,6 +22,15 @@ use tracing::trace;
 
 const LOOKAHEAD_WINDOW: usize = 10;
 
+/// How many observed events in a row may leave the replayed schedule's next
+/// event unmatched before the replay stops following the schedule
+/// (`Replayer::observe_event`). A replay that resynchronizes matches within a
+/// few events: fast-forward looks `LOOKAHEAD_WINDOW` events ahead, and an
+/// inserted event is followed by the recorded one. A thousand is a long way
+/// past both, and short of a stuck run: a `sched_yield` spinner makes four
+/// events per turn, so the replay lets it go after 250 turns.
+pub(super) const UNMATCHED_EVENTS_BEFORE_RELEASE: u64 = 1000;
+
 /// Replayer
 #[derive(Debug)]
 pub struct Replayer {
@@ -33,6 +42,14 @@ pub struct Replayer {
 
     /// The number of events we've popped from the recording.
     pub events_popped: u64,
+
+    /// How many observed events in a row have left the schedule's next event
+    /// unmatched (`UNMATCHED_EVENTS_BEFORE_RELEASE`).
+    unmatched_run: u64,
+
+    /// Whether the replay dropped the rest of the schedule
+    /// (`Replayer::release_schedule`).
+    released: bool,
 
     /// Desync events observed per thread.  Counts different kinds of desyncs.
     pub desync_counts: BTreeMap<DetTid, DesyncStats>,
@@ -233,6 +250,8 @@ impl Replayer {
             replay_exhausted_panic: false,
             traced_event_count: 0,
             events_popped: 0,
+            unmatched_run: 0,
+            released: false,
         }
     }
 
@@ -368,6 +387,12 @@ impl Replayer {
         })
     }
 
+    /// Whether the replay dropped the rest of the schedule after a long run of
+    /// unmatched events (`Replayer::release_schedule`).
+    pub(super) fn released(&self) -> bool {
+        self.released
+    }
+
     /// Whether the recorded schedule still has an event to replay. Past its
     /// end the run goes on unguided (`ReplayAction::Continue`).
     pub(super) fn has_events_left(&self) -> bool {
@@ -448,7 +473,12 @@ impl Replayer {
                 // is_desync = false; // Logically correct, but... unused_assignments
             }
 
-            if !in_hard_desync_mode {
+            if in_hard_desync_mode {
+                self.unmatched_run += 1;
+                if self.unmatched_run >= UNMATCHED_EVENTS_BEFORE_RELEASE {
+                    return self.release_schedule(current_ix);
+                }
+            } else {
                 // Whether naturally or by fast forward, we should end up in this state before we pop:
                 if !self.next_replay_matches(observed) {
                     tracing::warn!(
@@ -458,6 +488,7 @@ impl Replayer {
                     );
                 }
                 let _ = self.pop_next();
+                self.unmatched_run = 0;
             }
 
             let action = self.check_context_switch(observed);
@@ -506,6 +537,42 @@ impl Replayer {
             }
             _ => {}
         }
+    }
+
+    /// Stop following the schedule: `UNMATCHED_EVENTS_BEFORE_RELEASE`
+    /// observed events in a row, through event `current_ix`, matched none of
+    /// its next event.
+    ///
+    /// The replay runs the thread the schedule names next and holds every
+    /// other thread back. When that thread cannot produce the recorded event,
+    /// a spinner waiting for a thread the replay holds back, say, the run
+    /// stops making progress for good. Dropping the rest of the schedule
+    /// ends the replay as running out of it does: the scheduler gives every
+    /// thread the default priority (`Scheduler::consume_schedevent`), the
+    /// recorded callback checkpoints go with the events, and the run goes on
+    /// unguided. Under `--replay-exhausted-panic` the run stops here instead.
+    ///
+    /// The count is a liveness backstop, and a heuristic: a detour longer than
+    /// the threshold that would have rejoined the schedule loses the rest of
+    /// it too. It is a function of the observed events in turn order alone, so
+    /// the release happens at the same event in every run.
+    fn release_schedule(&mut self, current_ix: u64) -> ReplayAction {
+        let dropped = self.cursor.by_ref().count();
+        self.released = true;
+        tracing::warn!(
+            "[tracereplay] {} observed events in a row, through event #{}, matched none of the replayed schedule's next event; the replay no longer follows the schedule ({} recorded events left unreplayed)",
+            UNMATCHED_EVENTS_BEFORE_RELEASE,
+            current_ix,
+            dropped
+        );
+        if self.replay_exhausted_panic {
+            eprintln!(
+                "[detcore] The replay left its schedule at event #{} with {} recorded events left; stopping (--replay-exhausted-panic)",
+                current_ix, dropped
+            );
+            return ReplayAction::Stop(StopReason::ReplayExausted);
+        }
+        ReplayAction::Continue(None)
     }
 
     /// Logically advance the counting machinery to the next round.
@@ -701,6 +768,41 @@ mod tests {
                 ..*se
             })
             .collect()
+    }
+
+    /// A replay lets go of its schedule once `UNMATCHED_EVENTS_BEFORE_RELEASE`
+    /// observed events in a row match none of its next event, and not before:
+    /// a matched event starts the count again.
+    #[test]
+    fn a_replay_releases_its_schedule_after_a_long_unmatched_run() {
+        let mut b = builder::SchedTestBuilder::new();
+        let recorded = b.other(SOME_RIP, tid(3));
+        let spinner = b.other(SOME_RIP + 8, tid(5));
+        let mut replayer = Replayer::new([recorded.clone(), recorded.clone(), recorded.clone()]);
+
+        let unmatched = |replayer: &mut Replayer, count: u64| {
+            for _ in 0..count {
+                assert_eq!(
+                    replayer.observe_event(&spinner),
+                    ReplayAction::ContextSwitch(true, tid(3), None)
+                );
+            }
+        };
+        unmatched(&mut replayer, UNMATCHED_EVENTS_BEFORE_RELEASE - 1);
+        assert_eq!(
+            replayer.observe_event(&recorded),
+            ReplayAction::Continue(None)
+        );
+        unmatched(&mut replayer, UNMATCHED_EVENTS_BEFORE_RELEASE - 1);
+        assert!(replayer.has_events_left());
+        assert!(!replayer.released());
+
+        assert_eq!(
+            replayer.observe_event(&spinner),
+            ReplayAction::Continue(None)
+        );
+        assert!(!replayer.has_events_left());
+        assert!(replayer.released());
     }
 
     /// A fatal desync names the fields that differed: an event that matches

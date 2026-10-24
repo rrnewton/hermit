@@ -6472,9 +6472,13 @@ impl GlobalState {
                 );
             }
 
+            // Read after any wait for the schedule: a release another thread's
+            // event made meanwhile, in an earlier turn, counts too.
+            let schedule_released = self.lock_rpc_scheduler(false).await.schedule_released();
             TraceSchedEventResponse {
                 print_stack_strace: print_stack.or(print_stack2),
                 timeslice: end_of_timeslice,
+                schedule_released,
             }
         } else {
             let print_stack_strace = {
@@ -6493,6 +6497,7 @@ impl GlobalState {
             TraceSchedEventResponse {
                 print_stack_strace,
                 timeslice: None,
+                schedule_released: false,
             }
         };
 
@@ -9678,6 +9683,9 @@ where
 pub struct TraceSchedEventResponse {
     print_stack_strace: MaybePrintStack,
     timeslice: Option<LogicalTime>,
+    /// Whether the replay has dropped the rest of its schedule
+    /// (`Scheduler::schedule_released`).
+    schedule_released: bool,
 }
 
 struct SchedEventForLog<'a> {
@@ -9783,8 +9791,12 @@ where
             GlobalResponse::TraceSchedEvent(TraceSchedEventResponse {
                 print_stack_strace,
                 timeslice,
+                schedule_released,
             }),
         ) => {
+            if schedule_released {
+                guest.thread_state_mut().callback_history.release();
+            }
             if let Some(m_path) = print_stack_strace {
                 trace!("[trace_schedevent] writing stacktrace via Reverie...");
                 write_backtrace(guest, m_path.as_ref());

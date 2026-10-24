@@ -2257,6 +2257,12 @@
       "why": "tests/c/rendered_procfs_files.c is owned by hermit-cli/tests/cli.rs: the CLI tests detcore_renders_its_procfs_files_on_every_backend, detcore_renders_its_procfs_files_on_dbt_as_on_ptrace and detcore_keeps_its_procfs_files_across_a_chroot_and_trusts_no_forged_placeholder_on_dbt run it on ptrace, DBT, KVM and e9patch preprocessing with ptrace (SaBRe, LiteInst and in-guest-trap are named as not yet, with their issues; DBT's runs are in the second and third test, https://github.com/rrnewton/hermit/issues/4783) and require every backend to give Linux's answers for /proc/sys/kernel/random/uuid and /proc/sys/kernel/pty/nr, which Detcore renders without the backend opening them, and the same device and inode on each (https://github.com/rrnewton/hermit/issues/4213). It stays a fixture because a generic manifest cannot pass the KVM-only option or compare stdout across backends."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/replay_desync_spinner.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/replay_desync_spinner.c is owned by hermit-cli/tests/cli.rs: a_replay_stuck_off_its_schedule_lets_every_thread_run records it joining its worker at once and replays the record with its spin argument, where the main thread spins on sched_yield until the sleeping worker sets a flag; the replay leaves its schedule at the first sched_yield and must let the worker run instead of giving the spinner every turn. It needs a recording and a replay of different arguments, so it remains a guest fixture rather than a manifest cell."
+    },
+    {
       "disposition": "cargo-integration-test-fixture",
       "path": "tests/c/replay_epoch_probe.c",
       "runner": "cargo test -p hermit-run --test clock_determinism and --test cli",

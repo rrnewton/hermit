@@ -5404,6 +5404,7 @@ impl Scheduler {
             let print_stack =
                 position.and_then(|position| self.try_pop_stacktrace_event(position, observed));
             debug!("Next ReplayAction = {:?}", action);
+            self.drop_callback_checkpoints_if_released();
             self.release_replay_priorities_if_exhausted();
 
             match action {
@@ -16226,8 +16227,29 @@ impl Scheduler {
     /// for ever behind a foreground thread that never blocks, a thread the
     /// schedule readmitted at the deferred priority included
     /// (https://github.com/rrnewton/hermit/issues/4472). The point is the
-    /// consumption of the last recorded event, a scheduled event of a running
-    /// thread, so it is the same in every run.
+    /// consumption of the last recorded event, or the replayer's release of
+    /// the rest of the schedule after a long run of events that match none of
+    /// it (`Replayer::release_schedule`). Either is a scheduled event of a
+    /// running thread, so it is the same in every run.
+    /// Whether the replay dropped the rest of its schedule after a long run of
+    /// unmatched events (`Replayer::release_schedule`).
+    pub(crate) fn schedule_released(&self) -> bool {
+        self.replayer.as_ref().is_some_and(Replayer::released)
+    }
+
+    /// A released schedule takes its callback checkpoints with it: they
+    /// belong to the recorded slices the replay no longer follows, and acting
+    /// on them in the unguided rest of the run would add scheduler turns and
+    /// report desyncs. Each thread drops its own copy when it hears of the
+    /// release (`trace_schedevent`).
+    fn drop_callback_checkpoints_if_released(&mut self) {
+        if self.schedule_released() {
+            self.callback_checkpoints
+                .values_mut()
+                .for_each(std::collections::VecDeque::clear);
+        }
+    }
+
     fn release_replay_priorities_if_exhausted(&mut self) {
         if self.replay_priorities_released
             || !self.has_schedule_replay()
@@ -26497,6 +26519,61 @@ mod test {
     /// and only when it is a `sched_yield`: the zero-timeout loopback poll's
     /// yield, whose count is host-timed, keeps the one-turn exclusion
     /// (https://github.com/rrnewton/hermit/issues/4068).
+    /// A replay that lets go of its schedule drops the recorded callback
+    /// checkpoints with it, and says so to the threads that ask.
+    #[test]
+    fn a_released_schedule_drops_its_callback_checkpoints() {
+        use crate::preemptions::callback_history::Checkpoint;
+        use crate::preemptions::callback_history::Origin;
+        use crate::preemptions::callback_history::Site;
+        use crate::slice_boundary::callbacks::Callback;
+        let thread = DetTid::from_raw(3);
+        let event = |rip: usize| SchedEvent {
+            dettid: thread,
+            op: detcore_model::schedule::Op::OtherInstructions,
+            count: 1,
+            start_rip: None,
+            end_rip: std::num::NonZeroUsize::new(rip),
+            end_time: Some(LogicalTime::from_nanos(0)),
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let schedule = directory.path().join("schedule.json");
+        let recorded = vec![event(100), event(100)];
+        std::fs::write(
+            &schedule,
+            serde_json::json!({ "per_thread": {}, "global": recorded }).to_string(),
+        )
+        .unwrap();
+        let mut scheduler = Scheduler::new(&Config {
+            replay_schedule_from: Some(schedule),
+            ..Config::default()
+        });
+        let origin = Origin {
+            callback: Callback::PmuTimer,
+            site: Site::Prehook,
+            progress: 1,
+            last_op: None,
+            time: LogicalTime::from_nanos(0),
+            rcbs: 0,
+        };
+        scheduler.callback_checkpoints.insert(
+            thread,
+            [Checkpoint {
+                history_index: 0,
+                origin,
+            }]
+            .into(),
+        );
+        for _ in 1..replayer::UNMATCHED_EVENTS_BEFORE_RELEASE {
+            assert!(scheduler.consume_schedevent(&event(200)).keep_running);
+        }
+        assert!(!scheduler.schedule_released());
+        assert!(scheduler.callback_checkpoints[&thread].len() == 1);
+        assert!(scheduler.consume_schedevent(&event(200)).keep_running);
+        assert!(scheduler.schedule_released());
+        assert!(scheduler.callback_checkpoints[&thread].is_empty());
+    }
+
     #[test]
     fn only_a_chaos_sched_yield_opens_a_yield_epoch() {
         let tid = DetTid::from_raw(100);
