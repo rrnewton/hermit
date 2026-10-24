@@ -313,6 +313,12 @@
       "why": "tests/c/cwd_roundtrip.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/datagram_read_shutdown.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/datagram_read_shutdown.c is owned by hermit-cli/tests/cli.rs: a_datagram_receive_ends_when_its_read_side_is_shut_down runs it natively and under ptrace, --strict and not, and requires byte-identical output with a fixed expectation: once a UDP or AF_UNIX datagram socket's read side is shut down, a blocking recvfrom, recv, recvmsg, recvmmsg or read returns at once (0 with nothing queued, a queued datagram first), with the address lengths Linux writes, a thread joining its shut-down reader returns, a later blocking send on that socket still waits for its peer to drain, and a TCP listener that SHUT_RD disconnected, so its read side is open again, still waits for data once it connects elsewhere. It stays a fixture because the test compares native and Hermit output."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/dbt_copied_tiocgpgrp.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
