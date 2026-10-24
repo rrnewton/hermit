@@ -162,6 +162,7 @@ impl std::fmt::Display for NothingToKnockOut {
 
 impl std::error::Error for NothingToKnockOut {}
 
+<<<<<<< HEAD
 /// `--minimize`'s baseline: knock interventions out of `record`, the latest
 /// first, until `replay(try, knocked_out)` misses the target and returns the
 /// run that did; [`NothingToKnockOut`] when none is left. Each knock-out
@@ -185,6 +186,8 @@ fn knock_out_until_missed<T>(
     Err(NothingToKnockOut.into())
 }
 
+=======
+>>>>>>> 4b6408b193e (analyze: let --minimize replay the record that met the target, and say how it finds its baseline)
 /// `record` with its latest intervention knocked out, for `--minimize`'s
 /// baseline; `None` when it has none left. Threads at the default priority
 /// with no change are dropped first: replay gives a thread the record does
@@ -1893,6 +1896,7 @@ impl AnalyzeOpts {
             // If we're minimizing, then we know that ALL interventions in the schedule are critical.
             // Thus omitting any of them is sufficient to exit the target schedule space.
             // Omitting the last one should yield the lowest distance match/non-match schedule pair.
+<<<<<<< HEAD
             let newrun = knock_out_until_missed(matching_pr, |ix, knocked_out| {
                 let runname = format!("run2_baseline_try{:03}", ix);
                 let (still_matching, newrun) =
@@ -1901,6 +1905,25 @@ impl AnalyzeOpts {
             })?;
             self.record_endpoint(&newrun);
             Ok(newrun)
+=======
+            let mut pr = matching_pr;
+            let mut ix = 1;
+            loop {
+                let Some(knocked_out) = knock_out_latest(&pr) else {
+                    return Err(NothingToKnockOut.into());
+                };
+                let runname = format!("run2_baseline_try{:03}", ix);
+                let (still_matching, mut newrun) =
+                    self.save_nearby_non_matching_sched_events(&runname, &knocked_out)?;
+                if still_matching {
+                    pr = newrun.preempts_out().clone();
+                    ix += 1;
+                } else {
+                    self.record_endpoint(&newrun);
+                    return Ok(newrun);
+                }
+            }
+>>>>>>> 4b6408b193e (analyze: let --minimize replay the record that met the target, and say how it finds its baseline)
         } else {
             let runname = "run2_baseline".to_string();
             let mut newrun = RunData::new_baseline(self, runname)?.with_preemption_recording();
@@ -4941,6 +4964,7 @@ mod tests {
         );
     }
 
+<<<<<<< HEAD
     /// `--minimize`'s baseline search knocks out one more intervention of the
     /// record it last replayed each time, until a replay misses the target or
     /// none is left; it never starts again from a run's own recording, which
@@ -5112,6 +5136,8 @@ mod tests {
         }
     }
 
+=======
+>>>>>>> 4b6408b193e (analyze: let --minimize replay the record that met the target, and say how it finds its baseline)
     /// A report written before the deciding event was reported still reads.
     #[test]
     fn a_report_without_a_deciding_event_reads() {

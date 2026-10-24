@@ -3686,6 +3686,7 @@ mod tests {
         refusal(&["--"]).unwrap();
     }
 
+<<<<<<< HEAD
     /// A bisection trial's schedules are removed once read, unless --keep-tmp
     /// keeps them: the workspace's names only, so a schedule the run arguments
     /// name (`--replay-schedule-from`) stays, and so does the reproducer.
@@ -3746,6 +3747,8 @@ mod tests {
         }
     }
 
+=======
+>>>>>>> 4b6408b193e (analyze: let --minimize replay the record that met the target, and say how it finds its baseline)
     /// The normalized copy of a run's preemption record is written beside it
     /// for reading, and the run keeps its own record: the target endpoint
     /// and --minimize's baseline replay the record that met the target.
