@@ -187,6 +187,7 @@ static YIELD_LOOP_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DIRECTORY_SIZE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUSE_DIRECTORY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LAST_BAND_BACKGROUND_CALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CHAOS_POLLER_BESIDE_SLEEPERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SCHEDULER_SIGNAL_WAITING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_WAITING_BESIDE_BACKGROUND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAIT_UNREADABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -41886,6 +41887,68 @@ fn a_last_band_worker_holds_back_a_host_observed_completion_under_chaos() {
                 "seed {seed}, run {attempt}: the call rejoined between the worker's turns"
             );
         }
+    }
+}
+
+/// A server thread polls a pipe with no timeout, two threads sleep in 1 ms
+/// loops, and main writes a byte every 20 ms and waits up to 5 s for the
+/// server to take it (tests/c/chaos_poller_beside_sleepers.c). Under
+/// `--chaos --chaos-target-races` the server can start in the last priority
+/// band, and backed off there, a poll upgrade cannot move it. At these seeds
+/// the two sleepers, at better priorities, took turns for every scheduler
+/// turn, the change-point bound never counted the poller, and its poll was
+/// never retried again: main printed "round 5: the poller did not see the
+/// write within 5 s" and exited 1, at 15 of seeds 1-100. Now the upgrade lets
+/// the bound count it (`RunQueue::can_be_passed_over`), as it counts every
+/// upgraded poller, and every round is answered. The INFO log must show the
+/// bound taking the last band behind that poller at every seed, so the test
+/// notices if a seed stops reaching the starved state.
+#[test]
+fn a_last_band_poller_sees_a_pipe_write_beside_two_sleepers_under_chaos() {
+    let guest = futex_c_guest(
+        &CHAOS_POLLER_BESIDE_SLEEPERS_GUEST,
+        "chaos_poller_beside_sleepers",
+    )
+    .to_str()
+    .unwrap()
+    .to_owned();
+    for seed in ["8", "12", "13", "21"] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let args = [
+            "--log=info",
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--chaos",
+            "--chaos-target-races",
+            "--seed",
+            seed,
+            "--",
+            guest.as_str(),
+        ];
+        let (status, log) = run_with_deadline(
+            hermit_command(&args),
+            directory.path(),
+            Duration::from_secs(120),
+            false,
+        );
+        let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the guest's stdout");
+        let tail: Vec<&str> = log.lines().rev().take(40).collect();
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "seed {seed}: the run must finish and exit 0:\n\
+             stdout:\n{stdout}\nlast INFO lines (newest first):\n{}",
+            tail.join("\n")
+        );
+        assert_eq!(stdout, "20 rounds answered\n", "seed {seed}");
+        assert!(
+            log.contains("10000 taken, behind poller dettid"),
+            "seed {seed}: the bound never took the last band behind the poller, so this seed \
+             no longer starves it; pick new seeds"
+        );
     }
 }
 
