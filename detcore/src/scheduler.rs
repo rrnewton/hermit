@@ -15456,6 +15456,21 @@ impl Scheduler {
     /// the rest of the schedule after a long run of events that match none of
     /// it (`Replayer::release_schedule`). Either is a scheduled event of a
     /// running thread, so it is the same in every run.
+    fn release_replay_priorities_if_exhausted(&mut self) {
+        if self.replay_priorities_released
+            || !self.has_schedule_replay()
+            || self.replay_has_records_left()
+        {
+            return;
+        }
+        self.replay_priorities_released = true;
+        info!("[sched] the replayed schedule ran out; every thread takes the default priority");
+        let threads: Vec<DetTid> = self.priorities.keys().copied().collect();
+        for dettid in threads {
+            self.requeue_with_new_priority(dettid, DEFAULT_PRIORITY);
+        }
+    }
+
     /// Whether the replay dropped the rest of its schedule after a long run of
     /// unmatched events (`Replayer::release_schedule`).
     pub(crate) fn schedule_released(&self) -> bool {
@@ -15472,21 +15487,6 @@ impl Scheduler {
             self.callback_checkpoints
                 .values_mut()
                 .for_each(std::collections::VecDeque::clear);
-        }
-    }
-
-    fn release_replay_priorities_if_exhausted(&mut self) {
-        if self.replay_priorities_released
-            || !self.has_schedule_replay()
-            || self.replay_has_records_left()
-        {
-            return;
-        }
-        self.replay_priorities_released = true;
-        info!("[sched] the replayed schedule ran out; every thread takes the default priority");
-        let threads: Vec<DetTid> = self.priorities.keys().copied().collect();
-        for dettid in threads {
-            self.requeue_with_new_priority(dettid, DEFAULT_PRIORITY);
         }
     }
 
