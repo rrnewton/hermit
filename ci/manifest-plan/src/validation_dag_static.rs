@@ -2807,7 +2807,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And -1 from 979f3fed: 2529.
     // And tool_local::timeslice_tests::chaos_schedule_replay_draws_no_slice_end
     // (a schedule replay under --chaos draws no chaos decision): 2530, listed.
-    ("test.detcore_unit", 2530),
+    // And tool_local::timeslice_tests::a_kept_replay_slice_restarts_only_the_backstop
+    // and preemptions::callback_history::tests::a_later_site_of_the_running_callback_ends_the_slice_later
+    // (a replayed slice end a callback checkpoint marks is one turn): 2532, listed.
+    // And tool_global::tests::legacy_callback_checkpoint_at_the_pmu_epsilon_ends_an_expired_deadline_once
+    // and tool_global::tests::legacy_chaos_replay_ends_an_expired_deadline_as_without_chaos
+    // (the same two fixes through the hooks): 2534, listed.
+    ("test.detcore_unit", 2534),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4015,7 +4021,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And liteinst_in_guest_programs::in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name
     // (A5 step 3c slice 0g): 601, listed.
     // And a_schedule_replay_under_chaos_follows_its_recording: 602, listed.
-    ("test.cli", 602),
+    // And a_schedule_replay_ends_each_recorded_slice_once: 603, listed.
+    ("test.cli", 603),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4506,7 +4513,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The in-guest unsequentialized-handler refusal test (slice 0g) starts the
     // in-guest runtime too and joins the hosted exclusions: unchanged at 520.
     // And a_schedule_replay_under_chaos_follows_its_recording: 521, listed.
-    ("test.cli_on_host", 521),
+    // And a_schedule_replay_ends_each_recorded_slice_once: 522, listed.
+    ("test.cli_on_host", 522),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4930,7 +4938,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three slice 7d determinize_stat_tests units: 2530, listed.
     // And -1 from 979f3fed: 2529.
     // And the same chaos schedule-replay unit: 2530, listed.
-    ("test.detcore_unit_on_host", 2530),
+    // And the same two callback-checkpoint replay units: 2532, listed.
+    // And the same two hook-level replay units: 2534, listed.
+    ("test.detcore_unit_on_host", 2534),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
