@@ -33657,6 +33657,145 @@ fn each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name() {
     );
 }
 
+/// `run --verify --print-verify-logs` echoes the first run's log when that run
+/// is itself refused. A fail-closed refusal names its reason only in a Detcore
+/// tracing event, and only the policy-refusal status leaves the container, so
+/// under `--verify` the reason is only in run 1's log. The refused run used to
+/// return before the echo: stderr said "the refusal reason is above", and it
+/// was not. The guest's `sender_blocks` send is refused as in
+/// [`each_unscheduled_signal_to_the_senders_own_process_is_refused_by_name`],
+/// here fail-closed, so run 1 stops with the policy-refusal status.
+///
+/// - With the flag, the reason is on stderr exactly once, and the
+///   `--verify-json` record is run 1's `run_failed` policy refusal,
+///   byte-identical to the record without the flag.
+/// - Without the flag, stderr does not carry the reason: the default output is
+///   unchanged.
+/// - With `--keep-logs`, the retained run-1 log is the echoed text, byte for
+///   byte and once, and it is still retained, after the echo.
+#[test]
+fn verify_print_verify_logs_echoes_a_refused_first_runs_log() {
+    let guest = own_process_signal_guest().to_str().unwrap().to_owned();
+    let reason = "by kill is not supported: the sending thread blocks the signal \
+                  (https://github.com/rrnewton/hermit/issues/4034)";
+    let run = |label: &str, flags: &[&str]| {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let verdict_flag = format!("--verify-json={}", verdict.display());
+        let mut args = vec![
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            verdict_flag.as_str(),
+            "--timeout",
+            "60",
+        ];
+        args.extend_from_slice(flags);
+        args.extend(["--", guest.as_str(), "sender_blocks"]);
+        // --verify buffers a non-seekable stdin to its end for both runs, so
+        // an inherited open pipe would hold the run until the deadline.
+        let mut command = hermit_command(&args);
+        command.stdin(Stdio::null());
+        let (status, log) =
+            run_with_deadline(command, directory.path(), Duration::from_secs(120), false);
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{label}: run 1 must stop with the policy-refusal status:\nstderr:\n{log}"
+        );
+        assert!(
+            log.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+            "{label}: the refusal must keep its class line:\nstderr:\n{log}"
+        );
+        let report = fs::read_to_string(&verdict)
+            .unwrap_or_else(|error| panic!("{label}: reading {}: {error}", verdict.display()));
+        (directory, log, report)
+    };
+
+    let (_directory, plain, plain_report) = run("without --print-verify-logs", &[]);
+    assert!(
+        !plain.contains(reason),
+        "without --print-verify-logs the run-1 log must not be echoed:\nstderr:\n{plain}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&plain_report).unwrap();
+    assert_eq!(parsed["verdict"], "no_result", "{plain_report}");
+    assert_eq!(
+        parsed["no_result_reason"]["kind"], "run_failed",
+        "{plain_report}"
+    );
+    assert_eq!(parsed["no_result_reason"]["run"], "run1", "{plain_report}");
+    assert_eq!(
+        parsed["no_result_reason"]["failure"], "policy_refusal",
+        "{plain_report}"
+    );
+
+    let (_directory, echoed, echoed_report) =
+        run("with --print-verify-logs", &["--print-verify-logs"]);
+    assert_eq!(
+        echoed.matches(reason).count(),
+        1,
+        "--print-verify-logs must echo the refusal reason once:\nstderr:\n{echoed}"
+    );
+    assert_eq!(
+        echoed_report, plain_report,
+        "the echo must not change the --verify-json record"
+    );
+
+    let logs = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let log_dir = format!("--verify-log-dir={}", logs.path().display());
+    let (_directory, kept, kept_report) = run(
+        "with --print-verify-logs --keep-logs",
+        &["--print-verify-logs", "--keep-logs", &log_dir],
+    );
+    assert_eq!(
+        kept_report, plain_report,
+        "--keep-logs must not change the --verify-json record"
+    );
+    let named = |prefix: &str| -> Vec<PathBuf> {
+        fs::read_dir(logs.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(prefix))
+            })
+            .map(|path| fs::canonicalize(path).unwrap())
+            .collect()
+    };
+    let retained = named("run1_log_");
+    assert_eq!(
+        retained.len(),
+        1,
+        "run 1's log must be retained once: {retained:?}\nstderr:\n{kept}"
+    );
+    assert_eq!(
+        named("run2_log_"),
+        Vec::<PathBuf>::new(),
+        "run 2 never started, so no run-2 log is retained:\nstderr:\n{kept}"
+    );
+    let retained_log = fs::read_to_string(&retained[0]).unwrap();
+    assert!(
+        retained_log.contains(reason),
+        "the retained run-1 log must hold the reason:\n{retained_log}"
+    );
+    assert_eq!(
+        kept.matches(retained_log.as_str()).count(),
+        1,
+        "the echo must be the retained run-1 log, once:\nstderr:\n{kept}"
+    );
+    let retention = format!("::   run 1: {}", retained[0].display());
+    let echo_at = kept.find(retained_log.as_str()).unwrap();
+    let retention_at = kept
+        .find(retention.as_str())
+        .unwrap_or_else(|| panic!("stderr must name the retained log:\nstderr:\n{kept}"));
+    assert!(
+        echo_at < retention_at,
+        "the echo must come before retention takes the log:\nstderr:\n{kept}"
+    );
+}
+
 /// The vDSO a guest sees versions its exports as Linux's does: glibc finds
 /// `__vdso_clock_gettime@LINUX_2.6`, refuses `LINUX_2.5`, and the image named by
 /// `AT_SYSINFO_EHDR` carries `DT_VERDEF`. Reverie's canonical vDSO had no

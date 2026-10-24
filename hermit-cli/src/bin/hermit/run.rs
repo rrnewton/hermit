@@ -72,6 +72,7 @@ use reverie::process::Namespace;
 use reverie::process::Output;
 
 use super::container::IdentityGuard;
+use super::container::LogCapExceeded;
 use super::container::PlannedMount;
 use super::container::PolicyRefusal;
 use super::container::apply_affinity;
@@ -760,6 +761,34 @@ fn verification_log(
         BoundedWriter::new(log_file, limit),
         budget,
     ))
+}
+
+/// The `--print-verify-logs` echo of the first verification run's log.
+///
+/// With --verify the first run's `--log` output was diverted to a temporary
+/// file for later comparison rather than shown to the user. Echo that log to
+/// stderr so the user still sees `--log` output, matching a normal
+/// (non-verify) run. The log file is fully flushed here because run_verify
+/// runs each execution in a child process that has already exited.
+///
+/// Run 2 has not started yet, so under --max-log-bytes this echo must not
+/// wait on stderr: the log goes through `DroppingStderr`, which waits for a
+/// full pipe only within `RetryingStderr`'s bounded deadline and drops what it
+/// then cannot deliver. Without the cap it is written exactly as before, and a
+/// failed write is still an error.
+fn echo_first_run_log(log1_path: &Path) -> Result<(), Error> {
+    match fs::read(log1_path) {
+        Ok(bytes) if hermit::nonwaiting_write::diagnostics_must_not_wait() => {
+            let _ = detcore::util::DroppingStderr.write_all(&bytes);
+        }
+        Ok(bytes) => std::io::stderr().write_all(&bytes)?,
+        Err(err) => crate::tracing::diagnostic_eprintln!(
+            "WARNING: --print-verify-logs could not read first-run log {}: {}",
+            log1_path.display(),
+            err
+        ),
+    }
+    Ok(())
 }
 
 impl Write for SharedLog {
@@ -9352,6 +9381,19 @@ impl RunOpts {
                 }
                 error =
                     publish_run_failure(self.verify_json.as_deref(), VerificationRun::Run1, error);
+                // A refused or failed first run names its reason only in its
+                // own log (a policy refusal's reason is a Detcore tracing
+                // event, and only the exit status leaves the container), so
+                // --print-verify-logs echoes it here too, before retention
+                // takes the log. Not after the log cap: that exit must stay
+                // prompt, and the log is the one that crossed it.
+                if self.print_verify_logs
+                    && error.downcast_ref::<LogCapExceeded>().is_none()
+                    && let Err(echo_error) = echo_first_run_log(&log1_path)
+                {
+                    error =
+                        retain_verification_error(error, "echoing the first-run log", echo_error);
+                }
                 if self.keep_logs {
                     error = retain_logs_after_verification_error(error, [("run 1", log1_path)]);
                 }
@@ -9389,30 +9431,8 @@ impl RunOpts {
             signal_reports.prepare("run 1", out1.status, &log1_path);
         }
 
-        // With --verify the first run's `--log` output was diverted to a
-        // temporary file for later comparison rather than shown to the user.
-        // When --print-verify-logs is set, echo that first run's log to stderr so the
-        // user still sees `--log` output, matching a normal (non-verify) run.
-        // The log file is fully flushed here because run_verify runs each
-        // execution in a child process that has already exited.
-        //
-        // Run 2 has not started yet, so under --max-log-bytes this echo must not
-        // wait on stderr: the log goes through `DroppingStderr`, which waits for
-        // a full pipe only within `RetryingStderr`'s bounded deadline and drops
-        // what it then cannot deliver. Without the cap it is written exactly as
-        // before, and a failed write is still an error.
         if self.print_verify_logs {
-            match fs::read(&log1_path) {
-                Ok(bytes) if hermit::nonwaiting_write::diagnostics_must_not_wait() => {
-                    let _ = detcore::util::DroppingStderr.write_all(&bytes);
-                }
-                Ok(bytes) => std::io::stderr().write_all(&bytes)?,
-                Err(err) => crate::tracing::diagnostic_eprintln!(
-                    "WARNING: --print-verify-logs could not read first-run log {}: {}",
-                    log1_path.display(),
-                    err
-                ),
-            }
+            echo_first_run_log(&log1_path)?;
         }
 
         if let Some(error) = reject_first_run(
