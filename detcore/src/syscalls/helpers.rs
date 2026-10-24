@@ -5158,6 +5158,10 @@ where
 /// The real-time signals, 32 to 64, as kernel sigset bits.
 pub(crate) const REAL_TIME_SIGNALS: KernelSigset = !0 << 31;
 
+/// Linux's `SOCK_TYPE_MASK`: a socket's type without `SOCK_NONBLOCK` and
+/// `SOCK_CLOEXEC`.
+pub(crate) const SOCK_TYPE_MASK: i32 = 0xf;
+
 /// The signals a thread whose mask becomes `mask` lets the kernel take from
 /// its queues: those `mask` does not block, split into the ones whose delivery
 /// the guest observes and the ones Linux discards on delivery because their

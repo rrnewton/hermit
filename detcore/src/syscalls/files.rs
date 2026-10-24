@@ -75,6 +75,10 @@ use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::scheduler::terminal_signals;
 use crate::stat::*;
 use crate::syscalls::guest_siginfo::GuestSiginfo;
+use crate::syscalls::helpers::SOCK_TYPE_MASK;
+use crate::syscalls::implicit_bind::ImplicitBindCall;
+use crate::syscalls::implicit_bind::mark_bound;
+use crate::syscalls::implicit_bind::mark_unbound_port;
 use crate::syscalls::signal::ProcessSignalTarget;
 use crate::syscalls::threads::kernel_sigset_bit;
 use crate::tool_global::*;
@@ -13356,8 +13360,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.mark_sock_diag_fd(guest, fd, &call);
             self.note_unix_socket(guest, fd, call.family(), call.r#type());
             self.mark_error_queue_reads(guest, fd, &call)?;
-            // Linux's SOCK_TYPE_MASK: the type without SOCK_NONBLOCK and SOCK_CLOEXEC.
-            const SOCK_TYPE_MASK: i32 = 0xf;
+            mark_unbound_port(guest, fd, &call);
             if self.accept_in_turn_enabled() && call.r#type() & SOCK_TYPE_MASK == libc::SOCK_STREAM
             {
                 guest
@@ -13390,6 +13393,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest
                 .thread_state()
                 .with_detfd(fd, |detfd| detfd.set_guest_created())?;
+            mark_unbound_port(guest, fd, &call);
 
             Ok(fd as i64)
         }
@@ -13569,12 +13573,16 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
-    /// Transition an already tracked socket into listening state.
+    /// Transition an already tracked socket into listening state. An unbound
+    /// socket first takes a port from Detcore
+    /// (`crate::syscalls::implicit_bind`).
     pub async fn handle_listen<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Listen,
     ) -> Result<i64, Error> {
+        self.bind_implicit_port(guest, call.fd(), ImplicitBindCall::Listen)
+            .await?;
         Ok(self.record_or_replay(guest, call).await?)
     }
 
@@ -13941,8 +13949,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(name) = &notice_abstract_name {
             notice_host_network_abstract_bind(name, &res);
         }
-
-        Ok(res?)
+        let res = res?;
+        // Detcore gave an IPv4 or IPv6 bind its port, so the socket has one.
+        if [libc::AF_INET, libc::AF_INET6].contains(&i32::from(sockaddr_family)) {
+            mark_bound(guest, sock_fd);
+        }
+        Ok(res)
     }
 
     /// Create and register an event notification counter.

@@ -11615,6 +11615,124 @@ fn no_namespace_runs_render_the_base_mount_table() {
     }
 }
 
+/// A socket the guest never bound gets the same local port on every run. Linux
+/// picks the port of an implicit bind (TCP `connect` and `listen`, UDP
+/// `connect` and send) at random, and Hermit passed that pick on, so
+/// `getsockname`, `accept` and a datagram's source differed run to run.
+/// Detcore now binds such a socket first to a port from the allocator a bind
+/// to port 0 uses.
+///
+/// `wide`: every implicit port in the default range, at bitwise parity, with
+/// the guest's own checks of what holds on Linux whatever it picks. `forced`:
+/// one-port ranges, so each pick, and each call that finds no free port, has
+/// Linux's one answer; the expected text is the guest's native output under
+/// `unshare -Urn`, which Hermit must match.
+#[test]
+fn implicit_binds_take_the_same_ports_on_every_run() {
+    let _guard = hermit_run_guard();
+    static GUEST: OnceLock<PathBuf> = OnceLock::new();
+    let guest = compiled_c_guest(&GUEST, "implicit_bind_ports")
+        .to_str()
+        .unwrap();
+    // The guest's fresh network namespace has IPv6 loopback when the host's
+    // kernel does.
+    let ipv6 = std::net::TcpListener::bind("[::1]:0").is_ok();
+    let wide = [
+        "tcp4 listener 127.0.0.1:32768",
+        "tcp4 client connect=0 local 127.0.0.1:32769 peer 127.0.0.1:32768",
+        "tcp4 accepted local 127.0.0.1:32768 peer 127.0.0.1:32769",
+        "udp4 receiver 127.0.0.1:32770",
+        "udp4 sender sendto=1 local 0.0.0.0:32771 datagram-from 127.0.0.1:32771",
+        "udp4 connected connect=0 local 127.0.0.1:32772",
+        "udp4 sendmsg sender sent=1 local 0.0.0.0:32773 datagram-from 127.0.0.1:32773",
+        "udp4 sendmmsg sender sent=1 local 0.0.0.0:32774 datagram-from 127.0.0.1:32774",
+        "tcp4 listen-without-bind listen=0 local 0.0.0.0:32775",
+    ];
+    let wide6 = [
+        "tcp6 listener [::1]:32776",
+        "tcp6 client connect=0 local [::1]:32777 peer [::1]:32776",
+        "tcp6 accepted local [::1]:32776 peer [::1]:32777",
+        "udp6 receiver [::1]:32778",
+        "udp6 sender sendto=1 local [::]:32779 datagram-from [::1]:32779",
+        "udp6 connected connect=0 local [::1]:32780",
+        "udp6 sendmsg sender sent=1 local [::]:32781 datagram-from [::1]:32781",
+        "udp6 sendmmsg sender sent=1 local [::]:32782 datagram-from [::1]:32782",
+    ];
+    let mut wide_lines = wide.to_vec();
+    if ipv6 {
+        wide_lines.extend(wide6);
+    } else {
+        eprintln!("this host has no IPv6 loopback: the guest's IPv6 rounds are not run");
+        wide_lines.push("tcp6 unavailable");
+    }
+    wide_lines.push("checks failed=0");
+    let forced = [
+        "range 40000 40000",
+        "  listener bound to port 0: port 40000",
+        "range 40001 40001",
+        "  client connect=0 errno=0 port 40001",
+        "  accept reports port 40001",
+        "  second client connect=-1 errno=EADDRNOTAVAIL port 0",
+        "range 40002 40002",
+        "  udp sender sendto=1 errno=0 port 40002",
+        "  second udp sender sendto=-1 errno=EAGAIN port 0",
+        "  udp connect=-1 errno=EAGAIN port 0",
+        "range 40003 40003",
+        "  listen without bind listen=0 errno=0 port 40003",
+        "  second listen without bind listen=-1 errno=EADDRINUSE port 0",
+        "range 40004 40005",
+        "  client closing first connect=0 errno=0 port 40004",
+        "  listen without bind listen=0 errno=0 port 40005",
+        "  client after TIME_WAIT connect=0 errno=0 port 40005",
+        "  client with both ports in TIME_WAIT connect=-1 errno=EADDRNOTAVAIL port 0",
+        "range 40006 40008",
+        "  client with IP_LOCAL_PORT_RANGE 40007-40007 setsockopt=0 connect=0 port 40007",
+        "range 40009 40009",
+        "  tcp connect to an IPv6 address from an IPv4 socket connect=-1 errno=EAFNOSUPPORT port 0",
+        "  udp disconnect without a port connect=0 errno=0 port 0",
+        "  udp sendmsg sender sent=1 errno=0 port 40009",
+        "  udp second sendmsg sender sent=-1 errno=EAGAIN port 0",
+        "  udp sendmmsg sender sent=-1 errno=EAGAIN port 0",
+    ];
+    let directory = tempfile::tempdir().expect("failed to create the report directory");
+    for (mode, proc_level, lines) in [
+        ("wide", "--proc=minimal", wide_lines),
+        // The guest narrows /proc/sys/net/ipv4/ip_local_port_range, which
+        // only the standard level shows.
+        ("forced", "--proc=standard", forced.to_vec()),
+    ] {
+        let report = directory.path().join(format!("{mode}.json"));
+        let report = report.to_str().unwrap();
+        let args = [
+            "--log=info",
+            "run",
+            "--strict",
+            proc_level,
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report,
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let expected: String = lines.iter().map(|line| format!("{line}\n")).collect();
+        assert_eq!(stdout(&output), expected, "{mode}");
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(report).expect("read the verification report"))
+                .expect("parse the verification report");
+        assert_eq!(verdict["bitwise_parity"], true, "{mode}: {verdict}");
+        for side in ["left", "right"] {
+            assert!(
+                verdict["compared_log_messages"][side].as_u64() > Some(0),
+                "{mode}: {verdict}"
+            );
+        }
+    }
+}
+
 /// `statx` asked for the classic mount ID (0x1101, systemd `chase()`'s first
 /// call) and for the unique one (0x5109, its follow-up, adding `STATX_UID` and
 /// `STATX_MNT_ID_UNIQUE`) answers as Linux does (`vfs_statx_path`, v6.12
