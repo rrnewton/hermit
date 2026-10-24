@@ -954,7 +954,20 @@ impl RecordVersion {
 // values, or a refusal where it recorded a completion, and another schedule.
 // It is refused here.
 // https://github.com/rrnewton/hermit/pull/4885
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19a);
+// 0x19a -> 0x19b (HIGHEST_SHIPPED+1 at this change's rebase onto main
+// shipping 0x19a; provisionally 0x187 reserved for release-05's F1 in
+// minibeads dh-gxmvo, 2026-10-24, since spent on another change): on seven
+// Intel models (Ice Lake 0x6A, 0x6C, 0x7D and 0x7E, Tiger Lake 0x8D,
+// Sapphire Rapids 0x8F and Emerald Rapids 0xCF) the retired-conditional-
+// branch counter changes from umask 0x01, which counts only taken
+// conditional branches there, to umask 0x11, every conditional branch, the
+// metric every other profile counts. Every RCB coordinate a recording made
+// on those hosts stores (preemption points, branch counts, timer targets)
+// counted the other quantity, and a full recording states no RCB clock
+// identity of its own, so replaying an older one would place its events
+// elsewhere; it is refused here.
+// https://github.com/rrnewton/hermit/pull/4668
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19b);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -979,7 +992,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x19a);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19a;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x19b;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -1316,6 +1329,10 @@ fn record_or_replay_config_with_timer_support(
         cpu_profile_source: None,
         // Record and replay run under the ptrace backend.
         backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
+        // A recording replays no standalone history (`replay_schedule_from`
+        // and `replay_preemptions_from` stay unset below) and writes none;
+        // its compatibility is the record epoch's.
+        rcb_clock_claim: Default::default(),
         // As `hermit run` sets it for ptrace (`prepare_backend_config` in
         // lib.rs). With it off, the scheduler did not model signal targets, so
         // a thread asleep in a backgrounded rt_sigsuspend that a child-exit
@@ -2471,7 +2488,6 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x184)));
     }
 
-    /// A 0x186 recording polled a MSG_DONTWAIT send or receive on a
     /// A 0x187 recording polled a MSG_DONTWAIT send or receive on a
     /// socketpair end until it stopped failing with EAGAIN; this replayer runs
     /// it once, so the version gate must refuse it.
@@ -2482,6 +2498,19 @@ mod tests {
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
+    }
+
+    /// A recording from before the corrected RCB event (0x19a and earlier)
+    /// made on one of the seven corrected Intel models counted only taken
+    /// conditional branches, so every RCB coordinate it stores names another
+    /// point in the guest; the version gate must refuse it on every host, as
+    /// a full recording does not state which counter it used. A recording of
+    /// this version is accepted.
+    #[test]
+    fn record_version_rejects_streams_from_before_the_corrected_rcb_event() {
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x19a)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
+        assert!(RECORD_VERSION.compatible_with(&RecordVersion(0x19b)));
     }
 
     #[test]

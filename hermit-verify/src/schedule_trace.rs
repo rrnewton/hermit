@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use colored::Colorize;
 use detcore::edit_distance::iterable_bubble_sort;
+use detcore::preemptions::HistoryIdentity;
 use detcore::preemptions::PreemptionRecord;
 use detcore::preemptions::boundary_recording::Recording;
 use detcore_model::pid::DetTid;
@@ -256,10 +257,14 @@ impl InterpolateOpts {
         let charged_once = Self::common_expired_wait_charge(&self.file_a, &self.file_b)?;
         let first_pass = Self::common_sleep_registration(&self.file_a, &self.file_b)?;
         let capped = Self::common_cap_preemption_charge(&self.file_a, &self.file_b)?;
-        let first_record =
-            Recording::read(&self.file_a)?.into_legacy("schedule diff/interpolation")?;
-        let second_record =
-            Recording::read(&self.file_b)?.into_legacy("schedule diff/interpolation")?;
+        let first_recording = Recording::read(&self.file_a)?;
+        let second_recording = Recording::read(&self.file_b)?;
+        let identity = Self::common_identity(
+            (self.file_a.as_path(), &first_recording),
+            (self.file_b.as_path(), &second_recording),
+        )?;
+        let first_record = first_recording.into_legacy("schedule diff/interpolation")?;
+        let second_record = second_recording.into_legacy("schedule diff/interpolation")?;
         let first_schedule = first_record.schedevents();
         let second_schedule = second_record.schedevents();
         let (_swap_dist, _edit_dist, requested_schedule) = {
@@ -280,6 +285,7 @@ impl InterpolateOpts {
         let second_departed = second_record.replay_departed_at();
         let reconciled = |record: PreemptionRecord| {
             record
+                .with_identity(identity.clone())
                 .retain_replay_departure(first_departed)
                 .retain_replay_departure(second_departed)
                 .with_guest_ids(guest_ids)
@@ -349,14 +355,16 @@ impl InterpolateOpts {
     /// The `--pipe-wake-latency` both schedules were recorded under, which
     /// the interpolated schedule carries; schedules recorded under different
     /// values are refused (<https://github.com/rrnewton/hermit/issues/4380>).
+    /// Each input is a path and the bytes read from it.
     fn common_pipe_wake_latency(
-        file_a: &std::path::Path,
-        file_b: &std::path::Path,
+        (file_a, bytes_a): (&std::path::Path, &[u8]),
+        (file_b, bytes_b): (&std::path::Path, &[u8]),
     ) -> anyhow::Result<Option<u64>> {
-        let read = |path: &std::path::Path| {
-            detcore::preemptions::read_recorded_pipe_wake_latency(path).map_err(anyhow::Error::msg)
+        let read = |path: &std::path::Path, bytes: &[u8]| {
+            detcore::preemptions::recorded_pipe_wake_latency_in(path, bytes)
+                .map_err(anyhow::Error::msg)
         };
-        let (a, b) = (read(file_a)?, read(file_b)?);
+        let (a, b) = (read(file_a, bytes_a)?, read(file_b, bytes_b)?);
         if a != b {
             anyhow::bail!(
                 "{} and {} were recorded under different --pipe-wake-latency values ({:?} and \
@@ -426,19 +434,33 @@ impl InterpolateOpts {
             );
         }
         Ok(a)
+    /// The RCB coordinate identity both schedules state, which the
+    /// interpolated schedule carries unchanged; schedules stating different
+    /// identities are refused. Each input is a path and its decoded recording.
+    fn common_identity(
+        (file_a, a): (&std::path::Path, &Recording),
+        (file_b, b): (&std::path::Path, &Recording),
+    ) -> anyhow::Result<Option<HistoryIdentity>> {
+        detcore::clock_identity::combined_identity(
+            (&file_a.display().to_string(), a.identity()),
+            (&file_b.display().to_string(), b.identity()),
+        )
+        .map_err(anyhow::Error::msg)
     }
 
     /// The signal-state copy setting the interpolated schedule carries: the
     /// one the schedules state, where they agree or only one states it.
-    /// Schedules recorded under different settings are refused.
+    /// Schedules recorded under different settings are refused. Each input
+    /// is a path and the bytes read from it.
     fn common_signal_state_copy(
-        file_a: &std::path::Path,
-        file_b: &std::path::Path,
+        (file_a, bytes_a): (&std::path::Path, &[u8]),
+        (file_b, bytes_b): (&std::path::Path, &[u8]),
     ) -> anyhow::Result<Option<bool>> {
-        let read = |path: &std::path::Path| {
-            detcore::preemptions::read_recorded_signal_state_copy(path).map_err(anyhow::Error::msg)
+        let read = |path: &std::path::Path, bytes: &[u8]| {
+            detcore::preemptions::recorded_signal_state_copy_in(path, bytes)
+                .map_err(anyhow::Error::msg)
         };
-        match (read(file_a)?, read(file_b)?) {
+        match (read(file_a, bytes_a)?, read(file_b, bytes_b)?) {
             (Some(a), Some(b)) if a != b => anyhow::bail!(
                 "{} and {} were recorded with the signal-state copy {} and {}; no \
                  interpolation of them can be replayed",
@@ -533,7 +555,7 @@ mod tests {
         // format/jump fields. Deserialize the public record representation,
         // as the command does, rather than constructing private fields.
         let mut value =
-            serde_json::to_value(PreemptionRecord::from_sched_events(events).with_current_format())
+            serde_json::to_value(PreemptionRecord::from_sched_events_with_identity(events, None).with_current_format())
                 .unwrap();
         value["epoch"] = serde_json::json!("2026-01-01T00:00:00Z");
         value["cap_preemption_charge"] = serde_json::json!(true);
@@ -694,7 +716,7 @@ mod tests {
             SchedEvent::branches(DetTid::from_raw(5001), 2),
         ];
         let mut input =
-            serde_json::to_value(PreemptionRecord::from_sched_events(events.clone())).unwrap();
+            serde_json::to_value(PreemptionRecord::from_sched_events_with_identity(events.clone(), None)).unwrap();
         input["guest_ids"] = serde_json::to_value(ids).unwrap();
         let unmarked = input.clone();
         let unmarked_path = directory.path().join("unmarked.json");
@@ -790,7 +812,7 @@ mod tests {
             .map(|(index, ids)| {
                 let path = directory.path().join(format!("{index}.json"));
                 let mut record =
-                    serde_json::to_value(PreemptionRecord::from_sched_events(events.clone()))
+                    serde_json::to_value(PreemptionRecord::from_sched_events_with_identity(events.clone(), None))
                         .unwrap();
                 if let Some(ids) = ids {
                     record["guest_ids"] = ids.clone();
@@ -907,7 +929,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("recording.json");
         let recording = Recording::Boundaries(
-            BoundaryRecording::new(PreemptionRecord::from_sched_events(vec![]), schedule).unwrap(),
+            BoundaryRecording::new(PreemptionRecord::from_sched_events_with_identity(vec![], None), schedule)
+                .unwrap(),
         );
         recording.write(&path).unwrap();
         let before = std::fs::read(&path).unwrap();
@@ -948,14 +971,20 @@ mod tests {
         let write = |name: &str, copy: Option<bool>| {
             let path = dir.path().join(name);
             let record =
-                PreemptionRecord::from_sched_events(Vec::new()).with_signal_state_copy(copy);
+                PreemptionRecord::from_sched_events_with_identity(Vec::new(), None).with_signal_state_copy(copy);
             std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
             path
         };
         let unsaid = write("unsaid.json", None);
         let on = write("on.json", Some(true));
         let off = write("off.json", Some(false));
-        let common = InterpolateOpts::common_signal_state_copy;
+        let common = |a: &PathBuf, b: &PathBuf| {
+            let (bytes_a, bytes_b) = (std::fs::read(a).unwrap(), std::fs::read(b).unwrap());
+            InterpolateOpts::common_signal_state_copy(
+                (a.as_path(), bytes_a.as_slice()),
+                (b.as_path(), bytes_b.as_slice()),
+            )
+        };
         assert_eq!(common(&unsaid, &unsaid).unwrap(), None);
         assert_eq!(common(&on, &on).unwrap(), Some(true));
         assert_eq!(common(&unsaid, &off).unwrap(), Some(false));
@@ -973,7 +1002,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let write = |name: &str, once: bool| {
             let path = dir.path().join(name);
-            let record = PreemptionRecord::from_sched_events(Vec::new())
+            let record = PreemptionRecord::from_sched_events_with_identity(Vec::new(), None)
                 .with_expired_wait_runs_charged_once(once);
             std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
             path
@@ -998,7 +1027,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let write = |name: &str, first_pass: bool| {
             let path = dir.path().join(name);
-            let record = PreemptionRecord::from_sched_events(Vec::new())
+            let record = PreemptionRecord::from_sched_events_with_identity(Vec::new(), None)
                 .with_queued_sleeps_registered_at_first_pass(first_pass);
             std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
             path
@@ -1025,7 +1054,7 @@ mod tests {
         let write = |name: &str, on: bool| {
             let path = dir.path().join(name);
             let record =
-                PreemptionRecord::from_sched_events(Vec::new()).with_cap_preemption_charge(on);
+                PreemptionRecord::from_sched_events_with_identity(Vec::new(), None).with_cap_preemption_charge(on);
             std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
             path
         };
@@ -1056,6 +1085,58 @@ mod tests {
         }
     }
 
+    /// The interpolated schedule states the identity both inputs state, a
+    /// qualified, unqualified or absent one alike, and two schedules stating
+    /// different identities cannot be interpolated.
+    #[test]
+    fn interpolate_keeps_the_common_identity_and_refuses_different_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let known = Recording::decode(
+            br#"{"rcb_history":{"format":2,"identity":"rcb:cond-retired:user:v1","recording":{"per_thread":{},"global":[]}}}"#,
+        )
+        .unwrap()
+        .identity()
+        .cloned()
+        .unwrap();
+        let unqualified = HistoryIdentity::Unqualified("claim-unset".to_owned());
+        let write = |name: &str, identity: Option<HistoryIdentity>| {
+            let path = dir.path().join(name);
+            PreemptionRecord::from_sched_events_with_identity(Vec::new(), identity)
+                .write_to_disk(&path)
+                .unwrap();
+            path
+        };
+        let known_a = write("known-a.json", Some(known.clone()));
+        let known_b = write("known-b.json", Some(known.clone()));
+        let unqualified_a = write("unqualified-a.json", Some(unqualified.clone()));
+        let unqualified_b = write("unqualified-b.json", Some(unqualified.clone()));
+        let legacy = write("legacy.json", None);
+        let common = |a: &PathBuf, b: &PathBuf| {
+            InterpolateOpts::common_identity(
+                (a.as_path(), &Recording::read(a).unwrap()),
+                (b.as_path(), &Recording::read(b).unwrap()),
+            )
+        };
+        assert_eq!(common(&known_a, &known_b).unwrap(), Some(known));
+        assert_eq!(
+            common(&unqualified_a, &unqualified_b).unwrap(),
+            Some(unqualified)
+        );
+        assert_eq!(common(&legacy, &legacy).unwrap(), None);
+        for (a, b) in [
+            (&known_a, &unqualified_a),
+            (&unqualified_b, &known_b),
+            (&known_a, &legacy),
+            (&legacy, &unqualified_a),
+        ] {
+            let error = common(a, b).unwrap_err();
+            assert!(
+                error.to_string().contains("hermit refused to combine"),
+                "{error}"
+            );
+        }
+    }
+
     /// The schedule interpolation writes carries the settings its inputs
     /// were recorded under: a replay of two capped schedules' interpolation
     /// caps as they did, and one of two uncapped ones does not.
@@ -1078,7 +1159,7 @@ mod tests {
         for (capped, once) in [(true, true), (true, false), (false, true), (false, false)] {
             let write = |name: &str, tid: i32| {
                 let path = dir.path().join(format!("{name}-{capped}-{once}.json"));
-                PreemptionRecord::from_sched_events(events(tid))
+                PreemptionRecord::from_sched_events(events(tid), None)
                     .with_cap_preemption_charge(capped)
                     .with_expired_wait_runs_charged_once(once)
                     .write_to_disk(&path)
@@ -1108,38 +1189,67 @@ mod tests {
 
     /// Two schedules recorded under different `--pipe-wake-latency` values,
     /// off and `0` included, cannot be interpolated: no replay could
-    /// reproduce the result (https://github.com/rrnewton/hermit/issues/4380).
+    /// The interpolated schedule carries the identity, latency and copy
+    /// setting both inputs state; inputs stating different identities are
+    /// refused before anything is written.
     #[test]
-    fn interpolate_refuses_schedules_recorded_under_different_pipe_wake_latencies() {
+    fn interpolation_carries_the_common_identity_and_refuses_different_ones() {
         let dir = tempfile::tempdir().unwrap();
-        let write = |name: &str, latency: Option<u64>| {
+        let known = Recording::decode(
+            br#"{"rcb_history":{"format":2,"identity":"rcb:cond-retired:user:v1","recording":{"per_thread":{},"global":[]}}}"#,
+        )
+        .unwrap()
+        .identity()
+        .cloned()
+        .unwrap();
+        let (three, five) = (DetTid::from_raw(3), DetTid::from_raw(5));
+        let write = |name: &str, events: Vec<SchedEvent>, identity, latency, copy| {
             let path = dir.path().join(name);
-            let record =
-                PreemptionRecord::from_sched_events(Vec::new()).with_pipe_wake_latency(latency);
-            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+            PreemptionRecord::from_sched_events_with_identity(events, identity)
+                .with_pipe_wake_latency(latency)
+                .with_signal_state_copy(copy)
+                .write_to_disk(&path)
+                .unwrap();
             path
         };
-        let off = write("off.json", None);
-        let zero = write("zero.json", Some(0));
-        let one_ms = write("one-ms.json", Some(1_000_000));
-        assert_eq!(
-            InterpolateOpts::common_pipe_wake_latency(&off, &off).unwrap(),
-            None
+        let schedule = |events: &[(DetTid, u32)]| {
+            events
+                .iter()
+                .map(|&(tid, count)| SchedEvent::branches(tid, count))
+                .collect::<Vec<_>>()
+        };
+        let first = schedule(&[(three, 1), (five, 2), (three, 3)]);
+        let second = schedule(&[(five, 2), (three, 1), (three, 3)]);
+        let file_a = write("a.json", first, Some(known.clone()), Some(0), Some(true));
+        let file_b = write("b.json", second, Some(known.clone()), Some(0), Some(true));
+        let options = InterpolateOpts {
+            interpolate: 50,
+            file_a: file_a.clone(),
+            file_b: file_b.clone(),
+        };
+        let record = options.interpolated_record().unwrap();
+        assert_eq!(record.identity(), Some(&known));
+        assert_eq!(record.pipe_wake_latency(), Some(0));
+        assert_eq!(record.signal_state_copy(), Some(true));
+        assert_eq!(record.schedevents().len(), 3);
+
+        write(
+            "b.json",
+            schedule(&[(three, 1)]),
+            Some(HistoryIdentity::Unqualified("claim-unset".to_owned())),
+            Some(0),
+            Some(true),
         );
-        assert_eq!(
-            InterpolateOpts::common_pipe_wake_latency(&zero, &zero).unwrap(),
-            Some(0)
+        let error = options
+            .interpolated_record()
+            .err()
+            .expect("different identities are refused");
+        assert!(
+            error.to_string().contains("hermit refused to combine"),
+            "{error}"
         );
-        for (a, b) in [(&off, &zero), (&zero, &one_ms), (&one_ms, &off)] {
-            let error = InterpolateOpts::common_pipe_wake_latency(a, b).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("different --pipe-wake-latency values"),
-                "{error}"
-            );
-        }
     }
+
 }
 
 #[cfg(test)]
@@ -1157,11 +1267,11 @@ mod replay_departure_tests {
         )];
         for left in [None, Some(0), Some(7)] {
             for right in [None, Some(3), Some(9)] {
-                PreemptionRecord::from_sched_events(events.clone())
+                PreemptionRecord::from_sched_events_with_identity(events.clone(), None)
                     .retain_replay_departure(left)
                     .write_to_disk(&a)
                     .unwrap();
-                PreemptionRecord::from_sched_events(events.clone())
+                PreemptionRecord::from_sched_events_with_identity(events.clone(), None)
                     .retain_replay_departure(right)
                     .write_to_disk(&b)
                     .unwrap();
