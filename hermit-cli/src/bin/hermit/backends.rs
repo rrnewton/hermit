@@ -1126,6 +1126,7 @@ impl DbtInvocation {
                 detcore_model::summary::PreemptionSummary {
                     max_timeslice_ns: self.config.max_timeslice.map(|maximum| maximum.get()),
                     timer_enabled: Some(false),
+                    stopless_slice_ends: None,
                 }
             );
         }

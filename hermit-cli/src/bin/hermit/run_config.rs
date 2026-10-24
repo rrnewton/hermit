@@ -927,6 +927,7 @@ mod tests {
         ("runs-post-fork", &["--runs-post-fork=parent"]),
         ("passthru-opt", &["--passthru-opt"]),
         ("imprecise-timers", &["--imprecise-timers"]),
+        ("eager-lone-preemptions", &["--eager-lone-preemptions"]),
         ("no-signal-state-copy", &["--no-signal-state-copy"]),
         ("chaos", &["--chaos"]),
         ("fuzz-futexes", &["--fuzz-futexes"]),

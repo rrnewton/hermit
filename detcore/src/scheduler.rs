@@ -2146,6 +2146,16 @@ pub struct Scheduler {
     /// (<https://github.com/rrnewton/hermit/issues/4121>).
     deadline_hints: BTreeMap<DetTid, Duration>,
 
+    /// The threads whose latest grant found them the only thread able to run
+    /// before they next enter Detcore
+    /// ([`Scheduler::runs_alone_until_it_enters_detcore`]), taken by the
+    /// grant's reply as `GlobalResponse::WithLoneGrant`. Kept only under
+    /// [`Config::replays_lone_preemptions`].
+    lone_grants: BTreeSet<DetTid>,
+
+    /// [`Config::replays_lone_preemptions`], fixed for the run.
+    replays_lone_preemptions: bool,
+
     /// The threads the scheduler resumed from a wait since their current
     /// request arrived: granted a turn ([`Scheduler::unblock_guest`]), or a
     /// parked wait resumed to observe a signal before its grant
@@ -4680,6 +4690,8 @@ impl Scheduler {
             boundary_budgets: Default::default(),
             boundary_owners: boundaries.then(Default::default),
             deadline_hints: Default::default(),
+            lone_grants: Default::default(),
+            replays_lone_preemptions: cfg.replays_lone_preemptions(),
             granted: Default::default(),
             per_thread_timeslice: Default::default(),
             per_thread_syscalls: Default::default(),
@@ -7786,6 +7798,7 @@ impl Scheduler {
     /// Remove entries from everywhere that non-runnable threads lurk.
     fn remove_blocking_entries(&mut self, dtid: &DetTid) {
         self.deadline_hints.remove(dtid);
+        self.lone_grants.remove(dtid);
         self.blocked.timed_waiters.remove(*dtid);
         let _ = self.blocked.external_io_blockers.remove(dtid);
         self.blocked.replay_log_served.remove(dtid);
@@ -15449,6 +15462,92 @@ impl Scheduler {
             })
     }
 
+    /// Whether no guest thread other than `dtid` can run before `dtid` next
+    /// enters Detcore, judged at `dtid`'s grant from scheduler state alone
+    /// (`Config::eager_lone_preemptions`). Stricter than
+    /// [`Scheduler::nothing_else_can_run`], which lets a timer, a host or an
+    /// idle poller count as waiting: here nothing else may be queued, every
+    /// other registered thread must wait for what only a guest's own call
+    /// brings (a futex wake without a timeout, a child's change of state, a
+    /// signal), with no signal already pending for it, and nothing may be
+    /// pending that a scheduler pass acts on by itself: no deadline, alarm,
+    /// interval or POSIX timer, no poll deadline, no call waiting on a host,
+    /// no physical child, no deferred `SIGCHLD`, no happens-before program,
+    /// and nothing queued for a pass's prefix
+    /// ([`Scheduler::pass_has_pending_work`]).
+    ///
+    /// While that holds, nothing changes it but `dtid`'s own requests, so
+    /// every scheduler pass until `dtid` next enters Detcore grants `dtid`
+    /// again: a timeslice end in between decides nothing, and `dtid`'s next
+    /// entry can process it at its branch count with the same effect.
+    fn runs_alone_until_it_enters_detcore(&self, dtid: DetTid) -> bool {
+        self.run_queue.tids().all(|tid| *tid == dtid)
+            && !self.pass_has_pending_work()
+            && self.blocked.timed_waiters.holds_nothing()
+            && self.poll_deadlines.is_empty()
+            && self.blocked.external_io_blockers.is_empty()
+            && self.blocked.physical_child_waiters.is_empty()
+            && self.blocked.physical_child_ready.is_empty()
+            && self.blocked.sigchld_deferred.is_empty()
+            && self.happens_before.is_none()
+            && self
+                .next_turns
+                .keys()
+                .filter(|&&tid| tid != dtid)
+                .all(|&tid| {
+                    let parked_futex = self.next_turns.get(&tid).is_some_and(is_futex_request)
+                        && self
+                            .blocked
+                            .futex_waiters
+                            .values()
+                            .any(|waiters| waiters.iter().any(|waiter| waiter.dettid == tid));
+                    let waits_on_a_guest = parked_futex
+                        || self.blocked.child_waiters.contains_key(&tid)
+                        || self.blocked.rt_sigsuspend_blockers.contains_key(&tid);
+                    waits_on_a_guest && self.inbound_signals(tid).is_empty()
+                })
+    }
+
+    /// Whether a scheduler pass has anything to act on before it picks a
+    /// thread: what `step2_drain_prefix` drains or waits for (parent-death
+    /// signals, the SIGKILL fence and its retained wakes, run-queue removals
+    /// and admissions, cross-task signals, physical process exits and
+    /// child-exit publications not yet seen, the vfork, background-entry,
+    /// exited-leader and exited-thread barriers) and the blocked pool's
+    /// one-pass marks (signaled background calls and `rt_sigsuspend`
+    /// requests, `SIGCHLD` deliveries placed or to be taken, drain-woken and
+    /// timed-out waiters, woken sleeps). A queue added to that prefix belongs
+    /// here too.
+    fn pass_has_pending_work(&self) -> bool {
+        !self.pending_parent_death_signals.is_empty()
+            || self.sigkill_fence_holds()
+            || self.has_retained_sigkill_wakes()
+            || !self.pending_run_queue_removals.is_empty()
+            || !self.pending_cross_task_signals.is_empty()
+            || !self.pending_run_queue_admissions.is_empty()
+            || !self.pending_physical_process_exits.is_empty()
+            || !self.child_exit_publications_pending.is_empty()
+            || !self.vfork_barriers.is_empty()
+            || !self.background_entry_barriers.is_empty()
+            || !self.exited_leader_barriers.is_empty()
+            || !self.exited_thread_barriers.is_empty()
+            || !self.blocked.signaled_background.is_empty()
+            || !self.blocked.signaled_sigsuspend_requests.is_empty()
+            || !self.blocked.sigchld_ready.is_empty()
+            || !self.blocked.sigchld_takers.is_empty()
+            || !self.blocked.drain_woken_waiters.is_empty()
+            || !self.blocked.woken_sleeps.is_empty()
+            || !self.blocked.timed_out_futex_waiters.is_empty()
+    }
+
+    /// Take the mark [`Scheduler::unblock_guest`] left for `dtid`'s latest
+    /// grant (`Scheduler::lone_grants`). Every request clears it on arrival,
+    /// as it does the deadline hint, so a reply carries only a mark recorded
+    /// while its own request was pending.
+    pub fn take_lone_grant(&mut self, dtid: DetTid) -> bool {
+        self.lone_grants.remove(&dtid)
+    }
+
     /// A strong yield issued, on a backend whose loopback pollers yield to their peers
     /// (today SaBRe), before a zero-timeout poll while the task owns a
     /// loopback connection. Its count is kernel-readiness timing, not guest-visible progress.
@@ -15957,6 +16056,11 @@ impl Scheduler {
             Some(remaining) => self.deadline_hints.insert(dtid, remaining),
             None => self.deadline_hints.remove(&dtid),
         };
+        if self.replays_lone_preemptions && self.runs_alone_until_it_enters_detcore(dtid) {
+            self.lone_grants.insert(dtid);
+        } else {
+            self.lone_grants.remove(&dtid);
+        }
         self.granted.insert(dtid);
         self.parked.running = Some(dtid);
         self.boundary_budgets.committed_grant(dtid);
@@ -18121,6 +18225,195 @@ mod test {
         register_known_thread(&mut sched, opener);
         queued_poller(&mut sched, DetTid::from_raw(5), true);
         assert!(sched.nothing_else_can_run(opener));
+    }
+
+    /// A sequentialized ptrace configuration with the PMU timer, under which
+    /// grants may be marked lone (`Config::replays_lone_preemptions`).
+    fn lone_config() -> Config {
+        let config = Config {
+            sequentialize_threads: true,
+            backend: reverie::BackendCapabilities::PTRACE,
+            ..Config::default()
+        };
+        assert!(config.replays_lone_preemptions());
+        config
+    }
+
+    /// `waiter` parked in a futex wait without a timeout.
+    fn park_untimed_futex_waiter(sched: &mut Scheduler, waiter: DetTid) {
+        register_known_thread(sched, waiter);
+        let mut resources = Resources::new(waiter);
+        resources.insert(ResourceID::FutexWait, Permission::W);
+        sched.next_turns[&waiter].req.put(Ok(resources));
+        sched
+            .blocked
+            .futex_waiters
+            .entry(FutexID::private(MmId::initial(waiter), 0x1000))
+            .or_default()
+            .push(futex_waiter(waiter.as_raw(), u32::MAX));
+    }
+
+    /// Beside threads in untimed futex waits a thread runs alone; a deadline,
+    /// an alarm or a call waiting on a host anywhere means a pass may act
+    /// without it.
+    #[test]
+    fn a_thread_runs_alone_only_while_nothing_but_its_own_calls_can_wake_another() {
+        let runner = DetTid::from_raw(3);
+        let waiter = DetTid::from_raw(5);
+        let alone = |prepare: &dyn Fn(&mut Scheduler)| {
+            let mut sched = Scheduler::new(&lone_config());
+            register_known_thread(&mut sched, runner);
+            park_untimed_futex_waiter(&mut sched, waiter);
+            prepare(&mut sched);
+            sched.runs_alone_until_it_enters_detcore(runner)
+        };
+        assert!(alone(&|_| {}));
+        assert!(!alone(&|sched| {
+            sched
+                .blocked
+                .timed_waiters
+                .insert(LogicalTime::from_nanos(1_000_000), waiter);
+        }));
+        assert!(!alone(&|sched| {
+            sched.blocked.timed_waiters.insert_alarm(
+                LogicalTime::from_nanos(1_000_000),
+                DetPid::from_raw(3),
+                runner,
+                Signal::SIGALRM,
+                LogicalTime::from_nanos(0),
+            );
+        }));
+        assert!(!alone(&|sched| {
+            let other = DetTid::from_raw(7);
+            register_known_thread(sched, other);
+            sched
+                .blocked
+                .external_io_blockers
+                .insert(other, ExternalOpId::new(other, 1));
+        }));
+        assert!(!alone(&|sched| {
+            sched
+                .poll_deadlines
+                .insert((LogicalTime::from_nanos(1_000_000), waiter));
+        }));
+        assert!(!alone(&|sched| {
+            sched
+                .blocked
+                .physical_child_waiters
+                .entry(DetPid::from_raw(9))
+                .or_default()
+                .insert(waiter);
+        }));
+        assert!(!alone(&|sched| {
+            sched.blocked.physical_child_ready.insert(waiter);
+        }));
+        assert!(!alone(&|sched| {
+            sched.blocked.sigchld_deferred.insert(waiter);
+        }));
+        assert!(!alone(&|sched| {
+            sched.happens_before = Some(HbRuntime::new(
+                detcore_model::happens_before::HappensBeforeProgram {
+                    version: 1,
+                    anchors: Default::default(),
+                    edges: Vec::new(),
+                    max_hold_ns: None,
+                },
+            ));
+        }));
+        // Work a pass acts on by itself (`pass_has_pending_work`).
+        assert!(!alone(&|sched| {
+            sched
+                .pending_cross_task_signals
+                .entry(waiter)
+                .or_default()
+                .push(SigWrapper::from(Signal::SIGUSR1));
+        }));
+        assert!(!alone(&|sched| {
+            sched
+                .exited_leader_barriers
+                .insert(DetTid::from_raw(11), std::time::Instant::now());
+        }));
+        assert!(!alone(&|sched| {
+            sched.blocked.woken_sleeps.insert(waiter);
+        }));
+    }
+
+    /// A thread whose request is a futex wait the pool does not hold has not
+    /// parked yet; one in a child wait or `rt_sigsuspend` waits on a guest.
+    #[test]
+    fn only_parked_guest_waits_leave_a_thread_alone() {
+        let runner = DetTid::from_raw(3);
+        let other = DetTid::from_raw(5);
+        let with = |prepare: &dyn Fn(&mut Scheduler)| {
+            let mut sched = Scheduler::new(&lone_config());
+            register_known_thread(&mut sched, runner);
+            register_known_thread(&mut sched, other);
+            prepare(&mut sched);
+            sched.runs_alone_until_it_enters_detcore(runner)
+        };
+        assert!(!with(&|sched| {
+            let mut resources = Resources::new(other);
+            resources.insert(ResourceID::FutexWait, Permission::W);
+            sched.next_turns[&other].req.put(Ok(resources));
+        }));
+        assert!(with(&|sched| {
+            sched
+                .blocked
+                .rt_sigsuspend_blockers
+                .insert(other, ExternalOpId::new(other, 1));
+        }));
+        assert!(with(&|sched| {
+            sched.blocked.child_waiters.insert(
+                other,
+                (DetPid::from_raw(5), normal_wait(ChildWaitSelector::Any)),
+            );
+        }));
+    }
+
+    /// A queued thread, even an idle poller that
+    /// [`Scheduler::nothing_else_can_run`] counts as waiting, takes turns at
+    /// slice ends; so may a registered thread not yet admitted.
+    #[test]
+    fn a_queued_or_unadmitted_thread_means_no_thread_runs_alone() {
+        let runner = DetTid::from_raw(3);
+        let mut sched = Scheduler::new(&lone_config());
+        register_known_thread(&mut sched, runner);
+        queued_poller(&mut sched, DetTid::from_raw(5), true);
+        assert!(sched.nothing_else_can_run(runner));
+        assert!(!sched.runs_alone_until_it_enters_detcore(runner));
+
+        let mut sched = Scheduler::new(&lone_config());
+        register_known_thread(&mut sched, runner);
+        register_known_thread(&mut sched, DetTid::from_raw(7));
+        assert!(!sched.runs_alone_until_it_enters_detcore(runner));
+    }
+
+    /// A grant is marked lone when the thread runs alone, once, and never
+    /// under `--eager-lone-preemptions`.
+    #[test]
+    fn a_grant_to_a_thread_running_alone_is_marked_once() {
+        let runner = DetTid::from_raw(3);
+        let grant = |config: &Config, beside_a_poller: bool| {
+            let mut sched = Scheduler::new(config);
+            register_known_thread(&mut sched, runner);
+            if beside_a_poller {
+                queued_poller(&mut sched, DetTid::from_raw(5), true);
+            }
+            sched.next_turns[&runner]
+                .req
+                .put(Ok(Resources::new(runner)));
+            let _ = turn_answer(&mut sched, runner);
+            let first = sched.take_lone_grant(runner);
+            assert!(!sched.take_lone_grant(runner), "a mark is taken once");
+            first
+        };
+        assert!(grant(&lone_config(), false));
+        assert!(!grant(&lone_config(), true));
+        let eager = Config {
+            eager_lone_preemptions: true,
+            ..lone_config()
+        };
+        assert!(!grant(&eager, false));
     }
 
     #[test]

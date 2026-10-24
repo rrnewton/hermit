@@ -4895,6 +4895,32 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub last_rcb_timer_is_max: bool,
 
+    /// Whether the scheduler's last reply to this thread was a grant that
+    /// found it the only thread able to run before it next enters Detcore
+    /// (`GlobalResponse::WithLoneGrant`). Every reply without that mark
+    /// clears it.
+    #[serde(default)]
+    pub lone_grant: bool,
+
+    /// While the thread runs alone (`Config::replays_lone_preemptions`): the
+    /// branch count, in `committed_clock_value` units, at which its current
+    /// timeslice ends. No timer stops the guest there; the thread's next
+    /// entry into Detcore processes every such end at or before the count it
+    /// reached, in order (`Detcore::catch_up_lone_slice_ends`).
+    #[serde(default)]
+    pub lone_slice_end: Option<u64>,
+
+    /// While such an end is processed: its branch count, which the clock
+    /// update reads in place of the hardware counter.
+    #[serde(default)]
+    pub replaying_lone_slice_end: Option<u64>,
+
+    /// Set when a grant while such an end was processed did not find the
+    /// thread alone, which the scheduler's predicate rules out; taken by
+    /// `Detcore::catch_up_lone_slice_ends`, which reports it.
+    #[serde(default)]
+    pub lone_replay_unsound: bool,
+
     /// Are we past the global moment when the guest's first execve of its root binary completes
     /// (with a successful exit code).
     pub(crate) past_global_first_execve: bool,
@@ -5628,6 +5654,10 @@ impl<T> ThreadState<T> {
             published_runtime_private_memory: None,
             last_rcb_timer: None,
             last_rcb_timer_is_max: false,
+            lone_grant: false,
+            lone_slice_end: None,
+            replaying_lone_slice_end: None,
+            lone_replay_unsound: false,
             record_or_replay,
             preemption_points: None,
             past_global_first_execve: false,
