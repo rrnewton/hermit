@@ -4041,7 +4041,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And dbt_guest_environment_does_not_carry_hermits_configuration and
     // dbt_run_refuses_strict_schedule_boundaries, added when Hermit stopped
     // putting its configuration in the DBT guest's environment: 608, listed.
-    ("test.cli", 608),
+    // And verify_print_verify_logs_echoes_a_refused_first_runs_log, added by
+    // Hermit bbcd2f3e without a count: 609 (validate at 285a61ae saw 609).
+    ("test.cli", 609),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4537,7 +4539,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // out unchanged and not excluded: 525.
     // And the same DBT guest-environment and strict-boundaries refusal tests:
     // 527.
-    ("test.cli_on_host", 527),
+    // And the same uncounted verify-log echo test from bbcd2f3e, not excluded:
+    // 528.
+    ("test.cli_on_host", 528),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
