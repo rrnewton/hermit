@@ -1624,7 +1624,17 @@ pub struct RunOpts {
 
     /// The base environment that is presented to the guest. "Empty" is completely empty, and "Host"
     /// allows through all the environment variables in hermit's own environment.
-    /// "Minimal" provides a minimal deterministic environment, setting only PATH, HOSTNAME, and HOME.
+    /// "Minimal" provides a minimal deterministic environment that sets PATH, HOSTNAME, HOME, USER
+    /// and LOGNAME.
+    ///
+    /// "Minimal" sets exactly HOSTNAME=hermetic-container.local,
+    /// PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin, HOME=/root, USER=root
+    /// and LOGNAME=root, the same on every host, and like every instrumented guest the guest also
+    /// gets ASAN_OPTIONS=detect_leaks=0 and LSAN_OPTIONS=detect_leaks=0. HOME, USER and LOGNAME
+    /// name the guest's own identity: the guest's getuid() is 0, which its user database names
+    /// root with home directory /root. That directory is usually the host's, which the guest
+    /// cannot write; give a writable one with `--env HOME=/tmp`, and replace any of these values
+    /// with `--env NAME=VALUE`.
     #[clap(long, default_value = "host", value_name = "str")]
     base_env: BaseEnv,
 
@@ -1747,6 +1757,40 @@ pub(super) fn parse_assignment(src: &str) -> Result<(String, Option<String>), Er
     }
 }
 
+/// The whole environment `--base-env=minimal` gives the guest, and the default
+/// an `--image` guest gets for each of these its image does not declare. Every
+/// value is a constant, so the guest sees the same environment on every host.
+///
+/// HOME, USER and LOGNAME name the guest's own identity, as login(1) sets them
+/// for a user: Detcore presents every guest the fixed identity uid 0
+/// (`getuid()` returns 0 with or without the container's user namespace, which
+/// maps the invoking user to uid 0), and the guest's `getpwuid(0)` names that
+/// user `root` with home directory `/root`.
+const MINIMAL_BASE_ENV: [(&str, &str); 5] = [
+    ("HOSTNAME", "hermetic-container.local"),
+    (
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    ),
+    ("HOME", "/root"),
+    ("USER", "root"),
+    ("LOGNAME", "root"),
+];
+
+/// Replace the guest's environment with [`MINIMAL_BASE_ENV`].
+fn apply_minimal_base_environment(command: &mut Command) {
+    command.env_clear();
+    command.envs(MINIMAL_BASE_ENV);
+}
+
+/// Replace the guest's environment with an `--image` guest's: the image's
+/// declared `Env` over [`MINIMAL_BASE_ENV`], so each value the image declares
+/// replaces the default it names.
+fn apply_image_base_environment(command: &mut Command, image_env: &[(String, String)]) {
+    apply_minimal_base_environment(command);
+    command.envs(image_env.iter().map(|(key, value)| (key, value)));
+}
+
 fn apply_base_and_explicit_environment(
     command: &mut Command,
     base_env: &BaseEnv,
@@ -1757,13 +1801,7 @@ fn apply_base_and_explicit_environment(
             command.env_clear();
         }
         BaseEnv::Minimal => {
-            command.env_clear();
-            command.env("HOSTNAME", "hermetic-container.local");
-            command.env(
-                "PATH",
-                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            );
-            command.env("HOME", "/root");
+            apply_minimal_base_environment(command);
         }
         BaseEnv::Host => {
             // Hermit's own settings, not the guest's: where its verify logs go,
@@ -3129,12 +3167,21 @@ fn namespace_only_guest_command_applies_process_options_once() {
     let envs = command.get_captured_envs();
     assert_eq!(
         envs.len(),
-        4,
+        6,
         "unexpected namespace-only environment: {envs:?}"
     );
     assert_eq!(
         envs.get(OsStr::new("HOME")).map(|value| value.as_os_str()),
         Some(OsStr::new("/root"))
+    );
+    assert_eq!(
+        envs.get(OsStr::new("USER")).map(|value| value.as_os_str()),
+        Some(OsStr::new("root"))
+    );
+    assert_eq!(
+        envs.get(OsStr::new("LOGNAME"))
+            .map(|value| value.as_os_str()),
+        Some(OsStr::new("root"))
     );
     assert_eq!(
         envs.get(OsStr::new("HOSTNAME"))
@@ -10035,28 +10082,13 @@ impl RunOpts {
         // PROTOTYPE (--image): an OCI rootfs is a self-contained filesystem, so
         // leaking the host environment (a host `PATH` full of paths absent from
         // the image) both breaks usability and undermines determinism. Instead
-        // apply the image's *own* declared `Env` — pinned by the image digest,
-        // hence deterministic — over an otherwise empty base, then merge user
-        // `--env` on top. If the image declares no `PATH`/`HOME` we fall back to
-        // the same hermetic defaults `--base-env=minimal` uses.
+        // start from the `--base-env=minimal` defaults, apply the image's *own*
+        // declared `Env` over them — pinned by the image digest, hence
+        // deterministic — so each value the image declares replaces the
+        // default it names, then merge user `--env` on top.
         if let Some(image) = &self.image {
-            command.env_clear();
             let cfg = crate::image::read_image_config(image)?;
-            let declares_path = cfg.env.iter().any(|(k, _)| k == "PATH");
-            let declares_home = cfg.env.iter().any(|(k, _)| k == "HOME");
-            command.env("HOSTNAME", "hermetic-container.local");
-            if !declares_path {
-                command.env(
-                    "PATH",
-                    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                );
-            }
-            if !declares_home {
-                command.env("HOME", "/root");
-            }
-            for (key, value) in &cfg.env {
-                command.env(key, value);
-            }
+            apply_image_base_environment(&mut command, &cfg.env);
             self.merge_from_env_settings(&mut command)?;
             return Ok(command);
         }
@@ -11742,6 +11774,34 @@ mod tests {
                 "{name} must not reach a guest with the host environment: removed {removed:?}"
             );
         }
+    }
+
+    /// An `--image` guest gets each `--base-env=minimal` variable its image
+    /// does not declare, and the image's value for each one it does.
+    #[test]
+    fn image_env_replaces_only_the_minimal_defaults_it_declares() {
+        let mut command = Command::new("/bin/true");
+        let image_env = [
+            ("PATH".to_owned(), "/image/bin".to_owned()),
+            ("USER".to_owned(), "builder".to_owned()),
+            ("IMAGE_ONLY".to_owned(), "present".to_owned()),
+        ];
+        apply_image_base_environment(&mut command, &image_env);
+        let envs = command.get_captured_envs();
+        let expected = [
+            ("HOME", "/root"),
+            ("HOSTNAME", "hermetic-container.local"),
+            ("IMAGE_ONLY", "present"),
+            ("LOGNAME", "root"),
+            ("PATH", "/image/bin"),
+            ("USER", "builder"),
+        ];
+        assert_eq!(
+            envs.iter()
+                .map(|(name, value)| (name.to_str().unwrap(), value.to_str().unwrap()))
+                .collect::<Vec<_>>(),
+            expected,
+        );
     }
 
     #[test]
