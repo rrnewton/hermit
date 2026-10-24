@@ -33595,9 +33595,9 @@ fn a_zero_timeout_poll_ended_by_a_signal_restarts_as_on_linux() {
 /// the poll they end over and over must still time out after 100 ms, long
 /// before they stop; and a 30 ms ITIMER_REAL interrupts five more polls
 /// through a SIGALRM handler. Every mode must print native's lines, except that
-/// record skips the storm (see the comment there). The strict and plain legs
-/// emulate the poll on virtual time and passed before; the
-/// `--no-sequentialize-threads` and record legs run it in the kernel.
+/// record compares only the storm's poll result (see the comment there). The
+/// strict and plain legs emulate the poll on virtual time and passed before;
+/// the `--no-sequentialize-threads` and record legs run it in the kernel.
 #[test]
 fn a_kernel_run_poll_a_signal_ends_restarts_until_its_deadline() {
     let _lock = hermit_run_guard();
@@ -33642,30 +33642,52 @@ fn a_kernel_run_poll_a_signal_ends_restarts_until_its_deadline() {
             assert_success(&output, &args);
             assert_eq!(stdout(&output), line, "{args:?}");
         }
-        // Record skips the storm: there the sender's sleeps take virtual
-        // time, so its signals do not span the poll's host-time wait, and
-        // replay refused a poll restarted that often in most runs.
-        if mode == "storm" {
-            continue;
+        // The storm is recorded three times: its signals reach the restarted
+        // poll at host-timed points, and replay refused or diverged on most
+        // such recordings while record left a signal that stopped a restart
+        // before it ran out of its schedule (`kernel_poll_restart_code`).
+        // Two of them start each backgrounded call up to 10 ms late
+        // (docs/RACE_PROBES.md), so signals reach restarts before they run. Its sender's sleeps take virtual time under
+        // record, so only the poll's result is compared.
+        let recordings: &[bool] = if mode == "storm" {
+            &[true, true, false]
+        } else {
+            &[false]
+        };
+        for &probe in recordings {
+            let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+                .expect("failed to create the recording data dir");
+            let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+            let args = [
+                "record",
+                "start",
+                "--verify",
+                "--verify-strict",
+                "--record-timeout",
+                "120",
+                &data_dir_arg,
+                "--",
+                guest,
+                mode,
+            ];
+            let mut command = hermit_command(&args);
+            if probe {
+                command
+                    .env("HERMIT_RACE_PROBE", "bg_pre_call=0-10")
+                    .env("HERMIT_RACE_PROBE_SEED", "7");
+            }
+            let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+            assert_success(&output, &args);
+            let recorded = stdout(&output);
+            if mode == "storm" {
+                assert!(
+                    recorded.starts_with("storm: poll 0; "),
+                    "{args:?} (probe: {probe}): {recorded}"
+                );
+            } else {
+                assert_eq!(recorded, line, "{args:?}");
+            }
         }
-        let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-            .expect("failed to create the recording data dir");
-        let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
-        let args = [
-            "record",
-            "start",
-            "--verify",
-            "--verify-strict",
-            "--record-timeout",
-            "120",
-            &data_dir_arg,
-            "--",
-            guest,
-            mode,
-        ];
-        let output = hermit(&args);
-        assert_success(&output, &args);
-        assert_eq!(stdout(&output), line, "{args:?}");
     }
 }
 
