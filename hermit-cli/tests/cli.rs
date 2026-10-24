@@ -21392,11 +21392,12 @@ fn gdbserver_listens_promptly(command: &mut Command, port: u16) -> (bool, Durati
     (listened, elapsed, stderr)
 }
 
-/// `--gdbserver` with the default local network warns on stderr that it
-/// switches to host networking, while the outer process prepares the run.
-/// The gdbserver then waits for a client and the cap is not reached, so the
-/// test requires that it listens on its port within
-/// [`LOG_CAP_RUN_WAIT_BOUND`], and kills it.
+/// `--gdbserver` says on stderr where to attach while the outer process
+/// prepares the run. The gdbserver then waits for a client and the cap is not
+/// reached, so the test requires that it listens on its port within
+/// [`LOG_CAP_RUN_WAIT_BOUND`], and kills it. The guest has the default local
+/// network, whose namespace hides no port of the gdbserver: Hermit binds it in
+/// the host's namespace, where this test looks for it.
 #[test]
 fn max_log_bytes_gdbserver_listens_promptly_when_stderr_is_a_full_pipe() {
     let _lock = hermit_run_guard();
@@ -21426,7 +21427,10 @@ fn max_log_bytes_gdbserver_listens_promptly_when_stderr_is_a_full_pipe() {
     let (listened, elapsed, stderr) =
         gdbserver_listens_promptly(command(&port.to_string()).stderr(Stdio::piped()), port);
     assert!(
-        listened && stderr.contains("WARNING: --gdbserver requires host networking"),
+        listened
+            && stderr.contains(&format!(
+                "hermit run: the guest waits for one gdb client on 127.0.0.1:{port}"
+            )),
         "the premise does not hold: with stderr read, listened={listened} after {elapsed:?}; \
          stderr:\n{stderr}"
     );
@@ -21444,6 +21448,147 @@ fn max_log_bytes_gdbserver_listens_promptly_when_stderr_is_a_full_pipe() {
         "hermit run --gdbserver did not listen on port {port} within {elapsed:?} and was \
          killed: a diagnostic waited on the full stderr pipe"
     );
+}
+
+/// A single-process guest that prints its PID, its open descriptors and the
+/// network interfaces it sees. Single-process: a guest that forks under a
+/// gdb session is a separate gdbserver limitation, on main as here.
+const GDBSERVER_PARITY_GUEST_SOURCE: &str = r#"#include <dirent.h>
+#include <stdio.h>
+#include <unistd.h>
+
+static void list(const char *path) {
+  DIR *dir = opendir(path);
+  struct dirent *entry;
+  while (dir && (entry = readdir(dir))) {
+    if (entry->d_name[0] != '.') {
+      printf("%s %s\n", path, entry->d_name);
+    }
+  }
+  if (dir) {
+    closedir(dir);
+  }
+}
+
+int main(void) {
+  printf("pid=%d\n", (int)getpid());
+  list("/proc/self/fd");
+  list("/sys/class/net");
+  return 0;
+}
+"#;
+
+/// `hermit run --strict --gdbserver` is admitted, and a gdb session that only
+/// continues leaves the strict run's output as it is without gdb. The guest
+/// ([`GDBSERVER_PARITY_GUEST_SOURCE`]) pins three things: the relay that
+/// serves the port is no thread of the tracer's (a thread would take a PID in
+/// the container's namespace before the guest's), the port Hermit binds before
+/// the container exists reaches no guest descriptor, and the guest keeps its
+/// loopback-only network (the gdbserver used to force host networking, which
+/// `--strict` refused).
+#[test]
+fn strict_gdbserver_session_that_only_continues_matches_the_run_without_gdb() {
+    const TEST: &str = "strict_gdbserver_session_that_only_continues_matches_the_run_without_gdb";
+    // The same GDB, and the same skip-or-fail policy, as the DAP tests.
+    let Some(gdb) = dap_capable_gdb(TEST) else {
+        return;
+    };
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the gdbserver work dir");
+    let (_source, program) = dap_compile(
+        work.path(),
+        "gdbserver_parity",
+        GDBSERVER_PARITY_GUEST_SOURCE,
+    );
+    let program = program.to_str().expect("guest path should be UTF-8");
+    let strict = [
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+    ];
+    let mut args = vec!["run"];
+    args.extend(strict);
+    args.extend(["--", program]);
+    let plain = hermit(&args);
+    assert!(
+        plain.status.success()
+            && String::from_utf8_lossy(&plain.stdout).ends_with("\n/sys/class/net lo\n"),
+        "the strict run without gdb: {}\nstdout:\n{}\nstderr:\n{}",
+        plain.status,
+        String::from_utf8_lossy(&plain.stdout),
+        stderr(&plain)
+    );
+
+    let port = unused_local_port();
+    let port_arg = format!("--gdbserver-port={port}");
+    let mut args = vec!["run"];
+    args.extend(strict);
+    args.extend(["--gdbserver", &port_arg, "--", program]);
+    let run_stdout = work.path().join("hermit-run.stdout");
+    let run_stderr = work.path().join("hermit-run.stderr");
+    let mut command = hermit_command(&args);
+    command
+        .stdin(Stdio::null())
+        .stdout(fs::File::create(&run_stdout).expect("failed to create the run stdout file"))
+        .stderr(fs::File::create(&run_stderr).expect("failed to create the run stderr file"));
+    let mut run = KillOnDrop(
+        command
+            .spawn()
+            .expect("failed to spawn hermit run --strict --gdbserver"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !tcp_port_is_listening(port) {
+        let exited = run.0.try_wait().expect("failed to poll hermit run");
+        assert!(
+            exited.is_none() && Instant::now() < deadline,
+            "hermit run --strict --gdbserver never listened on port {port} (exit: {exited:?})\n\
+             stderr:\n{}",
+            fs::read_to_string(&run_stderr).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let session = Command::new(&gdb)
+        .args(["-batch", "-nx", "-iex", "set debuginfod enabled off"])
+        .args([
+            "-ex",
+            &format!("target remote 127.0.0.1:{port}"),
+            "-ex",
+            "continue",
+        ])
+        .arg(program)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run gdb");
+    let session_out = String::from_utf8_lossy(&session.stdout);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = run.0.try_wait().expect("failed to poll hermit run") {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "hermit run did not exit after gdb continued it\ngdb:\n{session_out}\nstderr:\n{}",
+            fs::read_to_string(&run_stderr).unwrap_or_default()
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let run_err = fs::read_to_string(&run_stderr).unwrap_or_default();
+    assert!(
+        session_out.contains("exited normally"),
+        "gdb did not see the guest exit:\n{session_out}\nstderr:\n{run_err}"
+    );
+    assert_eq!(
+        (
+            status.code(),
+            fs::read_to_string(&run_stdout).unwrap_or_default()
+        ),
+        (
+            plain.status.code(),
+            String::from_utf8_lossy(&plain.stdout).into_owned()
+        ),
+        "the strict run under gdb differs from the run without it\nstderr:\n{run_err}"
+    );
+    assert!(!run_err.contains("host networking"), "stderr:\n{run_err}");
 }
 
 /// A capped run whose stderr pipe has no reader still exits exactly 123.
@@ -24029,8 +24174,8 @@ fn tcp_listener_commands(port: u16) -> Vec<String> {
 }
 
 /// `hermit run --dap-listen` refuses, before any adapter starts, every run it
-/// could not serve: one whose `--gdbserver` is refused (`--strict`), one that
-/// runs the program twice (`--verify`) or without a GDB server
+/// could not serve: one that runs the program twice (`--verify`) or without a
+/// GDB server
 /// (`--namespace-only`), one whose gdbserver port the system would pick
 /// (`--gdbserver-port=0`), an address that does not parse or is already
 /// taken, and a run that the internal mark of a supervised run claims, from
@@ -24044,14 +24189,8 @@ fn hermit_run_dap_listen_refusals_start_no_adapter() {
         .local_addr()
         .expect("failed to read the taken address")
         .to_string();
-    // Each refusal must name every one of its causes: --strict's names the
-    // --gdbserver that --dap-listen turns on.
+    // Each refusal must name every one of its causes.
     for (args, marker, reasons) in [
-        (
-            vec!["--strict", "--dap-listen", "127.0.0.1:0"],
-            None,
-            &["--strict", "--gdbserver"][..],
-        ),
         (
             vec!["--verify", "--dap-listen", "127.0.0.1:0"],
             None,
@@ -24652,8 +24791,7 @@ fn hermit_run_dap_listen_keeps_the_not_found_status() {
 
 /// Without a `hermit-dap` beside `hermit`, `--dap-listen` fails and says how
 /// to build it. A run that fails before it needs the adapter fails as it
-/// would with one: a program that is not found exits 127, and `--strict` is
-/// refused naming `--strict` and `--gdbserver`.
+/// would with one: a program that is not found exits 127.
 #[test]
 fn hermit_dap_listen_without_an_adapter_names_the_build_command() {
     let work =
@@ -24705,45 +24843,26 @@ fn hermit_dap_listen_without_an_adapter_names_the_build_command() {
             output.status
         );
     }
-    for (args, code, reasons) in [
-        (
-            &[
-                "run",
-                "--dap-listen",
-                "127.0.0.1:0",
-                "--",
-                "hermit-no-such-program-for-dap-listen",
-            ][..],
-            Some(GUEST_PROGRAM_NOT_FOUND_EXIT),
-            &[][..],
-        ),
-        (
-            &[
-                "run",
-                "--strict",
-                "--dap-listen",
-                "127.0.0.1:0",
-                "--",
-                "/bin/true",
-            ][..],
-            None,
-            &["--strict", "--gdbserver"][..],
-        ),
-    ] {
-        let mut command = Command::new(&lonely);
-        append_hermit_args(&mut command, args);
-        let output = hermit_test::hermit_output("hermit run", command.stdin(Stdio::null()));
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            !output.status.success()
-                && code.is_none_or(|code| output.status.code() == Some(code))
-                && reasons.iter().all(|reason| stderr.contains(reason))
-                && !stderr.contains("needs hermit-dap beside hermit"),
-            "{args:?} must fail as without --dap-listen, not for the missing adapter: {}\n\
-             stderr:\n{stderr}",
-            output.status
-        );
-    }
+    let mut command = Command::new(&lonely);
+    append_hermit_args(
+        &mut command,
+        &[
+            "run",
+            "--dap-listen",
+            "127.0.0.1:0",
+            "--",
+            "hermit-no-such-program-for-dap-listen",
+        ],
+    );
+    let output = hermit_test::hermit_output("hermit run", command.stdin(Stdio::null()));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.code() == Some(GUEST_PROGRAM_NOT_FOUND_EXIT)
+            && !stderr.contains("needs hermit-dap beside hermit"),
+        "a missing program must fail as without --dap-listen, not for the missing adapter: {}\n\
+         stderr:\n{stderr}",
+        output.status
+    );
 }
 
 /// `hermit replay --dap-listen` serves a recording to one DAP client over TCP,

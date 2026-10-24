@@ -1839,7 +1839,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And A5 slice 3c.1e B's forced-gate harness (in_guest_delivery_harness):
     // the_parent_runner_never_forces_the_gate and six forced_gate_* rows:
     // 1121, listed (1114 on main plus seven).
-    ("test.hermit_unit", 1121),
+    // The gdbserver port bound in the host's network namespace adds five
+    // gdbserver::tests units and removes
+    // record_start::tests::a_gdb_checked_recording_refuses_local_networking: 1125.
+    ("test.hermit_unit", 1125),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4286,7 +4289,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none
     // (the placeholder is mounted only for KVM), are run_kvm_ tests, which this
     // node skips and privileged-test.cli_kvm runs.
-    ("test.cli", 622),
+    // And strict_gdbserver_session_that_only_continues_matches_the_run_without_gdb
+    // (the gdbserver port bound in the host's network namespace): 623.
+    ("test.cli", 623),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4802,7 +4807,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two tests split out of the discarded-at-send test, not
     // excluded: 535.
     // And the same four P1 placeholder tests, not excluded: 539.
-    ("test.cli_on_host", 541),
+    // And the same strict gdbserver session test: 542.
+    ("test.cli_on_host", 542),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5626,7 +5632,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (validation_dag::HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS) while
     // test.hermit_unit runs all seven: 1115, listed
     // (1114 on main plus one).
-    ("test.hermit_unit_on_host", 1115),
+    // And the same five gdbserver units, less the same record_start unit: 1119.
+    ("test.hermit_unit_on_host", 1119),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
