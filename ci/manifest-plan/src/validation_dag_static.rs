@@ -3619,7 +3619,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_replay_posix_timer_rows_replay_but_diverge_from_linux: 220.
     // And record_chaos_schedule_replays_under_its_seed: 221.
     // And record_replay_gives_the_guest_a_private_dev_shm: 222.
-    ("test.record_replay", 222),
+    // And record_replay_gives_the_guest_a_private_ipc_namespace: 223.
+    ("test.record_replay", 223),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -4341,7 +4342,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_run_gets_a_private_empty_dev_shm,
     // concurrent_runs_do_not_share_dev_shm and
     // host_dev_shm_sources_stay_the_hosts: 657.
-    ("test.cli", 657),
+    // And a_run_gets_a_private_ipc_namespace and
+    // concurrent_runs_do_not_share_ipc: 659.
+    ("test.cli", 659),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4874,7 +4877,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same in-guest dup2-onto-runtime-descriptors test, not excluded:
     // 564.
     // And the three private /dev/shm tests: 576.
-    ("test.cli_on_host", 576),
+    // And the two private IPC namespace tests: 578.
+    ("test.cli_on_host", 578),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
