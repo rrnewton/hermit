@@ -949,6 +949,25 @@ where
     }
 }
 
+/// The result Detcore gives the guest for a `poll` it ran in the kernel. A
+/// signal pending while the poll runs ends it with `ERESTART_RESTARTBLOCK`,
+/// even with a zero timeout, which cannot wait (`do_poll` checks for a signal
+/// before it honours the timeout), and with no handler to run the kernel
+/// restarts it through `restart_syscall`. The poll returns the code Detcore's
+/// own polls return for it instead (`NonblockableSyscall::kernel_restart_errno`).
+/// A zero or infinite timeout keeps no deadline (`do_restart_poll` reruns the
+/// poll as issued), so that code is `ERESTARTNOHAND`, which the kernel restarts
+/// by running the call again; a positive timeout keeps Linux's own. A handler
+/// turns either code into `EINTR`. Under a tracer a default-ignored `SIGCHLD`
+/// is still queued, so a child that exits while its parent polls is such a
+/// signal, and so is the backend's own timer signal under `--imprecise-timers`.
+fn kernel_poll_result(call: &syscalls::Poll, result: Result<i64, Error>) -> Result<i64, Error> {
+    match result {
+        Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK)) => Err(call.kernel_restart_errno().into()),
+        result => result,
+    }
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     /// poll syscall (MAYHANG)
     // TODO-HUMAN-REVIEW(PR-1023): Review zero-timeout poll scheduling across backends.
@@ -968,14 +987,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 zero_timeout_poll_request(guest.thread_state().dettid, yield_to_peer),
             )
             .await;
-            if self.cfg.recordreplay_modes {
-                Ok(self.record_or_replay(guest, call).await?)
+            let result = if self.cfg.recordreplay_modes {
+                self.record_or_replay(guest, call).await
             } else {
                 // A virtual timerfd among the fds is readable exactly when its
                 // deadline has passed (`crate::syscalls::timerfd`).
                 crate::syscalls::timerfd::publish_expired(guest).await;
-                Ok(guest.inject(call).await?)
-            }
+                guest.inject(call).await
+            };
+            kernel_poll_result(&call, result.map_err(Error::from))
         } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
             // In replay mode, we cannot assume the existence of FILES during replay.
             // Thus we must record the poll and replay it from the trace.
@@ -2579,9 +2599,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(0)
         } else {
             print_poll(&call);
-            Ok(self
+            let result = self
                 .record_or_replay_blocking(guest, Syscall::Poll(call))
-                .await?)
+                .await;
+            kernel_poll_result(&call, result)
         }
     }
 
@@ -3936,6 +3957,35 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_kernel_poll_without_a_deadline_restarts_by_running_again() {
+        let restart_block = || Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK));
+        for timeout in [0, -1] {
+            let call = syscalls::Poll::new().with_timeout(timeout);
+            assert!(matches!(
+                kernel_poll_result(&call, restart_block()),
+                Err(Error::Errno(Errno::ERESTARTNOHAND))
+            ));
+        }
+        // A positive timeout keeps its deadline in the kernel's restart block.
+        let timed = syscalls::Poll::new().with_timeout(5);
+        assert!(matches!(
+            kernel_poll_result(&timed, restart_block()),
+            Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK))
+        ));
+        // Every other result is the call's own.
+        let zero = syscalls::Poll::new().with_timeout(0);
+        assert!(matches!(kernel_poll_result(&zero, Ok(2)), Ok(2)));
+        assert!(matches!(
+            kernel_poll_result(&zero, Err(Error::Errno(Errno::EINTR))),
+            Err(Error::Errno(Errno::EINTR))
+        ));
+        assert!(matches!(
+            kernel_poll_result(&zero, Err(Error::Errno(Errno::ERESTARTSYS))),
+            Err(Error::Errno(Errno::ERESTARTSYS))
+        ));
+    }
 
     #[test]
     fn zero_timeout_socket_poll_requests_a_strong_one_turn_yield() {

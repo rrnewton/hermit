@@ -2800,7 +2800,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unit, rendered_procfs's write-open and mode unit, its write-open
     // refusal unit and its `..` alias walk unit, and tool_global's four
     // comm_alias_open_tests through handle_openat): 2527, listed.
-    ("test.detcore_unit", 2527),
+    // And a_kernel_poll_without_a_deadline_restarts_by_running_again: 2528.
+    ("test.detcore_unit", 2528),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4007,7 +4008,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (A5 step 3c slice 0c): 600, listed.
     // And liteinst_in_guest_programs::in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name
     // (A5 step 3c slice 0g): 601, listed.
-    ("test.cli", 601),
+    // And a_zero_timeout_poll_ended_by_a_signal_restarts_as_on_linux: 602.
+    ("test.cli", 602),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4497,7 +4499,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unchanged at 520.
     // The in-guest unsequentialized-handler refusal test (slice 0g) starts the
     // in-guest runtime too and joins the hosted exclusions: unchanged at 520.
-    ("test.cli_on_host", 520),
+    // And a_zero_timeout_poll_ended_by_a_signal_restarts_as_on_linux: 521.
+    ("test.cli_on_host", 521),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4918,7 +4921,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/4582: 2500.
     // And the same fifteen D4c-1 units: 2515, listed.
     // And the same twelve A+ units: 2527, listed.
-    ("test.detcore_unit_on_host", 2527),
+    // And a_kernel_poll_without_a_deadline_restarts_by_running_again: 2528.
+    ("test.detcore_unit_on_host", 2528),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
