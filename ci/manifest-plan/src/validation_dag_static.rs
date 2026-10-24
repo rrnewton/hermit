@@ -2800,7 +2800,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unit, rendered_procfs's write-open and mode unit, its write-open
     // refusal unit and its `..` alias walk unit, and tool_global's four
     // comm_alias_open_tests through handle_openat): 2527, listed.
-    ("test.detcore_unit", 2527),
+    // And KVM per-call slice 7d's three syscalls::files::determinize_stat_tests
+    // units (rendered_entry's record/replay gate, determinize_stat's mode and
+    // epoch read without copying the configuration, and its placeholder
+    // gate): 2530, listed.
+    ("test.detcore_unit", 2530),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4918,7 +4922,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/4582: 2500.
     // And the same fifteen D4c-1 units: 2515, listed.
     // And the same twelve A+ units: 2527, listed.
-    ("test.detcore_unit_on_host", 2527),
+    // And the same three slice 7d determinize_stat_tests units: 2530, listed.
+    ("test.detcore_unit_on_host", 2530),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

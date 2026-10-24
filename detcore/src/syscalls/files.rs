@@ -84,6 +84,8 @@ use crate::tool_local::finish_partial_record_or_replay_write;
 use crate::types::*;
 
 #[cfg(test)]
+mod determinize_stat_tests;
+#[cfg(test)]
 mod prefilter_tests;
 pub(crate) mod procfs_levels;
 pub(crate) mod procfs_numbers;
@@ -1678,14 +1680,15 @@ impl<'a> StatTarget<'a> {
 /// the name Detcore gave it, or by its kernel identity where Detcore names no
 /// procfs files. Never a per-process file, whose kernel-reached instances
 /// keep the kernel's identity. `files` are the files the session renders
-/// (`Detcore::rendered_files`).
+/// (`Detcore::rendered_files`); `recordreplay_modes` is the run's
+/// `Config::recordreplay_modes`, under which Detcore renders none.
 fn rendered_entry(
     procfs: &ProcfsEntry,
     stat: &DetStat,
-    cfg: &crate::config::Config,
+    recordreplay_modes: bool,
     files: crate::procfs::RenderedFiles,
 ) -> Option<&'static Path> {
-    if cfg.recordreplay_modes {
+    if recordreplay_modes {
         return None;
     }
     let found = match procfs {
@@ -6283,7 +6286,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let procfs =
                         Self::procfs_entry(guest, &stat, StatTarget::Descriptor(target_fd)).await;
                     let files = self.rendered_files(guest);
-                    if let Some(path) = rendered_entry(&procfs, &stat, guest.config(), files) {
+                    if let Some(path) =
+                        rendered_entry(&procfs, &stat, guest.config().recordreplay_modes, files)
+                    {
                         DetInode::mint(procfs_inode::rendered_inode(path))
                     } else {
                         determinize_inode_observing_mtime(
@@ -9308,13 +9313,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         G: Guest<Self>,
         S: Into<DetStat>,
     {
-        let cfg = guest.config().clone();
+        // The two fields this reads, copied: cloning the whole Config here
+        // copied its mount-table lists, one allocation per container mount, on
+        // every stat-family call.
+        let recordreplay_modes = guest.config().recordreplay_modes;
+        let epoch = guest.config().epoch;
 
         let mut stat: DetStat = stat.into();
         // Detcore's placeholder, however the guest reached it: the rendered
         // file it stands in for.
         if inode_override.is_none()
-            && !cfg.recordreplay_modes
+            && !recordreplay_modes
             && let Some(path) = rendered_procfs::placeholder_identity(stat.dev, stat.inode)
         {
             return self.rendered_metadata(guest, path).await;
@@ -9324,8 +9333,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // report the epoch: whatever backs them on the host (a pipe, a
             // terminal, a redirected file) is not part of the guest's view.
             Some(inode) => {
-                let nanos = cfg
-                    .epoch
+                let nanos = epoch
                     .timestamp_nanos_opt()
                     .expect("epoch cannot be represented in nanoseconds")
                     as u64;
@@ -9360,13 +9368,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 {
                     stat.nlink = 1;
                 }
-                match rendered_entry(&procfs, &stat, &cfg, self.rendered_files(guest)) {
+                match rendered_entry(
+                    &procfs,
+                    &stat,
+                    recordreplay_modes,
+                    self.rendered_files(guest),
+                ) {
                     // A file Detcore renders, reached through a spelling the
                     // kernel resolved (a symbolic link): the number its path
                     // names, and the epoch.
                     Some(path) => {
-                        let nanos = cfg
-                            .epoch
+                        let nanos = epoch
                             .timestamp_nanos_opt()
                             .expect("epoch cannot be represented in nanoseconds")
                             as u64;
@@ -9459,8 +9471,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let epoch_tp = Timespec {
-            tv_sec: cfg.epoch.timestamp(),
-            tv_nsec: cfg.epoch.timestamp_subsec_nanos() as i64,
+            tv_sec: epoch.timestamp(),
+            tv_nsec: epoch.timestamp_subsec_nanos() as i64,
         };
 
         let mtime: Timespec = global_mtime.into();
