@@ -35,6 +35,7 @@ pub(crate) use namespace::anonymous_object_devices;
 pub(crate) use namespace::guest_task_procfs;
 pub(crate) use network_trace::received_descriptors;
 mod network_trace;
+pub(crate) mod pi_futex;
 pub(crate) mod robust_list;
 mod signal;
 pub(crate) mod signal_shadow;

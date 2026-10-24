@@ -1892,8 +1892,17 @@ impl NonblockableSyscall for reverie::syscalls::Futex {
     /// return `ERESTARTNOHAND`, which ran the call again with its original
     /// arguments and so read the deadline again (round-10 finding Medium 4 on
     /// https://github.com/rrnewton/hermit/pull/3361).
+    ///
+    /// FUTEX_LOCK_PI and FUTEX_LOCK_PI2 return `-ERESTARTNOINTR`, which the
+    /// kernel restarts whatever the handler (`futex_lock_pi`,
+    /// kernel/futex/pi.c:1124 at v6.16).
     fn kernel_restart_errno(&self) -> Errno {
-        if self.restart_keeps_deadline() {
+        if matches!(
+            self.futex_op() & libc::FUTEX_CMD_MASK,
+            libc::FUTEX_LOCK_PI | libc::FUTEX_LOCK_PI2
+        ) {
+            Errno::ERESTARTNOINTR
+        } else if self.restart_keeps_deadline() {
             Errno::ERESTART_RESTARTBLOCK
         } else if self.timeout().is_some() {
             Errno::ERESTARTNOHAND
@@ -5336,6 +5345,19 @@ mod tests {
             Errno::ERESTART_RESTARTBLOCK
         );
         assert!(bitset.with_timeout(Some(timeout)).restart_keeps_deadline());
+        // FUTEX_LOCK_PI and FUTEX_LOCK_PI2 are always restarted, timed or not, and
+        // the restarted call reads its absolute deadline again (`futex_lock_pi`).
+        for op in [
+            libc::FUTEX_LOCK_PI,
+            libc::FUTEX_LOCK_PI | libc::FUTEX_PRIVATE_FLAG,
+            libc::FUTEX_LOCK_PI2 | libc::FUTEX_CLOCK_REALTIME,
+        ] {
+            let lock = reverie::syscalls::Futex::new().with_futex_op(op);
+            assert_eq!(lock.kernel_restart_errno(), Errno::ERESTARTNOINTR);
+            let timed = lock.with_timeout(Some(timeout));
+            assert_eq!(timed.kernel_restart_errno(), Errno::ERESTARTNOINTR);
+            assert!(!timed.restart_keeps_deadline());
+        }
     }
 
     #[test]

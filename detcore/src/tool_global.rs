@@ -3494,6 +3494,12 @@ impl GlobalState {
                         return (None, R::ThreadExited);
                     }
                 }
+                // The exec caller's priority-inheritance futexes go to their
+                // waiters, as Linux's `futex_exec_release` releases them after
+                // the robust lists, which the exec's backend delivered first.
+                if self.cfg.sequentialize_threads {
+                    sched.release_pi_futexes_of(dtid);
+                }
                 self.past_first_execve.store(true, SeqCst);
                 let first_image = !self.initial_descriptor_image_complete.swap(true, SeqCst);
                 let mut overrides = self
@@ -4797,10 +4803,14 @@ impl GlobalState {
 
                 let endtime_update = match schedval {
                     // Only syscalls timeout, and they don't need to update guest timeslice end.
-                    // Nor does a futex requeue's answer, which a resource grant never carries.
-                    SchedValue::TimeOut | SchedValue::Signaled(_) | SchedValue::Requeued { .. } => {
-                        None
-                    }
+                    // Nor does a futex requeue's or a PI futex command's answer,
+                    // which a resource grant never carries.
+                    SchedValue::TimeOut
+                    | SchedValue::Signaled(_)
+                    | SchedValue::Requeued { .. }
+                    | SchedValue::PiFutex(_)
+                    | SchedValue::PiTaken(_)
+                    | SchedValue::PiWaiterReached { .. } => None,
                     SchedValue::Value(timeslice) => Some(LogicalTime::from_nanos(timeslice)),
                 };
                 (
@@ -5632,17 +5642,22 @@ impl GlobalState {
                     return None;
                 }
                 FutexAction::WakeRequest(num_threads) => {
-                    let num = sched.wake_futex_waiters(dettid, futexid, num_threads, mask);
+                    let (num, met_pi) =
+                        sched.wake_futex_waiters_until_pi(dettid, futexid, num_threads, mask);
                     if self.cfg.yields_after_futex_wake(num) {
                         sched.requeue_futex_waker(dettid);
                     }
-                    return Some(SchedValue::Value(num));
+                    return Some(if met_pi {
+                        SchedValue::PiWaiterReached { woken: num }
+                    } else {
+                        SchedValue::Value(num)
+                    });
                 }
                 FutexAction::WakeFinished(_num_threads) => {
                     return None;
                 }
                 FutexAction::RequeueRequest(to, nr_wake, nr_requeue) => {
-                    let (woken, moved) = sched.requeue_futex_waiters(
+                    let (woken, moved, met_pi) = sched.requeue_futex_waiters(
                         futexid,
                         to,
                         nr_wake as usize,
@@ -5651,7 +5666,49 @@ impl GlobalState {
                     if self.cfg.yields_after_futex_wake(woken) {
                         sched.requeue_futex_waker(dettid);
                     }
-                    return Some(SchedValue::Requeued { woken, moved });
+                    return Some(if met_pi {
+                        SchedValue::PiWaiterReached { woken }
+                    } else {
+                        SchedValue::Requeued { woken, moved }
+                    });
+                }
+                FutexAction::PiState(named) => {
+                    return Some(SchedValue::PiFutex(
+                        sched.pi_futex_state(futexid, named, dettid),
+                    ));
+                }
+                FutexAction::PiTake => {
+                    return Some(SchedValue::PiTaken(
+                        sched.take_handed_pi_futex(futexid, dettid),
+                    ));
+                }
+                FutexAction::PiHandOff => {
+                    let woken = u64::from(sched.hand_off_pi_futex(futexid).is_some());
+                    if self.cfg.yields_after_futex_wake(woken) {
+                        sched.requeue_futex_waker(dettid);
+                    }
+                    return Some(SchedValue::Value(woken));
+                }
+                FutexAction::PiLockWait(maybe_timeout, signal_watch, owner) => {
+                    if let Err(error) = sched.install_resource_origin(
+                        dettid,
+                        ResourceOrigin {
+                            rpc: RpcOrigin::FutexAction,
+                            mm,
+                            control: ControlCapability::None,
+                        },
+                    ) {
+                        sched.fail_parked(dettid, error);
+                        return Some(SchedValue::Value(nix::errno::Errno::EINTR as u64));
+                    }
+                    sched.sleep_pi_futex_waiter(
+                        dettid,
+                        futexid,
+                        maybe_timeout,
+                        signal_watch,
+                        owner,
+                    );
+                    // block on ivar, below
                 }
             }
             // Blocking on the FUTEX_WAIT here, remove ourselves:
@@ -8589,6 +8646,21 @@ pub enum FutexAction {
     /// FUTEX_CMP_REQUEUE. Answers with the number woken plus the number moved,
     /// and is followed by a `WakeFinished`, as a wake is.
     RequeueRequest(FutexID, u32, u32),
+    /// Ask what the scheduler holds for a priority-inheritance futex whose word
+    /// names the given TID, and whether the caller queueing would deadlock
+    /// (`Scheduler::pi_futex_state`). Changes nothing the guest can observe: it
+    /// answers in the caller's turn.
+    PiState(u32),
+    /// Park as a FUTEX_LOCK_PI waiter behind the given owner, found in this
+    /// turn by `PiState`, with an optional deadline and signal watch as
+    /// `WaitRequest` has (`Scheduler::sleep_pi_futex_waiter`).
+    PiLockWait(Option<LogicalTime>, Option<FutexSignalWatch>, DetTid),
+    /// A woken FUTEX_LOCK_PI waiter takes the lock if it was handed it, and
+    /// learns how (`Scheduler::take_handed_pi_futex`).
+    PiTake,
+    /// FUTEX_UNLOCK_PI hands the futex to its longest PI waiter
+    /// (`Scheduler::hand_off_pi_futex`); answers with the number woken.
+    PiHandOff,
 }
 
 /// Ask scheduler for permission to proceed before/after futex operation.
