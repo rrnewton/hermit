@@ -138,6 +138,54 @@ pub(crate) enum NetworkSocketKind {
     InetOther,
 }
 
+/// `IPPROTO_L2TP` (include/uapi/linux/in.h), which the libc crate does not
+/// define.
+const IPPROTO_L2TP: i32 = 115;
+
+/// Whether a receive with `MSG_ERRQUEUE` on a socket that `socket(family,
+/// socket_type, protocol)` created never waits on Linux: its protocol reads the
+/// error queue and fails with `EAGAIN` when that is empty, even on a blocking
+/// socket. These do so: IPv4 and IPv6 TCP, UDP, UDP-Lite, ICMP ping and raw
+/// sockets (`tcp_recvmsg`, `udp_recvmsg`, `udpv6_recvmsg`, `ping_recvmsg`,
+/// `raw_recvmsg`, `rawv6_recvmsg`, through `ip_recv_error` and
+/// `ipv6_recv_error`), MPTCP and SCTP (`mptcp_recvmsg`, `sctp_recvmsg`), IPv6
+/// L2TP (`l2tp_ip6_recvmsg`), and every packet socket (`packet_recvmsg`,
+/// through `sock_recv_errqueue`). Every other socket keeps Detcore's polling:
+/// AF_UNIX and AF_NETLINK ignore the flag and wait as for a plain receive, so
+/// does IPv4 L2TP (`l2tp_ip_recvmsg`), and no other protocol or family is
+/// modelled.
+pub(crate) fn error_queue_read_never_waits(family: i32, socket_type: i32, protocol: i32) -> bool {
+    // Linux's SOCK_TYPE_MASK: the type without SOCK_NONBLOCK and SOCK_CLOEXEC.
+    let socket_type = socket_type & 0xf;
+    match family {
+        libc::AF_INET | libc::AF_INET6 => {
+            let ping = if family == libc::AF_INET {
+                libc::IPPROTO_ICMP
+            } else {
+                libc::IPPROTO_ICMPV6
+            };
+            match socket_type {
+                libc::SOCK_STREAM => matches!(
+                    protocol,
+                    0 | libc::IPPROTO_TCP | libc::IPPROTO_MPTCP | libc::IPPROTO_SCTP
+                ),
+                // SCTP is the only seqpacket protocol, so 0 selects it.
+                libc::SOCK_SEQPACKET => matches!(protocol, 0 | libc::IPPROTO_SCTP),
+                libc::SOCK_DGRAM => {
+                    matches!(protocol, 0 | libc::IPPROTO_UDP | libc::IPPROTO_UDPLITE)
+                        || protocol == ping
+                        || (family == libc::AF_INET6 && protocol == IPPROTO_L2TP)
+                }
+                // Every protocol of a raw socket reaches raw_recvmsg or rawv6_recvmsg.
+                libc::SOCK_RAW => true,
+                _ => false,
+            }
+        }
+        libc::AF_PACKET => true,
+        _ => false,
+    }
+}
+
 /// Read provenance authenticated at the container's initial image: a terminal
 /// checked with TCGETS, the launcher's actually created controller input pipe,
 /// or a readable pipe end the initial image holds on fds 0-2
@@ -624,6 +672,12 @@ struct OpenFileDescription {
     /// eventfd for it. See `is_accepted_connection`.
     #[serde(default)]
     accepted_connection: bool,
+    /// True when a receive with `MSG_ERRQUEUE` on this socket never waits on
+    /// Linux, whatever the socket's blocking mode. Set by `socket(2)`
+    /// (`error_queue_read_never_waits`) and inherited by the connections
+    /// `accept(2)` returns.
+    #[serde(default)]
+    error_queue_never_waits: bool,
     /// True when record/replay runs a blocking `accept(2)` on this socket in
     /// the caller's turn, one nonblocking attempt at a time. `socket(2)` sets
     /// it for a stream socket the container created. See
@@ -1059,6 +1113,7 @@ impl DetFd {
                 socketpair_endpoint: false,
                 guest_peer: false,
                 accepted_connection: false,
+                error_queue_never_waits: false,
                 accept_in_turn_eligible: false,
                 read_shutdown_requested: false,
                 exported: false,
@@ -2299,6 +2354,18 @@ impl DetFd {
         self.with_description(|d| d.accepted_connection = true);
     }
 
+    /// Record whether a receive with `MSG_ERRQUEUE` on this socket never
+    /// waits. It applies to the open file description, so dup and fork aliases
+    /// are covered too.
+    pub(crate) fn set_error_queue_never_waits(&self, never_waits: bool) {
+        self.with_description(|d| d.error_queue_never_waits = never_waits);
+    }
+
+    /// Whether a receive with `MSG_ERRQUEUE` on this socket never waits.
+    pub(crate) fn error_queue_never_waits(&self) -> bool {
+        self.with_description(|d| d.error_queue_never_waits)
+    }
+
     /// Whether `accept(2)` or `accept4(2)` returned this open file.
     pub(crate) fn is_accepted_connection(&self) -> bool {
         self.with_description(|d| d.accepted_connection)
@@ -2554,6 +2621,94 @@ mod tests {
             assert!(!is_random_device(kind | 0o666, libc::makedev(1, 9)));
         }
         assert!(!is_random_device(chr, libc::makedev(9, 1)));
+    }
+
+    /// The protocols whose receive handler reads the error queue never wait
+    /// for it, with the type's SOCK_NONBLOCK and SOCK_CLOEXEC bits or not;
+    /// AF_UNIX, AF_NETLINK and IPv4 L2TP wait, and a protocol or family that is
+    /// not modelled keeps Detcore's polling.
+    #[test]
+    fn error_queue_reads_never_wait_on_the_protocols_that_read_the_queue() {
+        let flags = libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC;
+        for family in [libc::AF_INET, libc::AF_INET6] {
+            let ping = if family == libc::AF_INET {
+                libc::IPPROTO_ICMP
+            } else {
+                libc::IPPROTO_ICMPV6
+            };
+            for (socket_type, protocol) in [
+                (libc::SOCK_STREAM, 0),
+                (libc::SOCK_STREAM, libc::IPPROTO_TCP),
+                (libc::SOCK_STREAM, libc::IPPROTO_MPTCP),
+                (libc::SOCK_STREAM, libc::IPPROTO_SCTP),
+                (libc::SOCK_SEQPACKET, 0),
+                (libc::SOCK_SEQPACKET, libc::IPPROTO_SCTP),
+                (libc::SOCK_DGRAM, 0),
+                (libc::SOCK_DGRAM, libc::IPPROTO_UDP),
+                (libc::SOCK_DGRAM, libc::IPPROTO_UDPLITE),
+                (libc::SOCK_DGRAM, ping),
+                (libc::SOCK_RAW, libc::IPPROTO_RAW),
+                (libc::SOCK_RAW, libc::IPPROTO_UDP),
+            ] {
+                assert!(error_queue_read_never_waits(family, socket_type, protocol));
+                assert!(error_queue_read_never_waits(
+                    family,
+                    socket_type | flags,
+                    protocol
+                ));
+            }
+            for (socket_type, protocol) in [
+                (libc::SOCK_DGRAM, libc::IPPROTO_TCP),
+                (libc::SOCK_STREAM, libc::IPPROTO_UDP),
+                // IPPROTO_SMC: not modelled.
+                (libc::SOCK_STREAM, 256),
+                (libc::SOCK_RDM, 0),
+            ] {
+                assert!(!error_queue_read_never_waits(family, socket_type, protocol));
+            }
+        }
+        // ICMP ping is IPv4's protocol only, ICMPv6 IPv6's.
+        assert!(!error_queue_read_never_waits(
+            libc::AF_INET6,
+            libc::SOCK_DGRAM,
+            libc::IPPROTO_ICMP
+        ));
+        assert!(!error_queue_read_never_waits(
+            libc::AF_INET,
+            libc::SOCK_DGRAM,
+            libc::IPPROTO_ICMPV6
+        ));
+        // l2tp_ip6_recvmsg reads the error queue, l2tp_ip_recvmsg waits.
+        assert!(error_queue_read_never_waits(
+            libc::AF_INET6,
+            libc::SOCK_DGRAM,
+            IPPROTO_L2TP
+        ));
+        assert!(!error_queue_read_never_waits(
+            libc::AF_INET,
+            libc::SOCK_DGRAM,
+            IPPROTO_L2TP
+        ));
+        for socket_type in [libc::SOCK_RAW, libc::SOCK_DGRAM] {
+            assert!(error_queue_read_never_waits(
+                libc::AF_PACKET,
+                socket_type,
+                0
+            ));
+        }
+        for socket_type in [libc::SOCK_STREAM, libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
+            assert!(!error_queue_read_never_waits(libc::AF_UNIX, socket_type, 0));
+        }
+        assert!(!error_queue_read_never_waits(
+            libc::AF_NETLINK,
+            libc::SOCK_RAW,
+            libc::NETLINK_ROUTE
+        ));
+        assert!(!error_queue_read_never_waits(
+            libc::AF_VSOCK,
+            libc::SOCK_STREAM,
+            0
+        ));
     }
 
     #[test]
