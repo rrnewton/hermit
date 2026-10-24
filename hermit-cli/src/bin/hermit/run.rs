@@ -4939,6 +4939,135 @@ fn pipe_wake_latency_parses_round_trips_and_is_refused_where_inert() {
     }
 }
 
+/// `--cap-preemption-charge` parses, is rendered into the reproduce command
+/// and round-trips. It is refused where no turn ends an expired timeslice:
+/// without a timeslice (given or downgraded for a host without a PMU timer),
+/// without Detcore's sequentializing scheduler, and with the DBT backend,
+/// whose runtime reads a configuration form that cannot carry it. A logical
+/// `--target-timeslice` without the PMU maximum still ends slices.
+#[test]
+fn cap_preemption_charge_parses_round_trips_and_is_refused_where_inert() {
+    let mut opts = RunOpts::parse_from(["fakehermit", "--cap-preemption-charge", "fakeprog"]);
+    opts.validate_args_with_perf_support(true).unwrap();
+    assert!(opts.det_opts.det_config.cap_preemption_charge);
+    let rendered = format!("{opts}");
+    assert!(rendered.contains(" --cap-preemption-charge"), "{rendered}");
+    let mut reparsed_args = vec!["fakehermit".to_owned()];
+    reparsed_args.extend(shell_words::split(&rendered).unwrap());
+    let mut reparsed = RunOpts::parse_from(reparsed_args);
+    reparsed.validate_args_with_perf_support(true).unwrap();
+    assert!(reparsed.det_opts.det_config.cap_preemption_charge);
+
+    let mut default = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    default.validate_args_with_perf_support(true).unwrap();
+    assert!(!default.det_opts.det_config.cap_preemption_charge);
+    assert!(!format!("{default}").contains("preemption-charge"));
+
+    let mut logical = RunOpts::parse_from([
+        "fakehermit",
+        "--cap-preemption-charge",
+        "--max-timeslice=disabled",
+        "--target-timeslice=1000000",
+        "fakeprog",
+    ]);
+    logical.validate_args_with_perf_support(true).unwrap();
+
+    let error = RunOpts::parse_from(["fakehermit", "--cap-preemption-charge", "fakeprog"])
+        .validate_args_with_perf_support(false)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("no timeslice ends by expiry because this host's PMU timer is unavailable")
+            && error.contains("Give a --max-timeslice"),
+        "{error}"
+    );
+
+    for (argv, expected) in [
+        (
+            vec![
+                "hermit",
+                "run",
+                "--max-timeslice=disabled",
+                "--cap-preemption-charge",
+                "fakeprog",
+            ],
+            "no timeslice ends by expiry because --max-timeslice=disabled",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--no-sequentialize-threads",
+                "--cap-preemption-charge",
+                "fakeprog",
+            ],
+            "Drop --no-sequentialize-threads or --cap-preemption-charge",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--strace-only",
+                "--cap-preemption-charge",
+                "fakeprog",
+            ],
+            "Drop --strace-only or --cap-preemption-charge",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--namespace-only",
+                "--cap-preemption-charge",
+                "fakeprog",
+            ],
+            "Drop --namespace-only or --cap-preemption-charge",
+        ),
+        (
+            vec![
+                "hermit",
+                "--backend=dbt",
+                "run",
+                "--cap-preemption-charge",
+                "fakeprog",
+            ],
+            "the dbt backend cannot apply --cap-preemption-charge",
+        ),
+    ] {
+        let error = run_opts_for(&argv)
+            .validate_args_with_perf_support(true)
+            .err()
+            .unwrap_or_else(|| panic!("{argv:?} was accepted"));
+        assert!(error.to_string().contains(expected), "{argv:?}: {error}");
+    }
+}
+
+/// A replay of a record made under the other `--cap-preemption-charge`
+/// setting is refused before launch with the setting to replay with; the
+/// recorded setting is accepted.
+#[test]
+fn a_replay_under_another_cap_preemption_charge_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("schedule.json");
+    let record = detcore::preemptions::PreemptionWriter::new(None)
+        .with_cap_preemption_charge(true)
+        .into_string();
+    std::fs::write(&path, record).unwrap();
+    let replay = |extra: &[&str]| {
+        let schedule = format!("--replay-schedule-from={}", path.display());
+        let mut argv = vec!["fakehermit", schedule.as_str()];
+        argv.extend_from_slice(extra);
+        argv.push("fakeprog");
+        RunOpts::parse_from(argv).refuse_replay_under_another_cap_preemption_charge()
+    };
+    replay(&["--cap-preemption-charge"]).unwrap();
+    let error = replay(&[]).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Replay with --cap-preemption-charge."),
+        "{error:#}"
+    );
+}
+
 /// `--scheduler-turn-cost` parses, is rendered into the reproduce command and
 /// round-trips; zero and the DBT backend are refused.
 #[test]
@@ -7206,6 +7335,35 @@ impl RunOpts {
         Ok(annotated)
     }
 
+    /// Refuses a replay of a recorded schedule under the other
+    /// `--cap-preemption-charge` setting, as
+    /// `refuse_replay_under_another_pipe_wake_latency` refuses another
+    /// latency. A record without the field was made with the option off.
+    fn refuse_replay_under_another_cap_preemption_charge(&self) -> Result<(), Error> {
+        if self.namespace_only {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        for (option, path) in [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            let recorded = detcore::preemptions::read_recorded_cap_preemption_charge(path)
+                .map_err(Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::cap_preemption_charge_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                config.cap_preemption_charge,
+            ) {
+                return Err(Error::new(PolicyRefusal).context(refusal));
+            }
+        }
+        Ok(())
+    }
+
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
     /// Used by `hermit oci run`, which resolves the user's reference to the
@@ -8041,6 +8199,7 @@ impl RunOpts {
             );
         }
         self.refuse_replay_under_another_expired_wait_charge()?;
+        self.refuse_replay_under_another_cap_preemption_charge()?;
         if !self.namespace_only
             && (self.verify_verbose
                 || global
@@ -8772,6 +8931,47 @@ impl RunOpts {
         // we're expecting full determinstic execution (sequentialize_threads).
         if config.max_timeslice.is_some() && config.sequentialize_threads {
             self.pin_threads = true;
+        }
+
+        // `--cap-preemption-charge` lowers the charge of turns that end an
+        // expired timeslice under Detcore's scheduler. A launch where no such
+        // turn can happen would accept the flag and ignore it, so it is
+        // refused before launch. Checked after the timer downgrade above, which
+        // can take the timeslices away, and after `lower_strace_only`.
+        if config.cap_preemption_charge {
+            if backend == Backend::Dbt {
+                anyhow::bail!(
+                    "the dbt backend cannot apply --cap-preemption-charge: its runtime reads a \
+                     frozen configuration form that predates the option; use the ptrace backend"
+                );
+            }
+            let unscheduled = if self.namespace_only {
+                Some("--namespace-only")
+            } else if self.strace_only {
+                Some("--strace-only")
+            } else if !config.sequentialize_threads {
+                Some("--no-sequentialize-threads")
+            } else {
+                None
+            };
+            if let Some(option) = unscheduled {
+                anyhow::bail!(
+                    "--cap-preemption-charge lowers the charge of the scheduler turns that end \
+                     timeslices; {option} runs the guest without them. Drop {option} or \
+                     --cap-preemption-charge"
+                );
+            }
+            if config.max_timeslice.is_none() && config.target_timeslice.is_none() {
+                let cause = match &self.timer_downgrade {
+                    Some(_) => "this host's PMU timer is unavailable (see the warning above)",
+                    None => "--max-timeslice=disabled",
+                };
+                anyhow::bail!(
+                    "--cap-preemption-charge has no effect: no timeslice ends by expiry because \
+                     {cause}. Give a --max-timeslice (or --target-timeslice), or drop \
+                     --cap-preemption-charge"
+                );
+            }
         }
 
         // Happens-before enforcement parks the "after" thread until its "before"

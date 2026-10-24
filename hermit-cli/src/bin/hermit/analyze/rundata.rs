@@ -811,6 +811,16 @@ impl AnalyzeOpts {
             .with_expired_wait_runs_charged_once(
                 self.trial_expired_wait_charge() == ExpiredWaitCharge::Once,
             )
+            .with_cap_preemption_charge(self.trial_cap_preemption_charge())
+    }
+
+    /// Whether the trials cap preemption charges (`--cap-preemption-charge`
+    /// in their run arguments).
+    pub fn trial_cap_preemption_charge(&self) -> bool {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .cap_preemption_charge
     }
 
     /// Write the schedule `events` for a trial to replay, stamped
@@ -880,6 +890,15 @@ impl AnalyzeOpts {
                 recorded,
                 Some(self.trial_expired_wait_charge()),
                 true,
+            ) {
+                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+            }
+            let recorded = detcore::preemptions::read_recorded_cap_preemption_charge(path)
+                .map_err(anyhow::Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::cap_preemption_charge_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                config.cap_preemption_charge,
             ) {
                 return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
             }

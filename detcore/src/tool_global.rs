@@ -5543,6 +5543,7 @@ impl GlobalState {
                     guest_signal_mask: None,
                     callback_checkpoint: None,
                     priority_row: None,
+                    slice_expired: false,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {
@@ -13231,6 +13232,10 @@ mod tests {
             .await
             .expect("the original request must commit exactly one turn");
             assert!(turn.slice_boundary.is_none());
+            assert!(
+                turn.slice_expired,
+                "a slice that ends because its time ran out marks its request"
+            );
             turns.push(turn);
             request.await;
         }
@@ -13422,6 +13427,10 @@ mod tests {
             .await
             .expect("one sched_yield must commit its original turn");
             assert!(turn.slice_boundary.is_none());
+            assert!(
+                !turn.slice_expired,
+                "an explicit sched_yield is a syscall turn, not an expired slice"
+            );
             assert_eq!(request.await.unwrap(), 0);
             assert_eq!(state.sched.lock().unwrap().turn, before_turn + 1);
             assert_eq!(guest.requests.lock().unwrap().len(), before_requests + 1);

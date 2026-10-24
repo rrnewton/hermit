@@ -6090,6 +6090,7 @@ impl<T> ThreadState<T> {
             guest_signal_mask: None,
             callback_checkpoint: None,
             priority_row: None,
+            slice_expired: false,
         }
     }
 

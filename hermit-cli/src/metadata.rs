@@ -1246,6 +1246,10 @@ fn record_or_replay_config_with_timer_support(
         // A `hermit run` option; record and replay do not gather it.
         work_span_report: None,
         scheduler_turn_cost: default_config.scheduler_turn_cost,
+        // A `hermit run` option, like `pipe_wake_latency`: record mode's own
+        // scheduling, and recordings made before the option existed, charge
+        // every turn in full.
+        cap_preemption_charge: false,
         seed: default_config.seed,
         rng_seed: default_config.rng_seed,
         imprecise_timers: false,

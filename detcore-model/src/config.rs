@@ -972,6 +972,26 @@ pub struct Config {
     #[clap(long, value_name = "virtual-nanoseconds")]
     pub scheduler_turn_cost: Option<NonZeroU64>,
 
+    /// Charge a scheduler turn that ends a timeslice because its time ran out (a preemption)
+    /// at most the virtual time its thread ran since its previous turn, instead of the full
+    /// turn charge (`--scheduler-turn-cost`, default 500000 virtual nanoseconds). Without it,
+    /// every preemption adds the full charge however short the slice was, so a small
+    /// `--max-timeslice`, or a short `--chaos` draw, multiplies the guest-visible time of
+    /// CPU-bound work by about `1 + charge / slice`: 501 times at `--max-timeslice=1000`,
+    /// enough for a test's own timeouts to expire before it reaches the code under test. With
+    /// it the factor is at most 2, what a slice one full charge long already costs; a slice
+    /// at least that long is charged as before. A capped turn is charged at least one virtual
+    /// nanosecond. An explicit `sched_yield`, and every turn that does not end a timeslice,
+    /// keep the full charge. This changes the guest-visible time of runs with short slices:
+    /// recorded schedules store the setting, and a replay under the other is refused.
+    /// Refused where no timeslice ends by expiry (`--max-timeslice=disabled` without
+    /// `--target-timeslice`) or no Detcore scheduler orders the threads (`--namespace-only`,
+    /// `--strace-only`, `--no-sequentialize-threads`), and with the DBT backend; never applied
+    /// in record mode.
+    #[serde(default)]
+    #[clap(long)]
+    pub cap_preemption_charge: bool,
+
     /// Shut down immediately upon SIGINT, rather than letting the guest handle it.
     #[clap(long)]
     pub sigint_instakill: bool,
@@ -1850,6 +1870,9 @@ impl fmt::Display for Config {
         if let Some(cost) = self.scheduler_turn_cost {
             write!(f, " --scheduler-turn-cost={}", cost)?;
         }
+        if self.cap_preemption_charge {
+            write!(f, " --cap-preemption-charge")?;
+        }
         if self.sigint_instakill {
             write!(f, " --sigint-instakill")?;
         }
@@ -2490,8 +2513,9 @@ impl Default for Config {
 /// [`Config::in_guest_site_patching_off`], which is unset for DBT, and
 /// [`Config::launch_image`], which came after it. So is [`Config::target_timeslice_syscalls_only`],
 /// added after this form froze; DBT runs without a PMU maximum, where the
-/// option has no effect. So are [`Config::futex_wake_yields`] and
-/// [`Config::scheduler_turn_cost`], also added after this form froze, which
+/// option has no effect. So are [`Config::futex_wake_yields`],
+/// [`Config::scheduler_turn_cost`] and [`Config::cap_preemption_charge`],
+/// also added after this form froze, which
 /// `hermit run` refuses with the DBT backend, and [`Config::replaying`], set
 /// only by `hermit replay`, which runs only on the ptrace backend. So is
 /// [`Config::inherited_seccomp`], added after this form froze, which reads
@@ -2993,9 +3017,9 @@ mod legacy_backend_json {
     /// the behaviour every legacy reader already has.
     /// `in_guest_detlog_forward_policy` is unset for DBT (its runtime forwards
     /// no records on a socket), so it is never written and reads as unset.
-    /// `futex_wake_yields`, `pipe_wake_latency` and `scheduler_turn_cost` came
-    /// after the legacy form froze too, and `hermit run` refuses them with the
-    /// DBT backend.
+    /// `futex_wake_yields`, `pipe_wake_latency`, `scheduler_turn_cost` and
+    /// `cap_preemption_charge` came after the legacy form froze too, and
+    /// `hermit run` refuses them with the DBT backend.
     /// `replaying` is never written either: only `hermit replay` sets it, and
     /// replay runs only on the ptrace backend.
     /// `in_guest_site_patching_off` is false for DBT (it is set only for
@@ -3042,7 +3066,7 @@ mod legacy_backend_json {
     /// `notice_host_network_abstract_binds` came after it too. It is never written and
     /// reads as false, so the DBT runtime prints no notice for an abstract
     /// `AF_UNIX` bind under host networking.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 31] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 32] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3058,6 +3082,7 @@ mod legacy_backend_json {
         "expired_wait_charge",
         "replaying",
         "scheduler_turn_cost",
+        "cap_preemption_charge",
         "inherited_seccomp",
         "cpu_profile",
         "cpu_profile_host",
@@ -3171,7 +3196,8 @@ mod legacy_backend_json {
     /// [`Config::in_guest_signal_delivery`], [`Config::launch_image`],
     /// [`Config::target_timeslice_syscalls_only`],
     /// [`Config::futex_wake_yields`], [`Config::replaying`],
-    /// [`Config::scheduler_turn_cost`] or [`Config::inherited_seccomp`] takes
+    /// [`Config::scheduler_turn_cost`], [`Config::cap_preemption_charge`] or
+    /// [`Config::inherited_seccomp`] takes
     /// an element. Each gets a
     /// placeholder; [`super::from_legacy_backend_json`] replaces the first.
     struct LegacyPositions<'f, 'l, A> {
@@ -3212,6 +3238,7 @@ mod legacy_backend_json {
                     | "annotated_priority_replay"
                     | "target_timeslice_syscalls_only"
                     | "futex_wake_yields"
+                    | "cap_preemption_charge"
                     | "replaying"
                     | "signal_delivery_check_fatal"
                     | "container_procfs"
@@ -3515,6 +3542,7 @@ mod legacy_backend_json {
                 | "expired_wait_charge"
                 | "replaying"
                 | "scheduler_turn_cost"
+                | "cap_preemption_charge"
                 | "inherited_seccomp"
                 | "cpu_profile"
                 | "cpu_profile_host"
@@ -4218,7 +4246,7 @@ mod tests {
     /// `in_guest_signal_delivery`,
     /// `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
     /// `replaying`,
-    /// `scheduler_turn_cost` or
+    /// `scheduler_turn_cost`, `cap_preemption_charge` or
     /// `inherited_seccomp`, which is the
     /// key order the encoder writes.
     #[test]
@@ -4249,6 +4277,7 @@ mod tests {
                 | "expired_wait_charge"
                 | "replaying"
                 | "scheduler_turn_cost"
+                | "cap_preemption_charge"
                 | "inherited_seccomp"
                 | "cpu_profile"
                 | "cpu_profile_host"
@@ -4280,17 +4309,18 @@ mod tests {
         // `in_guest_reserved_signals`, `in_guest_refuses_host_timed_producers`,
         // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
         // `pipe_wake_latency`, `expired_wait_charge`, `replaying`, `scheduler_turn_cost`,
-        // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`, `cpu_profile_source`,
+        // `cap_preemption_charge`, `inherited_seccomp`, `cpu_profile`,
+        // `cpu_profile_host`, `cpu_profile_source`,
         // `signal_state_copy`, `container_mount_table`,
         // `mountinfo_mount_namespace`, `directory_placeholder`,
         // `container_procfs`, `signal_delivery_check_fatal`,
         // `work_span_report`, `signal_at`, `in_guest_signal_delivery`,
         // `annotated_priority_replay`, `virtual_cpus`,
         // `notice_host_network_abstract_binds` and `strict_schedule_boundaries`
-        // none: fourteen more keys and thirty fewer, so sixteen keys fewer
+        // none: fourteen more keys and thirty-one fewer, so seventeen keys fewer
         // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 16);
+        assert_eq!(fields.len(), keys.len() + 17);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -4834,6 +4864,69 @@ mod tests {
                 .unwrap()
                 .scheduler_turn_cost,
             None
+        );
+    }
+
+    /// `cap_preemption_charge` never enters the legacy form, whatever its
+    /// value: the guest-visible string stays the legacy bytes, and it reads
+    /// back as false from both the object and the array form.
+    #[test]
+    fn cap_preemption_charge_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            cap_preemption_charge: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("cap_preemption_charge"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .cap_preemption_charge
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .cap_preemption_charge
+        );
+    }
+
+    /// `--cap-preemption-charge` is off by default, parses, and survives the
+    /// rendered command line and serde, so a recorded configuration replays
+    /// with the rule it ran with.
+    #[test]
+    fn cap_preemption_charge_is_opt_in_and_round_trips() {
+        let default = Config::default();
+        assert!(!default.cap_preemption_charge);
+        assert!(!default.to_string().contains("--cap-preemption-charge"));
+        let config = Config::parse_from(["detcore", "--cap-preemption-charge"]);
+        assert!(config.cap_preemption_charge);
+        let rendered = config.to_string();
+        assert!(rendered.contains(" --cap-preemption-charge"), "{rendered}");
+        let reparsed =
+            Config::parse_from(std::iter::once("detcore").chain(rendered.split_whitespace()));
+        assert!(reparsed.cap_preemption_charge);
+        let json = serde_json::to_string(&config).unwrap();
+        let back: Config = serde_json::from_str(&json).unwrap();
+        assert!(back.cap_preemption_charge);
+        let mut legacy: serde_json::Value = serde_json::to_value(&default).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("cap_preemption_charge");
+        let old: Config = serde_json::from_value(legacy).unwrap();
+        assert!(
+            !old.cap_preemption_charge,
+            "a configuration from before the option reads as off"
         );
     }
 
