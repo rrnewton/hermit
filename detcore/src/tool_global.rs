@@ -4467,6 +4467,14 @@ impl GlobalState {
                     .set_rss_limit(process, limit);
                 R::SetRssLimit(())
             }
+            GlobalRequest::CpuAffinity(tid) => {
+                R::CpuAffinity(self.lock_rpc_scheduler(false).await.cpu_affinity(tid))
+            }
+            GlobalRequest::SetCpuAffinity(tid, cpus) => R::CpuAffinity(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .set_cpu_affinity(tid, cpus),
+            ),
             GlobalRequest::RenderedFileState(inode, change) => R::RenderedFileState(
                 self.inodes
                     .lock()
@@ -6899,6 +6907,13 @@ pub enum GlobalRequest {
     /// Record a process's virtual soft `RLIMIT_RSS` after a `setrlimit` or
     /// `prlimit64` changed it (`Scheduler::set_rss_limit`). Appended last.
     SetRssLimit(DetPid, u64),
+    /// A live task's CPU affinity under `--virtual-cpus`
+    /// (`Scheduler::cpu_affinity`). Appended last.
+    CpuAffinity(DetTid),
+    /// Record a live task's CPU affinity under `--virtual-cpus`, in the turn
+    /// of the `sched_setaffinity` that set it (`Scheduler::set_cpu_affinity`).
+    /// Appended last.
+    SetCpuAffinity(DetTid, crate::cpu_set::CpuSet),
 }
 
 /// Responses from the global object
@@ -7165,6 +7180,9 @@ pub enum GlobalResponse {
     RecordExternalParent(()),
     /// Appended last.
     SetRssLimit(()),
+    /// The answer to `GlobalRequest::CpuAffinity` and
+    /// `GlobalRequest::SetCpuAffinity`. Appended last.
+    CpuAffinity(crate::cpu_set::TaskAffinity),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -9907,6 +9925,42 @@ where
             .await
             .1;
     assert_eq!(response, GlobalResponse::RecordExternalParent(()));
+}
+
+/// The CPU affinity of task `tid` under `--virtual-cpus`
+/// (`Scheduler::cpu_affinity`).
+pub(crate) async fn cpu_affinity<G, T>(guest: &mut G, tid: DetTid) -> crate::cpu_set::TaskAffinity
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::CpuAffinity(tid))
+        .await
+        .1
+    {
+        GlobalResponse::CpuAffinity(affinity) => affinity,
+        _ => unreachable!(),
+    }
+}
+
+/// Record `cpus` as the CPU affinity of task `tid` under `--virtual-cpus`
+/// (`Scheduler::set_cpu_affinity`).
+pub(crate) async fn set_cpu_affinity<G, T>(
+    guest: &mut G,
+    tid: DetTid,
+    cpus: crate::cpu_set::CpuSet,
+) -> crate::cpu_set::TaskAffinity
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::SetCpuAffinity(tid, cpus))
+        .await
+        .1
+    {
+        GlobalResponse::CpuAffinity(affinity) => affinity,
+        _ => unreachable!(),
+    }
 }
 
 /// Record `limit` as `process`'s virtual soft `RLIMIT_RSS`

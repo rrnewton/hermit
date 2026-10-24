@@ -1227,6 +1227,7 @@ fn record_or_replay_config_with_timer_support(
         detlog_regs_cadence: 1,
         sysinfo_uptime_offset: 120,
         memory: default_config.memory,
+        virtual_cpus: default_config.virtual_cpus,
         proc_level: default_config.proc_level,
         interrupt_at: vec![],
         happens_before: None,

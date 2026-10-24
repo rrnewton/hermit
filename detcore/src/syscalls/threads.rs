@@ -94,6 +94,8 @@ use crate::types::FutexID;
 use crate::types::LogicalTime;
 use crate::types::SigWrapper;
 
+#[path = "affinity.rs"]
+mod affinity;
 #[path = "emulated_waitid.rs"]
 mod emulated_waitid;
 
@@ -4605,11 +4607,19 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#546)
     /// Accept valid affinity masks without changing the host scheduler.
+    /// Under `--virtual-cpus` the mask is checked and kept as Linux does
+    /// (`virtual_sched_setaffinity`); Hermit's historical single CPU accepts
+    /// any readable mask and stays CPU 0.
     pub async fn handle_sched_setaffinity<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::SchedSetaffinity,
     ) -> Result<i64, Error> {
+        if let Some(cpus) = self.cfg.virtual_cpus {
+            return self
+                .virtual_sched_setaffinity(guest, call, cpus.get())
+                .await;
+        }
         let size_bytes = call.len() as usize;
         if size_bytes == 0 {
             return Err(Errno::EINVAL.into());
@@ -4640,11 +4650,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (`kernel_max` 127), so an 8-byte set, which `CPU_ALLOC` gives for the
     /// one CPU that `sysconf(_SC_NPROCESSORS_CONF)` reports, receives its
     /// first 8 bytes (<https://github.com/rrnewton/hermit/issues/4160>).
+    /// Under `--virtual-cpus` it is the named task's mask over the machine's
+    /// CPUs (`virtual_sched_getaffinity`).
     pub async fn handle_sched_getaffinity<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::SchedGetaffinity,
     ) -> Result<i64, Error> {
+        if let Some(cpus) = self.cfg.virtual_cpus {
+            return self
+                .virtual_sched_getaffinity(guest, call, cpus.get())
+                .await;
+        }
         let size_bytes: usize = call.len() as usize;
         if size_bytes == 0 || !size_bytes.is_multiple_of(std::mem::size_of::<libc::c_ulong>()) {
             return Err(Errno::EINVAL.into());

@@ -2321,7 +2321,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let virtual_pty_count = guest
             .thread_state()
             .count_open_files_at_paths(&[Path::new("/dev/ptmx"), Path::new("/dev/pts/ptmx")]);
-        let virtual_cpuinfo = file.is_cpuinfo().then(|| self.virtual_cpuid().cpuinfo());
+        let virtual_cpuinfo = file.is_cpuinfo().then(|| {
+            self.virtual_cpuid()
+                .cpuinfo(guest.config().virtual_cpu_count())
+        });
         let template = file.rendering_template().to_vec();
         file.initialize(
             template,
@@ -3003,6 +3006,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             reader_is_task: described == guest.thread_state().dettid.as_raw(),
             ppid,
             rsslim: facts.rsslim,
+            processor: facts.cpus.current(guest.config().virtual_cpu_count()),
         }))
     }
 
