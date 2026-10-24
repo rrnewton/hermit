@@ -1940,7 +1940,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the batched round's targeted rerun at the merged head (the six
     // forced-gate rows fail only for want of a locally built liteinst
     // runtime, which the validate builds; they pass there).
-    ("test.hermit_unit", 1329),
+    // And container::tests::superblock_options_leave_out_the_owner: 1330.
+    ("test.hermit_unit", 1330),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3794,7 +3795,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4930): 226 + 2 = 228.
     // And record_replay_flocks_a_self_created_file_opened_by_relative_path
     // (https://github.com/rrnewton/hermit/issues/5007): 228 + 1 = 229.
-    ("test.record_replay", 229),
+    // And record_replay_gives_the_guest_a_private_dev_shm: 230.
+    ("test.record_replay", 230),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -4555,7 +4557,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // passing.
     // N3 adds twelve cli cases, measured at its base (763 + 12 = 775 in
     // its tight loop): 764 + 12 = 776.
-    ("test.cli", 776),
+    // And a_run_gets_a_private_empty_dev_shm,
+    // concurrent_runs_do_not_share_dev_shm and
+    // host_dev_shm_sources_stay_the_hosts: 779.
+    ("test.cli", 779),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5169,7 +5174,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same eighteen integrated-chain cli cases: 664 + 18 = 682.
     // The same recount at bc48233db5 as test.cli: 682 + 1 = 683.
     // The same twelve N3 cli cases: 683 + 12 = 695.
-    ("test.cli_on_host", 695),
+    // And the three private /dev/shm tests: 698.
+    ("test.cli_on_host", 698),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -6106,7 +6112,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same four T2 and replay-refusal units as test.hermit_unit:
     // 1319 + 4 = 1323 (carried: the hosted lane did not run here; the
     // portable twin executed 1329 in the targeted rerun).
-    ("test.hermit_unit_on_host", 1323),
+    // And the container's superblock-owner test: 1324.
+    ("test.hermit_unit_on_host", 1324),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
