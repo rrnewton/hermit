@@ -25,6 +25,7 @@ mod pipe_wake;
 pub(crate) mod posix_timer_coalesce;
 #[cfg(test)]
 mod posix_timer_coalesce_tests;
+pub(crate) mod process_signal_receiver;
 pub(crate) mod real_timer;
 mod rejoin_log;
 mod replayer;
@@ -1975,6 +1976,19 @@ pub struct Scheduler {
     /// (`record_guest_marker_signal`). Set in the sending call's turn and
     /// never cleared.
     guest_sent_marker_signal: bool,
+
+    /// Each process's `signal->curr_target`: the thread the walk of
+    /// `complete_signal` last chose for a process-directed signal a guest sent
+    /// (`process_signal_receiver`). Absent: the process's leader, where
+    /// Linux starts it.
+    signal_curr_targets: BTreeMap<DetPid, DetTid>,
+
+    /// For each thread, the signals it was chosen to take of the
+    /// process-directed copies a guest sent and the scheduler left in its
+    /// process's shared queue (`process_signal_receiver`). Step 3 resumes
+    /// such a thread before any other, so it is the one that takes the copy
+    /// (`first_process_signal_taker`).
+    process_signal_takers: BTreeMap<DetTid, u64>,
 
     /// Test-only stand-in for the /proc signal-mask fields, keyed by
     /// (process, thread, field). Unit tests use small fake pids that can name
@@ -4355,6 +4369,8 @@ impl Scheduler {
             undelivered_scheduler_signals: Default::default(),
             thread_timer_copies: Default::default(),
             guest_sent_marker_signal: false,
+            signal_curr_targets: Default::default(),
+            process_signal_takers: Default::default(),
             #[cfg(test)]
             test_signal_masks: Default::default(),
             resources: Default::default(),
@@ -5264,6 +5280,7 @@ impl Scheduler {
         self.work_span_retire_thread(*dtid, *detpid);
         if last_of_process {
             self.shared_queue_scheduler_signals.remove(detpid);
+            self.signal_curr_targets.remove(detpid);
             // The generation stays, so that no publication older than one
             // already taken can bring dispositions back.
             if let Some(published) = self.published_dispositions.get_mut(detpid) {
@@ -5273,6 +5290,7 @@ impl Scheduler {
         // Its own queue goes with it; a later thread with its tid starts empty.
         self.thread_timer_copies
             .retain(|(thread, _), _| thread != dtid);
+        self.process_signal_takers.remove(dtid);
         self.remove_physical_thread(dtid, mm);
         // A killed vfork parent must not leave its barrier behind: step2a
         // drops a barrier only when it can read the parent's pending request,
@@ -13429,7 +13447,17 @@ impl Scheduler {
             // caller), so it is the thread that takes the process-directed
             // copy (`sigchld_takers`).
             let taker = self.first_sigchld_taker();
-            let next_dtid = match self.queued_group_exit_decider().or(taker).or(gated_child) {
+            // So does the thread a guest's process-directed signal was sent
+            // to: Linux woke no ptrace-stopped thread, so the copy waits in
+            // the shared queue for the first thread that resumes and does not
+            // block it (`process_signal_takers`).
+            let process_taker = self.first_process_signal_taker();
+            let next_dtid = match self
+                .queued_group_exit_decider()
+                .or(taker)
+                .or(process_taker)
+                .or(gated_child)
+            {
                 Some(child) => self
                     .run_queue
                     .tentative_pop_tid(child)
@@ -14180,6 +14208,14 @@ impl Scheduler {
                     self.note_process_signal_taken(dettid, sig.raw());
                     if sig.raw() == libc::SIGCHLD {
                         self.blocked.sigchld_takers.remove(&dettid);
+                    }
+                    // The copy it was chosen to take is taken
+                    // (`process_signal_takers`).
+                    if let Some(signals) = self.process_signal_takers.get_mut(&dettid) {
+                        *signals &= !kernel_signal_bit(sig.raw());
+                        if *signals == 0 {
+                            self.process_signal_takers.remove(&dettid);
+                        }
                     }
                 }
                 // `sigchld_ready` marks a parent step2e has already re-admitted,

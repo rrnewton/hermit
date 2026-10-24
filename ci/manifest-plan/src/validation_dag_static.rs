@@ -2805,7 +2805,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // epoch read without copying the configuration, and its placeholder
     // gate): 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit", 2529),
+    // And the eight scheduler::process_signal_receiver units
+    // (https://github.com/rrnewton/hermit/issues/4034): 2537.
+    ("test.detcore_unit", 2537),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3665,7 +3667,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3904) retain all 276: 278.
     // a_real_time_signal_timer_is_refused_by_name_when_it_expires
     // (https://github.com/rrnewton/hermit/issues/3893) retains all 278: 279.
-    // a_process_directed_signal_to_several_threads_is_refused_by_name
+    // a_process_directed_signal_to_several_threads_is_refused_by_name (now
+    // a_process_directed_signal_to_a_sleeping_sibling_is_refused_by_name)
     // (https://github.com/rrnewton/hermit/issues/4034) retains all 279: 280.
     // a_signal_to_a_process_group_is_refused_by_name
     // (https://github.com/rrnewton/hermit/issues/4046) retains all 280: 281.
@@ -3702,7 +3705,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 293, listed with this node's arguments.
     // a_futex_wait_on_an_unreadable_word_is_efault
     // (https://github.com/rrnewton/hermit/issues/4030) retains all 293: 294.
-    // a_pidfd_signal_to_several_threads_is_refused_by_name
+    // a_pidfd_signal_to_several_threads_is_refused_by_name (now
+    // a_pidfd_signal_to_a_sleeping_sibling_is_refused_by_name)
     // (https://github.com/rrnewton/hermit/issues/4047) retains all 294: 295.
     // signals_to_hermits_own_tasks_are_dropped_in_every_mode,
     // a_nested_pid_namespace_signals_its_own_tasks and
@@ -4012,7 +4016,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (A5 step 3c slice 0c): 600, listed.
     // And liteinst_in_guest_programs::in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name
     // (A5 step 3c slice 0g): 601, listed.
-    ("test.cli", 601),
+    // And a_process_directed_signal_goes_to_the_thread_linux_chooses,
+    // a_signal_to_the_senders_own_process_that_another_thread_takes_is_refused_by_name,
+    // and each_unforced_signal_to_the_senders_own_process_reaches_the_thread_linux_chooses
+    // split from the own-process refusal test
+    // (https://github.com/rrnewton/hermit/issues/4034): 604.
+    ("test.cli", 604),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4066,7 +4075,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scratch contract: 192, listed.
     // The 2026-10-17 test audit deleted rr_simple_threads_stress
     // (rr_join_threads without its asserts): 191.
-    ("test.rr_suite_contract", 191),
+    // And rr_multiple_pending_signals_sequential's new case, with
+    // rr_multiple_pending_signals no longer ignored, now that Detcore chooses
+    // a process-directed signal's receiving thread
+    // (https://github.com/rrnewton/hermit/issues/4034): 193.
+    ("test.rr_suite_contract", 193),
     ("privileged-test.pmu_buck_chaos_cases", 6),
     // PMU-subject cases moved out of test.hermit_unit and test.cli so the
     // hosted lane, which has no PMU, does not select them (see
@@ -4502,7 +4515,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unchanged at 520.
     // The in-guest unsequentialized-handler refusal test (slice 0g) starts the
     // in-guest runtime too and joins the hosted exclusions: unchanged at 520.
-    ("test.cli_on_host", 520),
+    // And the same three process-directed signal tests: 523.
+    ("test.cli_on_host", 523),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4925,7 +4939,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twelve A+ units: 2527, listed.
     // And the same three slice 7d determinize_stat_tests units: 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit_on_host", 2529),
+    // And the same eight process_signal_receiver units: 2537.
+    ("test.detcore_unit_on_host", 2537),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5463,7 +5478,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
-    ("test.rr_suite_contract_on_host", 190),
+    // And the same two multiple-pending-signals cases: 192.
+    ("test.rr_suite_contract_on_host", 192),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
     // And the same target-scoped DETLOG forwarding test (13), and the same
