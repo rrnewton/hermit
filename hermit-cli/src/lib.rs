@@ -8608,7 +8608,6 @@ mod tests {
         assert!(sabre.rediscovers_descriptors_after_exec);
         assert!(sabre.loopback_pollers_yield_to_peers);
         assert!(sabre.guest_clock_reads_bypass_backend);
-        assert!(sabre.virtualizes_syscall_clobbers);
         assert!(sabre.needs_killed_thread_rpc_cancellation);
         assert!(sabre.reports_physical_process_exits);
         assert!(sabre.tracks_process_children);
@@ -8620,7 +8619,6 @@ mod tests {
         assert!(!ptrace.rediscovers_descriptors_after_exec);
         assert!(!ptrace.loopback_pollers_yield_to_peers);
         assert!(!ptrace.guest_clock_reads_bypass_backend);
-        assert!(!ptrace.virtualizes_syscall_clobbers);
         assert!(!ptrace.needs_killed_thread_rpc_cancellation);
         assert!(!ptrace.reports_physical_process_exits);
         assert!(ptrace.tracks_process_children);
@@ -8742,10 +8740,6 @@ mod tests {
     /// on ptrace. `reports_kernel_child_exit_signals` is true for ptrace,
     /// e9patch and SaBRe, whose signal callbacks see the kernel's child-exit
     /// SIGCHLD with its siginfo and can suppress or rewrite it.
-    /// `virtualizes_syscall_clobbers` is true for KVM too since Reverie's
-    /// per-call slice 6: its Tool register snapshot at a syscall has RCX ==
-    /// RIP and R11 == RFLAGS, and it offers no register write, so Detcore's
-    /// canonicalization could change nothing there.
     fn golden_backend_capabilities(backend: Backend) -> serde_json::Value {
         let sabre = backend == Backend::Sabre;
         let kvm = backend == Backend::Kvm;
@@ -8757,7 +8751,6 @@ mod tests {
             "rediscovers_descriptors_after_exec": sabre || dbt,
             "loopback_pollers_yield_to_peers": sabre,
             "guest_clock_reads_bypass_backend": sabre,
-            "virtualizes_syscall_clobbers": sabre || kvm,
             "needs_killed_thread_rpc_cancellation": in_guest_liteinst || sabre || dbt || kvm,
             "reports_physical_process_exits": sabre,
             "process_exits_complete_asynchronously": in_guest_liteinst,
@@ -8990,9 +8983,10 @@ mod tests {
     /// first, `cpuid_virtualized_by_backend`, is written false for every
     /// backend now that no backend installs a CPUID profile of its own, and so
     /// is the fourteenth, `backend_virtualizes_capability_prctls`, now that
-    /// the capability prctls reach the kernel on every backend. KVM's fifth,
-    /// `syscall_clobbers_virtualized_by_backend`, is set since Reverie's
-    /// per-call slice 6 declared `virtualizes_syscall_clobbers`.
+    /// the capability prctls reach the kernel on every backend, and so is the
+    /// fifth, `syscall_clobbers_virtualized_by_backend`, now that Reverie's
+    /// backend contract requires every backend to leave the syscall-clobbered
+    /// registers as a native return would (with the exceptions it names).
     #[test]
     fn every_backend_encodes_its_current_legacy_projection() {
         for (backend, unsequenced, sequential) in [
@@ -9000,9 +8994,9 @@ mod tests {
             (Backend::E9patch, "010000011000100", "010000011000100"),
             (Backend::Liteinst, "010001010000000", "010001010000000"),
             (Backend::InGuestTrap, "010001010000000", "010001010000000"),
-            (Backend::Sabre, "011111110000000", "011111110000000"),
+            (Backend::Sabre, "011101110000000", "011101110000000"),
             (Backend::Dbt, "011001000100000", "011001000100000"),
-            (Backend::Kvm, "000011010010101", "000011010011101"),
+            (Backend::Kvm, "000001010010101", "000001010011101"),
         ] {
             for (sequentialize_threads, expected) in [(false, unsequenced), (true, sequential)] {
                 let config = prepare_backend_config(

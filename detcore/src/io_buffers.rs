@@ -1471,7 +1471,6 @@ mod event_tests {
                 // address limit, is the guest's `user_address_limit` answer.
                 backend.provides_process_signal_control = true;
                 backend.emulates_child_waits = true;
-                backend.virtualizes_syscall_clobbers = true;
             })
         };
         let pid = DetPid::from_raw(1);

@@ -2720,6 +2720,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/syscall_clobbers.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on every backend; ci=true)",
+      "why": "tests/c/syscall_clobbers.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: after raw syscalls of each kind (emulated, run by the kernel, tail-injected, failing), every backend must leave %rcx at the next instruction and %r11 at RFLAGS, as a native Linux return does"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/syscall_file_io.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/syscall_file_io.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"

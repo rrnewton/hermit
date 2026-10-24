@@ -10345,6 +10345,48 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/syscall-clobbers",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syscall-clobbers",
+          "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syscall-clobbers",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syscall-clobbers",
+          "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syscall-clobbers",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syscall-clobbers",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/syscall-file-io",
           "mode": "verify",
           "backend": "dbt"
@@ -30681,6 +30723,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/syscall-clobbers",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/syscall-file-io",
           "mode": "verify",
           "backend": "ptrace"
@@ -38956,6 +39005,27 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/sync-file-range",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syscall-clobbers",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syscall-clobbers",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syscall-clobbers",
           "mode": "verify",
           "backend": "sabre"
         },
@@ -61455,6 +61525,48 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/sync-file-range",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syscall-clobbers",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syscall-clobbers",
+          "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syscall-clobbers",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syscall-clobbers",
+          "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syscall-clobbers",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/syscall-clobbers",
           "mode": "verify",
           "backend": "sabre"
         },

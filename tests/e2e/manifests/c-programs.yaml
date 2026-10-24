@@ -18443,6 +18443,92 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/syscall-clobbers
+    description: Strict verification for tests/c/syscall_clobbers.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/syscall_clobbers.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    build:
+      cflags:
+        - -D_GNU_SOURCE
+    modes:
+      verify:
+        ci:
+          ptrace: true
+          sabre: true
+          kvm: true
+          dbt: true
+          liteinst: true
+          in-guest-trap: true
+        backends_enabled:
+          - ptrace
+          - sabre
+          - kvm
+          - dbt
+          - liteinst
+          - in-guest-trap
+        assert:
+          bitwise_parity: true
+        backends_disabled: {}
+        expected_stdout:
+          ptrace: "getpid: rcx ok, r11 ok\ngetppid: rcx ok, r11 ok\ngettid: rcx ok, r11 ok\ngetuid: rcx ok, r11 ok\nsched_yield: rcx ok, r11 ok\nuname: rcx ok, r11 ok\ngetcwd: rcx ok, r11 ok\nclock_gettime: rcx ok, r11 ok\ngetrandom: rcx ok, r11 ok\nbrk: rcx ok, r11 ok\nwrite-empty: rcx ok, r11 ok\nclose-ebadf: rcx ok, r11 ok\nnanosleep: rcx ok, r11 ok\nclobbers-ok\n"
+          dbt: "getpid: rcx ok, r11 ok\ngetppid: rcx ok, r11 ok\ngettid: rcx ok, r11 ok\ngetuid: rcx ok, r11 ok\nsched_yield: rcx ok, r11 ok\nuname: rcx ok, r11 ok\ngetcwd: rcx ok, r11 ok\nclock_gettime: rcx ok, r11 ok\ngetrandom: rcx ok, r11 ok\nbrk: rcx ok, r11 ok\nwrite-empty: rcx ok, r11 ok\nclose-ebadf: rcx ok, r11 ok\nnanosleep: rcx ok, r11 ok\nclobbers-ok\n"
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled, as c-programs/pipe-capacity does; the guest makes only raw syscalls and needs no preemption
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
   - id: c-programs/pipe-capacity-pin
     description: Detcore-created pipes expose the fixed 8192-byte scheduler capacity instead of the host default
     lane: portable

@@ -2607,7 +2607,28 @@ fi
 # Cargo.toml, Cargo.lock and rust-toolchain.toml, so the inventory, SDK and
 # native inputs, calibrated budget, job width and limits carry unchanged from
 # the 6f8fc22e entry.
-expected_pin=8b7ab5f3cbd2af2438d9c142aef486c5958ba05c
+# CARRY TO 943c0a9ac4b04ef41621a51497357081be551abe (2026-10-24): from
+# 8b7ab5f3cbd2af2438d9c142aef486c5958ba05c. Nine commits. Seven landed on
+# Reverie main from other lanes: 2857e9c4 (comments only), 75c612fa (test
+# helper cfgs), 91433813, 8dbf981d and f30fbbd7 (the pidfd self-sentinel
+# spelling, which adds reverie-dbt/src/pidfd_self.rs, so the reverie-dbt
+# inventory grows from 1008 to 1009 files; scripts/lib/reverie_dbt_inventory.rs
+# records it), 7428d6aa and cf745200. The eighth is 0cef7007 (liteinst lane:
+# it refreshes the reviewed native-source catalog in
+# reverie-liteinst-artifact/src/lib.rs only). The ninth is 943c0a9a (capflags
+# lane, slice 3:
+# the DBT client canonicalizes the syscall-clobbered registers, and the
+# virtualizes_syscall_clobbers capability is deleted). It changes
+# reverie/src/capabilities.rs and reverie-dbt/native/client.c; both repository
+# inputs to the DynamoRIO content-key miss are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# and the root Cargo.toml, Cargo.lock and rust-toolchain.toml are unchanged
+# across all nine commits, so the SDK and native inputs, calibrated budget, job
+# width and limits carry unchanged from the 8b7ab5f3 entry; only the source
+# inventory count moves, by the one added Rust file named above. The client.c
+# change still requires a fresh client build and Hermit validation.
+expected_pin=943c0a9ac4b04ef41621a51497357081be551abe
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

@@ -2316,10 +2316,11 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
             "detect_host_clock_futex_timeouts",
             backend.guest_clock_reads_bypass_backend,
         ),
-        (
-            "syscall_clobbers_virtualized_by_backend",
-            backend.virtualizes_syscall_clobbers,
-        ),
+        // Reverie's backend contract now requires every backend to leave the
+        // syscall-clobbered registers as a native return would (with the
+        // exceptions it names), so the key is always written false, its value
+        // on DBT, the form's only reader; see `from_legacy_backend_json`.
+        ("syscall_clobbers_virtualized_by_backend", false),
         (
             "cancel_killed_thread_rpcs",
             backend.needs_killed_thread_rpc_cancellation,
@@ -2409,6 +2410,14 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// so the legacy form keeps its bytes, and an input that
 /// says `true` fails the parse rather than being read as a policy no backend
 /// has.
+///
+/// `syscall_clobbers_virtualized_by_backend` supplies no capability either: it
+/// said the backend left the registers a `syscall` instruction clobbers as a
+/// native return would, which Reverie's backend contract now requires of every
+/// backend (with the exceptions that contract names). It is written as false,
+/// its value on DBT, so the legacy form keeps its bytes. The reader still takes it as one of the fifteen keys, so
+/// it keeps its position in the array form, must be a boolean and may appear
+/// once, and ignores its value (SaBRe and KVM wrote true).
 ///
 /// `backend_virtualizes_capability_prctls` supplies no capability either: it
 /// said the backend answered the capability-set prctls itself, and every
@@ -2581,6 +2590,12 @@ struct LegacyBackendKeys {
     discover_live_file_metadata: bool,
     #[serde(default)]
     detect_host_clock_futex_timeouts: bool,
+    // Supplies no capability; declared so that the key, like the others,
+    // fails the parse when it is given twice.
+    #[expect(
+        dead_code,
+        reason = "read only to refuse a repeated key; its value is ignored"
+    )]
     #[serde(default)]
     syscall_clobbers_virtualized_by_backend: bool,
     #[serde(default)]
@@ -2618,7 +2633,6 @@ impl LegacyBackendKeys {
         backend.rediscovers_descriptors_after_exec = self.discover_live_file_metadata;
         backend.loopback_pollers_yield_to_peers = self.discover_live_file_metadata;
         backend.guest_clock_reads_bypass_backend = self.detect_host_clock_futex_timeouts;
-        backend.virtualizes_syscall_clobbers = self.syscall_clobbers_virtualized_by_backend;
         backend.needs_killed_thread_rpc_cancellation = self.cancel_killed_thread_rpcs;
         // A legacy encoding predates this key. Only the ptrace tracer reports
         // child-exit publication, and it is the one backend that needs no
@@ -3751,7 +3765,15 @@ mod tests {
                     expected.guest_clock_reads_bypass_backend = true
                 }
                 "syscall_clobbers_virtualized_by_backend" => {
-                    expected.virtualizes_syscall_clobbers = true
+                    // It supplies no capability: either value reads back the
+                    // same configuration.
+                    let mut flipped = ptrace.clone();
+                    flipped.insert(key.to_owned(), serde_json::Value::Bool(!ptrace_value));
+                    let decoded =
+                        from_legacy_backend_json(&serde_json::to_string(&flipped).unwrap())
+                            .unwrap();
+                    assert_eq!(serde_json::to_string(&decoded).unwrap(), unflipped, "{key}");
+                    continue;
                 }
                 "cancel_killed_thread_rpcs" => {
                     expected.needs_killed_thread_rpc_cancellation = true;
