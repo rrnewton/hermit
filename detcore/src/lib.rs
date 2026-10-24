@@ -4351,6 +4351,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             None
         };
         tool_global::mark_past_first_execve(guest, unprepared_exe).await;
+        // The task's name for its rendered `/proc/<pid>/stat` where the tool
+        // cannot read the kernel's (`procfs::task_stat`): the one the new
+        // image's `AT_EXECFN` (`bprm->filename`) gives, under the leader's
+        // tid, which the exec'ing thread holds now. Where it cannot be read
+        // the previous name stands.
+        let detpid = guest.thread_state().detpid.expect("detpid unset");
+        if let Some(comm) = self.execfn_comm(guest) {
+            tool_global::set_task_comm(guest, DetTid::from_raw(detpid.as_raw()), comm).await;
+        }
         // That request also took the process out of its old descriptor table
         // in `procfs::locks::LockLedger`; name the descriptions whose locks
         // Detcore follows that survived the exec (its close-on-exec slots are

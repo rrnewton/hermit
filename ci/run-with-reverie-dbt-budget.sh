@@ -2571,7 +2571,15 @@ fi
 # third-party/ and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml,
 # so the inventory, SDK and native inputs, calibrated budget, job width and
 # limits carry unchanged from the fb93f1bd entry.
-expected_pin=42ba7f0fcdbcbb8728a641c8cb543eba8bfed2c6
+# CARRY TO 1b894c0cd804589bc1366338df720fef40391a0c (2026-10-23): from
+# 42ba7f0fcdbcbb8728a641c8cb543eba8bfed2c6. One commit (kvm lane,
+# package K slice D4c-1: reverie-kvm deletes its executor's /proc/self/stat
+# copy, which Detcore now renders). It changes reverie-kvm/src and
+# reverie-kvm/tests only; git diff is empty under reverie-dbt/ and
+# third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory, SDK and native inputs, calibrated
+# budget, job width and limits carry unchanged from the 42ba7f0f entry.
+expected_pin=1b894c0cd804589bc1366338df720fef40391a0c
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

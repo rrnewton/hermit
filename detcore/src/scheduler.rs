@@ -2245,6 +2245,32 @@ pub struct ThreadTree {
     /// Each nested task's pid in each namespace it belongs to, recorded at its
     /// creation (`pid_namespaces`).
     pub(crate) pid_namespaces: pid_namespaces::PidNamespaces,
+    /// Each task's name, Linux's `task_struct::comm` (`procfs::task_stat`),
+    /// which a rendered `/proc/<pid>/stat` shows where its guest threads are
+    /// not host tasks whose name the tool reads (`Detcore::comm_source`,
+    /// KVM): set after each
+    /// exec from the new image's `AT_EXECFN` (`Scheduler::set_task_comm`),
+    /// inherited by every new task from the task that created it, as
+    /// `copy_process` copies `comm`, and replaced by `PR_SET_NAME`. A task
+    /// with no entry has no recorded name (its process has not exec'd an
+    /// image Detcore saw). Entries are kept for the run, as the tree's own
+    /// entries are (about 40 bytes a task), and replaced when a number is
+    /// given out again.
+    task_comms: HashMap<DetTid, crate::procfs::task_stat::TaskComm>,
+    /// The guest-visible parent of each process whose real parent is outside
+    /// the guest's process tree, its own `getppid` answer
+    /// (`Scheduler::record_external_parent`): the run's root process, and a
+    /// process the root (or another such process) created with
+    /// `CLONE_PARENT`, which shares its creator's parent. That parent is the
+    /// container's init or a process outside its PID namespace (0), and does
+    /// not change during the run.
+    external_parents: HashMap<DetPid, i32>,
+    /// Each process's virtual soft `RLIMIT_RSS` where it is not
+    /// `RLIM_INFINITY`, every process's starting limit
+    /// (`Scheduler::set_rss_limit`), which a rendered `stat` shows (field
+    /// 25, `rsslim`) whoever reads it: copied to a forked child, kept by
+    /// exec, as Linux keeps `signal->rlim`.
+    rss_limits: HashMap<DetPid, u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2426,7 +2452,29 @@ impl ThreadTree {
         // Linux's copy_process starts every new task with no parent-death
         // signal; a reused tid does not keep the old task's.
         self.parent_death_signals.remove(&child_dettid);
+        // And with its creator's name (`dup_task_struct` copies `comm`); the
+        // root starts with none until its first image names it.
+        match self
+            .task_comms
+            .get(&parent_dettid)
+            .copied()
+            .filter(|_| parent_dettid != child_dettid)
+        {
+            Some(comm) => self.task_comms.insert(child_dettid, comm),
+            None => self.task_comms.remove(&child_dettid),
+        };
         if is_group_leader {
+            // A new process starts with its creator's resource limits
+            // (`copy_signal` copies `rlim`) and no recorded outside parent.
+            let creator = self.thread_to_leader.get(&parent_dettid).copied();
+            match creator
+                .filter(|_| parent_dettid != child_dettid)
+                .and_then(|creator| self.rss_limits.get(&creator).copied())
+            {
+                Some(limit) => self.rss_limits.insert(child_dettid, limit),
+                None => self.rss_limits.remove(&child_dettid),
+            };
+            self.external_parents.remove(&child_dettid);
             self.thread_group_leaders.insert(child_dettid);
             self.thread_to_leader.insert(child_dettid, child_dettid);
             // A reused pid starts with neither Linux attribute: the flag is
@@ -2605,6 +2653,12 @@ impl ThreadTree {
         match self.parent_death_signals.remove(&former) {
             Some(signal) => self.parent_death_signals.insert(leader, signal),
             None => self.parent_death_signals.remove(&leader),
+        };
+        // The surviving task keeps its own name under the leader's tid until
+        // the exec's edge names the new image (`Scheduler::set_task_comm`).
+        match self.task_comms.remove(&former) {
+            Some(comm) => self.task_comms.insert(leader, comm),
+            None => self.task_comms.remove(&leader),
         };
     }
 
@@ -9824,6 +9878,109 @@ impl Scheduler {
             self.thread_tree.session(process)
         } else {
             self.thread_tree.process_group(process)
+        }
+    }
+
+    /// Record `comm` as the name of task `tid` (`ThreadTree::task_comms`),
+    /// in its own turn: after `PR_SET_NAME`, and after an exec, the name the
+    /// new image's `AT_EXECFN` gives it.
+    pub fn set_task_comm(&mut self, tid: DetTid, comm: crate::procfs::task_stat::TaskComm) {
+        self.thread_tree.task_comms.insert(tid, comm);
+    }
+
+    /// Record `parent`, the `getppid` answer of `process` when it first
+    /// opened or listed its rendered `stat`, as its guest-visible parent
+    /// (`ThreadTree::external_parents`), where Detcore's model knows no other
+    /// (`Self::guest_visible_parent` is `None`): its real parent is outside
+    /// the guest's process tree, as the run's root process's is, and a
+    /// `CLONE_PARENT` child's of such a process (Linux gives it its
+    /// creator's `real_parent`). Ignored for any other process.
+    pub fn record_external_parent(&mut self, process: DetPid, parent: i32) {
+        if self.guest_visible_parent(process).is_none() {
+            self.thread_tree.external_parents.insert(process, parent);
+        }
+    }
+
+    /// Record `limit`, `process`'s virtual soft `RLIMIT_RSS` after a
+    /// `setrlimit` or `prlimit64` changed it, in its own turn
+    /// (`ThreadTree::rss_limits`).
+    pub fn set_rss_limit(&mut self, process: DetPid, limit: u64) {
+        if limit == crate::procfs::task_stat::RLIM_INFINITY {
+            self.thread_tree.rss_limits.remove(&process);
+        } else {
+            self.thread_tree.rss_limits.insert(process, limit);
+        }
+    }
+
+    /// The parent of `process` as the guest sees it (`getppid`'s answer),
+    /// from Detcore's model: the process of its real parent
+    /// (`ThreadTree::parent_death_parents`, which follows a parent thread's
+    /// exit and a subreaper's adoption), the namespace's init, pid 1, for an
+    /// orphan given to it (`ThreadTree::init_orphans`), and for a process
+    /// whose real parent is outside the guest's tree the parent its own
+    /// `getppid` answered (`Self::record_external_parent`). `None` where
+    /// none is known.
+    pub fn guest_visible_parent(&self, process: DetPid) -> Option<i32> {
+        let tree = &self.thread_tree;
+        if let Some(parent) = tree
+            .parent_death_parents
+            .get(&process)
+            .and_then(|parent| tree.thread_to_leader.get(parent))
+        {
+            return Some(parent.as_raw());
+        }
+        if tree.init_orphans.contains(&process) {
+            return Some(1);
+        }
+        tree.external_parents.get(&process).copied()
+    }
+
+    /// The recorded name of task `tid` (`ThreadTree::task_comms`).
+    #[cfg(test)]
+    pub fn task_comm(&self, tid: DetTid) -> Option<crate::procfs::task_stat::TaskComm> {
+        self.thread_tree.task_comms.get(&tid).copied()
+    }
+
+    /// What the process table says about the task a per-process `stat` file
+    /// names (`procfs::task_stat::TaskStatFacts`): the top-level
+    /// number `named` and the thread `thread` below its `task` directory, as
+    /// [`Self::procfs_task`] takes them. The task described is the thread,
+    /// else the task `named` is; its process is `named`'s.
+    pub fn task_stat_facts(
+        &self,
+        named: DetTid,
+        thread: Option<DetTid>,
+    ) -> crate::procfs::task_stat::TaskStatFacts {
+        let described = thread.unwrap_or(named);
+        let (_, exited) = self.procfs_task(named, thread);
+        let leader = self.signal_target_process(named);
+        let num_threads = self
+            .procfs_listing(leader)
+            .threads
+            .len()
+            .try_into()
+            .unwrap_or(i32::MAX);
+        let tree = &self.thread_tree;
+        let wait = leader.and_then(|leader| tree.process_wait.get(&leader));
+        let parent = leader.and_then(|leader| self.guest_visible_parent(leader));
+        crate::procfs::task_stat::TaskStatFacts {
+            comm: tree.task_comms.get(&described).copied(),
+            exited,
+            leads: tree.thread_group_leaders.contains(&described),
+            process_exit_signal: wait.map_or(libc::SIGCHLD, |wait| wait.exit_signal),
+            forked_without_exec: wait.is_some_and(|wait| wait.forked_without_exec),
+            process_group: leader
+                .and_then(|leader| self.group_or_session_of(leader, false))
+                .map_or(0, |group| group.as_raw()),
+            session: leader
+                .and_then(|leader| self.group_or_session_of(leader, true))
+                .map_or(0, |session| session.as_raw()),
+            num_threads,
+            process: leader.map(|leader| leader.as_raw()),
+            parent,
+            rsslim: leader
+                .and_then(|leader| tree.rss_limits.get(&leader).copied())
+                .unwrap_or(crate::procfs::task_stat::RLIM_INFINITY),
         }
     }
 
@@ -32857,6 +33014,130 @@ mod test {
         // A committed SIGKILL dooms it, so the wait will end.
         scheduler.record_committed_sigkill(child, Some(DetPid::from_raw(5)));
         assert!(!scheduler.child_waits_wait_only_on_stuck_children());
+    }
+
+    /// Detcore records each task's name (package K slice D4c-1): a new task
+    /// takes its creator's (`dup_task_struct`), a rename replaces only the
+    /// renamed task's, an exec by a thread carries the survivor's name to the
+    /// leader's tid until the exec's edge names the image, and the facts a
+    /// `stat` renders describe the task its file names, with the
+    /// guest-visible parent: the creator's process, the namespace init (1)
+    /// for an orphan given to it, and the recorded getppid answer of a
+    /// process whose parent is outside the tree (the root, its
+    /// `CLONE_PARENT` children); and with the process's own `RLIMIT_RSS`.
+    #[test]
+    fn task_comms_are_inherited_renamed_and_described_as_linux_keeps_them() {
+        use crate::procfs::task_stat::TaskComm;
+        let mut scheduler = Scheduler::new(&Config::default());
+        let (leader, worker, child) = (
+            DetTid::from_raw(3),
+            DetTid::from_raw(4),
+            DetTid::from_raw(5),
+        );
+        scheduler.thread_tree.add_child(leader, leader, true);
+        // The root has no name until its first image names it.
+        assert_eq!(scheduler.task_comm(leader), None);
+        let probe = TaskComm::new(b"probe");
+        scheduler.set_task_comm(leader, probe);
+        scheduler.thread_tree.add_child(leader, worker, false);
+        scheduler.thread_tree.add_child(worker, child, true);
+        for tid in [leader, worker, child] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        assert_eq!(scheduler.task_comm(worker), Some(probe));
+        assert_eq!(scheduler.task_comm(child), Some(probe));
+        let renamed = TaskComm::new(b"worker");
+        scheduler.set_task_comm(worker, renamed);
+        assert_eq!(scheduler.task_comm(leader), Some(probe));
+        assert_eq!(scheduler.task_comm(child), Some(probe));
+
+        let thread = scheduler.task_stat_facts(leader, Some(worker));
+        assert_eq!(thread.comm, Some(renamed));
+        assert!(!thread.leads);
+        assert!(!thread.exited);
+        assert_eq!(thread.process, Some(3));
+        assert_eq!(thread.num_threads, 2);
+        let process = scheduler.task_stat_facts(leader, None);
+        assert_eq!(process.comm, Some(probe));
+        assert!(process.leads);
+        assert_eq!(process.process_exit_signal, libc::SIGCHLD);
+        assert!(process.forked_without_exec);
+        assert_eq!((process.process_group, process.session), (0, 0));
+        assert_eq!(
+            process.parent, None,
+            "the root's parent is unknown until its first image records it"
+        );
+        // A getppid answer is recorded only for a process whose model knows
+        // no parent: the root's is; its child's, whose parent is the root,
+        // is ignored.
+        scheduler.record_external_parent(DetPid::from_raw(5), 9);
+        assert_eq!(scheduler.task_stat_facts(child, None).parent, Some(3));
+        scheduler.record_external_parent(DetPid::from_raw(3), 1);
+        assert_eq!(scheduler.task_stat_facts(leader, None).parent, Some(1));
+        // A CLONE_PARENT child of the root shares the root's outside parent:
+        // the model knows none, so its own getppid answer is recorded.
+        let sibling = DetTid::from_raw(6);
+        scheduler.thread_tree.add_child_with_wait_metadata(
+            leader,
+            sibling,
+            true,
+            true,
+            libc::SIGCHLD,
+        );
+        register_known_thread(&mut scheduler, sibling);
+        assert_eq!(scheduler.task_stat_facts(sibling, None).parent, None);
+        scheduler.record_external_parent(DetPid::from_raw(6), 1);
+        assert_eq!(scheduler.task_stat_facts(sibling, None).parent, Some(1));
+        // The virtual RLIMIT_RSS: each process's own, copied to a forked
+        // child, RLIM_INFINITY unless set.
+        let infinity = crate::procfs::task_stat::RLIM_INFINITY;
+        assert_eq!(scheduler.task_stat_facts(leader, None).rsslim, infinity);
+        scheduler.set_rss_limit(DetPid::from_raw(3), 123);
+        assert_eq!(scheduler.task_stat_facts(leader, None).rsslim, 123);
+        assert_eq!(
+            scheduler.task_stat_facts(leader, Some(worker)).rsslim,
+            123,
+            "a thread's file shows its process's limit"
+        );
+        assert_eq!(scheduler.task_stat_facts(child, None).rsslim, infinity);
+        let grandchild = DetTid::from_raw(7);
+        scheduler.thread_tree.add_child(leader, grandchild, true);
+        register_known_thread(&mut scheduler, grandchild);
+        assert_eq!(scheduler.task_stat_facts(grandchild, None).rsslim, 123);
+        scheduler.set_rss_limit(DetPid::from_raw(3), infinity);
+        assert_eq!(scheduler.task_stat_facts(leader, None).rsslim, infinity);
+        // A thread's file names its process's parent.
+        assert_eq!(
+            scheduler.task_stat_facts(leader, Some(worker)).parent,
+            Some(1)
+        );
+        let forked = scheduler.task_stat_facts(child, None);
+        assert_eq!(forked.process, Some(5));
+        assert_eq!(forked.parent, Some(3), "its creator's process");
+        assert_eq!(forked.num_threads, 1);
+        // An orphan given to the namespace's init has parent 1.
+        scheduler
+            .thread_tree
+            .parent_death_parents
+            .remove(&DetPid::from_raw(5));
+        scheduler
+            .thread_tree
+            .init_orphans
+            .insert(DetPid::from_raw(5));
+        assert_eq!(scheduler.task_stat_facts(child, None).parent, Some(1));
+        // A successful exec clears PF_FORKNOEXEC.
+        scheduler.record_successful_exec(DetPid::from_raw(3));
+        assert!(!scheduler.task_stat_facts(leader, None).forked_without_exec);
+        // An exec by the worker: it survives under the leader's tid with its
+        // own name, which the exec's edge then replaces.
+        scheduler
+            .thread_tree
+            .transfer_exec_parent_death(worker, leader);
+        assert_eq!(scheduler.task_comm(leader), Some(renamed));
+        assert_eq!(scheduler.task_comm(worker), None);
+        // A number given out again starts with its new creator's name.
+        scheduler.thread_tree.add_child(child, worker, false);
+        assert_eq!(scheduler.task_comm(worker), Some(probe));
     }
 
     /// A parent-death signal follows Linux's `forget_original_parent`
