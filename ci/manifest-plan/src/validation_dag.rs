@@ -2207,13 +2207,22 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
     // Since reproducible staging (https://github.com/rrnewton/hermit/pull/3948)
     // it builds in a fixed directory: six full validations on 2026-10-08/09
     // measured 172.6 to 181.2 s wall and 2438 to 2561 CPU-s.
-    // The CPU bound is the next 300-s bucket above 1.5 x 2561 (3842). The wall
-    // bound keeps build.buck_release_artifact's 1800 s for the same builds,
+    // The CPU bound was the next 300-s bucket above 1.5 x 2561 (3842), 3900.
+    // Every stage is cold (the fixed directory is wiped before and after), so a
+    // core-crate change costs no more than any other run. The work grew by
+    // about 500 CPU-s when d4594afa (2026-10-17) added a cold build of the
+    // liteinst-runtime profile to the stage, which b42f1992 then ran beside the
+    // other builds (its throttled time doubled, its CPU did not change). Across
+    // the 169 passing full validations from d4594afa to 2026-10-24, the step's cgroup
+    // CPU was 2558 to 3801 CPU-s (median 3269, p99 3597), and the validation of
+    // 46be6638 was killed at 3901 CPU-s and 215 s wall, before its builds
+    // finished. The CPU bound is the next 300-s bucket above 1.5 x 3901 (5851).
+    // The wall bound keeps build.buck_release_artifact's 1800 s for the same builds,
     // about 10 times the measurement; it also encloses the stage's lock wait,
     // whose default (HERMIT_BUCK_STAGE_LOCK_TIMEOUT, 1200 s) leaves room for one
     // stage after it.
     stage.timeout = 1800;
-    stage.cpu_timeout = 3900;
+    stage.cpu_timeout = 6000;
     stage.hint.est_duration_s = 177.0;
     // The baseline cloned from build.buck_release_artifact (8.39 GiB) is below
     // what ci/buck-e2e/stage peaks at with its builds running side by side:
