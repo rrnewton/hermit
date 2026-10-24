@@ -537,17 +537,33 @@ impl RunData {
         }
     }
 
+    /// Replay the preemption record at `path`, a recording: a replay that
+    /// reaches a recorded slice end already passed stops, as any replay
+    /// that diverges does.
     pub fn with_preempts_path_in(mut self, path: PathBuf) -> Self {
         self.runopts.det_opts.det_config.replay_preemptions_from = Some(path);
         self
     }
 
+    /// Replay the preemption record at `path`, one analyze edited
+    /// (minimization and the baseline search knock preemptions out of a
+    /// recording) or one a replay of such a record met the target with. A
+    /// thread can then reach recorded slices that have already ended, which
+    /// the replay skips (`--replay-edited-preemptions`).
+    pub fn with_edited_preempts_path_in(self, path: PathBuf) -> Self {
+        let mut run = self.with_preempts_path_in(path);
+        run.runopts.det_opts.det_config.replay_edited_preemptions = true;
+        run
+    }
+
+    /// Replay `pr`, a record analyze edited
+    /// ([`Self::with_edited_preempts_path_in`]).
     pub fn with_preempts_in(mut self, pr: PreemptionRecord) -> Self {
         let path = self.preempts_path_in().to_path_buf();
         pr.write_to_disk(&path)
             .expect("write of preempts file to succeed");
         self.in_mem_preempts_in = Some(pr);
-        self.with_preempts_path_in(path)
+        self.with_edited_preempts_path_in(path)
     }
 
     pub fn with_preemption_recording(self) -> Self {
@@ -1054,6 +1070,55 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    /// The records analyze edited (minimization's and the baseline search's)
+    /// replay with `--replay-edited-preemptions`, and so do the repro
+    /// commands it prints for them; a recording replays strictly. Before, a
+    /// minimization trial whose knock-out let a thread start a slice past
+    /// its recorded end stopped the whole analysis with Detcore's "Cannot
+    /// set end of timeslice" panic (exit 101).
+    #[test]
+    fn analyze_replays_only_its_edited_preemption_records_as_edited() {
+        let args = crate::Args::try_parse_from(["hermit", "analyze", "--", "/bin/true"]).unwrap();
+        let crate::Subcommand::Analyze(mut options) = args.command else {
+            panic!("not analyze")
+        };
+        options.apply_global(&args.global);
+        let workspace = tempfile::tempdir().unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        let record = workspace.path().join("round_001.preempts");
+        let edited = RunData::new_baseline(&options, "round_001".to_string())
+            .unwrap()
+            .with_edited_preempts_path_in(record.clone());
+        assert!(edited.runopts.det_opts.det_config.replay_edited_preemptions);
+        let repro = edited.to_repro();
+        assert!(repro.contains(" --replay-edited-preemptions"), "{repro}");
+        // A record analyze builds in memory (the baseline search's
+        // knock-outs) is written to the workspace and replayed as edited.
+        let knocked_out = RunData::new_baseline(&options, "round_002".to_string())
+            .unwrap()
+            .with_preempts_in(PreemptionRecord::from_vecs(
+                &std::collections::BTreeMap::new(),
+            ));
+        let config = &knocked_out.runopts.det_opts.det_config;
+        assert!(config.replay_edited_preemptions);
+        assert!(config.replay_preemptions_from.as_ref().unwrap().is_file());
+        let recording = RunData::new_baseline(&options, "verify".to_string())
+            .unwrap()
+            .with_preempts_path_in(record);
+        assert!(
+            !recording
+                .runopts
+                .det_opts
+                .det_config
+                .replay_edited_preemptions
+        );
+        assert!(
+            !recording.to_repro().contains("--replay-edited-preemptions"),
+            "{}",
+            recording.to_repro()
+        );
+    }
 
     /// Round-2 review of https://github.com/rrnewton/hermit/pull/3686, finding
     /// 2: the refusal `RunOpts::main` makes never sees an analyze or bisect

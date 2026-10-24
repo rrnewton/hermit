@@ -212,7 +212,7 @@ Do not work around them by trusting the output of the failed run.
 | --- | --- |
 | `LogicalTime::duration_since ... future`, `update_global_time ... before start`, `Attempted to update ... time ... already ...`, or `Trying to extract time for thread ... no entry` | Detcore's logical clock moved backward or lost a registered thread. |
 | `Couldn't read clock`, `end_of_timeslice is None`, `Ended time slice ... still beyond`, `Timer invariant broken`, or `Failed to set timer` | PMU/RCB timeslice state violated an invariant or the backend rejected a timer. |
-| `Cannot set end of timeslice ... current ... already ...` | A replayed preemption point is not later than current thread time. This can originate in a mismatched/corrupt preemption record; regenerate it before reporting. |
+| `Cannot set end of timeslice ... current ... already ...` or `Cannot set RCB end of timeslice` | A replayed preemption point is not later than current thread time. A record edited after recording (preemptions removed) does this by design: replay it with `--replay-edited-preemptions`, which skips slices that already ended. Otherwise it can originate in a mismatched/corrupt preemption record; regenerate it before reporting. |
 | `thread time should never go down`, `Global time is before epoch start`, or `bump_global_time ... went backwards` | Global and per-thread logical clocks disagree. |
 | `Detcore Default impl should not be called` or `Detcore GlobalState Default impl should not be called` | Reverie initialized Detcore through an invalid default path. |
 | `Missing DetPid`, `clone_flags must be set by parent`, `parent ... does not exist in thread_to_leader`, or `no entry for dettid ... next_turns` | Thread creation/lifecycle bookkeeping is inconsistent. |

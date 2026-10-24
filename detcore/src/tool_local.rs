@@ -6802,6 +6802,19 @@ impl<T> ThreadState<T> {
         self.callback_history.remaining().next()
     }
 
+    /// The post-hook's margin of one retired conditional branch, in logical
+    /// time at this thread's current clock and chaos slowdown: a PMU
+    /// deadline closer than this ends the slice at once.
+    pub(crate) fn pmu_epsilon(&self, cfg: &Config) -> Duration {
+        Duration::from_nanos((NANOS_PER_RCB * self.clock_multiplier(cfg)).ceil() as u64)
+    }
+
+    /// Logical nanoseconds per nanosecond of retired-branch time for this
+    /// thread now: the configured clock multiplier times its chaos slowdown.
+    pub(crate) fn clock_multiplier(&self, cfg: &Config) -> f64 {
+        cfg.clock_multiplier.unwrap_or(1.0) * self.rcb_time_multiplier().as_f64()
+    }
+
     /// Whether this thread has consumed its current logical timeslice.
     pub(crate) fn timeslice_expired(&self) -> bool {
         if let Some(replay_rcb_end) = self.replay_rcb_end {
@@ -6920,11 +6933,43 @@ impl<T> ThreadState<T> {
             let replay_controls_deadline =
                 self.preemption_points.is_some() || self.follows_replayed_schedule(cfg);
 
+            // How far ahead an edited record's slice without an RCB target
+            // must end to be replayed (`next_edited_slice`): the post-hook's
+            // one-RCB margin at this slice's clock, which ends a closer slice
+            // at once. Without a PMU maximum there is no such margin, so a
+            // slice is kept whenever it ends ahead, as in a faithful replay.
+            let margin = if cfg.max_timeslice.is_some() {
+                self.pmu_epsilon(cfg)
+            } else {
+                Duration::from_nanos(1)
+            };
             // Preemption-point replay from recorded --chaos configuration.
             if let Some(thi) = &mut self.preemption_points {
                 if self.stats.last_recorded_slice.is_none() {
                     // We have not tapped out the recording yet.
-                    if let Some((end_time, prio, replay_rcb_end)) = thi.next_with_rcbs() {
+                    let current_rcbs = self.committed_clock_value;
+                    // For an edited record, skip the recorded slices that
+                    // already ended (`next_edited_slice`). The chaos epoch
+                    // advanced only to the previous slice's end (above), so
+                    // a slice after skipped ones keeps that epoch's
+                    // slowdown: deterministic, if stale. At a thread's start
+                    // the scheduler has already applied the record's first
+                    // priority, which then holds until the kept slice ends
+                    // (the startup reset files no scheduler request).
+                    let next = if cfg.replay_edited_preemptions {
+                        let (next, skipped) =
+                            next_edited_slice(thi, current_ns, current_rcbs, margin);
+                        if skipped > 0 {
+                            debug!(
+                                "[dtid {}] edited record: skipped {} recorded slices that ended before {} (RCB {})",
+                                self.dettid, skipped, current_ns, current_rcbs
+                            );
+                        }
+                        next
+                    } else {
+                        thi.next_with_rcbs()
+                    };
+                    if let Some((end_time, prio, replay_rcb_end)) = next {
                         debug!(
                             "[dtid {}] next timeslice (T{}), set by recording to {:?} (current {}), priority {}",
                             self.dettid,
@@ -6933,18 +6978,23 @@ impl<T> ThreadState<T> {
                             current_ns,
                             prio
                         );
-                        let current_rcbs = self.committed_clock_value;
                         if let Some(target_rcbs) = replay_rcb_end
                             && target_rcbs < current_rcbs
                         {
                             panic!(
-                                "Cannot set RCB end of timeslice to {} for thread {}, when current RCB count is already {}.",
+                                "Cannot set RCB end of timeslice to {} for thread {}, when current RCB count is already {}. \
+                                 An edited record, not the recording of this run's schedule, needs \
+                                 --replay-edited-preemptions.",
                                 target_rcbs, self.dettid, current_rcbs
                             )
                         }
                         let exact_deadline_is_now =
                             replay_rcb_end.is_some_and(|target| target == current_rcbs);
-                        if end_time <= current_ns && !exact_deadline_is_now {
+                        // An edited record keeps a slice whose end has passed
+                        // while its RCB target is ahead: the target governs.
+                        let rcb_target_governs =
+                            cfg.replay_edited_preemptions && replay_rcb_end.is_some();
+                        if end_time <= current_ns && !exact_deadline_is_now && !rcb_target_governs {
                             // Records that store their epoch are reconciled with
                             // this run's epoch before any guest starts (see
                             // `adopt_replayed_schedule_epoch` in hermit-cli), so
@@ -6955,7 +7005,8 @@ impl<T> ThreadState<T> {
                                 "Cannot set end of timeslice to {} for thread {}, when current thread logical time is already {}. \
                                  The replayed preemption record's timeslice ends are absolute virtual times; if it was \
                                  recorded under a different virtual-time epoch, replay it with that --epoch \
-                                 (https://github.com/rrnewton/hermit/issues/3413).",
+                                 (https://github.com/rrnewton/hermit/issues/3413). An edited record, not the \
+                                 recording of this run's schedule, needs --replay-edited-preemptions.",
                                 end_time, self.dettid, current_ns
                             )
                         }
@@ -7060,9 +7111,24 @@ impl<T> ThreadState<T> {
                 );
             }
 
-            let configured_max_end = cfg
-                .max_timeslice
-                .map(|max_timeslice| current_ns + Duration::from_nanos(u64::from(max_timeslice)));
+            // Past an edited record's last recorded slice, a restored chaos
+            // slowdown can make one RCB longer than the configured maximum
+            // (the configuration checks that maximum at the ambient
+            // slowdown): keep at least the post-hook's one-RCB margin, or it
+            // would end this slice at once and find itself past its maximum
+            // again.
+            let past_an_edited_record = cfg.replay_edited_preemptions
+                && self.preemption_points.is_some()
+                && self.end_of_timeslice == Some(LogicalTime::MAX);
+            let configured_max_end = cfg.max_timeslice.map(|max_timeslice| {
+                let length = Duration::from_nanos(u64::from(max_timeslice));
+                current_ns
+                    + if past_an_edited_record {
+                        length.max(margin)
+                    } else {
+                        length
+                    }
+            });
             self.max_timeslice_end = if replay_controls_deadline {
                 if cfg.max_timeslice.is_some() {
                     // A replay history uses `LogicalTime::MAX` after its last
@@ -7134,6 +7200,41 @@ impl<T> ThreadState<T> {
     /// guarantee determinism!
     pub fn guest_past_first_execve(&self) -> bool {
         self.past_global_first_execve
+    }
+}
+
+/// The first recorded slice of an edited record (`--replay-edited-preemptions`)
+/// still ahead of a thread at logical time `now` and committed PMU count
+/// `rcbs`, and how many recorded slices before it were skipped.
+///
+/// An edited record (`hermit analyze` knocks preemptions out of a recording)
+/// changes when threads run, so a thread can reach recorded slices that have
+/// already ended. Those no longer apply. A slice is ahead when its RCB target
+/// is, since that target governs where there is one (its end may have
+/// passed), and otherwise when it ends at least `margin` ahead
+/// ([`ThreadState::next_timeslice`] passes the post-hook's one-RCB margin), so
+/// a recorded one-RCB slice that starts where the previous one ended is kept.
+/// Only the baseline search's knock-outs keep RCB targets; minimization's
+/// records skip by time alone. The returned target is the kept slice's own,
+/// or none when its end governs.
+fn next_edited_slice(
+    history: &mut ThreadHistoryIterator,
+    now: LogicalTime,
+    rcbs: u64,
+    margin: Duration,
+) -> (Option<(LogicalTime, Priority, Option<u64>)>, usize) {
+    let mut skipped = 0;
+    loop {
+        match history.next_with_rcbs() {
+            None => return (None, skipped),
+            Some((end, prio, Some(target))) if target >= rcbs => {
+                return (Some((end, prio, Some(target))), skipped);
+            }
+            Some((end, prio, _)) if end >= now + margin => {
+                return (Some((end, prio, None)), skipped);
+            }
+            Some(_) => skipped += 1,
+        }
     }
 }
 
@@ -8085,6 +8186,347 @@ mod timeslice_tests {
             state.end_of_timeslice,
             Some(now + Duration::from_nanos(200))
         );
+    }
+
+    /// A thread at 500 ns of logical time (50 RCBs at multiplier 1) and PMU
+    /// count 10, replaying `history` from its start with `config`: returns
+    /// the thread, the priority its next slice gets, and the time it chose
+    /// that slice at.
+    fn replay_from_500ns(
+        config: &Config,
+        history: ThreadHistory,
+    ) -> (ThreadState<()>, Option<Priority>, LogicalTime) {
+        let mut state = ThreadState::new(DetPid::from_raw(5), config, ());
+        state.preemption_points = Some(history.into_iter());
+        state
+            .thread_logical_time
+            .add_rcbs_with_multiplier(50, RcbTimeMultiplier::ONE);
+        state.committed_clock_value = 10;
+        let now = state.thread_logical_time.as_nanos();
+        let prio = state.next_timeslice(config);
+        (state, prio, now)
+    }
+
+    fn edited_replay_config() -> Config {
+        Config {
+            target_timeslice: nz(10_000),
+            max_timeslice: nz(100_000),
+            replay_edited_preemptions: true,
+            ..Default::default()
+        }
+    }
+
+    /// With --replay-edited-preemptions, recorded slices that ended before
+    /// the thread got to them are skipped: the first slice still ahead
+    /// applies, with its own end, priority and RCB target, and the slice
+    /// after it follows as recorded. Slices whose RCB target has passed, or
+    /// that end within the post-hook's one-RCB margin, count as ended.
+    #[test]
+    fn an_edited_record_skips_the_slices_that_already_ended() {
+        let config = edited_replay_config();
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let at = |ns: u64| start + Duration::from_nanos(ns);
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![
+                (at(100), DEFAULT_PRIORITY + 1),
+                // RCB target behind, end within one RCB (10 ns) of 500 ns.
+                (at(505), DEFAULT_PRIORITY + 2),
+                (at(900), DEFAULT_PRIORITY + 3),
+                (at(1300), DEFAULT_PRIORITY + 4),
+            ])
+            .with_preemption_rcbs(vec![4, 9, 90, 130]);
+        let (mut state, prio, _) = replay_from_500ns(&config, history);
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 3));
+        assert_eq!(state.end_of_timeslice, Some(at(900)));
+        assert_eq!(state.replay_rcb_end, Some(90));
+
+        state
+            .thread_logical_time
+            .add_rcbs_with_multiplier(40, RcbTimeMultiplier::ONE);
+        state.committed_clock_value = 90;
+        assert!(state.timeslice_expired());
+        assert_eq!(state.next_timeslice(&config), Some(DEFAULT_PRIORITY + 4));
+        assert_eq!(state.end_of_timeslice, Some(at(1300)));
+        assert_eq!(state.replay_rcb_end, Some(130));
+    }
+
+    /// Only one clock may have passed: an RCB target still ahead governs a
+    /// slice whose end has passed, and an end still ahead (with no RCB
+    /// target, or a passed one) governs on its own.
+    #[test]
+    fn an_edited_record_keeps_a_slice_one_of_whose_deadlines_is_ahead() {
+        let config = edited_replay_config();
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let at = |ns: u64| start + Duration::from_nanos(ns);
+        let one_slice = |end: u64, rcbs: Option<u64>| {
+            let history = ThreadHistory::new().with_prio_changes(vec![
+                (at(end), DEFAULT_PRIORITY + 7),
+                (at(5000), DEFAULT_PRIORITY),
+            ]);
+            match rcbs {
+                Some(rcbs) => history.with_preemption_rcbs(vec![rcbs, 500]),
+                None => history,
+            }
+        };
+        // End passed, RCB target ahead: the target governs.
+        let (state, prio, _) = replay_from_500ns(&config, one_slice(100, Some(20)));
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 7));
+        assert_eq!(state.replay_rcb_end, Some(20));
+        assert!(!state.timeslice_expired());
+        // RCB target passed, end ahead: the end governs, without the target.
+        let (state, prio, _) = replay_from_500ns(&config, one_slice(800, Some(4)));
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 7));
+        assert_eq!(
+            (state.end_of_timeslice, state.replay_rcb_end),
+            (Some(at(800)), None)
+        );
+        // An RCB target exactly at the current count ends the slice at once,
+        // as in any replay.
+        let (state, prio, _) = replay_from_500ns(&config, one_slice(100, Some(10)));
+        assert_eq!(prio, Some(DEFAULT_PRIORITY + 7));
+        assert_eq!(state.replay_rcb_end, Some(10));
+        assert!(state.timeslice_expired());
+    }
+
+    /// When every recorded slice has ended, the thread goes on at the
+    /// record's final priority, as after the last recorded slice.
+    #[test]
+    fn an_edited_record_whose_slices_all_ended_goes_on_at_its_final_priority() {
+        let config = edited_replay_config();
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let history = ThreadHistory::new().with_prio_changes(vec![
+            (start + Duration::from_nanos(100), DEFAULT_PRIORITY + 1),
+            (start + Duration::from_nanos(200), DEFAULT_PRIORITY + 2),
+        ]);
+        let final_priority = history.clone().into_iter().final_priority();
+        let (state, prio, now) = replay_from_500ns(&config, history);
+        assert_eq!(prio, Some(final_priority));
+        // As after the last recorded slice of any replay: no recorded end,
+        // so the configured maximum timeslice bounds it.
+        assert_eq!(
+            state.end_of_timeslice,
+            Some(now + Duration::from_nanos(100_000))
+        );
+        assert!(state.stats.last_recorded_slice.is_some());
+    }
+
+    /// The one-RCB margin follows the clock multiplier and the thread's chaos
+    /// slowdown: at multiplier 0.3 one RCB is 3 ns, so an end 2 ns ahead is
+    /// within it (the post-hook would end that slice at once) and one 3 ns
+    /// ahead is not. Without a PMU maximum there is no margin.
+    #[test]
+    fn the_skipping_margin_is_one_rcb_at_the_thread_clock() {
+        let config = Config {
+            clock_multiplier: Some(0.3),
+            ..edited_replay_config()
+        };
+        let state = ThreadState::new(DetPid::from_raw(5), &config, ());
+        assert_eq!(state.pmu_epsilon(&config), Duration::from_nanos(3));
+        let mut slowed = ThreadState::new(DetPid::from_raw(5), &config, ());
+        slowed.chaos_slowdown_factor = RcbTimeMultiplier::from_f64(2.0);
+        slowed.chaos_slowdown_active = true;
+        assert_eq!(slowed.pmu_epsilon(&config), Duration::from_nanos(6));
+
+        let start = state.thread_logical_time.as_nanos();
+        for (ahead, skipped) in [(2, true), (3, false)] {
+            // 50 RCBs at multiplier 1 are 500 ns; at 0.3 the thread's time
+            // advances by 150 ns.
+            let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+            state
+                .thread_logical_time
+                .add_rcbs_with_multiplier(50, RcbTimeMultiplier::ONE);
+            let now = state.thread_logical_time.as_nanos();
+            state.preemption_points = Some(
+                ThreadHistory::new()
+                    .with_prio_changes(vec![
+                        (now + Duration::from_nanos(ahead), DEFAULT_PRIORITY + 1),
+                        (start + Duration::from_nanos(9000), DEFAULT_PRIORITY + 2),
+                    ])
+                    .into_iter(),
+            );
+            let prio = state.next_timeslice(&config);
+            let expected = if skipped {
+                DEFAULT_PRIORITY + 2
+            } else {
+                DEFAULT_PRIORITY + 1
+            };
+            assert_eq!(prio, Some(expected), "{ahead} ns ahead");
+        }
+
+        // At a 2 times slowdown (a recorded epoch) one RCB is 6 ns: an end
+        // 5 ns ahead is within it, one 6 ns ahead is not.
+        for (ahead, skipped) in [(5, true), (6, false)] {
+            let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+            let begin = state.thread_logical_time.as_nanos();
+            state.preemption_points = Some(
+                ThreadHistory::new()
+                    .with_prio_changes(vec![
+                        (begin + Duration::from_nanos(ahead), DEFAULT_PRIORITY + 1),
+                        (begin + Duration::from_nanos(9000), DEFAULT_PRIORITY + 2),
+                    ])
+                    .with_chaos_epochs(vec![ChaosEpochTransition {
+                        logical_time: begin,
+                        epoch: 0,
+                        factor: RcbTimeMultiplier::from_f64(2.0),
+                    }])
+                    .into_iter(),
+            );
+            let prio = state.next_timeslice(&config);
+            assert_eq!(state.pmu_epsilon(&config), Duration::from_nanos(6));
+            let expected = if skipped {
+                DEFAULT_PRIORITY + 2
+            } else {
+                DEFAULT_PRIORITY + 1
+            };
+            assert_eq!(prio, Some(expected), "{ahead} ns ahead at 2 times");
+        }
+
+        // Without a PMU maximum the post-hook has no margin: a slice is kept
+        // whenever it ends ahead, as in a faithful replay.
+        let unbounded = Config {
+            max_timeslice: None,
+            ..edited_replay_config()
+        };
+        for (end, expected) in [(501, DEFAULT_PRIORITY + 1), (500, DEFAULT_PRIORITY + 2)] {
+            let history = ThreadHistory::new().with_prio_changes(vec![
+                (start + Duration::from_nanos(end), DEFAULT_PRIORITY + 1),
+                (start + Duration::from_nanos(9000), DEFAULT_PRIORITY + 2),
+            ]);
+            let (_, prio, _) = replay_from_500ns(&unbounded, history);
+            assert_eq!(
+                prio,
+                Some(expected),
+                "an end at {end} ns, without a maximum"
+            );
+        }
+    }
+
+    /// A recorded one-RCB slice that starts exactly where the previous one
+    /// ended is one the post-hook runs, not one that ended: on a record
+    /// without RCB targets (as minimization writes), an edited replay keeps
+    /// every such slice, with the same ends and priorities as a faithful one.
+    #[test]
+    fn an_edited_replay_keeps_one_rcb_slices_as_a_faithful_one_does() {
+        let edited = edited_replay_config();
+        let faithful = Config {
+            replay_edited_preemptions: false,
+            ..edited_replay_config()
+        };
+        let start = ThreadState::new(DetPid::from_raw(5), &edited, ())
+            .thread_logical_time
+            .as_nanos();
+        let at = |ns: u64| start + Duration::from_nanos(ns);
+        // At 500 ns, one RCB (10 ns) per slice, then a longer one.
+        let history = ThreadHistory::new().with_prio_changes(vec![
+            (at(510), DEFAULT_PRIORITY + 1),
+            (at(520), DEFAULT_PRIORITY + 2),
+            (at(530), DEFAULT_PRIORITY + 3),
+            (at(900), DEFAULT_PRIORITY + 4),
+        ]);
+        let slices = |config: &Config| {
+            let (mut state, prio, _) = replay_from_500ns(config, history.clone());
+            let mut slices = vec![(prio, state.end_of_timeslice)];
+            for _ in 0..3 {
+                state.thread_logical_time.add_rcbs(1);
+                let prio = state.next_timeslice(config);
+                slices.push((prio, state.end_of_timeslice));
+            }
+            slices
+        };
+        assert_eq!(slices(&edited), slices(&faithful));
+        assert_eq!(
+            slices(&edited)[..3],
+            [
+                (Some(DEFAULT_PRIORITY + 1), Some(at(510))),
+                (Some(DEFAULT_PRIORITY + 2), Some(at(520))),
+                (Some(DEFAULT_PRIORITY + 3), Some(at(530))),
+            ]
+        );
+    }
+
+    /// Past an edited record's last recorded slice, a restored chaos slowdown
+    /// can make one RCB longer than the configured maximum timeslice: the
+    /// slice's PMU maximum is kept at least one RCB ahead, so the post-hook
+    /// neither ends it at once nor finds itself past it again. A faithful
+    /// replay keeps the configured maximum.
+    #[test]
+    fn past_an_edited_record_the_maximum_keeps_one_rcb_at_a_restored_slowdown() {
+        let config = |edited: bool| Config {
+            target_timeslice: None,
+            max_timeslice: nz(10),
+            replay_edited_preemptions: edited,
+            ..Default::default()
+        };
+        for (edited, expected) in [(true, 20), (false, 10)] {
+            let config = config(edited);
+            let mut state = ThreadState::new(DetPid::from_raw(5), &config, ());
+            let now = state.thread_logical_time.as_nanos();
+            let doubled = ChaosEpochTransition {
+                logical_time: now,
+                epoch: 1,
+                factor: RcbTimeMultiplier::from_f64(2.0),
+            };
+            state.preemption_points = Some(
+                ThreadHistory::new()
+                    .with_chaos_epochs(vec![doubled])
+                    .into_iter(),
+            );
+            state.next_timeslice(&config);
+            assert_eq!(state.chaos_slowdown_factor, doubled.factor);
+            assert_eq!(state.pmu_epsilon(&config), Duration::from_nanos(20));
+            assert!(state.stats.last_recorded_slice.is_some());
+            assert_eq!(
+                state.max_timeslice_end,
+                Some(now + Duration::from_nanos(expected)),
+                "edited: {edited}"
+            );
+        }
+    }
+
+    /// Without --replay-edited-preemptions, a replay that reaches a recorded
+    /// slice end already passed stops: a faithful replay never does, so the
+    /// replay diverged.
+    #[test]
+    #[should_panic(expected = "needs --replay-edited-preemptions")]
+    fn a_faithful_replay_past_a_recorded_end_stops() {
+        let config = Config {
+            replay_edited_preemptions: false,
+            ..edited_replay_config()
+        };
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let history = ThreadHistory::new().with_prio_changes(vec![
+            (start + Duration::from_nanos(100), DEFAULT_PRIORITY + 1),
+            (start + Duration::from_nanos(900), DEFAULT_PRIORITY),
+        ]);
+        replay_from_500ns(&config, history);
+    }
+
+    /// The same for a recorded RCB deadline the PMU count has passed.
+    #[test]
+    #[should_panic(expected = "count is already 10. An edited record")]
+    fn a_faithful_replay_past_a_recorded_rcb_end_stops() {
+        let config = Config {
+            replay_edited_preemptions: false,
+            ..edited_replay_config()
+        };
+        let start = ThreadState::new(DetPid::from_raw(5), &config, ())
+            .thread_logical_time
+            .as_nanos();
+        let history = ThreadHistory::new()
+            .with_prio_changes(vec![
+                (start + Duration::from_nanos(100), DEFAULT_PRIORITY + 1),
+                (start + Duration::from_nanos(900), DEFAULT_PRIORITY),
+            ])
+            .with_preemption_rcbs(vec![4, 90]);
+        replay_from_500ns(&config, history);
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

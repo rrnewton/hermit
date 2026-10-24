@@ -960,6 +960,13 @@ mod tests {
             "replay-schedule-from",
             &["--replay-schedule-from=/tmp/s.json"],
         ),
+        (
+            "replay-edited-preemptions",
+            &[
+                "--replay-preemptions-from=/tmp/r.json",
+                "--replay-edited-preemptions",
+            ],
+        ),
         ("replay-exhausted-panic", &["--replay-exhausted-panic"]),
         ("die-on-desync", &["--die-on-desync"]),
         (

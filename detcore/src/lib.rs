@@ -48,6 +48,8 @@ pub mod dispatch_observer;
 /// Schedule-alignment and edit-distance algorithms shared by Hermit tools.
 #[allow(missing_docs)]
 pub mod edit_distance;
+#[cfg(test)]
+mod edited_replay_hook_tests;
 pub mod exec_record;
 pub mod exit_dependencies;
 mod fatal_core;
@@ -2297,9 +2299,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return false;
         }
         if site == preemptions::callback_history::Site::PosthookPmuEpsilon {
-            let multiplier = guest.config().clock_multiplier.unwrap_or(1.0)
-                * thread.rcb_time_multiplier().as_f64();
-            let epsilon = Duration::from_nanos((NANOS_PER_RCB * multiplier).ceil() as u64);
+            let epsilon = thread.pmu_epsilon(guest.config());
             return thread.replay_rcb_end.is_none()
                 && thread.max_timeslice_end.is_some_and(|maximum| {
                     thread.thread_logical_time.as_nanos() + epsilon > maximum
@@ -2429,9 +2429,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             // TODO: get rid of fractional NANOS_PER_RCB so it's clear that this does not lose precision:
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1151)
-            let clock_multiplier = guest.config().clock_multiplier.unwrap_or(1.0)
-                * guest.thread_state().rcb_time_multiplier().as_f64();
-            let epsilon = Duration::from_nanos((NANOS_PER_RCB * clock_multiplier).ceil() as u64);
+            let mut clock_multiplier = guest.thread_state().clock_multiplier(guest.config());
+            let mut epsilon = guest.thread_state().pmu_epsilon(guest.config());
 
             if replay_rcb_end.is_none() && current_time + epsilon > max_timeslice_end {
                 if guest.thread_state().own_signal_turn_hold.is_some() {
@@ -2465,6 +2464,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .expect("ending a PMU-backed timeslice must install a new maximum");
                 current_time = guest.thread_state().thread_logical_time.as_nanos();
                 replay_rcb_end = guest.thread_state().replay_rcb_end;
+                if guest.config().replay_edited_preemptions {
+                    // The slice ending path chose the new slice with the
+                    // margin at the chaos slowdown it installed, which can
+                    // differ from the one before; check against that one.
+                    // A faithful replay keeps the earlier values for this
+                    // check and the timer below, as its recording did, so
+                    // that existing records replay unchanged.
+                    clock_multiplier = guest.thread_state().clock_multiplier(guest.config());
+                    epsilon = guest.thread_state().pmu_epsilon(guest.config());
+                }
             }
             if replay_rcb_end.is_none() && current_time + epsilon > max_timeslice_end {
                 panic!(

@@ -166,6 +166,18 @@ impl AnalyzeOpts {
         }
     }
 
+    /// `run` replaying the target's preemption record at `path`: one
+    /// minimization edited when `--minimize` ran, which replays as edited
+    /// ([`RunData::with_edited_preempts_path_in`]); otherwise the target
+    /// run's recording, which replays strictly.
+    fn replaying_the_target_record(&self, run: RunData, path: PathBuf) -> RunData {
+        if self.minimize {
+            run.with_edited_preempts_path_in(path)
+        } else {
+            run.with_preempts_path_in(path)
+        }
+    }
+
     // TODO: REMOVE. Only used by minimize atm.
     //
     /// Launch a run with preempts provided (to replay). No logging. Return true if it matches the
@@ -178,7 +190,7 @@ impl AnalyzeOpts {
         record_sched_path: Option<&Path>,
     ) -> anyhow::Result<(bool, RunOpts)> {
         let mut run = RunData::new_baseline(self, runname.to_string())?
-            .with_preempts_path_in(preempts_path.to_path_buf());
+            .with_edited_preempts_path_in(preempts_path.to_path_buf());
 
         if let Some(path) = record_sched_path {
             run = run.with_schedule_recording_to(path.to_path_buf());
@@ -434,8 +446,9 @@ impl AnalyzeOpts {
             yellow_msg("[selfcheck] Verifying target run preserved under preemption-replay");
 
             let runname = "run1b_selfcheck";
-            let mut run1b = RunData::new_run1_replay(self, runname.to_string(), &min_run.runopts)?
-                .with_preempts_path_in(min_preempts_path.clone())
+            let run1b = RunData::new_run1_replay(self, runname.to_string(), &min_run.runopts)?;
+            let mut run1b = self
+                .replaying_the_target_record(run1b, min_preempts_path.clone())
                 .with_preemption_recording();
             eprintln!("    {}", run1b.to_repro());
 
@@ -1011,8 +1024,9 @@ impl AnalyzeOpts {
                 "Verify target endpoint preemption record causes criteria to hold and record sched events",
             );
             let runname = "verify_target_endpoint";
-            let mut newrun = RunData::new(self, runname.to_string(), last_run.runopts.clone())
-                .with_preempts_path_in(last_run.preempts_path_out().to_path_buf())
+            let newrun = RunData::new(self, runname.to_string(), last_run.runopts.clone());
+            let mut newrun = self
+                .replaying_the_target_record(newrun, last_run.preempts_path_out().to_path_buf())
                 .with_schedule_recording();
             newrun.launch()?;
             eprintln!("    {}", newrun.to_repro());
@@ -1262,6 +1276,34 @@ mod tests {
             "{warnings:?}"
         );
         assert_eq!(search_warnings(&same_thread, 3).len(), 2);
+    }
+
+    /// The target's record replays as edited only when `--minimize` edited
+    /// it: otherwise it is the target run's recording, whose replay stops
+    /// where it diverges.
+    #[test]
+    fn the_target_record_replays_as_edited_only_after_minimization() {
+        let workspace = tempfile::tempdir().unwrap();
+        for (minimize, edited) in [(false, false), (true, true)] {
+            let mut argv = vec!["analyze", "--", "/bin/true"];
+            if minimize {
+                argv.insert(1, "--minimize");
+            }
+            let mut options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            let run =
+                RunData::new_baseline(&options, "verify_target_endpoint".to_string()).unwrap();
+            let run =
+                options.replaying_the_target_record(run, workspace.path().join("target.preempts"));
+            assert_eq!(
+                run.into_runopts()
+                    .det_opts
+                    .det_config
+                    .replay_edited_preemptions,
+                edited,
+                "--minimize: {minimize}"
+            );
+        }
     }
 
     /// A search round whose trial `--max-log-bytes` ended stops the `--search`
