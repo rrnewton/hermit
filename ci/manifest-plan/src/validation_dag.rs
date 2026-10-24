@@ -560,6 +560,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.cli",
     "test.liteinst_allocator",
     "test.liteinst_stacks",
+    "test.in_guest_trap_no_liteinst",
     "test.isolated_dbt_workdir",
     "test.inherited_terminal_read",
     "test.isolation_matrix_ptrace_runtime",
@@ -713,13 +714,13 @@ const PROFILES: [Profile; 11] = [
         // the ordinary in-guest Detcore runtime's prebuild, which carries the
         // same two labels: 101/102 and 80/81 before.
         label: "full",
-        direct_steps: 102,
-        selected_steps: 103,
+        direct_steps: 103,
+        selected_steps: 104,
     },
     Profile {
         label: "portable",
-        direct_steps: 81,
-        selected_steps: 82,
+        direct_steps: 82,
+        selected_steps: 83,
     },
     Profile {
         label: "quick",
@@ -1304,6 +1305,7 @@ fn needs_proc_locks_runtime(tag: &str) -> bool {
             | "test.hermit_integration_3"
             | "e2e.manifest_c_programs"
             | "quick.e2e_verify"
+            | "test.in_guest_trap_no_liteinst"
     )
 }
 
@@ -3032,9 +3034,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // test.pmu_integration_cases_2, the second PMU integration shard, adds one.
     // 145 since the isolation matrix's three nodes joined as Conformance
     // producers (2026-10-17).
-    if expected.len() != 145 {
+    // The additive trap-only cohort merges three typed populations through the
+    // existing envelope writer; none of the enabled producers is removed.
+    if expected.len() != 146 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 145",
+            "structured result producer registry has {} entries, expected 146",
             expected.len()
         ));
     }
@@ -3210,7 +3214,7 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // (https://github.com/rrnewton/hermit/issues/4243).
     // The second PMU integration shard adds the 77th Nextest writer.
     // Conformance 3: the three isolation-matrix nodes (2026-10-17).
-    if actual_group_counts != [77, 56, 7, 2, 3] {
+    if actual_group_counts != [77, 56, 8, 2, 3] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -4418,9 +4422,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // Detcore runtime's prebuild ahead of its packaging finalizer; its host
     // original has no hosted label and no local consumer, so it is retired
     // (441 + 1).
-    if cfg.steps.len() != 442 {
+    // One isolated OFF test node is added beside the unchanged enabled cohort.
+    if cfg.steps.len() != 443 {
         return Err(format!(
-            "superset has {} steps, expected 442",
+            "superset has {} steps, expected 443",
             cfg.steps.len()
         ));
     }
@@ -7002,7 +7007,8 @@ sys.exit(37)
         // 99 again since that check runs in Reverie's own validate and CI
         // (102 full nodes), and 100 with build.liteinst_runtime_in_pinned_root
         // (103 full nodes).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 100);
+        // The independent OFF cohort remains required in a Buck E2E run too.
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 101);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps

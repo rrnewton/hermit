@@ -86,10 +86,20 @@ const COMPAT_FIXTURE_BLAKE2: &str = "d69629a852f326482ab1e50881d63a17028e3205b66
 const SEMANTIC_FIXTURE_CONTENT: &[u8] = b"gamma:3\nalpha:1\nalpha:1\nbeta:2\n";
 const SEMANTIC_FIXTURE_MD5: &str = "c61c6cb65c4b5e1a6f3eb32b601db629";
 
-/// The line Hermit prints when it runs the guest under in-guest LiteInst
-/// (`RunOpts::main` in `hermit-cli/src/bin/hermit/run.rs`).
+// Shared program tests exercise LiteInst in the enabled configuration and the
+// trap runtime in the base configuration. Explicit backend matrices below keep
+// every trap row in both builds and every patching row in the enabled build.
+#[cfg(feature = "liteinst")]
+const TEST_BACKEND: &str = "liteinst";
+#[cfg(not(feature = "liteinst"))]
+const TEST_BACKEND: &str = "in-guest-trap";
+
+/// The selection line for the shared program tests.
+#[cfg(feature = "liteinst")]
 const IN_GUEST_SELECTED: &str =
     "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool";
+#[cfg(not(feature = "liteinst"))]
+const IN_GUEST_SELECTED: &str = IN_GUEST_TRAP_SELECTED;
 
 fn hermit_binary() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_hermit"))
@@ -255,7 +265,7 @@ fn liteinst_command_at_epoch(log_level: &str, epoch: Option<&str>) -> Command {
     let mut command = Command::new(hermit_binary());
     command
         .arg(format!("--log={log_level}"))
-        .args(["--backend", "liteinst", "run"]);
+        .args(["--backend", TEST_BACKEND, "run"]);
     match epoch {
         Some(epoch) => {
             command.arg(format!("--epoch={epoch}"));
@@ -289,7 +299,7 @@ fn liteinst_in_guest_commands_use_minimal_environment_and_private_workdir() {
         [
             "--log=off",
             "--backend",
-            "liteinst",
+            TEST_BACKEND,
             "run",
             "--max-timeslice=disabled",
             "--strict",
@@ -307,7 +317,7 @@ fn liteinst_in_guest_commands_use_minimal_environment_and_private_workdir() {
         [
             "--log=off",
             "--backend",
-            "liteinst",
+            TEST_BACKEND,
             "run",
             "--epoch=2026-01-01T00:00:00Z",
             "--max-timeslice=disabled",
@@ -736,7 +746,11 @@ fn in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name() {
                    socket=ok errno=0\nfork=ok errno=0\nto_default=0 errno=0\n\
                    ignore=0\nsocket_after=ok errno=0\n";
     for relaxation in ["--no-sequentialize-threads", "--strace-only"] {
-        for backend in ["in-guest-trap", "liteinst"] {
+        for backend in [
+            "in-guest-trap",
+            #[cfg(feature = "liteinst")]
+            "liteinst",
+        ] {
             let output = run(backend, relaxation, &handler);
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(
@@ -915,9 +929,11 @@ fn liteinst_sigalrm_scalar_identity_keeps_handler_admission_controls() {
             expected.push_str(&format!("{stage} {query} value=0 errno=0\n"));
         }
     }
-    for (backend, admission, patching) in
-        [("in-guest-trap", None, "0"), ("liteinst", Some("1"), "1")]
-    {
+    for (backend, admission, patching) in [
+        ("in-guest-trap", None, "0"),
+        #[cfg(feature = "liteinst")]
+        ("liteinst", Some("1"), "1"),
+    ] {
         let stdout = strict_sigalrm_fixture_run(&guest, backend, admission, patching, "refused");
         assert_eq!(stdout, expected.as_bytes(), "{backend} admission control");
     }
@@ -937,7 +953,12 @@ fn liteinst_in_guest_default_fatal_alarms_end_emulated_sleeps_and_verify() {
         "child_signal=14 child_exit=-1 core=0\n",
         "parent_alarm=0\n",
     );
-    for (backend, patching) in [("ptrace", "0"), ("in-guest-trap", "0"), ("liteinst", "1")] {
+    for (backend, patching) in [
+        ("ptrace", "0"),
+        ("in-guest-trap", "0"),
+        #[cfg(feature = "liteinst")]
+        ("liteinst", "1"),
+    ] {
         for mode in ["default-pause", "default-nanosleep"] {
             let stdout = strict_sigalrm_fixture_run(&guest, backend, None, patching, mode);
             assert_eq!(stdout, expected.as_bytes(), "{backend}/{mode}");
@@ -967,7 +988,12 @@ fn liteinst_in_guest_noninterrupting_alarms_preserve_sleep_and_pending_state() {
              cancel_after_sleep=0\nafter_cancel action={disposition} blocked={blocked} pending={pending}\n\
              child_signal=0 child_exit=0 core=0\nparent_alarm=0\n"
         ));
-        for (backend, patching) in [("ptrace", "0"), ("in-guest-trap", "0"), ("liteinst", "1")] {
+        for (backend, patching) in [
+            ("ptrace", "0"),
+            ("in-guest-trap", "0"),
+            #[cfg(feature = "liteinst")]
+            ("liteinst", "1"),
+        ] {
             let stdout = strict_sigalrm_fixture_run(&guest, backend, None, patching, mode);
             assert_eq!(stdout, expected.as_bytes(), "{backend}/{mode}");
         }
@@ -983,7 +1009,11 @@ fn liteinst_in_guest_alarm_outside_emulated_sleep_keeps_its_loss() {
 
     let _guard = hermit_run_guard();
     let guest = sigalrm_fixture("liteinst_sigalrm_sleep");
-    for backend in ["in-guest-trap", "liteinst"] {
+    for backend in [
+        "in-guest-trap",
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+    ] {
         let directory = process_build_root(&format!("alarm-outside-sleep-{backend}"));
         fs::create_dir_all(&directory).expect("excluded alarm directory");
         let mut command = Command::new(hermit_binary());
@@ -1195,11 +1225,16 @@ fn liteinst_in_guest_sigalrm_handler_runs_at_syscall_completion() {
             Vec::new()
         };
         assert_eq!(stderr, expected_stderr, "native/{mode}");
-        for backend in ["liteinst", "ptrace", "in-guest-trap"] {
+        for backend in [
+            #[cfg(feature = "liteinst")]
+            "liteinst",
+            "ptrace",
+            "in-guest-trap",
+        ] {
             let result = std::panic::catch_unwind(|| {
                 let verified = strict_sigalrm_fixture_run(&guest, backend, Some("1"), "0", mode);
                 let retained = process_build_root(&format!("sigalrm-fixture-{backend}-{mode}"));
-                if backend == "liteinst" {
+                if backend == TEST_BACKEND {
                     let stderr = bounded_read(&retained.join("stderr"), 16 * 1024 * 1024);
                     assert_in_guest_selected(&String::from_utf8_lossy(&stderr));
                 }
@@ -1338,6 +1373,7 @@ fn liteinst_in_guest_runtime_leaves_the_guest_heap_as_the_program_made_it() {
 
     let mut first_run: Option<(String, String)> = None;
     for (backend, selected) in [
+        #[cfg(feature = "liteinst")]
         ("liteinst", IN_GUEST_SELECTED),
         ("in-guest-trap", IN_GUEST_TRAP_SELECTED),
     ] {
@@ -1517,6 +1553,7 @@ fn liteinst_in_guest_runtime_calls_none_of_the_converted_libc_wrappers() {
     assert_eq!(native_lines[2], "interposed calls before main: 0");
 
     for (backend, selected) in [
+        #[cfg(feature = "liteinst")]
         ("liteinst", IN_GUEST_SELECTED),
         ("in-guest-trap", IN_GUEST_TRAP_SELECTED),
     ] {
@@ -1629,6 +1666,7 @@ fn liteinst_in_guest_fork_child_heap_is_the_parents() {
     assert_eq!(native_child, native_parent, "{native_stdout}");
 
     for (backend, selected) in [
+        #[cfg(feature = "liteinst")]
         ("liteinst", IN_GUEST_SELECTED),
         ("in-guest-trap", IN_GUEST_TRAP_SELECTED),
     ] {
@@ -1709,7 +1747,8 @@ fn liteinst_in_guest_admitted_sigalrm_leaves_the_guest_heap_as_the_program_made_
     );
 
     for (backend, selected, site_patching) in [
-        ("in-guest-trap", IN_GUEST_TRAP_SELECTED, None),
+        ("in-guest-trap", IN_GUEST_TRAP_SELECTED, None::<&str>),
+        #[cfg(feature = "liteinst")]
         (
             "liteinst",
             IN_GUEST_SELECTED,
@@ -2377,7 +2416,7 @@ fn liteinst_in_guest_cpuid_in_a_late_loaded_library_runs() {
             .arg(library)
             .stdin(Stdio::null()),
     );
-    check(&output, "liteinst");
+    check(&output, TEST_BACKEND);
     assert_in_guest_selected(&String::from_utf8_lossy(&output.stderr));
 }
 
@@ -2561,6 +2600,7 @@ fn liteinst_in_guest_runtime_bootstrap_is_not_charged_to_host_identity_uptime() 
 /// LiteInst's dispatch record: it measures its patch candidates and finds some
 /// in the guest. `--max-timeslice=disabled` because in-guest LiteInst refuses
 /// a maximum timeslice.
+#[cfg(feature = "liteinst")]
 #[test]
 fn liteinst_in_guest_dispatch_record_reports_patched_sites() {
     let _guard = hermit_run_guard();
@@ -2615,17 +2655,20 @@ fn in_guest_trap_dispatch_record_reports_no_patched_sites() {
         "{record}"
     );
 
-    let control = dispatch_stats::dispatch_record(
-        "liteinst",
-        hermit_binary(),
-        &["--max-timeslice=disabled"],
-        &[],
-        &guest,
-    );
-    assert!(
-        control.sites.patched.is_some_and(|patched| patched > 0),
-        "liteinst patched nothing, so a zero proves nothing about in-guest-trap: {control}"
-    );
+    #[cfg(feature = "liteinst")]
+    {
+        let control = dispatch_stats::dispatch_record(
+            "liteinst",
+            hermit_binary(),
+            &["--max-timeslice=disabled"],
+            &[],
+            &guest,
+        );
+        assert!(
+            control.sites.patched.is_some_and(|patched| patched > 0),
+            "liteinst patched nothing, so a zero proves nothing about in-guest-trap: {control}"
+        );
+    }
 }
 
 /// A real program verifies deterministically under `--backend=in-guest-trap`:
@@ -2848,7 +2891,11 @@ fn liteinst_in_guest_refuses_exec_and_thread_creation_by_name() {
             "the in-guest backend cannot create a thread or a vfork child",
         ),
     ];
-    for backend in ["liteinst", "in-guest-trap"] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+        "in-guest-trap",
+    ] {
         for (program, args, refusal, reason) in cases {
             let output = super::hermit_test::hermit_output(
                 "hermit run",
@@ -2924,18 +2971,21 @@ fn in_guest_trap_keeps_site_patching_off_whatever_a_guest_library_does() {
             "{mode}"
         );
     }
-    let restored = run_constructor_mutation_guest("liteinst", "set-then-restore");
-    assert!(restored.status.success(), "{restored:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&restored.stdout),
-        "main ran; constructor set-then-restore; restored 1; REVERIE_LITEINST_SITE_PATCHING=0\n"
-    );
-    let liteinst = run_constructor_mutation_guest("liteinst", "set");
-    assert!(liteinst.status.success(), "{liteinst:?}");
-    assert_eq!(
-        String::from_utf8_lossy(&liteinst.stdout),
-        "main ran; constructor set; restored 0; REVERIE_LITEINST_SITE_PATCHING=1\n"
-    );
+    #[cfg(feature = "liteinst")]
+    {
+        let restored = run_constructor_mutation_guest("liteinst", "set-then-restore");
+        assert!(restored.status.success(), "{restored:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&restored.stdout),
+            "main ran; constructor set-then-restore; restored 1; REVERIE_LITEINST_SITE_PATCHING=0\n"
+        );
+        let liteinst = run_constructor_mutation_guest("liteinst", "set");
+        assert!(liteinst.status.success(), "{liteinst:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&liteinst.stdout),
+            "main ran; constructor set; restored 0; REVERIE_LITEINST_SITE_PATCHING=1\n"
+        );
+    }
 }
 
 fn userfaultfd_guest() -> &'static Path {
@@ -3184,7 +3234,7 @@ fn liteinst_in_guest_exit_reaping_matches_ptrace() {
         ("rawexit", "1", "1", "child", 7),
     ] {
         let mut outputs = Vec::new();
-        for backend in ["ptrace", "liteinst"] {
+        for backend in ["ptrace", TEST_BACKEND] {
             let pending = if backend == "ptrace" {
                 ptrace_pending
             } else {
@@ -3192,7 +3242,7 @@ fn liteinst_in_guest_exit_reaping_matches_ptrace() {
             };
             let mut command = Command::new(hermit_binary());
             command.args(["--log=info", "--backend", backend, "run"]);
-            if backend == "liteinst" {
+            if backend == TEST_BACKEND {
                 command.arg("--max-timeslice=disabled");
             }
             let output = super::hermit_test::hermit_output(
@@ -3301,6 +3351,7 @@ fn run_self_signal_death_probe(backend: &str, extra: &[&str], mode: &str) -> Out
 fn liteinst_in_guest_self_signal_deaths_are_scheduled_and_verify() {
     let _guard = hermit_run_guard();
     for (backend, selected) in [
+        #[cfg(feature = "liteinst")]
         ("liteinst", IN_GUEST_SELECTED),
         ("in-guest-trap", IN_GUEST_TRAP_SELECTED),
     ] {
@@ -3339,7 +3390,11 @@ fn liteinst_in_guest_self_signal_deaths_are_scheduled_and_verify() {
 #[test]
 fn liteinst_in_guest_a_root_that_aborts_ends_with_its_own_status() {
     let _guard = hermit_run_guard();
-    for backend in ["liteinst", "in-guest-trap"] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+        "in-guest-trap",
+    ] {
         let output = run_self_signal_death_probe(backend, &[], "root-abort");
         let stderr = String::from_utf8_lossy(&output.stderr);
         // Hermit ends itself with the signal that ended its guest.
@@ -3378,7 +3433,11 @@ fn liteinst_in_guest_a_root_that_aborts_ends_with_its_own_status() {
 #[test]
 fn liteinst_in_guest_runtime_owned_self_signals_refuse_verification() {
     let _guard = hermit_run_guard();
-    for backend in ["liteinst", "in-guest-trap"] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+        "in-guest-trap",
+    ] {
         for mode in ["excluded-sigsegv", "excluded-sigsys"] {
             let output =
                 run_self_signal_death_probe(backend, &["--verify", "--verify-strict"], mode);
@@ -3825,7 +3884,12 @@ fn liteinst_in_guest_reserved_signal_sends_and_armings_are_refused() {
         "sigtrap caught: no\n",
         "native"
     );
-    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+        "in-guest-trap",
+        "ptrace",
+    ] {
         // The runtime's real router state, read from inside the image: the
         // kernel's SigCgt has SIGTRAP only where LiteInst installed its guard
         // router (site patching on). A Reverie that installed it with
@@ -3946,6 +4010,7 @@ fn liteinst_in_guest_reserved_signal_sends_and_armings_are_refused() {
 /// over-refusal, never a missed reservation. Following each image's router
 /// state needs target-image-scoped reservation, deferred to 3c.1's
 /// published per-process state. Both runs verify bitwise.
+#[cfg(feature = "liteinst")]
 #[test]
 fn liteinst_in_guest_patching_off_by_environment_still_reserves_sigtrap() {
     let _guard = hermit_run_guard();
@@ -3992,7 +4057,12 @@ fn liteinst_in_guest_reserved_sends_to_exited_targets_keep_linuxs_answers() {
         .expect("failed to run the guest natively");
     assert!(native.status.success(), "{native:?}");
     assert_eq!(String::from_utf8_lossy(&native.stdout), expected, "native");
-    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+        "in-guest-trap",
+        "ptrace",
+    ] {
         let stderr = assert_reserved_probe_runs(backend, "exited", &expected);
         assert!(
             !stderr.contains("HERMIT_RESERVED_SIGNAL"),
@@ -4032,7 +4102,12 @@ fn liteinst_in_guest_reserved_sends_keep_linuxs_siginfo_answers() {
         .expect("failed to run the guest natively");
     assert!(native.status.success(), "{native:?}");
     assert_eq!(String::from_utf8_lossy(&native.stdout), expected, "native");
-    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+        "in-guest-trap",
+        "ptrace",
+    ] {
         let stderr = assert_reserved_probe_runs(backend, "siginfo", &expected);
         assert!(
             !stderr.contains("HERMIT_RESERVED_SIGNAL"),
@@ -4052,7 +4127,11 @@ fn liteinst_in_guest_reserved_sends_keep_linuxs_siginfo_answers() {
         native_tail,
         "native"
     );
-    for backend in ["liteinst", "in-guest-trap"] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+        "in-guest-trap",
+    ] {
         let reserved = reserved_under(backend);
         let unscheduled = unscheduled_deaths_under(backend);
         let verifiable = signals_where(|number| !unscheduled.contains(&number));
@@ -4129,7 +4208,12 @@ fn liteinst_in_guest_reserved_sends_keep_linuxs_siginfo_answers() {
 #[test]
 fn liteinst_in_guest_reserved_group_sends_stay_refused_by_name() {
     let _guard = hermit_run_guard();
-    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+        "in-guest-trap",
+        "ptrace",
+    ] {
         for (mode, refusal) in [
             (
                 "group-kill0",
@@ -4375,7 +4459,12 @@ fn liteinst_in_guest_host_timed_producer_completions_are_refused() {
             ("F_SETLEASE(F_UNLCK) after it", "rc=-1 errno=EAGAIN"),
         ],
     );
-    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+        "in-guest-trap",
+        "ptrace",
+    ] {
         if backend == "ptrace" {
             let stderr = assert_producer_probe_runs(backend, "fcntl", &native);
             assert!(
@@ -4446,7 +4535,12 @@ fn liteinst_in_guest_parent_death_signals_are_held_or_refused_at_arming() {
         refused_before = refused;
     }
     assert_ne!(in_guest, native);
-    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+        "in-guest-trap",
+        "ptrace",
+    ] {
         if backend == "ptrace" {
             let stderr = assert_producer_probe_runs(backend, "pdeathsig-arm", &native);
             assert!(
@@ -4489,7 +4583,12 @@ fn liteinst_in_guest_a_held_parent_death_signal_that_would_fire_ends_the_run_by_
     let _guard = hermit_run_guard();
     let native = native_producer_probe("pdeathsig-fire");
     assert_eq!(native, "child armed; parent exits\n");
-    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+        "in-guest-trap",
+        "ptrace",
+    ] {
         let output = run_producer_probe(backend, &[], "pdeathsig-fire", |_| {});
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -4546,7 +4645,12 @@ fn liteinst_in_guest_cpu_limit_changes_are_refused_with_a_warning() {
         prlimit64(0, RLIMIT_CPU, 5/10): rc=-1 errno=EPERM\n\
         getrlimit(RLIMIT_CPU): rc=0 errno=0\n\
         setrlimit(RLIMIT_CPU, unchanged): rc=0 errno=0\n";
-    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+        "in-guest-trap",
+        "ptrace",
+    ] {
         let stderr = assert_producer_probe_runs(backend, "rlimit-cpu", expected);
         let (setrlimit, prlimit) = if backend == "ptrace" { (0, 0) } else { (1, 2) };
         assert_eq!(
@@ -4612,7 +4716,12 @@ fn liteinst_in_guest_launch_raises_a_soft_cpu_limit_and_refuses_a_hard_one() {
     let unchanged = "HERMIT_IN_GUEST_RLIMIT_CPU: the guest's physical RLIMIT_CPU was soft \
                      unlimited hard unlimited, the value Detcore reports; the guest starts with \
                      it unchanged";
-    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+        "in-guest-trap",
+        "ptrace",
+    ] {
         let in_guest = backend != "ptrace";
         let output = run_producer_probe(backend, &[], "cpu-burn", |command| {
             set_cpu_limit(command, 1, libc::RLIM_INFINITY)
@@ -4783,7 +4892,12 @@ fn liteinst_in_guest_launch_refuses_an_inherited_signal_producer() {
     fs::create_dir_all(&directory).expect("failed to create the lease directory");
     let file = directory.join("leased");
     fs::write(&file, b"leased\n").expect("failed to create the leased file");
-    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+        "in-guest-trap",
+        "ptrace",
+    ] {
         for (producer, refusal) in [
             (
                 InheritedProducer::AsyncGroupOwner,
@@ -4870,7 +4984,11 @@ fn liteinst_in_guest_library_launch_refuses_a_configured_producer() {
     use std::os::fd::OwnedFd;
     let _guard = hermit_run_guard();
     let guest = c_guest(&HOST_TIMED_PRODUCER_GUEST, "host_timed_producer_probe").to_owned();
-    for backend in [hermit::Backend::Liteinst, hermit::Backend::InGuestTrap] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        hermit::Backend::Liteinst,
+        hermit::Backend::InGuestTrap,
+    ] {
         for producer in [
             LibraryProducer::Stdin,
             LibraryProducer::ClearedCloseOnExec,
@@ -5002,7 +5120,11 @@ impl std::io::Write for CapturedLog {
 fn liteinst_in_guest_library_launch_checks_what_a_caller_callback_leaves() {
     let _guard = hermit_run_guard();
     let guest = c_guest(&HOST_TIMED_PRODUCER_GUEST, "host_timed_producer_probe").to_owned();
-    for backend in [hermit::Backend::Liteinst, hermit::Backend::InGuestTrap] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        hermit::Backend::Liteinst,
+        hermit::Backend::InGuestTrap,
+    ] {
         for (mode, resource, soft) in [
             ("cpu-burn", libc::RLIMIT_CPU, 1),
             ("noop", libc::RLIMIT_NOFILE, 3),
@@ -5099,7 +5221,12 @@ fn liteinst_in_guest_a_held_parent_death_signal_at_an_unscheduled_death_ends_the
     let _guard = hermit_run_guard();
     let native = native_producer_probe("pdeathsig-unscheduled");
     assert_eq!(native, "parent ended by signal 9\n");
-    for backend in ["liteinst", "in-guest-trap", "ptrace"] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+        "in-guest-trap",
+        "ptrace",
+    ] {
         let output = run_producer_probe(backend, &[], "pdeathsig-unscheduled", |_| {});
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5201,7 +5328,7 @@ fn liteinst_in_guest_max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe() {
             command.args(args);
             command
         },
-        global: &["--backend", "liteinst"],
+        global: &["--backend", TEST_BACKEND],
         run_options: &[
             "--max-timeslice=disabled",
             "--strict",
@@ -5228,10 +5355,10 @@ fn liteinst_in_guest_dup_aliases_share_one_cursor_after_fork() {
     let _guard = hermit_run_guard();
     let guest = c_guest(&DUP_ALIAS_GUEST, "dup_alias_after_fork");
     let mut outputs = Vec::new();
-    for backend in ["ptrace", "liteinst"] {
+    for backend in ["ptrace", TEST_BACKEND] {
         let mut command = Command::new(hermit_binary());
         command.args(["--log=info", "--backend", backend, "run"]);
-        if backend == "liteinst" {
+        if backend == TEST_BACKEND {
             command.arg("--max-timeslice=disabled");
         }
         let output = super::hermit_test::hermit_output(
@@ -5268,10 +5395,10 @@ fn liteinst_in_guest_close_range_releases_ports_like_ptrace() {
     let _guard = hermit_run_guard();
     let guest = c_guest(&CLOSE_RANGE_PORT_GUEST, "close_range_releases_port");
     let mut outputs = Vec::new();
-    for backend in ["ptrace", "liteinst"] {
+    for backend in ["ptrace", TEST_BACKEND] {
         let mut command = Command::new(hermit_binary());
         command.args(["--log=info", "--backend", backend, "run"]);
-        if backend == "liteinst" {
+        if backend == TEST_BACKEND {
             command.arg("--max-timeslice=disabled");
         }
         let output = super::hermit_test::hermit_output(
@@ -5525,11 +5652,14 @@ fn liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno() {
     let _guard = hermit_run_guard();
     for (backend, hooks) in [
         ("ptrace", "no in-guest runtime"),
+        #[cfg(feature = "liteinst")]
         ("liteinst", "warm=1 cold=1 cached=1"),
+        #[cfg(not(feature = "liteinst"))]
+        ("in-guest-trap", "warm=0 cold=0 cached=0"),
     ] {
         let mut command = Command::new(hermit_binary());
         command.args(["--log=off", "--backend", backend, "run"]);
-        if backend == "liteinst" {
+        if backend == TEST_BACKEND {
             command.arg("--max-timeslice=disabled");
         }
         let output = super::hermit_test::hermit_output(
@@ -5546,7 +5676,7 @@ fn liteinst_in_guest_user_address_limit_queries_keep_the_guest_errno() {
             format!("{PROBES}hook entries per probe: {hooks}\n"),
             "{backend}: {output:?}"
         );
-        if backend == "liteinst" {
+        if backend == TEST_BACKEND {
             assert_in_guest_selected(&String::from_utf8_lossy(&output.stderr));
         }
     }

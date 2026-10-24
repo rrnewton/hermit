@@ -31,7 +31,7 @@ mod host_seccomp;
 mod image;
 #[cfg(any(
     feature = "native-exec",
-    all(feature = "exec-stop-launcher", feature = "liteinst")
+    all(feature = "exec-stop-launcher", feature = "in-guest-trap")
 ))]
 mod initial_image_admission;
 mod instruction_map;
@@ -39,7 +39,7 @@ mod inventory;
 mod list;
 mod logdiff;
 mod manifest;
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 mod mapped_first_admission;
 #[cfg(feature = "native-exec")]
 mod native_exec_artifacts;
@@ -53,7 +53,7 @@ mod native_exec_inputs;
 mod native_exec_maps;
 #[cfg(any(
     feature = "native-exec",
-    all(feature = "exec-stop-launcher", feature = "liteinst")
+    all(feature = "exec-stop-launcher", feature = "in-guest-trap")
 ))]
 mod native_exec_observer;
 #[cfg(feature = "native-exec")]

@@ -77,6 +77,7 @@ pub(crate) fn liteinst_cdylib_from_cargo_messages(
     package_id: &str,
     manifest: &Path,
     allocator_fixture: bool,
+    liteinst: bool,
 ) -> Result<PathBuf, String> {
     let mut artifacts = Vec::new();
     for (index, line) in messages.lines().filter(|line| !line.is_empty()).enumerate() {
@@ -98,12 +99,14 @@ pub(crate) fn liteinst_cdylib_from_cargo_messages(
                 index + 1
             ));
         }
-        let expected_features = if allocator_fixture {
-            serde_json::json!(["allocator-fixture"])
-        } else {
-            serde_json::json!([])
-        };
-        if message["features"] != expected_features {
+        let mut expected_features = Vec::new();
+        if allocator_fixture {
+            expected_features.push("allocator-fixture");
+        }
+        if liteinst {
+            expected_features.push("liteinst");
+        }
+        if message["features"] != serde_json::json!(expected_features) {
             return Err(format!(
                 "LiteInst preload artifact on line {} has unexpected features",
                 index + 1
@@ -268,7 +271,7 @@ mod tests {
     }
 
     fn select(messages: &str) -> Result<PathBuf, String> {
-        liteinst_cdylib_from_cargo_messages(messages, PACKAGE, Path::new(MANIFEST), false)
+        liteinst_cdylib_from_cargo_messages(messages, PACKAGE, Path::new(MANIFEST), false, false)
     }
 
     #[test]
@@ -306,12 +309,48 @@ mod tests {
                 messages,
                 "actual-local-detcore-package",
                 Path::new("/isolated/hermit/detcore-liteinst/Cargo.toml"),
+                false,
             )
         };
         assert_eq!(
             select_native(&format!("{native}\n{finished}\n")).unwrap(),
             PathBuf::from("/isolated/native-target/libdetcore_liteinst.so")
         );
+        let mut native_on = native.clone();
+        native_on["features"] =
+            serde_json::json!(["exec-native-injection", "exec-private-init", "liteinst"]);
+        let select_native_on = |messages: &str| {
+            native_cdylib_from_cargo_messages(
+                messages,
+                "actual-local-detcore-package",
+                Path::new("/isolated/hermit/detcore-liteinst/Cargo.toml"),
+                true,
+            )
+        };
+        assert_eq!(
+            select_native_on(&format!("{native_on}\n{finished}\n")).unwrap(),
+            PathBuf::from("/isolated/native-target/libdetcore_liteinst.so")
+        );
+        assert!(select_native(&format!("{native_on}\n{finished}\n")).is_err());
+        assert!(select_native_on(&format!("{native}\n{finished}\n")).is_err());
+        for features in [
+            serde_json::json!([
+                "default",
+                "exec-native-injection",
+                "exec-private-init",
+                "liteinst"
+            ]),
+            serde_json::json!([
+                "allocator-fixture",
+                "exec-native-injection",
+                "exec-private-init",
+                "liteinst"
+            ]),
+        ] {
+            let mut wrong = native_on.clone();
+            wrong["features"] = features;
+            assert!(select_native_on(&format!("{wrong}\n{finished}\n")).is_err());
+        }
         // This is the canonical Detcore validate tuple, independently spelled
         // in the artifact fixture. Outer dev/release cannot select another ELF.
         for (field, wrong, wrong_type) in [
@@ -478,9 +517,55 @@ mod tests {
     }
 
     #[test]
+    fn patching_feature_identity_is_exact_in_both_runtime_modes() {
+        for allocator_fixture in [false, true] {
+            for liteinst in [false, true] {
+                let mut features = Vec::new();
+                if allocator_fixture {
+                    features.push("allocator-fixture");
+                }
+                if liteinst {
+                    features.push("liteinst");
+                }
+                let mut message = artifact();
+                message["features"] = serde_json::json!(features);
+                let select_mode = |message: &Value| {
+                    liteinst_cdylib_from_cargo_messages(
+                        &message.to_string(),
+                        PACKAGE,
+                        Path::new(MANIFEST),
+                        allocator_fixture,
+                        liteinst,
+                    )
+                };
+                assert_eq!(
+                    select_mode(&message).unwrap(),
+                    PathBuf::from("/isolated/libreverie_liteinst_preload.so")
+                );
+                let mut other_mode = message.clone();
+                other_mode["features"] = serde_json::json!(if liteinst {
+                    features
+                        .into_iter()
+                        .filter(|feature| *feature != "liteinst")
+                        .collect::<Vec<_>>()
+                } else {
+                    features.into_iter().chain(["liteinst"]).collect::<Vec<_>>()
+                });
+                assert!(select_mode(&other_mode).is_err());
+                let mut default_mode = message;
+                default_mode["features"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(serde_json::json!("default"));
+                assert!(select_mode(&default_mode).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn selects_only_the_explicit_allocator_fixture_feature_mode() {
         let select_fixture = |message: &str| {
-            liteinst_cdylib_from_cargo_messages(message, PACKAGE, Path::new(MANIFEST), true)
+            liteinst_cdylib_from_cargo_messages(message, PACKAGE, Path::new(MANIFEST), true, false)
         };
         assert!(select_fixture(&artifact().to_string()).is_err());
         let mut message = artifact();
@@ -545,7 +630,12 @@ pub(crate) fn native_cdylib_from_cargo_messages(
     messages: &str,
     package_id: &str,
     manifest: &Path,
+    liteinst: bool,
 ) -> Result<PathBuf, String> {
+    let mut features = vec!["exec-native-injection", "exec-private-init"];
+    if liteinst {
+        features.push("liteinst");
+    }
     let mut selected = None;
     let mut finished = false;
     for line in messages.lines().filter(|line| !line.is_empty()) {
@@ -567,8 +657,7 @@ pub(crate) fn native_cdylib_from_cargo_messages(
                 || value["manifest_path"].as_str().map(Path::new) != Some(manifest)
                 || value["target"]["kind"] != serde_json::json!(["cdylib"])
                 || value["target"]["crate_types"] != serde_json::json!(["cdylib"])
-                || value["features"]
-                    != serde_json::json!(["exec-native-injection", "exec-private-init"])
+                || value["features"] != serde_json::json!(features)
             {
                 return Err("native Detcore artifact has ambiguous package/target/features".into());
             }
@@ -703,7 +792,9 @@ pub(crate) mod native {
     pub(crate) fn build() {
         println!("cargo:rerun-if-env-changed=HERMIT_NATIVE_EXEC_STAGE");
         println!("cargo:rerun-if-env-changed=HERMIT_LITEINST_REVERIE_PIN");
+        println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LITEINST");
         println!("cargo:rerun-if-env-changed=PROFILE");
+        let liteinst = env::var_os("CARGO_FEATURE_LITEINST").is_some();
         for file in ["artifact.rs", "build.rs", "Cargo.toml", "Cargo.lock"] {
             println!("cargo:rerun-if-changed={file}");
         }
@@ -855,7 +946,11 @@ pub(crate) mod native {
                 "--lib".into(),
                 "--no-default-features".into(),
                 "--features".into(),
-                "exec-native-injection".into(),
+                if liteinst {
+                    "exec-native-injection,liteinst".into()
+                } else {
+                    "exec-native-injection".into()
+                },
                 "--profile".into(),
                 "liteinst-runtime".into(),
                 "--target-dir".into(),
@@ -868,6 +963,7 @@ pub(crate) mod native {
             std::str::from_utf8(&build_stdout).unwrap(),
             package["id"].as_str().unwrap(),
             &package_manifest,
+            liteinst,
         )
         .unwrap();
         assert!(
@@ -875,6 +971,14 @@ pub(crate) mod native {
                 .unwrap()
                 .starts_with(fs::canonicalize(&nested).unwrap())
         );
+        let sources = if liteinst {
+            sources
+        } else {
+            let build_command = runner.commands.last().unwrap();
+            sources
+                .with_current_build(build_command, &runtime_path, &nested)
+                .unwrap_or_else(|error| panic!("actual native compiler evidence refused: {error}"))
+        };
         sources.verify_unchanged(&mut runner).unwrap();
         let qualification = qualifier::qualify_detcore_native_entry_with_sources(
             &runtime_path,

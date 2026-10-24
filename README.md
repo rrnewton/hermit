@@ -193,9 +193,36 @@ actually captured (site patching off, statistics collected) with Hermit's
 request, which reaches it over the coordinator connection, and refuses to run
 the program when they differ; and Hermit refuses (exit 122) any in-guest-trap
 run whose LiteInst statistics report a patched or candidate site, or that no
-guest process reported. It has the same feature, prerequisites and refusals as `liteinst`, and its
-run summary's dispatch record is named `in-guest-trap` and reports no patched
-site.
+guest process reported. Its run summary's dispatch record is named
+`in-guest-trap` and reports no patched site.
+
+The `in-guest-trap` Cargo feature builds this common runtime without
+`liteinst2`. The existing `liteinst` feature extends it with site patching.
+Build both the host and preload in the same mode:
+
+```bash
+cargo build --locked -p hermit-run --no-default-features --features in-guest-trap --bin hermit
+cargo build --locked -p detcore-liteinst --no-default-features
+./target/debug/hermit --backend=in-guest-trap run --max-timeslice=disabled -- /bin/echo hello
+```
+
+The `exec-stop-launcher` and `native-exec` features also use this base runtime;
+neither enables `liteinst`. The trap-only build retains preload, RPC, loader
+and native launch support when those launch features are selected. Requesting
+`--backend=liteinst` from it refuses with the missing build feature. The
+runtime prerequisites and supported-program restrictions above still apply.
+
+The full and portable validation profiles also run
+`test.in_guest_trap_no_liteinst`. It builds a separate trap-only installation,
+checks that its Cargo graphs contain no `liteinst2`, and runs the shared CLI,
+native launch, proc-fd alias, socket timestamp, allocator, stack and required
+in-guest-trap manifest tests,
+plus the existing isolation conformance cohort and its mismatch ledger.
+Standalone legacy `strace`/`compat` allocation and active-stack controls remain
+in the enabled cohort. OFF checks their distinct API refusals without granting
+allocation, continuation or stack-placement credit; the Detcore and inert
+preload positives still run.
+The existing LiteInst-enabled cohort remains a separate check.
 
 The `dbt`, `sabre`, and `e9patch` selections require optional CLI features as
 well as runtime resources. Build both with:

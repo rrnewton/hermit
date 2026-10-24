@@ -1102,9 +1102,9 @@ def main():
                     digests[key]=values[0];result[key.lower()]=values[0]
                 manifest = str(Path(c['H']) / 'detcore-liteinst/Cargo.toml')
                 features = 'exec-native-injection,exec-private-init,loader-private-runtime'
-                metadata_args = ['metadata','--locked','--offline','--format-version=1','--manifest-path',manifest,
+                metadata_args = ['metadata','--locked','--offline','--no-default-features','--format-version=1','--manifest-path',manifest,
                                  '--filter-platform','x86_64-unknown-linux-musl','--features',features]
-                archive_args = ['rustc','--locked','--offline','--manifest-path',manifest,'--lib','--target',
+                archive_args = ['rustc','--locked','--offline','--no-default-features','--manifest-path',manifest,'--lib','--target',
                                 'x86_64-unknown-linux-musl','--profile','liteinst-runtime','--features',features,
                                 '--crate-type','staticlib','--message-format=json-render-diagnostics','--target-dir',c['target']]
                 # Original outer and nested owner controls resolve before the link.

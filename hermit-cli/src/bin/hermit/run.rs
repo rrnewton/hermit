@@ -2392,7 +2392,7 @@ fn assert_exec_stop_not_ready(error: &Error) {
     );
 }
 
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 #[test]
 fn exec_stop_admission_reads_the_global_backend_before_launch() {
     use clap::Parser;
@@ -2425,7 +2425,7 @@ fn exec_stop_admission_reads_the_global_backend_before_launch() {
     }
 }
 
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 #[test]
 fn admitted_exec_stop_captures_one_effective_epoch() {
     let mut run = run_opts_for(&[
@@ -2462,7 +2462,7 @@ fn admitted_exec_stop_captures_one_effective_epoch() {
     assert_eq!(calls.get(), 1);
 }
 
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 #[test]
 fn pending_exec_stop_epoch_cannot_be_admitted_by_later_package_appearance() {
     let mut run = run_opts_for(&[
@@ -4656,7 +4656,7 @@ fn in_guest_refusal(backend_flag: &str, options: &[&str]) -> Result<(), anyhow::
 /// caller selected.
 #[test]
 fn in_guest_trap_refuses_the_options_liteinst_refuses() {
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     {
         let error = in_guest_refusal("--backend=in-guest-trap", &[]).unwrap_err();
         assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
@@ -4742,7 +4742,7 @@ fn liteinst_in_guest_refuses_options_it_cannot_honour() {
         .unwrap();
 }
 
-/// Without the `liteinst` feature there is no in-guest runtime to advise
+/// Without the `liteinst` extension there is no patching backend to advise
 /// about: a `--backend=liteinst` run that no other in-guest refusal stops,
 /// including one with the default maximum timeslice, is refused for the
 /// missing build feature instead.
@@ -6514,7 +6514,10 @@ impl RunOpts {
             return Ok(());
         }
         let config = &self.det_opts.det_config;
-        let reason = if cfg!(feature = "liteinst") && config.max_timeslice.is_some() {
+        let backend = self.selected_backend();
+        let included = (backend == Backend::Liteinst && cfg!(feature = "liteinst"))
+            || (backend != Backend::Liteinst && cfg!(feature = "in-guest-trap"));
+        let reason = if included && config.max_timeslice.is_some() {
             "it cannot deliver Detcore's preemption timer yet (the in-guest Tool host refuses \
              set_timer with ENOSYS), so the run would fail at its first timeslice; pass \
              --max-timeslice=disabled"
@@ -6550,7 +6553,10 @@ impl RunOpts {
     /// check whether the LiteInst runtime is installed later, with the other
     /// backends.
     fn refuse_liteinst_without_the_feature(&self) -> Result<(), Error> {
-        if cfg!(feature = "liteinst") || !self.uses_in_guest_liteinst() {
+        let backend = self.selected_backend();
+        let included = (backend != Backend::Liteinst || cfg!(feature = "liteinst"))
+            && (backend != Backend::InGuestTrap || cfg!(feature = "in-guest-trap"));
+        if included || !self.uses_in_guest_liteinst() {
             return Ok(());
         }
         self.selected_backend().ensure_available()
@@ -6797,7 +6803,7 @@ impl RunOpts {
 
     // Pure option/availability admission. The caller supplies real package
     // discovery; retained opening still authenticates actual files before spawn.
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     fn exec_stop_direct_domain(&self, package_available: bool) -> bool {
         self.selected_backend() == Backend::InGuestTrap
             && package_available
@@ -6816,12 +6822,12 @@ impl RunOpts {
     /// Admit only the opt-in packaged first-image direct-run domain. Resource
     /// availability does not replace the retained image and actual startup checks.
     pub(crate) fn refuse_unready_exec_stop(&self) -> Result<(), Error> {
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         let package_available = self.in_guest_exec_stop
             && !self.exec_stop_epoch_refused
             && self.selected_backend() == Backend::InGuestTrap
             && super::mapped_first_admission::packaged_image_declared();
-        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
         let package_available = false;
         self.refuse_unready_exec_stop_with_availability(package_available)
     }
@@ -6831,10 +6837,10 @@ impl RunOpts {
         &self,
         package_available: bool,
     ) -> Result<(), Error> {
-        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
         let _ = package_available;
         if self.in_guest_exec_stop {
-            #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+            #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
             if !self.exec_stop_epoch_refused && self.exec_stop_direct_domain(package_available) {
                 return Ok(());
             }
@@ -8834,13 +8840,13 @@ impl RunOpts {
         let mut options = self.clone();
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         let mapped_image = if self.in_guest_exec_stop {
             Some(super::mapped_first_admission::RetainedImage::open()?)
         } else {
             None
         };
-        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
         let mapped_image: Option<()> = None;
         let resources = if network_trace.is_some() {
             "network trace descriptor"
@@ -8861,7 +8867,7 @@ impl RunOpts {
                 }
                 #[cfg(not(feature = "native-exec"))]
                 let _ = native;
-                #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+                #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
                 if let Some(image) = mapped_image.as_ref() {
                     return options.run_mapped_in_container(
                         &global,
@@ -8870,16 +8876,16 @@ impl RunOpts {
                         image,
                     );
                 }
-                #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+                #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
                 let _ = mapped_image;
                 options.run_in_container(&global, capture_output, identity)
             },
         )?;
-        #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+        #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
         if let Some(image) = mapped_image.as_ref() {
             image.verify()?;
         }
-        #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
+        #[cfg(not(all(feature = "exec-stop-launcher", feature = "in-guest-trap")))]
         let _ = mapped_image;
         Ok(value)
     }
@@ -10807,7 +10813,7 @@ impl RunOpts {
         )))
     }
 
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     fn run_mapped_in_container(
         &self,
         global: &GlobalOpts,

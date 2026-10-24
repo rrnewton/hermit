@@ -2655,6 +2655,7 @@ fi
 # third-party/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so the inventory, SDK and native inputs, calibrated
 # budget, job width and limits carry unchanged from the 42ba7f0f entry.
+# Historical main carry from the shared 1b894c0c revision:
 # CARRY TO 0e2bf15a2ca0ce02beb4c15532def254a629bc2e (2026-10-24): from
 # 1b894c0cd804589bc1366338df720fef40391a0c. One commit (capflags lane, slice 1:
 # delete three backend capability fields that change nothing). It changes
@@ -2662,8 +2663,61 @@ fi
 # third-party/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so the inventory, SDK and native inputs, calibrated
 # budget, job width and limits carry unchanged from the 1b894c0c entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0e2bf15a2ca0ce02beb4c15532def254a629bc2e ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0e2bf15a2ca0ce02beb4c15532def254a629bc2e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# Historical feature-lane carries from the same shared revision:
+# CARRY TO 840aebecbdc39af90ca599e027690185f5d237fe (2026-10-24): from
+# 1b894c0cd804589bc1366338df720fef40391a0c. Split the shared in-guest trap
+# runtime from optional LiteInst patching and retain exact artifact/source
+# qualification. git diff is empty under reverie-dbt/ and third-party/ and
+# for the root Cargo.toml, Cargo.lock and rust-toolchain.toml. In particular,
+# build.rs remains blob ff1eeb32b140ae477894126af21296723c1ba582 and the
+# DynamoRIO gitlink remains 4ab89708f2e9e8d0c28cf2213fa7752cd64d4055.
+# The pin does not alter CMAKE, CMAKE_GENERATOR or normalized SOURCE_DATE_EPOCH
+# selection. Preserve the inventory, measured SDK budget, job width, limits
+# and all prior calibration history; this source carry supplies no new timing
+# calibration or runtime/package receipt.
+# CARRY TO 6b02b5ece41db1b8a20af23723288769f29625ce (2026-10-24): from
+# 840aebecbdc39af90ca599e027690185f5d237fe. Runtime, native Buck inputs and
+# strict allocator/compiler evidence changes leave reverie-dbt/ and third-party/
+# and the root Cargo.toml, Cargo.lock and rust-toolchain.toml byte-identical.
+# build.rs remains blob ff1eeb32b140ae477894126af21296723c1ba582; the
+# DynamoRIO gitlink remains 4ab89708f2e9e8d0c28cf2213fa7752cd64d4055.
+# CMAKE, CMAKE_GENERATOR and normalized SOURCE_DATE_EPOCH selection are unchanged.
+# Preserve the inventory, measured SDK budget, job width, limits and prior
+# calibration history. This source carry is not new timing or runtime evidence.
+# CARRY TO f935b39c29899b95def3157eae959fbc6a0b6b26 (2026-10-24): from
+# 6b02b5ece41db1b8a20af23723288769f29625ce. The complete in-guest runtime and
+# exact artifact-proof successor leaves reverie-dbt/, third-party/, and the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml byte-identical by Git object.
+# build.rs remains blob ff1eeb32b140ae477894126af21296723c1ba582; the
+# DynamoRIO gitlink remains 4ab89708f2e9e8d0c28cf2213fa7752cd64d4055.
+# CMAKE, CMAKE_GENERATOR and normalized SOURCE_DATE_EPOCH selection are unchanged.
+# Preserve all measured SDK budgets, job widths, limits and calibration history.
+# This source-identity carry supplies no new timing sample or runtime receipt.
+# CARRY TO cc840cdc4ff16ba5a3713f4955141daf86fa0695 (2026-10-24): from
+# f935b39c29899b95def3157eae959fbc6a0b6b26. The refusal handshake, artifact
+# representation and fixture successor leaves reverie-dbt/, third-party/, and
+# root Cargo.toml, Cargo.lock and rust-toolchain.toml byte-identical by Git object.
+# build.rs remains blob ff1eeb32b140ae477894126af21296723c1ba582; the
+# DynamoRIO gitlink remains 4ab89708f2e9e8d0c28cf2213fa7752cd64d4055.
+# CMAKE, CMAKE_GENERATOR and normalized SOURCE_DATE_EPOCH selection are unchanged.
+# Preserve all measured SDK budgets, job widths, limits and calibration history.
+# This source-identity carry supplies no new timing sample or runtime receipt.
+# CARRY TO 129caa4924adff52d93476698253906dac4717c1 (2026-10-24): paired-main feature integration.
+# All eight DBT source objects below equal both RV 0e2bf15a2ca0ce02beb4c15532def254a629bc2e
+# and the prior qualified-source binding cc840cdc4ff16ba5a3713f4955141daf86fa0695:
+#   reverie-dbt b5182e1f021f15821e729209823db3475c615149
+#   third-party fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+#   Cargo.toml 23677dde91da462e52e3b5900c864849f288aedf
+#   Cargo.lock 08db717e243f0fcca64cfeb9de7737177cca18c6
+#   rust-toolchain.toml b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+#   reverie-dbt/build.rs ff1eeb32b140ae477894126af21296723c1ba582
+#   reverie-dbt/vendor/dynamorio 4ab89708f2e9e8d0c28cf2213fa7752cd64d4055
+#   third-party/dynamorio 929840ad9190e5086775e8debc0f0b79b4208d59
+# Preserve the existing calibration, job widths, limits and all history.
+# This source-identity carry supplies no new timing or runtime/package
+# validation. Fresh exact-source producers and validation remain required.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 129caa4924adff52d93476698253906dac4717c1 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 129caa4924adff52d93476698253906dac4717c1 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

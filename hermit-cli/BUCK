@@ -15,7 +15,7 @@ hermit_build_env = {
     "CARGO_PKG_VERSION": "0.5.1",
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "0e2bf15a2ca0ce02beb4c15532def254a629bc2e",
+    "HERMIT_REVERIE_PIN": "129caa4924adff52d93476698253906dac4717c1",
 }
 
 # The shadow release entrypoint supplies these values from Git/Cargo metadata
@@ -38,12 +38,14 @@ release_unstamped = read_root_config("hermit_release", "unstamped", "false") == 
 release_features = {"features": [
     "dbt",
     "e9patch",
+    "in-guest-trap",
     "liteinst",
     "sabre",
 ]} if release_unstamped else {"features": [
     "buck-release-provenance",
     "dbt",
     "e9patch",
+    "in-guest-trap",
     "liteinst",
     "sabre",
 ]}
@@ -90,6 +92,8 @@ rust_library(
                 "dependencies": {
                     "hermit-test-workdir": {"optional": True},
                     "reverie-inguest": {"default-features": False, "optional": True},
+                    "reverie-liteinst": {"default-features": False, "optional": True},
+                    "reverie-loader": {"optional": True},
                     "sha2": {"optional": True},
                     "reverie-rpc-transport": {"optional": True},
                     "reverie-sabre-stats": {"optional": True},
@@ -99,17 +103,18 @@ rust_library(
                 },
             },
             "features": {
-                "exec-stop-launcher": ["dep:reverie-inguest", "reverie-inguest/exec-stop", "reverie-inguest/loader-private-runtime"],
+                "exec-stop-launcher": ["in-guest-trap", "dep:reverie-inguest", "reverie-inguest/exec-stop", "reverie-inguest/loader-private-runtime", "dep:reverie-loader", "dep:sha2"],
                 "default": [],
                 "loader-rcb-observation": ["exec-stop-launcher", "reverie-ptrace/rcb-observation"],
                 "dbt": ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"],
                 "sabre": ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"],
                 "e9patch": [],
-                "liteinst": ["dep:reverie-liteinst", "dep:reverie-rpc-transport"],
-                "native-exec": ["liteinst", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "dep:reverie-inguest", "dep:sha2"],
+                "in-guest-trap": ["dep:reverie-liteinst", "dep:reverie-rpc-transport"],
+                "liteinst": ["in-guest-trap", "reverie-liteinst/liteinst"],
+                "native-exec": ["in-guest-trap", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "dep:reverie-inguest", "dep:sha2"],
                 "third-party-backends": ["dbt", "sabre", "e9patch", "liteinst"],
                 "kvm-native-test-support": ["reverie-kvm/native-test-support"],
-                "mm-cancellation-test-support": ["exec-stop-launcher", "liteinst", "detcore/physical-mm-test-support"],
+                "mm-cancellation-test-support": ["exec-stop-launcher", "in-guest-trap", "detcore/physical-mm-test-support"],
                 "kvm-execution-tests": [],
             },
         },
@@ -125,9 +130,10 @@ rust_library(
     ),
     crate = "hermit",
     env = hermit_build_env,
-    # LiteInst is an optional cargo feature so the published crate leaves out
-    # reverie-liteinst; the internal build keeps the backend.
-    features = ["liteinst"],
+    # The base internal target includes the trap runtime and exec-stop loader.
+    # Native-exec also needs the qualified Cargo-produced embedded bundle; no
+    # Buck producer exists for that bundle yet, so this target does not claim it.
+    features = ["in-guest-trap", "exec-stop-launcher"],
     # iced-x86 decoder tables are process-lifetime globals.
     test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
     deps = [
@@ -160,9 +166,10 @@ rust_library(
         "//hermetic_infra/hermit/hermit-run-ptrace:hermit-run-ptrace",
         "//hermetic_infra/hermit/hermit-resources:hermit-resources",
         "//hermetic_infra/reverie:reverie",
-        "//hermetic_infra/reverie:reverie-inguest",
+        "//hermetic_infra/reverie:reverie-inguest-native",
+        "//hermetic_infra/reverie:reverie-loader",
         "//hermetic_infra/reverie:reverie-kvm",
-        "//hermetic_infra/reverie:reverie-liteinst",
+        "//hermetic_infra/reverie:reverie-liteinst-native",
         "//hermetic_infra/reverie:reverie-ptrace",
         "//hermetic_infra/reverie:reverie-rpc-transport",
         "//hermetic_infra/reverie:reverie-sabre-stats",
@@ -196,6 +203,8 @@ rust_binary(
                 "dependencies": {
                     "hermit-test-workdir": {"optional": True},
                     "reverie-inguest": {"default-features": False, "optional": True},
+                    "reverie-liteinst": {"default-features": False, "optional": True},
+                    "reverie-loader": {"optional": True},
                     "sha2": {"optional": True},
                     "reverie-rpc-transport": {"optional": True},
                     "reverie-sabre-stats": {"optional": True},
@@ -205,23 +214,25 @@ rust_binary(
                 },
             },
             "features": {
-                "exec-stop-launcher": ["dep:reverie-inguest", "reverie-inguest/exec-stop", "reverie-inguest/loader-private-runtime"],
+                "exec-stop-launcher": ["in-guest-trap", "dep:reverie-inguest", "reverie-inguest/exec-stop", "reverie-inguest/loader-private-runtime", "dep:reverie-loader", "dep:sha2"],
                 "default": [],
                 "loader-rcb-observation": ["exec-stop-launcher", "reverie-ptrace/rcb-observation"],
                 "dbt": ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"],
                 "sabre": ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"],
                 "e9patch": [],
-                "liteinst": ["dep:reverie-liteinst", "dep:reverie-rpc-transport"],
-                "native-exec": ["liteinst", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "dep:reverie-inguest", "dep:sha2"],
+                "in-guest-trap": ["dep:reverie-liteinst", "dep:reverie-rpc-transport"],
+                "liteinst": ["in-guest-trap", "reverie-liteinst/liteinst"],
+                "native-exec": ["in-guest-trap", "detcore-model/native-exec", "reverie-liteinst/exec-native-injection", "dep:reverie-inguest", "dep:sha2"],
                 "third-party-backends": ["dbt", "sabre", "e9patch", "liteinst"],
                 "kvm-native-test-support": ["reverie-kvm/native-test-support"],
-                "mm-cancellation-test-support": ["exec-stop-launcher", "liteinst", "detcore/physical-mm-test-support"],
+                "mm-cancellation-test-support": ["exec-stop-launcher", "in-guest-trap", "detcore/physical-mm-test-support"],
                 "kvm-execution-tests": [],
             },
         },
     },
     srcs = glob(["src/bin/**/*.rs"]),
     env = hermit_build_env,
+    features = ["in-guest-trap", "exec-stop-launcher"],
     # Signal-handler messages intentionally live for the process lifetime.
     test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
     test_srcs = glob([
@@ -261,9 +272,13 @@ rust_binary(
         "//hermetic_infra/hermit/common/test-workdir:hermit-test-workdir",
         "//hermetic_infra/hermit/detcore:detcore",
         "//hermetic_infra/hermit/detcore-model:detcore-model",
+        "//hermetic_infra/hermit/hermit-resources:hermit-resources",
         "//hermetic_infra/reverie:reverie",
-        "//hermetic_infra/reverie:reverie-inguest",
+        "//hermetic_infra/reverie:reverie-inguest-native",
+        "//hermetic_infra/reverie:reverie-loader",
+        "//hermetic_infra/reverie:reverie-liteinst-native",
         "//hermetic_infra/reverie:reverie-ptrace",
+        "//hermetic_infra/reverie:reverie-rpc-transport",
     ],
 )
 
@@ -313,7 +328,7 @@ rust_library(
         "//hermetic_infra/hermit/hermit-resources:hermit-resources",
         "//hermetic_infra/reverie:reverie",
         "//hermetic_infra/reverie:reverie-kvm",
-        "//hermetic_infra/reverie:reverie-liteinst",
+        "//hermetic_infra/reverie:reverie-liteinst-with-patching",
         "//hermetic_infra/reverie:reverie-ptrace",
         "//hermetic_infra/reverie:reverie-rpc-transport",
         "//hermetic_infra/reverie:reverie-sabre-stats",

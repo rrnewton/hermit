@@ -7,3 +7,7 @@
 # above-listed licenses.
 
 buildscript.run = false
+
+# generic-array 0.14.7/build.rs enables this cfg for rustc >= 1.41.0.
+# The pinned OSS toolchain is rustc 1.99.0-nightly (rust-toolchain.toml).
+cfgs = ["relaxed_coherence"]
