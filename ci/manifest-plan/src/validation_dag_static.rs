@@ -3649,7 +3649,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_replay_posix_timer_rows_replay_but_diverge_from_linux: 220.
     // And record_chaos_schedule_replays_under_its_seed: 221.
     // And record_replay_gives_the_guest_a_private_dev_shm: 227.
-    ("test.record_replay", 227),
+    // And record_replay_gives_the_guest_a_private_ipc_namespace: 228.
+    ("test.record_replay", 228),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -4390,7 +4391,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_run_gets_a_private_empty_dev_shm,
     // concurrent_runs_do_not_share_dev_shm and
     // host_dev_shm_sources_stay_the_hosts: 706.
-    ("test.cli", 706),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
+    // And a_run_gets_a_private_ipc_namespace and
+    // concurrent_runs_do_not_share_ipc: 708.
+    ("test.cli", 708),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
     // sabre_reports_a_replaced_host_file_without_naming_it_the_cause,
@@ -4941,7 +4944,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two TracerPid cli tests: 619 + 2 = 621.
     // And the same two 11c35a504a6 tests: 621 + 2 = 623.
     // And the three private /dev/shm tests: 625.
-    ("test.cli_on_host", 625),
+    // And the two private IPC namespace tests: 627.
+    ("test.cli_on_host", 627),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
