@@ -1863,7 +1863,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_target_replay_with_another_failure_than_the_target_run_is_named,
     // a_report_without_a_deciding_event_reads,
     // a_timing_decision_names_the_thread_that_runs_next_in_each_continuation}: 1214.
-    ("test.hermit_unit", 1214),
+    // And phases::tests::slice_ends_are_reported_only_when_the_next_stacks_tell_nothing_apart: 1215.
+    ("test.hermit_unit", 1215),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5767,7 +5768,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same seven analyze per-trial bound tests: 1199.
     // And the same three continuation-timeslice tests: 1202.
     // And the same six report-stack tests: 1208.
-    ("test.hermit_unit_on_host", 1208),
+    // And the same slice-end test: 1209.
+    ("test.hermit_unit_on_host", 1209),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
