@@ -12322,12 +12322,27 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// shutdown never blocks and returns no data; its effect is deterministic
     /// given the container's socket state, so it forwards via record_or_replay
     /// exactly like the rest of the socket family (KVM ratchet round 12).
+    ///
+    /// Shutting the read side marks the socket when Linux shuts it: on success,
+    /// and on an unconnected socket, whose read side Linux shuts even as it
+    /// reports `ENOTCONN` (`inet_shutdown`). A polled receive asks the kernel
+    /// before it relies on the mark (`finish_after_read_shutdown`), since a TCP
+    /// disconnect opens the read side again (`tcp_disconnect`).
     pub async fn handle_shutdown<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Shutdown,
     ) -> Result<i64, Error> {
-        Ok(self.record_or_replay(guest, call).await?)
+        let result = self.record_or_replay(guest, call).await;
+        if matches!(call.how(), libc::SHUT_RD | libc::SHUT_RDWR)
+            && matches!(result, Ok(_) | Err(Errno::ENOTCONN))
+        {
+            // An untracked descriptor has no model to mark.
+            let _ = guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.set_read_shutdown_requested());
+        }
+        Ok(result?)
     }
 
     /// bind system call.

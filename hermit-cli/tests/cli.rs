@@ -228,6 +228,7 @@ static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DATAGRAM_READ_SHUTDOWN_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SELECT_TIMEOUT_NORMALIZATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TOOL_OUTPUT_PROTECTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "dbt")]
@@ -30310,6 +30311,54 @@ fn select_timeout_folds_microseconds_into_seconds_as_linux() {
     let guest = guest.to_str().unwrap();
     for strict in [true, false] {
         let mut args = vec!["run"];
+        if strict {
+            args.push("--strict");
+        }
+        args.extend(["--base-env=minimal", "--", guest]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+    }
+}
+
+/// A blocking receive on a datagram socket whose read side is shut down
+/// returns at once on Linux, 0 with nothing queued
+/// (`__skb_wait_for_more_packets`, `net/core/datagram.c`), where the
+/// nonblocking attempt Detcore polls with fails with EAGAIN. Detcore kept
+/// polling, so a thread that shut its reader's socket down and then joined the
+/// reader waited forever. The guest (`tests/c/datagram_read_shutdown.c`)
+/// covers recvfrom, recv, recvmsg, recvmmsg and read on UDP and AF_UNIX
+/// datagram sockets; a blocking send on the shut-down socket that must wait
+/// for its peer to drain, as it does once Detcore makes the socket
+/// nonblocking again; and a TCP listener whose read shutdown disconnected it,
+/// leaving its read side open, so that once it connects elsewhere its blocked
+/// receive must wait for data. Its native output is the oracle, and
+/// `--timeout` turns a hang into a failure.
+#[test]
+fn a_datagram_receive_ends_when_its_read_side_is_shut_down() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&DATAGRAM_READ_SHUTDOWN_GUEST, "datagram_read_shutdown");
+    let expected = "udp open: blocked receive got \"hello\": 5\n\
+         udp shutdown(SHUT_RD): -1 (Transport endpoint is not connected)\n\
+         udp blocked receive after the shutdown: 0\n\
+         udp address length written: 0\n\
+         udp queued datagram after the shutdown: 4\n\
+         udp then end of file: 0\n\
+         udp MSG_DONTWAIT after the shutdown: -1 (Resource temporarily unavailable)\n\
+         udp recvmsg after the shutdown: 0\n\
+         udp recvmsg msg_namelen 0 msg_flags 0\n\
+         udp recvmmsg after the shutdown: 2\n\
+         udp recvmmsg msg_len 0 0\n\
+         unix datagram shutdown(SHUT_RD): 0\n\
+         unix datagram blocked receive after the shutdown: 0\n\
+         unix datagram sent 64, peer drained 64\n\
+         tcp listener shutdown(SHUT_RD): 0\n\
+         tcp former listener connect: 0\n\
+         tcp blocked receive after the reconnect: 3\n";
+    assert_eq!(native_stdout(guest), expected);
+    let guest = guest.to_str().unwrap();
+    for strict in [true, false] {
+        let mut args = vec!["run", "--timeout", "120"];
         if strict {
             args.push("--strict");
         }

@@ -542,7 +542,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub(crate) fn receipt_is_observable<G, C>(&self, guest: &mut G, call: C) -> bool
     where
         G: Guest<Self>,
-        C: reverie::syscalls::SyscallInfo + Into<Syscall>,
+        C: crate::syscalls::helpers::NonblockableSyscall + Into<Syscall>,
     {
         matches!(
             crate::syscalls::helpers::ioaction_based_on_fd_status(guest, call),
