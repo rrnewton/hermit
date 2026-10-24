@@ -2936,6 +2936,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/timed_wait_pollers.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/timed_wait_pollers.c is owned by hermit-cli/tests/cli.rs: The integration test short_timed_wait_pollers_do_not_inflate_a_cpu_bound_threads_time runs this guest under run --strict with one or six 100 us pollers (pthread_cond_timedwait or clock_nanosleep) beside a CPU-bound main thread, without chaos and at two chaos seeds, and requires the run's virtual time to stay under twice that of the same work with no poller (five times when main's loop makes system calls), plus chaos runs at bitwise parity; a generic manifest cannot compare two runs' guest-reported virtual times."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/timer_coalesce.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/timer_coalesce.c is owned by hermit-cli/tests/cli.rs: posix_timer_entries_are_delivered_as_on_linux_at_bitwise_parity runs each mode (a POSIX timer's entry beside an ordinary copy of its signal, overruns, stale entries, parked and unignored expiries, the order of a signalfd read, the forged SI_TIMER rows) and requires Linux's output at bitwise parity, and posix_timer_entries_hermit_refuses_or_diverges_on_are_named requires the named refusal and the known divergence (https://github.com/rrnewton/hermit/issues/4262). It stays a fixture because a generic manifest cannot assert these per-mode outputs."
