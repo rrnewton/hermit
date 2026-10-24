@@ -51,9 +51,19 @@ pub enum TrialEnd {
     Met,
     /// It finished and did not meet them.
     Missed,
-    /// A wall-clock bound ended it before it finished, so it did not reach
-    /// the target.
-    Unfinished,
+    /// It stopped before it finished, so it did not reach the target.
+    Unfinished(Stop),
+}
+
+/// What stopped an unfinished trial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// A wall-clock bound: `--trial-timeout`, or a `--timeout` in the run
+    /// arguments.
+    Bound,
+    /// Hermit refused it (exit 122) when the guest reached an operation it
+    /// does not support.
+    Refusal,
 }
 
 impl TrialEnd {
@@ -62,25 +72,61 @@ impl TrialEnd {
         self == TrialEnd::Met
     }
 
-    /// How a trial that `launched` with this result ended: a trial that a
-    /// wall-clock bound (`--trial-timeout`, or a `--timeout` in the run
-    /// arguments) stopped is [`TrialEnd::Unfinished`]; any other error is
-    /// returned unchanged. `matched` says whether a finished trial met the
-    /// criteria.
+    /// Whether the trial finished.
+    pub fn finished(self) -> bool {
+        !matches!(self, TrialEnd::Unfinished(_))
+    }
+
+    /// How a trial that `launched` with this result ended; any error but a
+    /// wall-clock bound's and a run-time refusal ([`guest_reached_a_refusal`])
+    /// is returned unchanged. `matched` says whether a finished trial met the
+    /// criteria; `log` is the trial's own log file, if it has one, where a
+    /// refusal's reason is.
+    ///
+    /// A trial replays a schedule no endpoint run took, and that can lead
+    /// the guest to an operation Hermit refuses
+    /// (https://github.com/rrnewton/hermit/issues/4034, for example), which
+    /// stops it before it can show either outcome.
     fn classify(
         launched: anyhow::Result<()>,
         matched: impl FnOnce() -> bool,
+        log: Option<&Path>,
     ) -> anyhow::Result<Self> {
         match launched {
             Ok(()) if matched() => Ok(TrialEnd::Met),
             Ok(()) => Ok(TrialEnd::Missed),
             Err(error) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
                 eprintln!(" => Timed out ({error}); counted as the baseline condition");
-                Ok(TrialEnd::Unfinished)
+                Ok(TrialEnd::Unfinished(Stop::Bound))
+            }
+            Err(error) if guest_reached_a_refusal(&error) => {
+                eprintln!(
+                    " => {} Hermit refused this trial when the guest reached an operation it \
+                     does not support (exit 122; the reason is in {}); counted as the baseline \
+                     condition",
+                    "WARNING:".yellow().bold(),
+                    log.map_or("hermit's log above".to_owned(), |log| log
+                        .display()
+                        .to_string())
+                );
+                Ok(TrialEnd::Unfinished(Stop::Refusal))
             }
             Err(error) => Err(error),
         }
     }
+}
+
+/// Whether Hermit refused a run after its guest started, at an operation it
+/// does not support. The container's exit-122 arm returns a bare
+/// `PolicyRefusal`, whose reason Detcore logged before exiting. A refusal
+/// decided before the guest starts (an option or a backend Hermit does not
+/// admit) carries its reason as context instead; it is the same for every
+/// trial, so it ends the analysis.
+pub fn guest_reached_a_refusal(error: &anyhow::Error) -> bool {
+    error.chain().count() == 1
+        && error
+            .downcast_ref::<crate::container::PolicyRefusal>()
+            .is_some()
 }
 
 /// A single run plus the results of the run, either in memory or on disk.
@@ -112,6 +158,9 @@ pub struct RunData {
     trial_bound: Option<NonZeroU64>,
     /// How long the run took, once it finished.
     wall: Option<Duration>,
+    /// The log file the run wrote, once it launched (`--verbose` or
+    /// `--selfcheck`).
+    logged_to: Option<PathBuf>,
 }
 
 impl RunData {
@@ -268,6 +317,7 @@ impl RunData {
         // /tmp -- but the fix is the same and costs nothing.
         let mut gopts = gopts;
         gopts.open_log_file()?;
+        self.logged_to = gopts.log_file.clone();
         let final_record_path = self
             .runopts
             .det_opts
@@ -334,7 +384,7 @@ impl RunData {
     /// Launch a trial and say how it ended ([`TrialEnd::classify`]).
     pub fn launch_trial(&mut self) -> anyhow::Result<TrialEnd> {
         let launched = self.launch();
-        TrialEnd::classify(launched, || self.is_a_match())
+        TrialEnd::classify(launched, || self.is_a_match(), self.logged_to.as_deref())
     }
 
     /// Bound the run's wall-clock time ([`AnalyzeOpts::trial_bound`]) by the
@@ -374,8 +424,8 @@ impl RunData {
     pub fn measurement(&self) -> Option<(Duration, Option<u64>)> {
         let wall = self.wall?;
         let log_bytes = self
-            .trial_global_opts()
-            .log_file
+            .logged_to
+            .as_ref()
             .and_then(|path| std::fs::metadata(path).ok())
             .map(|metadata| metadata.len());
         Some((wall, log_bytes))
@@ -438,6 +488,7 @@ impl RunData {
             log_level,
             trial_bound: None,
             wall: None,
+            logged_to: None,
         };
 
         // By default we save the config for every run.
@@ -645,6 +696,7 @@ impl RunData {
             is_a_match: Some(true),
             trial_bound: None,
             wall: None,
+            logged_to: None,
         }
     }
 
@@ -671,6 +723,7 @@ impl RunData {
             is_a_match: None,
             trial_bound: None,
             wall: None,
+            logged_to: None,
         }
     }
 
@@ -2474,20 +2527,38 @@ mod tests {
         assert_eq!(options.trial_log_limit(), None);
     }
 
-    /// A trial that a wall-clock bound ended did not reach the target; a
-    /// trial that failed otherwise (here: the log cap) ends the analysis with
-    /// its error, still of its type.
+    /// A trial that did not finish did not reach the target: one that a
+    /// bound ended, or that Hermit refused at run time (a bare refusal, whose
+    /// reason Detcore logged). A refusal decided before the guest started
+    /// (with its reason attached) and any other failure (here: the log cap)
+    /// end the analysis with their error, still of their type.
     #[test]
-    fn a_trial_that_a_bound_ends_did_not_reach_the_target() {
-        let classify =
-            |launched: anyhow::Result<()>, matched: bool| TrialEnd::classify(launched, || matched);
+    fn a_trial_that_did_not_finish_did_not_reach_the_target() {
+        let classify = |launched: anyhow::Result<()>, matched: bool| {
+            TrialEnd::classify(launched, || matched, None)
+        };
         assert_eq!(classify(Ok(()), true).unwrap(), TrialEnd::Met);
         assert_eq!(classify(Ok(()), false).unwrap(), TrialEnd::Missed);
         let timed_out = anyhow::Error::new(RunTimeoutMarker)
             .context("Guest exceeded the --timeout bound of 3 seconds");
         let end = classify(Err(timed_out), true).unwrap();
-        assert_eq!(end, TrialEnd::Unfinished);
-        assert!(!end.reached_target());
+        assert_eq!(end, TrialEnd::Unfinished(Stop::Bound));
+        assert!(!end.reached_target() && !end.finished());
+        let refused = anyhow::Error::new(crate::container::PolicyRefusal);
+        assert_eq!(
+            classify(Err(refused), true).unwrap(),
+            TrialEnd::Unfinished(Stop::Refusal)
+        );
+        let admission = anyhow::Error::new(crate::container::PolicyRefusal)
+            .context("unsupported_preemption: --backend=kvm refuses --max-timeslice");
+        let admission = classify(Err(admission), true).unwrap_err();
+        assert!(
+            admission
+                .downcast_ref::<crate::container::PolicyRefusal>()
+                .is_some()
+                && format!("{admission:#}").contains("unsupported_preemption"),
+            "{admission:#}"
+        );
         let capped = classify(
             Err(anyhow::Error::new(crate::container::LogCapExceeded)),
             true,
