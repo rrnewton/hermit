@@ -4075,7 +4075,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scratch contract: 192, listed.
     // The 2026-10-17 test audit deleted rr_simple_threads_stress
     // (rr_join_threads without its asserts): 191.
-    ("test.rr_suite_contract", 191),
+    // And rr_multiple_pending_signals_sequential's new case, with
+    // rr_multiple_pending_signals no longer ignored, now that Detcore chooses
+    // a process-directed signal's receiving thread
+    // (https://github.com/rrnewton/hermit/issues/4034): 193.
+    ("test.rr_suite_contract", 193),
     ("privileged-test.pmu_buck_chaos_cases", 6),
     // PMU-subject cases moved out of test.hermit_unit and test.cli so the
     // hosted lane, which has no PMU, does not select them (see
@@ -5474,7 +5478,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
-    ("test.rr_suite_contract_on_host", 190),
+    // And the same two multiple-pending-signals cases: 192.
+    ("test.rr_suite_contract_on_host", 192),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
     // And the same target-scoped DETLOG forwarding test (13), and the same
