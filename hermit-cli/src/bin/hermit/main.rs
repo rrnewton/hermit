@@ -1695,6 +1695,7 @@ mod tests {
             "~/.hermit",
             "content addressible",
             "Record mode has no `--network` flag",
+            "defaults to, and requires, `--network=host`",
         ] {
             assert!(!help.contains(stale), "stale claim {stale:?} in:\n{help}");
         }
@@ -1705,7 +1706,8 @@ mod tests {
             "In run and record mode, by default (`--network=local`)",
             "only a loopback interface",
             "A recording stores its choice",
-            "`hermit record start --verify-with-gdbex` defaults to, and requires, `--network=host`",
+            "`--gdbserver`, and a replay served to gdb, keep the guest's network",
+            "bound in the host's network namespace",
             "The DBT backend does not apply `--network` yet",
             "`$XDG_CACHE_HOME/hermit`, which is `~/.cache/hermit`",
             "`--data-dir` or `HERMIT_DATA_DIR`",

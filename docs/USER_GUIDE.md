@@ -910,13 +910,30 @@ Network modes are:
 - `--network=host`: host networking. External responses and port state become
   nondeterministic inputs.
 
-`hermit run --gdbserver` needs a host gdb client to reach the gdbserver port.
-Because `--network=local` binds that port inside the guest's isolated network
-namespace, run mode forces host networking (printing a warning) whenever
-`--gdbserver` is set so the debugger can attach. Attach from another terminal
-with `gdb -ex 'target remote :PORT'` (default port 1234, override with
-`--gdbserver-port=PORT`). `--gdbserver` cannot be combined with
-`--analyze-networking`, which requires the isolated namespace.
+`hermit run --gdbserver` serves the guest to one gdb client and waits for it
+before the guest runs. Attach from another terminal with
+`gdb -ex 'target remote 127.0.0.1:PORT' PROGRAM` (default port 1234; override
+it with `--gdbserver-port=PORT`, or pass `0` for any free port, which the run
+prints). Hermit binds that port in the host's network namespace before it
+makes the guest's, so the guest keeps the network `--network` gives it,
+`--analyze-networking` included. A `--strict` run can be debugged with every
+strict refusal in force:
+
+```bash
+hermit run --strict --epoch=2026-01-01T00:00:00Z --gdbserver -- PROGRAM
+```
+
+The debugger is an input of the run that `--strict` cannot control.
+Breakpoints write `int3` into the guest's code, and writes to its memory or
+registers, the signals gdb sends and the moment it interrupts the guest all
+change the run; another session repeats the run only if it does the same.
+With a gdbserver, Detcore also takes no reports of the guest's signal-handler
+returns (docs/SIGNAL_STATE_CHECK.md), as in a recording and its replays: after
+a handler that took a scheduler turn, another thread can run before the next
+signal is delivered, so a multithreaded guest can be scheduled differently
+than without a debugger. A replay served to gdb (`hermit replay`,
+`--serve-only`, `hermit record start --verify-with-gdbex`) binds its port the
+same way and keeps the network the recording used.
 
 Environment controls include `--base-env=empty`, `--base-env=minimal`,
 `--base-env=host`, `-e NAME[=VALUE]`, and `--workdir=PATH`.

@@ -184,6 +184,7 @@ impl Replay {
         crate::cpu_profile_admission::refuse_unadmitted_launch(&config, true)?;
         // A sequentialized replay tells gdbserver not to serialize guests,
         // because Detcore already does.
+        let gdbserver = gdbserver.map(crate::gdbserver::connection).transpose()?;
         let tracer =
             hermit_replay::spawn_tracer(command, config, gdbserver, sequentialize_threads).await?;
         let proc_readonly = crate::proc_mount::guest_proc_readonly(tracer.guest_pid());
