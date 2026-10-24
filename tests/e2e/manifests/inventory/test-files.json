@@ -1652,6 +1652,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/poller_beside_short_sleeper.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/poller_beside_short_sleeper.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration test record_poller_beside_a_short_sleeper compiles this guest, a thread blocked in poll() on a pipe that main writes five times beside a thread that sleeps 100 us at a time until the poller has read every byte, and requires hermit record start --strict --verify --verify-strict to finish within its record timeout, print the poller's count and replay at bitwise parity (record runs the poll in the background, and readmitted it only once nothing but pollers was queued, which the sleeper never let happen); it remains a guest fixture because a generic manifest cannot run this record/replay contract."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/pollers_beside_worker.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/pollers_beside_worker.c is owned by hermit-cli/tests/cli.rs: The integration test a_worker_is_not_held_off_by_futex_waits_that_time_out runs this guest under run --strict --chaos and requires the compute-bound worker to finish with its longest gap under 5 s of virtual time beside four pollers whose 10 us futex waits time out; a generic manifest cannot express the measured bound."

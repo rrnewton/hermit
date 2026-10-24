@@ -3531,6 +3531,41 @@ fn record_vfork_child_waiting_for_another_thread() {
     }
 }
 
+/// A thread blocked in poll() on a pipe beside a thread that sleeps 100 us at
+/// a time until the poller has read every byte records and replays at bitwise
+/// parity. Record runs the poll in the background, and the sleeper, whose
+/// sleeps are shorter than one scheduler turn's charge (500 us, fixed under
+/// record), is runnable at every turn. Record readmitted a finished background call
+/// only once nothing but pollers was queued, so it never readmitted the
+/// poller, and the recording ran until `--record-timeout`. Now record
+/// readmits it in the first scheduler pass that finds it finished and logs
+/// that turn for replay to follow.
+#[test]
+fn record_poller_beside_a_short_sleeper() {
+    let _guard = hermit_record_lock();
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("hermit-cli should be inside the repository");
+    let build = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the guest build directory");
+    let guest = build.path().join("poller_beside_short_sleeper");
+    let output = Command::new("cc")
+        .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+        .arg(repository.join("tests/c/poller_beside_short_sleeper.c"))
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the poller_beside_short_sleeper guest");
+    assert!(
+        output.status.success(),
+        "guest compilation failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = canonical_record_replay_command("poller beside a short sleeper", &guest, &[]);
+    let line = "polled 5 of 5 bytes\n";
+    assert!(output.contains(line), "missing {line:?} in:\n{output}");
+}
+
 #[test]
 fn record_poll_partial_revents_copyout() {
     let _guard = hermit_record_lock();
