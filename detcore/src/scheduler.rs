@@ -8500,12 +8500,13 @@ impl Scheduler {
     }
 
     /// Re-admit parents whose host-async `SIGCHLD` was parked in
-    /// `blocked.sigchld_deferred` (see `block_for_one_resource`). Uses the same
-    /// deterministic-work-first gate as `step2c_process_io_blockers`: a deferred
-    /// signal is delivered only once the run queue holds no ordinary (non-poller)
-    /// guest work, so its commit order is fixed by the scheduler rather than by
-    /// host signal-arrival timing. Runs after external-IO harvesting so a ready
-    /// IO continuation is always ordered ahead of a deferred signal.
+    /// `blocked.sigchld_deferred` (see `block_for_one_resource`). Uses the
+    /// deterministic-work-first gate `step2c_process_io_blockers` applies in run
+    /// mode: a deferred signal is delivered only once the run queue holds no
+    /// ordinary (non-poller) guest work, so its commit order is fixed by the
+    /// scheduler rather than by host signal-arrival timing. Runs after external-IO
+    /// harvesting so a ready IO continuation is always ordered ahead of a deferred
+    /// signal.
     fn step2e_process_signal_deferred(&mut self) {
         if self.blocked.sigchld_deferred.is_empty() {
             return;
@@ -12690,23 +12691,6 @@ impl Scheduler {
             .copied()
     }
 
-    /// The vfork barriers' children whose call runs in the background
-    /// (`external_io_blockers`), in thread order. Under the rejoin log
-    /// `step2c_process_io_blockers` readmits each as soon as its call finishes
-    /// and logs the turn (<https://github.com/rrnewton/hermit/issues/4211>).
-    fn backgrounded_vfork_children(&self) -> impl Iterator<Item = DetTid> + '_ {
-        let mut children: Vec<DetTid> = self
-            .vfork_barriers
-            .values()
-            .flatten()
-            .copied()
-            .filter(|child| self.blocked.external_io_blockers.contains_key(child))
-            .collect();
-        children.sort();
-        children.dedup();
-        children.into_iter()
-    }
-
     /// Whether `dtid`'s backgrounded call, or signal-less wait, has finished,
     /// by the test `step2c_process_io_blockers` applies to each blocker.
     fn blocker_has_finished(&self, dtid: DetTid) -> bool {
@@ -12804,10 +12788,11 @@ impl Scheduler {
     /// polling): step 3 then selects it first. The deterministic-work-first
     /// gates count it as ordinary work even when its priority is in the last
     /// band, where `only_pollers` counts every entry as a poller, so that no
-    /// background call or deferred signal is admitted between its turns at a
-    /// moment the host chose. The fence that step 3 applies and the gates that
-    /// admit host-timed completions then agree on what is runnable work (Codex
-    /// re-check of https://github.com/rrnewton/hermit/pull/4205).
+    /// deferred signal, and no background call whose turn no rejoin log
+    /// records, is admitted between its turns at a moment the host chose. The
+    /// fence that step 3 applies and the gates that admit host-timed
+    /// completions then agree on what is runnable work (Codex re-check of
+    /// https://github.com/rrnewton/hermit/pull/4205).
     fn vfork_child_runs_turn(&self) -> bool {
         self.vfork_barriers
             .values()
@@ -12877,9 +12862,10 @@ impl Scheduler {
                 }
             };
 
-            // FIXME TODO (T137183027): for record/replay to work properly, we need to ALLOW the
-            // "Nondeterminstic algorithm" below, but record & replay those scheduler events. In
-            // the meantime, use a deterministic eager policy once there is no other runnable work.
+            // Record and replay. Which pass finds a background call finished is
+            // host-timed, so the rejoin log records the turn of each readmission
+            // (`log_rejoin`) and replay readmits the call at that turn
+            // (`step2c_replay_rejoin`) (T137183027).
             if self.recordreplay_modes {
                 // A call that replay serves from the recording cannot block, but it
                 // changes guest state while it runs: the stand-in for an accepted
@@ -12900,68 +12886,28 @@ impl Scheduler {
                     return Err(SkipTurn);
                 }
 
-                // Only *real* deterministic work should defer external-IO harvesting.
-                // Internal pollers sit at LAST_PRIORITY and are frequently spinning on
-                // the very result an external-IO blocker will produce (e.g. the reader
-                // side of `echo hi | cat`, where one stage uses InternalIOPolling while
-                // its peer is backgrounded on BlockingExternalIO). Treat a run queue
-                // that holds only pollers as "no deterministic work" so we still harvest
-                // completed IO below; a queued poller must not starve a ready blocker.
-                // Nor must a thread queued because it yielded: a sibling spinning
-                // on `sched_yield` is always queued, and it starved a finished
-                // background pselect6 forever (https://github.com/rrnewton/hermit/issues/4092).
-                // Whether the call has finished is host-timed, as for a poller;
-                // `log_rejoin` records the turn of the readmission for replay.
-                // A vfork barrier's child that will run a turn is work too,
-                // whatever its priority (see `vfork_child_runs_turn`).
-                let only_pollers =
-                    self.run_queue.only_pollers_or_yielders() && !self.vfork_child_runs_turn();
-
-                // Deterministic work is runnable: let it proceed. Waiting here while such
-                // work exists can deadlock thread creation -- the parent and new child
-                // cannot complete clone while an existing worker blocks indefinitely in
-                // epoll_wait.
-                //
-                // With the rejoin log active there is no vfork-gated child
-                // (`vfork_gated_background_child`): a backgrounded vfork child
-                // is readmitted below and logged like any other call. Without
-                // it, the gated child is readmitted here unlogged: until then
-                // no turn can commit (step 3 waits for it), so the turn of its
-                // readmission does not depend on when its call finished.
-                if !self.run_queue.is_empty() && !only_pollers {
-                    if let Some(child) = self.vfork_gated_background_child()
-                        && ready.contains(&child)
-                    {
-                        requeue_ready(self, &[child]);
-                    }
-                    // With the rejoin log active, a backgrounded vfork child is
-                    // readmitted as soon as its call finishes, even though other
-                    // work is runnable, and the turn is logged: a sibling of the
-                    // vfork parent can spin until the child is done, and deferring
-                    // the child behind it would never readmit it. Replay follows
-                    // the log here too, so a readmission due now is applied in the
-                    // same branch the recording took (the schedules agree up to
-                    // this turn, so the run queue is the same)
-                    // (https://github.com/rrnewton/hermit/issues/4211).
-                    if self.rejoin_replay.is_some() {
-                        if self.rejoin_due_now() {
-                            return self.step2c_replay_rejoin(&blockers, &ready, requeue_ready);
-                        }
-                    } else if self.rejoin_writer.is_some() {
-                        let children: Vec<DetTid> = self
-                            .backgrounded_vfork_children()
-                            .filter(|child| ready.contains(child))
-                            .collect();
-                        if !children.is_empty() {
-                            self.log_rejoin(&blockers, &children);
-                            requeue_ready(self, &children);
-                        }
-                    }
+                // Record readmits every call it finds finished, in the first pass
+                // that finds it, whatever else is runnable, and logs the turn.
+                // Runnable work can be waiting for that very call: a sibling of a
+                // vfork parent that spins until the child is done
+                // (https://github.com/rrnewton/hermit/issues/4211), or threads whose
+                // short sleeps fall due at every turn while the pollers they wait
+                // for stay backgrounded. Deferring the call behind such work never
+                // readmitted it. When a vfork child's release edge was one the
+                // scheduler committed (exec, Exit, logical kill), step2a has already
+                // dropped the parent's barrier or ended the pass, so no barrier
+                // holder is ready here; only a release the scheduler did not commit
+                // can post a continuation after step2a's read.
+                if self.rejoin_writer.is_some() && !ready.is_empty() {
+                    self.log_rejoin(&blockers, &ready);
+                    requeue_ready(self, &ready);
                     return Ok(());
                 }
 
-                // Replay readmits each call at the turn the recording logged, not when
-                // it finishes (see `rejoin_log`).
+                // Replay readmits each call at the turn the recording logged, not
+                // when it finishes (see `rejoin_log`), whatever else is queued: the
+                // schedules agree up to that turn, so replay reaches it with the
+                // recording's run queue.
                 if self.rejoin_replay.is_some() {
                     // As record does below: with nothing to run and no
                     // readmission due, a parent parked for its deferred
@@ -12973,6 +12919,42 @@ impl Scheduler {
                         return Ok(());
                     }
                     return self.step2c_replay_rejoin(&blockers, &ready, requeue_ready);
+                }
+
+                // With a rejoin log, record has readmitted every finished call above,
+                // and what follows only lets queued threads run, or waits while
+                // nothing is queued. Without one (a configuration only unit tests
+                // build), the gate below decides when a finished call is readmitted.
+                // Pollers sit at LAST_PRIORITY and often spin on the very result an
+                // external-IO blocker will produce (e.g. the reader side of
+                // `echo hi | cat`, where one stage uses InternalIOPolling while its
+                // peer is backgrounded on BlockingExternalIO), and a thread queued
+                // because it yielded asks for another to run first
+                // (https://github.com/rrnewton/hermit/issues/4092), so a run queue
+                // holding only those counts as no runnable work. A vfork barrier's
+                // child that will run a turn is work, whatever its priority (see
+                // `vfork_child_runs_turn`).
+                let only_pollers =
+                    self.run_queue.only_pollers_or_yielders() && !self.vfork_child_runs_turn();
+
+                // Deterministic work is runnable: let it proceed. Waiting here while such
+                // work exists can deadlock thread creation -- the parent and new child
+                // cannot complete clone while an existing worker blocks indefinitely in
+                // epoll_wait.
+                //
+                // With the rejoin log active there is no vfork-gated child
+                // (`vfork_gated_background_child`): a backgrounded vfork child
+                // is readmitted above and logged like any other call. Without
+                // it, the gated child is readmitted here unlogged: until then
+                // no turn can commit (step 3 waits for it), so the turn of its
+                // readmission does not depend on when its call finished.
+                if !self.run_queue.is_empty() && !only_pollers {
+                    if let Some(child) = self.vfork_gated_background_child()
+                        && ready.contains(&child)
+                    {
+                        requeue_ready(self, &[child]);
+                    }
+                    return Ok(());
                 }
 
                 // Readmit those calls first, in thread order; every one has finished.
@@ -12989,11 +12971,11 @@ impl Scheduler {
                 // return early forever, so the completed read/write was never rescheduled
                 // and the poller spun on data that never arrived.
                 //
-                // Which pass finds a call finished depends on host timing, so record
-                // logs the turn of each readmission for replay to follow.
+                // With a rejoin log, record readmitted and logged every finished call
+                // above, so a call is still ready here only without one (a Detcore
+                // configuration without a recording directory), where nothing logs it.
                 // TODO-HUMAN-REVIEW(PR-3908)
                 if !ready.is_empty() {
-                    self.log_rejoin(&blockers, &ready);
                     requeue_ready(self, &ready);
                     return Ok(());
                 }
@@ -13042,20 +13024,20 @@ impl Scheduler {
 
                 // No completed IO yet, and nothing to run. The
                 // blocking syscalls are executing in the host kernel; go around the loop
-                // and re-check readiness. (Still a busy-wait; see T137183027 for the
-                // record-the-nondeterministic-event fix.)
+                // and re-check readiness. (Still a busy-wait.)
                 trace!(
                     "[step2] eagerly waiting on external IO for dtids {:?}. spinning.",
                     &self.blocked.external_io_blockers
                 );
                 std::thread::yield_now();
                 return Err(SkipTurn);
-            } // End region which should be deleted.
+            } // End of the record and replay policy.
 
-            // Use the same deterministic-work-first policy as record/replay. Host
-            // completion timing must not decide whether a ready continuation overtakes
-            // guest work that was already runnable. Pollers are excluded because they
-            // commonly wait for the completed operation and would otherwise starve it.
+            // Run mode has no rejoin log, so host completion timing must not decide
+            // whether a ready continuation overtakes guest work that was already
+            // runnable: a finished call is readmitted only once no such work is queued.
+            // Pollers are excluded because they commonly wait for the completed
+            // operation and would otherwise starve it.
             let only_pollers = self.run_queue.only_pollers() && !self.vfork_child_runs_turn();
             if !self.run_queue.is_empty() && !only_pollers {
                 if let Some(child) = self.vfork_gated_background_child()
@@ -13135,7 +13117,9 @@ impl Scheduler {
     ///   turn could commit. A call still unfinished after `REJOIN_STALL_VALVE`
     ///   is refused rather than waited on forever.
     /// - Until then a finished call stays parked, and queued threads run as
-    ///   they did in record.
+    ///   they did in record. Such a pass also ends any earlier wait
+    ///   (`rejoin_stalled_since`), so a later due readmission gets the whole
+    ///   `REJOIN_STALL_VALVE`.
     /// - Replay refuses if it reaches a later turn than a logged readmission,
     ///   or if the parked call is not the logged one.
     ///   With nothing runnable and no readmission due, record spun until a call
@@ -23270,46 +23254,124 @@ mod test {
         assert_eq!(replay.vfork_gated_background_child(), None);
     }
 
-    /// Record readmits a backgrounded vfork child as soon as its call finishes,
-    /// though other work is runnable, and logs the turn; a finished blocker that
-    /// is not a vfork child still waits for the queue to hold only pollers.
+    /// Record readmits every finished background call as soon as a pass finds
+    /// it, though other work is runnable, in thread order, and logs the turn:
+    /// a vfork child (https://github.com/rrnewton/hermit/issues/4211) and any
+    /// other call alike. An unfinished call stays parked and is not logged.
     #[test]
-    fn record_readmits_and_logs_a_finished_vfork_child_while_work_is_runnable() {
+    fn record_readmits_and_logs_every_finished_call_while_work_is_runnable() {
         let dir = tempfile::tempdir().unwrap();
         let parent = DetTid::from_raw(7);
         let child = ExternalOpId::new(DetTid::from_raw(25), 4);
         let other = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let running = ExternalOpId::new(DetTid::from_raw(23), 2);
         let mut scheduler = Scheduler::new(&Config::default());
         scheduler.recordreplay_modes = true;
         scheduler.vfork_barriers.insert(parent, Some(child.tid));
         background(&mut scheduler, child, true);
         background(&mut scheduler, other, true);
+        background(&mut scheduler, running, false);
         queue_worker(&mut scheduler, DetTid::from_raw(9));
         scheduler.rejoin_writer = Some(RejoinWriter::create(dir.path()).unwrap());
         scheduler.turn = 12;
 
         assert!(scheduler.step2c_process_io_blockers().is_ok());
-        assert!(
-            !scheduler
-                .blocked
-                .external_io_blockers
-                .contains_key(&child.tid)
-        );
-        assert!(scheduler.run_queue.contains_tid(child.tid));
+        for readmitted in [child.tid, other.tid] {
+            assert!(
+                !scheduler
+                    .blocked
+                    .external_io_blockers
+                    .contains_key(&readmitted)
+            );
+            assert!(scheduler.run_queue.contains_tid(readmitted));
+        }
         assert!(
             scheduler
                 .blocked
                 .external_io_blockers
-                .contains_key(&other.tid)
+                .contains_key(&running.tid)
         );
         assert_eq!(
             rejoin_log::read(dir.path()).unwrap(),
             std::collections::VecDeque::from([Rejoin {
                 turn: 12,
                 wakes: 0,
-                calls: vec![(child.tid, 4)],
+                calls: vec![(other.tid, 9), (child.tid, 4)],
             }])
         );
+    }
+
+    /// A finished poll beside runnable work: record readmits it at the turn a
+    /// pass finds it finished and logs that turn, and a replay of that log,
+    /// with the same work runnable, keeps it parked until that turn and
+    /// readmits it there.
+    #[test]
+    fn a_finished_poll_beside_runnable_work_is_readmitted_at_the_logged_turn() {
+        let poll = ExternalOpId::new(DetTid::from_raw(9), 3);
+        let sleeper = DetTid::from_raw(5);
+        let make = || {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.recordreplay_modes = true;
+            background(&mut scheduler, poll, true);
+            queue_worker(&mut scheduler, sleeper);
+            scheduler
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut recording = make();
+        recording.rejoin_writer = Some(RejoinWriter::create(dir.path()).unwrap());
+        recording.turn = 40;
+        assert!(recording.step2c_process_io_blockers().is_ok());
+        assert!(recording.run_queue.contains_tid(poll.tid));
+        let logged = rejoin_log::read(dir.path()).unwrap();
+        assert_eq!(
+            logged,
+            std::collections::VecDeque::from([Rejoin {
+                turn: 40,
+                wakes: 0,
+                calls: vec![(poll.tid, 3)],
+            }])
+        );
+
+        let mut replay = make();
+        replaying(&mut replay, &Vec::from(logged));
+        replay.turn = 39;
+        assert!(replay.step2c_process_io_blockers().is_ok());
+        assert!(replay.blocked.external_io_blockers.contains_key(&poll.tid));
+        assert!(!replay.run_queue.contains_tid(poll.tid));
+        replay.turn = 40;
+        assert!(replay.step2c_process_io_blockers().is_ok());
+        assert!(replay.run_queue.contains_tid(poll.tid));
+        assert!(replay.rejoin_replay.as_ref().unwrap().is_empty());
+        assert!(replay.rejoin_refusal.is_none());
+    }
+
+    /// A replay that waited with nothing queued and no readmission due
+    /// (`rejoin_stalled_since`) ends that wait once a thread is queued, so a
+    /// readmission due later waits the whole `REJOIN_STALL_VALVE` for its calls
+    /// rather than what an earlier wait left of it.
+    #[test]
+    fn replay_ends_a_stalled_wait_once_a_thread_is_queued() {
+        let running = ExternalOpId::new(DetTid::from_raw(21), 9);
+        let mut replay = Scheduler::new(&Config::default());
+        replay.recordreplay_modes = true;
+        background(&mut replay, running, false);
+        replaying(
+            &mut replay,
+            &[Rejoin {
+                turn: 50,
+                wakes: 0,
+                calls: vec![(running.tid, 9)],
+            }],
+        );
+        replay.turn = 40;
+        assert!(replay.step2c_process_io_blockers().is_err());
+        assert!(replay.rejoin_stalled_since.is_some());
+
+        queue_worker(&mut replay, DetTid::from_raw(5));
+        assert!(replay.step2c_process_io_blockers().is_ok());
+        assert!(replay.rejoin_stalled_since.is_none());
+        assert!(replay.rejoin_refusal.is_none());
     }
 
     /// A middle child of a nested vfork (P vforks C, C vforks G) is backgrounded

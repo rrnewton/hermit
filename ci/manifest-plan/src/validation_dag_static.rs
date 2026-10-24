@@ -3053,7 +3053,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And determinize_stat_reports_one_link_for_directories_only and
     // determinize_stat_nlink_pin_edges (directory st_nlink pinned to 1):
     // 2736 + 2 = 2738, listed.
-    ("test.detcore_unit", 2738),
+    // And scheduler::test::{a_finished_poll_beside_runnable_work_is_readmitted_at_the_logged_turn,
+    // replay_ends_a_stalled_wait_once_a_thread_is_queued} (record readmits every
+    // finished background call at once): 2740.
+    ("test.detcore_unit", 2740),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3617,7 +3620,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And https://github.com/rrnewton/hermit/issues/4262: record_exec_discards_posix_timer_copies_as_on_linux and
     // record_replay_posix_timer_rows_replay_but_diverge_from_linux: 220.
     // And record_chaos_schedule_replays_under_its_seed: 221.
-    ("test.record_replay", 221),
+    // And record_poller_beside_a_short_sleeper: 222.
+    ("test.record_replay", 222),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -5334,7 +5338,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same protection-key subscription unit: 2692, listed.
     // And the same P2b deletion of the anchor device unit: 2694, listed.
     // And the same two directory st_nlink units: 2738, listed.
-    ("test.detcore_unit_on_host", 2738),
+    // And the same two background-readmission units: 2740.
+    ("test.detcore_unit_on_host", 2740),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
