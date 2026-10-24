@@ -36,6 +36,7 @@ mod namespace;
 pub(crate) use namespace::anonymous_object_devices;
 pub(crate) use namespace::guest_task_procfs;
 mod network_trace;
+pub(crate) mod pi_futex;
 pub(crate) mod robust_list;
 pub(crate) mod scm_rights;
 /// A buffer for an injected syscall, in the stack scratch or a transient page.
