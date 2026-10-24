@@ -1765,7 +1765,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The gdbserver port bound in the host's network namespace adds five
     // gdbserver::tests units and removes
     // record_start::tests::a_gdb_checked_recording_refuses_local_networking: 1100.
-    ("test.hermit_unit", 1100),
+    // And backends_without_a_gdbserver_refuse_gdbserver_and_dap_listen
+    // (--gdbserver refused on backends that do not serve gdb): 1101.
+    ("test.hermit_unit", 1101),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4004,7 +4006,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (A5 step 3c slice 0g): 601, listed.
     // And strict_gdbserver_session_that_only_continues_matches_the_run_without_gdb
     // (the gdbserver port bound in the host's network namespace): 602.
-    ("test.cli", 602),
+    // And backends_without_a_gdbserver_refuse_gdbserver_before_starting_the_guest: 603.
+    ("test.cli", 603),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4495,7 +4498,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The in-guest unsequentialized-handler refusal test (slice 0g) starts the
     // in-guest runtime too and joins the hosted exclusions: unchanged at 520.
     // And the same strict gdbserver session test: 521.
-    ("test.cli_on_host", 521),
+    // And the same gdbserver backend refusal test: 522.
+    ("test.cli_on_host", 522),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5258,7 +5262,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same eight finalization tests, with the existing selection unchanged.
     // And the frozen ld.so.cache container test (Hermit c10c2882): 1096.
     // And the same five gdbserver units, less the same record_start unit: 1100.
-    ("test.hermit_unit_on_host", 1100),
+    // And the same gdbserver backend refusal unit: 1101.
+    ("test.hermit_unit_on_host", 1101),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

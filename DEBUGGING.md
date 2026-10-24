@@ -94,7 +94,11 @@ cc -g -O0 -fno-pie -no-pie squares.c -o squares
 
 `--gdbserver` makes Hermit serve the guest through the GDB remote protocol
 and wait for a debugger before the guest's first instruction. It needs the
-ptrace backend (the default). Hermit binds the port in the host's network
+ptrace backend (the default; `--backend=e9patch` runs its rewritten guest
+under it too). Every other backend has no GDB server, and `hermit run`
+refuses `--gdbserver` there, as with `--namespace-only`, naming the remedy:
+`--backend=kvm`, `dbt` and `sabre` used to run the guest without one and
+without a word. Hermit binds the port in the host's network
 namespace, so the guest keeps its own network and GDB reaches the port, and
 prints where to attach.
 
@@ -181,7 +185,7 @@ hermit-dap: listening on 127.0.0.1:4711
 `--dap-listen` implies `--gdbserver`, so everything said above about
 `--gdbserver` holds. Before anything starts, `hermit run` refuses a run it
 could not serve: one whose `--gdbserver` would be refused (with
-`--backend=liteinst`, for example), one with `--verify` (which runs the
+`--backend=liteinst` or `--backend=kvm`, for example), one with `--verify` (which runs the
 program twice, and the adapter serves one session), `--namespace-only`
 (which has no GDB server) or `--image` (whose program lives in the image),
 `--gdbserver-port=0` (it must know the port to give the debugger), and an

@@ -5147,6 +5147,74 @@ fn run_dbt_executes_integrated_backend() {
     assert_success(&output, &args);
 }
 
+/// Only the ptrace backend serves gdb. The KVM, DBT and SaBRe backends used to
+/// take `--gdbserver` and run the guest without a gdbserver, `--strict` runs
+/// included, so the debugger waited on a port nothing served; now the run is
+/// refused before anything starts, naming the remedy, and so is
+/// `--namespace-only`, which runs no tracer. A backend that cannot even start
+/// on this host is refused the same way: the refusal comes before any backend
+/// is probed.
+#[test]
+fn backends_without_a_gdbserver_refuse_gdbserver_before_starting_the_guest() {
+    let _guard = hermit_run_guard();
+    let strict = ["--strict", "--epoch=2026-01-01T00:00:00Z", "--gdbserver"];
+    // `--dap-listen` is refused before it binds its address: a taken one
+    // would otherwise be refused for that instead.
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to take a loopback port");
+    let dap_listen = format!(
+        "--dap-listen={}",
+        taken
+            .local_addr()
+            .expect("failed to read the taken address")
+    );
+    let mut cases: Vec<(Vec<&str>, &str, String)> = Vec::new();
+    for backend in ["kvm", "dbt", "sabre"] {
+        for (options, option) in [
+            (&["--gdbserver"][..], "--gdbserver"),
+            (&strict[..], "--gdbserver"),
+            (&[dap_listen.as_str()][..], "--dap-listen"),
+        ] {
+            let mut args = vec!["--backend", backend, "run"];
+            args.extend_from_slice(options);
+            cases.push((
+                args,
+                option,
+                format!("the {backend} backend has none, so no debugger could attach; run it with the ptrace backend: drop --backend={backend}"),
+            ));
+        }
+    }
+    cases.push((
+        vec!["run", "--namespace-only", "--gdbserver"],
+        "--gdbserver",
+        "--namespace-only runs the guest without a tracer, so no debugger could attach; drop --namespace-only".to_owned(),
+    ));
+    for (mut args, option, cause) in cases {
+        args.extend(["--", "/bin/echo", "gdbserver-guest-must-not-start"]);
+        let output = hermit(&args);
+        let stderr = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!(
+                "{option} needs a gdbserver, which only the ptrace backend runs: {cause}"
+            )),
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("gdbserver-guest-must-not-start"),
+            "{args:?}"
+        );
+        assert!(!stderr.contains("attach with"), "{args:?}: {stderr}");
+    }
+}
+
 /// Static timer policy is checked before backend artifacts, guest startup or
 /// stdin consumption. An explicit value equal to the inherited default is still a
 /// request; a disabled maximum does not make other timer requests work.
