@@ -3066,7 +3066,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
-    ("test.detcore_unit", 2811),
+    // And the three scheduler::test units of a fatal delivery's committed
+    // retirement (a_fatal_delivery_retires_the_threads_parked_in_futex_waits,
+    // a_fatal_delivery_does_not_take_a_reused_thread_id_from_another_process,
+    // a_fatal_delivery_retires_nothing_where_it_cannot_commit_the_group_end):
+    // 2814, listed.
+    ("test.detcore_unit", 2814),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4362,7 +4367,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 654 + 5 = 659, listed.
     // And +1 from 82cbd684: 660.
     // Train 6 recount (measured on 21f770f6 base): 666.
-    ("test.cli", 675),
+    // And a_default_fatal_signal_ends_a_process_whose_other_threads_wait_on_a_futex:
+    // 676, listed.
+    ("test.cli", 676),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4905,7 +4912,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 5 = 578, listed.
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
-    ("test.cli_on_host", 594),
+    // And the same fatal-signal futex-waiters test, not excluded: 595, listed.
+    ("test.cli_on_host", 595),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5378,7 +5386,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
-    ("test.detcore_unit_on_host", 2811),
+    // And the same three fatal-delivery retirement units: 2814, listed.
+    ("test.detcore_unit_on_host", 2814),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
