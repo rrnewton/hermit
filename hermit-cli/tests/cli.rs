@@ -177,6 +177,7 @@ static YIELD_LOOP_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DIRECTORY_SIZE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUSE_DIRECTORY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LAST_BAND_BACKGROUND_CALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static TIMED_WAIT_POLLERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SCHEDULER_SIGNAL_WAITING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_WAITING_BESIDE_BACKGROUND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAIT_UNREADABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -39924,6 +39925,122 @@ fn a_last_band_worker_holds_back_a_host_observed_completion_under_chaos() {
                 "seed {seed}, run {attempt}: the call rejoined between the worker's turns"
             );
         }
+    }
+}
+
+/// Run tests/c/timed_wait_pollers.c under `run --strict` with `hermit_args`
+/// and the guest arguments `MODE POLLERS 100 20000000 SYSCALL_EVERY`, require
+/// exit 0, and return its work_us and total_us values.
+fn timed_wait_pollers_run(
+    hermit_args: &[&str],
+    mode: &str,
+    pollers: &str,
+    syscall_every: &str,
+) -> (u64, u64) {
+    let guest = futex_c_guest(&TIMED_WAIT_POLLERS_GUEST, "timed_wait_pollers")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut args = vec!["run", "--strict", "--timeout", "60"];
+    args.extend_from_slice(hermit_args);
+    args.extend_from_slice(&[
+        "--",
+        guest.as_str(),
+        mode,
+        pollers,
+        "100",
+        "20000000",
+        syscall_every,
+    ]);
+    let (status, log) = run_with_deadline(
+        hermit_command(&args),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "{args:?}: the run must finish and exit 0:\nstdout:\n{stdout}\nstderr:\n{log}"
+    );
+    let value = |key: &str| -> u64 {
+        stdout
+            .split_whitespace()
+            .find_map(|word| word.strip_prefix(&format!("{key}=")))
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| panic!("{args:?}: no {key}= in {stdout:?}"))
+    };
+    (value("work_us"), value("total_us"))
+}
+
+/// One or six threads poll with 100 us timed waits, the idle loop of many
+/// thread pools, beside a main thread running a 20M-iteration loop
+/// (tests/c/timed_wait_pollers.c): each poller loops on `clock_nanosleep`
+/// (`sleep`) or `pthread_cond_timedwait` (`condwait`). A wait shorter than one
+/// scheduler turn charge (500 us) ended at its own grant, so the pollers never
+/// blocked: one kept the CPU for its whole timeslice at a turn charge per
+/// iteration, or, under chaos, pollers that outranked main passed the CPU
+/// among themselves. On main f48d9d45, with a loop that makes no system call,
+/// the run's virtual time from the first poller's start to the last one's
+/// join was 11 to 41 s for `condwait` and 42 to 290 s for `sleep` under chaos
+/// (`sleep` without chaos was already fine), against about 400 ms with no
+/// poller. A run of turns that each end an expired timed wait is now charged
+/// one turn while another thread is queued, so the pollers block and main
+/// runs: the whole run takes less than twice its work alone. With a loop that
+/// calls getppid every 1000 iterations, the pollers' pending deadline now
+/// caps main's slices at one turn charge, the cost the deadline cap allows
+/// (about 3x, as for a sleeper of one turn charge), where main took 35x.
+/// Chaos runs of both kinds of poller also verify at bitwise parity.
+#[test]
+fn short_timed_wait_pollers_do_not_inflate_a_cpu_bound_threads_time() {
+    let (alone, _) = timed_wait_pollers_run(&[], "condwait", "0", "0");
+    let chaos_1 = &["--chaos", "--seed", "1"][..];
+    let chaos_2 = &["--chaos", "--seed", "2"][..];
+    for (mode, pollers) in [
+        ("sleep", "1"),
+        ("condwait", "1"),
+        ("sleep", "6"),
+        ("condwait", "6"),
+    ] {
+        for hermit_args in [&[][..], chaos_1, chaos_2] {
+            let (work, total) = timed_wait_pollers_run(hermit_args, mode, pollers, "0");
+            assert!(
+                total < 2 * alone,
+                "{mode} x{pollers} {hermit_args:?}: 100 us pollers made {alone} us of work take \
+                 {total} us (work {work} us)"
+            );
+        }
+    }
+    let (alone, _) = timed_wait_pollers_run(&[], "condwait", "0", "1000");
+    for (mode, hermit_args) in [("condwait", &[][..]), ("sleep", chaos_1)] {
+        let (work, total) = timed_wait_pollers_run(hermit_args, mode, "1", "1000");
+        assert!(
+            total < 5 * alone,
+            "{mode} {hermit_args:?}: a 100 us poller made {alone} us of work with syscalls \
+             take {total} us (work {work} us)"
+        );
+    }
+    for mode in ["condwait", "sleep"] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let verdict_arg = verdict.to_str().unwrap().to_owned();
+        let mut args = chaos_1.to_vec();
+        args.extend_from_slice(&[
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict_arg.as_str(),
+        ]);
+        timed_wait_pollers_run(&args, mode, "6", "0");
+        let report: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&verdict).expect("failed to read the verify verdict"),
+        )
+        .expect("the verify verdict is not JSON");
+        assert_eq!(report["verdict"], "matched", "{mode}: {report}");
+        assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
     }
 }
 
