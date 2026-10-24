@@ -224,6 +224,8 @@ static PROCFS_LISTINGS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VIRTUAL_KERNEL_FILES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static OMITTED_PROCFS_NAMES_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static VIRTUAL_CPUS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static VIRTUAL_CPUS_POOL_RACE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -35277,6 +35279,162 @@ fn a_cpu_set_sized_from_kernel_max_holds_the_one_virtual_cpu() {
         serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
             .expect("the verdict must be JSON");
     assert_eq!(report["bitwise_parity"], true, "{report}");
+}
+
+/// How many of `cpu0`, `cpu1`, ... in turn this host's
+/// `/sys/devices/system/cpu` has online (with a `topology` directory): the
+/// most CPUs `--virtual-cpus` admits here.
+fn host_cpu_directories() -> usize {
+    (0..)
+        .take_while(|cpu| Path::new(&format!("/sys/devices/system/cpu/cpu{cpu}/topology")).is_dir())
+        .count()
+}
+
+/// Every source a program can size a thread pool from reports the same
+/// count: sysconf, get_nprocs, sched_getaffinity, the /sys CPU lists and
+/// directories, /proc/cpuinfo, /proc/stat, Cpus_allowed, node 0, the
+/// distinct APIC IDs CPUID gives on each CPU, getcpu, sched_getcpu and
+/// /proc/thread-self/stat on each pinned CPU and the distinct CPUs of one
+/// thread per CPU. One without `--virtual-cpus`, as
+/// before, and N with it, at bitwise parity. On a host with fewer than N CPU
+/// directories the run is refused with the count that would be admitted.
+#[test]
+fn virtual_cpus_every_cpu_count_agrees() {
+    let guest = futex_c_guest(&VIRTUAL_CPUS_GUEST, "virtual_cpus")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for (flag, cpus) in [
+        (None, 1),
+        (Some("--virtual-cpus=4"), 4),
+        (Some("--virtual-cpus=8"), 8),
+    ] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let verdict = directory.path().join("verify.json");
+        let mut args = vec![
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict.to_str().unwrap(),
+        ];
+        args.extend(flag);
+        args.extend(["--", guest.as_str(), "counts"]);
+        let output = hermit(&args);
+        if host_cpu_directories() < cpus {
+            assert!(!output.status.success(), "{flag:?}: {output:?}");
+            let message = stderr(&output);
+            assert!(message.contains("pass --virtual-cpus"), "{message}");
+            continue;
+        }
+        assert_success(&output, &args);
+        let counts = stdout(&output);
+        assert_eq!(counts.lines().count(), 17, "{flag:?}:\n{counts}");
+        for line in counts.lines() {
+            assert!(
+                line.ends_with(&format!("={cpus}")),
+                "{flag:?}: {line}\n{counts}"
+            );
+        }
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+                .expect("the verdict must be JSON");
+        assert_eq!(report["bitwise_parity"], true, "{flag:?}: {report}");
+    }
+}
+
+/// Under `--virtual-cpus` sched_setaffinity behaves as Linux's: a mask reads
+/// back, an empty mask, a mask of no existing CPU and a zero length are
+/// EINVAL, an unreadable mask EFAULT and no such task ESRCH; the pinned CPU
+/// is what getcpu, sched_getcpu and /proc/thread-self/status report; a new
+/// thread and a child process inherit the mask; a thread created with an
+/// affinity attribute starts with it; one thread can set and read another's.
+/// The guest prints only whether each held, so its output is the same
+/// natively and under Hermit. A host with fewer than four CPUs refuses the
+/// run.
+#[test]
+fn virtual_cpus_affinity_follows_linux() {
+    let guest = futex_c_guest(&VIRTUAL_CPUS_GUEST, "virtual_cpus")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let args = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--virtual-cpus=4",
+        "--",
+        guest.as_str(),
+        "affinity",
+    ];
+    if host_cpu_directories() < 4 {
+        let output = hermit(&args);
+        assert!(!output.status.success(), "{output:?}");
+        assert!(
+            stderr(&output).contains("pass --virtual-cpus"),
+            "{output:?}"
+        );
+        return;
+    }
+    let native = Command::new(&guest).arg("affinity").output().unwrap();
+    assert!(native.status.success(), "{native:?}");
+    let native = String::from_utf8(native.stdout).unwrap();
+    assert!(
+        native.contains("empty mask: EINVAL, mask unchanged: yes\n"),
+        "{native}"
+    );
+    assert!(!native.contains("NO"), "{native}");
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), native);
+}
+
+/// A worker pool sized from sysconf, whose workers race on a shared counter,
+/// cannot race under Hermit's single CPU, whatever the chaos seed: it has one
+/// worker. Under `--virtual-cpus 4` it has four, and the chaos schedule loses
+/// updates, as any schedule that switches threads at the yield between a
+/// worker's read and its write does.
+#[test]
+fn virtual_cpus_let_a_sysconf_sized_pool_race() {
+    let guest = futex_c_guest(&VIRTUAL_CPUS_POOL_RACE_GUEST, "virtual_cpus_pool_race")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for seed in ["--seed=1", "--seed=2"] {
+        let run = |cpus: Option<&str>| {
+            let mut args = vec!["run", "--chaos", seed];
+            args.extend(cpus);
+            args.extend(["--", guest.as_str()]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            stdout(&output)
+        };
+        assert_eq!(run(None), "workers=1 no update lost\n", "{seed}");
+        assert_eq!(
+            run(Some("--virtual-cpus=4")),
+            "workers=4 updates lost\n",
+            "{seed}"
+        );
+    }
+}
+
+/// `--virtual-cpus` takes a CPU count from 1 to 128, and a refusal names the
+/// range.
+#[test]
+fn virtual_cpus_outside_1_to_128_are_refused() {
+    for count in ["0", "129", "many"] {
+        let flag = format!("--virtual-cpus={count}");
+        let args = ["run", flag.as_str(), "--", "/bin/true"];
+        let output = hermit(&args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        let message = stderr(&output);
+        assert!(
+            message.contains("expected a CPU count from 1 to 128, for example --virtual-cpus 4"),
+            "{message}"
+        );
+    }
 }
 
 /// /proc/cpuinfo describes the CPU that the CPUID instruction describes

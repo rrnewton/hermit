@@ -11,6 +11,8 @@
 mod boundary_controller;
 mod boundary_replayer;
 pub(crate) mod child_exit_sigchld;
+#[cfg(test)]
+mod cpu_affinity_tests;
 pub(crate) mod discarded_at_send;
 #[cfg(test)]
 pub(crate) mod exec_teardown_tests;
@@ -101,6 +103,9 @@ use tracing::warn;
 
 use crate::config::Config;
 use crate::config::RunsPostFork;
+use crate::cpu_set::CpuSet;
+use crate::cpu_set::TaskAffinity;
+use crate::cpu_set::TaskCpus;
 use crate::detlog_debug;
 use crate::ivar::Ivar;
 use crate::preemptions::PreemptionWriter;
@@ -2322,6 +2327,24 @@ pub struct ThreadTree {
     /// entries are (about 40 bytes a task), and replaced when a number is
     /// given out again.
     task_comms: HashMap<DetTid, crate::procfs::task_stat::TaskComm>,
+    /// Each task's CPU affinity under `--virtual-cpus`, Linux's
+    /// `task_struct::cpus_mask`, where a `sched_setaffinity` narrowed it
+    /// (`Scheduler::set_cpu_affinity`); a task with no entry may run on every
+    /// virtual CPU. Inherited by every new task from the task that created
+    /// it, as `dup_task_struct` copies the mask, and kept by exec. Like
+    /// `task_comms`, entries are kept for the run and replaced when a number
+    /// is given out again. Without `--virtual-cpus` no `sched_setaffinity`
+    /// records one, so it stays empty.
+    cpu_affinities: HashMap<DetTid, CpuSet>,
+    /// Each task's home: how many tasks the run had created before it
+    /// ([`Self::cpu_homes_given`]), which places it among the CPUs it may run
+    /// on (`TaskCpus::current`), so tasks created one after another take the
+    /// CPUs in turn, as Linux places each new task on an idle CPU. Kept by
+    /// exec, and replaced when a number is given out again. Every task has
+    /// one; only `--virtual-cpus` reads it.
+    cpu_homes: HashMap<DetTid, u32>,
+    /// How many tasks the run has created, the next task's home.
+    cpu_homes_given: u32,
     /// The guest-visible parent of each process whose real parent is outside
     /// the guest's process tree, its own `getppid` answer
     /// (`Scheduler::record_external_parent`): the run's root process, and a
@@ -2528,6 +2551,19 @@ impl ThreadTree {
             Some(comm) => self.task_comms.insert(child_dettid, comm),
             None => self.task_comms.remove(&child_dettid),
         };
+        // And with its creator's CPU affinity (`dup_task_struct` copies
+        // `cpus_mask`).
+        match self
+            .cpu_affinities
+            .get(&parent_dettid)
+            .copied()
+            .filter(|_| parent_dettid != child_dettid)
+        {
+            Some(cpus) => self.cpu_affinities.insert(child_dettid, cpus),
+            None => self.cpu_affinities.remove(&child_dettid),
+        };
+        self.cpu_homes.insert(child_dettid, self.cpu_homes_given);
+        self.cpu_homes_given = self.cpu_homes_given.wrapping_add(1);
         if is_group_leader {
             // A new process starts with its creator's resource limits
             // (`copy_signal` copies `rlim`) and no recorded outside parent.
@@ -2725,6 +2761,14 @@ impl ThreadTree {
             Some(comm) => self.task_comms.insert(leader, comm),
             None => self.task_comms.remove(&leader),
         };
+        // So do its CPU affinity and home: exec does not move a task.
+        match self.cpu_affinities.remove(&former) {
+            Some(cpus) => self.cpu_affinities.insert(leader, cpus),
+            None => self.cpu_affinities.remove(&leader),
+        };
+        if let Some(home) = self.cpu_homes.remove(&former) {
+            self.cpu_homes.insert(leader, home);
+        }
     }
 
     /// `process`'s successful exec count (`exec_generations`).
@@ -10070,6 +10114,46 @@ impl Scheduler {
         self.thread_tree.task_comms.get(&tid).copied()
     }
 
+    /// The CPUs task `tid` may run on and its home
+    /// (`ThreadTree::cpu_affinities`, `ThreadTree::cpu_homes`).
+    fn task_cpus(&self, tid: DetTid) -> TaskCpus {
+        let tree = &self.thread_tree;
+        TaskCpus {
+            mask: tree.cpu_affinities.get(&tid).copied(),
+            home: tree.cpu_homes.get(&tid).copied().unwrap_or(0),
+        }
+    }
+
+    /// Whether Linux's `find_process_by_pid` would find task `tid`: a live
+    /// task, from its clone's registration to its exit's, or the leader of
+    /// a process that has exited and is not reaped, which `/proc` still
+    /// lists (`procfs_listing`).
+    fn task_is_found(&self, tid: DetTid) -> bool {
+        self.next_turns.contains_key(&tid)
+            || (self.thread_tree.thread_group_leaders.contains(&tid) && self.process_exists(tid))
+    }
+
+    /// The CPUs of task `tid` under `--virtual-cpus`, or no such task where
+    /// Linux's `sched_getaffinity` answers ESRCH ([`Self::task_is_found`]).
+    pub fn cpu_affinity(&self, tid: DetTid) -> TaskAffinity {
+        match self.task_is_found(tid) {
+            true => TaskAffinity::Task(self.task_cpus(tid)),
+            false => TaskAffinity::NoSuchTask,
+        }
+    }
+
+    /// Record `cpus` as the CPU affinity of task `tid`
+    /// (`ThreadTree::cpu_affinities`): the mask of a `sched_setaffinity`
+    /// that Detcore checked against the virtual CPUs. Answers the task's
+    /// CPUs afterwards, or no such task as [`Self::cpu_affinity`] does.
+    pub fn set_cpu_affinity(&mut self, tid: DetTid, cpus: CpuSet) -> TaskAffinity {
+        if !self.task_is_found(tid) {
+            return TaskAffinity::NoSuchTask;
+        }
+        self.thread_tree.cpu_affinities.insert(tid, cpus);
+        self.cpu_affinity(tid)
+    }
+
     /// What the process table says about the task a per-process `stat` file
     /// names (`procfs::task_stat::TaskStatFacts`): the top-level
     /// number `named` and the thread `thread` below its `task` directory, as
@@ -10094,6 +10178,7 @@ impl Scheduler {
         let parent = leader.and_then(|leader| self.guest_visible_parent(leader));
         crate::procfs::task_stat::TaskStatFacts {
             comm: tree.task_comms.get(&described).copied(),
+            cpus: self.task_cpus(described),
             exited,
             leads: tree.thread_group_leaders.contains(&described),
             process_exit_signal: wait.map_or(libc::SIGCHLD, |wait| wait.exit_signal),

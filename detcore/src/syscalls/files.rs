@@ -4859,11 +4859,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // classify the open by the link the recording read
                 // (`recorded_open_path`).
                 // A process's `auxv` the kernel opened keeps the kernel's
-                // bytes, unclassified, as before Detcore rendered the file
-                // (`ProcfsFile::kernel_served`): by its spelling here, and by
-                // its link below.
-                let mut procfs =
-                    ProcfsFile::from_path(&observed_path).filter(ProcfsFile::kernel_served);
+                // bytes, unclassified, as before Detcore rendered the file,
+                // and so does a file of a CPU the machine does not have
+                // (`ProcfsFile::of_kernel_open`): by its spelling here, and
+                // by its link below.
+                let cpus = self.cfg.virtual_cpu_count();
+                let mut procfs = ProcfsFile::of_kernel_open(&observed_path, cpus);
                 // Under record and replay the link is read for every open,
                 // also one whose spelling classifies: a spelling through `..`
                 // (`/proc/self/../self/io`) classifies as the file it reaches,
@@ -4927,8 +4928,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if procfs.is_none() {
                         procfs = resolved
                             .filter(|resolved| resolved != &observed_path)
-                            .and_then(|resolved| ProcfsFile::from_path(&resolved))
-                            .filter(ProcfsFile::kernel_served);
+                            .and_then(|resolved| ProcfsFile::of_kernel_open(&resolved, cpus));
                     }
                 }
                 // A process's cgroup file bind-mounted at another path, or
@@ -6565,7 +6565,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
         })?;
         let virtual_cpuinfo = (is_cpuinfo && (placeholder || self.rendered_files(guest).cpuinfo))
-            .then(|| self.virtual_cpuid().cpuinfo());
+            .then(|| {
+                self.virtual_cpuid()
+                    .cpuinfo(guest.config().virtual_cpu_count())
+            });
         let needs_random_uuid = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_random_uuid())?;
@@ -6799,6 +6802,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             detfd.procfs_status_mask_thread(&contents)
         })?;
         let mask_facts = status_published_sigblk(guest, mask_thread).await?;
+        // Under `--virtual-cpus` a status reports the CPU affinity of the
+        // thread it describes. A thread the scheduler no longer knows (one
+        // reaped while the file was open) shows every CPU.
+        let cpus_allowed = match (self.cfg.virtual_cpus, mask_thread) {
+            (Some(cpus), Some(thread)) => Some(
+                crate::tool_global::cpu_affinity(guest, crate::types::DetTid::from_raw(thread))
+                    .await
+                    .cpus(cpus.get())
+                    .unwrap_or_else(|_| crate::cpu_set::CpuSet::first(cpus.get())),
+            ),
+            _ => None,
+        };
         // A process's `stat` or `comm` Detcore opened renders its task's
         // record in the process table as of this read (`procfs::task_stat`).
         let task_stat = self
@@ -6828,6 +6843,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // step 3c.1e A).
                     status_hides_ignored: guest.config().in_guest_signal_delivery,
                     status_held_ignored: (mask_facts.held_private, mask_facts.held_shared),
+                    cpus_allowed,
                     lock_rows_kept: lock_rows_kept.clone(),
                     task_stat,
                 },
@@ -14165,9 +14181,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Drop from `entries`, read from the directory open as `fd`, the CPUs and
-    /// nodes that Hermit's single virtual CPU and node leave out (see
+    /// nodes that the virtual CPUs and single node leave out (see
     /// [`is_absent_cpu_entry`]), so that a guest counting
-    /// `/sys/devices/system/cpu/cpuN` finds one CPU, as `online` and
+    /// `/sys/devices/system/cpu/cpuN` finds the virtual CPUs, as `online` and
     /// `sched_getaffinity` report
     /// (<https://github.com/rrnewton/hermit/issues/4160>); and the `/proc`
     /// names outside the run's `--proc` level, which lookups refuse (see
@@ -14232,8 +14248,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         if let Some(directory) = directory {
             let level = self.cfg.proc_level;
+            let cpus = self.cfg.virtual_cpu_count();
             entries.retain(|entry| {
-                !is_absent_cpu_entry(&directory, &entry.name)
+                !is_absent_cpu_entry(&directory, &entry.name, cpus)
                     && !(on_procfs && levels::absent_entry(&directory, &entry.name, level))
             });
         }

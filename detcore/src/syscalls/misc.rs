@@ -1143,15 +1143,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// getcpu system call
+    /// getcpu system call: CPU 0 of Hermit's historical single CPU, or under
+    /// `--virtual-cpus` the thread's virtual CPU (`Detcore::virtual_cpu`).
+    /// The vDSO's `getcpu` reaches here too: Reverie turns it into this
+    /// system call.
     pub async fn handle_getcpu<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Getcpu,
     ) -> Result<i64, Error> {
-        // Always set the CPU to 0.
+        let current = match self.cfg.virtual_cpus {
+            Some(cpus) => self.virtual_cpu(guest, cpus.get()).await,
+            None => 0,
+        };
         if let Some(cpu) = call.cpu() {
-            guest.memory().write_value(cpu, &0)?;
+            guest.memory().write_value(cpu, &current)?;
         }
 
         // Always set the NUMA node to 0.

@@ -1190,7 +1190,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's
     // syscall_histogram::tests::the_finished_form_keeps_only_nonzero_slots_and_sums_back_exactly
     // (finished threads keep sparse histograms): 1867, listed.
-    ("test.regular_crates", 1880),
+    // --virtual-cpus: config's virtual_cpus_never_enter_the_legacy_form and
+    // virtual_cpus_parse_from_1_to_128: 1882.
+    ("test.regular_crates", 1882),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1839,7 +1841,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And A5 slice 3c.1e B's forced-gate harness (in_guest_delivery_harness):
     // the_parent_runner_never_forces_the_gate and six forced_gate_* rows:
     // 1121, listed (1114 on main plus seven).
-    ("test.hermit_unit", 1121),
+    // --virtual-cpus: run's virtual_cpus_need_a_host_directory_per_cpu: 1122.
+    ("test.hermit_unit", 1122),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3033,7 +3036,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And A5 slice 3c.1e B's unit: threads' disposition_mask_tests::
     // a_gated_managed_wait_reads_the_guest_mask_without_replacing_it: 2682,
     // listed.
-    ("test.detcore_unit", 2682),
+    // And --virtual-cpus's twelve units: five cpu_set, two cpuid (a cpuinfo
+    // block per CPU, APIC IDs of the executing CPU), procfs's status
+    // affinity unit, affinity's getaffinity length unit and three
+    // cpu_affinity_tests of the thread tree: 2694.
+    ("test.detcore_unit", 2694),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4286,7 +4293,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none
     // (the placeholder is mounted only for KVM), are run_kvm_ tests, which this
     // node skips and privileged-test.cli_kvm runs.
-    ("test.cli", 622),
+    // And the four --virtual-cpus tests (every_cpu_count_agrees,
+    // affinity_follows_linux, let_a_sysconf_sized_pool_race,
+    // outside_1_to_128_are_refused): 626.
+    ("test.cli", 626),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4802,7 +4812,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two tests split out of the discarded-at-send test, not
     // excluded: 535.
     // And the same four P1 placeholder tests, not excluded: 539.
-    ("test.cli_on_host", 541),
+    // The four --virtual-cpus tests start no in-guest runtime: 545.
+    ("test.cli_on_host", 545),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5260,7 +5271,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five shared runtime-FD readlink regressions: 2667, listed.
     // Fixed 0.5.4 rebase recount also retains the priority-history regressions.
     // And the same 3c.1e B unit: 2682, listed.
-    ("test.detcore_unit_on_host", 2682),
+    // And the same twelve --virtual-cpus units: 2694.
+    ("test.detcore_unit_on_host", 2694),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5626,7 +5638,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (validation_dag::HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS) while
     // test.hermit_unit runs all seven: 1115, listed
     // (1114 on main plus one).
-    ("test.hermit_unit_on_host", 1115),
+    // The same --virtual-cpus host-directory test: 1116.
+    ("test.hermit_unit_on_host", 1116),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5831,7 +5844,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same native-client publication regression is included on the host.
     // And the same detcore-dbt fingerprint test: 1852, listed.
     // And the same finished-thread sparse histogram unit: 1853, listed.
-    ("test.regular_crates_on_host", 1866),
+    // The same two --virtual-cpus config tests: 1868.
+    ("test.regular_crates_on_host", 1868),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
