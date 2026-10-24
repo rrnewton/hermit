@@ -76,9 +76,16 @@ pub struct AnalyzeOpts {
     #[clap(long)]
     pub run_needleman: bool,
 
-    /// Given a passing/failing run pair, based on different chaos seeds, first minimize the
-    /// chaos-mode interventions necessary to flip between the two outcomes.  This may accelerate
-    /// the subsequent binary search.
+    /// Before searching, minimize the target run's chaos-mode interventions (its preemptions
+    /// and priority changes) to those it needs to meet the target criteria, by knocking them out
+    /// a batch at a time. This may accelerate the subsequent binary search.
+    ///
+    /// The baseline is then the minimized record with its latest intervention knocked out, and
+    /// knocked out again while the replay still meets the target; when no intervention is left,
+    /// or the knocked-out run does not finish, analyze searches within the target schedule
+    /// instead (as `--prefix-search` does). So `--minimize` finds its own baseline and does not
+    /// take `--run2-seed`, `--run2-preemptions` or `--run2-schedule`. To search between a given
+    /// pair of runs, omit `--minimize`.
     #[clap(
         long,
         conflicts_with = "run2_seed",
