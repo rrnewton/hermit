@@ -432,7 +432,7 @@ pub(crate) async fn unmap_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
         ))
         .await;
     if let Err(errno) = unmapped {
-        tracing::warn!("[detcore] could not unmap the transient procfs page: {errno}");
+        tracing::warn!("[detcore] could not unmap a transient page: {errno}");
     }
 }
 

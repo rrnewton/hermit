@@ -238,7 +238,7 @@ const SEND_FLAGS: i32 = libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT | libc::MSG_MORE
 
 /// The shortest IPv6 `sockaddr` Linux accepts: RFC 2133's, without
 /// `sin6_scope_id` (`SIN6_LEN_RFC2133`).
-const SOCKADDR_IN6_RFC2133_LEN: usize = 24;
+pub(crate) const SOCKADDR_IN6_RFC2133_LEN: usize = 24;
 
 /// The longest `sockaddr` Linux copies in (`sizeof(struct sockaddr_storage)`).
 const SOCKADDR_STORAGE_LEN: usize = 128;
@@ -468,7 +468,7 @@ fn address_from_sockaddr(bytes: &[u8]) -> Option<NetworkAddressV1> {
 /// Copy in a `sockaddr` as Linux's `move_addr_to_kernel` does: a length
 /// beyond `sockaddr_storage` or below zero fails with `EINVAL`, and a zero
 /// length copies nothing.
-fn read_sockaddr<M: MemoryAccess>(
+pub(crate) fn read_sockaddr<M: MemoryAccess>(
     memory: &M,
     address: Option<AddrMut<'_, libc::sockaddr>>,
     addrlen: i32,
