@@ -2660,6 +2660,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/sleep_restart.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/sleep_restart.c is owned by hermit-cli/tests/cli.rs: kernel_run_sleeps_and_futex_waits_restart_as_on_linux runs its nanosleep, clock_nanosleep, abs, futex and alrm modes natively, under ptrace with --strict, plain and with --no-sequentialize-threads, and (but for abs) under record start --verify --verify-strict, and requires native's lines: a 100 ms nanosleep, relative or absolute clock_nanosleep or FUTEX_WAIT that 40 ignored SIGWINCH end over and over outlasts the third and still ends before they stop, and a SIGALRM handler gets EINTR and the time left. It stays a fixture because the test compares native and Hermit output."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/sleep_sigchld_taker.c",
       "runner": "hermit-cli/tests/external_signal_interrupt.rs",
       "why": "tests/c/sleep_sigchld_taker.c is owned by hermit-cli/tests/external_signal_interrupt.rs: The integration suite compiles this guest and checks that a pause or nanosleep of the thread that forked a child, beside a sibling spinning without system calls, takes the child's SIGCHLD and returns EINTR with the handler on the sleeping thread, as on Linux."

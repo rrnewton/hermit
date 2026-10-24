@@ -939,7 +939,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         if call.flags() > libc::TIMER_ABSTIME {
             trace!("Unhandled clock_nanosleep flags, letting syscall through...");
-            return Ok(guest.inject(Syscall::from(call)).await?);
+            // Linux reads only TIMER_ABSTIME from the flags, so the kernel runs
+            // this as a relative or absolute sleep and may leave a restart block.
+            return crate::syscalls::helpers::inject_keeping_kernel_restart(
+                guest,
+                Syscall::from(call),
+            )
+            .await;
         }
 
         // The CPU clocks are Detcore's own only where it virtualizes time;
@@ -1022,7 +1028,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let req = stack.push(relative_ts);
                     stack.commit()?;
                     let modified_call = syscalls::Nanosleep::new().with_req(Some(req));
-                    Ok(guest.inject(modified_call).await?)
+                    // Linux restarts an absolute sleep by running it again, but
+                    // this relative one keeps the host end the kernel computed,
+                    // so it restarts from the kernel's restart block. Running
+                    // the absolute call again would wait the whole interval
+                    // again: logical time stands still while the thread sleeps
+                    // in the kernel. The block holds no pointer to the request
+                    // on the stack, and no `rem`.
+                    crate::syscalls::helpers::inject_keeping_kernel_restart(guest, modified_call)
+                        .await
                 } else {
                     trace!(
                         "Not sequentializing threads not virtualizing, letting nanosleep through..."
@@ -1055,7 +1069,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         trace!("Not sequentializing threads, letting nanosleep through...");
         if call.flags() & libc::TIMER_ABSTIME == 0 {
-            return Ok(guest.inject(Syscall::from(call)).await?);
+            return crate::syscalls::helpers::inject_keeping_kernel_restart(
+                guest,
+                Syscall::from(call),
+            )
+            .await;
         }
         let mut stack = guest.stack().await;
         let req = stack.push(Timespec {

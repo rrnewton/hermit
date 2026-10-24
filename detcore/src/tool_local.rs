@@ -4530,7 +4530,7 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) parent_cpu_publication: Option<Arc<ChildCpuPublication>>,
 
-    /// The deadline of a wait this thread's last syscall ended with
+    /// The record of a wait this thread's last syscall ended with
     /// `ERESTART_RESTARTBLOCK`, for the `restart_syscall` that resumes it
     /// (`syscalls::helpers::RestartBlock`). The next syscall takes it
     /// (`Detcore::handle_syscall_event`).

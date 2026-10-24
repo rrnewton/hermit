@@ -184,6 +184,7 @@ static FUTEX_LOCK_PI_REFUSED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_KEYED_ACCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAKE_OP_FILE_SHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_REWAIT_CHANGED_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SLEEP_RESTART_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMER_SIGNAL_MASKED_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_LAST_BAND_ADMISSION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static YIELD_LOOP_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -42643,6 +42644,87 @@ fn a_timer_armed_by_a_thread_that_blocks_its_signal_wakes_another_thread() {
             format!("{mode}: the worker woke, taken by worker 1\n"),
             "{mode}"
         );
+    }
+}
+
+/// A timed sleep or futex wait that a signal ends in the kernel leaves
+/// `ERESTART_RESTARTBLOCK`. With no handler to run, Linux restarts it through
+/// `restart_syscall` until the end it kept (`hrtimer_nanosleep_restart` in
+/// kernel/time/hrtimer.c, `futex_wait_restart` in kernel/futex/waitwake.c); a
+/// handler gets `EINTR`. Without sequentialized threads Detcore runs these
+/// waits in the kernel and refused the restart as an unsupported syscall
+/// (exit 122). In the guest (`tests/c/sleep_restart.c`) a child sends 40
+/// SIGWINCH, ignored by default but queued under ptrace, 20 ms apart while the
+/// parent waits 100 ms in `nanosleep`, a relative and an absolute
+/// `clock_nanosleep`, or a `FUTEX_WAIT`; each wait must outlast the third
+/// signal (a count the child keeps in shared memory) and still end long before
+/// the signals stop. A SIGALRM handler must still get `EINTR` and the time
+/// left. Every mode must print native's line, except that record skips the
+/// absolute sleep (see the comment there). The strict, plain and record legs
+/// emulate the waits and passed before; the `--no-sequentialize-threads` leg
+/// runs them in the kernel.
+#[test]
+fn kernel_run_sleeps_and_futex_waits_restart_as_on_linux() {
+    let _lock = hermit_run_guard();
+    let guest = compiled_c_guest(&SLEEP_RESTART_GUEST, "sleep_restart");
+    let guest = guest.to_str().unwrap();
+    // As in run_strict_flag_is_accepted_and_runs, the strict leg disables the
+    // PMU timer and CPUID faulting so it runs where those are unavailable.
+    let strict = [
+        "--strict",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+    ];
+    for mode in ["nanosleep", "clock_nanosleep", "abs", "futex", "alrm"] {
+        let native = Command::new(guest)
+            .arg(mode)
+            .output()
+            .expect("failed to run the guest natively");
+        let expected = String::from_utf8_lossy(&native.stdout).into_owned();
+        let pinned = if mode == "alrm" {
+            "alrm: nanosleep EINTR (time left within 0-100 ms: yes), clock_nanosleep EINTR \
+             (time left within 0-100 ms: yes), futex EINTR; 3 alarms\n"
+                .to_owned()
+        } else {
+            let result = if mode == "futex" { "ETIMEDOUT" } else { "0" };
+            format!(
+                "{mode}: {result}; at least 3 signals came first: yes; the storm was still \
+                 running when it returned: yes; 1 children\n"
+            )
+        };
+        assert_eq!(expected, pinned, "native {mode}");
+        for flags in [&strict[..], &[], &["--no-sequentialize-threads"]] {
+            let mut args = vec!["run", "--timeout", "120", "--base-env=minimal"];
+            args.extend_from_slice(flags);
+            args.extend(["--", guest, mode]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{args:?}");
+        }
+        // Record skips the absolute sleep: without virtual time a
+        // sequentialized absolute clock_nanosleep only yields
+        // (`handle_nanosleep_family`), so it returns before the signals.
+        if mode == "abs" {
+            continue;
+        }
+        let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create the recording data dir");
+        let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+        let args = [
+            "record",
+            "start",
+            "--verify",
+            "--verify-strict",
+            "--record-timeout",
+            "120",
+            &data_dir_arg,
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
     }
 }
 
