@@ -262,11 +262,51 @@ greppable marker, and that marker — not the status — is what a caller keys o
 | `safehermit: bound.wall=APPLIED` … then a kill | the outermost cgroup deadline reaped the tree | the run escaped every inner bound |
 | a nextest-named test with wrapper exit 100 | the test **process** exceeded its per-test cap | `.config/nextest.toml` |
 | exit 124 with **no marker at all** | something outside hermit killed it — `timeout(1)` on the cell, or a harness | the cell's `timeout_seconds`, or a missing inner bound |
+| `HERMIT_GUEST_DEADLOCK class=guest-deadlock`, exit **121** | **no rung fired**: the scheduler proved the guest can never run again and ended the run (see below) | the guest's synchronization; the report above the line names every blocked thread |
 
 That last row is the useful one. **A cell that times out with no class line means
 no inner bound fired**, which is either a missing `--timeout` or an inner bound
 set larger than the outer one. Both are configuration errors, and the marker's
 absence is what distinguishes them from a genuinely slow guest.
+
+## A guest deadlock is not a timeout
+
+A deadlocked guest is the virtual-time analogue of a hung one. Natively it
+would hang until some rung above stopped it; under Hermit every remaining
+thread is blocked on something no later scheduler turn can supply, so "no
+thread can be woken now" is also "no thread can ever be woken". The scheduler
+prints its `Deadlock detected: ...` report and the run ends at once, in virtual
+time and without waiting for any bound. That is the guest's outcome, not
+Hermit's failure, so it has its own status and class line:
+`HERMIT_GUEST_DEADLOCK class=guest-deadlock`, exit **121** (allocated in
+`hermit-cli/src/lib.rs` beside 122-127).
+
+On ptrace the run is unwound the way `--timeout` unwinds one, by publishing a
+termination that tears the parked guest down, and then finished as for a guest
+that exited: its output so far is kept, `--summary` is printed and says "The
+guest deadlocked", a recording is committed and replays to the same deadlock,
+and `--verify` compares the two runs (under every `--verify-allow`, since a
+deadlocked guest exited with no status of its own). Two runs that deadlock at
+the same point verify equal; the report records `guest_exit_code: 121`. A
+teardown that records a failure of its own (a capture drain or cleanup error)
+is Hermit's failure instead, `HERMIT_INTERNAL_FAILURE`, because the kept output
+may then be incomplete. Library callers receive `hermit::GuestDeadlocked`,
+carrying the output when the run captured it. Reverie still logs each tracee
+the unwind kills (`guest terminated by signal ... SIGKILL`), as it does for
+`--timeout`.
+
+Only ptrace unwinds the guest, and only ptrace is measured. On the other
+backends the scheduler still exits with 121 from the process it runs in. From
+a container child the parent reports that exit the same way, without a
+summary. A scheduler that runs elsewhere hands 121 to Hermit as an ordinary
+exit status, without the class line: DBT drives its scheduler in Hermit's own
+process (see `TerminalDeadlockRecording` in `hermit-cli/src/bin/hermit/verify.rs`),
+whose `--verify` records `run_failed` with failure `deadlock` as before.
+
+The scheduler's own `HERMIT_DEADLOCK: ...` verdicts are not this. They say
+Hermit cannot go on (a broken invariant, or a death the backend never
+reported), and stay `HERMIT_INTERNAL_FAILURE class=container-child-exit`,
+exit 125.
 
 ## `--timeout` is qualified per backend, and refuses elsewhere
 

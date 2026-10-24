@@ -291,6 +291,7 @@ static PARENT_DEATH_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_PIDFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static UNTRACED_CLONE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHILD_WAIT_DEADLOCK_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CONDVAR_JOIN_DEADLOCK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_THEN_SIBLING_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_PERMITS_PER_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GROUP_EXIT_SIGNAL_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -3383,6 +3384,32 @@ fn child_wait_deadlock_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "child-wait-deadlock guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn condvar_join_deadlock_guest() -> &'static Path {
+    CONDVAR_JOIN_DEADLOCK_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("condvar-join-deadlock");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the condvar-join-deadlock guest directory");
+        let guest = build_root.join("condvar_join_deadlock");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/condvar_join_deadlock.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the condvar-join-deadlock guest");
+        assert!(
+            output.status.success(),
+            "condvar-join-deadlock guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -36482,12 +36509,13 @@ fn a_wait_after_a_sigkill_to_an_exited_leader_is_a_deadlock() {
         );
         assert_eq!(
             status.and_then(|status| status.code()),
-            Some(HERMIT_INTERNAL_FAILURE_EXIT),
+            Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
             "{mode}: {log}"
         );
         assert!(
             log.contains("Deadlock detected")
-                && log.contains("thread(s) waiting for a child that cannot exit"),
+                && log.contains("thread(s) waiting for a child that cannot exit")
+                && log.contains("HERMIT_GUEST_DEADLOCK class=guest-deadlock"),
             "{mode}: the deadlock report must name the wait:\n{log}"
         );
     }
@@ -40817,14 +40845,210 @@ fn a_clone_pidfd_is_known_to_detcore() {
     );
 }
 
+/// The stdout `tests/c/condvar_join_deadlock.c` writes before it deadlocks.
+const CONDVAR_JOIN_DEADLOCK_STDOUT: &str = "main: joining a thread that waits forever\n";
+
+/// A guest that deadlocks (main joins a thread waiting on a condition
+/// variable nobody signals) ends with the guest-deadlock outcome, not as an
+/// internal failure: exit 121 and `HERMIT_GUEST_DEADLOCK class=guest-deadlock`
+/// after the scheduler's report, with the output written before the deadlock
+/// kept and the run summary saying the guest deadlocked. Before, the container
+/// child exited 1 and the run reported
+/// `HERMIT_INTERNAL_FAILURE class=container-child-exit` and exit 125, with no
+/// summary (ptrace, `--strict`, `--chaos`).
+#[test]
+fn a_guest_deadlock_is_the_guests_outcome_not_an_internal_failure() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let guest = condvar_join_deadlock_guest().to_str().unwrap().to_owned();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--chaos",
+            "--seed=1",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--summary",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+        "{log}"
+    );
+    assert_eq!(stdout, CONDVAR_JOIN_DEADLOCK_STDOUT, "{log}");
+    let line_of = |wanted: &str| {
+        log.lines()
+            .position(|line| line == wanted)
+            .unwrap_or_else(|| panic!("no line {wanted:?}:\n{log}"))
+    };
+    let report =
+        line_of("Deadlock detected: thread(s) waiting on futex, but no runnable threads left.");
+    let summary =
+        line_of("The guest deadlocked: every remaining thread was blocked with no possible wake.");
+    let class = line_of("HERMIT_GUEST_DEADLOCK class=guest-deadlock");
+    assert!(
+        report < summary && summary < class,
+        "the report, then the summary, then the class line:\n{log}"
+    );
+    assert!(!log.contains("HERMIT_INTERNAL_FAILURE"), "{log}");
+    assert!(!log.contains("backend failure"), "{log}");
+}
+
+/// Two runs of a guest that deadlocks reach the same deadlock, so `--verify
+/// --verify-strict` compares them and establishes bitwise parity, with the
+/// default `--verify-allow` and with `failure` alike (a deadlocked guest
+/// exited with no status of its own), and the verification ends with the
+/// guest's outcome: the stdout both runs agreed on once, the class line and
+/// exit 121. Before, run 1's container child exited 1 and the report was
+/// `no_result` with `container_failed` under either (ptrace, `--strict`).
+#[test]
+fn a_guest_deadlock_verifies_as_the_same_outcome_in_both_runs() {
+    let _guard = hermit_run_guard();
+    let guest = condvar_join_deadlock_guest().to_str().unwrap().to_owned();
+    for allow in [None, Some("--verify-allow=failure")] {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report_path = directory.path().join("verify.json");
+        let mut args = vec![
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_path.to_str().unwrap(),
+        ];
+        args.extend(allow);
+        args.extend(["--", guest.as_str()]);
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+            "{allow:?}: {log}"
+        );
+        assert_eq!(
+            stdout(&output),
+            CONDVAR_JOIN_DEADLOCK_STDOUT,
+            "{allow:?}: {log}"
+        );
+        assert!(
+            log.contains(":: Success: deterministic. Determinism verified."),
+            "{allow:?}: {log}"
+        );
+        assert!(
+            log.ends_with(
+                "HERMIT_GUEST_DEADLOCK class=guest-deadlock\nError: The guest deadlocked: every \
+                 remaining thread is blocked with no possible wake, so natively it would hang \
+                 forever. This is the guest's outcome, not a hermit failure; the deadlock \
+                 report is above. If the program does not hang natively, report it as a \
+                 hermit bug.\n"
+            ),
+            "{allow:?}: {log}"
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+        assert_eq!(report["verdict"], serde_json::json!("matched"), "{report}");
+        assert_eq!(report["verified"], serde_json::json!(true), "{report}");
+        assert_eq!(
+            report["bitwise_parity"],
+            serde_json::json!(true),
+            "{report}"
+        );
+        assert_eq!(
+            report["guest_exit_code"],
+            serde_json::json!(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+            "{report}"
+        );
+    }
+}
+
+/// A recording of a guest that deadlocks is kept, ends with the guest's
+/// outcome, and replays to the same deadlock; `record start --verify
+/// --verify-strict` finds the recording and its replay identical (ptrace,
+/// `--strict` recording). Before, the recorder's container child exited 1 and
+/// the recording was discarded.
+#[test]
+fn a_recorded_guest_deadlock_replays_to_the_same_outcome() {
+    let _guard = hermit_run_guard();
+    let data = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let directory = data.path().to_str().unwrap();
+    let guest = condvar_join_deadlock_guest().to_str().unwrap().to_owned();
+    let deadlocked = |output: &Output, what: &str| {
+        let log = stderr(output);
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+            "{what}: {log}"
+        );
+        assert_eq!(
+            stdout(output),
+            CONDVAR_JOIN_DEADLOCK_STDOUT,
+            "{what}: {log}"
+        );
+        assert!(
+            log.contains("HERMIT_GUEST_DEADLOCK class=guest-deadlock"),
+            "{what}: {log}"
+        );
+        log
+    };
+    let record_args = [
+        "record",
+        "start",
+        "--strict",
+        "--base-env=minimal",
+        "--data-dir",
+        directory,
+        "--",
+        guest.as_str(),
+    ];
+    let record_log = deadlocked(&hermit(&record_args), "record");
+    assert!(record_log.contains("RECORDING COMPLETE!"), "{record_log}");
+    let replay_log = deadlocked(
+        &hermit(&["replay", "--autopilot", "--data-dir", directory]),
+        "replay",
+    );
+    assert!(
+        replay_log.contains(
+            "Deadlock detected: thread(s) waiting on futex, but no runnable threads left."
+        ),
+        "{replay_log}"
+    );
+    let verify_args = [
+        "record",
+        "start",
+        "--strict",
+        "--base-env=minimal",
+        "--data-dir",
+        directory,
+        "--verify",
+        "--verify-strict",
+        "--",
+        guest.as_str(),
+    ];
+    let verify_log = deadlocked(&hermit(&verify_args), "record --verify");
+    assert!(
+        verify_log.contains(":: Success: replay matched recording."),
+        "{verify_log}"
+    );
+}
+
 /// A parent waiting for a child that cannot exit (its only thread paused
 /// forever, waiting on a futex no one wakes, or itself waiting for a paused
-/// grandchild) ends the run with Detcore's deadlock report, exit 125, as the
-/// same child without the wait does. Before, the run spun until the outer
-/// timeout (https://github.com/rrnewton/hermit/issues/4430). The report is
-/// the same in two runs with the same epoch. A wait that can end (a second
-/// parent thread kills the child after a sleep; the child's alarm wakes it)
-/// still ends as on Linux (ptrace, `--strict`).
+/// grandchild) ends the run with Detcore's deadlock report, exit 121 (class
+/// guest-deadlock), as the same child without the wait does. Before, the run
+/// spun until the outer timeout (https://github.com/rrnewton/hermit/issues/4430).
+/// The report is the same in two runs with the same epoch. A wait that can end
+/// (a second parent thread kills the child after a sleep; the child's alarm
+/// wakes it) still ends as on Linux (ptrace, `--strict`).
 #[test]
 fn a_wait_for_a_child_that_cannot_exit_is_a_deadlock() {
     let guest = child_wait_deadlock_guest().to_str().unwrap().to_owned();
@@ -40855,11 +41079,16 @@ fn a_wait_for_a_child_that_cannot_exit_is_a_deadlock() {
         ("chain", "thread(s) waiting indefinitely"),
     ] {
         let (code, stdout, log) = run(mode);
-        assert_eq!(code, Some(125), "{mode}: {stdout}\n{log}");
+        assert_eq!(
+            code,
+            Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+            "{mode}: {stdout}\n{log}"
+        );
         assert!(
             log.contains("Deadlock detected")
                 && log.contains(class)
-                && log.contains("thread(s) waiting for a child that cannot exit"),
+                && log.contains("thread(s) waiting for a child that cannot exit")
+                && log.contains("HERMIT_GUEST_DEADLOCK class=guest-deadlock"),
             "{mode}: the deadlock report must name the wait:\n{log}"
         );
     }

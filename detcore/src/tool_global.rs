@@ -2185,6 +2185,13 @@ impl GlobalState {
         }
     }
 
+    /// Whether this run ended with a guest deadlock that its backend unwound
+    /// (`GuestDeadlockUnwindGuard`): the status the run completed with is
+    /// then `HERMIT_GUEST_DEADLOCK_EXIT`, not one the guest exited with.
+    pub fn guest_deadlocked(&self) -> bool {
+        self.sched.lock().unwrap().guest_deadlocked()
+    }
+
     /// Consume failed-run state after the scheduler has naturally finished.
     ///
     /// A failed run has no successful run summary. Preserve the scheduler's

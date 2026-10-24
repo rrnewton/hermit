@@ -1858,7 +1858,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 11c35a504a6, less the five real_random_ skips: 1230 - 5; the full
     // validate at 24fbff99c7a saw 1224 before 11c35a504a6 added one):
     // 1202 + 23 = 1225.
-    ("test.hermit_unit", 1221),    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
+    // And the guest-deadlock outcome's units:
+    // container::tests::a_container_child_exiting_guest_deadlock_is_a_guest_outcome,
+    // tests::guest_deadlock_uses_its_own_exit_and_marker,
+    // ptrace_completion::tests::a_guest_deadlock_completes_with_its_status_and_the_captured_output
+    // and error::tests::a_guest_deadlock_is_the_guests_outcome_only_once_the_run_finished:
+    // 1225, listed.
+    ("test.hermit_unit", 1225),    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
     // Four process-retirement fence controls and four uncontrolled-retirement
@@ -3079,7 +3085,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // MSG_DONTWAIT): 2883 + 14 = 2897, measured with `cargo nextest list`
     // at 16fb7fbec04 and re-measured at this head.
     // And the TracerPid unit (32e9ef22f60): 2897 + 1 = 2898.
-    ("test.detcore_unit", 2898),
+    // And scheduler::test::terminal_verdicts_carry_the_kind_that_decides_the_status
+    // (the guest-deadlock outcome): 2899, listed.
+    ("test.detcore_unit", 2899),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4385,7 +4393,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 700 + 2 = 702.
     // And 11c35a504a6's two --base-env=minimal cli tests: 702 + 2 = 704,
     // measured with `cargo nextest list` at 11c35a504a6.
-    ("test.cli", 703),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
+    // And a_guest_deadlock_is_the_guests_outcome_not_an_internal_failure,
+    // a_guest_deadlock_verifies_as_the_same_outcome_in_both_runs and
+    // a_recorded_guest_deadlock_replays_to_the_same_outcome (the guest-deadlock
+    // outcome, tests/c/condvar_join_deadlock.c): 706, listed.
+    ("test.cli", 706),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
     // sabre_reports_a_replaced_host_file_without_naming_it_the_cause,
@@ -4935,7 +4947,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // `cargo nextest list` at 16fb7fbec04 and re-measured at this head.
     // And the same two TracerPid cli tests: 619 + 2 = 621.
     // And the same two 11c35a504a6 tests: 621 + 2 = 623.
-    ("test.cli_on_host", 622),
+    // And the same three guest-deadlock outcome tests: 625, listed.
+    ("test.cli_on_host", 625),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5411,7 +5424,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same fourteen train-12 detcore units: 2883 + 14 = 2897,
     // measured with `cargo nextest list` at this head.
     // And the same TracerPid unit: 2898.
-    ("test.detcore_unit_on_host", 2898),
+    // And the same guest-deadlock terminal-verdict unit: 2899, listed.
+    ("test.detcore_unit_on_host", 2899),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5783,7 +5797,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1166.
     // Train 6 recount (measured on 21f770f6 base): 1181.
     // The same 23, keeping the six local-only cases: 1196 + 23 = 1219.
-    ("test.hermit_unit_on_host", 1215),
+    // And the same four guest-deadlock outcome units: 1219, listed.
+    ("test.hermit_unit_on_host", 1219),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

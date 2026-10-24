@@ -132,6 +132,10 @@ pub enum VerifyRunOutcome {
         /// the log (LiteInst, SaBRe); `None` on a backend that forwards none.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forwarded_syscalls: Option<u64>,
+        /// The guest deadlocked (`hermit::GuestDeadlocked`); `status` is then
+        /// `HERMIT_GUEST_DEADLOCK_EXIT`, which the guest never exited with.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        guest_deadlock: bool,
     },
     /// A typed failure of the run stopped it ([`RunFailure`]).
     RunFailed {

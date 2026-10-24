@@ -247,6 +247,12 @@ pub struct RunSummary {
     /// records or replays preemptions. Full report only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_exclusives_unavailable: Option<String>,
+    /// The run ended because the guest deadlocked: every remaining thread was
+    /// blocked with no possible wake, so natively it would hang forever. Its
+    /// status is then `HERMIT_GUEST_DEADLOCK_EXIT`, not one the guest exited
+    /// with. Absent (false) for every other run and in older summaries.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub guest_deadlock: bool,
 }
 
 /// The store-exclusives a run's guest speculatively executed that failed,
@@ -369,6 +375,7 @@ impl RunSummary {
             exclusive_pairs,
             store_exclusives,
             store_exclusives_unavailable,
+            guest_deadlock,
         } = self;
         writeln!(f, "Final thread-tree was: {}", threads_descrip)?;
         writeln!(
@@ -378,6 +385,12 @@ impl RunSummary {
         )?;
         if let Some(syscalls) = syscalls {
             writeln!(f, "Guest threads completed {syscalls} syscalls.")?;
+        }
+        if *guest_deadlock {
+            writeln!(
+                f,
+                "The guest deadlocked: every remaining thread was blocked with no possible wake."
+            )?;
         }
         if include_report_metadata {
             writeln!(
