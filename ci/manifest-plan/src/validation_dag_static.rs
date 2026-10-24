@@ -1870,7 +1870,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And PR 4715's a_trial_writes_what_it_replays_only_into_the_workspace
     // (a trial never writes into a --replay-schedule-from or
     // --replay-preemptions-from file of the run arguments): 1226 + 1 = 1227.
-    ("test.hermit_unit", 1227),
+    // And PR 4639's schedule-search regression
+    // (schedules_without_a_reordering_end_with_no_single_swap): 1227 + 1 = 1228.
+    ("test.hermit_unit", 1228),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5811,7 +5813,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same 23, keeping the six local-only cases: 1196 + 23 = 1219.
     // The same six analyze outcome controls replace one obsolete warning test: +5.
     // And the same PR 4715 trial-input workspace test: 1220 + 1 = 1221.
-    ("test.hermit_unit_on_host", 1221),
+    // And the same PR 4639 regression: 1221 + 1 = 1222.
+    ("test.hermit_unit_on_host", 1222),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
