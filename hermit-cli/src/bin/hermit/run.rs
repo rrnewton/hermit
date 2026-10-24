@@ -438,6 +438,59 @@ pub(crate) fn refuse_an_inexact_branch_counter(
     )))
 }
 
+/// What reads the retired-conditional-branch counter on a command that
+/// [`refuse_an_inexact_branch_counter`] refuses with `--strict`, and so what
+/// [`warning_for_an_inexact_branch_counter`] says is not guaranteed without it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CounterReader {
+    /// A `hermit run`.
+    Run,
+    /// The trials of one `hermit analyze` or `hermit bisect`.
+    Trials,
+    /// A `hermit record start` recording.
+    Recording,
+}
+
+/// The one-line stderr warning for a command that goes on without `--strict`
+/// where [`refuse_an_inexact_branch_counter`] refuses it with `--strict`:
+/// Hermit times preemptions, and by default virtual time, with the
+/// retired-conditional-branch counter, so on a counter that failed Reverie's
+/// validation what `reader` would repeat is not guaranteed to repeat, and the
+/// command says so (https://github.com/rrnewton/hermit/issues/4515) and how
+/// to get a reproducible result. `None` when `inexact_branch_counter` finds the
+/// counter exact.
+///
+/// The fixed text comes first and Reverie's reason last: that reason carries
+/// measured counts that differ from one process to the next, so one host's
+/// warnings for one command share everything up to it. Reverie's message can
+/// span lines (`HardwareCountersNotWorking` embeds two newlines); the warning
+/// stays one line.
+pub(crate) fn warning_for_an_inexact_branch_counter(
+    reader: CounterReader,
+    inexact_branch_counter: fn() -> Option<String>,
+) -> Option<String> {
+    let reason = inexact_branch_counter()?;
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let not_guaranteed = match reader {
+        CounterReader::Run => {
+            "the same arguments and --seed, or a preemption record, are not guaranteed to \
+             reproduce this run"
+        }
+        CounterReader::Trials => {
+            "analyze and bisect trials can disagree for a hardware reason, and a seed, \
+             preemption record or schedule they report is not guaranteed to reproduce its outcome"
+        }
+        CounterReader::Recording => "a replay of this recording is not guaranteed to follow it",
+    };
+    Some(format!(
+        "WARNING: this host's retired-branch counter failed Reverie's performance-counter \
+         validation. Hermit times preemptions, and by default virtual time, with that counter, \
+         so {not_guaranteed}. For reproducible results use a host whose counters pass the \
+         validation (`hermit host-capabilities` reports exact-branch-counter: PRESENT, \
+         validation passed); --strict refuses this host. Reverie reports: {reason}\n"
+    ))
+}
+
 /// `hermit host-capabilities`'s own `exact_branch_counter` verdict, for a
 /// verification report (`VerificationReport::exact_branch_counter`).
 pub(crate) fn branch_counter_verdict() -> hermit::canonical_verdict::BranchCounterVerdict {
@@ -1719,8 +1772,8 @@ pub struct RunOpts {
     e9patch_sites: Option<reverie::SiteCounters>,
 
     /// Why this host's retired-branch counter is inexact, if it is. Only the
-    /// `--strict` refusal consults it; tests replace it to reach that refusal
-    /// on a host whose counters pass.
+    /// `--strict` refusal and the warning without `--strict` consult it; tests
+    /// replace it to reach both on a host whose counters pass.
     #[clap(skip = host_inexact_branch_counter as fn() -> Option<String>)]
     inexact_branch_counter: fn() -> Option<String>,
 }
@@ -5179,6 +5232,58 @@ fn a_run_on_an_inexact_branch_counter_warns_without_strict() {
         multiline,
     );
     assert!(result.is_ok() && lines.is_empty(), "{lines:?}");
+}
+
+/// The inexact-counter warning that `run`, `analyze`, `bisect` and `record
+/// start` share says, in one line, what the counter drives, what this command
+/// would repeat that is not guaranteed to (the run's seed or preemption
+/// record, the trials and what they report, a recording's replay), and what to
+/// do instead (a host whose counters pass, as `hermit host-capabilities`
+/// reports it; `--strict` refuses this one). It ends with Reverie's reason,
+/// whose counts vary between processes. A counter that passed gets no warning.
+#[test]
+fn the_inexact_branch_counter_warning_says_what_may_not_reproduce_and_what_to_do() {
+    let inexact: fn() -> Option<String> =
+        || Some("SpecLockMap is enabled\n  (91 of 95 locked\ninstructions)".to_string());
+    for (reader, not_guaranteed) in [
+        (
+            CounterReader::Run,
+            "so the same arguments and --seed, or a preemption record, are not guaranteed to \
+             reproduce this run.",
+        ),
+        (
+            CounterReader::Trials,
+            "so analyze and bisect trials can disagree for a hardware reason, and a seed, \
+             preemption record or schedule they report is not guaranteed to reproduce its \
+             outcome.",
+        ),
+        (
+            CounterReader::Recording,
+            "so a replay of this recording is not guaranteed to follow it.",
+        ),
+    ] {
+        assert_eq!(warning_for_an_inexact_branch_counter(reader, || None), None);
+        let warning = warning_for_an_inexact_branch_counter(reader, inexact)
+            .unwrap_or_else(|| panic!("{reader:?}: an inexact counter warns"));
+        for expected in [
+            "WARNING: this host's retired-branch counter failed Reverie's performance-counter \
+             validation. Hermit times preemptions, and by default virtual time, with that \
+             counter, ",
+            not_guaranteed,
+            " For reproducible results use a host whose counters pass the validation (`hermit \
+             host-capabilities` reports exact-branch-counter: PRESENT, validation passed); \
+             --strict refuses this host.",
+            " Reverie reports: SpecLockMap is enabled (91 of 95 locked instructions)\n",
+        ] {
+            assert!(
+                warning.contains(expected),
+                "{reader:?}: {expected:?}: {warning}"
+            );
+        }
+        assert!(warning.starts_with("WARNING: "), "{warning}");
+        assert!(warning.ends_with("instructions)\n"), "{warning:?}");
+        assert_eq!(warning.matches('\n').count(), 1, "one line: {warning:?}");
+    }
 }
 
 #[test]
@@ -10611,7 +10716,7 @@ impl RunOpts {
     /// The one-line stderr warning for a run that goes on without `--strict`
     /// while reading a retired-branch counter that failed Reverie's validation,
     /// which `--strict` refuses: the run proceeds on a degraded capability, so
-    /// it says so (https://github.com/rrnewton/hermit/issues/4515). Reverie
+    /// it says so ([`warning_for_an_inexact_branch_counter`]). Reverie
     /// validates the counters once per process, on its first timer, so asking
     /// here costs nothing more.
     fn inexact_branch_counter_warning(&self) -> Option<String> {
@@ -10620,16 +10725,7 @@ impl RunOpts {
         if !self.reads_the_branch_counter() {
             return None;
         }
-        (self.inexact_branch_counter)().map(|reason| {
-            // Reverie's message can span lines (`HardwareCountersNotWorking`
-            // embeds two newlines); the warning stays one line.
-            let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
-            format!(
-                "WARNING: this host's performance counters failed Reverie's validation \
-                 ({reason}); preemption by retired branches may not repeat, so a run may \
-                 not replay or verify. `hermit run --strict` refuses here.\n"
-            )
-        })
+        warning_for_an_inexact_branch_counter(CounterReader::Run, self.inexact_branch_counter)
     }
 
     /// `main`'s branch-counter check: a `--strict` run on a counter that failed
@@ -10650,20 +10746,35 @@ impl RunOpts {
         self.arms_reverie_ptrace_pmu_timer() && self.det_opts.det_config.max_timeslice.is_some()
     }
 
-    /// [`Self::refuse_strict_with_inexact_branch_counter`] for an `analyze` or
-    /// `bisect` trial (`AnalyzeOpts::refuse_strict_with_inexact_branch_counter`).
+    /// [`Self::reads_the_branch_counter`] for an `analyze` or `bisect` trial.
     /// Trials start through `RunOpts::run` and never pass through `main`
     /// (<https://github.com/rrnewton/hermit/issues/3810>), so `--namespace-only`
     /// (alias `--lite`) does not reach `run_with_namespace_only`: the trial
     /// still runs on the backend's runtime and its counter, and is not exempt.
+    fn trial_reads_the_branch_counter(&self) -> bool {
+        self.backend_arms_reverie_ptrace_pmu_timer()
+            && self.det_opts.det_config.max_timeslice.is_some()
+    }
+
+    /// [`Self::refuse_strict_with_inexact_branch_counter`] for an `analyze` or
+    /// `bisect` trial (`AnalyzeOpts::refuse_strict_with_inexact_branch_counter`),
+    /// under [`Self::trial_reads_the_branch_counter`].
     pub(crate) fn refuse_strict_trial_with_inexact_branch_counter(&self) -> Result<(), Error> {
-        if !self.strict
-            || !self.backend_arms_reverie_ptrace_pmu_timer()
-            || self.det_opts.det_config.max_timeslice.is_none()
-        {
+        if !self.strict || !self.trial_reads_the_branch_counter() {
             return Ok(());
         }
         refuse_an_inexact_branch_counter(self.selected_backend(), self.inexact_branch_counter)
+    }
+
+    /// [`Self::inexact_branch_counter_warning`] for the trials of one
+    /// `analyze` or `bisect` (`AnalyzeOpts::branch_counter_warning`): wherever
+    /// [`Self::refuse_strict_trial_with_inexact_branch_counter`] refuses
+    /// `--strict`, trials without it warn.
+    pub(crate) fn trial_inexact_branch_counter_warning(&self) -> Option<String> {
+        if !self.trial_reads_the_branch_counter() {
+            return None;
+        }
+        warning_for_an_inexact_branch_counter(CounterReader::Trials, self.inexact_branch_counter)
     }
 
     /// The run options set here that only `RunOpts::main` applies, as the

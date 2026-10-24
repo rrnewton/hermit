@@ -351,8 +351,8 @@ pub struct StartOpts {
     gdbex: Vec<String>,
 
     /// Why this host's retired-branch counter is inexact, if it is. Only the
-    /// `--strict` refusal consults it; tests replace it to reach that refusal
-    /// on a host whose counters pass.
+    /// `--strict` refusal and the warning without `--strict` consult it; tests
+    /// replace it to reach both on a host whose counters pass.
     #[clap(skip = crate::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
     inexact_branch_counter: fn() -> Option<String>,
 }
@@ -554,6 +554,29 @@ impl StartOpts {
         )
     }
 
+    /// `main`'s branch-counter check before a recording, as
+    /// `RunOpts::admit_branch_counter` makes it before a run:
+    /// [`Self::refuse_strict_with_inexact_branch_counter`], and a recording
+    /// without `--strict` on such a counter goes on and passes
+    /// `run::warning_for_an_inexact_branch_counter` to `warn` (stderr in
+    /// `main`), because its replay need not follow it. Every path of `main`
+    /// that records makes this check first: the plain recording, `--verify`,
+    /// the first run of `--verify-run`, and `--gdbex`.
+    fn admit_branch_counter(
+        &self,
+        global: &GlobalOpts,
+        warn: &mut dyn FnMut(&str),
+    ) -> Result<(), Error> {
+        self.refuse_strict_with_inexact_branch_counter(global)?;
+        if let Some(warning) = crate::run::warning_for_an_inexact_branch_counter(
+            crate::run::CounterReader::Recording,
+            self.inexact_branch_counter,
+        ) {
+            warn(&warning);
+        }
+        Ok(())
+    }
+
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         hermit::cpu_profile_admission::check_record_or_replay(self.cpu_profile).map_err(
             |refusal| Error::new(crate::container::PolicyRefusal).context(refusal.to_string()),
@@ -575,10 +598,10 @@ impl StartOpts {
             validate_log_level(global)?;
             self.record_verify_run(directory, global)
         } else if !self.gdbex.is_empty() {
-            self.refuse_strict_with_inexact_branch_counter(global)?;
+            self.admit_branch_counter(global, &mut crate::tracing::write_stderr_diagnostic)?;
             self.record_verify_debug(global)
         } else {
-            self.refuse_strict_with_inexact_branch_counter(global)?;
+            self.admit_branch_counter(global, &mut crate::tracing::write_stderr_diagnostic)?;
             let hermit = HermitData::from(self.data_dir.as_ref());
             let record_timeout = self.record_timeout();
             let local_networking = self.network() == NetworkingMode::Local;
@@ -680,7 +703,7 @@ impl StartOpts {
         }
         // After the pending report carries the counter verdict, so that a
         // refused recording still says which counter it would have read.
-        self.refuse_strict_with_inexact_branch_counter(global)?;
+        self.admit_branch_counter(global, &mut crate::tracing::write_stderr_diagnostic)?;
         let strictness = self.verification_strictness();
         let ((global1, log1), (global2, log2)) =
             setup_double_run(global, "record", "replay", strictness)
@@ -800,7 +823,7 @@ impl StartOpts {
         let exact_branch_counter = crate::run::branch_counter_verdict();
         let result = match &first {
             None => self
-                .refuse_strict_with_inexact_branch_counter(global)
+                .admit_branch_counter(global, &mut crate::tracing::write_stderr_diagnostic)
                 .and_then(|()| self.record_into(&writer.path(verify_run::RECORDING), &run_global)),
             Some(first) => {
                 self.replay_from(&first.directory().join(verify_run::RECORDING), &run_global)
@@ -1337,6 +1360,51 @@ mod tests {
             0,
             "a refused recording leaves nothing behind"
         );
+    }
+
+    /// Without `--strict`, a recording on a counter that fails Reverie's
+    /// validation goes on and writes the one warning line `hermit run` writes,
+    /// because its replay need not follow it. With `--strict` it is refused and
+    /// writes nothing, and a counter that passed writes nothing.
+    #[test]
+    fn a_recording_without_strict_warns_of_an_inexact_branch_counter() {
+        let ptrace = <GlobalOpts as clap::Parser>::parse_from(["hermit"]);
+        let admit = |options: &StartOpts| {
+            let mut lines = Vec::new();
+            let result = options
+                .admit_branch_counter(&ptrace, &mut |line: &str| lines.push(line.to_owned()));
+            (result, lines)
+        };
+        let inexact: fn() -> Option<String> = || Some("SpecLockMap is enabled".to_string());
+        let mut options = start_options(Vec::new());
+        options.inexact_branch_counter = inexact;
+        let (result, lines) = admit(&options);
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(
+            lines,
+            [crate::run::warning_for_an_inexact_branch_counter(
+                crate::run::CounterReader::Recording,
+                inexact
+            )
+            .unwrap()]
+        );
+
+        options.strict = true;
+        let (result, lines) = admit(&options);
+        assert!(
+            result.is_err_and(|error| {
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some()
+            }),
+            "--strict refuses"
+        );
+        assert!(lines.is_empty(), "{lines:?}");
+
+        options.strict = false;
+        options.inexact_branch_counter = || None;
+        let (result, lines) = admit(&options);
+        assert!(result.is_ok() && lines.is_empty(), "{lines:?}");
     }
 
     /// The refusal needs `--strict` and an inexact counter, and covers e9patch
