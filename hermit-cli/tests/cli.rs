@@ -167,6 +167,7 @@ static MINIMAL_ENV_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PRCTL_SET_PTRACER_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static TIMED_WAIT_SPREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_TWO_THREADS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FIFO_PEER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static BINDER_FD_PASSING_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -943,6 +944,32 @@ fn pipe_reader_replay_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "pipe-reader-replay guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn timed_wait_spread_guest() -> &'static Path {
+    TIMED_WAIT_SPREAD_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("timed-wait-spread");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create timed-wait-spread guest directory");
+        let guest = build_root.join("timed_wait_spread");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/timed_wait_spread.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile timed-wait-spread guest");
+        assert!(
+            output.status.success(),
+            "timed-wait-spread guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -20578,6 +20605,68 @@ fn prctl_set_ptracer_answers_as_the_host_kernel_does() {
     let output = hermit(&args);
     assert_success(&output, &args);
     assert_eq!(stdout(&output), native_stdout);
+}
+
+/// `--chaos-timed-wait-spread` reorders a sleep, and a timed futex wait,
+/// against a worker's progress across seeds, which chaos alone never does:
+/// without the spread every seed sees the same order. The waiter never sees
+/// less than its 50 ms on the guest's own clock, even when its wait ends
+/// early in the worker's progress; the guest prints SHORT and exits 1
+/// otherwise, and a spread run repeats under `--verify --verify-strict`. No
+/// PMU timer is needed: the worker's turns advance the clock. The timed
+/// futex wait is the mode that needs the clock jump to its deadline: a sleep
+/// woken early without it would be filed again, with a fresh draw, until the
+/// clock reached its deadline.
+#[test]
+fn chaos_timed_wait_spread_reorders_a_wait_against_work_and_keeps_the_clock_honest() {
+    let program = timed_wait_spread_guest()
+        .to_str()
+        .expect("timed-wait-spread guest path should be UTF-8");
+    for (mode, unspread, spread_only) in [
+        ("sleep", "sleeper", "worker"),
+        ("condwait", "timeout", "worker"),
+    ] {
+        let first = |extra: &[&str], seed: u64| {
+            let seed = format!("--seed={seed}");
+            let mut args = vec![
+                "run",
+                "--strict",
+                "--chaos",
+                "--max-timeslice=disabled",
+                "--no-virtualize-cpuid",
+                seed.as_str(),
+            ];
+            args.extend_from_slice(extra);
+            args.extend(["--", program, mode]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            let out = stdout(&output);
+            out.strip_prefix("first=")
+                .and_then(|rest| rest.split_whitespace().next())
+                .unwrap_or_else(|| panic!("{args:?}: unexpected output {out:?}"))
+                .to_owned()
+        };
+        assert_eq!(first(&[], 1), unspread, "{mode}, seed 1, no spread");
+        first(
+            &[
+                "--chaos-timed-wait-spread=10",
+                "--verify",
+                "--verify-strict",
+            ],
+            1,
+        );
+        let spread: std::collections::BTreeSet<String> = (1..=8)
+            .map(|seed| first(&["--chaos-timed-wait-spread=10"], seed))
+            .collect();
+        assert_eq!(
+            spread,
+            [unspread, spread_only]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            "{mode}: seeds 1-8 under the spread"
+        );
+    }
 }
 
 /// The same exec-boundary clock trajectory must also be reproducible, so the
