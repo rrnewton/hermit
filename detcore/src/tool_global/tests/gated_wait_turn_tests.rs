@@ -138,6 +138,49 @@ impl Stack for ScratchStack {
     }
 }
 
+/// Guest memory over this process's own (`LocalMemory`) that logs the start
+/// of every read Detcore makes through `Guest::memory`, in order
+/// (`TurnGuest::memory_reads`), so a test can tell that a call read none of
+/// its arguments (round-2 ruling 3).
+struct RecordingMemory {
+    reads: std::sync::Arc<Mutex<Vec<usize>>>,
+}
+
+impl MemoryAccess for RecordingMemory {
+    fn read_vectored(
+        &self,
+        read_from: &[std::io::IoSlice],
+        write_to: &mut [std::io::IoSliceMut],
+    ) -> Result<usize, Errno> {
+        self.reads
+            .lock()
+            .unwrap()
+            .extend(read_from.iter().map(|slice| slice.as_ptr() as usize));
+        LocalMemory::new().read_vectored(read_from, write_to)
+    }
+    fn write_vectored(
+        &mut self,
+        read_from: &[std::io::IoSlice],
+        write_to: &mut [std::io::IoSliceMut],
+    ) -> Result<usize, Errno> {
+        LocalMemory::new().write_vectored(read_from, write_to)
+    }
+    fn read<'a, A>(&self, addr: A, buf: &mut [u8]) -> Result<usize, Errno>
+    where
+        A: Into<Addr<'a, u8>>,
+    {
+        let addr = addr.into();
+        self.reads.lock().unwrap().push(addr.as_raw());
+        LocalMemory::new().read(addr, buf)
+    }
+    fn write(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
+        LocalMemory::new().write(addr, buf)
+    }
+    fn write_with_user_access(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
+        LocalMemory::new().write_with_user_access(addr, buf)
+    }
+}
+
 /// What the harness answers a `RequestResources` with, in order; a request
 /// with nothing left is answered `Normal`.
 type Answers = VecDeque<ResumeStatus>;
@@ -183,12 +226,18 @@ struct TurnGuest {
     stack: usize,
     /// Whether the scratch stack is tight (`ScratchStack::tight`).
     tight_stack: bool,
+    /// The start of every guest-memory read (`RecordingMemory`), in order.
+    memory_reads: std::sync::Arc<Mutex<Vec<usize>>>,
     /// The set of each injected `rt_sigtimedwait` (A5 step 3c.1d's removal of
     /// ignored signals, D37), in order.
     sigtimedwait_sets: Vec<u64>,
     /// What each injected `rt_sigtimedwait` returns, in order (`EAGAIN` once
     /// empty: nothing left to dequeue).
     sigtimedwait_results: VecDeque<Result<i64, Errno>>,
+    /// For each injected `rt_sigtimedwait`, how many `RequestResources` RPCs
+    /// had been filed before it (whether a removal ran in the call's own
+    /// turn, before any request).
+    sigtimedwait_after_requests: Vec<usize>,
     /// What each injected poll probe (`pselect6`, `select`, `ppoll`,
     /// `epoll_pwait`) returns, in order (0 once empty: nothing ready).
     probe_results: VecDeque<Result<i64, Errno>>,
@@ -196,11 +245,38 @@ struct TurnGuest {
     /// mask pointer of a `ppoll` or `epoll_pwait`) each injected probe
     /// carried, `None` for none, in order (IR-9).
     probe_masks: Vec<Option<usize>>,
+    /// How many poll probes have been injected, shared with a `/proc` script
+    /// that answers by it (`temporary_mask_turn_tests::script_by_probe`).
+    probe_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The scheduler's clock, in nanoseconds, which every
+    /// `GlobalTimeLowerBound` answers and then advances by `clock_step`.
+    clock: Mutex<u64>,
+    clock_step: u64,
+    /// How far each `RequestResources` advances that clock (0: not at all),
+    /// as other threads' turns would (round-3 ruling 6's write-back row).
+    clock_step_on_request: u64,
+    /// How many of the next `GlobalTimeLowerBound` RPCs are answered as a
+    /// hand-off (`GlobalResponse::Granted`), as a scheduler that let another
+    /// thread run would (round-3 ruling 1), and how many such hand-offs have
+    /// happened, shared with a `/proc` script that answers by it
+    /// (`temporary_mask_turn_tests::script_by_handoff`).
+    handoffs_left: std::sync::atomic::AtomicUsize,
+    handoffs: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The register record `Guest::regs` reports: zeroed but for `rsp`, 0
+    /// unless a test places a red zone (`stage_private_cells`).
+    rsp: u64,
+    /// The timeout pointer of each injected `pselect6` probe, in order.
+    probe_timeouts: Vec<usize>,
 }
 
 impl TurnGuest {
     fn rpcs(&self) -> Vec<GlobalRequest> {
         self.rpcs.lock().unwrap().clone()
+    }
+
+    /// The start of every guest-memory read so far (`RecordingMemory`).
+    fn memory_reads(&self) -> Vec<usize> {
+        self.memory_reads.lock().unwrap().clone()
     }
 
     fn requests(&self) -> Vec<Resources> {
@@ -222,13 +298,16 @@ impl GlobalRPC<GlobalState> for TurnGuest {
     ) -> <GlobalState as GlobalTool>::Response {
         self.rpcs.lock().unwrap().push(message.2.clone());
         let response = match message.2 {
-            GlobalRequest::RequestResources(..) => GlobalResponse::RequestResources(
-                self.answers
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .unwrap_or(ResumeStatus::Normal),
-            ),
+            GlobalRequest::RequestResources(..) => {
+                *self.clock.lock().unwrap() += self.clock_step_on_request;
+                GlobalResponse::RequestResources(
+                    self.answers
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or(ResumeStatus::Normal),
+                )
+            }
             GlobalRequest::ReleaseAllResources => GlobalResponse::ReleaseAllResources(()),
             GlobalRequest::SetSavedGuestSigmask(_) => GlobalResponse::SetSavedGuestSigmask(()),
             GlobalRequest::FutexAction(_, FutexAction::WaitRequest(..), ..) => {
@@ -258,6 +337,29 @@ impl GlobalRPC<GlobalState> for TurnGuest {
             GlobalRequest::TouchFile(_) => GlobalResponse::TouchFile(()),
             // Signal phase 1's ledger: no entry is due, nothing is refused.
             GlobalRequest::Sigalrm(_) => GlobalResponse::Sigalrm(false),
+            GlobalRequest::GlobalTimeLowerBound => {
+                let mut clock = self.clock.lock().unwrap();
+                let now = *clock;
+                *clock += self.clock_step;
+                let answer = GlobalResponse::GlobalTimeLowerBound(
+                    crate::types::LogicalTime::from_nanos(now),
+                );
+                let handoff = self
+                    .handoffs_left
+                    .try_update(
+                        std::sync::atomic::Ordering::SeqCst,
+                        std::sync::atomic::Ordering::SeqCst,
+                        |left| left.checked_sub(1),
+                    )
+                    .is_ok();
+                if handoff {
+                    self.handoffs
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    GlobalResponse::Granted(Box::new(answer))
+                } else {
+                    answer
+                }
+            }
             GlobalRequest::ResolveKillTargets(process) => {
                 let target = DetTid::from_raw(process.as_raw());
                 let live = self.live.contains(&target);
@@ -277,7 +379,7 @@ impl GlobalRPC<GlobalState> for TurnGuest {
 
 #[reverie::tool]
 impl Guest<Detcore> for TurnGuest {
-    type Memory = LocalMemory;
+    type Memory = RecordingMemory;
     type Stack = ScratchStack;
     fn pid(&self) -> Pid {
         Pid::from_raw(THREAD.as_raw())
@@ -288,8 +390,10 @@ impl Guest<Detcore> for TurnGuest {
     fn ppid(&self) -> Option<Pid> {
         None
     }
-    fn memory(&self) -> LocalMemory {
-        LocalMemory::new()
+    fn memory(&self) -> RecordingMemory {
+        RecordingMemory {
+            reads: self.memory_reads.clone(),
+        }
     }
     fn thread_state(&self) -> &ThreadState<()> {
         &self.thread
@@ -302,7 +406,9 @@ impl Guest<Detcore> for TurnGuest {
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
         // SAFETY: a plain register record.
-        unsafe { std::mem::zeroed() }
+        let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+        regs.rsp = self.rsp;
+        regs
     }
     async fn stack(&mut self) -> ScratchStack {
         ScratchStack {
@@ -366,29 +472,117 @@ impl Guest<Detcore> for TurnGuest {
                     .transpose()?
                     .unwrap_or(0);
                 self.sigtimedwait_sets.push(set);
+                let requests = self.requests().len();
+                self.sigtimedwait_after_requests.push(requests);
                 self.sigtimedwait_results
                     .pop_front()
                     .unwrap_or(Err(Errno::EAGAIN))
             }
+            // Each poll probe as the kernel answers it: the scripted result,
+            // and the copy-out the kernel makes then (a select family call
+            // writes its sets, emptied for nothing ready, `set_fd_set`; a
+            // poll writes every `revents`, `do_sys_poll`), which a read-only
+            // buffer fails with EFAULT.
+            // The wrapper's validation (`validate_pselect6_wrapper`): a
+            // malformed timeout, refused once the wrapper is copied.
+            Syscall::Pselect6(validation)
+                if validation.timeout().is_some_and(|timeout| {
+                    LocalMemory::new()
+                        .read_value::<_, [i64; 2]>(timeout.cast())
+                        .is_ok_and(|timeout| timeout[1] >= 1_000_000_000)
+                }) =>
+            {
+                match validation.sigmask() {
+                    Some(wrapper) => LocalMemory::new()
+                        .read_value::<_, [usize; 2]>(wrapper.cast())
+                        .map_or(Err(Errno::EFAULT), |_| Err(Errno::EINVAL)),
+                    None => Err(Errno::EINVAL),
+                }
+            }
             Syscall::Pselect6(probe) => {
+                self.probe_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let mask = probe
                     .sigmask()
                     .map(|wrapper| LocalMemory::new().read_value::<_, usize>(wrapper.cast()))
                     .transpose()?
                     .filter(|inner| *inner != 0);
                 self.probe_masks.push(mask);
-                self.probe_results.pop_front().unwrap_or(Ok(0))
+                self.probe_timeouts
+                    .push(probe.timeout().map_or(0, |timeout| timeout.as_raw()));
+                let result = self.probe_results.pop_front().unwrap_or(Ok(0));
+                // A count copies the sets out too (`set_fd_set` runs for any
+                // result that is not an error): the harness writes back the
+                // bytes in place, every requested descriptor taken as ready,
+                // so a read-only set fails with EFAULT as on Linux.
+                if let Ok(count) = result {
+                    let len = (probe.nfds().max(0) as usize).div_ceil(64) * 8;
+                    for set in [probe.readfds(), probe.writefds(), probe.exceptfds()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if len != 0 {
+                            let mut bytes = vec![0; len];
+                            if count != 0 {
+                                LocalMemory::new()
+                                    .read_exact(set.cast::<u8>(), &mut bytes)
+                                    .map_err(|_| Errno::EFAULT)?;
+                            }
+                            LocalMemory::new()
+                                .write_exact(set.cast(), &bytes)
+                                .map_err(|_| Errno::EFAULT)?;
+                        }
+                    }
+                }
+                result
             }
             Syscall::Select(_) => {
+                self.probe_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.probe_masks.push(None);
                 self.probe_results.pop_front().unwrap_or(Ok(0))
             }
             Syscall::Ppoll(probe) => {
+                self.probe_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.probe_masks
                     .push(probe.sigmask().map(|mask| mask.as_raw()));
-                self.probe_results.pop_front().unwrap_or(Ok(0))
+                let result = self.probe_results.pop_front().unwrap_or(Ok(0));
+                if result.is_ok()
+                    && let Some(fds) = probe.fds()
+                {
+                    for index in 0..probe.nfds() as usize {
+                        let revents = fds.as_raw() + index * 8 + 6;
+                        LocalMemory::new()
+                            .write_exact(AddrMut::<u8>::from_raw(revents).unwrap(), &[0, 0])
+                            .map_err(|_| Errno::EFAULT)?;
+                    }
+                }
+                result
+            }
+            // A stage-free `poll` probe (round-2 ruling 2), answered as a
+            // ppoll probe is: the scripted result, and `revents` written for a
+            // count, which an unreadable array fails with EFAULT.
+            Syscall::Poll(probe) => {
+                self.probe_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                self.probe_masks.push(None);
+                let result = self.probe_results.pop_front().unwrap_or(Ok(0));
+                if result.is_ok()
+                    && let Some(fds) = probe.fds()
+                {
+                    for index in 0..probe.nfds() as usize {
+                        let revents = fds.as_raw() + index * 8 + 6;
+                        LocalMemory::new()
+                            .write_exact(AddrMut::<u8>::from_raw(revents).unwrap(), &[0, 0])
+                            .map_err(|_| Errno::EFAULT)?;
+                    }
+                }
+                result
             }
             Syscall::EpollPwait(probe) => {
+                self.probe_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.probe_masks
                     .push(probe.sigmask().map(|mask| mask.as_raw()));
                 self.probe_results.pop_front().unwrap_or(Ok(0))
@@ -401,6 +595,13 @@ impl Guest<Detcore> for TurnGuest {
             }
             other => panic!("an unexpected injection: {other:?}"),
         }
+    }
+    async fn inject_with_purpose<S: SyscallInfo>(
+        &mut self,
+        call: S,
+        _: reverie::InjectionPurpose,
+    ) -> Result<i64, Error> {
+        self.inject(call).await.map_err(Error::from)
     }
     async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
         panic!("a wait must not tail-inject")
@@ -466,10 +667,20 @@ fn turn_guest(gate: bool, own_mask: Option<u64>) -> TurnGuest {
         host_tid: None,
         stack,
         tight_stack: false,
+        memory_reads: Default::default(),
         sigtimedwait_sets: Vec::new(),
         sigtimedwait_results: VecDeque::new(),
+        sigtimedwait_after_requests: Vec::new(),
         probe_results: VecDeque::new(),
         probe_masks: Vec::new(),
+        probe_count: Default::default(),
+        clock: Mutex::new(0),
+        clock_step: 300_000_000,
+        clock_step_on_request: 0,
+        handoffs_left: Default::default(),
+        handoffs: Default::default(),
+        rsp: 0,
+        probe_timeouts: Vec::new(),
     }
 }
 
