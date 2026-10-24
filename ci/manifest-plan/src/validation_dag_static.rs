@@ -3049,7 +3049,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And package K slice P2b deletes procfs_inode's
     // only_kvms_synthetic_procfs_device_is_proved_by_its_stat_fields with the
     // KVM /proc anchor's device check it tested: 2695 - 1 = 2694, listed.
-    ("test.detcore_unit", 2722),
+    // And a_restarted_kernel_poll_waits_only_until_its_deadline,
+    // only_record_replay_and_unsequentialized_runs_poll_in_the_kernel and
+    // a_kernel_poll_that_keeps_a_record_restarts_through_restart_syscall: 2725.
+    ("test.detcore_unit", 2725),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4328,7 +4331,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity, the ptrace
     // halves of https://github.com/rrnewton/hermit/issues/4798's two run_kvm_
     // tests: 632 + 2 = 634.
-    ("test.cli", 644),
+    // And a_kernel_run_poll_a_signal_ends_restarts_until_its_deadline: 645.
+    ("test.cli", 645),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4858,7 +4862,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed.
     // And the same two ptrace group-exit signal-wait tests, not excluded:
     // 551 + 2 = 553.
-    ("test.cli_on_host", 563),
+    // And a_kernel_run_poll_a_signal_ends_restarts_until_its_deadline: 564.
+    ("test.cli_on_host", 564),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5322,7 +5327,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same nine units for a read that faults: 2691, listed.
     // And the same protection-key subscription unit: 2692, listed.
     // And the same P2b deletion of the anchor device unit: 2694, listed.
-    ("test.detcore_unit_on_host", 2722),
+    // And a_restarted_kernel_poll_waits_only_until_its_deadline,
+    // only_record_replay_and_unsequentialized_runs_poll_in_the_kernel and
+    // a_kernel_poll_that_keeps_a_record_restarts_through_restart_syscall: 2725.
+    ("test.detcore_unit_on_host", 2725),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
