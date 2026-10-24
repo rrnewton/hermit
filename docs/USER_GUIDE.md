@@ -942,7 +942,8 @@ Network modes are:
   nondeterministic inputs.
 
 `hermit run --gdbserver` serves the guest to one gdb client and waits for it
-before the guest runs. Attach from another terminal with
+before the guest runs; only the ptrace backend (the default) serves gdb, and
+the other backends refuse the flag. Attach from another terminal with
 `gdb -ex 'target remote 127.0.0.1:PORT' PROGRAM` (default port 1234; override
 it with `--gdbserver-port=PORT`, or pass `0` for any free port, which the run
 prints). Hermit binds that port in the host's network namespace before it

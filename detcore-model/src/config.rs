@@ -814,6 +814,10 @@ pub struct Config {
     /// a gdbserver, Detcore also takes no reports of the guest's signal-handler
     /// returns, so a multithreaded guest whose handlers take scheduler turns can
     /// be scheduled differently than without one (docs/SIGNAL_STATE_CHECK.md).
+    /// Only the ptrace backend (the default, and `--backend=e9patch`, whose
+    /// rewritten guest runs under it) serves gdb: `--backend=kvm`, `dbt`,
+    /// `sabre`, `liteinst` and `in-guest-trap`, and `--namespace-only`, refuse
+    /// `--gdbserver` and `--dap-listen`.
     #[clap(long)]
     pub gdbserver: bool,
     /// The loopback TCP port `--gdbserver` serves on; 0 lets the system pick a
