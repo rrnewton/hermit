@@ -2640,7 +2640,14 @@ fi
 # Preserve the existing calibration, job widths, limits and all history.
 # This source-identity carry supplies no new timing or runtime/package
 # validation. Fresh exact-source producers and validation remain required.
-expected_pin=129caa4924adff52d93476698253906dac4717c1
+# CARRY TO dc7f689c32c4789f801444ca012db6fec73bc4e5 (2026-10-24): Buck compatibility repair.
+# Compared with 129caa4924adff52d93476698253906dac4717c1, all eight calibrated DBT Git
+# objects recorded in the preceding carry remain byte-identical: reverie-dbt,
+# third-party, Cargo.toml, Cargo.lock, rust-toolchain.toml, reverie-dbt/build.rs,
+# reverie-dbt/vendor/dynamorio, and third-party/dynamorio. Existing budget
+# values and limits are unchanged. This is source-identity carry only;
+# it supplies no new calibration, build, runtime, or landing evidence.
+expected_pin=dc7f689c32c4789f801444ca012db6fec73bc4e5
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

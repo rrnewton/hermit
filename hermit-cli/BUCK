@@ -15,7 +15,7 @@ hermit_build_env = {
     "CARGO_PKG_VERSION": "0.5.1",
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "129caa4924adff52d93476698253906dac4717c1",
+    "HERMIT_REVERIE_PIN": "dc7f689c32c4789f801444ca012db6fec73bc4e5",
 }
 
 # The shadow release entrypoint supplies these values from Git/Cargo metadata
@@ -130,10 +130,10 @@ rust_library(
     ),
     crate = "hermit",
     env = hermit_build_env,
-    # The base internal target includes the trap runtime and exec-stop loader.
+    # Existing labels retain LiteInst site patching and the exec-stop loader.
     # Native-exec also needs the qualified Cargo-produced embedded bundle; no
     # Buck producer exists for that bundle yet, so this target does not claim it.
-    features = ["in-guest-trap", "exec-stop-launcher"],
+    features = ["in-guest-trap", "exec-stop-launcher", "liteinst"],
     # iced-x86 decoder tables are process-lifetime globals.
     test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
     deps = [
@@ -232,7 +232,7 @@ rust_binary(
     },
     srcs = glob(["src/bin/**/*.rs"]),
     env = hermit_build_env,
-    features = ["in-guest-trap", "exec-stop-launcher"],
+    features = ["in-guest-trap", "exec-stop-launcher", "liteinst"],
     # Signal-handler messages intentionally live for the process lifetime.
     test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
     test_srcs = glob([
@@ -277,6 +277,124 @@ rust_binary(
         "//hermetic_infra/reverie:reverie-inguest-native",
         "//hermetic_infra/reverie:reverie-loader",
         "//hermetic_infra/reverie:reverie-liteinst-native",
+        "//hermetic_infra/reverie:reverie-ptrace",
+        "//hermetic_infra/reverie:reverie-rpc-transport",
+    ],
+)
+
+# Trap-only builds use distinct labels so existing internal callers retain
+# LiteInst. The existing targets keep the canonical Cargo export metadata.
+rust_library(
+    name = "libhermit-trap-only",
+    skip_autocargo_manifest = True,
+    srcs = glob(
+        [
+            "src/**/*.rs",
+            "README.md",
+        ],
+        exclude = [
+            "src/bin/**/*.rs",
+        ],
+    ),
+    crate = "hermit",
+    env = hermit_build_env,
+    # This explicit variant includes the trap runtime and exec-stop loader.
+    # Native-exec also needs the qualified Cargo-produced embedded bundle; no
+    # Buck producer exists for that bundle yet, so this target does not claim it.
+    features = ["in-guest-trap", "exec-stop-launcher"],
+    # iced-x86 decoder tables are process-lifetime globals.
+    test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
+    deps = [
+        "fbsource//third-party/rust:addr2line",
+        "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:bincode",
+        "fbsource//third-party/rust:clap",
+        "fbsource//third-party/rust:dirs",
+        "fbsource//third-party/rust:goblin",
+        "fbsource//third-party/rust:iced-x86",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+        "fbsource//third-party/rust:object",
+        "fbsource//third-party/rust:rand_pcg",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:sha2",
+        "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tracing",
+        "fbsource//third-party/rust:tracing-log",
+        "fbsource//third-party/rust:tracing-subscriber",
+        "fbsource//third-party/rust:uuid",
+        "//hermetic_infra/hermit/detcore:detcore",
+        "//hermetic_infra/hermit/detcore-model:detcore-model",
+        "//hermetic_infra/hermit/hermit-record:hermit-record",
+        "//hermetic_infra/hermit/hermit-record-format:hermit-record-format",
+        "//hermetic_infra/hermit/hermit-replay:hermit-replay",
+        "//hermetic_infra/hermit/hermit-run-kvm:hermit-run-kvm",
+        "//hermetic_infra/hermit/hermit-run-ptrace:hermit-run-ptrace",
+        "//hermetic_infra/hermit/hermit-resources:hermit-resources",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-inguest-native",
+        "//hermetic_infra/reverie:reverie-loader",
+        "//hermetic_infra/reverie:reverie-kvm",
+        "//hermetic_infra/reverie:reverie-liteinst-native-trap-only",
+        "//hermetic_infra/reverie:reverie-ptrace",
+        "//hermetic_infra/reverie:reverie-rpc-transport",
+        "//hermetic_infra/reverie:reverie-sabre-stats",
+        "//hermetic_infra/reverie:safeptrace",
+    ],
+)
+
+rust_binary(
+    name = "hermit-trap-only",
+    crate = "hermit",
+    srcs = glob(["src/bin/**/*.rs"]),
+    env = hermit_build_env,
+    features = ["in-guest-trap", "exec-stop-launcher"],
+    # Signal-handler messages intentionally live for the process lifetime.
+    test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
+    test_srcs = glob([
+        "src/bin/**/*.rs",
+        "test-resources/**/*.json",
+        "tests/common/readonly_proc.rs",
+        "tests/fixtures/staged-summary.gitignore",
+    ]),
+    deps = [
+        "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:bincode",
+        "fbsource//third-party/rust:clap",
+        "fbsource//third-party/rust:colored",
+        "fbsource//third-party/rust:diff",
+        "fbsource//third-party/rust:dirs",
+        "fbsource//third-party/rust:libc",
+        "fbsource//third-party/rust:nix",
+        "fbsource//third-party/rust:num_cpus",
+        "fbsource//third-party/rust:pretty_assertions",
+        "fbsource//third-party/rust:rand",
+        "fbsource//third-party/rust:rand_pcg",
+        "fbsource//third-party/rust:regex",
+        "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:serde_json",
+        "fbsource//third-party/rust:sha2",
+        "fbsource//third-party/rust:serde_yaml",
+        "fbsource//third-party/rust:shell-words",
+        "fbsource//third-party/rust:tempfile",
+        "fbsource//third-party/rust:tokio",
+        "fbsource//third-party/rust:tracing",
+        "fbsource//third-party/rust:tracing-appender",
+        "fbsource//third-party/rust:tracing-subscriber",
+        "fbsource//third-party/rust:uuid",
+        ":libhermit-trap-only",
+        "//common/rust/build_info:build_info",
+        "//common/rust/shed/fbinit:fbinit",
+        "//hermetic_infra/hermit/common/test-workdir:hermit-test-workdir",
+        "//hermetic_infra/hermit/detcore:detcore",
+        "//hermetic_infra/hermit/detcore-model:detcore-model",
+        "//hermetic_infra/hermit/hermit-resources:hermit-resources",
+        "//hermetic_infra/reverie:reverie",
+        "//hermetic_infra/reverie:reverie-inguest-native",
+        "//hermetic_infra/reverie:reverie-loader",
+        "//hermetic_infra/reverie:reverie-liteinst-native-trap-only",
         "//hermetic_infra/reverie:reverie-ptrace",
         "//hermetic_infra/reverie:reverie-rpc-transport",
     ],
