@@ -1002,6 +1002,7 @@ mod tests {
             &["--work-span-report=/tmp/work-span.json"],
         ),
         ("scheduler-turn-cost", &["--scheduler-turn-cost=10000"]),
+        ("cap-preemption-charge", &["--cap-preemption-charge"]),
         ("sigint-instakill", &["--sigint-instakill"]),
         ("warn-non-zero-binds", &["--warn-non-zero-binds"]),
         ("sched-heuristic", &["--sched-heuristic=random"]),
