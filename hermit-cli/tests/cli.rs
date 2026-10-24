@@ -28156,6 +28156,7 @@ fn a_schedule_replay_keeps_the_long_slices_of_a_preemption_replay() {
     assert!(
         marked(&schedule_record),
         "a schedule replay of a marked record drops the mark"
+    );
 }
 
 /// Records tests/c/chaos_replay_new_thread.c (with `guest_args`) under
@@ -28231,6 +28232,24 @@ fn chaos_schedule_replay_divergences(
 #[test]
 fn a_schedule_replay_under_chaos_follows_its_recording() {
     let divergences = chaos_schedule_replay_divergences(&[], true, &[1, 2, 3]);
+    assert!(
+        divergences.is_empty(),
+        "(seed, record, replay): {divergences:?}"
+    );
+}
+
+/// A schedule replay ends each recorded slice once. With the guest's
+/// syscalls, slices also end where a syscall's virtual time crosses the
+/// slice end; the record marks those with callback checkpoints. A replay
+/// ended a timer-preempted slice twice, at the recorded branch count in the
+/// timer's pre-hook and again at its checkpoint in the post-hook, and after a
+/// checkpoint that kept the slice it counted the `--max-timeslice` backstop
+/// from the slice's old start, so it ended the next slice early. Either adds
+/// a scheduler turn, and each turn moves the virtual clock. Before, none of
+/// the first 12 seeds' replays printed their recordings' times.
+#[test]
+fn a_schedule_replay_ends_each_recorded_slice_once() {
+    let divergences = chaos_schedule_replay_divergences(&["syscalls"], false, &[1, 2, 3]);
     assert!(
         divergences.is_empty(),
         "(seed, record, replay): {divergences:?}"
