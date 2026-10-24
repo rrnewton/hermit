@@ -307,6 +307,14 @@ impl Replayer {
         })
     }
 
+    /// Whether the next replayed event is `tid`'s unsuccessful attempt at a
+    /// blocked syscall: the recording retried it and failed again.
+    pub(super) fn next_is_failed_attempt_by(&self, tid: DetTid) -> bool {
+        self.cursor.peek().is_some_and(|next| {
+            next.dettid == tid && matches!(next.op, Op::Syscall(_, SyscallPhase::Polling))
+        })
+    }
+
     /// Whether the recorded schedule still has an event to replay. Past its
     /// end the run goes on unguided (`ReplayAction::Continue`).
     pub(super) fn has_events_left(&self) -> bool {
