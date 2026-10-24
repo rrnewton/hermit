@@ -501,7 +501,9 @@ impl PreemptionRecord {
     /// priority. For display only: the renumbered record does not replay the
     /// same, because the scheduler compares these priorities with fixed ones
     /// (the default priority of a thread the record does not name, among
-    /// others) and derives others from them.
+    /// others) and derives others from them. A record with more distinct
+    /// priorities than `DEFAULT_PRIORITY..=LAST_PRIORITY` holds (a long chaos
+    /// run) keeps its own.
     pub fn normalize(&self) -> PreemptionRecord {
         let mut clone = self.clone();
 
@@ -512,9 +514,11 @@ impl PreemptionRecord {
                 let _ = priomap.insert(*prio, 0);
             }
         }
+        if priomap.len() > usize::try_from(LAST_PRIORITY - DEFAULT_PRIORITY + 1).unwrap() {
+            return clone.without_default_threads();
+        }
 
         for (cur_prio, val) in (DEFAULT_PRIORITY..).zip(priomap.values_mut()) {
-            assert!(cur_prio <= LAST_PRIORITY);
             *val = cur_prio;
         }
         for history in clone.per_thread.values_mut() {
@@ -1073,6 +1077,34 @@ mod tests {
         let vecs = pr.as_vecs();
         let pr2 = PreemptionRecord::from_vecs(&vecs);
         assert_eq!(pr, pr2);
+    }
+
+    /// A record with more distinct priorities than the renumbering range
+    /// holds keeps its own instead of panicking (a long chaos run of six
+    /// threads reached 9978 distinct priorities). One that fits is still
+    /// renumbered, up to `LAST_PRIORITY`.
+    #[test]
+    fn a_record_too_varied_to_renumber_keeps_its_priorities() {
+        let record_of = |count: Priority| {
+            let changes: Vec<(LogicalTime, Priority)> = (FIRST_PRIORITY..FIRST_PRIORITY + count)
+                .enumerate()
+                .map(|(index, prio)| (LogicalTime::from_nanos(index as u64), prio))
+                .collect();
+            PreemptionRecord::from_vecs(&BTreeMap::from([(DetTid::from_raw(3), changes)]))
+        };
+        let slots = LAST_PRIORITY - DEFAULT_PRIORITY + 1;
+        let fits = record_of(slots).normalize();
+        fits.validate().unwrap();
+        let highest = fits
+            .as_vecs()
+            .values()
+            .flat_map(|history| history.iter().map(|(_, prio)| *prio))
+            .max();
+        assert_eq!(highest, Some(LAST_PRIORITY));
+        let too_many = record_of(slots + 1);
+        let kept = too_many.normalize();
+        kept.validate().unwrap();
+        assert_eq!(kept, too_many.without_default_threads());
     }
 
     #[test]
