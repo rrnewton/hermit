@@ -30,7 +30,9 @@ use reverie::process::Output;
 
 use crate::analyze::consts::*;
 use crate::analyze::rundata::RunData;
+use crate::analyze::rundata::Stop;
 use crate::analyze::rundata::TrialEnd;
+use crate::analyze::rundata::guest_reached_a_refusal;
 use crate::analyze::types::AnalyzeOpts;
 use crate::analyze::types::ExitStatusConstraint;
 use crate::analyze::types::Report;
@@ -88,7 +90,7 @@ fn stack_pair_sentences(
 }
 
 /// The baseline run (from `.0`) did not finish: a wall-clock bound ended it,
-/// so it recorded no schedule to bisect against.
+/// or Hermit refused it, so it recorded no schedule to bisect against.
 #[derive(Debug)]
 pub struct BaselineUnfinished(&'static str);
 
@@ -110,6 +112,20 @@ impl std::error::Error for BaselineUnfinished {}
 pub struct PrefixDecision {
     pub schedule: PreemptionRecord,
     pub decision: usize,
+    /// [`refused_trials_warning`], if any trial was refused.
+    pub refused: Option<String>,
+}
+
+/// What a search with `refused` trials Hermit refused at run time, all
+/// counted as not reaching the target, should say about its result.
+fn refused_trials_warning(refused: usize) -> Option<String> {
+    (refused > 0).then(|| {
+        format!(
+            "{refused} trial(s) were refused by Hermit (exit 122) and counted as not reaching \
+             the target, so the deciding event may separate the target from a path Hermit does \
+             not support rather than from a run that misses the target."
+        )
+    })
 }
 
 /// The binary search of `--prefix-search` over a schedule of `len` events:
@@ -149,8 +165,8 @@ fn search_prefix_boundary(
 ///
 /// Swapping two events of one thread is no interleaving any execution can take, so
 /// the outcome change at such a pair comes from the replay falling off the schedule.
-/// Trials that timed out were counted as not reaching the target, which can steer
-/// the search onto exactly such a pair.
+/// Trials that did not finish (a bound or a refusal ended them) were counted as
+/// not reaching the target, which can steer the search onto exactly such a pair.
 fn critical_pair_caveat(crit: &CriticalSchedule) -> Option<String> {
     let index = crit.critical_event_index;
     let schedule = &crit.failing_schedule;
@@ -300,11 +316,15 @@ impl AnalyzeOpts {
             // The stacks are written when the replay reaches the critical
             // events, so a replay that hangs afterwards has still done its job.
             Err(error)
-                if error.downcast_ref::<RunTimeoutMarker>().is_some() && stack2_path.exists() =>
+                if (error.downcast_ref::<RunTimeoutMarker>().is_some()
+                    || guest_reached_a_refusal(&error))
+                    && stack2_path.exists() =>
             {
                 eprintln!(
                     ":: {} ({error}) after recording the critical stacks",
-                    "WARNING: the stack-trace replay timed out".yellow().bold(),
+                    "WARNING: the stack-trace replay did not finish"
+                        .yellow()
+                        .bold(),
                 );
                 false
             }
@@ -335,9 +355,9 @@ impl AnalyzeOpts {
         Ok(run.with_schedule_replay_from(path))
     }
 
-    /// Launch a prefix trial; true when it meets the target criteria. A trial
-    /// that a wall-clock bound ends did not reach the target.
-    fn launch_prefix_trial(&self, run: &mut RunData) -> anyhow::Result<bool> {
+    /// Launch a prefix trial and say how it ended. A trial that a wall-clock
+    /// bound ends, or that Hermit refuses, did not reach the target.
+    fn launch_prefix_trial(&self, run: &mut RunData) -> anyhow::Result<TrialEnd> {
         if self.verbose {
             eprintln!(
                 ":: {}\n    {}",
@@ -345,7 +365,7 @@ impl AnalyzeOpts {
                 run.to_repro()
             );
         }
-        Ok(run.launch_trial()?.reached_target())
+        run.launch_trial()
     }
 
     /// `--prefix-search`: find the shortest prefix of the target schedule that,
@@ -357,11 +377,14 @@ impl AnalyzeOpts {
     ) -> anyhow::Result<PrefixDecision> {
         let target = target_record.schedevents();
         let mut trial = 0;
+        let mut refused = 0;
         let mut meets_target = |len: usize| -> anyhow::Result<bool> {
             trial += 1;
             let mut run =
                 self.prefix_trial(&format!("prefix_round_{trial:03}"), target_record, len)?;
-            let is_match = self.launch_prefix_trial(&mut run)?;
+            let end = self.launch_prefix_trial(&mut run)?;
+            refused += usize::from(end == TrialEnd::Unfinished(Stop::Refusal));
+            let is_match = end.reached_target();
             eprintln!(
                 ":: Prefix of {len} of {} events => {}",
                 target.len(),
@@ -385,6 +408,10 @@ impl AnalyzeOpts {
                 "WARNING:".yellow().bold()
             );
         }
+        let refused = refused_trials_warning(refused);
+        if let Some(warning) = &refused {
+            eprintln!(":: {} {warning}", "WARNING:".yellow().bold());
+        }
         eprintln!(
             ":: The scheduling decision at event #{passing} of {} decides the outcome: {}",
             target.len(),
@@ -393,6 +420,7 @@ impl AnalyzeOpts {
         Ok(PrefixDecision {
             schedule: target_record.clone(),
             decision: passing,
+            refused,
         })
     }
 
@@ -411,7 +439,7 @@ impl AnalyzeOpts {
         let stack_path = run.root_path().with_extension("stack");
         run.runopts.det_opts.det_config.stacktrace_event =
             vec![(position as u64, Some(stack_path.clone()))];
-        let is_match = self.launch_prefix_trial(&mut run)?;
+        let is_match = self.launch_prefix_trial(&mut run)?.reached_target();
         eprintln!(
             ":: {}\n{}",
             "Stack-trace run completed.  Repro command:".green().bold(),
@@ -449,7 +477,11 @@ impl AnalyzeOpts {
     /// The report of `--prefix-search`: the stacks of the two threads that
     /// could run at the deciding event.
     pub fn phase6_record_prefix_outputs(&self, found: PrefixDecision) -> anyhow::Result<Report> {
-        let PrefixDecision { schedule, decision } = found;
+        let PrefixDecision {
+            schedule,
+            decision,
+            refused,
+        } = found;
         let (target_met, chosen) = self.prefix_stack(
             "final_target_for_stacktraces",
             &schedule,
@@ -506,6 +538,9 @@ impl AnalyzeOpts {
             schedule.schedevents()[decision].dettid,
             continued.get(decision).map(|event| event.dettid),
         ));
+        if let Some(refused) = refused {
+            header.push_str(&format!("Note: {refused}\n"));
+        }
         let context = Self::generate_context(
             schedule.schedevents(),
             decision.max(1),
@@ -855,7 +890,7 @@ impl AnalyzeOpts {
                 // Otherwise we just assume that a *baseline* (non-chaos) run will do the trick.
                 ro.det_opts.det_config.chaos = false;
             }
-            if newrun.launch_trial()? == TrialEnd::Unfinished {
+            if !newrun.launch_trial()?.finished() {
                 // Without a baseline the user chose, analyze searches within
                 // the target schedule instead; one the user chose is not
                 // replaced behind their back.
@@ -863,10 +898,10 @@ impl AnalyzeOpts {
                     return Err(BaselineUnfinished(from_where).into());
                 }
                 bail!(
-                    "the baseline run ({from_where}) did not finish (see above). Pass a larger \
-                     --trial-timeout, or another baseline; without one, analyze bisects against \
-                     the run without chaos, or searches within the target schedule when that \
-                     does not finish either."
+                    "the baseline run ({from_where}) did not finish (a bound or a refusal \
+                     stopped it; see above). Pass a larger --trial-timeout, or another baseline; \
+                     without one, analyze bisects against the run without chaos, or searches \
+                     within the target schedule when that does not finish either."
                 );
             }
             self.record_endpoint(&newrun);
@@ -898,14 +933,17 @@ impl AnalyzeOpts {
         baseline: &[SchedEvent],
     ) -> anyhow::Result<CriticalSchedule> {
         let mut i = 0;
-        let mut timed_out = 0;
+        let mut unfinished = 0;
+        let mut refused = 0;
 
         // Each call is one trial. A trial that cannot finish (for example, one
         // that --max-log-bytes ended) returns its error unchanged, and the
         // search stops there. A trial that a wall-clock bound ended
-        // (--trial-timeout, or the run arguments' --timeout) is the exception:
-        // a spliced schedule can leave the guest waiting for an event that
-        // never comes, so it did not reach the target, and the search goes on.
+        // (--trial-timeout, or the run arguments' --timeout) or that Hermit
+        // refused is the exception: a spliced schedule can leave the guest
+        // waiting for an event that never comes, or take it down a path Hermit
+        // does not support, so it did not reach the target, and the search
+        // goes on.
         let test_fn = |sched: &[SchedEvent]| -> TrialOutcome {
             i += 1;
             let runname = format!("bisect_round_{:0wide$}", i, wide = 3);
@@ -926,8 +964,9 @@ impl AnalyzeOpts {
             }
 
             let is_match = match newrun.launch_trial()? {
-                TrialEnd::Unfinished => {
-                    timed_out += 1;
+                TrialEnd::Unfinished(stop) => {
+                    unfinished += 1;
+                    refused += usize::from(stop == Stop::Refusal);
                     return Ok((true, sched.to_owned()));
                 }
                 end => end.reached_target(),
@@ -950,7 +989,10 @@ impl AnalyzeOpts {
             "Critical event of final on-target schedule is {}",
             crit.critical_event_index
         );
-        for warning in search_warnings(&crit, timed_out) {
+        for warning in search_warnings(&crit, unfinished - refused) {
+            eprintln!(":: {} {warning}", "WARNING:".yellow().bold());
+        }
+        if let Some(warning) = refused_trials_warning(refused) {
             eprintln!(":: {} {warning}", "WARNING:".yellow().bold());
         }
         Ok(crit)
@@ -1452,7 +1494,7 @@ impl AnalyzeOpts {
         yellow_msg(
             "Verify preemption record *without* latest critical preempt causes criteria non-match. Also record sched events.",
         );
-        if newrun.launch_trial()? == TrialEnd::Unfinished {
+        if !newrun.launch_trial()?.finished() {
             return Err(BaselineUnfinished("--minimize's knock-out of its last preemption").into());
         }
         eprintln!("    {}", newrun.to_repro());
