@@ -244,16 +244,39 @@ impl<T: RecordOrReplay> Detcore<T> {
             maximum: requested.rlim_max,
         };
         let resource_limits = guest.thread_state().resource_limits.clone();
-        let mut limits = resource_limits
-            .lock()
-            .expect("resource limits mutex poisoned");
-        let previous = limits.get(resource).ok_or(Errno::EINVAL)?;
-        validate_resource_limit_mutation(resource, previous, requested)
-            .inspect_err(|errno| warn_refused_cpu_limit(guest, "setrlimit", resource, *errno))?;
-        if requested != previous {
-            limits.set(resource, requested);
-        }
+        let previous = {
+            let mut limits = resource_limits
+                .lock()
+                .expect("resource limits mutex poisoned");
+            let previous = limits.get(resource).ok_or(Errno::EINVAL)?;
+            validate_resource_limit_mutation(resource, previous, requested).inspect_err(
+                |errno| warn_refused_cpu_limit(guest, "setrlimit", resource, *errno),
+            )?;
+            if requested != previous {
+                limits.set(resource, requested);
+            }
+            previous
+        };
+        self.publish_rss_limit(guest, resource, previous, requested)
+            .await;
         Ok(0)
+    }
+
+    /// Tell Detcore's process table a process's new soft `RLIMIT_RSS`
+    /// (`Scheduler::set_rss_limit`), which a rendered `/proc/<pid>/stat` shows
+    /// whoever reads it (field 25): after a `setrlimit` or `prlimit64` of the
+    /// caller's own process changed it from `previous` to `requested`.
+    async fn publish_rss_limit<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        resource: u32,
+        previous: ResourceLimit,
+        requested: ResourceLimit,
+    ) {
+        if resource == libc::RLIMIT_RSS && requested.current != previous.current {
+            let process = self.own_detpid(guest);
+            crate::tool_global::set_rss_limit(guest, process, requested.current).await;
+        }
     }
 
     /// Virtualize `prlimit64(2)` for the current guest process.
@@ -341,6 +364,11 @@ impl<T: RecordOrReplay> Detcore<T> {
 
             previous
         };
+
+        if let Some(requested) = requested {
+            self.publish_rss_limit(guest, resource, previous, requested)
+                .await;
+        }
 
         if let Some(address) = call.old_rlim() {
             let previous = libc::rlimit64 {

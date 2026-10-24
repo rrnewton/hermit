@@ -760,6 +760,28 @@ impl RawFd {
         Ok(stat)
     }
 
+    /// The type of the file system the open file is on (`statfs::f_type`),
+    /// by a raw `fstatfs`.
+    pub fn fs_type(&self) -> std::io::Result<u64> {
+        // SAFETY: an all-zero `statfs` is a valid value, and the kernel
+        // writes at most its size.
+        let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
+        raw_zero_result(unsafe {
+            raw_syscall(
+                libc::SYS_fstatfs,
+                [
+                    self.0,
+                    &mut filesystem as *mut libc::statfs as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ],
+            )
+        })?;
+        Ok(filesystem.f_type as u64)
+    }
+
     /// Up to `buffer.len()` bytes at `offset`, by a raw `pread64`.
     pub fn read_at(&self, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
         // SAFETY: the buffer is writable for its length.

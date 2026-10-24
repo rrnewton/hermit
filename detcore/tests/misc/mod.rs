@@ -16,6 +16,7 @@
 mod cpuinfo_sessions;
 mod inode_reuse;
 mod notification_fds;
+mod proc_stat_lifecycle;
 mod procfs_caller_buffer;
 mod procfs_inode;
 mod raw_clone;

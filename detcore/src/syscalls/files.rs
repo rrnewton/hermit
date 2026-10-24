@@ -723,6 +723,18 @@ enum RenderedSeek {
 /// its EINVAL for a negative position; a negative `SEEK_HOLE` offset is
 /// replaced by the size, so the seek moves to 0. `seq_lseek` refuses every
 /// whence but `SEEK_SET` and `SEEK_CUR` with EINVAL.
+/// `rw_verify_area`'s range check for a read of a procfs file that has no
+/// unsigned offsets (fs/read_write.c:456-470 in 6.17): a count above
+/// `SSIZE_MAX`, or a position plus count past `LLONG_MAX`, is EINVAL.
+fn verify_procfs_read_range(position: usize, count: usize) -> Result<(), Errno> {
+    let count = i64::try_from(count).map_err(|_| Errno::EINVAL)?;
+    i64::try_from(position)
+        .ok()
+        .and_then(|position| position.checked_add(count))
+        .map(drop)
+        .ok_or(Errno::EINVAL)
+}
+
 fn rendered_procfs_seek(
     seek: RenderedSeek,
     whence: Whence,
@@ -2424,14 +2436,36 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             return Ok(total as i64);
         }
+        // A rendered `stat` renders anew where the read does not continue
+        // the sequence (`ProcfsFile::drop_stale_task_snapshot`).
+        let renders_task_record = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.procfs_renders_task_record())?;
+        let task_record_start = if renders_task_record {
+            let start = usize::try_from(position).map_err(|_| Errno::EINVAL)?;
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.procfs_drop_stale_task_snapshot(start))?;
+            Some(start)
+        } else {
+            None
+        };
         // A file the kernel opened takes its snapshot at its first read.
         if guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.procfs_needs_snapshot())?
         {
-            self.initialize_procfs_snapshot(guest, syscalls::Read::new().with_fd(fd))
-                .await?;
+            let rendered = self
+                .initialize_procfs_snapshot(guest, syscalls::Read::new().with_fd(fd))
+                .await;
+            if let Some(start) = task_record_start {
+                guest.thread_state().with_detfd(fd, |detfd| {
+                    detfd.procfs_note_task_record_rendered(start, rendered.is_ok())
+                })?;
+            }
+            rendered?;
         } else if let Some(offset) = offset
+            && !renders_task_record
             && guest.thread_state().with_detfd(fd, |detfd| {
                 detfd
                     .procfs_position()
@@ -2491,6 +2525,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .thread_state()
                 .with_detfd(fd, |detfd| detfd.commit_procfs_read(start, copied))?;
             self.sync_rendered_procfs_position(guest, fd).await?;
+        } else {
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.procfs_note_read_end(start + copied))?;
         }
         Ok(copied as i64)
     }
@@ -6578,6 +6616,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             detfd.procfs_status_mask_thread(&contents)
         })?;
         let published_sigblk = status_published_sigblk(guest, mask_thread).await;
+        // A process's `stat` or `comm` Detcore opened renders its task's
+        // record in the process table as of this read (`procfs::task_stat`).
+        let task_stat = self
+            .rendered_task_stat(guest, call.fd(), virtual_ppid)
+            .await?;
         guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.initialize_procfs(
                 contents.clone(),
@@ -6596,6 +6639,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     machine: machine.clone(),
                     published_sigblk,
                     lock_rows_kept: lock_rows_kept.clone(),
+                    task_stat,
                 },
             );
         })?;
@@ -6821,10 +6865,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        let (needs_procfs_snapshot, serves_procfs_snapshot, cannot_read) =
+        let (serves_procfs_snapshot, cannot_read) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
-                    detfd.procfs_needs_snapshot(),
                     detfd.procfs_serves_snapshot(),
                     !can_read(detfd.status_flags()),
                 )
@@ -6843,8 +6886,40 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.len(),
             )?;
         }
+        // A rendered `stat` renders anew where the read does not continue
+        // the sequence: after a `pread` or a `preadv` moved it, the shared
+        // cursor is elsewhere (`ProcfsFile::drop_stale_task_snapshot`). Only
+        // after `vfs_read`'s checks: the descriptor's access (above), the
+        // destination (`access_ok`, above) and the range (`rw_verify_area`:
+        // a cursor plus count past LLONG_MAX is EINVAL).
+        let task_record_cursor = if guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_renders_task_record())?
+        {
+            self.adopt_rendered_procfs_position(guest, call.fd())
+                .await?;
+            let cursor = guest.thread_state().with_detfd(call.fd(), |detfd| {
+                detfd.procfs_position().map_or(0, |(offset, _)| offset)
+            })?;
+            verify_procfs_read_range(cursor, call.len())?;
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                detfd.procfs_drop_stale_task_snapshot(cursor)
+            })?;
+            Some(cursor)
+        } else {
+            None
+        };
+        let needs_procfs_snapshot = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_snapshot())?;
         if needs_procfs_snapshot {
-            self.initialize_procfs_snapshot(guest, call).await?;
+            let rendered = self.initialize_procfs_snapshot(guest, call).await;
+            if let Some(cursor) = task_record_cursor {
+                guest.thread_state().with_detfd(call.fd(), |detfd| {
+                    detfd.procfs_note_task_record_rendered(cursor, rendered.is_ok())
+                })?;
+            }
+            rendered?;
         }
 
         self.adopt_rendered_procfs_position(guest, call.fd())
@@ -7157,12 +7232,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let offset = usize::try_from(call.offset()).map_err(|_| Errno::EINVAL)?;
-        let (needs_procfs_snapshot, serves_procfs_snapshot, cannot_read) =
+        let (serves_procfs_snapshot, cannot_read, renders_task_record) =
             guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (
-                    detfd.procfs_needs_snapshot(),
                     detfd.procfs_serves_snapshot(),
                     !can_read(detfd.status_flags()),
+                    detfd.procfs_renders_task_record(),
                 )
             })?;
         // A descriptor that cannot read (`O_PATH`, write-only, access mode 3)
@@ -7179,13 +7254,31 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.len(),
             )?;
         }
+        // A rendered `stat` renders anew where the read does not continue
+        // the sequence (`ProcfsFile::drop_stale_task_snapshot`), only after
+        // `vfs_read`'s checks: access, destination (above) and range
+        // (`rw_verify_area`: a position plus count past LLONG_MAX is EINVAL).
+        if renders_task_record {
+            verify_procfs_read_range(offset, call.len())?;
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                detfd.procfs_drop_stale_task_snapshot(offset)
+            })?;
+        }
+        let needs_procfs_snapshot = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_snapshot())?;
         if needs_procfs_snapshot {
             let read = syscalls::Read::new()
                 .with_fd(call.fd())
                 .with_buf(call.buf())
                 .with_len(call.len());
-            self.initialize_procfs_snapshot(guest, read).await?;
+            let rendered = self.initialize_procfs_snapshot(guest, read).await;
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                detfd.procfs_note_task_record_rendered(offset, rendered.is_ok())
+            })?;
+            rendered?;
         } else if serves_procfs_snapshot
+            && !renders_task_record
             && guest.thread_state().with_detfd(call.fd(), |detfd| {
                 detfd
                     .procfs_position()
@@ -7210,6 +7303,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 &bytes,
                 faults_on_a_short_copy,
             )?;
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                detfd.procfs_note_read_end(offset + copied)
+            })?;
             return Ok(copied as i64);
         }
 
@@ -7446,6 +7542,32 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
             let new_offset = rendered_procfs_seek(seek, call.whence(), call.offset(), current)?;
             let result = i64::try_from(new_offset).map_err(|_| Errno::EOVERFLOW)?;
+            // A rendered `stat` traverses at the seek wherever the sequence
+            // is not (`ProcfsFile::seek_task_record`): to a positive position
+            // its record is rendered here, in the seeking thread's turn, and
+            // a failed `show` (ESRCH, or the named refusal) leaves the cursor
+            // and the sequence at 0, as `seq_lseek` does.
+            if guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.procfs_renders_task_record())?
+            {
+                let renders = guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| detfd.seek_procfs_task_record(new_offset))?;
+                if renders
+                    && let Err(error) = self
+                        .initialize_procfs_snapshot(guest, syscalls::Read::new().with_fd(call.fd()))
+                        .await
+                {
+                    guest
+                        .thread_state()
+                        .with_detfd(call.fd(), |detfd| detfd.reset_procfs_task_record())?;
+                    self.sync_rendered_procfs_position(guest, call.fd()).await?;
+                    return Err(error);
+                }
+                self.sync_rendered_procfs_position(guest, call.fd()).await?;
+                return Ok(result);
+            }
             // seq_lseek to another positive position traverses the file,
             // which runs a per-process file's `show` (ESRCH once its task is
             // gone); a rewind or a no-op does not.
