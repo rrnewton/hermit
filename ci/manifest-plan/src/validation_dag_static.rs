@@ -3258,8 +3258,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Composed on measured main ffe313b1: 3395 + 44 = 3439 (Train 5 delta +44).
     // And tool_local::timeslice_tests::chaos_schedule_replay_draws_no_slice_end
     // (a schedule replay under --chaos draws no chaos decision): 3001, listed.
-    // Rebased onto main fcd62385f: 3465 + 1 = 3466.
-    ("test.detcore_unit", 3466),
+    // And tool_local::timeslice_tests::a_kept_replay_slice_restarts_only_the_backstop
+    // and preemptions::callback_history::tests::a_later_site_of_the_running_callback_ends_the_slice_later
+    // (a replayed slice end a callback checkpoint marks is one turn): 2814, listed.
+    // And tool_global::tests::legacy_callback_checkpoint_at_the_pmu_epsilon_ends_an_expired_deadline_once
+    // and tool_global::tests::legacy_chaos_replay_ends_an_expired_deadline_as_without_chaos
+    // (the same two fixes through the hooks): 3005, listed.
+    // Rebased onto main fcd62385f: 3465 + 5 = 3470.
+    ("test.detcore_unit", 3470),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4634,8 +4640,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on landed batch main: 789 + 5 = 794 (Train 5 delta +5 over 787).
     // And a_schedule_replay_under_chaos_follows_its_recording: 743, listed.
-    // Rebased onto main fcd62385f: 794 + 1 = 795.
-    ("test.cli", 795),
+    // And a_schedule_replay_ends_each_recorded_slice_once: 744, listed.
+    // Rebased onto main fcd62385f: 794 + 2 = 796.
+    ("test.cli", 796),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5265,8 +5272,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // growth as test.cli): 699 + 7 = 706.
     // Train 5 recount (same growth as test.cli), composed on landed batch main: 708 + 5 = 713.
     // And a_schedule_replay_under_chaos_follows_its_recording: 662, listed.
-    // Rebased onto main fcd62385f: 713 + 1 = 714.
-    ("test.cli_on_host", 714),
+    // And a_schedule_replay_ends_each_recorded_slice_once: 663, listed.
+    // Rebased onto main fcd62385f: 713 + 2 = 715.
+    ("test.cli_on_host", 715),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5822,8 +5830,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
     // Train 5 recount (same growth as test.detcore_unit), composed on measured main: 3395 + 44 = 3439.
     // And the same chaos schedule-replay unit: 3001, listed.
-    // Rebased onto main fcd62385f: 3465 + 1 = 3466.
-    ("test.detcore_unit_on_host", 3466),
+    // And the same two callback-checkpoint replay units: 2814, listed.
+    // And the same two hook-level replay units: 3005, listed.
+    // Rebased onto main fcd62385f: 3465 + 5 = 3470.
+    ("test.detcore_unit_on_host", 3470),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
