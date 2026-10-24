@@ -1155,7 +1155,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (A5 step 3c.1a, the delivery gate's field): 1816, listed.
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // 19 boundary/config model tests, two verifier tests, and five restored replay cases.
-    ("test.regular_crates", 1842),
+    // And detcore-model's four host-input set tests (host_input::tests): 1846,
+    // listed.
+    ("test.regular_crates", 1846),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2795,7 +2797,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // /proc/<pid>/stat (procfs::task_stat seven, procfs five, the
     // scheduler's task-name, parent and RSS-limit unit, rendered_procfs's
     // comm-authentication unit and misc's PR_SET_NAME unit): 2515, listed.
-    ("test.detcore_unit", 2515),
+    // And the host-input set's eight units (host_inputs six, tool_global's
+    // a_schedule_replay_reports_host_inputs_changed_since_its_recording and
+    // exec_record's
+    // an_image_names_its_program_interpreter_as_the_kernel_reads_it): 2523,
+    // listed.
+    ("test.detcore_unit", 2523),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3999,7 +4006,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (A5 step 3c slice 0c): 600, listed.
     // And liteinst_in_guest_programs::in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name
     // (A5 step 3c slice 0g): 601, listed.
-    ("test.cli", 601),
+    // And a_schedule_replay_names_a_host_input_changed_since_the_recording,
+    // which needs no PMU: 602, listed.
+    ("test.cli", 602),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4489,7 +4498,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unchanged at 520.
     // The in-guest unsequentialized-handler refusal test (slice 0g) starts the
     // in-guest runtime too and joins the hosted exclusions: unchanged at 520.
-    ("test.cli_on_host", 520),
+    // a_schedule_replay_names_a_host_input_changed_since_the_recording needs
+    // neither a PMU nor CPUID faulting: 521, listed.
+    ("test.cli_on_host", 521),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4908,7 +4919,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the nineteen callback-history units of
     // https://github.com/rrnewton/hermit/pull/4582: 2500.
     // And the same fifteen D4c-1 units: 2515, listed.
-    ("test.detcore_unit_on_host", 2515),
+    // And the same eight host-input set units: 2523, listed.
+    ("test.detcore_unit_on_host", 2523),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5442,7 +5454,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two in_guest_signal_delivery config tests: 1802, listed.
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // The same 26 tests; all existing hosted exclusions remain unchanged.
-    ("test.regular_crates_on_host", 1828),
+    // And the same four host-input set tests: 1832, listed.
+    ("test.regular_crates_on_host", 1832),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
