@@ -3053,7 +3053,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And determinize_stat_reports_one_link_for_directories_only and
     // determinize_stat_nlink_pin_edges (directory st_nlink pinned to 1):
     // 2736 + 2 = 2738, listed.
-    ("test.detcore_unit", 2738),
+    // And an_ignored_signal_shield_blocks_only_what_the_guest_ignores: 2739.
+    ("test.detcore_unit", 2739),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4336,7 +4337,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 632 + 2 = 634.
     // And in_guest_runtime_survives_a_guest_dup2_onto_each_of_its_descriptors
     // (https://github.com/rrnewton/hermit/issues/4689): 645.
-    ("test.cli", 654),
+    // And kernel_run_epoll_waits_are_not_ended_by_ignored_signals: 655.
+    ("test.cli", 655),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4868,7 +4870,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 551 + 2 = 553.
     // And the same in-guest dup2-onto-runtime-descriptors test, not excluded:
     // 564.
-    ("test.cli_on_host", 573),
+    // And kernel_run_epoll_waits_are_not_ended_by_ignored_signals: 574.
+    ("test.cli_on_host", 574),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5334,7 +5337,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same protection-key subscription unit: 2692, listed.
     // And the same P2b deletion of the anchor device unit: 2694, listed.
     // And the same two directory st_nlink units: 2738, listed.
-    ("test.detcore_unit_on_host", 2738),
+    // And an_ignored_signal_shield_blocks_only_what_the_guest_ignores: 2739.
+    ("test.detcore_unit_on_host", 2739),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

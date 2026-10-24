@@ -837,7 +837,15 @@ impl RecordVersion {
 // --chaos --seed=N`), and replay follows it. An older reader would replay a
 // chaos recording under the default schedule and fall out of step, so it is
 // refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x187);
+// 0x187 -> 0x188 (provisional: 0x188 is HIGHEST_SHIPPED + 1 at this base; the
+// lander re-checks HIGHEST_SHIPPED + 1 at land): an epoll_wait, or an
+// epoll_pwait or epoll_pwait2 without a mask, that Detcore runs in the kernel
+// now waits with the signals the guest ignores blocked, in record and in replay
+// (`IgnoredSignalShield`), so such a signal no longer ends it with EINTR. The
+// scheduler reads that mask when it commits the wait, so an older recording,
+// made under the guest's own mask, could choose another SIGCHLD taker or
+// readmission point in replay; it is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x188);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -862,7 +870,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x187);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x187;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x188;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
