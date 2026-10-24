@@ -2611,6 +2611,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         thread.callback_history.origin(thread, token, site)
     }
 
+    /// Under a schedule replay, let the recorded callback checkpoints decide
+    /// whether the slice ends at `site`. Returns whether one does: the next
+    /// checkpoint ended the slice here, or it ends it at a later site of the
+    /// running callback (`callback_history::State::ends_later_in_callback`).
+    /// In the second case the caller must not end the slice here either: a
+    /// timer preemption the record ended in its post-hook, within one RCB of
+    /// the PMU maximum, already reaches its replayed branch count in the
+    /// pre-hook, and ending it at both would give the replay a scheduler turn,
+    /// and a turn's charge of virtual time, that the record does not have.
     async fn replay_callback_checkpoint<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2632,10 +2641,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             return false;
         };
         let Some(origin) = self
-            .take_callback_checkpoint(guest, actual, token.as_ref())
+            .take_callback_checkpoint(guest, actual.clone(), token.as_ref())
             .await
         else {
-            return false;
+            return guest
+                .thread_state()
+                .callback_history
+                .ends_later_in_callback(&actual);
         };
         self.end_timeslice_with_checkpoint(guest, false, Some(origin), boundary, None)
             .await;
@@ -3217,8 +3229,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 if replay_checkpoint && !expiry_due {
                     // The event cursor may just have installed a future deadline,
                     // including through a TraceReplay resume. This administrative
-                    // pass does not draw or reset a slice. Later real grants may
-                    // update that authority normally; do not snapshot it here.
+                    // pass does not draw a slice end or close the slice; it only
+                    // restarts the backstop, as the recorded run's new slice
+                    // had it. Later real grants may update that authority
+                    // normally; do not snapshot it here.
+                    thread.restart_replay_backstop(&self.cfg);
                     (None, None)
                 } else if let Some(mut observed) = thread.slice_boundary.take() {
                     let result =
@@ -5076,6 +5091,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     lone_slice_end: None,
                     replaying_lone_slice_end: None,
                     lone_replay_unsound: false,
+                    replay_backstop: None,
 
                     record_or_replay,
                     preemption_points: None,
