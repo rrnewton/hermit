@@ -14200,18 +14200,23 @@ impl Scheduler {
             let priority = self.get_priority(dettid);
             // The replayed schedule's next event is this retry: a poll backoff
             // would hand the turn to another thread and leave the schedule. A
-            // recorded unsuccessful attempt keeps the turn. A recorded
-            // completion keeps it only until the retry is a second one after an
-            // attempt that moved nothing: that retry waits on another thread,
-            // which the recording ran as a retry with no event of its own (a
-            // FIFO open waiting for its peer's open), so it backs off as before;
-            // kept running, it would never let that thread run. The first retry
-            // keeps the turn, since the grant before it may have finished other
-            // calls, which counts as progress.
+            // recorded unsuccessful attempt keeps the turn. So does a recorded
+            // completion, except a retry that is a second one after an attempt
+            // that moved nothing on guest state alone (`polls_guest_state_only`):
+            // only another thread's action can make that retry succeed, and the
+            // recording ran it as a retry with no event of its own (a FIFO open
+            // waiting for its peer's open), so it backs off as before; kept
+            // running, it would never let that thread run. A retry whose outcome
+            // the host can change keeps the turn and tries again (an event-loop
+            // poll whose data arrives a few attempts later): backing it off
+            // would run another thread, an event the recording does not have
+            // there. The first retry keeps the turn, since the grant before it
+            // may have finished other calls, which counts as progress.
             let keeps_turn = self.replayer.as_ref().is_some_and(|replayer| {
                 replayer.next_is_retry_by(dettid)
                     && (replayer.next_is_failed_attempt_by(dettid)
-                        || !Self::retries_its_call_without_progress(rs))
+                        || !(rs.polls_guest_state_only
+                            && Self::retries_its_call_without_progress(rs)))
             });
             if keeps_turn {
                 self.run_queue.push_back(dettid, priority);
@@ -24243,20 +24248,22 @@ mod test {
     /// rather than backed off as a poller, which would hand another thread the
     /// turn the recording gave it. It is backed off as before when the
     /// schedule names another thread next, or names the retry's completion
-    /// while the retry is a second one after an attempt that moved nothing (it
-    /// waits on another thread's retry). A recorded unsuccessful attempt keeps
-    /// the turn either way.
+    /// while the retry is a second one after an attempt that moved nothing on
+    /// guest state alone (only another thread can make it succeed). A retry
+    /// whose outcome the host can change keeps the turn, and so does a
+    /// recorded unsuccessful attempt.
     #[test]
     fn a_replayed_retry_is_not_backed_off_as_a_poller() {
         let poller = DetTid::from_raw(3);
         let other = DetTid::from_raw(5);
         let (completion, attempt) = (SyscallPhase::Posthook, SyscallPhase::Polling);
-        for (next, phase, retry, made_progress, backed_off) in [
-            (poller, completion, 1, false, false),
-            (other, completion, 1, false, true),
-            (poller, completion, 2, false, true),
-            (poller, completion, 2, true, false),
-            (poller, attempt, 2, false, false),
+        for (next, phase, retry, made_progress, guest_state_only, backed_off) in [
+            (poller, completion, 1, false, true, false),
+            (other, completion, 1, false, true, true),
+            (poller, completion, 2, false, true, true),
+            (poller, completion, 2, false, false, false),
+            (poller, completion, 2, true, true, false),
+            (poller, attempt, 2, false, true, false),
         ] {
             let mut scheduler = Scheduler::new(&Config::default());
             register_known_thread(&mut scheduler, poller);
@@ -24273,6 +24280,7 @@ mod test {
             request.insert(ResourceID::InternalIOPolling, Permission::W);
             request.poll_attempt = retry;
             request.previous_attempt_made_progress = made_progress;
+            request.polls_guest_state_only = guest_state_only;
             let turn = scheduler.next_turns.get(&poller).unwrap();
             turn.req.put(Ok(request.clone()));
             let response = turn.resp.clone();
@@ -24287,7 +24295,7 @@ mod test {
                 !scheduler.run_queue.contains_non_polling_tid(poller),
                 backed_off,
                 "the schedule's next event is dtid {next}'s {phase:?}, retry {retry}, \
-                 progress {made_progress}"
+                 progress {made_progress}, guest state only {guest_state_only}"
             );
         }
     }
