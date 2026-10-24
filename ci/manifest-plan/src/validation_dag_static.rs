@@ -2805,7 +2805,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // epoch read without copying the configuration, and its placeholder
     // gate): 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit", 2529),
+    // And nine fatal_core::tests for cores that hold every thread (one
+    // decision per death, a reused TGID, the PF_DUMPCORE thread as the
+    // dumper, a core without its dumping thread refused, the thread order, the
+    // leader's state, the kernel's note order, the offered thread's
+    // registers, every thread's frames in the Stack tier): 2538, listed.
+    ("test.detcore_unit", 2538),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3133,7 +3138,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and recvmsg-import refusals and native-lock control, and
     // proc_locks_determinism's copied-child OFD unlock and stale-flock-record
     // tests: 285, listed.
-    ("test.hermit_integration_2", 285),
+    // And fatal_core_capture's three tests of cores that hold every thread
+    // (the note layout and each thread's registers, gdb, two identical runs):
+    // 288, listed.
+    ("test.hermit_integration_2", 288),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -4925,7 +4933,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twelve A+ units: 2527, listed.
     // And the same three slice 7d determinize_stat_tests units: 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit_on_host", 2529),
+    // And the same nine fatal_core::tests: 2538, listed.
+    ("test.detcore_unit_on_host", 2538),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5037,7 +5046,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 28 retained coherent mapping-capture controls: 685.
     // Split the five birth cases into separately bounded identities (+4): 689.
     // And two pure declared-Redis input controls in redis_strict: 691, listed.
-    ("test.hermit_integration_on_host", 691),
+    // And the same three fatal_core_capture tests: 694, listed.
+    ("test.hermit_integration_on_host", 694),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
