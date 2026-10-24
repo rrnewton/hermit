@@ -420,11 +420,13 @@ fn protected_evidence_capture_ready(protected_level: i32, tracing_active: bool) 
     protected_level == 0 || tracing_active
 }
 
-/// Stable CLI-derived Detcore [`Config`] JSON for standalone initialization.
+/// Detcore [`Config`] JSON for standalone initialization.
 ///
-/// The admitted native startup mode selects this existing fallback only when
-/// no coordinator control is present. Coordinated initialization receives the
-/// complete physical Config from the existing first RPC frame instead.
+/// The admitted native startup mode selects this fallback only when no
+/// coordinator control is present. Coordinated initialization, which is how
+/// `hermit run` launches DBT, receives the complete physical Config from the
+/// first RPC frame instead, and Hermit does not set this variable: the guest's
+/// environment carries only what the guest was given.
 pub const DETCONFIG_ENV: &str = "HERMIT_DBT_DETCONFIG";
 
 /// Where the effective Detcore [`Config`] came from, for native diagnostics.
@@ -452,16 +454,16 @@ fn default_dbt_config() -> Config {
 /// What the DBT backend can do, in the form Detcore reads.
 ///
 /// `hermit run --backend=dbt` copies the same value into its configuration.
-/// The coordinator frame retains that value; the stable [`DETCONFIG_ENV`]
-/// producer also encodes it for the existing standalone fallback.
+/// The coordinator frame carries that value. Hermit does not write
+/// [`DETCONFIG_ENV`]; a standalone run that sets it can state it there too.
 pub const fn backend_capabilities() -> reverie::BackendCapabilities {
     reverie_dbt::DbtRunner::capabilities()
 }
 
 /// Builds the admitted standalone Detcore [`Config`] fallback.
 ///
-/// The configuration is taken from the CLI-derived Detcore config serialized
-/// into [`DETCONFIG_ENV`] when present; otherwise a strict default is used.
+/// The configuration is taken from the Detcore config serialized into
+/// [`DETCONFIG_ENV`] when present; otherwise a strict default is used.
 /// Regardless of the source, the DBT execution-model invariants are re-asserted
 /// by [`assert_dbt_execution_model`]. A present coordinator control is handled
 /// by [`initial_dbt_config`] and never falls back through this function.
@@ -473,8 +475,8 @@ fn load_dbt_config() -> (Config, ConfigSource) {
 /// variable is absent or not Unicode.
 ///
 /// The backend facts are those the value carries, decoded by
-/// [`detcore::decode_backend_config_json`]; `hermit run` encodes
-/// [`backend_capabilities`] there. Without a parseable value they are the
+/// [`detcore::decode_backend_config_json`]; a configuration for this backend
+/// states [`backend_capabilities`] there. Without a parseable value they are the
 /// strict default's, which are ptrace's. This is the admitted standalone
 /// fallback only: coordinated startup, including an empty-environment exec,
 /// receives the authoritative physical Config through [`initial_dbt_config`].
@@ -1375,8 +1377,9 @@ unsafe fn runtime_background_init(
             // Fail-closed unsupported-syscall handling (PR #644): the rest of the
             // Config arrives via the selected startup source, but the panic
             // flag comes from the DBT callback (the `-panic-on-unsupported-syscalls` client
-            // argument), because DynamoRIO re-injects the client across execve
-            // while an empty-env exec would drop the serialized config. Set up
+            // argument), because DynamoRIO re-injects the client, with its arguments,
+            // across every execve, while an empty-environment exec would drop a
+            // standalone run's serialized configuration. Set up
             // the protected report descriptor the guest children write aggregated
             // unsupported-syscall records to, and force the exit+report path so a
             // child terminates the process tree deterministically.
@@ -3444,8 +3447,8 @@ mod tests {
         assert!(!arms.contains("result.write"), "{arms}");
     }
 
-    /// The configuration `hermit run --backend=dbt` would send, encoded as it
-    /// is put in the guest's environment.
+    /// The configuration `hermit run --backend=dbt` sends, encoded as a
+    /// standalone run's [`DETCONFIG_ENV`] carries it.
     fn hermit_run_dbt_detconfig() -> (Config, String) {
         let mut sent = default_dbt_config();
         sent.seed = 7;
@@ -3457,6 +3460,91 @@ mod tests {
         )
         .unwrap();
         (sent, json)
+    }
+
+    /// A configuration with non-default payloads (seeds, a clock multiplier, a
+    /// path whose text looks like legacy keys and a stack-trace event) decodes to every field it was encoded with, under
+    /// each combination of the three independent descriptor facts. Only the
+    /// combinations the legacy form couples (all false, all true) fit it;
+    /// every other one takes the versioned envelope.
+    #[test]
+    fn a_rich_configuration_round_trips_under_every_descriptor_mask() {
+        for mask in 0_u8..8 {
+            let (mut sent, _) = hermit_run_dbt_detconfig();
+            sent.rng_seed = Some(13);
+            sent.sched_seed = Some(11);
+            sent.clock_multiplier = Some(1.5);
+            sent.record_preemptions_to = Some(std::path::PathBuf::from(
+                "/tmp/a,\"detect_host_clock_futex_timeouts\":true,\"backend_tracks_process_children\":{",
+            ));
+            sent.stacktrace_event = vec![(3, Some(std::path::PathBuf::from("/s")))];
+            sent.backend.tool_shares_guest_descriptor_table = mask & 1 != 0;
+            sent.backend.rediscovers_descriptors_after_exec = mask & 2 != 0;
+            sent.backend.loopback_pollers_yield_to_peers = mask & 4 != 0;
+            let json = detcore::encode_backend_config_json(
+                detcore::to_legacy_backend_json(&sent).unwrap(),
+                sent.backend,
+            )
+            .unwrap();
+            assert_eq!(
+                detcore::from_legacy_backend_json(&json).is_ok(),
+                mask == 0 || mask == 7,
+                "only coupled facts fit the legacy form: mask {mask}"
+            );
+            let decoded = detcore::decode_backend_config_json(&json).unwrap();
+            assert_eq!(
+                serde_json::to_string(&decoded).unwrap(),
+                serde_json::to_string(&sent).unwrap(),
+                "mask {mask}"
+            );
+        }
+    }
+
+    /// The versioned envelope admits exactly version 1 with one `config` and
+    /// one `backend` member, while a legacy object keeps ignoring a stray
+    /// `dbt_config_version` key as it ignores every unknown key.
+    #[test]
+    fn versioned_config_rejects_unknown_or_malformed_envelopes() {
+        let (config, _) = hermit_run_dbt_detconfig();
+        let legacy = detcore::to_legacy_backend_json(&config).unwrap();
+        let legacy_backend = detcore::from_legacy_backend_json(&legacy).unwrap().backend;
+        let backend = serde_json::to_string(&config.backend).unwrap();
+        let envelope = |version: &str| {
+            format!(
+                "{{\"dbt_config_version\":{version},\"config\":{legacy},\"backend\":{backend}}}"
+            )
+        };
+        for version in ["0", "2", "-1", "null", "\"1\""] {
+            assert!(
+                detcore::decode_backend_config_json(&envelope(version)).is_err(),
+                "version {version} must be refused"
+            );
+            let tagged_legacy =
+                legacy.replacen('{', &format!("{{\"dbt_config_version\":{version},"), 1);
+            assert_eq!(
+                detcore::decode_backend_config_json(&tagged_legacy)
+                    .unwrap()
+                    .backend,
+                legacy_backend,
+                "an unknown legacy key must remain ignored"
+            );
+        }
+        let duplicate = format!(
+            "{{\"dbt_config_version\":1,\"dbt_config_version\":1,\"config\":{legacy},\"backend\":{backend}}}"
+        );
+        assert!(detcore::decode_backend_config_json(&duplicate).is_err());
+        let missing_backend = format!("{{\"dbt_config_version\":1,\"config\":{legacy}}}");
+        assert!(detcore::decode_backend_config_json(&missing_backend).is_err());
+        let missing_config = format!("{{\"dbt_config_version\":1,\"backend\":{backend}}}");
+        assert!(detcore::decode_backend_config_json(&missing_config).is_err());
+        for duplicate in [
+            format!("\"config\":{legacy}"),
+            format!("\"backend\":{backend}"),
+            "\"unknown\":true".to_owned(),
+        ] {
+            let json = envelope("1").replacen('{', &format!("{{{duplicate},"), 1);
+            assert!(detcore::decode_backend_config_json(&json).is_err());
+        }
     }
 
     #[test]
@@ -3564,12 +3652,12 @@ mod tests {
         }
     }
 
-    /// The CLI encodes the admitted standalone fallback with
-    /// [`detcore::encode_backend_config_json`]. Its standalone reader retains
-    /// every field, DBT's capabilities included. Coordinated startup receives
-    /// the authoritative typed Config through its separate handshake.
+    /// A standalone run's configuration, encoded with
+    /// [`detcore::encode_backend_config_json`], reads back with every field,
+    /// DBT's capabilities included. Coordinated startup, which is how Hermit
+    /// launches DBT, receives the typed Config through its handshake instead.
     #[test]
-    fn the_cli_configuration_round_trips_through_its_environment_encoding() {
+    fn a_standalone_configuration_round_trips_through_its_environment_encoding() {
         let (sent, json) = hermit_run_dbt_detconfig();
         assert!(detcore::from_legacy_backend_json(&json).is_err());
         let (received, source) = dbt_config_from(Some(&json));

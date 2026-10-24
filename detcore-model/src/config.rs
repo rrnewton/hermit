@@ -939,9 +939,9 @@ pub struct Config {
     /// they finish. Otherwise the descriptor-table changes of different threads could
     /// interleave differently from one replay to the next.
     ///
-    /// It never enters the legacy form ([`to_legacy_backend_json`]), so the DBT runtime's
-    /// `HERMIT_DBT_DETCONFIG` in the guest's environment is unchanged by its introduction
-    /// and reads it as false. Record and replay run only on the ptrace backend.
+    /// It never enters the legacy form ([`to_legacy_backend_json`]), so a standalone DBT
+    /// run's `HERMIT_DBT_DETCONFIG` reads it as false. Record and replay run only on the
+    /// ptrace backend.
     #[serde(default)]
     #[clap(skip = false)]
     pub replaying: bool,
@@ -2267,11 +2267,11 @@ impl Default for Config {
 /// other field is serialized exactly as `serde_json::to_string(config)`
 /// serializes it.
 ///
-/// Use this wherever the JSON is visible to the guest. `hermit run
-/// --backend=dbt` passes the configuration to the in-guest DBT runtime in the
-/// guest's own environment, so a guest that reads its environment, or whose
-/// initial stack layout depends on the environment's size, observes this
-/// string; producing the earlier bytes keeps that observation unchanged.
+/// A standalone DBT run (one with no coordinator) reads its configuration
+/// from `HERMIT_DBT_DETCONFIG` in this form or in the versioned envelope of
+/// [`encode_backend_config_json`]. `hermit run --backend=dbt` writes neither:
+/// it launches DBT coordinated, and the runtime receives the typed `Config`
+/// through the coordinator's first RPC frame.
 ///
 /// Read the result with [`from_legacy_backend_json`], which recovers
 /// [`Config::backend`] from the fifteen keys. A plain `Config`
@@ -2406,14 +2406,14 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// `cpuid_virtualized_by_backend` supplies no capability either: it said the
 /// backend installed a CPUID policy of its own, which no backend does any
 /// more (KVM stopped with Reverie 0f4d8852). It is still written, as false,
-/// so DBT's guest-visible configuration keeps its bytes, and an input that
+/// so the legacy form keeps its bytes, and an input that
 /// says `true` fails the parse rather than being read as a policy no backend
 /// has.
 ///
 /// `backend_virtualizes_capability_prctls` supplies no capability either: it
 /// said the backend answered the capability-set prctls itself, and every
-/// backend now passes them to the kernel. It is written as false, so DBT's
-/// configuration keeps its bytes, and `true` fails the parse.
+/// backend now passes them to the kernel. It is written as false, so the
+/// legacy form keeps its bytes, and `true` fails the parse.
 ///
 /// `kvm_shared_dequeue_timers` supplies no capability. It was read into a
 /// `Config` field that chose the controlled signal path, and that choice is
@@ -2485,8 +2485,8 @@ pub fn from_legacy_backend_json(json: &str) -> serde_json::Result<Config> {
 /// Preserve the exact backend facts alongside an already encoded legacy config.
 ///
 /// The legacy form couples some capabilities and omits others. When it can
-/// express `backend` exactly, return `legacy_json` byte for byte: DBT exposes
-/// this string in the guest's environment. Otherwise wrap it in a versioned
+/// express `backend` exactly, return `legacy_json` byte for byte, so a reader
+/// of the legacy form reads it unchanged. Otherwise wrap it in a versioned
 /// envelope whose typed backend replaces the legacy projection on decoding.
 /// Non-backend fields keep the legacy form's semantics in either case.
 pub fn encode_backend_config_json(
@@ -2734,10 +2734,10 @@ mod legacy_backend_json {
     /// `signal_state_copy` came after it too. The copy is never kept on DBT
     /// (its kernel signal state is not the guest's), so it is never written
     /// and reads as on, its serde default.
-    /// And `container_mount_table`. DBT's launcher encodes the
-    /// legacy form before the container exists, so it has no table to write;
-    /// it is never written and reads as absent. The coordinated startup's
-    /// typed configuration carries the table.
+    /// And `container_mount_table`, which describes one run's container: the
+    /// frozen form omits it, so it is never written and reads as absent. The
+    /// coordinated startup's typed configuration, which is how Hermit
+    /// launches DBT, carries the table.
     /// `mountinfo_mount_namespace` too, for the same reason: it is never
     /// written and reads as absent.
     /// `signal_delivery_check_fatal` matters only where the copy is kept, so
@@ -3373,7 +3373,7 @@ mod tests {
     /// it was a field still reads and the key decides nothing, whatever it
     /// holds and however often it appears. This is the whole compatibility
     /// policy for the named form, and it is safe because no production code
-    /// reads a `Config` by field name: the guest-visible DBT form is read by
+    /// reads a `Config` by field name: the standalone DBT form is read by
     /// [`from_legacy_backend_json`], which checks the key, and the bincode form
     /// that crosses process boundaries is positional. Removing the field
     /// changed that positional form and [`config_wire_fingerprint`]. SaBRe's
@@ -3967,7 +3967,7 @@ mod tests {
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
-    /// the guest-visible string stays the legacy bytes, and it reads back as
+    /// the legacy string keeps its bytes, and it reads back as
     /// false from both the object and the array form.
     #[test]
     fn record_host_inputs_never_enters_the_legacy_form() {
@@ -3993,8 +3993,8 @@ mod tests {
 
     /// `process_exits_complete_asynchronously`, added after the legacy form
     /// froze, never enters it, whatever its value, exactly as
-    /// `record_host_inputs` does not: the guest-visible bytes stay the legacy
-    /// bytes, and it reads back as false from the object and the array form.
+    /// `record_host_inputs` does not: the legacy string keeps its bytes, and
+    /// it reads back as false from the object and the array form.
     #[test]
     fn process_exits_complete_asynchronously_never_enters_the_legacy_form() {
         let on = Config {
@@ -4032,7 +4032,7 @@ mod tests {
     /// it, `delivers_preemption_timer_events`,
     /// `runs_guest_code_between_injections`, `reports_sigreturns`) never enter
     /// it, whatever their
-    /// value: the guest-visible string stays the legacy bytes, and they read
+    /// value: the legacy string keeps its bytes, and they read
     /// back as false from both the object and the array form.
     #[test]
     fn post_freeze_capabilities_never_enter_the_legacy_form() {
@@ -4079,7 +4079,7 @@ mod tests {
     }
 
     /// `guest_may_inherit_a_terminal` never enters the legacy form, whatever
-    /// its value: the guest-visible string stays the legacy bytes, and it reads
+    /// its value: the legacy string keeps its bytes, and it reads
     /// back as false from both the object and the array form.
     /// `in_guest_detlog_forward_policy` is unset for DBT, so the legacy form
     /// never carries it, and it reads back as unset.
@@ -4206,7 +4206,7 @@ mod tests {
     }
 
     /// `inherited_seccomp` never enters the legacy form, whatever its value:
-    /// the guest-visible string stays the legacy bytes, and it reads back as
+    /// the legacy string keeps its bytes, and it reads back as
     /// unknown from both the object and the array form.
     #[test]
     fn the_cpu_profile_never_enters_the_legacy_form() {
@@ -4330,7 +4330,7 @@ mod tests {
     }
 
     /// `target_timeslice_syscalls_only` never enters the legacy form, whatever
-    /// its value: the guest-visible string stays the legacy bytes, and it reads
+    /// its value: the legacy string keeps its bytes, and it reads
     /// back as false from both the object and the array form.
     #[test]
     fn target_timeslice_syscalls_only_never_enters_the_legacy_form() {
@@ -4453,7 +4453,7 @@ mod tests {
     }
 
     /// `futex_wake_yields` never enters the legacy form, whatever its
-    /// value: the guest-visible string stays the legacy bytes, and it reads
+    /// value: the legacy string keeps its bytes, and it reads
     /// back as false from both the object and the array form.
     #[test]
     fn futex_wake_yields_never_enters_the_legacy_form() {
@@ -4478,7 +4478,7 @@ mod tests {
     }
 
     /// `scheduler_turn_cost` never enters the legacy form, whatever its value:
-    /// the guest-visible string stays the legacy bytes, and it reads back as
+    /// the legacy string keeps its bytes, and it reads back as
     /// unset from both the object and the array form.
     #[test]
     fn scheduler_turn_cost_never_enters_the_legacy_form() {
@@ -4511,7 +4511,7 @@ mod tests {
     }
 
     /// `replaying` never enters the legacy form, whatever its value: the
-    /// guest-visible string stays the legacy bytes, and it reads back as false
+    /// legacy string keeps its bytes, and it reads back as false
     /// from both the object and the array form.
     #[test]
     fn replaying_never_enters_the_legacy_form() {

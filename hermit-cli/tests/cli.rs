@@ -11961,6 +11961,105 @@ fn run_dbt_guest_sees_ptraces_environment_before_and_after_exec() {
     assert_eq!(dbt, ptrace);
 }
 
+/// Hermit's configuration is not in a DBT guest's environment. DynamoRIO
+/// erases the runtime's private variables to NULs before each image it follows
+/// runs, and passes them on to the next, but the kernel's range for
+/// `/proc/self/environ` still covers their bytes, so the range's size shows
+/// what was hidden there. The shell opens its own `/proc/self/environ`, so the
+/// range measured is that of the first image DynamoRIO started (a redirection
+/// on `wc` would open the forked child before its exec, whose old range then
+/// reads as empty). With the same starting environment as under ptrace, the
+/// difference is the private variables alone: about 250 bytes (the
+/// coordinator socket path and DynamoRIO's own variables). Hermit's serialized
+/// configuration, which it used to put there as `HERMIT_DBT_DETCONFIG`, added
+/// about 3,700 bytes more (measured 254 and 3,950 hidden bytes).
+#[test]
+fn dbt_guest_environment_does_not_carry_hermits_configuration() {
+    if dbt_unavailable("dbt_guest_environment_does_not_carry_hermits_configuration") {
+        return;
+    }
+    let range = |backend: &str| {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--",
+            "/bin/sh",
+            "-c",
+            "exec 3</proc/self/environ; wc -c <&3; env | wc -c",
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let numbers: Vec<usize> = stdout
+            .lines()
+            .map(|line| {
+                line.split_whitespace()
+                    .next()
+                    .and_then(|count| count.parse().ok())
+                    .unwrap_or_else(|| panic!("{backend}: {stdout}"))
+            })
+            .collect();
+        assert_eq!(numbers.len(), 2, "{backend}: {stdout}");
+        (numbers[0], numbers[1])
+    };
+    let (ptrace_range, ptrace_visible) = range("ptrace");
+    let (dbt_range, dbt_visible) = range("dbt");
+    // A range that read as empty measured nothing. (`env` prints more than
+    // the shell started with: the shell adds PWD, SHLVL and the like.)
+    assert!(
+        ptrace_range > 0 && dbt_range > 0,
+        "an environment range read as empty: ptrace {ptrace_range}, DBT {dbt_range}"
+    );
+    assert_eq!(
+        dbt_visible, ptrace_visible,
+        "the visible environments differ"
+    );
+    let hidden = dbt_range
+        .checked_sub(ptrace_range)
+        .unwrap_or_else(|| panic!("DBT range {dbt_range} < ptrace range {ptrace_range}"));
+    assert!(
+        hidden < 2048,
+        "the DBT guest's environment range hides {hidden} bytes (ptrace {ptrace_range}, \
+         DBT {dbt_range}); Hermit's configuration is about 3,700"
+    );
+}
+
+/// `hermit run --backend=dbt --strict-schedule-boundaries` is refused by name
+/// before any guest runs: strict schedule boundaries have never run on this
+/// backend.
+#[test]
+fn dbt_run_refuses_strict_schedule_boundaries() {
+    if dbt_unavailable("dbt_run_refuses_strict_schedule_boundaries") {
+        return;
+    }
+    let args = [
+        "--backend",
+        "dbt",
+        "run",
+        "--strict",
+        "--strict-schedule-boundaries",
+        "--record-preemptions",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--",
+        "/bin/true",
+    ];
+    let output = hermit(&args);
+    assert!(!output.status.success(), "{args:?} succeeded");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the dbt backend does not run --strict-schedule-boundaries"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("Detcore Tool active"),
+        "the refusal came after launch: {stderr}"
+    );
+}
+
 /// DBT verification of a guest that prints its environment passes. It failed
 /// with "Mismatch in stdout between run 1 and run 2" on the coordinator socket
 /// path, which was random per run and in the guest's environment.

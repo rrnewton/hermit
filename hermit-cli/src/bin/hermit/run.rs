@@ -3235,14 +3235,14 @@ fn dbt_runtime_binds_do_not_change_original_options_or_guest_inputs() {
     ]);
     let original = format!("{options:?}");
     let guest = options.guest_command().unwrap();
-    let config = hermit::dbt_detconfig_json(&options.effective_det_config()).unwrap();
+    let config = serde_json::to_string(&options.effective_det_config()).unwrap();
     let binding = Bind::new("/host/private/stats", "/tmp/.hermit-dbt-stats-0");
     let launch = options.with_dbt_mounts(std::slice::from_ref(&binding), Vec::new());
     assert_eq!(launch.bind.last(), Some(&binding));
     assert_eq!(format!("{options:?}"), original);
     assert!(options.dbt_binds().is_empty());
     assert_eq!(
-        hermit::dbt_detconfig_json(&launch.effective_det_config()).unwrap(),
+        serde_json::to_string(&launch.effective_det_config()).unwrap(),
         config
     );
     let launched_guest = launch.guest_command().unwrap();

@@ -939,12 +939,18 @@ impl DbtInvocation {
              remove --no-sequentialize-threads (or --strace-only) to run under --backend dbt",
             ));
         }
-        // The guest sees this string in its environment, so it keeps the encoding
-        // it had before the backend facts moved into `Config::backend` and before
-        // three constant switches were deleted; see `hermit::dbt_detconfig_json`.
-        // The DBT runtime decodes the backend facts back out of it (here DBT's
-        // own); when the string is absent or does not parse, it uses the strict
-        // default's facts, which are ptrace's.
+        // Strict schedule boundaries have never run on this backend: the
+        // configuration form that once carried Detcore's configuration to the
+        // DBT runtime could not express them, which refused such a run. They
+        // stay refused, by name.
+        if config.strict_schedule_boundaries {
+            return Err(Error::msg(
+                "the dbt backend does not run --strict-schedule-boundaries",
+            ));
+        }
+        // The DBT runtime receives this configuration through the coordinator's
+        // first RPC frame, never through the guest's environment, which carries
+        // only what the guest was given.
         let (drrun, client) = detcore_dbt::prepare_native_client().map_err(|error| {
             Error::msg(format!(
                 "failed to prepare the Detcore DynamoRIO client: {error}"
@@ -954,14 +960,16 @@ impl DbtInvocation {
         hermit::declare_dbt_launcher(&mut config, &drrun)
             .map_err(|error| Error::msg(format!("{error:#}")))?;
         let config = &config;
-        let config_json = hermit::dbt_detconfig_json(config).map_err(|error| {
+        // The coordinator's first RPC frame carries this configuration to the
+        // runtime. One that cannot be serialized (a path option that is not
+        // UTF-8, say) is refused here, before any guest runs.
+        serde_json::to_vec(config).map_err(|error| {
             Error::msg(format!(
                 "failed to serialize the Detcore config for the DBT backend: {error}"
             ))
         })?;
-        // The full DetConfig now reaches the DBT runtime via the serialized env
-        // above; the fail-closed policy (PR #644) still drives process-group
-        // isolation and the client flag here.
+        // The fail-closed policy (PR #644) also drives process-group isolation
+        // and the client flag here.
         let panic_on_unsupported_syscalls = config.panic_on_unsupported_syscalls;
 
         let marker = std::env::var_os(hermit_test_workdir::REQUEST_ENV);
@@ -1031,7 +1039,6 @@ impl DbtInvocation {
 
         let mut guest = StdCommand::new(program);
         environment.remove(OsStr::new("HERMIT_LOG_FILE"));
-        environment.insert(detcore_dbt::DETCONFIG_ENV.into(), config_json.into());
         apply_exact_environment(&mut guest, &environment);
         guest.args(args);
         apply_dbt_workdir(&mut guest, workdir);
@@ -1693,9 +1700,9 @@ impl DbtExecution {
     }
 
     /// Run `run` with a fresh coordinator runtime and `config` completed for
-    /// the container. The guest's environment keeps the configuration
-    /// encoded before the container exists: the completed one carries this
-    /// run's host mount IDs, and its length would move the guest's stack.
+    /// the container. The completed configuration carries this run's host
+    /// mount IDs; it reaches the DBT runtime only through the coordinator's
+    /// first RPC frame, never through the guest's environment.
     fn run<F, T>(&self, config: &Config, mut run: F) -> Result<T, Error>
     where
         F: FnMut(&tokio::runtime::Runtime, &Config) -> Result<T, Error> + 'static,
