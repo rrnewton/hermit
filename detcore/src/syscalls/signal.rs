@@ -40,6 +40,7 @@ use crate::scheduler::discarded_at_send::DiscardedSignalAnswer;
 use crate::scheduler::discarded_at_send::DiscardedSignalControl;
 use crate::scheduler::discarded_at_send::QueueId;
 use crate::scheduler::pid_namespaces::GuestPidAnswer;
+use crate::scheduler::process_signal_receiver::ProcessSignalReceiver;
 use crate::scheduler::signal_lists::KernelSiginfo;
 use crate::syscalls::guest_siginfo::GuestSiginfo;
 use crate::syscalls::helpers::REAL_TIME_SIGNALS;
@@ -2454,22 +2455,45 @@ impl<T: RecordOrReplay> Detcore<T> {
             OwnProcessSend::Refused(answer) => return answer,
             OwnProcessSend::NotOwn => {}
         }
-        let Some(tid) = self
-            .process_signal_target(guest, Sysno::kill, DetPid::from_raw(process), call.sig())
+        let named = DetTid::from_raw(tgid);
+        let tid = match self
+            .process_signal_target(
+                guest,
+                Sysno::kill,
+                DetPid::from_raw(process),
+                named,
+                call.sig(),
+            )
             .await?
-        else {
-            // A zombie: exited, and its parent can still wait for it. Linux's
-            // kill_pid_info still finds it and the send succeeds, discarding
-            // the signal, so answer 0 without a system call: the host process
-            // may already be gone if a backend reaped it, and the logical
-            // answer must not depend on when
-            // (https://github.com/rrnewton/hermit/issues/4091). Linux checks
-            // the signal number after finding the task, so an invalid one is
-            // EINVAL.
-            if !(1..=libc::SIGRTMAX()).contains(&call.sig()) {
-                return Err(Errno::EINVAL.into());
+        {
+            ProcessSignalTarget::Thread(tid) => tid,
+            ProcessSignalTarget::SharedQueue => {
+                return self
+                    .send_guest_signal(
+                        guest,
+                        call,
+                        DetTid::from_raw(process),
+                        call.sig(),
+                        Some(DetPid::from_raw(process)),
+                        false,
+                        named,
+                    )
+                    .await;
             }
-            return Ok(0);
+            ProcessSignalTarget::Zombie => {
+                // A zombie: exited, and its parent can still wait for it.
+                // Linux's kill_pid_info still finds it and the send succeeds,
+                // discarding the signal, so answer 0 without a system call:
+                // the host process may already be gone if a backend reaped
+                // it, and the logical answer must not depend on when
+                // (https://github.com/rrnewton/hermit/issues/4091). Linux
+                // checks the signal number after finding the task, so an
+                // invalid one is EINVAL.
+                if !(1..=libc::SIGRTMAX()).contains(&call.sig()) {
+                    return Err(Errno::EINVAL.into());
+                }
+                return Ok(0);
+            }
         };
         let value = if !guest
             .config()
@@ -2603,10 +2627,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
     }
 
-    /// Decide a process-directed `sig` that the calling thread sends by `sysno`
-    /// to `pid` when `pid` names its own process (`process`, the process that
-    /// `pid` names: any of its live threads' ids names it), and the process
-    /// has another live thread (https://github.com/rrnewton/hermit/issues/4034).
+    /// Decide whether a process-directed `sig` that the calling thread sends
+    /// by `sysno` to `pid`, when `pid` names its own process (`process`, the
+    /// process that `pid` names: any of its live threads' ids names it), and
+    /// the process has another live thread, goes to the kernel unchanged
+    /// (https://github.com/rrnewton/hermit/issues/4034). It does when the
+    /// schedule forces the kernel's choice of receiver and the sender's
+    /// dequeue (`own_process_signal_refusal` finds nothing against it);
+    /// otherwise the ordinary path chooses the receiver
+    /// (`process_signal_target`).
     /// Only where the kernel's signal state for a guest thread is the guest's
     /// own (`BackendCapabilities::kernel_signal_state_is_guests`: ptrace and
     /// e9patch): the decision reads each thread's blocked, pending, ignored
@@ -2663,19 +2692,39 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Some(refusal) = own_process_signal_refusal(&send) else {
             return Ok(OwnProcessSend::Admitted);
         };
-        tracing::error!(
-            "[detcore, dtid {}] process-directed signal {} to process {} by {} is not supported: \
-             {} (https://github.com/rrnewton/hermit/issues/4034)",
+        // A recorded schedule of a send that was forwarded, its sender holding
+        // its turn, cannot be replayed by a send Detcore routes.
+        if refusal == OwnProcessSignalRefusal::ScheduleReplay
+            && own_process_signal_refusal(&OwnProcessSignal {
+                schedule_replay: false,
+                ..send.clone()
+            })
+            .is_none()
+        {
+            tracing::error!(
+                "[detcore, dtid {}] process-directed signal {} to process {} by {} is not \
+                 supported: {} (https://github.com/rrnewton/hermit/issues/4034)",
+                sender,
+                sig,
+                self.detpid,
+                sysno,
+                refusal,
+            );
+            return Ok(OwnProcessSend::Refused(
+                self.refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+                    .await,
+            ));
+        }
+        tracing::debug!(
+            "[detcore, dtid {}] process-directed signal {} to its own process {} by {} is not \
+             forwarded as it is: {}; Detcore chooses the receiving thread",
             sender,
             sig,
             self.detpid,
             sysno,
             refusal,
         );
-        Ok(OwnProcessSend::Refused(
-            self.refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
-                .await,
-        ))
+        Ok(OwnProcessSend::NotOwn)
     }
 
     /// Forward an admitted process-directed signal to the sender's own process
@@ -3007,23 +3056,29 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/4034)
-    /// The thread, of `tgid`'s live `targets`, that a process-directed signal
-    /// `sig` is routed to.
+    /// How the process-directed signal `sig`, which the calling thread sends
+    /// by `sysno` naming the task `named` of process `tgid`, reaches it.
     ///
-    /// With several live threads the call is refused by name: Linux's
-    /// `complete_signal` (kernel/signal.c) gives the signal to any thread that
-    /// `wants_signal` (one that does not block it, is not exiting and is not
-    /// stopped), which depends on the threads' masks and run states, and Detcore
-    /// does not model that choice. The refusal goes through the
-    /// unsupported-operation policy, so a fail-closed run stops with the
-    /// policy-refusal status and `--allow-unsupported-syscalls` returns ENOSYS.
+    /// With one live thread, that thread takes it however it is sent. With
+    /// several, Linux's `complete_signal` (kernel/signal.c) picks the thread,
+    /// and Detcore applies the same rule to its own model of the threads'
+    /// masks, pending signals and run states
+    /// (`Scheduler::process_signal_receiver`,
+    /// https://github.com/rrnewton/hermit/issues/4034): the receiver, or no
+    /// thread when none wants it. Where that model is not available (a
+    /// backend that does not model signal targets, a mask Detcore does not
+    /// know, an exec in flight, a run that records or replays), the send is
+    /// refused through the unsupported-operation policy, so a fail-closed run
+    /// stops with the policy-refusal status and `--allow-unsupported-syscalls`
+    /// returns ENOSYS.
     pub(crate) async fn process_signal_target<G: Guest<Self>>(
         &self,
         guest: &mut G,
         sysno: Sysno,
         tgid: DetPid,
+        named: DetTid,
         sig: libc::c_int,
-    ) -> Result<Option<DetTid>, Error> {
+    ) -> Result<ProcessSignalTarget, Error> {
         let (targets, zombie) = resolve_kill_targets_and_exit(guest, tgid).await;
         // SIGKILL ends the whole thread group whichever thread receives it, so
         // it needs no recipient choice. On a backend that sends process
@@ -3039,27 +3094,94 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .backend
                 .requires_thread_directed_process_signals
         {
-            return Ok(targets.first().copied());
+            return Ok(ProcessSignalTarget::Thread(targets[0]));
         }
         match deterministic_kill_target(&targets, zombie, sig) {
-            Err(Errno::ENOSYS) => {
-                tracing::error!(
-                    "[detcore, dtid {}] process-directed signal {} to process {} by {} is not supported: \
-                     the process has {} live threads, and Detcore does not choose the receiving \
-                     thread as Linux's complete_signal does \
-                     (https://github.com/rrnewton/hermit/issues/4034)",
-                    guest.thread_state().dettid,
-                    sig,
-                    tgid,
-                    sysno,
-                    targets.len(),
-                );
-                self.refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
-                    .await
-                    .and(Err(Errno::ENOSYS.into()))
-            }
-            target => Ok(target?),
+            Err(Errno::ENOSYS) => {}
+            Ok(None) => return Ok(ProcessSignalTarget::Zombie),
+            Ok(Some(thread)) => return Ok(ProcessSignalTarget::Thread(thread)),
+            Err(errno) => return Err(errno.into()),
         }
+        // Reverie takes these for itself, so the receiver's handler would never
+        // run (`APPROPRIATED_SIGNALS`).
+        let appropriated = APPROPRIATED_SIGNALS
+            .iter()
+            .find(|(signal, _)| *signal == sig)
+            .map(|(_, why)| *why);
+        let receiver = if appropriated.is_some()
+            || self.cfg.recordreplay_modes
+            || self.cfg.replay_schedule_from.is_some()
+        {
+            None
+        } else {
+            Some(crate::tool_global::process_signal_receiver(guest, tgid, named, sig).await)
+        };
+        let reason = match receiver {
+            Some(ProcessSignalReceiver::Thread { thread, .. }) => {
+                return Ok(ProcessSignalTarget::Thread(thread));
+            }
+            // Linux queues no second copy and chooses no thread: the call is
+            // forwarded, and the thread chosen for the copy already queued
+            // keeps it.
+            Some(ProcessSignalReceiver::AlreadyQueued) => {
+                return Ok(ProcessSignalTarget::SharedQueue);
+            }
+            Some(ProcessSignalReceiver::SharedQueue) => {
+                return Ok(ProcessSignalTarget::SharedQueue);
+            }
+            Some(ProcessSignalReceiver::UnknownMask(thread)) => {
+                format!("thread {thread}'s signal mask is unknown")
+            }
+            Some(ProcessSignalReceiver::SenderTakesIt) => "the sending thread does not block the \
+                 signal, so under ptrace, where every other thread of the process is stopped, it \
+                 is the one thread the kernel's complete_signal admits, and it would take the \
+                 copy before the receiving thread could"
+                .to_owned(),
+            Some(ProcessSignalReceiver::OutOfSchedule(thread)) => format!(
+                "thread {thread} runs or sleeps outside the schedule and does not block the \
+                 signal, so the kernel can wake it for the copy at a moment host timing sets"
+            ),
+            Some(ProcessSignalReceiver::TakenOutOfTurn(thread)) => format!(
+                "thread {thread} can take the copy from the shared queue outside its turn: its \
+                 call's temporary mask admits the signal, a signalfd of the process covers it, \
+                 or it waits for it in rt_sigtimedwait"
+            ),
+            Some(ProcessSignalReceiver::ExecInFlight) => {
+                "an exec is in flight in the process".to_owned()
+            }
+            Some(ProcessSignalReceiver::NotModeled) => {
+                "Detcore models the threads' signal masks only where the kernel's signal \
+                 state is the guest's (ptrace)"
+                    .to_owned()
+            }
+            None => match appropriated {
+                Some(why) => format!("the receiving thread could not take it: {why}"),
+                None if self.cfg.replay_schedule_from.is_some() => {
+                    "the run replays a recorded schedule (--replay-schedule-from), whose trace \
+                     turn can hand the turn to another thread before the chosen one takes the \
+                     copy"
+                        .to_owned()
+                }
+                None => "the run records or replays, and a replay does not reproduce the masks \
+                         the choice reads"
+                    .to_owned(),
+            },
+        };
+        tracing::error!(
+            "[detcore, dtid {}] process-directed signal {} to process {} by {} is not supported: \
+             the process has {} live threads, and Detcore cannot choose the receiving thread \
+             as Linux's complete_signal does: {} \
+             (https://github.com/rrnewton/hermit/issues/4034)",
+            guest.thread_state().dettid,
+            sig,
+            tgid,
+            sysno,
+            targets.len(),
+            reason,
+        );
+        self.refuse_unserviceable_operation(guest, sysno, Errno::ENOSYS)
+            .await
+            .and(Err(Errno::ENOSYS.into()))
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3379,10 +3501,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// call) can take the copy the moment it is queued, before this handler
     /// could record it afterwards (the Claude re-check of
     /// https://github.com/rrnewton/hermit/pull/4131). `thread_directed`: the
-    /// send names one thread (`tkill`, `tgkill`, `rt_tgsigqueueinfo`, a
-    /// thread-scoped `pidfd_send_signal`). `named`: the task Linux reads to
-    /// decide whether it discards the signal (`kill`'s pid, `tgkill`'s tid),
-    /// which the discarded-at-send record classifies the send against
+    /// call names one thread (`tkill`, `tgkill`, `rt_tgsigqueueinfo`, a
+    /// thread-scoped `pidfd_send_signal`), whose private queue the copy
+    /// joins, as it does on a backend that must name a thread for every
+    /// process signal. `named`: the task Linux reads to decide whether it
+    /// discards the signal (`kill`'s pid, `tgkill`'s tid), which the
+    /// discarded-at-send record classifies the send against
     /// (`discard_pre_send`).
     #[expect(
         clippy::too_many_arguments,
@@ -3405,6 +3529,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
         use crate::scheduler::child_exit_sigchld::ChildExitSigchldControl;
         let syscall: syscalls::Syscall = syscall.into();
+        // Whether the physical send names one thread, so its copy joins that
+        // thread's private queue: the call does, or the backend must name a
+        // thread for every process signal.
+        let to_one_thread = thread_directed
+            || guest
+                .config()
+                .backend
+                .requires_thread_directed_process_signals;
         // D44 asks about the thread the send reaches: for a thread-directed
         // send the one it names, as the scheduler numbers it (`named`, which
         // the handlers translate from a nested PID namespace's id; `target`
@@ -3419,15 +3551,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let mut undo = None;
         if raw_signal == libc::SIGCHLD && guest.config().sequentialize_threads {
-            // Without a process, or on a backend that sends process signals to
-            // a thread, the copy joins the target's private queue.
-            if thread_directed
-                || target_process.is_none()
-                || guest
-                    .config()
-                    .backend
-                    .requires_thread_directed_process_signals
-            {
+            // Without a process, or sent to one thread, the copy joins the
+            // target's private queue.
+            if to_one_thread || target_process.is_none() {
                 let answer = crate::tool_global::child_exit_sigchld(
                     guest,
                     ChildExitSigchldControl::PrivateSent { target },
@@ -3453,18 +3579,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 });
             }
         }
-        // Without a process, or on a backend that sends process signals to a
-        // thread, the copy joins the target's private queue.
+        // Without a process, or sent to one thread, the copy joins the
+        // target's private queue.
         let queue = match target_process {
-            Some(process)
-                if !thread_directed
-                    && !guest
-                        .config()
-                        .backend
-                        .requires_thread_directed_process_signals =>
-            {
-                QueueId::Process(process)
-            }
+            Some(process) if !to_one_thread => QueueId::Process(process),
             _ => QueueId::Thread(target),
         };
         let token = self.discard_pre_send(guest, named, queue, raw_signal).await;
@@ -4339,11 +4457,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             OwnProcessSend::Refused(answer) => return answer,
             OwnProcessSend::NotOwn => {}
         }
+        let named = DetTid::from_raw(tgid);
         let target = match self
             .process_signal_target(
                 guest,
                 Sysno::rt_sigqueueinfo,
                 DetPid::from_raw(process),
+                named,
                 call.sig(),
             )
             .await
@@ -4361,21 +4481,38 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             target => target?,
         };
-        let Some(tid) = target else {
-            // A zombie: its parent can still wait for it, so Linux still
-            // finds it. Unlike kill, the kernel checks the siginfo first
-            // (EFAULT, EPERM for a forged si_code, E2BIG), so let it answer:
-            // it validates, finds the zombie, and returns 0. A backend that
-            // must name a receiving thread has none to name, and keeps ESRCH
-            // (https://github.com/rrnewton/hermit/issues/4091).
-            if guest
-                .config()
-                .backend
-                .requires_thread_directed_process_signals
-            {
-                return Err(Errno::ESRCH.into());
+        let tid = match target {
+            ProcessSignalTarget::Thread(tid) => tid,
+            ProcessSignalTarget::SharedQueue => {
+                return self
+                    .send_guest_signal(
+                        guest,
+                        call,
+                        DetTid::from_raw(process),
+                        call.sig(),
+                        Some(DetPid::from_raw(process)),
+                        false,
+                        named,
+                    )
+                    .await;
             }
-            return Ok(self.record_or_replay(guest, call).await?);
+            ProcessSignalTarget::Zombie => {
+                // A zombie: its parent can still wait for it, so Linux still
+                // finds it. Unlike kill, the kernel checks the siginfo first
+                // (EFAULT, EPERM for a forged si_code, E2BIG), so let it
+                // answer: it validates, finds the zombie, and returns 0. A
+                // backend that must name a receiving thread has none to name,
+                // and keeps ESRCH
+                // (https://github.com/rrnewton/hermit/issues/4091).
+                if guest
+                    .config()
+                    .backend
+                    .requires_thread_directed_process_signals
+                {
+                    return Err(Errno::ESRCH.into());
+                }
+                return Ok(self.record_or_replay(guest, call).await?);
+            }
         };
         let value = if !guest
             .config()
@@ -5317,8 +5454,9 @@ const OWN_PROCESS_SIGNALS: [libc::c_int; 7] = [
 ];
 
 /// Why a process-directed signal a thread sends to its own multi-threaded
-/// process is refused, each a named refusal of the design for
-/// https://github.com/rrnewton/hermit/issues/4034.
+/// process does not go to the kernel unchanged, each a named refusal of the
+/// design for https://github.com/rrnewton/hermit/issues/4034: Detcore then
+/// chooses the receiving thread itself (`Detcore::process_signal_target`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OwnProcessSignalRefusal {
     /// The signal is not one of `OWN_PROCESS_SIGNALS`.
@@ -5799,13 +5937,35 @@ enum NamedGuestPid {
     Answer(Result<i64, Error>),
 }
 
+/// How a process-directed signal reaches its process
+/// (`Detcore::process_signal_target`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProcessSignalTarget {
+    /// The process has no live thread: a zombie, which Linux still finds and
+    /// signals successfully, discarding the signal.
+    Zombie,
+    /// The thread that takes the signal: the process's only live thread, or,
+    /// among several, the receiver Detcore chose by Linux's rule
+    /// (`Scheduler::process_signal_receiver`). The call is forwarded
+    /// unchanged, so the copy is the kernel's own; where other threads could
+    /// take it from the shared queue first, the scheduler resumes this one
+    /// before them (`Scheduler::first_process_signal_taker`).
+    Thread(DetTid),
+    /// Several live threads and none wants the signal: the call is forwarded
+    /// unchanged too, and the signal waits in the process's shared queue for
+    /// the first thread that can take it, waking none.
+    SharedQueue,
+}
+
 enum OwnProcessSend {
-    /// The call does not name the sender's own multi-threaded process: the
-    /// ordinary path decides.
+    /// The ordinary path decides: the call does not name the sender's own
+    /// multi-threaded process, or the schedule does not force the kernel's
+    /// choice of receiver.
     NotOwn,
     /// Admitted: forward the call unchanged, holding the sender's turn.
     Admitted,
-    /// Refused by name, with the policy's answer.
+    /// Refused by name, with the policy's answer: the replay of a recorded
+    /// schedule of a send that would be admitted.
     Refused(Result<i64, Error>),
 }
 

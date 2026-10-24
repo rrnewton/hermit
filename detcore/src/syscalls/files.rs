@@ -75,6 +75,7 @@ use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::scheduler::terminal_signals;
 use crate::stat::*;
 use crate::syscalls::guest_siginfo::GuestSiginfo;
+use crate::syscalls::signal::ProcessSignalTarget;
 use crate::syscalls::threads::kernel_sigset_bit;
 use crate::tool_global::*;
 use crate::tool_local::CapturedDetFdInstallError;
@@ -13858,33 +13859,41 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(value);
         }
         // A process-directed signal. To a process with two or more live threads
-        // it is refused by name as `kill` refuses it: Linux's complete_signal
-        // picks the receiving thread, which Detcore does not model
-        // (https://github.com/rrnewton/hermit/issues/4047). Everything else is
-        // forwarded and the kernel answers: signal 0, which only checks that
-        // the process exists; a SIGKILL that could not be reserved, which kills
-        // the whole group whichever thread it reaches (the scheduler is told
-        // below); a process with one live thread, whose receiver the scheduler
-        // is then told about, as `kill` does; and a process with none (a
-        // zombie, which Linux still signals successfully).
+        // it goes to the thread Linux's complete_signal picks, as Detcore
+        // decides it, or waits in the shared queue when none wants it, as for
+        // `kill` (https://github.com/rrnewton/hermit/issues/4034). Everything
+        // else is forwarded and the kernel answers: signal 0, which only
+        // checks that the process exists; a SIGKILL that could not be
+        // reserved, which kills the whole group whichever thread it reaches
+        // (the scheduler is told below); a process with one live thread, whose
+        // receiver the scheduler is then told about, as `kill` does; and a
+        // process with none (a zombie, which Linux still signals
+        // successfully).
         let mut receiver = None;
         if signal != 0
             && signal != libc::SIGKILL
             && guest.config().sequentialize_threads
             && let Some(target) = process
         {
-            match resolve_kill_targets(guest, target).await.as_slice() {
-                [] => {}
-                [thread] => receiver = Some((*thread, target)),
-                _ => {
-                    self.process_signal_target(
-                        guest,
-                        reverie::syscalls::Sysno::pidfd_send_signal,
-                        target,
-                        signal,
-                    )
-                    .await?;
-                }
+            // A process-scoped pidfd names the process's leader; a
+            // `/proc/<tid>` descriptor names its thread.
+            let named_task = DetTid::from_raw(named.unwrap_or(target).as_raw());
+            match self
+                .process_signal_target(
+                    guest,
+                    reverie::syscalls::Sysno::pidfd_send_signal,
+                    target,
+                    named_task,
+                    signal,
+                )
+                .await
+            {
+                Ok(ProcessSignalTarget::Thread(thread)) => receiver = Some((thread, target)),
+                // Forwarded below, waking no thread: into the shared queue,
+                // to a zombie, or to a process the kernel answers for.
+                Ok(ProcessSignalTarget::SharedQueue | ProcessSignalTarget::Zombie)
+                | Err(Error::Errno(Errno::ESRCH)) => {}
+                Err(error) => return Err(error),
             }
         }
         let value = match receiver {
