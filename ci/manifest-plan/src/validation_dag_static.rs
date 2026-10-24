@@ -2838,7 +2838,35 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
     // unit (a removal with no scratch stack is Hermit's own failure): 2546,
     // listed.
-    ("test.detcore_unit", 2546),
+    // And A5 step 3c.1d-ii's ten
+    // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
+    // units (the staged zero-timeout pselect6 rows, pselect6 with more than 64
+    // descriptors, each select form under its mask (IR-9), the masked ppoll
+    // rows, the masked epoll_pwait rows with D37's exception (IR-3, IR-7),
+    // epoll_pwait2's route, the gate-off paths, the 3c.1.0 base rows kept,
+    // IR-7 rows (A) and (B) for pselect6 and ppoll, D41 at a masked form's
+    // entry): 2556, listed.
+    // And 3c.1d-ii review round 1's four
+    // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
+    // units (an invalid masked call meets D41 only under the own mask, every
+    // masked wait publishes the mask Linux installs, an unreadable pselect6
+    // argument is EFAULT only where Linux faults, the sets read before the
+    // more-than-1024 refusal): 2560, listed.
+    // And 3c.1d-ii review round 2's two
+    // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
+    // units (a masked wait ready at its first probe still yields once; a
+    // masked ppoll on a tight stack gets the kernel's answer first): 2562,
+    // listed.
+    // And 3c.1d-ii review round 3's four units: the
+    // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
+    // units (a signal sent during a hand-off before the first check is not an
+    // entry instance; a zero-timeout masked pselect6 on a tight stack gets the
+    // kernel's answer; a staged pselect6's private timeout avoids sets in the
+    // red zone) and syscalls::signal's own_process_signal_tests unit (a copy
+    // to user memory faults where no mapping is writable): 2566, listed.
+    // And 3c.1d-ii review round 4's tool_global::tests unit (a clock
+    // observation grants no turn and moves no time): 2567, listed.
+    ("test.detcore_unit", 2567),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4986,7 +5014,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fourteen slice 3c.1d-i units: 2543, listed.
     // And the same two 3c.1d-i review round 1 units: 2545, listed.
     // And the same one 3c.1d-i review round 3 unit: 2546, listed.
-    ("test.detcore_unit_on_host", 2546),
+    // And the same ten slice 3c.1d-ii units: 2556, listed.
+    // And the same four 3c.1d-ii review round 1 units: 2560, listed.
+    // And the same two 3c.1d-ii review round 2 units: 2562, listed.
+    // And the same four 3c.1d-ii review round 3 units: 2566, listed.
+    // And the same one 3c.1d-ii review round 4 unit: 2567, listed.
+    ("test.detcore_unit_on_host", 2567),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

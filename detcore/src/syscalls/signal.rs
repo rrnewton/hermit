@@ -5834,6 +5834,9 @@ struct Mapping {
     /// Whether user mode can read it: on x86 any of read, write or execute
     /// permission allows a read; none (`---`) faults.
     user_readable: bool,
+    /// Whether user mode, and so the kernel's copy to user memory, can
+    /// write it: write permission.
+    user_writable: bool,
     /// `VmFlags` `gd`: a fault just below it can grow it downwards.
     growsdown: bool,
 }
@@ -5866,11 +5869,80 @@ fn parse_smaps(smaps: &str) -> Vec<Mapping> {
             start,
             end,
             user_readable: perms.chars().take(3).any(|perm| perm != '-'),
+            user_writable: perms.chars().nth(1) == Some('w'),
             growsdown: false,
         });
     }
     mappings.sort_by_key(|mapping| mapping.start);
     mappings
+}
+
+/// A5 step 3c.1d (round-1 ruling 4, 3c.1c's rule): whether Linux's copy
+/// from user memory of `[start, start + len)` by thread `tid` faults, as the
+/// thread's `/proc/<tid>/smaps` shows in its own turn: `Some(true)` for a byte
+/// in no mapping and not below a grow-down one, or in a mapping with no read,
+/// write or execute permission (x86 user mode reads any page with one of
+/// them; `first_user_unreadable`), or a range that overflows; `Some(false)`
+/// when every byte is readable by user mode or lies below a grow-down mapping
+/// the copy may grow; `None` when the mappings cannot be read.
+pub(crate) fn user_copy_faults(tid: i32, start: usize, len: usize) -> Option<bool> {
+    if start.checked_add(len).is_none() {
+        return Some(true);
+    }
+    let smaps = std::fs::read_to_string(format!("/proc/{tid}/smaps")).ok()?;
+    Some(matches!(
+        first_user_unreadable(&parse_smaps(&smaps), start, len),
+        Some(Unreadable::NoPermission)
+            | Some(Unreadable::Hole {
+                below_growsdown: false
+            })
+    ))
+}
+
+/// A5 step 3c.1d (round-3 ruling 3): whether Linux's copy to user memory of
+/// `[start, start + len)` by thread `tid` faults, as the thread's
+/// `/proc/<tid>/smaps` shows in its own turn: `Some(true)` for a byte in no
+/// mapping and not below a grow-down one, or in a mapping without write
+/// permission, or a range that overflows; `Some(false)` when every byte is
+/// writable or lies below a grow-down mapping the copy may grow; `None` when
+/// the mappings cannot be read.
+///
+/// smaps' write permission is not always the kernel's whole answer: a write
+/// can still fault on a page that smaps shows writable, under a protection
+/// key that denies writes, a userfaultfd write-protected range, or a shared
+/// file mapping beyond the file's end. There `Some(false)` is wrong, and a
+/// caller probing in place gets the copy-out's EFAULT where Linux, with a
+/// signal pending at entry, would make no copy-out (a named residual of A5
+/// step 3c.1d, review round 4).
+pub(crate) fn user_copy_out_faults(tid: i32, start: usize, len: usize) -> Option<bool> {
+    if start.checked_add(len).is_none() {
+        return Some(true);
+    }
+    let smaps = std::fs::read_to_string(format!("/proc/{tid}/smaps")).ok()?;
+    Some(user_unwritable(&parse_smaps(&smaps), start, len))
+}
+
+/// Whether a byte of `[address, address + len)` is one a copy to user memory
+/// faults on: in a mapping without write permission, or in a hole not below a
+/// grow-down mapping (`user_copy_out_faults`).
+fn user_unwritable(mappings: &[Mapping], address: usize, len: usize) -> bool {
+    let Some(end) = address.checked_add(len) else {
+        return true;
+    };
+    let mut next = address;
+    while next < end {
+        match mappings.iter().find(|mapping| mapping.end > next) {
+            Some(mapping) if mapping.start <= next => {
+                if !mapping.user_writable {
+                    return true;
+                }
+                next = mapping.end;
+            }
+            Some(above) if above.growsdown => next = above.start,
+            _ => return true,
+        }
+    }
+    false
 }
 
 /// Why a byte is not readable by user mode (`first_user_unreadable`).
@@ -7428,6 +7500,34 @@ mod own_process_signal_tests {
         let mut send = admitted_s1();
         edit(&mut send);
         own_process_signal_refusal(&send)
+    }
+
+    /// Round-3 ruling 3: a copy to user memory faults on a byte without
+    /// write permission (read-only, execute-only, `PROT_NONE`) or in a hole,
+    /// and not across writable mappings or below a grow-down one.
+    #[test]
+    fn a_copy_to_user_memory_faults_where_no_mapping_is_writable() {
+        let smaps = "1000-2000 rw-p 0 0:0 0\nVmFlags: rd wr mr mw\n\
+                     2000-3000 -w-p 0 0:0 0\nVmFlags: wr mw\n\
+                     3000-4000 r--p 0 0:0 0\nVmFlags: rd mr\n\
+                     6000-7000 --xp 0 0:0 0 [vvar]\nVmFlags: ex\n\
+                     9000-a000 rw-p 0 0:0 0 [stack]\nVmFlags: rd wr gd\n";
+        let mappings = parse_smaps(smaps);
+        assert!(!user_unwritable(&mappings, 0x1fc0, 128), "rw- into -w-");
+        assert!(
+            user_unwritable(&mappings, 0x2fc0, 128),
+            "runs into read-only"
+        );
+        assert!(user_unwritable(&mappings, 0x6000, 8), "execute-only");
+        assert!(
+            user_unwritable(&mappings, 0x4000, 8),
+            "a hole below a fixed mapping"
+        );
+        assert!(
+            !user_unwritable(&mappings, 0x8ff8, 16),
+            "a hole below the grow-down stack, into it"
+        );
+        assert!(user_unwritable(&mappings, usize::MAX - 4, 8), "overflow");
     }
 
     /// The first byte user mode cannot read is found across contiguous
