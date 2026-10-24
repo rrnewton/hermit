@@ -16965,9 +16965,9 @@ mod tests {
         let t = LogicalTime::from_nanos;
         let [periodic, disarmed, silent] = {
             let mut timers = guest.thread.posix_timers.lock().unwrap();
-            let periodic = timers.create(Some(libc::SIGUSR2), None, None);
-            let disarmed = timers.create(Some(libc::SIGALRM), None, None);
-            let silent = timers.create(None, None, None);
+            let periodic = timers.create(Some(libc::SIGUSR2), None, None, false);
+            let disarmed = timers.create(Some(libc::SIGALRM), None, None, false);
+            let silent = timers.create(None, None, None, false);
             timers.settime(periodic, 50, Some(t(100)), t(0));
             timers.settime(silent, 0, Some(t(200)), t(0));
             [periodic, disarmed, silent]
@@ -17000,7 +17000,7 @@ mod tests {
             }
         }
         let mut timers = guest.thread.posix_timers.lock().unwrap();
-        let new = timers.create(Some(libc::SIGUSR1), None, None);
+        let new = timers.create(Some(libc::SIGUSR1), None, None, false);
         assert_eq!(new, 3);
         assert_eq!(timers.settime(new, 0, Some(t(300)), t(10)), Some((0, 0)));
         assert_eq!(timers.gettime(new, t(20)), Some((280, 0)));

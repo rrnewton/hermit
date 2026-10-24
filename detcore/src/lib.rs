@@ -38,6 +38,7 @@
 
 mod config;
 mod consts;
+mod cpu_clock;
 mod cpuid;
 mod digest;
 mod dirents;
@@ -6204,6 +6205,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             )
             .await;
         }
+        // Only once the thread has left the scheduler, which then no longer
+        // finds it in its process, does its id stop naming a CPU clock; until
+        // then its clock reads its final time. A leader stays as long as its
+        // process does (`ProcessCpuTime::threads`).
+        if current != detpid {
+            thread_state.forget_thread_cpu_time();
+        }
 
         self.record_or_replay
             .on_exit_thread(
@@ -7067,6 +7075,65 @@ mod thread_cpu_time_tests {
             assert!(user < parent.thread_logical_time.user_cpu_time());
             assert!(system <= parent.thread_logical_time.system_cpu_time());
         }
+    }
+
+    /// Another thread's CPU clock reads its process's per-thread table: a
+    /// thread's own time as of its last accounting, zero before it has run,
+    /// and nothing once it has exited, while its time stays in the process
+    /// total. A fork child keeps a table of its own.
+    #[test]
+    fn the_per_thread_table_follows_each_threads_accounting() {
+        let config = Config::default();
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+        let mut parent = ThreadState::new(DetPid::from_raw(1), &config, ());
+        parent.thread_logical_time.add_rcbs(30);
+        parent.thread_logical_time.add_syscall_with_cost(700);
+        let zero = (LogicalTime::ZERO, LogicalTime::ZERO);
+        let new_child = |parent: &mut ThreadState<()>, tid: i32, flags: CloneFlags| {
+            parent.clone_flags = Some(flags);
+            let child = <Detcore as Tool>::init_thread_state(
+                &tool,
+                Tid::from_raw(tid),
+                Some((Tid::from_raw(1), &*parent)),
+            );
+            parent.clone_flags = None;
+            child
+        };
+        let mut thread = new_child(&mut parent, 2, CloneFlags::CLONE_THREAD);
+        let mut fork = new_child(&mut parent, 3, CloneFlags::empty());
+        let thread_id = DetPid::from_raw(2);
+        let fork_id = DetPid::from_raw(3);
+        assert_eq!(parent.sibling_cpu_time(thread_id), zero);
+
+        thread.thread_logical_time.add_rcbs(5);
+        thread.thread_logical_time.add_syscall_with_cost(90);
+        thread.account_process_cpu_time();
+        let accounted = thread.thread_cpu_time();
+        assert!(accounted.0 > LogicalTime::ZERO && accounted.1 > LogicalTime::ZERO);
+        assert_eq!(parent.sibling_cpu_time(thread_id), accounted);
+        assert_eq!(thread.sibling_cpu_time(DetPid::from_raw(1)), zero);
+
+        // Work not yet accounted is not seen.
+        thread.thread_logical_time.add_rcbs(1_000);
+        assert_eq!(parent.sibling_cpu_time(thread_id), accounted);
+
+        fork.thread_logical_time.add_syscall_with_cost(4_000);
+        fork.account_process_cpu_time();
+        assert_eq!(parent.sibling_cpu_time(fork_id), zero);
+
+        let own = parent.thread_cpu_time();
+        let total = parent.process_cpu_time();
+        assert_eq!(total.user, own.0 + accounted.0);
+        assert_eq!(total.system, own.1 + accounted.1);
+        assert_eq!(parent.sibling_cpu_time(DetPid::from_raw(1)), own);
+
+        thread.account_process_cpu_time();
+        thread.forget_thread_cpu_time();
+        let exited = thread.thread_cpu_time();
+        assert_eq!(parent.sibling_cpu_time(thread_id), zero);
+        let total = parent.process_cpu_time();
+        assert_eq!(total.user, own.0 + exited.0);
+        assert_eq!(total.system, own.1 + exited.1);
     }
 }
 
