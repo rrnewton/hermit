@@ -4304,13 +4304,32 @@ struct CheckedScorecard<'a> {
 }
 
 fn check_scorecard(root: &Path) -> Result<CheckedScorecard<'_>, String> {
-    let output = Command::new(root.join("ci/compat-envelope/scorecard.rs"))
+    let mut command = Command::new(root.join("ci/compat-envelope/scorecard.rs"));
+    // A unit test never takes the checkout's real write-back lock. That lock
+    // is the Git common directory's, shared by every worktree of the primary
+    // checkout, so a live write-back elsewhere on the host would hold the
+    // test for the check's 30 s lock timeout and then fail it.
+    #[cfg(test)]
+    let private_lock = env::temp_dir().join(format!(
+        "hermit-pressure-test-scorecard-lock-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    #[cfg(test)]
+    command.env("HERMIT_SCORECARD_WRITEBACK_LOCK", &private_lock);
+    let output = command
         .arg("check")
         .current_dir(root)
         .stdout(Stdio::inherit())
         .stderr(Stdio::piped())
         .output()
-        .map_err(|e| format!("cannot run scorecard check: {e}"))?;
+        .map_err(|e| format!("cannot run scorecard check: {e}"));
+    #[cfg(test)]
+    let _ = fs::remove_file(&private_lock);
+    let output = output?;
     let stderr = String::from_utf8_lossy(&output.stderr);
     eprint!("{stderr}");
     if output.status.success() {
