@@ -1762,7 +1762,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Eight terminal-finalization custody and classification tests.
     // And container::tests::identity_hardening_freezes_the_dynamic_linker_cache
     // (the frozen /etc/ld.so.cache, Hermit c10c2882): 1096.
-    ("test.hermit_unit", 1096),
+    // And container::tests::superblock_options_leave_out_the_owner: 1097.
+    ("test.hermit_unit", 1097),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3352,7 +3353,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4362, part 2 step 0b): 218.
     // And https://github.com/rrnewton/hermit/issues/4262: record_exec_discards_posix_timer_copies_as_on_linux and
     // record_replay_posix_timer_rows_replay_but_diverge_from_linux: 220.
-    ("test.record_replay", 220),
+    // And record_replay_gives_the_guest_a_private_dev_shm: 221.
+    // And record_replay_gives_the_guest_a_private_ipc_namespace: 222.
+    ("test.record_replay", 222),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -4012,7 +4015,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (A5 step 3c slice 0c): 600, listed.
     // And liteinst_in_guest_programs::in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name
     // (A5 step 3c slice 0g): 601, listed.
-    ("test.cli", 601),
+    // And a_run_gets_a_private_empty_dev_shm,
+    // concurrent_runs_do_not_share_dev_shm and
+    // host_dev_shm_sources_stay_the_hosts: 604.
+    // And a_run_gets_a_private_ipc_namespace and
+    // concurrent_runs_do_not_share_ipc: 606.
+    ("test.cli", 606),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4502,7 +4510,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unchanged at 520.
     // The in-guest unsequentialized-handler refusal test (slice 0g) starts the
     // in-guest runtime too and joins the hosted exclusions: unchanged at 520.
-    ("test.cli_on_host", 520),
+    // And the three private /dev/shm tests: 523.
+    // And the two private IPC namespace tests: 525.
+    ("test.cli_on_host", 525),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5268,7 +5278,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // The same eight finalization tests, with the existing selection unchanged.
     // And the frozen ld.so.cache container test (Hermit c10c2882): 1096.
-    ("test.hermit_unit_on_host", 1096),
+    // And the container's superblock-owner test: 1097.
+    ("test.hermit_unit_on_host", 1097),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

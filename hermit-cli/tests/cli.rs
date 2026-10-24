@@ -91,6 +91,7 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
+use std::io::Read;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -221,6 +222,8 @@ static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PRIVATE_DEV_SHM_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PRIVATE_IPC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SELECT_TIMEOUT_NORMALIZATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TOOL_OUTPUT_PROTECTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "dbt")]
@@ -28994,6 +28997,593 @@ fn select_timeout_folds_microseconds_into_seconds_as_linux() {
     }
 }
 
+/// A POSIX shared memory object in the host's `/dev/shm`, removed when the
+/// test ends.
+struct HostShmObject(PathBuf);
+
+impl HostShmObject {
+    /// The object `name` (`/hermit-...`), holding `contents`.
+    fn create(name: &str, contents: &[u8]) -> Self {
+        let path = Path::new("/dev/shm").join(name.trim_start_matches('/'));
+        fs::write(&path, contents).expect("failed to create a host /dev/shm object");
+        Self(path)
+    }
+}
+
+impl Drop for HostShmObject {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// Every run gets a private, empty `/dev/shm`: a fresh tmpfs, mounted as
+/// Linux distributions mount it (mode 1777, `nosuid`, `nodev`), whose mount
+/// row names no host user. A guest neither sees the host's POSIX shared
+/// memory objects nor changes them, even under the same name;
+/// `--bind /dev/shm` keeps the host's, and a `--bind` below `/dev/shm` adds a
+/// host file to the private one. The guest is `tests/c/private_dev_shm.c`.
+#[test]
+fn a_run_gets_a_private_empty_dev_shm() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&PRIVATE_DEV_SHM_GUEST, "private_dev_shm")
+        .to_str()
+        .unwrap();
+    let name = format!("/hermit-private-dev-shm-{}", std::process::id());
+    let host_object = HostShmObject::create(&name, b"host");
+    let expected = format!(
+        "/dev/shm entries: 0\n\
+         /dev/shm mode 1777, tmpfs: yes\n\
+         shm_open({name}, O_CREAT | O_EXCL): created\n\
+         shared memory written and unlinked: yes\n\
+         mount row: rw,nosuid,nodev tmpfs, owner in superblock options: no\n"
+    );
+    for strict in [true, false] {
+        let mut args = vec!["run", "--timeout", "120"];
+        if strict {
+            args.push("--strict");
+        }
+        args.extend(["--base-env=minimal", "--", guest, "check", &name]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+    }
+    assert_eq!(fs::read(&host_object.0).unwrap(), b"host");
+
+    let args = [
+        "run",
+        "--timeout",
+        "120",
+        "--base-env=minimal",
+        "--bind",
+        "/dev/shm",
+        "--",
+        guest,
+        "sees",
+        &name,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), format!("shm_open({name}): opened\n"));
+
+    // A host file bound below the private /dev/shm is an object there.
+    let host_dir = tempfile::tempdir().unwrap();
+    let host_file = host_dir.path().join("bound");
+    fs::write(&host_file, b"bound").unwrap();
+    let bound = format!("/hermit-bound-dev-shm-{}", std::process::id());
+    let bind = format!("{}:/dev/shm{bound}", host_file.display());
+    let args = [
+        "run",
+        "--timeout",
+        "120",
+        "--base-env=minimal",
+        "--bind",
+        &bind,
+        "--",
+        guest,
+        "sees",
+        &bound,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), format!("shm_open({bound}): opened\n"));
+}
+
+/// Two runs at once each have their own `/dev/shm`: while one holds a POSIX
+/// shared memory object, the other finds `/dev/shm` empty and creates the
+/// same name exclusively. Every run of a program gets the same PIDs and
+/// random bytes, so programs that name such objects after them collide this
+/// way between concurrent runs on a shared `/dev/shm`.
+#[test]
+fn concurrent_runs_do_not_share_dev_shm() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&PRIVATE_DEV_SHM_GUEST, "private_dev_shm")
+        .to_str()
+        .unwrap();
+    let name = format!("/hermit-concurrent-dev-shm-{}", std::process::id());
+    let holder_args = [
+        "run",
+        "--timeout",
+        "120",
+        "--base-env=minimal",
+        "--",
+        guest,
+        "hold",
+        &name,
+    ];
+    let mut holder = hermit_command(&holder_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start the holding run");
+    let mut holder_stdout = BufReader::new(holder.stdout.take().unwrap());
+    let mut holder_stderr = holder.stderr.take().unwrap();
+    // The holding run's stderr, once it has ended: closing its stdin ends it.
+    let mut holder_stderr_text = |stdin: &mut Option<std::process::ChildStdin>| {
+        drop(stdin.take());
+        let mut text = String::new();
+        let _ = holder_stderr.read_to_string(&mut text);
+        text
+    };
+    let mut created = String::new();
+    holder_stdout.read_line(&mut created).unwrap();
+    assert_eq!(
+        created,
+        format!("shm_open({name}, O_CREAT | O_EXCL): created\n"),
+        "the holding run's stderr:\n{}",
+        holder_stderr_text(&mut holder.stdin)
+    );
+
+    let args = [
+        "run",
+        "--timeout",
+        "120",
+        "--base-env=minimal",
+        "--",
+        guest,
+        "check",
+        &name,
+    ];
+    let output = hermit(&args);
+    let holder_stderr = holder_stderr_text(&mut holder.stdin);
+    let mut released = String::new();
+    holder_stdout.read_to_string(&mut released).unwrap();
+    let status = holder.wait().unwrap();
+    assert_success(&output, &args);
+    let stdout = stdout(&output);
+    assert!(
+        stdout.starts_with(&format!(
+            "/dev/shm entries: 0\n\
+             /dev/shm mode 1777, tmpfs: yes\n\
+             shm_open({name}, O_CREAT | O_EXCL): created\n"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        status.success(),
+        "the holding run failed: {status:?}\n{holder_stderr}"
+    );
+    assert_eq!(released, "released: yes\n", "{holder_stderr}");
+}
+
+/// The private `/dev/shm` is installed after every mount sourced from a host
+/// path, so such a source in the host's `/dev/shm` is still the host's: a
+/// `--bind` from it into guest `/tmp` shows the host's object, a run whose
+/// `$TMPDIR` (which holds its private `/tmp`) is there starts, and
+/// `--tmp=/dev/shm` is the host's. A bind from it into the private
+/// `/dev/shm`, which would find the guest's own empty tmpfs, is refused, as
+/// is one from host `/tmp` when `$TMPDIR` is in `/dev/shm` and a program or
+/// an output file there, which the guest cannot see.
+#[test]
+fn host_dev_shm_sources_stay_the_hosts() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&PRIVATE_DEV_SHM_GUEST, "private_dev_shm")
+        .to_str()
+        .unwrap();
+    let name = format!("hermit-dev-shm-source-{}", std::process::id());
+    let _object = HostShmObject::create(&name, b"host");
+
+    let target = format!("/tmp/hostshm/{name}");
+    let args = [
+        "run",
+        "--timeout",
+        "120",
+        "--base-env=minimal",
+        "--bind",
+        "/dev/shm:/tmp/hostshm",
+        "--",
+        "/bin/cat",
+        &target,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "host");
+
+    let tmpdir = tempfile::Builder::new()
+        .prefix("hermit-dev-shm-tmpdir-")
+        .tempdir_in("/dev/shm")
+        .expect("failed to create a TMPDIR under /dev/shm");
+    let args = [
+        "run",
+        "--timeout",
+        "120",
+        "--base-env=minimal",
+        "--",
+        guest,
+        "check",
+        "/hermit-dev-shm-tmpdir-probe",
+    ];
+    let mut command = hermit_command(&args);
+    command.env("TMPDIR", tmpdir.path());
+    let output = hermit_test::hermit_output("a run with TMPDIR under /dev/shm", &mut command);
+    assert_success(&output, &args);
+    assert!(
+        stdout(&output).starts_with("/dev/shm entries: 0\n"),
+        "{}",
+        stdout(&output)
+    );
+
+    let through_tmp = format!("/tmp/{name}");
+    let args = [
+        "run",
+        "--timeout",
+        "120",
+        "--base-env=minimal",
+        "--tmp=/dev/shm",
+        "--",
+        "/bin/cat",
+        &through_tmp,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "host", "--tmp=/dev/shm is not the host's");
+
+    let source = format!("/dev/shm/{name}");
+    let refused = |args: &[&str], expected: &str| {
+        let output = hermit(args);
+        assert!(!output.status.success(), "{args:?} was not refused");
+        assert!(
+            stderr(&output).contains(expected),
+            "{args:?} was refused without saying {expected:?}:\n{}",
+            stderr(&output)
+        );
+    };
+    refused(
+        &[
+            "run",
+            "--base-env=minimal",
+            "--bind",
+            &source,
+            "--",
+            guest,
+            "check",
+            "/x",
+        ],
+        &format!("cannot bind {source} from host /dev/shm to {source}"),
+    );
+    let host_tmp_file = tempfile::Builder::new()
+        .prefix("hermit-dev-shm-from-tmp-")
+        .tempfile_in("/tmp")
+        .expect("failed to create a file under host /tmp");
+    let from_tmp = format!("{}:/dev/shm/from-tmp", host_tmp_file.path().display());
+    let args = [
+        "run",
+        "--base-env=minimal",
+        "--bind",
+        &from_tmp,
+        "--",
+        "/bin/true",
+    ];
+    let mut command = hermit_command(&args);
+    command.env("TMPDIR", tmpdir.path());
+    let output =
+        hermit_test::hermit_output("a bind from host /tmp, TMPDIR in /dev/shm", &mut command);
+    assert!(!output.status.success(), "{args:?} was not refused");
+    assert!(
+        stderr(&output).contains(&format!(
+            "cannot bind {} from host /tmp to /dev/shm/from-tmp",
+            host_tmp_file.path().display()
+        )),
+        "{}",
+        stderr(&output)
+    );
+    let program = tempfile::Builder::new()
+        .prefix("hermit-dev-shm-program-")
+        .tempfile_in("/dev/shm")
+        .expect("failed to create a program under /dev/shm");
+    fs::copy("/bin/true", program.path()).unwrap();
+    refused(
+        &[
+            "run",
+            "--base-env=minimal",
+            "--",
+            program.path().to_str().unwrap(),
+        ],
+        "is under host /dev/shm, but Hermit gives the guest a private /dev/shm",
+    );
+    let summary = format!("/dev/shm/{name}.json");
+    refused(
+        &[
+            "run",
+            "--base-env=minimal",
+            "--summary-json",
+            &summary,
+            "--",
+            "/bin/true",
+        ],
+        "it is under host /dev/shm, but Hermit gives the guest a private /dev/shm",
+    );
+}
+
+/// A POSIX message queue in the host's IPC namespace, removed when dropped.
+/// It holds one one-byte message at most, so that the queues the tests make
+/// stay far below the user's RLIMIT_MSGQUEUE.
+struct HostMessageQueue(PathBuf);
+
+impl HostMessageQueue {
+    fn create(name: &str) -> Self {
+        let path = Path::new("/dev/mqueue").join(name);
+        assert!(
+            path.parent().unwrap().is_dir(),
+            "these tests need the host's mqueue filesystem at /dev/mqueue"
+        );
+        let c_name = std::ffi::CString::new(format!("/{name}")).unwrap();
+        // SAFETY: an all-zero mq_attr is valid; the fields set are the ones
+        // mq_open reads.
+        let mut attributes: libc::mq_attr = unsafe { std::mem::zeroed() };
+        attributes.mq_maxmsg = 1;
+        attributes.mq_msgsize = 1;
+        // SAFETY: the name is NUL-terminated and the attributes outlive the
+        // call.
+        let queue = unsafe {
+            libc::mq_open(
+                c_name.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                0o600,
+                &mut attributes as *mut libc::mq_attr,
+            )
+        };
+        assert!(
+            queue != -1,
+            "failed to create a host message queue: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: the descriptor was just opened here.
+        unsafe { libc::mq_close(queue) };
+        let queue = Self(path);
+        assert!(
+            queue.0.exists(),
+            "/dev/mqueue is not the mqueue mount of this process's IPC namespace"
+        );
+        queue
+    }
+}
+
+impl Drop for HostMessageQueue {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+/// A System V shared memory segment in the host's IPC namespace, removed when
+/// dropped.
+struct HostShmSegment(i32);
+
+impl HostShmSegment {
+    fn create(key: i32) -> Self {
+        // SAFETY: shmget takes no pointers.
+        let id = unsafe { libc::shmget(key, 4096, libc::IPC_CREAT | libc::IPC_EXCL | 0o600) };
+        assert!(
+            id >= 0,
+            "failed to create a host shared memory segment: {}",
+            std::io::Error::last_os_error()
+        );
+        Self(id)
+    }
+}
+
+impl Drop for HostShmSegment {
+    fn drop(&mut self) {
+        // SAFETY: IPC_RMID takes no buffer.
+        unsafe { libc::shmctl(self.0, libc::IPC_RMID, std::ptr::null_mut()) };
+    }
+}
+
+/// A System V key no other test uses: this process's, in a range of its own.
+fn ipc_test_key() -> i32 {
+    0x4800_0000 | (std::process::id() & 0x00ff_ffff) as i32
+}
+
+/// Every run gets its own IPC namespace and a fresh mqueue filesystem at
+/// `/dev/mqueue`, mounted as systemd mounts it. A guest neither lists nor
+/// collides with the host's message queues, even under the same name; Detcore
+/// refuses the System V and `mq_*` calls (ENOSYS), and a `--namespace-only`
+/// guest, which makes them for real, gets the System V key and the queue name
+/// the host already uses. A bind of the host's `/dev/mqueue` keeps the host's
+/// queues there. The guest is `tests/c/private_ipc.c`.
+#[test]
+fn a_run_gets_a_private_ipc_namespace() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&PRIVATE_IPC_GUEST, "private_ipc")
+        .to_str()
+        .unwrap();
+    let name = format!("hermit-private-ipc-{}", std::process::id());
+    let key = ipc_test_key().to_string();
+    let host_queue = HostMessageQueue::create(&name);
+    let _host_mq_open_queue = HostMessageQueue::create(&format!("{name}-mq"));
+    let host_segment = HostShmSegment::create(ipc_test_key());
+    let expected = |calls: &str| {
+        format!(
+            "/dev/mqueue entries: 0\n\
+             /dev/mqueue mount: rw,nosuid,nodev,noexec,relatime mqueue\n\
+             open(/dev/mqueue/{name}, O_CREAT | O_EXCL): created\n\
+             shmget(key, IPC_CREAT | IPC_EXCL): {calls}\n\
+             semget(key, IPC_CREAT | IPC_EXCL): {calls}\n\
+             msgget(key, IPC_CREAT | IPC_EXCL): {calls}\n\
+             mq_open(/{name}-mq, O_CREAT | O_EXCL): {calls}\n\
+             removed: yes\n"
+        )
+    };
+    for strict in [true, false] {
+        let mut args = vec!["run", "--timeout", "120"];
+        if strict {
+            args.push("--strict");
+        }
+        args.extend(["--base-env=minimal", "--", guest, "check", &name, &key]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            expected("Function not implemented"),
+            "{args:?}"
+        );
+    }
+    let args = [
+        "run",
+        "--timeout",
+        "120",
+        "--namespace-only",
+        "--base-env=minimal",
+        "--",
+        guest,
+        "check",
+        &name,
+        &key,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), expected("created"), "{args:?}");
+    assert!(host_queue.0.exists(), "a guest removed the host's queue");
+    // SAFETY: shmget takes no pointers.
+    let found = unsafe { libc::shmget(ipc_test_key(), 0, 0) };
+    assert_eq!(found, host_segment.0, "a guest removed the host's segment");
+
+    let args = [
+        "run",
+        "--timeout",
+        "120",
+        "--base-env=minimal",
+        "--mount=type=bind,source=/dev/mqueue,target=/dev/mqueue",
+        "--",
+        guest,
+        "sees",
+        &name,
+        &key,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        format!("open(/dev/mqueue/{name}): opened\nshmget(key): Function not implemented\n")
+    );
+
+    // A mount the private /dev/mqueue would cover is refused.
+    let args = [
+        "run",
+        "--base-env=minimal",
+        "--mount=type=tmpfs,target=/dev/mqueue/below",
+        "--",
+        "/bin/true",
+    ];
+    let output = hermit(&args);
+    assert!(!output.status.success(), "{args:?} was not refused");
+    assert!(
+        stderr(&output).contains(
+            "cannot mount at /dev/mqueue/below: the guest's /dev/mqueue is its own mqueue filesystem"
+        ),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// Two runs at once each have their own IPC namespace: while one holds a
+/// message queue it created through `/dev/mqueue` (and, under
+/// `--namespace-only`, System V objects and an `mq_open` queue with the same
+/// key and names), the other creates the same ones. Concurrent runs choose
+/// the same names and keys, so on a shared namespace the second run's
+/// exclusive creates failed with EEXIST.
+#[test]
+fn concurrent_runs_do_not_share_ipc() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&PRIVATE_IPC_GUEST, "private_ipc")
+        .to_str()
+        .unwrap();
+    let name = format!("hermit-concurrent-ipc-{}", std::process::id());
+    let key = ipc_test_key().to_string();
+    for (mode, created, calls) in [
+        ("--base-env=minimal", 1, "Function not implemented"),
+        ("--namespace-only", 5, "created"),
+    ] {
+        let holder_args = [
+            "run",
+            "--timeout",
+            "120",
+            mode,
+            "--",
+            guest,
+            "hold",
+            &name,
+            &key,
+        ];
+        let mut holder = hermit_command(&holder_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to start the holding run");
+        let mut holder_stdout = BufReader::new(holder.stdout.take().unwrap());
+        let mut holder_stderr = holder.stderr.take().unwrap();
+        // The holding run's stderr, once it has ended: closing its stdin ends it.
+        let mut holder_stderr_text = |stdin: &mut Option<std::process::ChildStdin>| {
+            drop(stdin.take());
+            let mut text = String::new();
+            let _ = holder_stderr.read_to_string(&mut text);
+            text
+        };
+        let mut line = String::new();
+        holder_stdout.read_line(&mut line).unwrap();
+        assert_eq!(
+            line,
+            format!("created: {created}\n"),
+            "{mode}: the holding run's stderr:\n{}",
+            holder_stderr_text(&mut holder.stdin)
+        );
+
+        let args = [
+            "run",
+            "--timeout",
+            "120",
+            mode,
+            "--",
+            guest,
+            "check",
+            &name,
+            &key,
+        ];
+        let output = hermit(&args);
+        let holder_stderr = holder_stderr_text(&mut holder.stdin);
+        let mut released = String::new();
+        holder_stdout.read_to_string(&mut released).unwrap();
+        let status = holder.wait().unwrap();
+        assert_success(&output, &args);
+        let stdout = stdout(&output);
+        for line in [
+            format!("open(/dev/mqueue/{name}, O_CREAT | O_EXCL): created\n"),
+            format!("shmget(key, IPC_CREAT | IPC_EXCL): {calls}\n"),
+            format!("semget(key, IPC_CREAT | IPC_EXCL): {calls}\n"),
+            format!("msgget(key, IPC_CREAT | IPC_EXCL): {calls}\n"),
+            format!("mq_open(/{name}-mq, O_CREAT | O_EXCL): {calls}\n"),
+        ] {
+            assert!(stdout.contains(&line), "{mode}: {stdout}");
+        }
+        assert!(
+            status.success(),
+            "{mode}: the holding run failed: {status:?}\n{holder_stderr}"
+        );
+        assert_eq!(released, "released: yes\n", "{mode}: {holder_stderr}");
+    }
+}
+
 /// Under DBT each guest `cpuid` is answered by Detcore, as under ptrace, so
 /// the two print the same CPUID rows (every basic leaf for subleaves 0 to 2 and
 /// every extended leaf), and DBT's `/proc/cpuinfo` lists HLE and RTM exactly
@@ -45408,7 +45998,7 @@ fn a_run_without_namespaces_is_not_refused_where_user_namespaces_are_denied() {
     );
     assert!(
         log.contains("class=backend-unavailable")
-            && log.contains("unshare(CLONE_NEWUSER | CLONE_NEWPID) was denied"),
+            && log.contains("unshare(CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWIPC) was denied"),
         "{log}"
     );
     let args = ["run", "--no-namespace", "--", "/bin/echo", "ran"];
