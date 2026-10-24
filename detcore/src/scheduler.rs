@@ -108,8 +108,6 @@ use crate::scheduler::rejoin_log::Rejoin;
 use crate::scheduler::rejoin_log::RejoinRefusal;
 use crate::scheduler::rejoin_log::RejoinWriter;
 use crate::scheduler::replayer::StopReason;
-use crate::scheduler::replayer::events_consistent;
-use crate::scheduler::replayer::events_match;
 use crate::syscalls::KernelSignalState;
 use crate::syscalls::read_kernel_signal_state;
 use crate::syscalls::thread_is_gone;
@@ -4091,10 +4089,14 @@ impl Scheduler {
                             .collect();
                         let vec = record.into_global();
                         trace!("Trace loaded, length {}", vec.len());
+                        // Indices are schedule positions (`Replayer::stacktrace_position`),
+                        // so no recorded event is kept to match against, and one at or
+                        // past the end names the events the run makes after the
+                        // schedule runs out.
                         let toprint = cfg
                             .stacktrace_event
                             .iter()
-                            .map(|(ix, path)| (*ix, Some(vec[*ix as usize].clone()), path.clone()))
+                            .map(|(ix, path)| (*ix, None, path.clone()))
                             .collect();
                         let mut replayer = Replayer::new(vec);
                         replayer.replay_exhausted_panic = cfg.replay_exhausted_panic;
@@ -5009,6 +5011,9 @@ impl Scheduler {
 
     /// Try to pop the next event from the sorted list of stacktrace_events, if it matches the given
     /// index.  This is idempotent, because subsequent attempts will just fizzle.
+    ///
+    /// The index is the traced count when recording, and the schedule position
+    /// (`Replayer::stacktrace_position`) under `--replay-schedule-from`.
     fn try_pop_stacktrace_event(
         &mut self,
         current_ix: u64,
@@ -5016,29 +5021,22 @@ impl Scheduler {
     ) -> MaybePrintStack {
         let mut result = None;
         if let Some(iter) = &mut self.stacktrace_events
-            && let Some((next_ix, event, m_path)) = iter.peek()
+            && let Some((next_ix, _, m_path)) = iter.peek()
+            && *next_ix == current_ix
         {
-            let go = if let Some(ev) = event {
-                (*next_ix == current_ix && events_consistent(observed, ev))
-                    || events_match(observed, ev)
-            } else {
-                *next_ix == current_ix
-            };
-            if go {
-                info!(
-                    "Now output stack trace for scheduled event #{} = {}:",
-                    current_ix, observed,
+            info!(
+                "Now output stack trace for scheduled event #{} = {}:",
+                current_ix, observed,
+            );
+            if m_path.is_none() {
+                crate::util::capped_eprintln!(
+                    "\nPrinting stack trace for scheduled event #{} = {}:",
+                    current_ix,
+                    observed,
                 );
-                if m_path.is_none() {
-                    crate::util::capped_eprintln!(
-                        "\nPrinting stack trace for scheduled event #{} = {}:",
-                        current_ix,
-                        observed,
-                    );
-                }
-                result = Some(m_path.clone());
-                let _ = iter.next();
             }
+            result = Some(m_path.clone());
+            let _ = iter.next();
         }
         result
     }
@@ -5059,11 +5057,13 @@ impl Scheduler {
         debug_assert!(self.replayer.is_some());
         let mytid = observed.dettid;
 
-        if let Some((ix, action)) = self.replayer.as_mut().map(|r| {
+        if let Some((ix, action, position)) = self.replayer.as_mut().map(|r| {
             let current_ix = r.traced_event_count;
-            (current_ix, r.observe_event(observed))
+            let action = r.observe_event(observed);
+            (current_ix, action, r.stacktrace_position(current_ix))
         }) {
-            let print_stack = self.try_pop_stacktrace_event(ix, observed);
+            let print_stack =
+                position.and_then(|position| self.try_pop_stacktrace_event(position, observed));
             debug!("Next ReplayAction = {:?}", action);
             self.release_replay_priorities_if_exhausted();
 
@@ -8022,6 +8022,13 @@ impl Scheduler {
         if std::mem::take(&mut self.fast_forward_for_alone_poller) {
             self.fast_forward_to_next_finite_deadline(global_time);
         }
+        if self.replay_fast_forward_to_recorded_wake(global_time) {
+            // No thread runs until the replayed thread wakes: committed time
+            // catches up in the next pass's step 1, and each pass then pops one
+            // due timed event, the replayed thread's last if others are earlier.
+            self.step2b_process_timed(global_time);
+            return Err(SkipTurn);
+        }
         self.step2b_process_timed(global_time);
         self.step2b_restore_due_pollers();
         // A timed signal that just armed a background thread is followed by an
@@ -8036,6 +8043,69 @@ impl Scheduler {
         self.step2c_process_io_blockers()?;
         self.step2e_process_signal_deferred();
         self.step2d_handle_empty_queue(global_time)
+    }
+
+    /// Under `--replay-schedule-from`, when the next recorded event belongs to a
+    /// thread asleep until a finite deadline, move global time to that deadline
+    /// and report that the pass must wait for the wake (true).
+    ///
+    /// The recorded schedule is authoritative: if the recording resumed that
+    /// thread here, its deadline had passed in the recording, since any wake by
+    /// another thread would already have been replayed and taken it out of the
+    /// timed waiters. A replay can reach this point with less virtual time
+    /// elapsed than the recording (its context switches are replay turns, which
+    /// charge no scheduler time, where the recording's were ordinary turns), and
+    /// it would then run another thread here and leave the schedule. Advancing
+    /// time keeps it monotonic and makes the recorded wake legal; timed waiters
+    /// with earlier deadlines wake on the way, as they would have in the
+    /// recording.
+    ///
+    /// The pass waits only while the wake is not yet due: committed time is
+    /// behind the deadline, or an earlier timed event pops first. Once the
+    /// thread's deadline is the earliest due one, the ordinary pass pops it
+    /// and goes on to its turn, as the recording's pass did.
+    ///
+    /// A schedule that carries callback checkpoints replays its software
+    /// expiry turns from them (`callback_history_active`), so it keeps its own
+    /// time and is left alone here. One without them, such as the trials
+    /// `hermit analyze` writes, has nothing else to wake the thread on time.
+    /// After a hard desync the cursor stays on the event it expected, so the
+    /// jump can repeat for that thread; it still only moves time forward.
+    fn replay_fast_forward_to_recorded_wake(
+        &mut self,
+        global_time: &Arc<Mutex<GlobalTime>>,
+    ) -> bool {
+        if self.callback_history_active {
+            return false;
+        }
+        let Some((tid, _)) = self
+            .replayer
+            .as_ref()
+            .and_then(|replayer| replayer.next_resume())
+        else {
+            return false;
+        };
+        let Some(deadline) = self.blocked.timed_waiters.thread_deadline(tid) else {
+            return false;
+        };
+        if deadline.is_indefinite() {
+            return false;
+        }
+        let mut gt = global_time.lock().unwrap();
+        let now = gt.as_nanos();
+        if deadline > now {
+            info!(
+                "[scheduler] The replayed schedule resumes dtid {} next, which sleeps until {}; skipping global time ahead to it.",
+                tid, deadline
+            );
+            gt.add_extra_time(deadline.duration_since(now));
+        }
+        deadline > self.committed_time
+            || self
+                .blocked
+                .timed_waiters
+                .next_deadline()
+                .is_some_and(|earliest| earliest < deadline)
     }
 
     /// Move global time to the earliest finite timed deadline, if it lies
@@ -13575,8 +13645,28 @@ impl Scheduler {
             // Requeue the thread as a poller
             let popped = self.run_queue.commit_tentative_pop();
             assert_eq!(dettid, popped);
-            self.run_queue
-                .push_poller(dettid, self.get_priority(dettid), rs.poll_attempt);
+            let priority = self.get_priority(dettid);
+            // The replayed schedule's next event is this retry: a poll backoff
+            // would hand the turn to another thread and leave the schedule. A
+            // recorded unsuccessful attempt keeps the turn. A recorded
+            // completion keeps it only until the retry is a second one after an
+            // attempt that moved nothing: that retry waits on another thread,
+            // which the recording ran as a retry with no event of its own (a
+            // FIFO open waiting for its peer's open), so it backs off as before;
+            // kept running, it would never let that thread run. The first retry
+            // keeps the turn, since the grant before it may have finished other
+            // calls, which counts as progress.
+            let keeps_turn = self.replayer.as_ref().is_some_and(|replayer| {
+                replayer.next_is_retry_by(dettid)
+                    && (replayer.next_is_failed_attempt_by(dettid)
+                        || !Self::retries_its_call_without_progress(rs))
+            });
+            if keeps_turn {
+                self.run_queue.push_back(dettid, priority);
+            } else {
+                self.run_queue
+                    .push_poller(dettid, priority, rs.poll_attempt);
+            }
             // Before the count reset below hides that this is a retry.
             self.note_sigalrm_polling_wait(dettid, rs);
             self.work_span_note_wait(dettid, rs);
@@ -15215,6 +15305,17 @@ impl Scheduler {
             }
             std::collections::btree_map::Entry::Occupied(_) => false,
         }
+    }
+
+    /// Whether a schedule replay has been in hard desync with its record at
+    /// some point: a thread ran an event other than the recorded one.
+    pub(crate) fn replay_left_its_record(&self) -> bool {
+        self.replayer.as_ref().is_some_and(|replayer| {
+            replayer
+                .desync_counts
+                .values()
+                .any(|counts| counts.hard > 0)
+        })
     }
 
     /// Once the replayed schedule has no events left, give every thread the
@@ -18325,6 +18426,54 @@ mod test {
         assert!(sched.run_queue.remove_tid(readmitted));
         sched.readmit_ready_thread(readmitted);
         assert_eq!(sched.run_queue.queued_priority(readmitted), Some(eager));
+    }
+
+    /// A replay has left its record once a thread runs an event other than the
+    /// recorded one; until then it has not.
+    #[test]
+    fn a_replay_leaves_its_record_at_its_first_hard_desync() {
+        let mut sched = Scheduler::new(&Config::default());
+        assert!(!sched.replay_left_its_record(), "not replaying");
+        let at = LogicalTime::from_nanos;
+        let first = SchedEvent::syscall(DetTid::from_raw(3), Sysno::getpid, SyscallPhase::Prehook)
+            .with_time(at(10_000));
+        let second =
+            SchedEvent::syscall(DetTid::from_raw(3), Sysno::getppid, SyscallPhase::Prehook)
+                .with_time(at(20_000));
+        let third = SchedEvent::syscall(DetTid::from_raw(3), Sysno::getuid, SyscallPhase::Prehook)
+            .with_time(at(30_000));
+        sched.replayer = Some(Replayer::new(vec![first.clone(), second, third]));
+        let _ = sched.consume_schedevent(&first);
+        assert!(!sched.replay_left_its_record(), "in step");
+        let other = SchedEvent::syscall(DetTid::from_raw(5), Sysno::gettid, SyscallPhase::Prehook)
+            .with_time(at(20_000));
+        let _ = sched.consume_schedevent(&other);
+        assert!(sched.replay_left_its_record());
+    }
+
+    /// Under a schedule replay a `--stacktrace-event` index is a schedule
+    /// position: an event the replay observes that the recording lacks (a
+    /// timeslice split by a few branches) neither prints the stack nor shifts
+    /// the recorded event that does.
+    #[test]
+    fn a_replayed_stacktrace_event_prints_at_its_schedule_position() {
+        let mut sched = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw(3);
+        let at = LogicalTime::from_nanos;
+        let first =
+            SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Prehook).with_time(at(10_000));
+        let second =
+            SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Posthook).with_time(at(20_000));
+        sched.replayer = Some(Replayer::new(vec![first.clone(), second.clone()]));
+        sched.stacktrace_events = Some(vec![(1, None, None)].into_iter().peekable());
+        assert_eq!(sched.consume_schedevent(&first).print_stack, None);
+        let extra = SchedEvent::branches(tid, 2).with_time(at(15_000));
+        assert_eq!(
+            sched.consume_schedevent(&extra).print_stack,
+            None,
+            "the second observed event is not recorded event #1"
+        );
+        assert_eq!(sched.consume_schedevent(&second).print_stack, Some(None));
     }
 
     /// A thread queued at the deferred replay priority when the recording
@@ -22264,6 +22413,129 @@ mod test {
             },
         );
         (global_time, deadline)
+    }
+
+    /// A polling thread's retry keeps its turn when the replayed schedule's
+    /// next event is that retry: it is queued as an ordinary runnable thread
+    /// rather than backed off as a poller, which would hand another thread the
+    /// turn the recording gave it. It is backed off as before when the
+    /// schedule names another thread next, or names the retry's completion
+    /// while the retry is a second one after an attempt that moved nothing (it
+    /// waits on another thread's retry). A recorded unsuccessful attempt keeps
+    /// the turn either way.
+    #[test]
+    fn a_replayed_retry_is_not_backed_off_as_a_poller() {
+        let poller = DetTid::from_raw(3);
+        let other = DetTid::from_raw(5);
+        let (completion, attempt) = (SyscallPhase::Posthook, SyscallPhase::Polling);
+        for (next, phase, retry, made_progress, backed_off) in [
+            (poller, completion, 1, false, false),
+            (other, completion, 1, false, true),
+            (poller, completion, 2, false, true),
+            (poller, completion, 2, true, false),
+            (poller, attempt, 2, false, false),
+        ] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            register_known_thread(&mut scheduler, poller);
+            scheduler
+                .priorities
+                .insert(poller, runqueue::FIRST_PRIORITY + 2);
+            scheduler.runqueue_push_back(poller);
+            scheduler.replayer = Some(replayer::Replayer::new(vec![SchedEvent::syscall(
+                next,
+                Sysno::recvfrom,
+                phase,
+            )]));
+            let mut request = Resources::new(poller);
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            request.poll_attempt = retry;
+            request.previous_attempt_made_progress = made_progress;
+            let turn = scheduler.next_turns.get(&poller).unwrap();
+            turn.req.put(Ok(request.clone()));
+            let response = turn.resp.clone();
+            assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(poller));
+            assert!(
+                scheduler
+                    .step4_resource_block(poller, &request, &response)
+                    .is_err(),
+                "a retry that has not been remade runnable grants no turn"
+            );
+            assert_eq!(
+                !scheduler.run_queue.contains_non_polling_tid(poller),
+                backed_off,
+                "the schedule's next event is dtid {next}'s {phase:?}, retry {retry}, \
+                 progress {made_progress}"
+            );
+        }
+    }
+
+    /// A schedule replay whose next recorded event resumes a thread asleep in
+    /// virtual time moves global time to that thread's deadline and holds the
+    /// pass for its wake. A replay that resumes another thread, or a run that
+    /// is not replaying, leaves time alone.
+    #[test]
+    fn a_replay_resuming_a_sleeper_moves_time_to_its_deadline() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let sleeper = DetTid::from_raw(5);
+        let other = DetTid::from_raw(7);
+        let (global_time, deadline) = add_sleeper(&mut scheduler, sleeper);
+        let before = global_time.lock().unwrap().as_nanos();
+
+        assert!(
+            !scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "not replaying"
+        );
+        let resume_other = SchedEvent::syscall(other, Sysno::getpid, SyscallPhase::Prehook);
+        scheduler.replayer = Some(replayer::Replayer::new(vec![resume_other]));
+        assert!(
+            !scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "the replay resumes another thread"
+        );
+        assert_eq!(global_time.lock().unwrap().as_nanos(), before);
+
+        let wake = SchedEvent::syscall(sleeper, Sysno::clock_nanosleep, SyscallPhase::Posthook);
+        scheduler.replayer = Some(replayer::Replayer::new(vec![wake.clone()]));
+        assert!(scheduler.replay_fast_forward_to_recorded_wake(&global_time));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+        assert!(
+            scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "the pass keeps waiting until committed time reaches the deadline"
+        );
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+
+        // An earlier timed waiter pops first, then the sleeper's wake is due:
+        // the ordinary pass pops it and goes on to its turn.
+        let early = DetTid::from_raw(9);
+        let early_deadline = deadline - LogicalTime::from_nanos(10);
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(early_deadline, early);
+        scheduler.committed_time = deadline;
+        assert!(
+            scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "an earlier deadline is still waiting to pop"
+        );
+        scheduler.blocked.timed_waiters.remove(early);
+        assert!(
+            !scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "the wake is due, so the pass runs"
+        );
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+
+        // A schedule with callback checkpoints replays its expiry turns from
+        // them and is left alone.
+        let (global_time, _) = add_sleeper(&mut scheduler, DetTid::from_raw(11));
+        let before = global_time.lock().unwrap().as_nanos();
+        scheduler.committed_time = before;
+        scheduler.callback_history_active = true;
+        scheduler.replayer = Some(replayer::Replayer::new(vec![SchedEvent::syscall(
+            DetTid::from_raw(11),
+            Sysno::clock_nanosleep,
+            SyscallPhase::Posthook,
+        )]));
+        assert!(!scheduler.replay_fast_forward_to_recorded_wake(&global_time));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), before);
     }
 
     /// With a backgrounded call unfinished and nothing queued, record wakes a
@@ -35784,6 +36056,39 @@ mod strict_boundary_admission_tests {
             };
             assert!(std::panic::catch_unwind(|| Scheduler::new(&cfg)).is_err());
         }
+    }
+
+    /// A `--stacktrace-event` index at or past the end of a replayed legacy
+    /// schedule names an event the run makes after the schedule runs out, so
+    /// building the scheduler takes it as it is instead of indexing the
+    /// recording with it, which panicked.
+    #[test]
+    fn a_stacktrace_index_past_a_legacy_schedule_is_kept_for_the_run_after_it() {
+        use reverie::syscalls::Sysno;
+
+        use crate::preemptions::PreemptionRecord;
+        use crate::preemptions::boundary_recording::Recording;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("schedule.json");
+        let tid = DetTid::from_raw(3);
+        Recording::Legacy(PreemptionRecord::from_sched_events(vec![
+            SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Prehook),
+            SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Posthook),
+        ]))
+        .write(&path)
+        .unwrap();
+        let cfg = Config {
+            replay_schedule_from: Some(path),
+            stacktrace_event: vec![(7, None), (2, None)],
+            ..Config::default()
+        };
+        let scheduler = Scheduler::new(&cfg);
+        let positions: Vec<u64> = scheduler
+            .stacktrace_events
+            .unwrap()
+            .map(|(position, _, _)| position)
+            .collect();
+        assert_eq!(positions, vec![2, 7]);
     }
 }
 

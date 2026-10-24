@@ -5183,11 +5183,22 @@ impl GlobalState {
             } else {
                 // In replay mode the schedule decides the thread's priority
                 // (`Scheduler::replay_registration_priority`).
+                // A child registers before the schedule switches to it
+                // whenever its parent runs on after the clone, as recorded
+                // schedules usually have it, so this is a sign that the
+                // replay lost its guide only once it has left the record.
                 if sched.replay_registration_priority(child_dettid, initial_priority) {
-                    warn!(
-                        "[detcore, dtid {}] registered before the replayed schedule switched to it, created by process {}; it takes its starting priority {}",
-                        child_dettid, parent_detpid, initial_priority
-                    );
+                    if sched.replay_left_its_record() {
+                        warn!(
+                            "[detcore, dtid {}] registered before the replayed schedule switched to it, created by process {}; it takes its starting priority {}",
+                            child_dettid, parent_detpid, initial_priority
+                        );
+                    } else {
+                        debug!(
+                            "[detcore, dtid {}] registered before the replayed schedule switched to it, created by process {}; it takes its starting priority {}",
+                            child_dettid, parent_detpid, initial_priority
+                        );
+                    }
                 }
             }
 
