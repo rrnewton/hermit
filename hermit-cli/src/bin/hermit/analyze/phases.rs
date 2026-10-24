@@ -127,6 +127,29 @@ impl std::fmt::Display for NothingToKnockOut {
 
 impl std::error::Error for NothingToKnockOut {}
 
+/// `--minimize`'s baseline: knock interventions out of `record`, the latest
+/// first, until `replay(try, knocked_out)` misses the target and returns the
+/// run that did; [`NothingToKnockOut`] when none is left. Each knock-out
+/// starts from the record the previous one replayed, not from what that run
+/// recorded: a run's recording also holds the priority changes chaos makes
+/// after the replayed record ends, which every run makes again, so knocking
+/// those out never ends.
+fn knock_out_until_missed<T>(
+    mut record: PreemptionRecord,
+    mut replay: impl FnMut(usize, &PreemptionRecord) -> anyhow::Result<Option<T>>,
+) -> anyhow::Result<T> {
+    for attempt in 1.. {
+        let Some(knocked_out) = knock_out_latest(&record) else {
+            break;
+        };
+        if let Some(missed) = replay(attempt, &knocked_out)? {
+            return Ok(missed);
+        }
+        record = knocked_out;
+    }
+    Err(NothingToKnockOut.into())
+}
+
 /// `record` with its latest intervention knocked out, for `--minimize`'s
 /// baseline; `None` when it has none left. Threads at the default priority
 /// with no change are dropped first: replay gives a thread the record does
@@ -1560,22 +1583,12 @@ impl AnalyzeOpts {
             // If we're minimizing, then we know that ALL interventions in the schedule are critical.
             // Thus omitting any of them is sufficient to exit the target schedule space.
             // Omitting the last one should yield the lowest distance match/non-match schedule pair.
-            let mut pr = matching_pr;
-            let mut ix = 1;
-            loop {
-                let Some(knocked_out) = knock_out_latest(&pr) else {
-                    return Err(NothingToKnockOut.into());
-                };
+            knock_out_until_missed(matching_pr, |ix, knocked_out| {
                 let runname = format!("run2_baseline_try{:03}", ix);
-                let (still_matching, mut newrun) =
-                    self.save_nearby_non_matching_sched_events(&runname, &knocked_out)?;
-                if still_matching {
-                    pr = newrun.preempts_out().clone();
-                    ix += 1;
-                } else {
-                    return Ok(newrun);
-                }
-            }
+                let (still_matching, newrun) =
+                    self.save_nearby_non_matching_sched_events(&runname, knocked_out)?;
+                Ok((!still_matching).then_some(newrun))
+            })
         } else {
             let runname = "run2_baseline".to_string();
             let mut newrun = RunData::new_baseline(self, runname)?.with_preemption_recording();
@@ -2881,6 +2894,48 @@ mod tests {
         assert_eq!(
             threads(&knocked.without_default_threads()),
             Vec::<u32>::new()
+        );
+    }
+
+    /// `--minimize`'s baseline search knocks out one more intervention of the
+    /// record it last replayed each time, until a replay misses the target or
+    /// none is left; it never starts again from a run's own recording, which
+    /// holds more priority changes than it replayed. Before, a target whose
+    /// replays kept meeting the target knocked out chaos's own changes
+    /// without end.
+    #[test]
+    fn the_baseline_search_knocks_out_the_replayed_record_until_a_replay_misses() {
+        use std::collections::BTreeMap;
+
+        use detcore::types::LogicalTime;
+        let at = LogicalTime::from_nanos;
+        let record = PreemptionRecord::from_vecs(&BTreeMap::from([
+            (DetTid::from_raw(3), vec![(at(0), 4923), (at(500), 1200)]),
+            (DetTid::from_raw(5), vec![(at(0), 352)]),
+        ]));
+        let mut replayed = Vec::new();
+        let missed = knock_out_until_missed(record.clone(), |attempt, knocked_out| {
+            replayed.push(knocked_out.clone());
+            Ok((attempt == 2).then_some(attempt))
+        })
+        .unwrap();
+        assert_eq!(missed, 2);
+        assert_eq!(replayed[0], knock_out_latest(&record).unwrap());
+        assert_eq!(replayed[1], knock_out_latest(&replayed[0]).unwrap());
+
+        let mut attempts = 0;
+        let error = knock_out_until_missed(record, |_, _| {
+            attempts += 1;
+            Ok(None::<()>)
+        })
+        .unwrap_err();
+        assert!(
+            error.downcast_ref::<NothingToKnockOut>().is_some(),
+            "{error:#}"
+        );
+        assert!(
+            attempts == 3,
+            "{attempts} knock-outs for three interventions"
         );
     }
 
