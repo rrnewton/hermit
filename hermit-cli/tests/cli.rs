@@ -199,6 +199,7 @@ static FUSE_DIRECTORY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LAST_BAND_BACKGROUND_CALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_POLLER_BESIDE_SLEEPERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TIMED_WAIT_POLLERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static EPOLL_IGNORED_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SOCKET_READER_BESIDE_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HANDOFF_BESIDE_NEWCOMER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SLEEPER_BESIDE_NEWCOMER_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -37427,7 +37428,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x18a, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x18b, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];

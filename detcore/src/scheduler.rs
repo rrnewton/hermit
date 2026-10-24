@@ -692,7 +692,9 @@ pub struct BlockedPool {
     /// where the call ran and was interrupted in the kernel, and replay, where
     /// it was not. A call that returned normally has no entry: Linux restored
     /// the thread's own mask before it returned, and the kernel holds that in
-    /// both.
+    /// both (with the signals the thread ignores blocked over it until after
+    /// the continuation, for a wait Detcore shielded from them,
+    /// `syscalls::helpers::IgnoredSignalShield`).
     pub continuation_masks: BTreeMap<DetTid, Option<u64>>,
 
     /// Parents parked awaiting deterministic delivery of a host-async `SIGCHLD`.

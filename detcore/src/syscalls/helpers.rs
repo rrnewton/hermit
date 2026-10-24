@@ -4295,6 +4295,120 @@ where
     panic!("unserviceable operation on syscall: {sysno:?}");
 }
 
+/// The signals the guest ignores, blocked for one wait that Detcore runs in the
+/// kernel and that a signal ends with `EINTR` rather than a restart code: the
+/// `epoll_wait` family (`ep_poll`). Linux discards a signal the process ignores
+/// when it is generated (`sig_ignored`), so it never ends such a wait, but it
+/// queues one for a traced thread, and the wait then returned `EINTR` to the
+/// guest. Blocked for the wait, such a signal stays pending without ending it;
+/// once the guest's mask is back it is delivered and ignored, as it was before.
+/// The mask changes through the backend (`Guest::set_blocked_signals`, on
+/// ptrace `PTRACE_SETSIGMASK`), so no syscall the guest or the recorder sees is
+/// added. Replay, which serves the wait from the recording, raises the same
+/// shield: the scheduler reads the thread's mask when it commits the wait's
+/// request (`Resources::blocked_signal_mask`), and record and replay must
+/// present the same one.
+#[must_use]
+pub(crate) struct IgnoredSignalShield {
+    /// The guest's mask to put back, when the shield is up.
+    guest_mask: Option<u64>,
+}
+
+impl IgnoredSignalShield {
+    /// No shield: the wait cannot block, or runs under its own temporary mask.
+    pub(crate) fn none() -> Self {
+        Self { guest_mask: None }
+    }
+
+    /// Blocks the signals the guest ignores and does not block, read from the
+    /// kernel (`KernelSignalState::discarded_at_generation`). If the state
+    /// cannot be read or the backend refuses the change and left the mask as
+    /// it was, the wait runs under the guest's own mask, as it did before. A
+    /// change that may have been written without being confirmed ends the
+    /// run: the guest must not resume as if its mask were known
+    /// (`MaskChangeRefused::Failed`).
+    pub(crate) async fn raise<T, G>(guest: &mut G) -> Result<Self, Error>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        let state = match crate::syscalls::read_thread_signal_state(guest.pid(), guest.tid()) {
+            Ok(state) => state,
+            Err(errno) => {
+                tracing::debug!("[tid {}] no ignored-signal shield: {errno}", guest.tid());
+                return Ok(Self::none());
+            }
+        };
+        let Some(mask) = ignored_signal_shield_mask(&state) else {
+            return Ok(Self::none());
+        };
+        match guest.set_blocked_signals(mask).await {
+            Ok(guest_mask) => Ok(Self {
+                guest_mask: Some(guest_mask),
+            }),
+            Err(refused) if shield_refusal_leaves_the_mask_known(&refused) => {
+                tracing::debug!("[tid {}] no ignored-signal shield: {refused}", guest.tid());
+                Ok(Self::none())
+            }
+            Err(refused) => Err(Error::Tool(anyhow::anyhow!(
+                "[tid {}] could not block the signals the guest ignores ({mask:#x}) for a wait, \
+                 and its signal mask is unknown: {refused}",
+                guest.tid()
+            ))),
+        }
+    }
+
+    /// Puts the guest's mask back. The guest must not resume under the
+    /// shield, so a mask that cannot be put back ends the run.
+    pub(crate) async fn lower<T, G>(mut self, guest: &mut G) -> Result<(), Error>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        let Some(guest_mask) = self.guest_mask.take() else {
+            return Ok(());
+        };
+        match guest.set_blocked_signals(guest_mask).await {
+            Ok(_) | Err(MaskChangeRefused::Gone) => Ok(()),
+            Err(refused) => Err(Error::Tool(anyhow::anyhow!(
+                "[tid {}] could not put back the guest's signal mask {guest_mask:#x} after a \
+                 wait that blocked the signals it ignores: {refused}",
+                guest.tid()
+            ))),
+        }
+    }
+}
+
+impl Drop for IgnoredSignalShield {
+    fn drop(&mut self) {
+        debug_assert!(
+            self.guest_mask.is_none(),
+            "an ignored-signal shield was dropped without putting back the guest's mask"
+        );
+    }
+}
+
+/// Whether a refused shield change left the thread's mask as it was, so the
+/// wait can run under it: every refusal but a failure after which the backend
+/// could not confirm the mask (`MaskChangeRefused::Failed`'s `mask_unknown`).
+fn shield_refusal_leaves_the_mask_known(refused: &MaskChangeRefused) -> bool {
+    !matches!(
+        refused,
+        MaskChangeRefused::Failed {
+            mask_unknown: true,
+            ..
+        }
+    )
+}
+
+/// The mask an ignored-signal shield sets over `state`: the thread's mask and
+/// the signals it would discard at generation, or `None` when there are none
+/// (`IgnoredSignalShield`).
+fn ignored_signal_shield_mask(state: &KernelSignalState) -> Option<KernelSigset> {
+    let ignored = state.discarded_at_generation();
+    (ignored != 0).then_some(state.blocked | ignored)
+}
+
 /// Refuse the guest's `sysno` call when its wait ended with a
 /// [`HeldSignalRefusal`], through the unsupported-operation policy
 /// (`refuse_unserviceable_operation_with`): a fail-closed run, which ordinary
@@ -5936,6 +6050,61 @@ pub fn poll_nfds(nfds: libc::nfds_t) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ignored_signal_shield_blocks_only_what_the_guest_ignores() {
+        use crate::syscalls::threads::kernel_sigset_bit as bit;
+        let state = |blocked, ignored, caught| KernelSignalState {
+            blocked,
+            ignored,
+            caught,
+            ..Default::default()
+        };
+        let default_ignored =
+            bit(libc::SIGCHLD) | bit(libc::SIGCONT) | bit(libc::SIGURG) | bit(libc::SIGWINCH);
+        // With every disposition at its default, the shield blocks exactly the
+        // default-ignored signals, on top of the thread's own mask.
+        assert_eq!(
+            ignored_signal_shield_mask(&state(bit(libc::SIGUSR2), 0, 0)),
+            Some(bit(libc::SIGUSR2) | default_ignored)
+        );
+        // A signal set to SIG_IGN joins them; a caught one leaves them.
+        assert_eq!(
+            ignored_signal_shield_mask(&state(0, bit(libc::SIGUSR1), bit(libc::SIGCHLD))),
+            Some(bit(libc::SIGUSR1) | (default_ignored & !bit(libc::SIGCHLD)))
+        );
+        // Nothing to block when every ignored signal is caught or already blocked.
+        assert_eq!(
+            ignored_signal_shield_mask(&state(
+                bit(libc::SIGCONT) | bit(libc::SIGURG),
+                0,
+                bit(libc::SIGCHLD) | bit(libc::SIGWINCH)
+            )),
+            None
+        );
+        // A refused change leaves the wait under the guest's own mask, unless the
+        // backend could not confirm what the mask is.
+        for refused in [
+            MaskChangeRefused::Unsupported,
+            MaskChangeRefused::Gone,
+            MaskChangeRefused::RestorePending {
+                saved: 0,
+                effective: 1,
+            },
+            MaskChangeRefused::Failed {
+                errno: Errno::ESRCH,
+                mask_unknown: false,
+            },
+        ] {
+            assert!(shield_refusal_leaves_the_mask_known(&refused), "{refused}");
+        }
+        assert!(!shield_refusal_leaves_the_mask_known(
+            &MaskChangeRefused::Failed {
+                errno: Errno::ESRCH,
+                mask_unknown: true,
+            }
+        ));
+    }
 
     /// Bracket the millisecond-to-nanosecond timeout conversion in both
     /// directions: the non-positive values that are NOT deadlines, and the
@@ -8468,7 +8637,9 @@ pub(crate) enum ContinuationMask {
     /// Not known to the scheduler, in record and replay alike.
     Unknown,
     /// The thread's own mask, which the kernel restored before the call
-    /// returned and holds in record and replay alike.
+    /// returned and holds in record and replay alike (with the signals it
+    /// ignores blocked over it until after the continuation, when the call
+    /// raised an `IgnoredSignalShield`).
     Restored,
 }
 

@@ -49,6 +49,7 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
+use crate::syscalls::files::SocketRole;
 #[cfg(target_arch = "x86_64")]
 use crate::syscalls::helpers::KernelPollDeadline;
 use crate::syscalls::helpers::KernelSignalWait;
@@ -3108,9 +3109,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
             Ok(self.record_or_replay(guest, call).await?)
         } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
-            Ok(self
-                .record_or_replay_blocking(guest, Syscall::EpollPwait(call))
-                .await?)
+            self.record_or_replay_epoll_wait_blocking(guest, Syscall::EpollPwait(call))
+                .await
         } else {
             self.handle_internal_epoll_pwait(guest, call).await
         }
@@ -3384,7 +3384,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     self.record_or_replay_masked_epoll_pwait2(guest, args, !observed)
                         .await
                 } else {
-                    self.record_or_replay_blocking(guest, call).await
+                    self.record_or_replay_epoll_wait_blocking(guest, call).await
                 };
             }
         } else if self.cfg.sequentialize_threads
@@ -3411,7 +3411,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             crate::syscalls::timerfd::refuse_host_wait(guest, "epoll_pwait2 with a signal mask");
         }
-        Ok(self.record_or_replay(guest, call).await?)
+        // Only a call that may wait under the thread's own mask needs the
+        // shield; a masked one waits under its own temporary mask.
+        let shield = if zero_timeout || args.arg4 != 0 {
+            crate::syscalls::helpers::IgnoredSignalShield::none()
+        } else {
+            crate::syscalls::helpers::IgnoredSignalShield::raise(guest).await?
+        };
+        let result = self
+            .record_or_replay(guest, call)
+            .await
+            .map_err(Error::from);
+        shield.lower(guest).await?;
+        result
+    }
+
+    /// `record_or_replay_blocking` for an `epoll_wait`, or an `epoll_pwait` or
+    /// `epoll_pwait2` without a mask, that waits in the kernel, with the
+    /// signals the guest ignores blocked for the wait (`IgnoredSignalShield`):
+    /// Linux discards them at generation, so they never end the wait with
+    /// `EINTR`, but ptrace queues them.
+    async fn record_or_replay_epoll_wait_blocking<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        let shield = crate::syscalls::helpers::IgnoredSignalShield::raise(guest).await?;
+        let result = self.record_or_replay_blocking(guest, call).await;
+        shield.lower(guest).await?;
+        result
     }
 
     /// An epoll_pwait2 that may wait, under sequentialized threads: it polls
@@ -3612,9 +3640,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
             Ok(self.record_or_replay(guest, call).await?)
         } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
-            Ok(self
-                .record_or_replay_blocking(guest, Syscall::EpollWait(call))
-                .await?)
+            self.record_or_replay_epoll_wait_blocking(guest, Syscall::EpollWait(call))
+                .await
         } else {
             self.handle_internal_epoll_wait(guest, call).await
         }

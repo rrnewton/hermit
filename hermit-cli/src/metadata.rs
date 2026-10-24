@@ -855,7 +855,14 @@ impl RecordVersion {
 // single stream from its start. An older recording's guest read the old
 // bytes, while this replayer serves the new ones and falls out of step, so it
 // is refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18a);
+// 0x18a -> 0x18b (ledger-assigned for this change): an epoll_wait, or an
+// epoll_pwait or epoll_pwait2 without a mask, that Detcore runs in the kernel
+// now waits with the signals the guest ignores blocked, in record and in replay
+// (`IgnoredSignalShield`), so such a signal no longer ends it with EINTR. The
+// scheduler reads that mask when it commits the wait, so an older recording,
+// made under the guest's own mask, could choose another SIGCHLD taker or
+// readmission point in replay; it is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18b);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -880,7 +887,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18a);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x18a;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x18b;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
