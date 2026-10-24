@@ -227,6 +227,7 @@ impl<P: AsRef<OsStr>> Verify<P> {
             Ok(serde_json::from_reader(BufReader::new(
                 std::fs::File::open(path)?,
             ))?)
+            Ok(serde_json::from_reader(std::fs::File::open(path)?)?)
         };
         let (left, right) = (read(&left.schedule_file)?, read(&right.schedule_file)?);
         // Name what was compared, so an exact agreement of two empty

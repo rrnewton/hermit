@@ -561,6 +561,24 @@ struct PriorityCheckin<'a> {
     site: preemptions::callback_history::Site,
 }
 
+/// The registers a syscall's completion leaves, computed from `entry`, the
+/// context at its entry (`rip` at the `syscall` instruction): `rax` holds the
+/// result, `rip` follows the instruction, and the instruction's own clobbers
+/// hold `rcx` = that `rip` and `r11` = `rflags` (signal phase 1's completed
+/// projection, design section 4). Only read, never written back.
+fn completed_syscall_projection(
+    entry: libc::user_regs_struct,
+    result: i64,
+) -> libc::user_regs_struct {
+    const SYSCALL_INSTRUCTION_LENGTH: u64 = 2;
+    let mut completed = entry;
+    completed.rax = result as u64;
+    completed.rip = entry.rip.wrapping_add(SYSCALL_INSTRUCTION_LENGTH);
+    completed.rcx = completed.rip;
+    completed.r11 = entry.eflags;
+    completed
+}
+
 /// Why this configuration cannot keep the two-phase delivery protocol
 /// (`Tool::announce_signal_event`), if it cannot: a part of the commit would
 /// file a scheduler request, or would read what only exists after the
@@ -2147,6 +2165,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if delivery && self.cfg.sequentialize_threads && self.cfg.observes_schedevents() {
             let access = self.access_trace_signal(guest, signal);
             trace_schedevent_with_access(
+            trace_schedevent(
                 guest,
                 SchedEvent {
                     dettid,
@@ -2856,6 +2875,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
         }
         crate::scheduler::exit_on_replay_refusal(&message)
+        crate::scheduler::exit_on_scheduler_refusal(&message)
     }
 
     fn callback_checkpoint_expiry_due<G: Guest<Self>>(
@@ -4493,7 +4513,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // same RPC that reads it back (`send_and_update_time` updates the
             // coordinator before dispatching the request), so consecutive reads
             // from one thread still advance.
-            //
             // Read it before the event is traced. Under `--replay-schedule-from`
             // tracing the event is where the replayer hands the CPU to the next
             // recorded thread when this read was the last event of a slice, so
@@ -5704,6 +5723,67 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             return;
         }
         self.take_timer_event(guest).await;
+        // This may LOOK like a noop, but actually all of the logic for ending the timeslice is in
+        // the prehook.  All the timer has to do is interrupt the guest and generate an extra call
+        // to this prehook.
+        let boundary_entry = if guest.config().no_rcb_time {
+            slice_boundary::callbacks::Callback::NoRcbTimer
+        } else {
+            slice_boundary::callbacks::Callback::PmuTimer
+        };
+        let boundary_token = self
+            .pre_handler_hook_observed(guest, true, CheckIn::Event, Some(boundary_entry))
+            .await;
+        if guest.config().no_rcb_time && guest.thread_state().last_rcb_timer_is_max {
+            let max_timeslice_end = guest
+                .thread_state()
+                .max_timeslice_end
+                .expect("PMU maximum timer requires a deadline");
+            guest
+                .thread_state_mut()
+                .thread_logical_time
+                .advance_to(max_timeslice_end);
+            if self.cfg.observes_schedevents() {
+                let dettid = guest.thread_state().dettid;
+                let ev = with_guest_time(
+                    guest,
+                    SchedEvent {
+                        dettid,
+                        op: Op::OtherInstructions,
+                        count: 1,
+                        start_rip: None,
+                        end_rip: None,
+                        end_time: None,
+                    },
+                );
+                let ev = with_guest_rip(guest, ev).await;
+                trace_schedevent(guest, ev, false).await;
+            }
+            if self.cfg.replay_schedule_from.is_some()
+                && guest.thread_state().slice_boundary.is_none()
+            {
+                let fallback_deadline = max_timeslice_end
+                    + Duration::from_nanos(u64::from(
+                        self.cfg
+                            .max_timeslice
+                            .expect("PMU maximum must be configured"),
+                    ));
+                let thread_state = guest.thread_state_mut();
+                let replay_deadline = thread_state
+                    .end_of_timeslice
+                    .filter(|deadline| *deadline > max_timeslice_end)
+                    .unwrap_or(fallback_deadline);
+                thread_state.end_of_timeslice = Some(replay_deadline);
+                thread_state.max_timeslice_end = Some(replay_deadline);
+                thread_state.last_rcb_timer = None;
+                thread_state.last_rcb_timer_is_max = false;
+                thread_state.stats.reset_timeslice();
+            } else if guest.thread_state().own_signal_turn_hold.is_none() {
+                slice_boundary::no_rcb_maximum(guest.thread_state_mut())
+                    .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
+                self.end_timeslice(guest).await;
+        }
+        self.post_handler_hook_observed(guest, CheckIn::Event, boundary_token)
     }
 
     async fn handle_syscall_event<G: Guest<Self>>(
@@ -5792,6 +5872,149 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let mut native_guest = reverie::NativeOperationGuest::<_, Self>::optional(
             guest,
             input_operation
+        // Linux's restart of an interrupted wait is the thread's very next syscall,
+        // so the record a wait kept for it lives only until then
+        // (`handle_restart_syscall`).
+        let restart_block = guest.thread_state_mut().restart_block.take();
+
+        let dettid = guest.thread_state().dettid;
+        if guest.thread_state().guest_past_first_execve() {
+            detlog!(
+                event = crate::detlog::DetLogEvent::Syscall;
+                "[syscall][detcore, dtid {}] inbound syscall: {} = ?",
+                dettid,
+                call.display(&guest.memory())
+            );
+        }
+        // The hot syscall path only reads a few Copy flags from the config, so copy
+        // just those out instead of cloning the entire Config on every intercepted
+        // syscall (previously flagged inline as an unnecessary copy). guest.config()
+        // borrows guest immutably; bind the flags in a tight scope so the borrow ends
+        // before the later thread_state_mut()/&mut guest borrows below.
+        let (sequentialize_threads, virtualize_time, panic_on_unsupported_syscalls) = {
+            let config = guest.config();
+            (
+                config.sequentialize_threads,
+                config.virtualize_time,
+                config.panic_on_unsupported_syscalls,
+            )
+        };
+        if sequentialize_threads && self.cfg.observes_schedevents() {
+            trace_schedevent(
+                guest,
+                with_guest_time(
+                    guest,
+                    SchedEvent::syscall(dettid, call.number(), SyscallPhase::Prehook),
+                ),
+                true,
+            .await;
+        let syscall_cost_ns = syscall_time::cost_ns(call.number());
+        // The backend-runtime bootstrap window. A backend-resident runtime (the
+        // LiteInst preload constructor) issues hundreds to thousands of syscalls
+        // on one thread (315 for a small C program, 6,970 for emacs; see
+        // `syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS`) between its validated
+        // begin trap and the trap that ends its bootstrap: the ready report, or
+        // the report that preparation failed.
+        // Reverie reports that window only for the bootstrapping thread; every
+        // other thread and every forked process sees no window.
+        //
+        // What is withheld: the per-syscall cost below, for the bootstrapping
+        // thread only, for each syscall it makes inside the window that does not
+        // observe virtual time, up to
+        // `syscall_time::MAX_UNCHARGED_BOOTSTRAP_SYSCALLS` per window. That
+        // includes syscalls made by guest code the runtime calls into, such as
+        // an interposed malloc or open64. Charging the runtime's own syscalls
+        // would make guest-visible virtual time (uptime, CLOCK_MONOTONIC, CPU
+        // time) depend on which backend ran the program. Every withheld syscall
+        // is still counted and fully handled below, so Detcore keeps tracking
+        // the fds, mappings and inodes it creates.
+        // What is always charged, inside the window too: syscalls that observe
+        // virtual time (`syscall_time::observes_virtual_time`), so two clock
+        // reads on the bootstrapping thread differ by at least one syscall cost
+        // exactly as outside the window; and every syscall past the cap, so a
+        // loop inside the window, or a runtime that never reports ready, again
+        // advances the clock at each syscall.
+        // When it matters: with a syscall-driven clock (no PMU, or
+        // --max-timeslice=disabled, which Hermit selects when perf counters are
+        // unavailable, or --no-rcb-time) these charges are the thread's only
+        // per-syscall progress, and with sequentialized threads the 500x no-RCB
+        // multiplier makes each one large. With RCB time on a PMU host, retired
+        // branches still advance the thread's clock inside the window and only
+        // the syscall costs are withheld.
+        // The decision depends only on the window the backend reports (opened
+        // and closed by trap instructions the runtime executes), the syscall
+        // number and the count of earlier uncharged syscalls in the same
+        // window: all functions of the guest's own execution. Record/replay and
+        // both --verify runs therefore make the same decisions. The clock is
+        // never reset: the first syscall after the window continues from the
+        // value the window left. See https://github.com/rrnewton/hermit/issues/3338
+        // and https://github.com/rrnewton/hermit/pull/3430#issuecomment-5928691696.
+        // The scheduler turns such a syscall needs are withheld the same way.
+        // Handling an uncharged syscall can still commit scheduler turns (for
+        // example the file resources of a read of /proc/self/maps), and each
+        // committed turn normally advances global time by the per-turn
+        // scheduler cost. While the syscall is being handled the thread is
+        // marked `in_uncharged_bootstrap_syscall`, `tool_global::resource_request`
+        // copies that mark into the request, and the scheduler does not
+        // advance global time for a marked turn unless it is an IO-polling
+        // retry, whose time enforces timeouts. Without this, a LiteInst run of
+        // the clock-trajectory fixture reached its first clock read 11.5 ms of
+        // virtual time later than with it, and each exec added 12.0 ms more
+        // (measured locally), which was enough for its sysinfo uptime to
+        // differ from the ptrace backend's on the hosted runner
+        // (https://github.com/rrnewton/hermit/issues/3517). A charged syscall
+        // (one that observes virtual time, or any past the cap) is not marked,
+        // so its turns advance the clock as everywhere else.
+        let in_backend_runtime_bootstrap = guest.is_backend_runtime_bootstrap();
+        let new_count = {
+            // which results from not being able to borrow guest twice.
+            let thread_state = guest.thread_state_mut();
+            thread_state.stats.count_syscall();
+            // Every intercepted syscall advances logical time, including configurations that do
+            // not serialize threads. This keeps virtual clocks productive during syscall loops.
+            // The one exception is the bootstrap window described above: on the bootstrapping
+            // thread, up to MAX_UNCHARGED_BOOTSTRAP_SYSCALLS syscalls per window that do not
+            // observe virtual time are left uncharged.
+            let charged =
+                thread_state.charge_syscall_time(in_backend_runtime_bootstrap, call.number());
+            if charged {
+                thread_state
+                    .thread_logical_time
+                    .add_syscall_with_cost(syscall_cost_ns);
+            }
+            thread_state.in_uncharged_bootstrap_syscall = !charged;
+            // This only folds the thread's new user and system time into the process total.
+            // An uncharged syscall added none, so it needs no guard.
+            thread_state.account_process_cpu_time();
+            thread_state.stats.syscall_count
+        // Happens-before enforcement checkpoint. When the run carries a
+        // happens-before program and an anchor at exactly
+        // `Position::SyscallCount(new_count)` names this thread (by dettid, or by
+        // a spawn ordinal only the scheduler can resolve), this syscall checks in
+        // with the scheduler at its prehook, carrying this thread's running
+        // syscall count.
+        // The scheduler fires any anchor at that count on this thread and parks
+        // the thread (out of the run queue) when that anchor is the AFTER
+        // endpoint of a Hard edge whose BEFORE endpoint has not fired yet. For
+        // any other (thread, count) the scheduler would find no anchor and do
+        // nothing, so the request is skipped: one scheduler round trip per anchor
+        // the thread reaches rather than per syscall
+        // (https://github.com/rrnewton/hermit/issues/3877), and threads the spec
+        // does not name keep their schedule.
+        // This is the gate that makes an authored partial order reproduce a known
+        // race deterministically (see detcore-model `happens_before`). It
+        // requires sequentialized threads (enforced by the CLI) so the scheduler
+        // owns ordering.
+        // A syscall-occurrence anchor ("the thread's Nth writev to fd 9") is
+        // counted here, in this thread's own counters, once per syscall entry;
+        // the thread checks in only when a call is some such anchor's nth
+        // occurrence, naming the anchors it reached.
+        let hb_checkpoint = if guest.config().happens_before.is_some() {
+            let dettid = guest.thread_state().dettid;
+            let mut counters = std::mem::take(&mut guest.thread_state_mut().stats.hb_occurrences);
+            let program = guest
+                .config()
+                .happens_before
                 .as_ref()
                 .map(|operation| operation.binding()),
         )?;
@@ -7397,7 +7620,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     crate::fifo_peer::forget_guest_made(fifo);
                 }
                 self.note_guest_made_fifo(guest, &call).await;
-            }
             // A read or write that moved bytes through a pipe or FIFO readies the
             // threads polling its other direction (`--pipe-wake-latency`).
             if let Ok(moved) = res
@@ -7405,12 +7627,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 && let Some((fd, wants)) = crate::pipe_wake::progress_of(&call)
             {
                 self.note_fd_readied(guest, fd, wants).await;
-            }
             if crate::fifo_peer::any_orphaned_page() {
                 // Boxed: a rare cleanup, kept out of every syscall's future
                 // (`hot_path_futures_stay_small`).
                 Box::pin(Self::unmap_orphaned_staging_pages(guest)).await;
-            }
 
             // With asynchronous exit completion, a descriptor that would make this
             // guest serve another guest's exit ends the run before anything
@@ -7422,8 +7642,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             if let Ok(ret) = res
                 && let Err(error) =
                     Box::pin(self.refuse_exit_dependencies_in_view(guest, &call, ret)).await
-            {
                 return Box::pin(self.complete_after_posthook(
+        if sequentialize_threads && self.cfg.observes_schedevents() {
+            trace_schedevent(
+                guest,
+                with_guest_time(
                     guest,
                     new_count,
                     Err(error),

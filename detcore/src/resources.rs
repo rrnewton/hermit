@@ -806,7 +806,6 @@ pub struct Resources {
     /// and a coordinator built on either side of this field refuse each other
     /// before any request is decoded because of the global RPC revision in
     /// the configuration fingerprint (revision 8 appended this field).
-    #[serde(default)]
     pub(crate) zero_length_sleep: bool,
 }
 

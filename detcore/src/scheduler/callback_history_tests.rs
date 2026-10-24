@@ -703,7 +703,6 @@ mod callback_history_scheduler_tests {
         ]));
         s
     }
-
     /// `spinner` takes `UNMATCHED_EVENTS_BEFORE_RELEASE` traced events in a
     /// row, none of them the schedule's next, and the replay releases the
     /// schedule at the last (`Replayer::release_schedule`).
@@ -716,8 +715,6 @@ mod callback_history_scheduler_tests {
         assert!(!s.schedule_released());
         assert!(s.consume_schedevent(&spin).keep_running);
         assert!(s.schedule_released());
-    }
-
     /// A thread the replay holds back files a priority request that carries
     /// a callback checkpoint, so it has popped its own copy of the checkpoint
     /// already; the spinner's traced events then release the schedule, and
@@ -756,20 +753,13 @@ mod callback_history_scheduler_tests {
             s.get_priority(a),
             crate::scheduler::runqueue::DEFAULT_PRIORITY,
             "past the release the change point takes the default priority"
-        );
-    }
-
     /// The other half of the same window: a thread that has not heard of the
     /// release yet checks its own copy of a checkpoint at a callback and
     /// reports a mismatch. The scheduler pops its copy of the same checkpoint
     /// and records the DESYNC line. Before, the release had emptied the
     /// scheduler's copy and the report hit the custody assertion.
-    #[test]
     fn a_checkpoint_mismatch_reported_after_a_release_finds_its_checkpoint() {
         use crate::preemptions::callback_history::Checkpoint;
-        let a = tid(3);
-        let b = tid(4);
-        let mut s = replay_waiting_for(a);
         let point = Checkpoint {
             history_index: 0,
             origin: row_origin(20),
@@ -777,22 +767,15 @@ mod callback_history_scheduler_tests {
         s.callback_checkpoints
             .insert(a, std::collections::VecDeque::from([point.clone()]));
         install(&mut s, a, REPLAY_DEFERRED_PRIORITY, Resources::new(a));
-        install(&mut s, b, REPLAY_FOREGROUND_PRIORITY, Resources::new(b));
-        release_by_spinning(&mut s, b);
         let actual = crate::preemptions::callback_history::Origin {
             time: LogicalTime::from_nanos(201),
             ..point.origin.clone()
-        };
         s.callback_checkpoint_mismatch(a, &point, true, &actual);
-        assert!(s.callback_checkpoints[&a].is_empty());
         let text = s
             .generate_partial_run_summary(None)
             .unwrap()
             .desync_descrip
             .unwrap();
-        assert!(
             text.contains("DESYNC callback checkpoint 0 for 3"),
             "{text}"
-        );
-    }
 }

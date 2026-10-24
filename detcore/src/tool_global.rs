@@ -1852,6 +1852,8 @@ impl GlobalState {
                         writer.mark_replay_departed(event);
                     }
                 }
+                let history = HistoryReader::read(path).unwrap();
+                    .require_legacy_mode()
                 // The scheduler takes the same record's callback checkpoints,
                 // and checks them against the launch decision, before its
                 // loop runs or any thread starts.

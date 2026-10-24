@@ -222,6 +222,83 @@ pub fn refuse_unqualified_annotated_launch(
     }
 }
 
+/// A named, pre-guest refusal of a configuration that cannot replay a
+/// callback-annotated priority history (`Config::annotated_priority_replay`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnqualifiedAnnotatedReplay {
+    /// The selected backend for a command line; `None` for a library launch,
+    /// whose configuration is judged on the capabilities it carries.
+    backend: Option<Backend>,
+    setting: &'static str,
+}
+
+impl std::fmt::Display for UnqualifiedAnnotatedReplay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE: --replay-preemptions-from names a record \
+             with callback checkpoints, which replay only with precise PMU preemption timer \
+             events; "
+        )?;
+        match self.backend {
+            Some(backend) => write!(f, "--backend={} {}", backend.as_str(), self.setting)?,
+            None => write!(f, "the launch configuration {}", self.setting)?,
+        }
+        write!(f, "; the guest has not started")
+    }
+}
+
+impl std::error::Error for UnqualifiedAnnotatedReplay {}
+
+/// Refuse to replay a callback-annotated priority history where its row ends
+/// cannot be honored: they are actual callback endpoints at exact RCB counts,
+/// guarded one RCB past each. The requirements are
+/// `Config::annotated_priority_replay_unqualified`'s, judged here on the
+/// command line's configuration with the selected backend's capabilities, so
+/// the refusal comes before input is read and names the backend. Without
+/// them a replay would neither reach nor bound those endpoints, and silently
+/// falling back to the legacy expiry would replay the wrong schedule. A
+/// record without checkpoints keeps its existing admission; this check never
+/// rewrites the configuration.
+pub fn refuse_unqualified_annotated_replay(
+    config: &Config,
+    backend: Backend,
+) -> Result<(), UnqualifiedAnnotatedReplay> {
+    let effective = Config {
+        backend: crate::backend_capabilities(backend),
+        ..config.clone()
+    };
+    match effective.annotated_priority_replay_unqualified() {
+        None => Ok(()),
+        Some(setting) => Err(UnqualifiedAnnotatedReplay {
+            backend: Some(backend),
+            setting,
+        }),
+    }
+}
+
+/// The library launches' backstop for the same requirements, on the
+/// prepared configuration a backend is about to run: a library caller passes
+/// no command line, and its configuration reaches here unqualified. An
+/// annotated configuration must meet `annotated_priority_replay_unqualified`
+/// on the capabilities it carries. Its record is not reread here: Detcore
+/// refuses a record whose checkpoints disagree with the flag before any
+/// thread starts. Nothing is changed or forced.
+pub fn refuse_unqualified_annotated_launch(
+    config: &Config,
+) -> Result<(), UnqualifiedAnnotatedReplay> {
+    if !config.annotated_priority_replay {
+        return Ok(());
+    }
+    match config.annotated_priority_replay_unqualified() {
+        None => Ok(()),
+        Some(setting) => Err(UnqualifiedAnnotatedReplay {
+            backend: None,
+            setting,
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::Parser;
@@ -461,10 +538,7 @@ mod tests {
                 )),
                 "{message}"
             );
-            assert!(
                 message.ends_with("; the guest has not started"),
-                "{message}"
-            );
             assert_eq!(serde_json::to_value(&config).unwrap(), before);
             refuse_unsupported_preemption(&config, Backend::Ptrace, true, false).unwrap();
             refuse_unsupported_preemption(&config, Backend::E9patch, true, false).unwrap();
@@ -483,7 +557,6 @@ mod tests {
     /// Every other timer request runs on KVM, as on ptrace: an explicit or
     /// replayed maximum, imprecise timers, interrupt points, an overshoot
     /// panic, a skid margin, preemption-point replay and a chaos range.
-    #[test]
     fn kvm_accepts_every_timer_request_but_the_stack_traces() {
         for args in [
             vec!["--max-timeslice=1000"],
@@ -493,14 +566,9 @@ mod tests {
             vec!["--panic-on-rcb-overshoot"],
             vec!["--replay-preemptions-from=unused"],
             vec!["--chaos", "--chaos-timeslice-range=1000..2000"],
-        ] {
             let config = Config::parse_from(["detcore"].into_iter().chain(args.iter().copied()));
             if let Err(error) = refuse_unsupported_preemption(&config, Backend::Kvm, true, true) {
                 panic!("{args:?}: {error}");
-            }
-        }
-    }
-
     #[test]
     fn cooperative_and_boundary_event_settings_do_not_require_a_timer() {
         for disabled in [

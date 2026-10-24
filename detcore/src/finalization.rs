@@ -59,7 +59,6 @@ impl ReplayDepartureError {
     pub fn summary(&self) -> Option<&detcore_model::replay_departure::Summary> {
         self.summary.as_ref()
     }
-
     /// Find the authoritative departure cause, including Reverie's transparent
     /// Tool wrapper. Secondary finalization observations never reclassify the
     /// operation's primary failure.
@@ -69,16 +68,12 @@ impl ReplayDepartureError {
         }
         if let Some(departure) = error.downcast_ref::<Self>() {
             return Some(departure);
-        }
         error
             .chain()
             .find_map(|cause| match cause.downcast_ref::<reverie::Error>() {
                 Some(reverie::Error::Tool(inner)) => Self::in_error(inner),
                 _ => None,
             })
-    }
-}
-
 impl fmt::Display for ReplayDepartureError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("HERMIT_REPLAY_DEPARTURE: ")?;
@@ -89,19 +84,10 @@ impl fmt::Display for ReplayDepartureError {
                 "{} nonadvancing change-point detection(s); first {:?} in thread {} at {}, preceding {}; ",
                 summary.count, first.source, first.thread, first.observed, first.previous
             )?;
-        }
         if let Some((thread, reason)) = &self.publication_refusal {
-            write!(
-                f,
                 "finding publication from thread {thread} refused ({reason:?}); "
-            )?;
-        }
         f.write_str("refusing faithful replay completion")
-    }
-}
-
 impl std::error::Error for ReplayDepartureError {}
-
 /// An earlier error plus a later finalization failure. Only the primary is in
 /// the cause chain: a secondary policy refusal must not reclassify an I/O or
 /// backend failure. Both full diagnostics remain available through Display.

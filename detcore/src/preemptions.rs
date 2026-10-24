@@ -3071,11 +3071,8 @@ pub fn expired_wait_charge_mismatch(
                 recorded.as_str()
             )
         } else {
-            format!(
                 "Replay with --expired-wait-charge={}, or leave the option out to take the \
                  record's.",
-                recorded.as_str()
-            )
         };
         format!(
             "{source} was recorded with --expired-wait-charge={} and would be replayed with \
@@ -3086,21 +3083,14 @@ pub fn expired_wait_charge_mismatch(
             replay.as_str(),
         )
     })
-}
-
 /// Read only the timeslice a preemption record file states its run drew under
 /// `--chaos-timeslice-draw=run` (`PreemptionRecord::chaos_timeslice`), as
 /// [`read_recorded_epoch`] reads the epoch. `Ok(None)` for a record without
 /// one.
 pub fn read_recorded_chaos_timeslice(path: &Path) -> Result<Option<u64>, String> {
-    #[derive(Deserialize)]
     struct TimesliceOnly {
-        #[serde(default)]
         chaos_timeslice: Option<u64>,
-    }
     Ok(boundary_recording::read_settings::<TimesliceOnly>(path)?.chaos_timeslice)
-}
-
 /// The `--max-timeslice` a chaos run with `--chaos-timeslice-draw=run` draws:
 /// log-uniform over `range`, both bounds included, as a pure function of the
 /// scheduler seed. A stream of its own (`CHAOS_TIMESLICE_SALT`) keeps it
@@ -3117,8 +3107,6 @@ pub fn draw_chaos_timeslice(
     let drawn = range.log_uniform(prng.random::<f64>()).round() as u64;
     std::num::NonZeroU64::new(drawn.clamp(range.min.get(), range.max.get()))
         .expect("the range starts at one RCB")
-}
-
 /// The refusal of a replay whose signal-state copy setting differs from the
 /// one a record stores, naming the record by `source` (an option and a path),
 /// or `None` when they agree or the record does not say.

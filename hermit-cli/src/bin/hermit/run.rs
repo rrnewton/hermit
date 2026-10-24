@@ -9270,7 +9270,6 @@ impl RunOpts {
             ) {
                 return Err(Error::new(PolicyRefusal).context(refusal));
             }
-        }
         Ok(())
     }
 
@@ -9281,29 +9280,10 @@ impl RunOpts {
     /// namespace: `--no-namespace` does not take either replay option.
     fn refuse_replay_under_other_guest_ids(&self) -> Result<(), Error> {
         if self.namespace_only || self.no_namespace {
-            return Ok(());
-        }
-        let config = &self.det_opts.det_config;
-        for (option, path) in [
-            ("--replay-preemptions-from", &config.replay_preemptions_from),
-            ("--replay-schedule-from", &config.replay_schedule_from),
-        ] {
-            let Some(path) = path else {
-                continue;
-            };
             let recorded =
                 detcore::preemptions::read_recorded_guest_ids(path).map_err(Error::msg)?;
             if let Some(refusal) = detcore::preemptions::guest_ids_mismatch(
-                &format!("{option} {}", path.display()),
-                recorded,
                 detcore::GuestIds::Namespace,
-            ) {
-                return Err(Error::new(PolicyRefusal).context(refusal));
-            }
-        }
-        Ok(())
-    }
-
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
     /// Used by `hermit oci run`, which resolves the user's reference to the

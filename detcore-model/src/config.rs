@@ -3630,6 +3630,7 @@ mod legacy_backend_json {
     /// `standard_stream_aliases` came after it too, and is set only for KVM;
     /// it is never written and reads as unset.
     const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 46] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 26] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4177,6 +4178,7 @@ mod legacy_backend_json {
                 | "access_trace_max_records"
                 | "access_trace_max_bytes" => Ok(()),
                 "replay_continue_fairly" => Ok(()),
+                | "annotated_priority_replay" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -5090,6 +5092,7 @@ mod tests {
                 | "access_trace_max_records"
                 | "access_trace_max_bytes" => {}
                 "replay_continue_fairly" => {}
+                | "annotated_priority_replay" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -5129,6 +5132,11 @@ mod tests {
         // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
         assert_eq!(fields.len(), keys.len() + 31);
+        // `mountinfo_mount_namespace`, `signal_delivery_check_fatal`,
+        // `annotated_priority_replay` and `strict_schedule_boundaries` none:
+        // fourteen more keys and twenty-five fewer, so eleven keys fewer than
+        // fields.
+        assert_eq!(fields.len(), keys.len() + 11);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:

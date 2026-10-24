@@ -1204,7 +1204,6 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-dbt's
     // tests::startup_refuses_another_trees_coordinator_before_reading_its_frame
     // (the DBT runtime checks the coordinator's fingerprint): 1866, listed.
-    // And detcore-model's
     // syscall_histogram::tests::the_finished_form_keeps_only_nonzero_slots_and_sums_back_exactly
     // (finished threads keep sparse histograms): 1867, listed.
     // --virtual-cpus: config's virtual_cpus_never_enter_the_legacy_form and
@@ -1249,6 +1248,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The typedlog module adds four units: 1961 + 4 = 1965, measured
     // in the full validate at 508bd6faea (1965 passed).
     ("test.regular_crates", 1965),
+    // Callback-annotated priority replay (https://github.com/rrnewton/hermit/issues/4082): three detcore-model config
+    // tests and hermit-verify priority_histories_must_agree_exactly: 1846, listed.
+    // And the four replay_modes chaos-replay print_*nanosleep*_race cases no
+    // longer ignored (https://github.com/rrnewton/hermit/pull/4657): 1850, listed.
+    // Both histories combined on main a21f47d1 with c36b658e: 1852, listed.
+    ("test.regular_crates", 1852),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1943,6 +1948,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // forced-gate rows fail only for want of a locally built liteinst
     // runtime, which the validate builds; they pass there).
     ("test.hermit_unit", 1329),
+    // Callback-annotated priority replay (https://github.com/rrnewton/hermit/issues/4082): two preemption_admission
+    // admission tests: 1098, listed.
+    // Both histories combined on main a21f47d1 with c36b658e: 1093, listed.
+    ("test.hermit_unit", 1093),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2997,15 +3006,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // rt_sigaction's rule (iii), phase 1's refusal of temporary-mask calls):
     // 2543, listed.
     // And 3c.1d-i review round 1's two
-    // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
     // units (the parked rt_sigsuspend publishes the mask Linux installs; a
     // caught end of a temporary-mask wait is the named refusal): 2545, listed.
     // And 3c.1d-i review round 3's one
-    // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
     // unit (a removal with no scratch stack is Hermit's own failure): 2546,
     // listed.
     // And A5 step 3c.1d-ii's ten
-    // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
     // units (the staged zero-timeout pselect6 rows, pselect6 with more than 64
     // descriptors, each select form under its mask (IR-9), the masked ppoll
     // rows, the masked epoll_pwait rows with D37's exception (IR-3, IR-7),
@@ -3013,18 +3019,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // IR-7 rows (A) and (B) for pselect6 and ppoll, D41 at a masked form's
     // entry): 2556, listed.
     // And 3c.1d-ii review round 1's four
-    // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
     // units (an invalid masked call meets D41 only under the own mask, every
     // masked wait publishes the mask Linux installs, an unreadable pselect6
     // argument is EFAULT only where Linux faults, the sets read before the
     // more-than-1024 refusal): 2560, listed.
     // And 3c.1d-ii review round 2's two
-    // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
     // units (a masked wait ready at its first probe still yields once; a
     // masked ppoll on a tight stack gets the kernel's answer first): 2562,
-    // listed.
     // And 3c.1d-ii review round 3's four units: the
-    // tool_global::tests::gated_wait_turn_tests::temporary_mask_turn_tests
     // units (a signal sent during a hand-off before the first check is not an
     // entry instance; a zero-timeout masked pselect6 on a tight stack gets the
     // kernel's answer; a staged pselect6's private timeout avoids sets in the
@@ -3075,7 +3077,6 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_clone_publishes_the_creators_current_mask_before_its_child_is_seeded
     // and guest_mask_publication_tests'
     // rejoins_and_withdrawals_decide_the_mark_a_child_is_seeded_from: 2603,
-    // listed.
     // And the capability slice 5 scheduler units
     // a_continuation_without_a_child_past_its_valve_refuses_the_run_and_stays
     // and a_vfork_child_torn_down_before_registering_ends_the_barrier_at_continuation:
@@ -3092,7 +3093,6 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // addresses, only changed cookies written, and a write-only destination)
     // and config's two units for the global RPC revision in the runtimes'
     // fingerprint (https://github.com/rrnewton/hermit/issues/4765): 2622,
-    // listed.
     // And package K slice F1's nineteen units: procfs::fd_directory's nine
     // (the own directories classified, the entries at Linux positions, the
     // end at the table's capacity, a leader without a table, the capacity's
@@ -3103,7 +3103,6 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // without opening anything, the respelled operands) and tool_local's
     // four (the descriptor capacity, an unmodelled descriptor, a failed
     // dup's growth, an unmodelled descriptor's close-on-exec changes): 2641,
-    // listed.
     // And package K slice E1's five units: syscalls::namespace::own_links's
     // three (the own links of every spelling, the working directory getcwd
     // gives, a target d_path cannot hold) and exec_record's two
@@ -3135,7 +3134,6 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Fixed 0.5.4 rebase recount also retains the priority-history regressions.
     // And A5 slice 3c.1e B's unit: threads' disposition_mask_tests::
     // a_gated_managed_wait_reads_the_guest_mask_without_replacing_it: 2682,
-    // listed.
     // And syscalls::inotify's nine units for a read that faults (the cookies
     // found depend only on where the copy ended, only a rename cookie is cut,
     // a cookie before the fault is whole, the copy ends at the first page the
@@ -3204,6 +3202,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // re-measured at this landing by cargo nextest run -p hermit-detcore
     // --lib (3348 passed): 3321 + 27 = 3348.
     ("test.detcore_unit", 3348),
+    // Callback-annotated priority replay (https://github.com/rrnewton/hermit/issues/4082): five callback_history
+    // decision tests, six scheduler custody/admission tests and the retained
+    // row-1 fixture: 2541, listed.
+    // And the two no-identity and custody overshot-refusal tests (https://github.com/rrnewton/hermit/pull/4657):
+    ("test.detcore_unit", 2543),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4558,6 +4561,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // N3 adds twelve cli cases, measured at its base (763 + 12 = 775 in
     // its tight loop): 764 + 12 = 776.
     ("test.cli", 776),
+    // verify_print_verify_logs_echoes_a_refused_first_runs_log (https://github.com/rrnewton/hermit/pull/4638)
+    // landed without its pin, so 606 already ran 607. And the CLI and library
+    // unqualified-mode refusal tests of callback-annotated priority replay
+    // (https://github.com/rrnewton/hermit/issues/4082): 609, listed.
+    // Both histories combined on main a21f47d1 with c36b658e: 611, listed.
+    ("test.cli", 611),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5177,6 +5186,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
     // The same four typedlog units: 1947 + 4 = 1951 (carried).
     ("test.regular_crates_on_host", 1951),
+    // The same unpinned verify test (https://github.com/rrnewton/hermit/pull/4638), not excluded: 526. And the same
+    // two unqualified-mode refusal tests (https://github.com/rrnewton/hermit/issues/4082), outside every hosted
+    // exclusion: 528, listed.
+    // Both histories combined on main a21f47d1 with c36b658e: 530, listed.
+    ("test.cli_on_host", 530),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5703,6 +5717,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same recount at 4e916633ca as test.detcore_unit: 3279 + 42 = 3321.
     // The same twenty-seven N3 detcore units: 3321 + 27 = 3348.
     ("test.detcore_unit_on_host", 3348),
+    // And the same twelve priority-replay units (https://github.com/rrnewton/hermit/issues/4082): 2541, listed.
+    // And the same two overshot-refusal tests (https://github.com/rrnewton/hermit/pull/4657): 2543, listed.
+    ("test.detcore_unit_on_host", 2543),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6110,6 +6127,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1319 + 4 = 1323 (carried: the hosted lane did not run here; the
     // portable twin executed 1329 in the targeted rerun).
     ("test.hermit_unit_on_host", 1323),
+    // And the same two admission tests (https://github.com/rrnewton/hermit/issues/4082): 1098, listed.
+    // Both histories combined on main a21f47d1 with c36b658e: 1093, listed.
+    ("test.hermit_unit_on_host", 1093),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6342,6 +6362,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two composite-verdict units: 1961 - 14 = 1947.
     // The same four typedlog units, none hosted-excluded: 1965 - 14 = 1951.
     ("test.regular_crates_on_host", 1951),
+    // And the same four priority-replay tests (https://github.com/rrnewton/hermit/issues/4082); hosted exclusions
+    // unchanged: 1832, listed.
+    // And the same four no-longer-ignored chaos-replay cases (https://github.com/rrnewton/hermit/pull/4657), outside
+    // the hosted exclusions: 1836, listed.
+    // Both histories combined on main a21f47d1 with c36b658e: 1838, listed.
+    ("test.regular_crates_on_host", 1838),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

@@ -8724,8 +8724,6 @@ impl<T> ThreadState<T> {
     /// thread now: the configured clock multiplier times its chaos slowdown.
     pub(crate) fn clock_multiplier(&self, cfg: &Config) -> f64 {
         cfg.clock_multiplier.unwrap_or(1.0) * self.rcb_time_multiplier().as_f64()
-    }
-
     /// Files a priority change point at `time` in a preemption replay, or
     /// returns the thread's last one when `time` is not after it.
     ///
@@ -8752,11 +8750,8 @@ impl<T> ThreadState<T> {
         }
         if let Some(last) = self.last_replay_change_point.filter(|last| time <= *last) {
             return Err(last);
-        }
         self.last_replay_change_point = Some(time);
         Ok(())
-    }
-
     /// Runs the rest of a preemption replay's thread as its final slice: no
     /// recorded end governs it any more, and only the run's own PMU maximum
     /// (if any) bounds its slices, as when the record runs out. For a thread
@@ -8772,8 +8767,6 @@ impl<T> ThreadState<T> {
             .map(|max_timeslice| now + Duration::from_nanos(u64::from(max_timeslice)));
         self.last_rcb_timer = None;
         self.last_rcb_timer_is_max = false;
-    }
-
     /// Whether this thread has consumed its current logical timeslice.
     pub(crate) fn timeslice_expired(&self) -> bool {
         if let Some(replay_rcb_end) = self.replay_rcb_end {
