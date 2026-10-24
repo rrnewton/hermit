@@ -63,6 +63,12 @@ pub enum FailureKind {
     /// Carried so the parent can record the verification run as failed by its
     /// backend instead of leaving the pending no-result stamp.
     BackendRunFailure,
+    /// The GUEST deadlocked ([`crate::GuestDeadlocked`]): a guest outcome, not
+    /// a failure. Carried for the reason `RunTimeout` is: the child reports it
+    /// through this channel, after the run was unwound and finished, rather
+    /// than through the `HERMIT_GUEST_DEADLOCK_EXIT` status it exits with when
+    /// its backend cannot unwind the guest.
+    GuestDeadlock,
 }
 
 /// ⚠️ THE `kind` FIELD IS THE THIRD AND LAST OF ONE CHAIN OF FLATTENINGS.
@@ -172,6 +178,11 @@ fn is_policy_refusal(err: &Error) -> bool {
 /// cleanup observations are deliberately unreachable from this function.
 pub(crate) fn classify_ptrace_primary(error: &reverie::Error) -> FailureKind {
     match error {
+        // A guest deadlock completes as the guest's outcome only when its
+        // teardown was clean (`ptrace_completion::is_guest_deadlock`). Left as
+        // the primary of a failed run, the teardown failed or never
+        // confirmed, which is Hermit's failure.
+        reverie::Error::Tool(inner) if inner.is::<crate::GuestDeadlocked>() => FailureKind::Error,
         reverie::Error::Tool(inner) => classify_unwrapped(inner),
         _ => FailureKind::Error,
     }
@@ -228,6 +239,8 @@ fn classify_unwrapped(error: &Error) -> FailureKind {
         FailureKind::PolicyRefusal
     } else if error.downcast_ref::<crate::GuestTimedOut>().is_some() {
         FailureKind::RunTimeout
+    } else if error.downcast_ref::<crate::GuestDeadlocked>().is_some() {
+        FailureKind::GuestDeadlock
     } else if error.downcast_ref::<crate::BackendRunFailure>().is_some() {
         FailureKind::BackendRunFailure
     } else {
@@ -354,6 +367,10 @@ mod tests {
             (
                 Error::new(crate::BackendRunFailure),
                 FailureKind::BackendRunFailure,
+            ),
+            (
+                Error::new(crate::GuestDeadlocked::new(None)),
+                FailureKind::GuestDeadlock,
             ),
             (
                 Error::new(crate::SkidOvershootError::new(2)),
@@ -497,6 +514,18 @@ mod tests {
             "{}",
             serialized.error
         );
+    }
+
+    /// A finished run's guest deadlock is the guest's outcome; one left as the
+    /// primary of a failed ptrace run (its teardown failed or never confirmed)
+    /// is Hermit's failure, so the unclean teardown is not reported as the
+    /// guest's.
+    #[test]
+    fn a_guest_deadlock_is_the_guests_outcome_only_once_the_run_finished() {
+        let finished = SerializableError::from(Error::new(crate::GuestDeadlocked::new(None)));
+        assert_eq!(finished.kind(), FailureKind::GuestDeadlock);
+        let primary = reverie::Error::Tool(Error::new(crate::GuestDeadlocked::new(None)));
+        assert_eq!(classify_ptrace_primary(&primary), FailureKind::Error);
     }
 
     /// An in-guest-trap refusal names that backend and keeps the same class.

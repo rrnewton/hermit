@@ -1259,6 +1259,7 @@ impl DbtVerification {
             output: dbt_verification_output(output),
             skid_overshoots: 0,
             latches: dbt_run_latches(&evidence),
+            guest_deadlock: false,
             dbt: Some(DbtRunCompletion {
                 stats,
                 initialization_records: evidence.initialization_records(),
@@ -1456,6 +1457,7 @@ fn dbt_verify_run(
                     status: verify_run::recorded_status(output.status),
                     skid_overshoots: 0,
                     forwarded_syscalls: None,
+                    guest_deadlock: false,
                 },
                 Some(verify_run::DbtRunRecord {
                     initialization_records: evidence.initialization_records() as u64,
@@ -3102,6 +3104,7 @@ mod tests {
                             determinism_loss: loss.map(str::to_owned),
                             log_sink_failure: None,
                         },
+                        guest_deadlock: false,
                         dbt: Some(DbtRunCompletion {
                             stats: DbtStatsSink::new()?,
                             initialization_records: 1,
@@ -3178,6 +3181,7 @@ mod tests {
                     },
                     skid_overshoots: 0,
                     latches: super::super::run::RunLatches::default(),
+                    guest_deadlock: false,
                     dbt: Some(DbtRunCompletion {
                         stats,
                         initialization_records: 1,

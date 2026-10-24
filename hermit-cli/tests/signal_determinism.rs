@@ -568,7 +568,7 @@ fn sigsuspend_without_signal_reports_terminal_deadlock() {
         );
         assert_eq!(
             output.status.code(),
-            Some(HERMIT_INTERNAL_FAILURE_EXIT),
+            Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
             "{label} did not exit with the scheduler deadlock status in {elapsed:?}\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
@@ -582,6 +582,7 @@ fn sigsuspend_without_signal_reports_terminal_deadlock() {
             "Deadlock detected: thread(s) waiting in rt_sigsuspend with no possible signal, but no runnable threads left.",
             "external IO blockers: none",
             "rt_sigsuspend blockers (1), by dettid:",
+            "HERMIT_GUEST_DEADLOCK class=guest-deadlock",
         ] {
             assert!(
                 stderr.contains(expected),
