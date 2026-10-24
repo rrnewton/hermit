@@ -3554,12 +3554,18 @@ fn sanitize_status_held(
             normalized.extend_from_slice(PPID);
             normalized.extend_from_slice(format!("\t{virtual_ppid}").as_bytes());
         } else if body.starts_with(TRACER_PID) {
+            // No guest task has a tracer the guest could know of: Detcore
+            // refuses `ptrace` to every guest
+            // (`is_privileged_observation_refused_syscall`), and the backend's
+            // own tracer (under ptrace, Hermit's container init, pid 1 in the
+            // guest's pid namespace) is not the guest's debugger. Linux shows 0
+            // for a task with no tracer (`task_state`, fs/proc/array.c,
+            // lines 156, 163-165 and 188 at v6.16), which is what the program
+            // reads natively. Showing the tracer sent programs that look for a
+            // debugger down their debugger path: a death test's assertion then
+            // raised SIGTRAP to break into it instead of aborting.
             normalized.extend_from_slice(TRACER_PID);
-            normalized.extend_from_slice(if virtual_identity.is_some() {
-                b"\t1"
-            } else {
-                b"\t0"
-            });
+            normalized.extend_from_slice(b"\t0");
         } else if body.starts_with(NS_PGID) || body.starts_with(NS_SID) {
             let label = body.split(|byte| *byte == b':').next().unwrap_or_default();
             normalized.extend_from_slice(label);
@@ -7470,8 +7476,27 @@ Rss:                   4 kB\n" as &[u8];
         let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nVmHWM:\t1572 kB\nVmRSS:\t1568 kB\nRssFile:\t1452 kB\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nMems_allowed:\t00000000,00000003\nMems_allowed_list:\t0-1\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
         assert_eq!(
             sanitize_status(input, Some((3, 3, 1)), None, false),
-            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t1\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nMems_allowed:\t00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
+            b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t0\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nMems_allowed:\t00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
         );
+    }
+
+    /// A status shows no tracer, as Linux does for a task nobody traces,
+    /// whatever the kernel reports for the backend's own tracer and whether
+    /// the status is the reader's own (a virtual identity) or another task's.
+    #[test]
+    fn status_shows_no_tracer() {
+        for kernel_tracer in ["0", "1", "4242"] {
+            let input = format!("Name:\tcat\nPid:\t1234\nTracerPid:\t{kernel_tracer}\n");
+            for identity in [Some((3, 3, 1)), None] {
+                let output =
+                    String::from_utf8(sanitize_status(input.as_bytes(), identity, None, false))
+                        .unwrap();
+                assert!(
+                    output.contains("\nTracerPid:\t0\n"),
+                    "kernel TracerPid {kernel_tracer}, identity {identity:?}: {output:?}"
+                );
+            }
+        }
     }
 
     #[test]
