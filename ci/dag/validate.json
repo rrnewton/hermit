@@ -70265,7 +70265,7 @@
       "networkonly": false,
       "engine_only": false,
       "timeout": 1800,
-      "cpu_timeout": 3900,
+      "cpu_timeout": 6000,
       "jobs_flag": "",
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
