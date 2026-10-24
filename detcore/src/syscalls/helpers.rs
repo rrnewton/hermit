@@ -2400,6 +2400,10 @@ where
 /// the handler's other syscalls and resumes it from any address; Detcore does
 /// not, so a `restart_syscall` after another syscall or at another address takes
 /// the unsupported-syscall policy.
+///
+/// A wait that Detcore ran in the kernel as the guest made it keeps a record
+/// too, holding no deadline: its `restart_syscall` then goes to the kernel,
+/// whose restart block describes the wait (`RestartCall::InKernel`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RestartBlock {
     /// The instruction pointer at the interrupted call's syscall stop: the address
@@ -2505,6 +2509,64 @@ pub(crate) enum RestartCall {
     /// A relative `nanosleep` or `clock_nanosleep` that ended for a claimed
     /// `SIGCHLD` (`syscalls::signal::SleepSignal::Claimed`).
     Nanosleep(reverie::syscalls::family::NanosleepFamily),
+    /// A timed wait that Detcore ran in the kernel as the guest made it, which
+    /// the kernel's own restart block describes (`inject_keeping_kernel_restart`):
+    /// a sleep or futex wait without sequentialized threads. Its
+    /// `restart_syscall` goes to the kernel, which resumes the wait until the
+    /// end it kept.
+    InKernel(Sysno),
+}
+
+/// Injects `call`, which the kernel runs as the guest made it, and keeps a
+/// record for the kernel's restart when a signal ends it with
+/// `ERESTART_RESTARTBLOCK` (`RestartCall::InKernel`). Linux then restarts the
+/// wait through `restart_syscall` with the end time it stored in the thread's
+/// restart block (`hrtimer_nanosleep_restart`, `futex_wait_restart`), and that
+/// block is the one this call left: nothing else Detcore runs for the thread
+/// before the restart sets or resets it.
+pub(crate) async fn inject_keeping_kernel_restart<T, G, S>(
+    guest: &mut G,
+    call: S,
+) -> Result<i64, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+    S: SyscallInfo,
+{
+    let sysno = call.number();
+    let result = guest.inject(call).await.map_err(Error::from);
+    keep_restart_block(guest, &result, RestartCall::InKernel(sysno), None).await;
+    result
+}
+
+/// The kernel's restart of a wait Detcore ran in the kernel
+/// (`RestartCall::InKernel`): `restart_syscall` itself, which resumes the wait
+/// from the thread's restart block. A signal that ends the resumed wait
+/// leaves `ERESTART_RESTARTBLOCK` and the block again, so the record is kept
+/// again. A signal that stops the injected call before it runs leaves the
+/// block unused; the result is then the same `ERESTART_RESTARTBLOCK`, never
+/// the `ERESTARTSYS` the backend reports, which would make the kernel rerun
+/// `restart_syscall` without a record (`resumed_kernel_wait_result`).
+pub(crate) async fn resume_kernel_wait<T, G>(
+    guest: &mut G,
+    restart: Syscall,
+    sysno: Sysno,
+) -> Result<i64, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let result = resumed_kernel_wait_result(guest.inject(restart).await).map_err(Error::from);
+    keep_restart_block(guest, &result, RestartCall::InKernel(sysno), None).await;
+    result
+}
+
+/// The result of an injected `restart_syscall` (`resume_kernel_wait`).
+fn resumed_kernel_wait_result(result: Result<i64, Errno>) -> Result<i64, Errno> {
+    match result {
+        Err(Errno::ERESTARTSYS) => Err(Errno::ERESTART_RESTARTBLOCK),
+        other => other,
+    }
 }
 
 /// Where the timeout of a `poll` Detcore runs in the kernel ends
@@ -6430,6 +6492,26 @@ mod tests {
             for signal in [libc::SIGUSR1, libc::SIGSTOP] {
                 assert_eq!(held_signal_restart_errno(errno, signal), errno);
             }
+        }
+    }
+
+    #[test]
+    fn resumed_kernel_wait_result_maps_only_erestartsys() {
+        // The backend's code for a signal that stopped the injected restart
+        // before it ran; the kernel's restart block is still in place.
+        assert_eq!(
+            resumed_kernel_wait_result(Err(Errno::ERESTARTSYS)),
+            Err(Errno::ERESTART_RESTARTBLOCK)
+        );
+        // Every other result is the restarted wait's own.
+        for result in [
+            Ok(0),
+            Err(Errno::ERESTART_RESTARTBLOCK),
+            Err(Errno::EINTR),
+            Err(Errno::ETIMEDOUT),
+            Err(Errno::EAGAIN),
+        ] {
+            assert_eq!(resumed_kernel_wait_result(result), result);
         }
     }
 

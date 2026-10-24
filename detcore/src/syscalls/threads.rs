@@ -3004,7 +3004,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Error::Errno(Errno::EINVAL));
         }
         if !self.cfg.sequentialize_threads {
-            return Ok(guest.inject(call).await?);
+            return crate::syscalls::helpers::inject_keeping_kernel_restart(guest, call).await;
         }
         let polling = match self.cfg.debug_futex_mode {
             BlockingMode::External => {
