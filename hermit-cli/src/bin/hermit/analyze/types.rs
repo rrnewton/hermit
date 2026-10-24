@@ -8,8 +8,10 @@
 
 //! A mode for analyzing a hermit run.
 
+use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
 
 use clap::Parser;
 use regex::Regex;
@@ -84,6 +86,28 @@ pub struct AnalyzeOpts {
         conflicts_with = "run2_schedule"
     )]
     pub minimize: bool,
+
+    /// Search within the target run's schedule instead of between it and a baseline run.
+    ///
+    /// Each trial replays the first K events of the target schedule and then lets the
+    /// scheduler continue without chaos. Replaying none of it gives the baseline outcome and
+    /// replaying all of it the target outcome; a binary search finds the K at which the
+    /// outcome flips. Event #K is the scheduling decision that commits the run to the target:
+    /// the report shows the stack of the thread the target schedule runs there and of the
+    /// thread the scheduler would run instead.
+    ///
+    /// Unlike the default search, it needs no baseline schedule, so events that only one of
+    /// two unrelated runs executed (timeslices that end at other points, iterations of a
+    /// polling loop) cannot stop it. It takes about log2(schedule length) trials.
+    #[clap(
+        long,
+        conflicts_with = "minimize",
+        conflicts_with = "run2_seed",
+        conflicts_with = "run2_preemptions",
+        conflicts_with = "run2_schedule",
+        conflicts_with = "run_needleman"
+    )]
+    pub prefix_search: bool,
 
     /// Use `--imprecise-timers` during the (chaos) search phase. Only has an effect if search is
     /// enabled.
@@ -175,11 +199,34 @@ pub struct AnalyzeOpts {
     #[clap(long, short, value_name = "EVTCNT", default_value = "5")]
     pub execution_context: usize,
 
-    /// Where the analysis run will store its temporary artifacts.
+    /// Directory under which the analysis creates its workspace of temporary artifacts
+    /// (schedules, logs, reports of every run), created if missing.
     ///
-    /// By default this is a directory in `/tmp`
+    /// By default the workspace is a directory in `/tmp`
     #[clap(long, value_name = "PATH")]
     pub tmp_dir: Option<PathBuf>,
+
+    /// Wall-clock bound, in seconds, on each run after the target run: `auto` (the default), a
+    /// number of seconds, or `off`.
+    ///
+    /// A replayed or spliced schedule can leave the guest spinning, or waiting for an event that
+    /// never comes. The endpoint runs are measured: the target run (or, with
+    /// `--run1-preemptions`, the first replay of its record) and the baseline run (from
+    /// `--run2-seed`, `--run2-preemptions`, or the run without chaos). With `auto`, every run
+    /// after the first measured one is bounded at max(60 s, 10 times the slowest endpoint run so
+    /// far), the baseline run included. A trial that reaches the bound did not reach the target:
+    /// it counts as the baseline condition, as a trial that a `--timeout` in the run arguments
+    /// ends does. A baseline run that reaches it gives no baseline, so analyze searches within
+    /// the target schedule instead (as `--prefix-search` does). A `--timeout` in the run
+    /// arguments still bounds every run, and wins where it is shorter. The bound needs a backend
+    /// on which `hermit run --timeout` is qualified; elsewhere `auto` gives none, and an
+    /// explicit number is refused.
+    ///
+    /// While trials are bounded, the log file a trial writes under `--verbose` or `--selfcheck`
+    /// is capped too, at max(64 MiB, 10 times the largest endpoint log) and within
+    /// HERMIT_LOG_MAX_BYTES (0 there lifts both caps); `off` lifts it as well.
+    #[clap(long, value_name = "SECONDS|auto|off", default_value = "auto")]
+    pub trial_timeout: TrialTimeout,
 
     /// Specify that analyze itself should return a non-zero exit code on success.
     /// This is needed under esoteric invocation scenarios.
@@ -216,6 +263,71 @@ pub struct AnalyzeOpts {
     /// reach that refusal on a host whose counters pass.
     #[clap(skip = crate::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
     pub inexact_branch_counter: fn() -> Option<String>,
+
+    /// What the endpoint runs measured so far; the trials' bounds derive
+    /// from it ([`AnalyzeOpts::trial_bound`]). Every `RunData` copies these
+    /// options when it is created, so a run takes the bound of the endpoints
+    /// measured before it.
+    #[clap(skip)]
+    pub endpoints: EndpointMeasurements,
+}
+
+/// `--trial-timeout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrialTimeout {
+    /// Derived from the endpoint runs' wall-clock time.
+    Auto,
+    /// No bound beyond the run arguments' own `--timeout`.
+    Off,
+    /// This many seconds.
+    Seconds(NonZeroU64),
+}
+
+impl FromStr for TrialTimeout {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "auto" => Ok(TrialTimeout::Auto),
+            "off" => Ok(TrialTimeout::Off),
+            _ => s.parse().map(TrialTimeout::Seconds).map_err(|_| {
+                format!("expected a positive number of seconds, `auto` or `off`, got {s:?}")
+            }),
+        }
+    }
+}
+
+/// The least wall-clock bound `--trial-timeout=auto` gives a trial.
+pub const TRIAL_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
+/// How many times the slowest endpoint run `--trial-timeout=auto` gives a trial.
+pub const TRIAL_TIMEOUT_FACTOR: u32 = 10;
+/// The least cap on a trial's log file.
+pub const TRIAL_LOG_FLOOR: u64 = 64 << 20;
+/// How many times the largest endpoint log a trial's log file may grow to.
+pub const TRIAL_LOG_FACTOR: u64 = 10;
+
+/// The slowest wall-clock time and the largest log file of the endpoint runs
+/// measured so far.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EndpointMeasurements {
+    /// The slowest endpoint run, if one has been measured.
+    pub slowest: Option<Duration>,
+    /// The largest endpoint log file, if an endpoint run wrote one.
+    pub largest_log: Option<u64>,
+}
+
+impl EndpointMeasurements {
+    /// Record one endpoint run. Returns true if it is the slowest so far.
+    pub fn record(&mut self, wall: Duration, log_bytes: Option<u64>) -> bool {
+        if let Some(bytes) = log_bytes {
+            self.largest_log = self.largest_log.max(Some(bytes));
+        }
+        let slowest = self.slowest.is_none_or(|slowest| wall > slowest);
+        if slowest {
+            self.slowest = Some(wall);
+        }
+        slowest
+    }
 }
 
 // TODO: introduce a new type to encapsulate the state of the search, and make it immutable.
