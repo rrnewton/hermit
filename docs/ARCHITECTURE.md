@@ -703,9 +703,15 @@ synthesize a full virtual filesystem, Detcore takes a **snapshot-and-normalize**
 approach for a small allow-list of volatile files (`detcore/src/procfs.rs`):
 
 - `/proc/self/stat` — a fixed set of volatile numeric fields (the page-fault
-  counters, `utime`/`stime`/`cutime`/`cstime`, `itrealvalue`, `starttime`, the
-  last-run `processor`, and the trailing delay/guest-time accounting fields) are
-  rewritten to `0`, while the `comm` string and structural fields are preserved.
+  counters, `itrealvalue`, `starttime`, the last-run `processor`, and the
+  trailing delay/guest-time accounting fields) are rewritten to `0`, while the
+  `comm` string and structural fields are preserved. Where Detcore renders the
+  reader's own process's `stat`, `utime`/`stime`/`cutime`/`cstime` are its
+  logical CPU accounting, the one `times(2)`, `getrusage(2)` and the CPU-time
+  clocks report; elsewhere they are `0`.
+- `/proc/<pid>/schedstat` — the task's runtime from the same accounting, for
+  a thread of the reader's own process where its `stat` is rendered (else
+  `0`), and `0` for the run-queue wait and the run count.
 - `/proc/self/status` — the CPU affinity mask/list are pinned to virtual CPU 0,
   and `voluntary_ctxt_switches` and `nonvoluntary_ctxt_switches` are pinned to
   `0`.

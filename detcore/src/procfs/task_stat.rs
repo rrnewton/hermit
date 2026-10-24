@@ -92,6 +92,9 @@
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::syscalls::sysinfo::clock_ticks;
+use crate::types::LogicalTime;
+
 /// Linux's `TASK_COMM_LEN`: a task's name and its terminating NUL.
 pub const TASK_COMM_LEN: usize = 16;
 
@@ -310,6 +313,21 @@ pub(crate) fn render_comm(comm: &TaskComm) -> Vec<u8> {
     line
 }
 
+/// The CPU time a `stat` shows (fields 14-17, `do_task_stat`,
+/// fs/proc/array.c:549-550 and 571-575 at v6.16): the user and system time of
+/// the whole process for a process's file and of the one thread for a
+/// thread's (`thread_group_cputime_adjusted`, `task_cputime_adjusted`), and
+/// the process's reaped children's (`signal_struct::cutime`, `cstime`) in
+/// both. Detcore's logical CPU accounting, the one `times(2)`,
+/// `getrusage(2)` and the CPU-time clocks report (`crate::cpu_clock`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TaskCpuTimes {
+    pub(crate) user: LogicalTime,
+    pub(crate) system: LogicalTime,
+    pub(crate) children_user: LogicalTime,
+    pub(crate) children_system: LogicalTime,
+}
+
 /// One rendering of a `stat` file, with what its reader adds to the
 /// process table's facts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -331,6 +349,10 @@ pub(crate) struct TaskStat {
     /// The process's `RLIMIT_RSS` soft limit ([`TaskStatFacts::rsslim`]),
     /// whoever reads it.
     pub(crate) rsslim: u64,
+    /// The task's CPU time as of this read, its reader's own process's;
+    /// zero for another process's file, whose accounting Detcore keeps in
+    /// that process's own threads.
+    pub(crate) cpu: TaskCpuTimes,
 }
 
 /// `stat`'s state letter for a task: `R` for the reader itself, which runs
@@ -377,6 +399,8 @@ fn flags(stat: &TaskStat) -> u64 {
 /// | 5, 6 | pgrp, session | Detcore's model, as `getpgid` and `getsid` answer |
 /// | 7, 8 | tty_nr, tpgid | 0, -1: no controlling terminal |
 /// | 9 | flags | [`flags`] |
+/// | 14, 15 | utime, stime | the task's user and system time ([`TaskCpuTimes`]), in clock ticks; 0 for another process's file |
+/// | 16, 17 | cutime, cstime | its process's reaped children's, in clock ticks; 0 for another process's file |
 /// | 18, 19 | priority, nice | 20, 0: nice is inert under Detcore |
 /// | 20 | num_threads | the process's tasks |
 /// | 25 | rsslim | the process's `RLIMIT_RSS` soft limit |
@@ -384,7 +408,7 @@ fn flags(stat: &TaskStat) -> u64 {
 /// | 40, 41 | rt_priority, policy | 0, 0 (`SCHED_OTHER`) |
 /// | 52 | exit_code | 0 |
 ///
-/// Every other field is 0: the fault and time accounting (10-17, 43, 44),
+/// Every other field is 0: the fault counts (10-13), the guest time (43, 44),
 /// `itrealvalue` (21, always 0 in Linux), the start time (22), the memory
 /// sizes and addresses (23, 24, 26-30, 45-51), the four obsolete signal
 /// words (31-34, which the sanitizer zeroed on every backend before this),
@@ -411,15 +435,16 @@ pub(crate) fn render_stat(stat: &TaskStat) -> Vec<u8> {
         "-1".to_owned(),
         // 9 flags
         flags(stat).to_string(),
-        // 10 minflt .. 17 cstime
+        // 10 minflt .. 13 cmajflt
         "0".to_owned(),
         "0".to_owned(),
         "0".to_owned(),
         "0".to_owned(),
-        "0".to_owned(),
-        "0".to_owned(),
-        "0".to_owned(),
-        "0".to_owned(),
+        // 14 utime .. 17 cstime
+        clock_ticks(stat.cpu.user).to_string(),
+        clock_ticks(stat.cpu.system).to_string(),
+        clock_ticks(stat.cpu.children_user).to_string(),
+        clock_ticks(stat.cpu.children_system).to_string(),
         // 18 priority, 19 nice, 20 num_threads
         "20".to_owned(),
         "0".to_owned(),
@@ -517,6 +542,7 @@ mod tests {
             reader_is_task: true,
             ppid: 3,
             rsslim: RLIM_INFINITY,
+            cpu: TaskCpuTimes::default(),
         };
         let line = render_stat(&stat);
         let (comm, fields) = fields(&line);
@@ -556,6 +582,29 @@ mod tests {
         );
     }
 
+    /// The CPU times are the task's and its process's reaped children's,
+    /// truncated to clock ticks (`nsec_to_clock_t`): 10 ms each.
+    #[test]
+    fn stat_shows_the_cpu_times_in_clock_ticks() {
+        let ms = |ms: u64| LogicalTime::from_nanos(ms * 1_000_000);
+        let stat = TaskStat {
+            pid: 7,
+            comm: TaskComm::new(b"probe"),
+            facts: facts(),
+            reader_is_task: true,
+            ppid: 3,
+            rsslim: RLIM_INFINITY,
+            cpu: TaskCpuTimes {
+                user: ms(1234),
+                system: ms(9),
+                children_user: ms(20),
+                children_system: ms(10) + LogicalTime::from_nanos(9_999_999),
+            },
+        };
+        let (_, fields) = fields(&render_stat(&stat));
+        assert_eq!(fields[13..17], ["123", "0", "2", "1"], "{fields:?}");
+    }
+
     /// A thread that does not lead shows exit signal -1 and `PF_FORKNOEXEC`
     /// (it was cloned and never exec'd), and a sibling's state is `S`; a
     /// zombie's is `Z`, with `PF_EXITING`.
@@ -572,6 +621,7 @@ mod tests {
             reader_is_task: false,
             ppid: 3,
             rsslim: 4096,
+            cpu: TaskCpuTimes::default(),
         };
         let (_, sibling_fields) = fields(&render_stat(&sibling));
         assert_eq!(sibling_fields.len(), 52);
@@ -611,6 +661,7 @@ mod tests {
             reader_is_task: true,
             ppid: 0,
             rsslim: RLIM_INFINITY,
+            cpu: TaskCpuTimes::default(),
         };
         let line = render_stat(&stat);
         assert!(line.starts_with(b"1 (a)b\n\\\xff c) R 0 "), "{line:?}");

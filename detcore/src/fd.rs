@@ -1499,6 +1499,21 @@ impl DetFd {
         })
     }
 
+    /// The task a `schedstat` describes (`ProcfsFile::schedstat_thread`).
+    pub(crate) fn procfs_schedstat_thread(&self) -> Option<DetTid> {
+        self.with_description(|d| d.procfs.as_ref().and_then(ProcfsFile::schedstat_thread))
+    }
+
+    /// Before a positioned read at `position`
+    /// (`ProcfsFile::drop_schedstat_snapshot_for_read_at`).
+    pub(crate) fn procfs_drop_schedstat_snapshot_for_read_at(&self, position: u64) {
+        self.with_description(|d| {
+            if let Some(procfs) = d.procfs.as_mut() {
+                procfs.drop_schedstat_snapshot_for_read_at(position);
+            }
+        });
+    }
+
     /// The guest's numbers for the kernel's numbers in the snapshot about to
     /// be taken (`ProcfsFile::set_guest_numbers`).
     pub(crate) fn set_procfs_guest_numbers(&self, numbers: std::collections::BTreeMap<i32, i32>) {
