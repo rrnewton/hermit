@@ -185,7 +185,9 @@ starts instead of drawing that input from the host.
 - makes I/O completion behavior deterministic;
 - virtualizes time, random inputs, CPUID, and selected file metadata;
 - rejects syscalls classified Unsupported instead of forwarding them silently;
-- gives the guest an isolated PID namespace and `/tmp`;
+- gives the guest an isolated PID namespace and `/tmp`, shared by every
+  process of the run but, unless `--tmp` names a shared directory, by no
+  other run (see "Races Between Processes");
 - uses an isolated local network namespace;
 - exposes most of the host file system read/write.
 
@@ -504,6 +506,91 @@ are left out, and so are paths the guest itself renamed, linked or unlinked,
 or opened with `O_CREAT`. Under `--backend=dbt` nothing is recorded. The
 line is information, not a refusal: Hermit does not make a changing
 filesystem deterministic.
+
+### Races Between Processes
+
+Each `hermit run` gets its own `/tmp` and PID namespace, so two separate runs
+never share a scratch file under `/tmp`, and a race between separate test
+processes that share the host's `/tmp` cannot happen between runs. (The rest
+of the host file system, such as the working directory, `$HOME` and
+`/var/tmp`, is shared by all runs.) To look for one, start the copies inside
+one run. They then share that run's `/tmp` and the rest of its file system,
+and Hermit schedules all of their threads together, so the interleaving that
+makes them collide is chosen by the seed and reproduced by it. A short shell
+wrapper is enough. It needs no Hermit option and works with every mode,
+`--verify` and `--record-preemptions-to` included:
+
+```sh
+# copies.sh: run N copies of a command at once, print each copy's exit
+# status, and exit 0 only if every copy exited 0.
+n=$1; shift
+i=1; pids=
+while [ "$i" -le "$n" ]; do "$@" & pids="$pids $!"; i=$((i + 1)); done
+i=1; status=0
+for pid in $pids; do
+  wait "$pid"; s=$?; echo "copy $i exit $s"
+  [ "$s" = 0 ] || status=1; i=$((i + 1))
+done
+exit $status
+```
+
+```bash
+for seed in $(seq 1 30); do
+  for slice in 100000 1000000; do
+    hermit run --strict --epoch=2026-01-01T00:00:00Z --timeout=60 --chaos \
+      --seed="$seed" --max-timeslice="$slice" \
+      -- /bin/sh ./copies.sh 2 ./my_test --some-arg ||
+      echo "failure at seed $seed, max-timeslice $slice: exit $?"
+  done
+done
+```
+
+Keep the wrapper out of host `/tmp`, which the guest does not see. A failure
+is not necessarily a collision: read the copies' output (a timeout, or a
+Hermit refusal such as a skid overshoot, also fails the run). To keep each
+copy's output apart, redirect it to a file of its own, for example
+`"$@" > "/tmp/copy$i.log" 2>&1 &`, and print the files from the wrapper
+before it exits: the run's `/tmp` is gone afterwards. The shell starts each
+copy as a background job, which ignores SIGINT and SIGQUIT, so a test that
+relies on those signals behaves differently from a foreground run.
+
+What the copies share, compared with Linux, decides which scratch names
+collide:
+
+| The program names its file from | Separate runs | Copies in one run | Copies on Linux |
+| --- | --- | --- | --- |
+| A fixed path, such as `/tmp/myapp/state` | Never collide under `/tmp` (private) | Collide when the schedule overlaps them | Collide when they overlap in time |
+| An address, such as `/tmp/fixture-%p` | Never collide under `/tmp` | The same name while both copies allocate alike: Hermit runs guests without address randomization | Usually differ: each process gets other addresses |
+| The time in seconds, such as `time(NULL)` | Never collide under `/tmp` | Usually the same: copies that start together read the same virtual second | Usually the same |
+| The process ID, `mkstemp`, `mkdtemp` or `getrandom` | Never collide under `/tmp` | Differ: each process has its own ID and its own random stream | Differ |
+
+Two separate runs with the same seed see the same process IDs, addresses and
+random bytes. If they share a host directory (`--tmp=DIR`, or the same path
+bound into both), even names drawn from those collide, but host timing then
+decides whether the runs overlap, and nothing reproduces it.
+
+How the copies interleave depends on the schedule. Hermit runs every thread of
+every process in the run on one virtual CPU. Without `--chaos` it picks the
+next thread at each system call and timeslice end by a fixed rule, so the
+copies interleave the same way in every run: a collision shows up in every run
+or in none. With `--chaos`, each thread draws a priority that changes at the
+ends of its timeslices, and the runnable thread with the highest priority is
+picked until its slice ends or it blocks. The timeslice length therefore
+matters as much as the seed. For two copies of a program that writes a
+fixed-name file and reads it back, with the wrapper and loop above, no seed of
+30 collided at the default timeslice, 3 collided at `--max-timeslice=1000000`
+and 18 at `--max-timeslice=100000`. Sweep both, as the loop above does. A seed
+that fails fails again with the same command, environment, seed, timeslice,
+epoch and host files (see "Reproducibility Checklist"). A different wrapper or
+environment is a different program, with other failing seeds.
+`--verify --verify-strict` on a failing seed confirms that it reproduces, and
+`--record-preemptions-to` saves the schedule for replay. `hermit analyze`
+compares a failing run with a passing baseline, which by default is the run
+without `--chaos`. When that run collides too, analyze stops with "baseline
+run matched target criteria". Name a failing seed with `--run1-seed=N` and a
+passing one with `--run2-seed=N` instead, chosen under analyze itself: it adds
+options of its own to the run, so a seed's outcome under analyze can differ
+from the plain run's.
 
 ### Verify Mode
 
