@@ -439,23 +439,35 @@ fn analyze_race_then(
     (combined, report)
 }
 
-const BOUND_REACHED: &str = "reached hermit analyze's bound of 3 s per run \
+const BOUND_REACHED: &str = "reached hermit analyze's bound of 3 s for this run \
                              (--trial-timeout=SECONDS raises it, --trial-timeout=off lifts it)); \
-                             counted as the baseline condition";
+                             counted as not meeting the target";
 
 /// Every prefix trial in which thread a wins the race spins for ever, the
 /// run without chaos (the prefix search's baseline) among them. Each is
-/// bounded by `--trial-timeout` and counts as the baseline condition, so
+/// bounded by `--trial-timeout` and counts as not meeting the target, so
 /// the search still finds the deciding event. Before the bound, the first
-/// such trial never ended.
+/// such trial never ended. The trial on the boundary's baseline side runs
+/// once more with 4 times the bound, does not finish then either, and the
+/// report says the boundary rests on that bound rather than on an outcome.
 #[test]
 #[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_bounds_trials_that_never_end() {
     let label = "analyze --prefix-search analyze_race_then spin";
-    let (combined, _) = analyze_race_then(label, "spin", &["--prefix-search"]);
+    let (combined, report) = analyze_race_then(label, "spin", &["--prefix-search"]);
     assert!(
         combined.contains(BOUND_REACHED),
         "{label}: no trial reached the bound\n{combined}"
+    );
+    assert!(
+        combined.contains("running it again with a bound of 12 s, so that a finished trial"),
+        "{label}: the boundary was not confirmed\n{combined}"
+    );
+    let header = report["header"].as_str().unwrap();
+    assert!(
+        header.contains("does not finish, which the search counts as not meeting")
+            && header.contains("this boundary rests on a wall-clock bound, not on an outcome"),
+        "{label}: {report}"
     );
 }
 
@@ -479,7 +491,7 @@ fn analyze_searches_the_target_schedule_when_the_baseline_never_ends() {
 
 /// Every prefix trial in which thread a wins the race asks for something
 /// Hermit refuses at run time (exit 122), the run without chaos (the prefix
-/// search's baseline) among them. Each counts as the baseline condition, with
+/// search's baseline) among them. Each counts as not meeting the target, with
 /// a warning, and the report says how many were refused. Before, the first
 /// refused trial ended the whole analysis with exit 122. The refusal is
 /// Detcore's for a process-directed signal while several threads live
