@@ -3139,7 +3139,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4862 adds three detcore units: 2955 + 3 = 2958, re-measured at this integration head.
     // The loader-cache provenance fix adds one detcore unit: 2958 + 1 = 2959, re-measured at this integration head.
     // PR 4738 adds twenty detcore units: 2959 + 20 = 2979, re-measured at this integration head.
-    ("test.detcore_unit", 2979),
+    // And scheduler::fair_continuation::tests's three run-time units,
+    // scheduler::test::a_fair_continuation_runs_the_thread_that_ran_least and
+    // scheduler::runqueue::tests::a_restored_entry_ordered_by_run_time_takes_the_next_free_turn
+    // (--replay-continue-fairly): 2984, listed.
+    ("test.detcore_unit", 2984),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4544,7 +4548,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_schedule_replay_ends_check_in_slices_where_the_record_did, whose
     // replay needs a PMU stop on a branch count to go wrong, joins them: 17,
     // listed.
-    ("privileged-test.pmu_cli_cases", 18),
+    // a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write, whose spinner only
+    // the PMU timer ends a slice of, joins them: 19, listed.
+    ("privileged-test.pmu_cli_cases", 19),
     // The six x86-64-v3 CLI cases that run a guest, with
     // HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 so that a refusal fails
     // (https://github.com/rrnewton/hermit/issues/4243): 6, listed with this
@@ -5508,7 +5514,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same three PR 4862 units: 2955 + 3 = 2958.
     // The same loader-cache provenance unit: 2958 + 1 = 2959.
     // The same twenty PR 4738 units: 2959 + 20 = 2979.
-    ("test.detcore_unit_on_host", 2979),
+    // And the same five fair-continuation units: 2984, listed.
+    ("test.detcore_unit_on_host", 2984),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

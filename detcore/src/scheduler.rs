@@ -16,6 +16,7 @@ mod cpu_affinity_tests;
 pub(crate) mod discarded_at_send;
 #[cfg(test)]
 pub(crate) mod exec_teardown_tests;
+mod fair_continuation;
 #[cfg(test)]
 mod gated_wait_tests;
 pub(crate) mod guest_mask_publication;
@@ -2351,6 +2352,15 @@ pub struct Scheduler {
     /// thread when the thread heard that the replay released its schedule
     /// (`drop_released_callback_checkpoints`), for the run summary.
     released_callback_checkpoints: BTreeMap<DetTid, usize>,
+
+    /// The fair order of the run past the end of its replayed schedule,
+    /// under `--replay-continue-fairly`
+    /// ([`fair_continuation::FairContinuation`]).
+    fair_continuation: Option<fair_continuation::FairContinuation>,
+
+    /// Each thread's clock at the last scheduler pass, read while every
+    /// thread was parked, for [`Self::order_continuation_fairly`].
+    continuation_clocks: BTreeMap<DetTid, LogicalTime>,
 
     /// Count record_event calls which determines the event number if we're recording a schedule
     /// event trace.
@@ -4907,6 +4917,8 @@ impl Scheduler {
             recorded_host_inputs,
             replay_priorities_released: false,
             released_callback_checkpoints: BTreeMap::new(),
+            fair_continuation: cfg.replay_continue_fairly.then(Default::default),
+            continuation_clocks: BTreeMap::new(),
             recorded_event_count: 0,
             stacktrace_events,
             stop_after_turn: cfg.stop_after_turn,
@@ -6988,6 +7000,9 @@ impl Scheduler {
         // The caller's own queue survives under the leader's tid; the
         // leader's went with the leader (`logically_kill_thread` above).
         self.transfer_thread_timer_copies(caller, new_leader);
+        if let Some(fair) = self.fair_continuation.as_mut() {
+            fair.reassign(caller, new_leader);
+        }
         self.discarded_at_send.rekey_thread(caller, new_leader);
         self.work_span_transfer_thread(caller, new_leader);
 
@@ -15317,6 +15332,8 @@ impl Scheduler {
         // Must precede `tentative_pop_next`: the run queue forbids pushes while a
         // selection transaction is live.
         self.hb_flush_wakes();
+        // Also before the selection, since it moves queue entries.
+        self.order_continuation_fairly();
         debug!(
             "[sched-step3] Stepping scheduler, queue len {}, current turn {}, committed_time {}",
             self.run_queue.len(),
@@ -16993,6 +17010,11 @@ impl Scheduler {
             {
                 *self.chaos_turns_in_slice.entry(resources.tid).or_insert(0) += 1;
             }
+            if self.replay_priorities_released
+                && let Some(fair) = self.fair_continuation.as_mut()
+            {
+                fair.note_selected(resources.tid);
+            }
         }
 
         match snapshot.cmp(&self.committed_time) {
@@ -17024,6 +17046,16 @@ impl Scheduler {
         // O3: every turn of an observable process has quiesced, and no pop or
         // grant of the next pass has run yet.
         self.reconcile_inactive_alarms(self.committed_time);
+        // Every thread is parked, so its clock is frozen.
+        if self.fair_continuation.is_some() && self.replay_priorities_released {
+            let gtime = global_time.lock().unwrap();
+            self.continuation_clocks = self
+                .priorities
+                .keys()
+                .filter(|dettid| gtime.contains_thread(**dettid))
+                .map(|&dettid| (dettid, gtime.threads_time(dettid)))
+                .collect();
+        }
     }
 
     /// Record a granted turn for `--cap-preemption-charge`: the thread's
@@ -17794,7 +17826,9 @@ impl Scheduler {
     /// consumption of the last recorded event, or the replayer's release of
     /// the rest of the schedule after a long run of events that match none of
     /// it (`Replayer::release_schedule`). Either is a scheduled event of a
-    /// running thread, so it is the same in every run.
+    /// running thread, so it is the same in every run. Under
+    /// `--replay-continue-fairly` the threads of each band are then ordered
+    /// by their run time ([`Self::order_continuation_fairly`]).
     fn release_replay_priorities_if_exhausted(&mut self) {
         if self.replay_priorities_released
             || !self.has_schedule_replay()
@@ -17875,6 +17909,27 @@ impl Scheduler {
                 .or_default() += points.len();
             points.clear();
         }
+    }
+
+    /// Past the end of the replayed schedule, under `--replay-continue-fairly`,
+    /// order the threads queued in round-robin order by the virtual time each
+    /// has run since the continuation began, least first, and equal run times
+    /// by least recent selection ([`fair_continuation::FairContinuation`]).
+    /// Called before each selection, beside `hb_flush_wakes` and for the same
+    /// reason: it moves queue entries. The clocks are those every parked
+    /// thread had at this pass's step 1 ([`Self::bump_global_time`]); a thread
+    /// admitted since without a clock yet is placed at the floor. Reads only
+    /// those clocks, the run queue and the order of past selections.
+    fn order_continuation_fairly(&mut self) {
+        if !self.replay_priorities_released {
+            return;
+        }
+        let Some(fair) = self.fair_continuation.as_mut() else {
+            return;
+        };
+        let runnable = self.run_queue.round_robin_tids();
+        let run_times = fair.run_times(&self.continuation_clocks, &runnable);
+        self.run_queue.order_by_run_time(&run_times);
     }
 
     /// Readmit a thread whose blocking call finished, or whose deferred
@@ -21656,6 +21711,64 @@ mod test {
         assert!(!sched.replay_registration_priority(late, REPLAY_DEFERRED_PRIORITY));
         assert_eq!(sched.priorities.get(&late), Some(&DEFAULT_PRIORITY));
         assert_eq!(sched.priorities.get(&early), Some(&DEFAULT_PRIORITY));
+    }
+
+    /// Under `--replay-continue-fairly`, once the last recorded event is
+    /// consumed, each selection takes the queued thread that has run the
+    /// least virtual time since then: a writer that ran half a millisecond
+    /// goes ahead of a spinner that ran a 200 ms slice, though the spinner was
+    /// queued first. Before the schedule runs out, or without the option,
+    /// queue order decides.
+    #[test]
+    fn a_fair_continuation_runs_the_thread_that_ran_least() {
+        for (fair, exhausted, first) in [
+            (true, true, "writer"),
+            (true, false, "spinner"),
+            (false, true, "spinner"),
+        ] {
+            let cfg = Config {
+                replay_continue_fairly: fair,
+                ..Default::default()
+            };
+            let mut sched = Scheduler::new(&cfg);
+            let (writer, spinner) = (DetTid::from_raw(3), DetTid::from_raw(5));
+            for tid in [writer, spinner] {
+                sched.register_thread_for_test(tid);
+            }
+            let last = SchedEvent::syscall(writer, Sysno::getpid, SyscallPhase::Prehook)
+                .with_time(LogicalTime::from_nanos(10_000));
+            sched.replayer = Some(Replayer::new(vec![last.clone()]));
+            if exhausted {
+                let _ = sched.consume_schedevent(&last);
+            }
+            let mut gtime = GlobalTime::new(&Config::default());
+            let epoch = gtime.as_nanos();
+            let at = |ns: u64| epoch + LogicalTime::from_nanos(ns);
+            let none = LogicalTime::from_nanos(0);
+            gtime.update_global_time(writer, at(1_000), none);
+            gtime.update_global_time(spinner, at(1_000), none);
+            let time = Mutex::new(gtime);
+            sched.bump_global_time(&time, &Err(SkipTurn));
+            sched.order_continuation_fairly();
+            // The spinner ran a 200 ms slice and is queued first, then the
+            // writer, which ran half a millisecond.
+            time.lock()
+                .unwrap()
+                .update_global_time(spinner, at(200_001_000), none);
+            time.lock()
+                .unwrap()
+                .update_global_time(writer, at(501_000), none);
+            sched.run_queue.push_back(spinner, DEFAULT_PRIORITY);
+            sched.run_queue.push_back(writer, DEFAULT_PRIORITY);
+            sched.bump_global_time(&time, &Err(SkipTurn));
+            let selected = sched.select_test_turn().map(|(tid, _, _)| tid);
+            let expected = if first == "writer" { writer } else { spinner };
+            assert_eq!(
+                selected,
+                Some(expected),
+                "fair {fair}, schedule exhausted {exhausted}"
+            );
+        }
     }
 
     /// Only a leader retired at its own exit while its group lives on counts
