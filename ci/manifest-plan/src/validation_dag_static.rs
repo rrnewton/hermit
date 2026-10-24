@@ -1155,7 +1155,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (A5 step 3c.1a, the delivery gate's field): 1816, listed.
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // 19 boundary/config model tests, two verifier tests, and five restored replay cases.
-    ("test.regular_crates", 1842),
+    // Callback-annotated priority replay (https://github.com/rrnewton/hermit/issues/4082): three detcore-model config
+    // tests and hermit-verify priority_histories_must_agree_exactly: 1846, listed.
+    // And the four replay_modes chaos-replay print_*nanosleep*_race cases no
+    // longer ignored (https://github.com/rrnewton/hermit/pull/4657): 1850, listed.
+    ("test.regular_crates", 1850),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1762,7 +1766,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Eight terminal-finalization custody and classification tests.
     // And container::tests::identity_hardening_freezes_the_dynamic_linker_cache
     // (the frozen /etc/ld.so.cache, Hermit c10c2882): 1096.
-    ("test.hermit_unit", 1096),
+    // Callback-annotated priority replay (https://github.com/rrnewton/hermit/issues/4082): two preemption_admission
+    // admission tests: 1098, listed.
+    ("test.hermit_unit", 1098),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2805,7 +2811,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // epoch read without copying the configuration, and its placeholder
     // gate): 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit", 2529),
+    // Callback-annotated priority replay (https://github.com/rrnewton/hermit/issues/4082): five callback_history
+    // decision tests, six scheduler custody/admission tests and the retained
+    // row-1 fixture: 2541, listed.
+    // And the two no-identity and custody overshot-refusal tests (https://github.com/rrnewton/hermit/pull/4657):
+    // 2543, listed.
+    ("test.detcore_unit", 2543),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4024,7 +4035,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nested-refusal sub-check split out of
     // a_namespace_only_guests_kill_0_never_reaches_hermits_group
     // (https://github.com/rrnewton/hermit/issues/4065), unchanged: 606, listed.
-    ("test.cli", 606),
+    // verify_print_verify_logs_echoes_a_refused_first_runs_log (https://github.com/rrnewton/hermit/pull/4638)
+    // landed without its pin, so 606 already ran 607. And the CLI and library
+    // unqualified-mode refusal tests of callback-annotated priority replay
+    // (https://github.com/rrnewton/hermit/issues/4082): 609, listed.
+    ("test.cli", 609),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4518,7 +4533,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // removals), none excluded: 524.
     // And a_nested_namespace_only_run_is_refused_without_its_kill_filter, split
     // out unchanged and not excluded: 525.
-    ("test.cli_on_host", 525),
+    // The same unpinned verify test (https://github.com/rrnewton/hermit/pull/4638), not excluded: 526. And the same
+    // two unqualified-mode refusal tests (https://github.com/rrnewton/hermit/issues/4082), outside every hosted
+    // exclusion: 528, listed.
+    ("test.cli_on_host", 528),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4941,7 +4959,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twelve A+ units: 2527, listed.
     // And the same three slice 7d determinize_stat_tests units: 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit_on_host", 2529),
+    // And the same twelve priority-replay units (https://github.com/rrnewton/hermit/issues/4082): 2541, listed.
+    // And the same two overshot-refusal tests (https://github.com/rrnewton/hermit/pull/4657): 2543, listed.
+    ("test.detcore_unit_on_host", 2543),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5285,7 +5305,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // The same eight finalization tests, with the existing selection unchanged.
     // And the frozen ld.so.cache container test (Hermit c10c2882): 1096.
-    ("test.hermit_unit_on_host", 1096),
+    // And the same two admission tests (https://github.com/rrnewton/hermit/issues/4082): 1098, listed.
+    ("test.hermit_unit_on_host", 1098),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5476,7 +5497,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two in_guest_signal_delivery config tests: 1802, listed.
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // The same 26 tests; all existing hosted exclusions remain unchanged.
-    ("test.regular_crates_on_host", 1828),
+    // And the same four priority-replay tests (https://github.com/rrnewton/hermit/issues/4082); hosted exclusions
+    // unchanged: 1832, listed.
+    // And the same four no-longer-ignored chaos-replay cases (https://github.com/rrnewton/hermit/pull/4657), outside
+    // the hosted exclusions: 1836, listed.
+    ("test.regular_crates_on_host", 1836),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

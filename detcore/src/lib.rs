@@ -133,6 +133,7 @@ pub use config::to_legacy_backend_json;
 pub use consts::ROOT_DETPID;
 pub use digest::Digest;
 pub use finalization::FinalizationFailure;
+pub use finalization::PriorityHistoryRefusal;
 pub use finalization::TerminalReplayRefusal;
 pub use finalization::combine_finalization;
 #[cfg(test)]
@@ -436,6 +437,17 @@ fn choose_rcb_timer(
     (max_rcbs_remaining, true)
 }
 
+/// The actual callback check-in at which a slice ends, carried into
+/// `end_timeslice_with_checkpoint` so that priority-history replay of a
+/// callback-annotated record (`Config::annotated_priority_replay`) decides
+/// each row that check-in installs from the same callback and site, with
+/// freshly observed progress, rather than from the legacy RCB expiry.
+#[derive(Clone, Copy)]
+struct PriorityCheckin<'a> {
+    token: Option<&'a preemptions::callback_history::Token>,
+    site: preemptions::callback_history::Site,
+}
+
 /// The registers a syscall's completion leaves, computed from `entry`, the
 /// context at its entry (`rip` at the `syscall` instruction): `rax` holds the
 /// result, `rip` follows the instruction, and the instruction's own clobbers
@@ -477,7 +489,7 @@ pub fn two_phase_refusal(cfg: &Config) -> Option<&'static str> {
     if cfg.target_timeslice.or(cfg.max_timeslice).is_some() {
         return Some("the post-handler hook can end the timeslice");
     }
-    if cfg.should_trace_schedevent() {
+    if cfg.observes_schedevents() {
         return Some(
             "a recorded or replayed schedule traces the delivery, and a replay can hand off",
         );
@@ -1272,7 +1284,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .map_or_else(|| "".to_string(), |x| format!("{}", x)),
                 clock_value,
             );
-            if self.cfg.use_rcb_time() && self.cfg.should_trace_schedevent() {
+            if self.cfg.use_rcb_time() && self.cfg.observes_schedevents() {
                 let mut vec = Vec::new();
                 let ev = with_guest_time(
                     guest,
@@ -1568,7 +1580,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let time = &guest.thread_state().thread_logical_time;
         let nanos = time.as_nanos();
 
-        if delivery && self.cfg.sequentialize_threads && self.cfg.should_trace_schedevent() {
+        if delivery && self.cfg.sequentialize_threads && self.cfg.observes_schedevents() {
             trace_schedevent(
                 guest,
                 SchedEvent {
@@ -1658,7 +1670,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             signal
         );
         guest.thread_state_mut().stats.count_signal();
-        if self.cfg.sequentialize_threads && self.cfg.should_trace_schedevent() {
+        if self.cfg.sequentialize_threads && self.cfg.observes_schedevents() {
             let dettid = guest.thread_state().dettid;
             let nanos = guest.thread_state().thread_logical_time.as_nanos();
             trace_schedevent(
@@ -2029,6 +2041,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return;
         }
+        // An annotated priority-history row ends only at its recorded
+        // callback endpoint, never at the first stop that reaches its RCBs.
+        if self
+            .priority_checkpoint_at(guest, boundary, token, site)
+            .await
+        {
+            return;
+        }
         let thread_state = guest.thread_state();
         let Some(slice_end) = thread_state.end_of_timeslice else {
             return;
@@ -2048,7 +2068,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             slice_end
         );
         let origin = self.record_callback_origin(guest, token, site);
-        self.end_timeslice_with_checkpoint(guest, false, origin, boundary)
+        let checkin = PriorityCheckin {
+            token: token.as_ref(),
+            site,
+        };
+        self.end_timeslice_with_checkpoint(guest, false, origin, boundary, Some(checkin))
             .await;
     }
 
@@ -2091,9 +2115,128 @@ impl<T: RecordOrReplay> Detcore<T> {
         else {
             return false;
         };
-        self.end_timeslice_with_checkpoint(guest, false, Some(origin), boundary)
+        self.end_timeslice_with_checkpoint(guest, false, Some(origin), boundary, None)
             .await;
         true
+    }
+
+    /// Priority-history replay of a callback-annotated record
+    /// (`Config::annotated_priority_replay`): decide this actual check-in
+    /// for the thread's active recorded row. True when it decided: the row
+    /// ended at its recorded endpoint, or that endpoint is still ahead and the
+    /// slice must not end here. False when the active row has no checkpoint,
+    /// and the legacy expiry decides. A refusal ends the run.
+    async fn priority_checkpoint_at<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        boundary: CheckIn,
+        token: &mut Option<preemptions::callback_history::Token>,
+        site: preemptions::callback_history::Site,
+    ) -> bool {
+        if !self.cfg.annotated_priority_replay
+            || guest.thread_state().active_priority_row().is_none()
+        {
+            return false;
+        }
+        if let Some(token) = token.as_mut() {
+            token.note_cut(guest.thread_state().callback_history.progress(), site);
+        }
+        match self.decide_priority_row(guest, token.as_ref(), Some(site)) {
+            preemptions::callback_history::RowDecision::NoCheckpoint => false,
+            preemptions::callback_history::RowDecision::Pending => true,
+            preemptions::callback_history::RowDecision::Match(checkpoint) => {
+                let checkin = PriorityCheckin {
+                    token: token.as_ref(),
+                    site,
+                };
+                self.end_timeslice_with_checkpoint(
+                    guest,
+                    false,
+                    Some(checkpoint.origin),
+                    boundary,
+                    Some(checkin),
+                )
+                .await;
+                true
+            }
+            preemptions::callback_history::RowDecision::Refuse {
+                refusal,
+                checkpoint,
+                actual,
+            } => {
+                self.refuse_priority_checkpoint(guest, refusal, checkpoint, actual)
+                    .await;
+                unreachable!("a priority-history refusal ends the run")
+            }
+        }
+    }
+
+    /// The decision for the thread's active recorded row at a check-in of
+    /// `token`'s callback at `site` (`None`: no callback identity), with
+    /// progress, time and RCBs observed now.
+    fn decide_priority_row<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        token: Option<&preemptions::callback_history::Token>,
+        site: Option<preemptions::callback_history::Site>,
+    ) -> preemptions::callback_history::RowDecision {
+        let thread = guest.thread_state();
+        let Some(active) = thread.active_priority_row() else {
+            return preemptions::callback_history::RowDecision::NoCheckpoint;
+        };
+        let actual = site.and_then(|site| thread.callback_history.observed(thread, token, site));
+        let rcbs = thread.committed_clock_value;
+        guest
+            .thread_state_mut()
+            .callback_history
+            .decide_row(active, actual, token, rcbs)
+    }
+
+    /// Refuse a recorded callback checkpoint of priority-history replay by
+    /// name. With an actual origin, the scheduler first pops its own copy of
+    /// the same checkpoint and records the DESYNC line, so both custodies
+    /// consume it; a check-in without a callback identity has only the local
+    /// one, and the refusal says so. Never returns.
+    async fn refuse_priority_checkpoint<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        refusal: preemptions::callback_history::Refusal,
+        checkpoint: preemptions::callback_history::Checkpoint,
+        actual: Option<preemptions::callback_history::Origin>,
+    ) {
+        let dettid = guest.thread_state().dettid;
+        let observed = match &actual {
+            Some(actual) => format!("observed {actual:?}"),
+            None => "observed a check-in with no callback identity (scheduler custody not \
+                     reported)"
+                .to_owned(),
+        };
+        let message = format!(
+            "{}: dtid {} priority-history row {}: expected {:?}, {observed}",
+            refusal.name(),
+            dettid,
+            checkpoint.history_index,
+            checkpoint.origin,
+        );
+        if let Some(actual) = actual {
+            let (time, response) = tool_global::send_and_update_time(
+                guest,
+                tool_global::GlobalRequest::CallbackCheckpointMismatch {
+                    checkpoint,
+                    hard: true,
+                    actual,
+                },
+            )
+            .await;
+            assert_eq!(
+                (time, response),
+                (
+                    None,
+                    tool_global::GlobalResponse::CallbackCheckpointMismatch(())
+                )
+            );
+        }
+        crate::scheduler::exit_on_scheduler_refusal(&message)
     }
 
     fn callback_checkpoint_expiry_due<G: Guest<Self>>(
@@ -2217,6 +2360,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             preemptions::callback_history::Site::PosthookPmuEpsilon,
         )
         .await;
+        // A row recorded as ending within one RCB of the PMU maximum ends at
+        // the same posthook site here; the recorded site is the authority,
+        // not a re-derived epsilon test. The signal hold stays authoritative.
+        if guest.thread_state().own_signal_turn_hold.is_none() {
+            self.priority_checkpoint_at(
+                guest,
+                boundary,
+                &mut token,
+                preemptions::callback_history::Site::PosthookPmuEpsilon,
+            )
+            .await;
+        }
 
         let dettid = guest.thread_state().dettid;
         let mut current_time = guest.thread_state().thread_logical_time.as_nanos();
@@ -2251,7 +2406,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                     &token,
                     preemptions::callback_history::Site::PosthookPmuEpsilon,
                 );
-                self.end_timeslice_with_checkpoint(guest, false, origin, boundary)
+                let checkin = PriorityCheckin {
+                    token: token.as_ref(),
+                    site: preemptions::callback_history::Site::PosthookPmuEpsilon,
+                };
+                self.end_timeslice_with_checkpoint(guest, false, origin, boundary, Some(checkin))
                     .await;
                 max_timeslice_end = guest
                     .thread_state()
@@ -2269,6 +2428,75 @@ impl<T: RecordOrReplay> Detcore<T> {
 
             let current_rcbs = guest.thread_state().thread_logical_time.rcbs();
             let current_pmu_rcbs = guest.thread_state().committed_clock_value;
+            // A callback-annotated priority history (`annotated_priority_replay`)
+            // holds a row whose recorded endpoint is still ahead: its RCBs,
+            // and whether the recorded endpoint is the PMU timer's own stop.
+            let pending_checkpoint = if self.cfg.annotated_priority_replay {
+                guest.thread_state().pending_checkpoint().map(|checkpoint| {
+                    (
+                        checkpoint.origin.rcbs,
+                        checkpoint.origin.callback == slice_boundary::callbacks::Callback::PmuTimer,
+                    )
+                })
+            } else {
+                None
+            };
+            let pending_checkpoint_rcbs = pending_checkpoint.map(|(rcbs, _)| rcbs);
+            if let Some(replay_rcb_end) = replay_rcb_end
+                && self.cfg.annotated_priority_replay
+                && guest.thread_state().own_signal_turn_hold.is_some()
+                && current_pmu_rcbs >= pending_checkpoint_rcbs.unwrap_or(replay_rcb_end)
+            {
+                // As at the PMU maximum above: no guest instruction runs
+                // before the delivery stop that ends the hold, and that stop's
+                // hooks decide the row and set the next timer. The hold, the
+                // request and the pending checkpoint are left as they are.
+                trace!(
+                    "posthook [dtid {}] at its recorded RCB deadline {} while it keeps its turn",
+                    dettid, replay_rcb_end
+                );
+                return;
+            }
+            // The timer aims one RCB past an annotated row's endpoint unless
+            // the recorded endpoint is the timer's own stop, and always once
+            // the thread waits at the endpoint's RCBs. The recorded path
+            // reaches a software endpoint with no stop at those RCBs, and
+            // with no further conditional branch, so the timer fires only
+            // for a replay that branches past the endpoint, whose next
+            // check-in refuses it; the recording saw no stop there, and
+            // neither does a faithful replay. This is a physical arm target
+            // only; the recorded endpoint is unchanged.
+            let replay_rcb_end = match (replay_rcb_end, pending_checkpoint) {
+                (Some(end), Some((endpoint, timer_endpoint)))
+                    if !timer_endpoint || endpoint == current_pmu_rcbs =>
+                {
+                    assert_eq!(end, endpoint, "a checkpoint's RCBs are its row's");
+                    Some(endpoint.checked_add(1).unwrap_or_else(|| {
+                        crate::scheduler::exit_on_scheduler_refusal(&format!(
+                            "{}: dtid {} has no RCB beyond its recorded endpoint {} to aim at",
+                            preemptions::callback_history::Refusal::Overshot.name(),
+                            dettid,
+                            endpoint
+                        ))
+                    }))
+                }
+                (other, _) => other,
+            };
+            // With an annotated row pending, a target that is not ahead of the
+            // committed RCBs means the thread is already past the recorded
+            // endpoint: refuse that by name. The assertion below still guards
+            // every other path.
+            if let (Some(target), Some((endpoint, _))) = (replay_rcb_end, pending_checkpoint)
+                && target <= current_pmu_rcbs
+            {
+                crate::scheduler::exit_on_scheduler_refusal(&format!(
+                    "{}: dtid {} is at RCB {}, past its recorded endpoint {}",
+                    preemptions::callback_history::Refusal::Overshot.name(),
+                    dettid,
+                    current_pmu_rcbs,
+                    endpoint
+                ));
+            }
             let (ns_remaining, max_rcbs_remaining) = if let Some(replay_rcb_end) = replay_rcb_end {
                 assert!(
                     replay_rcb_end > current_pmu_rcbs,
@@ -2383,7 +2611,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         explicit_sched_yield: bool,
     ) {
-        self.end_timeslice_with_checkpoint(guest, explicit_sched_yield, None, CheckIn::Event)
+        self.end_timeslice_with_checkpoint(guest, explicit_sched_yield, None, CheckIn::Event, None)
             .await;
     }
 
@@ -2393,6 +2621,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         mut explicit_sched_yield: bool,
         mut checkpoint: Option<preemptions::callback_history::Origin>,
         check_in: CheckIn,
+        checkin: Option<PriorityCheckin<'_>>,
     ) {
         let chaos = guest.config().chaos;
         loop {
@@ -2419,6 +2648,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                     check_in,
                     checkpoint.as_ref().unwrap().site,
                 );
+            // The recorded row this slice end acknowledges, read before
+            // `next_timeslice` installs the next one.
+            let priority_row = if self.cfg.annotated_priority_replay {
+                match guest.thread_state().active_priority_row() {
+                    Some(preemptions::callback_history::ActiveRow::Row(row)) => {
+                        Some(u64::try_from(row).expect("row index fits in u64"))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let (maybe_prio, boundary) = {
                 let thread = guest.thread_state_mut();
                 if replay_checkpoint && !expiry_due {
@@ -2460,6 +2701,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
             req.slice_boundary = boundary;
             req.callback_checkpoint = checkpoint.clone().map(Box::new);
+            req.priority_row = priority_row;
             resource_request(guest, req).await;
 
             if self.cfg.replay_schedule_from.is_some()
@@ -2480,9 +2722,42 @@ impl<T: RecordOrReplay> Detcore<T> {
             // conditional branch. Exact-RCB replay represents those as
             // adjacent zero-RCB slices, which must be consumed before the
             // guest resumes.
-            let ends = slice_boundary::replay_expiration(guest.thread_state())
+            let ends = match slice_boundary::replay_expiration(guest.thread_state())
                 .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error))
-                .unwrap_or_else(|| guest.thread_state().timeslice_expired());
+            {
+                Some(ends) => ends,
+                // A callback-annotated priority history decides each row
+                // this check-in installs from the same actual callback and
+                // site, with refreshed progress. Only an unannotated row
+                // takes the legacy expiry, and it inherits no origin.
+                None if self.cfg.annotated_priority_replay => {
+                    let (token, site) = match checkin {
+                        Some(checkin) => (checkin.token, Some(checkin.site)),
+                        None => (None, None),
+                    };
+                    match self.decide_priority_row(guest, token, site) {
+                        preemptions::callback_history::RowDecision::NoCheckpoint => {
+                            checkpoint = None;
+                            guest.thread_state().timeslice_expired()
+                        }
+                        preemptions::callback_history::RowDecision::Pending => false,
+                        preemptions::callback_history::RowDecision::Match(next) => {
+                            checkpoint = Some(next.origin);
+                            true
+                        }
+                        preemptions::callback_history::RowDecision::Refuse {
+                            refusal,
+                            checkpoint,
+                            actual,
+                        } => {
+                            self.refuse_priority_checkpoint(guest, refusal, checkpoint, actual)
+                                .await;
+                            unreachable!("a priority-history refusal ends the run")
+                        }
+                    }
+                }
+                None => guest.thread_state().timeslice_expired(),
+            };
             if !ends {
                 break;
             }
@@ -3324,7 +3599,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 "[dtid {}] inbound cpuid, new logical time: {:?}",
                 dettid, time
             );
-            if self.cfg.should_trace_schedevent() {
+            if self.cfg.observes_schedevents() {
                 trace_schedevent(
                     guest,
                     SchedEvent {
@@ -3382,7 +3657,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 dettid,
                 guest.thread_state().thread_logical_time
             );
-            if self.cfg.should_trace_schedevent() {
+            if self.cfg.observes_schedevents() {
                 let ev = with_guest_time(
                     guest,
                     SchedEvent {
@@ -4508,7 +4783,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .thread_state_mut()
                 .thread_logical_time
                 .advance_to(max_timeslice_end);
-            if self.cfg.should_trace_schedevent() {
+            if self.cfg.observes_schedevents() {
                 let dettid = guest.thread_state().dettid;
                 let ev = with_guest_time(
                     guest,
@@ -4659,7 +4934,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             )
         };
 
-        if sequentialize_threads && self.cfg.should_trace_schedevent() {
+        if sequentialize_threads && self.cfg.observes_schedevents() {
             trace_schedevent(
                 guest,
                 with_guest_time(
@@ -6019,7 +6294,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             return self.complete_syscall(guest, res).await;
         }
 
-        if sequentialize_threads && self.cfg.should_trace_schedevent() {
+        if sequentialize_threads && self.cfg.observes_schedevents() {
             trace_schedevent(
                 guest,
                 with_guest_time(

@@ -5575,6 +5575,7 @@ impl<T> ThreadState<T> {
             slice_boundary: None,
             guest_signal_mask: None,
             callback_checkpoint: None,
+            priority_row: None,
         }
     }
 
@@ -6120,6 +6121,40 @@ impl<T> ThreadState<T> {
             );
             self.end_of_timeslice = Some(cap);
         }
+    }
+
+    /// The recorded priority-history row whose end the current slice waits
+    /// for, under `--replay-preemptions-from`; `None` without a history.
+    /// Derived from the history's own cursor: rows are installed as slice
+    /// ends in order, and the final slice follows the last.
+    pub(crate) fn active_priority_row(
+        &self,
+    ) -> Option<crate::preemptions::callback_history::ActiveRow> {
+        use crate::preemptions::callback_history::ActiveRow;
+        let history = self.preemption_points.as_ref()?;
+        Some(if self.stats.last_recorded_slice.is_some() {
+            ActiveRow::Exhausted
+        } else {
+            match history.installed_rows() {
+                0 => ActiveRow::BeforeFirst,
+                installed => ActiveRow::Row(installed - 1),
+            }
+        })
+    }
+
+    /// The active row's callback checkpoint, when the row has one and it has
+    /// not been consumed (`Config::annotated_priority_replay`).
+    pub(crate) fn pending_checkpoint(
+        &self,
+    ) -> Option<&crate::preemptions::callback_history::Checkpoint> {
+        use crate::preemptions::callback_history::ActiveRow;
+        let ActiveRow::Row(row) = self.active_priority_row()? else {
+            return None;
+        };
+        if !self.callback_history.annotates(row) {
+            return None;
+        }
+        self.callback_history.remaining().next()
     }
 
     /// Whether this thread has consumed its current logical timeslice.
