@@ -256,6 +256,7 @@ static SIGNAL_THEN_SIBLING_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PARKED_WAIT_THEN_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PARKED_READ_SIGNAL_THEN_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_SPINNER_AND_NEW_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static REPLAY_DESYNC_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_EXIT_SIGNAL_EFFECTIVE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -3047,6 +3048,32 @@ fn chaos_spinner_and_new_thread_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "chaos-spinner-and-new-thread guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn replay_desync_spinner_guest() -> &'static Path {
+    REPLAY_DESYNC_SPINNER_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("replay-desync-spinner");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the replay-desync-spinner guest directory");
+        let guest = build_root.join("replay_desync_spinner");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/replay_desync_spinner.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the replay-desync-spinner guest");
+        assert!(
+            output.status.success(),
+            "replay-desync-spinner guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -20534,6 +20561,55 @@ fn a_desynced_schedule_replay_admits_a_non_root_process_child() {
             .filter_map(|line| line.split_once(marker))
             .any(|(_, rest)| !rest.starts_with("3;")),
         "no thread of a process other than the root registered unguided:\n{log}"
+    );
+}
+
+/// A schedule replay that cannot follow its schedule any more lets every
+/// thread run. tests/c/replay_desync_spinner.c is recorded joining its worker
+/// at once and replayed spinning on sched_yield until the worker, which first
+/// sleeps, sets a flag. The replay leaves its schedule at the first
+/// sched_yield, where the schedule's next event is the main thread's join. It
+/// kept running the main thread, the thread that event names, and held the
+/// worker back, so the spinner took every turn and the run never finished
+/// (it ran into `--timeout`, exit 124; the fixed run takes under a second). After a thousand unmatched events the
+/// replay now drops the rest of the schedule and gives every thread the
+/// default priority, as when a schedule runs out.
+#[test]
+fn a_replay_stuck_off_its_schedule_lets_every_thread_run() {
+    let _guard = hermit_run_guard();
+    let guest = replay_desync_spinner_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let common = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+    ];
+    let record_to = format!("--record-preemptions-to={}", schedule.display());
+    let mut record_args: Vec<&str> = common.to_vec();
+    record_args.extend([record_to.as_str(), "--", guest]);
+    let record = hermit(&record_args);
+    assert_success(&record, &record_args);
+
+    let replay_from = format!("--replay-schedule-from={}", schedule.display());
+    let mut replay_args = vec!["--log=warn"];
+    replay_args.extend(common);
+    replay_args.extend(["--timeout=20", replay_from.as_str(), "--", guest, "spin"]);
+    let replay = hermit(&replay_args);
+    let log = stderr(&replay);
+    assert_eq!(
+        replay.status.code(),
+        Some(0),
+        "{replay_args:?}:\n{}",
+        log.lines().take(40).collect::<Vec<_>>().join("\n")
+    );
+    assert_eq!(stdout(&replay), "done\n");
+    assert!(
+        log.contains("the replay no longer follows the schedule"),
+        "the replay did not leave its schedule, so this is not the case:\n{log}"
     );
 }
 
