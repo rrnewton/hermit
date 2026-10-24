@@ -1681,6 +1681,12 @@
       "why": "tests/c/preemption_callback_boundaries.c is compiled and exercised by hermit-cli/tests/clock_determinism.rs::preemption_replay_preserves_equal_rcb_software_callback_boundaries: direct unrolled clock_gettime syscalls require an Exec/Prehook endpoint at RCB zero and distinct adjacent equal-RCB software callback boundaries, then compare the complete recorded and replayed schedule bytes with exactly one attempt per run (https://github.com/rrnewton/hermit/issues/4082)."
     },
     {
+      "disposition": "cargo-integration-test-fixture",
+      "path": "tests/c/preemption_replay_syscall_slice_end.c",
+      "runner": "cargo test -p hermit-run --test cli",
+      "why": "tests/c/preemption_replay_syscall_slice_end.c is compiled and exercised by hermit-cli/tests/cli.rs: a sleeper's pending timed wait ends a computing worker's --chaos slices at the prehook of its next write, and the guest prints the virtual clock last; on PMU hosts (privileged-test.pmu_cli_cases) a replay of such a recording must reproduce it, so that no replayed slice ends at a PMU stop on the branch count before the prehook"
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/print_memaddrs.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (blocking CI)",

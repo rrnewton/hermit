@@ -117,6 +117,12 @@ cpp_binary(
 )
 
 cpp_binary(
+    name = "preemption_replay_syscall_slice_end",
+    srcs = ["preemption_replay_syscall_slice_end.c"],
+    labels = ["autodeps2_generated"],
+)
+
+cpp_binary(
     name = "replay_epoch_probe",
     srcs = ["replay_epoch_probe.c"],
     labels = ["autodeps2_generated"],

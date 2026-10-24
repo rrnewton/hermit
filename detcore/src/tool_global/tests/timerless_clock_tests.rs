@@ -592,13 +592,11 @@ async fn replay_continue_installs_a_logical_deadline_without_requiring_a_timer()
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(
             file.path(),
+            // A timer preemption the thread runs on from, as recordings write
+            // it: branches, with no OtherInstructions after them, then more.
             crate::preemptions::PreemptionRecord::from_sched_events(vec![
                 event.clone(),
                 branch.clone(),
-                SchedEvent {
-                    end_time: branch.end_time,
-                    ..event.clone()
-                },
                 SchedEvent {
                     count: 1,
                     end_time: Some(sample_time + LogicalTime::from_nanos(1_240)),
