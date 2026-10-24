@@ -60,6 +60,8 @@ pub const DEFAULT_BACKEND_CAPABILITIES: BackendCapabilities = {
     backend.delivers_preemption_timer_events = false;
     backend.runs_guest_code_between_injections = false;
     backend.reports_sigreturns = false;
+    // Nor does it know which counter the run's RCB clock is.
+    backend.rcb_clock_contract = None;
     backend
 };
 
@@ -2222,19 +2224,26 @@ fn config_wire_default() -> Config {
     config.sched_seed = None;
     // `BackendCapabilities` is defined in Reverie, outside
     // `CONFIG_DEFINITION_SOURCES`, so the source domain cannot see a change to
-    // it; only its encoding can. Every field is a bool, so any constant
-    // carries every field's width (see
+    // it; only its encoding can. Every field but one is a bool, so any
+    // constant carries its width. The optional `rcb_clock_contract` carries
+    // its width only when set, and KVM states none, so it is set here to
+    // ptrace's (see
     // `config_fingerprint_sees_the_width_of_every_backend_capability`). KVM's
     // is kept, as it was when one field was optional and only KVM's set it.
     config.backend = BackendCapabilities::KVM;
+    config.backend.rcb_clock_contract = BackendCapabilities::PTRACE.rcb_clock_contract;
     config
 }
 
 pub fn config_wire_fingerprint() -> String {
-    let config = config_wire_default();
-    let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy())
+    wire_fingerprint_of(&config_wire_default())
+}
+
+/// [`config_wire_fingerprint`] with `config` in place of the canonical default.
+fn wire_fingerprint_of(config: &Config) -> String {
+    let wire = bincode::serde::encode_to_vec(config, bincode::config::legacy())
         .expect("canonical Config wire default must encode with Reverie's bincode configuration");
-    let named_shape = serde_json::to_string(&config)
+    let named_shape = serde_json::to_string(config)
         .expect("canonical Config wire default must encode as JSON for field-name checking");
     fingerprint_of_config_material(&wire, &named_shape, CONFIG_DEFINITION_SOURCES)
 }
@@ -2576,7 +2585,7 @@ pub fn decode_backend_config_json(json: &str) -> serde_json::Result<Config> {
     }
     // Deserialize the original bytes, not a Value map that would erase
     // duplicate keys before the typed deserializers can reject them.
-    let envelope: VersionedBackendConfig<'_> = serde_json::from_str(json)?;
+    let envelope: VersionedBackendConfigInput<'_> = serde_json::from_str(json)?;
     if envelope.dbt_config_version != 1 {
         return Err(<serde_json::Error as serde::de::Error>::custom(
             format_args!(
@@ -2586,17 +2595,48 @@ pub fn decode_backend_config_json(json: &str) -> serde_json::Result<Config> {
         ));
     }
     let mut config = from_legacy_backend_json(envelope.config.get())?;
-    config.backend = envelope.backend;
+    config.backend = backend_with_every_capability(envelope.backend.get())?;
     Ok(config)
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// The typed capabilities in `json`, each of which must be present.
+///
+/// Reverie defaults a missing `rcb_clock_contract` to `None` so that its own
+/// older serialized values still read. The envelope states every capability
+/// it carries, so a missing key here is an error like any other missing
+/// capability, not an unqualified clock.
+fn backend_with_every_capability(json: &str) -> serde_json::Result<BackendCapabilities> {
+    let backend: BackendCapabilities = serde_json::from_str(json)?;
+    let present: serde_json::Map<String, serde_json::Value> = serde_json::from_str(json)?;
+    let expected = serde_json::to_value(backend)?;
+    match expected
+        .as_object()
+        .and_then(|fields| fields.keys().find(|key| !present.contains_key(*key)))
+    {
+        Some(missing) => Err(<serde_json::Error as serde::de::Error>::custom(
+            format_args!("missing field `{missing}`"),
+        )),
+        None => Ok(backend),
+    }
+}
+
+#[derive(Serialize)]
 struct VersionedBackendConfig<'a> {
+    dbt_config_version: u32,
+    config: &'a serde_json::value::RawValue,
+    backend: BackendCapabilities,
+}
+
+/// [`VersionedBackendConfig`] as read. The backend object stays as written so
+/// that [`backend_with_every_capability`] can see which keys it names.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct VersionedBackendConfigInput<'a> {
     dbt_config_version: u32,
     #[serde(borrow)]
     config: &'a serde_json::value::RawValue,
-    backend: BackendCapabilities,
+    #[serde(borrow)]
+    backend: &'a serde_json::value::RawValue,
 }
 
 /// The names of the fifteen legacy backend keys, in the order
@@ -2670,6 +2710,9 @@ impl LegacyBackendKeys {
     /// constant contributes nothing a key decides.
     fn capabilities(&self) -> BackendCapabilities {
         let mut backend = BackendCapabilities::PTRACE;
+        // The legacy form predates the key and serves only DBT, whose RCB
+        // clock is not a qualified contract.
+        backend.rcb_clock_contract = None;
         backend.tool_shares_guest_descriptor_table = self.discover_live_file_metadata;
         backend.rediscovers_descriptors_after_exec = self.discover_live_file_metadata;
         backend.loopback_pollers_yield_to_peers = self.discover_live_file_metadata;
@@ -3302,7 +3345,18 @@ mod legacy_backend_json {
 
 #[cfg(test)]
 mod tests {
+    use reverie::RcbClockContract;
+
     use super::*;
+
+    /// Every value `BackendCapabilities::rcb_clock_contract` takes today.
+    /// Reverie's enum is non-exhaustive, so no match here fails on a new
+    /// variant; `every_backend_constant_states_a_listed_rcb_clock_contract`
+    /// checks that every backend constant's value is listed.
+    const RCB_CLOCK_CONTRACTS: [Option<RcbClockContract>; 2] = [
+        None,
+        Some(RcbClockContract::PerfCounterOnTargetThreadUserOnly),
+    ];
 
     /// The four capabilities split out of
     /// `supports_blocked_wait_signal_interruption` in A5 step 3c.0 equal it
@@ -3411,6 +3465,7 @@ mod tests {
         assert!(!config.backend.host_timed_signals_are_physical);
         assert!(!config.backend.delivers_preemption_timer_events);
         assert!(!config.backend.runs_guest_code_between_injections);
+        assert!(config.backend.rcb_clock_contract.is_none());
         assert!(!config.guest_may_inherit_a_terminal);
         assert!(config.in_guest_detlog_forward_policy.is_none());
         assert!(!config.in_guest_site_patching_off);
@@ -3485,6 +3540,8 @@ mod tests {
         backend.delivers_preemption_timer_events = false;
         backend.runs_guest_code_between_injections = false;
         backend.reports_sigreturns = false;
+        // The legacy form names no RCB clock contract: it reads back as none.
+        backend.rcb_clock_contract = None;
         backend.reports_kernel_child_exit_signals = backend.reports_child_exit_publication;
         // The legacy discover_live_file_metadata bit couples three facts.
         backend.rediscovers_descriptors_after_exec = backend.tool_shares_guest_descriptor_table;
@@ -3580,11 +3637,7 @@ mod tests {
 
     #[test]
     fn backend_config_json_round_trips_each_independent_capability() {
-        let baseline = serde_json::to_value(BackendCapabilities::DBT).unwrap();
-        for (name, value) in baseline.as_object().unwrap() {
-            let mut edited = baseline.clone();
-            edited[name] = serde_json::Value::Bool(!value.as_bool().unwrap());
-            let backend = serde_json::from_value(edited).unwrap();
+        let round_trip = |backend: BackendCapabilities, name: &str| {
             let sent = Config {
                 backend,
                 ..Config::default()
@@ -3593,19 +3646,53 @@ mod tests {
             let encoded = encode_backend_config_json(legacy, backend).unwrap();
             let received = decode_backend_config_json(&encoded).unwrap();
             assert_eq!(received.backend, backend, "{name}");
+        };
+        let baseline = serde_json::to_value(BackendCapabilities::DBT).unwrap();
+        for (name, value) in baseline.as_object().unwrap() {
+            if name == "rcb_clock_contract" {
+                // The typed capability takes each value it can, not a flip.
+                for contract in RCB_CLOCK_CONTRACTS {
+                    let mut backend = BackendCapabilities::DBT;
+                    backend.rcb_clock_contract = contract;
+                    round_trip(backend, &format!("{name} = {contract:?}"));
+                }
+                continue;
+            }
+            let mut edited = baseline.clone();
+            let value = value
+                .as_bool()
+                .unwrap_or_else(|| panic!("{name} is neither a bool nor the RCB clock contract"));
+            edited[name] = serde_json::Value::Bool(!value);
+            round_trip(serde_json::from_value(edited).unwrap(), name);
         }
     }
 
     #[test]
     fn backend_config_json_requires_each_typed_capability_once() {
+        for contract in RCB_CLOCK_CONTRACTS {
+            let mut backend = BackendCapabilities::LITEINST_IN_GUEST;
+            backend.rcb_clock_contract = contract;
+            requires_each_typed_capability_once(backend);
+        }
+    }
+
+    fn requires_each_typed_capability_once(backend: BackendCapabilities) {
         let sent = Config {
-            backend: BackendCapabilities::LITEINST_IN_GUEST,
+            backend,
             ..Config::default()
         };
         let encoded =
             encode_backend_config_json(to_legacy_backend_json(&sent).unwrap(), sent.backend)
                 .unwrap();
         let envelope: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(
+            decode_backend_config_json(&encoded).unwrap().backend,
+            backend
+        );
+        // A contract no Reverie names is refused, not read as none.
+        let mut unnamed = envelope.clone();
+        unnamed["backend"]["rcb_clock_contract"] = "PerfCounterOnSomeOtherThread".into();
+        assert!(decode_backend_config_json(&unnamed.to_string()).is_err());
         for (name, value) in envelope["backend"].as_object().unwrap() {
             let mut missing = envelope.clone();
             missing["backend"].as_object_mut().unwrap().remove(name);
@@ -4110,6 +4197,8 @@ mod tests {
         on.backend.delivers_preemption_timer_events = true;
         on.backend.runs_guest_code_between_injections = true;
         on.backend.reports_sigreturns = true;
+        assert_eq!(off.backend.rcb_clock_contract, None);
+        on.backend.rcb_clock_contract = Some(RcbClockContract::PerfCounterOnTargetThreadUserOnly);
         let json = to_legacy_backend_json(&on).unwrap();
         assert_eq!(json, to_legacy_backend_json(&off).unwrap());
         for key in [
@@ -4121,6 +4210,7 @@ mod tests {
             "delivers_preemption_timer_events",
             "runs_guest_code_between_injections",
             "reports_sigreturns",
+            "rcb_clock_contract",
         ] {
             assert!(!json.contains(key), "{json}");
         }
@@ -4139,6 +4229,7 @@ mod tests {
             assert!(!backend.delivers_preemption_timer_events);
             assert!(!backend.runs_guest_code_between_injections);
             assert!(!backend.reports_sigreturns);
+            assert_eq!(backend.rcb_clock_contract, None);
             assert_eq!(backend, legacy_expressible(BackendCapabilities::DBT));
         }
     }
@@ -5605,18 +5696,30 @@ mod tests {
         let config = config_wire_default();
         let fields = serde_json::to_value(config.backend).unwrap();
         let fields = fields.as_object().unwrap();
+        // One field is typed: the optional RCB clock contract, which the
+        // encoded default sets (`config_wire_default`). Every other is a bool,
+        // and any other non-bool fails here.
+        let contract = &fields["rcb_clock_contract"];
+        assert!(contract.is_string(), "{fields:?}");
+        let bools: Vec<&String> = fields
+            .keys()
+            .filter(|name| name.as_str() != "rcb_clock_contract")
+            .collect();
         assert!(
-            fields.values().all(serde_json::Value::is_boolean),
+            bools.iter().all(|name| fields[name.as_str()].is_boolean()),
             "{fields:?}"
         );
+        assert_eq!(bools.len() + 1, fields.len());
         let encode = |config: &Config| {
             bincode::serde::encode_to_vec(config, bincode::config::legacy()).unwrap()
         };
+        // A bool is one byte; the set contract is its `Some` tag and its
+        // four-byte variant index, so its width is in the encoded default.
         assert_eq!(
             bincode::serde::encode_to_vec(config.backend, bincode::config::legacy())
                 .unwrap()
                 .len(),
-            fields.len()
+            bools.len() + 1 + 4
         );
         // The backend's values are part of the encoded default.
         let flipped = config
@@ -5624,6 +5727,53 @@ mod tests {
             .with_backend(|backend| backend.supports_madvise = !backend.supports_madvise);
         assert_eq!(encode(&flipped).len(), encode(&config).len());
         assert_ne!(encode(&flipped), encode(&config));
+        // Every representable change to a capability changes the fingerprint:
+        // each bool flipped, and each other value of the contract.
+        let ours = wire_fingerprint_of(&config);
+        assert_eq!(ours, config_wire_fingerprint());
+        for name in bools {
+            let mut edited = fields.clone();
+            edited[name.as_str()] =
+                serde_json::Value::Bool(!fields[name.as_str()].as_bool().unwrap());
+            let backend: BackendCapabilities =
+                serde_json::from_value(serde_json::Value::Object(edited)).unwrap();
+            let changed = config.clone().with_backend(|b| *b = backend);
+            assert_ne!(wire_fingerprint_of(&changed), ours, "{name}");
+        }
+        let mut seen = BTreeSet::new();
+        for value in RCB_CLOCK_CONTRACTS {
+            let changed = config
+                .clone()
+                .with_backend(|backend| backend.rcb_clock_contract = value);
+            let fingerprint = wire_fingerprint_of(&changed);
+            assert_eq!(
+                fingerprint == ours,
+                value == config.backend.rcb_clock_contract,
+                "{value:?}"
+            );
+            assert!(seen.insert(fingerprint), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn every_backend_constant_states_a_listed_rcb_clock_contract() {
+        for backend in [
+            BackendCapabilities::PTRACE,
+            BackendCapabilities::E9PATCH,
+            BackendCapabilities::LITEINST_IN_GUEST,
+            BackendCapabilities::SABRE,
+            BackendCapabilities::DBT,
+            BackendCapabilities::KVM,
+        ] {
+            assert!(
+                RCB_CLOCK_CONTRACTS.contains(&backend.rcb_clock_contract),
+                "{backend:?}"
+            );
+        }
+        assert_eq!(
+            BackendCapabilities::PTRACE.rcb_clock_contract,
+            Some(RcbClockContract::PerfCounterOnTargetThreadUserOnly)
+        );
     }
 
     #[test]

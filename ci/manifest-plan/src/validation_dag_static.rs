@@ -1165,7 +1165,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the four replay_modes chaos-replay print_*nanosleep*_race cases no
     // longer ignored (https://github.com/rrnewton/hermit/pull/4657): 1850, listed.
     // Both histories combined on main a21f47d1 with c36b658e: 1852, listed.
-    ("test.regular_crates", 1852),
+    // The RCB clock contract pin: detcore-model
+    // config::tests::every_backend_constant_states_a_listed_rcb_clock_contract: 1853, listed.
+    ("test.regular_crates", 1853),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5534,7 +5536,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same four no-longer-ignored chaos-replay cases (https://github.com/rrnewton/hermit/pull/4657), outside
     // the hosted exclusions: 1836, listed.
     // Both histories combined on main a21f47d1 with c36b658e: 1838, listed.
-    ("test.regular_crates_on_host", 1838),
+    // And the same RCB clock contract test, not excluded: 1839, listed.
+    ("test.regular_crates_on_host", 1839),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

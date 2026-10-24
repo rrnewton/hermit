@@ -2683,8 +2683,16 @@ fi
 # Cargo.toml, Cargo.lock and rust-toolchain.toml, so the inventory, SDK and
 # native inputs, calibrated budget, job width and limits carry unchanged from
 # the 6f8fc22e entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 8b7ab5f3cbd2af2438d9c142aef486c5958ba05c ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 8b7ab5f3cbd2af2438d9c142aef486c5958ba05c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 77e4e4f43802b57101e3087ebf768351b36dd97d (2026-10-24): from
+# 8b7ab5f3cbd2af2438d9c142aef486c5958ba05c. Three unlanded F1 commits
+# (52640bca RCB event table, 71f292ea clock identity, 77e4e4f4 PMU-constructor
+# guard). They change reverie/src/{pmu.rs,pmu_config.rs,capabilities.rs} and
+# reverie-ptrace/src/{timer.rs,tracer.rs} only; git diff is empty under
+# reverie-dbt/ and third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory, SDK and native inputs, calibrated
+# budget, job width and limits carry unchanged from the 8b7ab5f3 entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 77e4e4f43802b57101e3087ebf768351b36dd97d ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 77e4e4f43802b57101e3087ebf768351b36dd97d (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
