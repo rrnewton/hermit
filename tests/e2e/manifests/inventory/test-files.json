@@ -3037,6 +3037,12 @@
       "why": "tests/c/unscheduled_exit_probe.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this probe of host-timed deaths (PR_SET_PDEATHSIG, a killed vfork parent), requires each in-guest LiteInst run to complete with its output, and requires verification to refuse with a recorded determinism loss; it remains a guest fixture because a generic manifest cannot express an expected verification refusal."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/untraced_clone.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/untraced_clone.c is owned by hermit-cli/tests/cli.rs: Guest that makes children with CLONE_UNTRACED in the shapes programs use, LeakSanitizer's exit-time helper (sharing memory, files and fs, no exit signal, waited for with __WALL), a fork-like child, a thread joined through CLONE_CHILD_CLEARTID and a clone3 child, and prints what it saw, so the integration test can compare a hermit run with a native one. Driven only by its own integration test, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/userfaultfd_self_service.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

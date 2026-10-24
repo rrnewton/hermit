@@ -3146,7 +3146,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // negative_count_on_unrecorded_received_descriptors): 163.
     // And tight_stack_received_inotify's test that an inotify descriptor
     // received and read on a tight stack is recorded and renumbered: 164.
-    ("test.detcore_misc", 164),
+    // And the eight untraced_clone tests (CLONE_UNTRACED children traced as
+    // every guest task is: the sanitizer helper, a process, a thread, clone3,
+    // a longer clone_args, a vfork on the caller's stack, a pidfd, and the
+    // sizes and faults Linux refuses): 172.
+    ("test.detcore_misc", 172),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -4323,7 +4327,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity, the ptrace
     // halves of https://github.com/rrnewton/hermit/issues/4798's two run_kvm_
     // tests: 632 + 2 = 634.
-    ("test.cli", 637),
+    // And the four an_untraced_*_runs_as_natively tests: 641.
+    ("test.cli", 641),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4850,7 +4855,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed.
     // And the same two ptrace group-exit signal-wait tests, not excluded:
     // 551 + 2 = 553.
-    ("test.cli_on_host", 556),
+    // And the same four an_untraced_*_runs_as_natively tests: 560.
+    ("test.cli_on_host", 560),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4924,7 +4930,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two A+ tests: 159.
     // And the same four F0a readdir_order variants: 163.
     // And the same tight-stack received-inotify test: 164.
-    ("test.detcore_misc_on_host", 164),
+    // And the same eight untraced_clone tests: 172.
+    ("test.detcore_misc_on_host", 172),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
