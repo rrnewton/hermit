@@ -4327,7 +4327,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // halves of https://github.com/rrnewton/hermit/issues/4798's two run_kvm_
     // tests: 632 + 2 = 634.
     // And short_timed_wait_pollers_do_not_inflate_a_cpu_bound_threads_time: 638.
-    ("test.cli", 638),
+    // And a_chaos_recording_of_short_timed_waits_replays_its_schedule_without_desync: 639.
+    ("test.cli", 639),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4856,7 +4857,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 551 + 2 = 553.
     // And short_timed_wait_pollers_do_not_inflate_a_cpu_bound_threads_time,
     // which is not among them: 557.
-    ("test.cli_on_host", 557),
+    // And a_chaos_recording_of_short_timed_waits_replays_its_schedule_without_desync,
+    // which is not among them either: 558.
+    ("test.cli_on_host", 558),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
