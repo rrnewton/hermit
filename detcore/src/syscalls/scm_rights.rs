@@ -527,8 +527,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Whether a receive through `call` completes in the caller's turn,
     /// decided before the call: the descriptor is one Detcore polls in turn
-    /// (`IOAction::NonblockizeRetry`) or one already nonblocking
-    /// (`IOAction::PassThru`). Any other receive runs on the background path
+    /// (`IOAction::NonblockizeRetry`), or one already nonblocking or a call
+    /// whose own flags keep it from waiting (`MSG_DONTWAIT`;
+    /// `IOAction::PassThru`). Any other receive runs on the background path
     /// (`BlockingExternalIO`: a physically blocking socket, or one Detcore
     /// keeps no model of), where other tasks run between the kernel's
     /// completion and the caller's continuation and could close or replace a

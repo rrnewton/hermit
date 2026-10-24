@@ -2803,6 +2803,12 @@
       "why": "tests/c/socket_cookie_unix.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/socket_dontwait.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/socket_dontwait.c is owned by hermit-cli/tests/cli.rs: msg_dontwait_returns_at_once_on_a_blocking_socket runs it natively, under ptrace with --strict and without, and its socketpair sections under record start --verify, and requires byte-identical output with a fixed expectation: on UDP, AF_UNIX datagram and stream socketpairs and TCP sockets left blocking, recvfrom, recvmsg, recvmmsg, sendto, sendmsg and sendmmsg with MSG_DONTWAIT return -1 EAGAIN at once with nothing queued or a full peer and the data when it is queued, while recvmmsg with MSG_WAITFORONE alone and a send without the flag still wait. It stays a fixture because the test compares native and Hermit output."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/socket_epoll_ordering.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
