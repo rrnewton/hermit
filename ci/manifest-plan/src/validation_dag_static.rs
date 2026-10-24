@@ -3175,7 +3175,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And 28 retained coherent mapping-capture controls: 339.
     // Split the five birth cases into separately bounded identities (+4): 343.
     // And two pure declared-Redis input controls in redis_strict: 345, listed.
-    ("test.hermit_integration_3", 345),
+    // Name the optional e9patch consumer leg separately; all ten legs remain (+1): 346.
+    ("test.hermit_integration_3", 346),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -5037,7 +5038,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 28 retained coherent mapping-capture controls: 685.
     // Split the five birth cases into separately bounded identities (+4): 689.
     // And two pure declared-Redis input controls in redis_strict: 691, listed.
-    ("test.hermit_integration_on_host", 691),
+    // Name the optional e9patch consumer leg separately; all ten legs remain (+1): 692.
+    ("test.hermit_integration_on_host", 692),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
