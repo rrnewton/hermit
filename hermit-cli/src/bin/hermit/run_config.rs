@@ -1059,6 +1059,10 @@ mod tests {
         ("tmp", &["--tmp=/tmp/guest tmp"]),
         ("image", &["--image=docker.io/library/busybox@sha256:00"]),
         ("seed-from", &["--seed-from=Args"]),
+        (
+            "chaos-seeded-timeslice",
+            &["--chaos", "--chaos-seeded-timeslice"],
+        ),
         ("verify", &["--verify"]),
         ("verify-verbose", &["--verify", "--verify-verbose"]),
         ("verify-strict", &["--verify", "--verify-strict"]),
