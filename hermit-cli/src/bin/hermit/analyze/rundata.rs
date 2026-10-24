@@ -263,19 +263,18 @@ impl RunData {
         self.is_a_match.is_some()
     }
 
-    /// Called after the run has been launched, normalize the output preemptions and swap around so
-    /// that our output file points to the normalized version.
-    pub fn normalize_preempts_out(&mut self) {
+    /// Write a normalized copy of the output preemption record, for reading
+    /// only, beside it, and return its path and contents. The run keeps its
+    /// own record: normalization renumbers priorities across the scheduler's
+    /// fixed ones, so the copy can replay another schedule.
+    pub fn write_normalized_preempts(&mut self) -> (PathBuf, PreemptionRecord) {
         assert!(self.has_launched());
-        let preempts_path = self.preempts_path_out();
-        let normalized_path = preempts_path.with_extension("normalized");
-
+        let normalized_path = self.preempts_path_out().with_extension("normalized");
         let normalized = self.preempts_out().normalize();
         normalized
             .write_to_disk(&normalized_path)
             .expect("write of preempts file to succeed");
-        self.in_mem_sched_out = Some(normalized);
-        self.sched_path_out = Some(normalized_path);
+        (normalized_path, normalized)
     }
 
     /// The global options a trial run is launched with. Trials go through
@@ -2719,5 +2718,46 @@ mod tests {
         ])
         .unwrap();
         refusal(&["--"]).unwrap();
+    }
+
+    /// The normalized copy of a run's preemption record is written beside it
+    /// for reading, and the run keeps its own record: the target endpoint
+    /// and --minimize's baseline replay the record that met the target.
+    /// Before, the run switched to the copy, whose renumbered priorities can
+    /// run another schedule, and a minimized record that met the target was
+    /// then "still not matching" it.
+    #[test]
+    fn a_normalized_record_is_written_for_reading_and_not_replayed() {
+        use detcore::preemptions::PreemptionRecord;
+        let workspace = tempfile::tempdir().unwrap();
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        let recorded = workspace.path().join("round_014.preempts");
+        let history = vec![
+            (detcore::types::LogicalTime::from_nanos(1_000), 352),
+            (detcore::types::LogicalTime::from_nanos(2_000), 4923),
+        ];
+        let record = PreemptionRecord::from_vecs(&std::collections::BTreeMap::from([(
+            detcore::DetTid::from_raw(7),
+            history,
+        )]));
+        record.write_to_disk(&recorded).unwrap();
+        let mut run = RunData::from_minimize_output(
+            &options,
+            "minimized".to_owned(),
+            RunData::get_raw_runopts(&options),
+            record.clone(),
+            recorded.clone(),
+            workspace.path().join("round_014.log"),
+        );
+        let (normalized_path, normalized) = run.write_normalized_preempts();
+        assert_eq!(
+            normalized_path,
+            workspace.path().join("round_014.normalized")
+        );
+        assert!(normalized_path.exists());
+        assert_ne!(normalized, record, "normalizing renumbers the priorities");
+        assert_eq!(run.preempts_path_out(), recorded.as_path());
+        assert_eq!(run.preempts_out(), &record);
     }
 }
