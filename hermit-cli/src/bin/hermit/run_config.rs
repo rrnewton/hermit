@@ -984,6 +984,13 @@ mod tests {
         ("replay-exhausted-panic", &["--replay-exhausted-panic"]),
         ("die-on-desync", &["--die-on-desync"]),
         (
+            "replay-continue-fairly",
+            &[
+                "--replay-schedule-from=/tmp/s.json",
+                "--replay-continue-fairly",
+            ],
+        ),
+        (
             "stacktrace-event",
             &["--stacktrace-event=3", "-s", "5,/tmp/st.txt"],
         ),

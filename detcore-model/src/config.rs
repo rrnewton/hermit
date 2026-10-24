@@ -821,6 +821,27 @@ pub struct Config {
     #[serde(default)]
     #[clap(long, requires = "replay_preemptions_from")]
     pub replay_edited_preemptions: bool,
+    /// Once the schedule replayed from `--replay-schedule-from` runs out,
+    /// order the threads queued in turn at each priority by the virtual time
+    /// each has run since then, least first, and equal run times by least
+    /// recent selection, instead of in queue order. A thread's run time is
+    /// what its own clock has advanced since that point; a thread seen for
+    /// the first time, or runnable again after it was not, starts at no less
+    /// than the least run time of the runnable threads. That is all it
+    /// changes: a selected thread still runs until its slice ends, there is no
+    /// preemption on wakeup, and threads pushed to the front of the queue (a
+    /// timed wake) and pollers keep their places. Without it threads of equal
+    /// priority take turns, so a thread that only computes or reads the clock
+    /// keeps the CPU for a whole timeslice at each committing call of another.
+    /// It reads nothing from the recording and draws nothing at random, so
+    /// the rest of the run is as neutral as without it: what happens there
+    /// depends only on the replayed prefix.
+    #[clap(
+        long,
+        requires = "replay_schedule_from",
+        conflicts_with_all = ["chaos", "replay_exhausted_panic"]
+    )]
+    pub replay_continue_fairly: bool,
 
     /// Given schedule events traced on recording or replaying, print the stack trace at the moment
     /// after the Nth event in the trace. Optionally, provide an output file into which the stack
@@ -2118,6 +2139,8 @@ impl fmt::Display for Config {
         }
         if self.replay_edited_preemptions {
             write!(f, " --replay-edited-preemptions")?;
+        if self.replay_continue_fairly {
+            write!(f, " --replay-continue-fairly")?;
         }
         for (index, path) in &self.stacktrace_event {
             write!(f, " --stacktrace-event={}", index)?;
@@ -3574,6 +3597,9 @@ mod legacy_backend_json {
         // `detlog_anon` came after it too: a coordinator-side ptrace-only
         // diagnostic the other backends refuse, so it is never written and
         // reads as absent, its serde default.
+    /// `replay_continue_fairly` came after it too; only the scheduler reads
+    /// it, so it is never written and reads as false.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 33] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3618,6 +3644,7 @@ mod legacy_backend_json {
         "access_trace_from",
         "access_trace_max_records",
         "access_trace_max_bytes",
+        "replay_continue_fairly",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3764,6 +3791,7 @@ mod legacy_backend_json {
                     | "notice_host_network_abstract_binds"
                     | "replay_edited_preemptions"
                     | "eager_lone_preemptions",
+                    | "replay_continue_fairly",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is; and 0, the default.
                 Some("in_guest_reserved_signals" | "access_trace_from") => {
@@ -4115,6 +4143,7 @@ mod legacy_backend_json {
                 | "access_trace_from"
                 | "access_trace_max_records"
                 | "access_trace_max_bytes" => Ok(()),
+                | "replay_continue_fairly" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -5020,6 +5049,7 @@ mod tests {
                 | "access_trace_from"
                 | "access_trace_max_records"
                 | "access_trace_max_bytes" => {}
+                | "replay_continue_fairly" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -5058,6 +5088,11 @@ mod tests {
         // forty-three fewer, so twenty-nine keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
         assert_eq!(fields.len(), keys.len() + 29);
+        // `annotated_priority_replay`, `virtual_cpus`,
+        // `notice_host_network_abstract_binds`, `replay_continue_fairly` and
+        // `strict_schedule_boundaries` none: fourteen more keys and thirty-two
+        // fewer, so eighteen keys fewer than fields.
+        assert_eq!(fields.len(), keys.len() + 18);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:

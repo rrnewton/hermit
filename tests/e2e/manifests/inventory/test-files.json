@@ -553,6 +553,12 @@
       "why": "tests/c/fadvise_hints.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/fair_continuation.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/fair_continuation.c is owned by hermit-cli/tests/cli.rs: the CLI test a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write replays an empty schedule with and without --replay-continue-fairly and requires the guest's rounds of writes beside a clock-reading spinner to take at least five 20 ms timeslices of virtual time in turn and less than two in the fair order, and, with the main thread spinning and the writer sleeping after each line, at most two thirds of the time in turn. It stays a fixture because a generic manifest cannot compare runs with different options."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/fallocate_extents.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

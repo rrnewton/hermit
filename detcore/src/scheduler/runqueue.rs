@@ -165,6 +165,10 @@ pub enum PollerRestore {
     NotQueued,
 }
 
+/// The first queue turn of an entry ordered by run time
+/// ([`RunQueue::order_by_run_time`]), far above any turn `push_back` hands out.
+const RUN_TIME_TURNS: RoundRobinTurn = 1 << 61;
+
 /// After queueing this many new tasks, perform a "poll upgrade," in which
 /// we upgrade all outstanding polling tasks their original priority levels,
 /// temporarily negating backoff behavior.
@@ -643,7 +647,85 @@ impl RunQueue {
                 entry.value.poll_upgrade = Some(current_priority);
             }
         }
+        // An entry ordered by run time may find its old turn taken: the order
+        // hands those turns out again at every selection. It takes the next
+        // free one, and the next selection orders it again.
+        if entry.key.turn >= RUN_TIME_TURNS {
+            while self.queue.contains_key(&entry.key) {
+                entry.key.turn += 1;
+            }
+        }
         assert!(self.queue.insert(entry.key, entry.value).is_none());
+    }
+
+    /// Whether an entry is in round-robin order at an ordinary band: neither
+    /// pushed to the front of its band (a time event, an eager readmission)
+    /// nor a poller, backed off or restored from its backoff. These are the
+    /// entries [`Self::order_by_run_time`] orders.
+    fn in_round_robin_order(key: &PrioritizedOrder, value: &QueueValue) -> bool {
+        key.turn >= 0
+            && key.priority != EAGER_IO_REPOLL_PRIORITY
+            && value.poll_upgrade.is_none()
+            && !value.deadline_restored
+    }
+
+    /// The threads queued in round-robin order at an ordinary band, in
+    /// thread order ([`Self::order_by_run_time`]). Read-only.
+    pub(super) fn round_robin_tids(&self) -> Vec<DetTid> {
+        let mut tids: Vec<DetTid> = self
+            .queue
+            .iter()
+            .filter(|(key, value)| Self::in_round_robin_order(key, value))
+            .map(|(_, value)| value.tid)
+            .collect();
+        tids.sort();
+        tids
+    }
+
+    /// Order the round-robin entries of `order`'s threads within their bands
+    /// by their sort keys, least first, and equal keys by thread order. Their
+    /// queue turns move to a range far above any turn `push_back` hands out,
+    /// so they never meet one; the entries this leaves alone (pushed to the
+    /// front, pollers, pollers restored from their backoff) keep their turns,
+    /// which are ahead of every ordered entry of their band.
+    pub(super) fn order_by_run_time(&mut self, order: &[(DetTid, (u64, u64))]) {
+        assert!(self.tentative_selection.is_none());
+        let wanted: BTreeMap<DetTid, (u64, u64)> = order.iter().copied().collect();
+        let keys: Vec<PrioritizedOrder> = self
+            .queue
+            .iter()
+            .filter(|(key, value)| {
+                wanted.contains_key(&value.tid) && Self::in_round_robin_order(key, value)
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        let mut moved: Vec<(Priority, (u64, u64), QueueValue)> = keys
+            .into_iter()
+            .map(|key| {
+                let value = self.queue.remove(&key).expect("located queue entry");
+                (key.priority, wanted[&value.tid], value)
+            })
+            .collect();
+        moved.sort_by_key(|(priority, sort_key, value)| (*priority, *sort_key, value.tid));
+        // Every ordered entry of these bands was taken out, and they go back
+        // in order, so each takes its run time's turn or the turn after the
+        // previous one in its band, whichever is later.
+        let mut last: Option<PrioritizedOrder> = None;
+        for (priority, (run_time, _), value) in moved {
+            let offset = RoundRobinTurn::try_from(run_time).unwrap_or(RoundRobinTurn::MAX);
+            let mut turn = RUN_TIME_TURNS.saturating_add(offset.min(RUN_TIME_TURNS));
+            if let Some(previous) = last
+                && previous.priority == priority
+            {
+                turn = turn.max(previous.turn + 1);
+            }
+            let mut key = PrioritizedOrder { priority, turn };
+            while self.queue.contains_key(&key) {
+                key.turn += 1;
+            }
+            assert!(self.queue.insert(key, value).is_none());
+            last = Some(key);
+        }
     }
 
     /// Remove `tid` from the queue, returning true if removal ocurred.
@@ -945,6 +1027,10 @@ impl RunQueue {
     /// older round-robin turn instead let it overtake a thread that became
     /// runnable before its deadline. The move is a queueing operation: it
     /// takes a new back turn and counts toward the poll-upgrade interval.
+    /// Under `--replay-continue-fairly`, past the end of a replayed schedule,
+    /// the threads ordered by run time sit behind every turn this hands out,
+    /// so a restored poller goes ahead of them
+    /// ([`Self::order_by_run_time`]).
     ///
     /// Mutating operation: this will error if a tentative_pop/commit transaction is underway.
     pub fn restore_poller_priority(&mut self, tid: DetTid) -> PollerRestore {
@@ -1051,6 +1137,24 @@ impl Default for RunQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An entry ordered by run time and suspended finds its turn taken by
+    /// another entry ordered to the same run time meanwhile; restoring it
+    /// takes the next free turn, behind that entry.
+    #[test]
+    fn a_restored_entry_ordered_by_run_time_takes_the_next_free_turn() {
+        let mut queue = RunQueue::new(SchedHeuristic::None, 0, 0.0);
+        let (first, second) = (DetTid::from_raw(3), DetTid::from_raw(5));
+        queue.push_back(first, DEFAULT_PRIORITY);
+        queue.push_back(second, DEFAULT_PRIORITY);
+        queue.order_by_run_time(&[(first, (5, 0)), (second, (9, 0))]);
+        let suspended = queue.suspend(first, DEFAULT_PRIORITY).expect("queued");
+        queue.order_by_run_time(&[(second, (5, 0))]);
+        queue.restore(suspended, DEFAULT_PRIORITY);
+        assert_eq!(queue.tentative_pop_next(), Some(second));
+        queue.commit_tentative_pop();
+        assert_eq!(queue.tentative_pop_next(), Some(first));
+    }
 
     /// `restore_poller_priority` restores one backed-off poller to its recorded
     /// priority at the back of that level: behind a thread queued before the
