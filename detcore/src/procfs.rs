@@ -2472,7 +2472,7 @@ impl ProcfsFile {
         }
         self.contents = Some(match &self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, Some((virtual_pid, virtual_ppid))),
-            ProcfsKind::Status => sanitize_status(
+            ProcfsKind::Status => sanitize_status_with_affinity(
                 &contents,
                 Some((virtual_pid, virtual_pid, virtual_ppid)),
                 published_sigblk,
@@ -2488,7 +2488,7 @@ impl ProcfsFile {
                 let (tgid, tid, ppid) = self
                     .bound_thread_identity
                     .expect("thread-self status was not bound when opened");
-                sanitize_status(
+                sanitize_status_with_affinity(
                     &contents,
                     Some((tgid, tid, ppid)),
                     published_sigblk,
@@ -2504,7 +2504,8 @@ impl ProcfsFile {
             }
             ProcfsKind::Statm => sanitize_statm(&contents),
             ProcfsKind::ProcessStatus => {
-                let sanitized = sanitize_status(&contents, None, published_sigblk, cpus_allowed);
+                let sanitized =
+                    sanitize_status_with_affinity(&contents, None, published_sigblk, cpus_allowed);
                 match &self.guest_numbers {
                     Some(numbers) => renumber_status(&sanitized, numbers),
                     None => sanitized,
@@ -3321,6 +3322,18 @@ fn sanitize_statm(contents: &[u8]) -> Vec<u8> {
     b"0 0 0 0 0 0 0\n".to_vec()
 }
 
+/// A status on Hermit's historical single CPU
+/// ([`sanitize_status_with_affinity`] with no affinity), as the tests of the
+/// status's other lines spell it.
+#[cfg(test)]
+fn sanitize_status(
+    contents: &[u8],
+    virtual_identity: Option<(i32, i32, i32)>,
+    published_sigblk: Option<u64>,
+) -> Vec<u8> {
+    sanitize_status_with_affinity(contents, virtual_identity, published_sigblk, None)
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#553)
 // TODO-HUMAN-REVIEW(PR-723): Review /proc status identity field normalization.
@@ -3328,7 +3341,7 @@ fn sanitize_statm(contents: &[u8]) -> Vec<u8> {
 /// and the machine's CPU count, the `nr_cpu_ids` bits Linux prints
 /// `Cpus_allowed` with (`task_cpus_allowed`, fs/proc/array.c); `None` reports
 /// Hermit's historical single CPU in a 128-bit mask.
-fn sanitize_status(
+fn sanitize_status_with_affinity(
     contents: &[u8],
     virtual_identity: Option<(i32, i32, i32)>,
     published_sigblk: Option<u64>,
@@ -7300,7 +7313,7 @@ Rss:                   4 kB\n" as &[u8];
     fn status_normalizes_affinity_and_context_switches() {
         let input = b"Name:\tcat\nTgid:\t1234\nPid:\t1234\nPPid:\t1200\nTracerPid:\t0\nNStgid:\t1234\nNSpid:\t1234\nNSpgid:\t1200\nNSsid:\t1190\nSigQ:\t426/2042342\nVmHWM:\t1572 kB\nVmRSS:\t1568 kB\nRssFile:\t1452 kB\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\nMems_allowed:\t00000000,00000003\nMems_allowed_list:\t0-1\nvoluntary_ctxt_switches:\t120\nnonvoluntary_ctxt_switches:\t3\n";
         assert_eq!(
-            sanitize_status(input, Some((3, 3, 1)), None, None),
+            sanitize_status(input, Some((3, 3, 1)), None),
             b"Name:\tcat\nTgid:\t3\nPid:\t3\nPPid:\t1\nTracerPid:\t1\nNStgid:\t3\nNSpid:\t3\nNSpgid:\t0\nNSsid:\t0\nSigQ:\t0/0\nVmHWM:\t0 kB\nVmRSS:\t0 kB\nRssFile:\t0 kB\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\nMems_allowed:\t00000000,00000001\nMems_allowed_list:\t0\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n"
         );
     }
@@ -7342,7 +7355,7 @@ Rss:                   4 kB\n" as &[u8];
         );
         let status = b"Name:\thermit\nState:\tR (running)\nPid:\t1\nPPid:\t0\nVmSize:\t249000 kB\nVmRSS:\t30000 kB\n";
         assert_eq!(
-            sanitize_status(status, None, None, None),
+            sanitize_status(status, None, None),
             b"Name:\thermit\nState:\tS (sleeping)\nPid:\t1\nPPid:\t0\nVmSize:\t0 kB\nVmRSS:\t0 kB\n"
         );
     }
@@ -7354,11 +7367,11 @@ Rss:                   4 kB\n" as &[u8];
     fn a_status_reports_the_described_threads_affinity() {
         let status = b"Pid:\t5\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\n";
         assert_eq!(
-            String::from_utf8(sanitize_status(status, None, None, None)).unwrap(),
+            String::from_utf8(sanitize_status(status, None, None)).unwrap(),
             "Pid:\t5\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\n"
         );
         assert_eq!(
-            String::from_utf8(sanitize_status(
+            String::from_utf8(sanitize_status_with_affinity(
                 status,
                 None,
                 None,
@@ -7369,7 +7382,13 @@ Rss:                   4 kB\n" as &[u8];
         );
         let pinned = CpuSet::from_mask_bytes(&[0b1010_0000]);
         assert_eq!(
-            String::from_utf8(sanitize_status(status, None, None, Some((pinned, 8)))).unwrap(),
+            String::from_utf8(sanitize_status_with_affinity(
+                status,
+                None,
+                None,
+                Some((pinned, 8))
+            ))
+            .unwrap(),
             "Pid:\t5\nCpus_allowed:\ta0\nCpus_allowed_list:\t5,7\n"
         );
     }
@@ -7383,11 +7402,11 @@ Rss:                   4 kB\n" as &[u8];
     fn a_status_reports_the_published_guest_mask_as_sigblk() {
         let status = b"Name:\tworker\nPid:\t5\nSigPnd:\t0000000000000000\nSigBlk:\tfffffffe7ffb7eef\nSigIgn:\t0000000000000000\n";
         assert_eq!(
-            sanitize_status(status, None, Some(0x800), None),
+            sanitize_status(status, None, Some(0x800)),
             b"Name:\tworker\nPid:\t5\nSigPnd:\t0000000000000000\nSigBlk:\t0000000000000800\nSigIgn:\t0000000000000000\n"
         );
         assert_eq!(
-            sanitize_status(status, None, None, None),
+            sanitize_status(status, None, None),
             status.to_vec(),
             "with nothing published, the kernel's mask stands"
         );
