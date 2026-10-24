@@ -1622,6 +1622,15 @@ mod tests {
             Some("/root")
         );
         assert_eq!(
+            env.get(OsStr::new("USER")).and_then(|value| value.to_str()),
+            Some("root")
+        );
+        assert_eq!(
+            env.get(OsStr::new("LOGNAME"))
+                .and_then(|value| value.to_str()),
+            Some("root")
+        );
+        assert_eq!(
             env.get(OsStr::new("HOSTNAME"))
                 .and_then(|value| value.to_str()),
             Some("hermetic-container.local")

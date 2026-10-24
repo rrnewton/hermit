@@ -148,6 +148,7 @@ static DBT_STDERR_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_LOG_ENV_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_GUEST_ENVIRONMENT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static ABSTRACT_UNIX_BIND_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static MINIMAL_ENV_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -609,6 +610,31 @@ fn host_network_abstract_bind_notices(output: &Output) -> Vec<String> {
         .filter(|line| line.starts_with("hermit: NOTICE: the guest"))
         .map(str::to_owned)
         .collect()
+}
+
+fn minimal_env_identity_guest() -> &'static Path {
+    MINIMAL_ENV_IDENTITY_GUEST.get_or_init(|| {
+        let build_root = process_build_root("minimal-env-identity");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create minimal-environment identity guest directory");
+        let guest = build_root.join("minimal_env_identity");
+        let output = Command::new("cc")
+            .args(["-O2", "-Wall", "-Wextra", "-Werror"])
+            .arg(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal_env_identity.c"),
+            )
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile minimal-environment identity guest");
+        assert!(
+            output.status.success(),
+            "minimal-environment identity guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
 }
 
 fn read_terminal_dbt_verdict(path: &Path) -> serde_json::Value {
@@ -15324,8 +15350,8 @@ fn namespace_only_applies_minimal_and_explicit_environment() {
         "--",
         "/bin/sh",
         "-c",
-        "printf 'home=%s\\nhostname=%s\\npath=%s\\nexplicit=%s\\nhost=%s\\nasan=%s\\nlsan=%s\\n' \
-         \"${HOME-UNSET}\" \"${HOSTNAME-UNSET}\" \"${PATH-UNSET}\" \
+        "printf 'home=%s\\nuser=%s\\nlogname=%s\\nhostname=%s\\npath=%s\\nexplicit=%s\\nhost=%s\\nasan=%s\\nlsan=%s\\n' \
+         \"${HOME-UNSET}\" \"${USER-UNSET}\" \"${LOGNAME-UNSET}\" \"${HOSTNAME-UNSET}\" \"${PATH-UNSET}\" \
          \"${NAMESPACE_ONLY_EXPLICIT-UNSET}\" \"${NAMESPACE_ONLY_HOST_ONLY-UNSET}\" \
          \"${ASAN_OPTIONS-UNSET}\" \"${LSAN_OPTIONS-UNSET}\"",
     ];
@@ -15341,11 +15367,67 @@ fn namespace_only_applies_minimal_and_explicit_environment() {
     assert_success(&output, &args);
     assert_eq!(
         stdout(&output),
-        "home=/root\nhostname=hermetic-container.local\n\
+        "home=/root\nuser=root\nlogname=root\nhostname=hermetic-container.local\n\
          path=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n\
          explicit=present\nhost=UNSET\nasan=UNSET\nlsan=UNSET\n"
     );
     assert_eq!(stderr(&output), "");
+}
+
+/// `--base-env=minimal` names the guest's own identity in HOME, USER and
+/// LOGNAME: the user `getpwuid(getuid())` returns in the guest, root (uid 0)
+/// with home directory /root. USER and LOGNAME used to be unset, so a guest
+/// that used `getenv("USER")` without a NULL check crashed only under Hermit.
+#[test]
+fn run_minimal_base_env_names_the_guests_own_user_and_home() {
+    let _guard = hermit_run_guard();
+    let guest = minimal_env_identity_guest()
+        .to_str()
+        .expect("minimal-environment identity guest path should be UTF-8");
+    let args = ["run", "--base-env=minimal", "--", guest];
+    let output = hermit(&args);
+
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "uid=0\nHOME=/root\nUSER=root\nLOGNAME=root\npw_name=root\npw_dir=/root\n\
+         HOME is a directory: yes\nidentity agrees\n"
+    );
+}
+
+/// `--env` replaces the `--base-env=minimal` values it names and leaves the
+/// rest, and the guest then reports each disagreement with its user database,
+/// which shows that its check can fail.
+#[test]
+fn run_explicit_env_replaces_the_minimal_user_and_home() {
+    let _guard = hermit_run_guard();
+    let guest = minimal_env_identity_guest()
+        .to_str()
+        .expect("minimal-environment identity guest path should be UTF-8");
+    let args = [
+        "run",
+        "--base-env=minimal",
+        "--env=USER=builder",
+        "--env=HOME=/tmp",
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "hermit {args:?} should exit with the guest's status 1\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output),
+    );
+    assert_eq!(
+        stdout(&output),
+        "uid=0\nHOME=/tmp\nUSER=builder\nLOGNAME=root\npw_name=root\npw_dir=/root\n\
+         HOME is a directory: yes\n\
+         disagrees: HOME=/tmp, user database /root\n\
+         disagrees: USER=builder, user database root\n"
+    );
 }
 
 #[test]

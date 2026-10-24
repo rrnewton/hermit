@@ -1006,6 +1006,29 @@ same way and keeps the network the recording used.
 Environment controls include `--base-env=empty`, `--base-env=minimal`,
 `--base-env=host`, `-e NAME[=VALUE]`, and `--workdir=PATH`.
 
+`--base-env=minimal` gives the guest exactly these variables, with the same
+values on every host, plus the `ASAN_OPTIONS` and `LSAN_OPTIONS` leak-check
+overrides every instrumented guest gets:
+
+| Variable | Value |
+| --- | --- |
+| `HOSTNAME` | `hermetic-container.local` |
+| `PATH` | `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` |
+| `HOME` | `/root` |
+| `USER` | `root` |
+| `LOGNAME` | `root` |
+
+`HOME`, `USER` and `LOGNAME` name the guest's own identity, as login sets them
+for a user: Hermit presents every guest user ID 0 (`getuid()` returns 0), and
+the guest's user database (`getpwuid(0)`) names that user `root` with home
+directory `/root`. A program that reads `USER` sees the same user as one that
+asks the user database. `/root` is usually the host's root home directory, which
+the guest can find but usually cannot list or write. Give a program that writes
+under its home directory a writable one, for example `-e HOME=/tmp`.
+`-e NAME=VALUE` replaces any of these values, and `--base-env=empty` sets none
+of them. `LANG`, `TERM`, `TZ` and `SHELL` are not set; pass them with `-e` when
+a program needs them.
+
 ## Logs And Run Summaries
 
 Global logging options go before the subcommand:
