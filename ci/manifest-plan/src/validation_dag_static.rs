@@ -1980,7 +1980,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4609 (rebased onto post-split main) adds ten hermit-run units
     // (nine in app::analyze::phases, one in app::analyze::rundata):
     // 1239 + 10 = 1249, measured by nextest list.
-    ("test.hermit_unit", 1252),
+    // And the bisection trials' checkpoints:
+    // phases::tests::a_bisection_trial_keeps_the_checkpoints_of_the_part_it_shares_with_an_endpoint: 1253.
+    ("test.hermit_unit", 1253),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6297,7 +6299,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the hosted CPUID-faulting skip set): 1327 + 2 = 1329.
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
-    ("test.hermit_unit_on_host", 1246),
+    // And the same bisection-trial checkpoint test: 1247.
+    ("test.hermit_unit_on_host", 1247),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
