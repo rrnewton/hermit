@@ -965,10 +965,27 @@ where
 /// is still queued, so a child that exits while its parent polls is such a
 /// signal, and so is the backend's own timer signal under `--imprecise-timers`.
 fn kernel_poll_result(call: &syscalls::Poll, result: Result<i64, Error>) -> Result<i64, Error> {
-    match result {
-        Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK)) => Err(call.kernel_restart_errno().into()),
-        result => result,
+    if poll_interrupted(&result) {
+        Err(call.kernel_restart_errno().into())
+    } else {
+        result
     }
+}
+
+/// Whether a signal ended a `poll` Detcore ran in the kernel: Linux's own
+/// `ERESTART_RESTARTBLOCK`, or `ERESTARTSYS` when the signal stopped the call
+/// before it ran (`Guest::inject`). Linux's poll never returns `ERESTARTSYS`
+/// (`do_poll` reports any signal as `-ERESTARTNOHAND`, which `poll` turns
+/// into `ERESTART_RESTARTBLOCK`), so both are the same interruption, and
+/// passing `ERESTARTSYS` on would let `SA_RESTART` rerun a poll that Linux
+/// ends with `EINTR`, and rerun a `restart_syscall` that keeps no record.
+fn poll_interrupted(result: &Result<i64, Error>) -> bool {
+    matches!(
+        result,
+        Err(Error::Errno(
+            Errno::ERESTART_RESTARTBLOCK | Errno::ERESTARTSYS
+        ))
+    )
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -4348,20 +4365,23 @@ mod tests {
 
     #[test]
     fn a_kernel_poll_without_a_deadline_restarts_by_running_again() {
-        let restart_block = || Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK));
-        for timeout in [0, -1] {
-            let call = syscalls::Poll::new().with_timeout(timeout);
+        // Linux's code, and a signal that stopped the call before it ran.
+        let interrupted = [Errno::ERESTART_RESTARTBLOCK, Errno::ERESTARTSYS];
+        for errno in interrupted {
+            for timeout in [0, -1] {
+                let call = syscalls::Poll::new().with_timeout(timeout);
+                assert!(matches!(
+                    kernel_poll_result(&call, Err(Error::Errno(errno))),
+                    Err(Error::Errno(Errno::ERESTARTNOHAND))
+                ));
+            }
+            // A positive timeout keeps its deadline in the kernel's restart block.
+            let timed = syscalls::Poll::new().with_timeout(5);
             assert!(matches!(
-                kernel_poll_result(&call, restart_block()),
-                Err(Error::Errno(Errno::ERESTARTNOHAND))
+                kernel_poll_result(&timed, Err(Error::Errno(errno))),
+                Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK))
             ));
         }
-        // A positive timeout keeps its deadline in the kernel's restart block.
-        let timed = syscalls::Poll::new().with_timeout(5);
-        assert!(matches!(
-            kernel_poll_result(&timed, restart_block()),
-            Err(Error::Errno(Errno::ERESTART_RESTARTBLOCK))
-        ));
         // Every other result is the call's own.
         let zero = syscalls::Poll::new().with_timeout(0);
         assert!(matches!(kernel_poll_result(&zero, Ok(2)), Ok(2)));
@@ -4370,8 +4390,8 @@ mod tests {
             Err(Error::Errno(Errno::EINTR))
         ));
         assert!(matches!(
-            kernel_poll_result(&zero, Err(Error::Errno(Errno::ERESTARTSYS))),
-            Err(Error::Errno(Errno::ERESTARTSYS))
+            kernel_poll_result(&zero, Err(Error::Errno(Errno::ERESTARTNOINTR))),
+            Err(Error::Errno(Errno::ERESTARTNOINTR))
         ));
     }
 
