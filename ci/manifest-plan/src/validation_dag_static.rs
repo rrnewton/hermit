@@ -1863,7 +1863,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_trial_that_a_bound_ends_did_not_reach_the_target,
     // an_unenforceable_trial_timeout_is_refused_and_auto_does_without} and
     // global_opts::tests::a_runs_log_bound_only_tightens_the_environment_bound: 1200.
-    ("test.hermit_unit", 1200),
+    // And the prefix search's continuation timeslice: phases::tests::{auto_continuations_only_get_coarser,
+    // the_prefix_search_continues_at_the_first_usable_timeslice} and
+    // rundata::tests::a_continuation_timeslice_that_would_change_the_prefix_is_refused: 1203.
+    ("test.hermit_unit", 1203),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5768,7 +5771,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same prefix-trial checkpoint test: 1186.
     // And the same one-thread prefix report test: 1187.
     // And the same seven analyze per-trial bound tests: 1194.
-    ("test.hermit_unit_on_host", 1194),
+    // And the same three continuation-timeslice tests: 1197.
+    ("test.hermit_unit_on_host", 1197),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

@@ -9,11 +9,14 @@
 // A race whose losing order cannot finish, for `hermit analyze`'s trials.
 // Two threads race to claim `winner`, and the program prints which one did.
 // When "b" won, it exits 0. When "a" won (the order the scheduler takes
-// without chaos), it then does what argv[1] says: "spin" yields for ever, and
+// without chaos at all but the tiniest timeslices), it exits 1, or does what
+// argv[1] says first: "spin" yields for ever, and
 // "refuse" sends its own process a signal through pidfd_send_signal while two
 // of its threads are alive, which Hermit refuses (exit 122) because Detcore
 // does not choose the receiving thread as Linux does
-// (https://github.com/rrnewton/hermit/issues/4034).
+// (https://github.com/rrnewton/hermit/issues/4034). With "late-a", thread a
+// takes about 20000 conditional branches before it claims, so a timeslice
+// shorter than that lets b win even without chaos.
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -24,6 +27,7 @@
 #include <unistd.h>
 
 static atomic_int winner;
+static int late_a;
 
 static void* idle(void* unused) {
   (void)unused;
@@ -34,6 +38,10 @@ static void* idle(void* unused) {
 }
 
 static void* claim(void* name) {
+  if (late_a && *(const char*)name == 'a') {
+    for (volatile int i = 0; i < 20000; i++) {
+    }
+  }
   int unclaimed = 0;
   atomic_compare_exchange_strong(&winner, &unclaimed, *(const char*)name);
   return NULL;
@@ -41,6 +49,7 @@ static void* claim(void* name) {
 
 int main(int argc, char** argv) {
   const char* then = argc > 1 ? argv[1] : "";
+  late_a = strcmp(then, "late-a") == 0;
   pthread_t a, b;
   pthread_create(&a, NULL, claim, "a");
   pthread_create(&b, NULL, claim, "b");
