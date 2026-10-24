@@ -601,6 +601,33 @@ impl AnalyzeOpts {
         RunData::get_raw_runopts(self).refuse_strict_trial_with_inexact_branch_counter()
     }
 
+    /// The warning for trials that go on without `--strict` on a
+    /// retired-branch counter that fails Reverie's validation, wherever
+    /// [`Self::refuse_strict_with_inexact_branch_counter`] refuses `--strict`
+    /// (`RunOpts::trial_inexact_branch_counter_warning`): a trial can then
+    /// disagree with another for a hardware reason, and a seed, preemption
+    /// record or schedule that analyze or bisect reports need not reproduce
+    /// its outcome.
+    pub fn trial_branch_counter_warning(&self) -> Option<String> {
+        RunData::get_raw_runopts(self).trial_inexact_branch_counter_warning()
+    }
+
+    /// The branch-counter check `analyze` and `bisect` make before any
+    /// workspace or trial, as `RunOpts::admit_branch_counter` does for a run:
+    /// [`Self::refuse_strict_with_inexact_branch_counter`], then
+    /// [`Self::trial_branch_counter_warning`] passed to `warn` (stderr in
+    /// `main`), once for all the trials, and kept in
+    /// `AnalyzeOpts::branch_counter_warning` for the final report.
+    pub fn admit_branch_counter(&mut self, warn: &mut dyn FnMut(&str)) -> anyhow::Result<()> {
+        self.refuse_strict_with_inexact_branch_counter()?;
+        let warning = self.trial_branch_counter_warning();
+        if let Some(warning) = &warning {
+            warn(warning);
+        }
+        self.branch_counter_warning = warning.map(|line| line.trim_end().to_owned());
+        Ok(())
+    }
+
     /// Installs the trials' `--skid-margin`, as `RunOpts::main` does for a
     /// run: Reverie's PMU configuration is per process, and every trial of
     /// one `analyze` or `bisect` runs in this process with the same run
@@ -1125,6 +1152,99 @@ mod tests {
             options(accepted, probe)
                 .refuse_strict_with_inexact_branch_counter()
                 .unwrap_or_else(|error| panic!("{accepted:?}: {error:#}"));
+        }
+    }
+
+    /// Without `--strict`, analyze and bisect trials on a counter that fails
+    /// Reverie's validation go on, and `admit_branch_counter` writes one
+    /// warning line for all of them and keeps it, without its newline, for the
+    /// final report (`branch_counter_warning`). With `--strict` they are
+    /// refused and nothing is written. A counter that passed, a backend that
+    /// does not read it, or trials without a timeslice write nothing: the
+    /// warning goes exactly where the `--strict` refusal would.
+    #[test]
+    fn trials_without_strict_warn_once_of_an_inexact_branch_counter() {
+        let options = |argv: &[&str], probe: fn() -> Option<String>| {
+            let args = crate::Args::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.apply_global(&args.global);
+            options.inexact_branch_counter = probe;
+            options
+        };
+        let admit = |options: &mut AnalyzeOpts| {
+            let mut lines = Vec::new();
+            let result =
+                options.admit_branch_counter(&mut |line: &str| lines.push(line.to_owned()));
+            (result, lines)
+        };
+        let inexact: fn() -> Option<String> = || Some("SpecLockMap is enabled".to_string());
+        let warning = crate::run::warning_for_an_inexact_branch_counter(
+            crate::run::CounterReader::Trials,
+            inexact,
+        )
+        .unwrap();
+        for warned in [
+            &["hermit", "analyze", "--", "/bin/true"][..],
+            &["hermit", "--backend=ptrace", "analyze", "--", "/bin/true"][..],
+        ] {
+            let mut options = options(warned, inexact);
+            let (result, lines) = admit(&mut options);
+            assert!(result.is_ok(), "{warned:?}: {result:?}");
+            assert_eq!(lines, std::slice::from_ref(&warning), "{warned:?}");
+            assert_eq!(
+                options.branch_counter_warning.as_deref(),
+                Some(warning.trim_end()),
+                "{warned:?}"
+            );
+        }
+
+        let mut strict = options(
+            &["hermit", "analyze", "--", "--strict", "/bin/true"],
+            inexact,
+        );
+        let (result, lines) = admit(&mut strict);
+        assert!(
+            result.is_err_and(|error| {
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some()
+            }),
+            "--strict refuses"
+        );
+        assert!(lines.is_empty(), "{lines:?}");
+        assert_eq!(strict.branch_counter_warning, None);
+
+        let unreachable: fn() -> Option<String> = || panic!("the counter is not consulted");
+        for (silent, probe) in [
+            (
+                &["hermit", "analyze", "--", "/bin/true"][..],
+                (|| None) as fn() -> _,
+            ),
+            (
+                &["hermit", "--backend=kvm", "analyze", "--", "/bin/true"][..],
+                unreachable,
+            ),
+            (
+                &[
+                    "hermit",
+                    "analyze",
+                    "--",
+                    "--max-timeslice=disabled",
+                    "/bin/true",
+                ][..],
+                unreachable,
+            ),
+        ] {
+            let mut options = options(silent, probe);
+            let (result, lines) = admit(&mut options);
+            assert!(
+                result.is_ok() && lines.is_empty(),
+                "{silent:?}: {result:?} {lines:?}"
+            );
+            assert_eq!(options.branch_counter_warning, None, "{silent:?}");
         }
     }
 
