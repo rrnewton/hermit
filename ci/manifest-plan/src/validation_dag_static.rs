@@ -3156,7 +3156,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And tool_global::tests::legacy_callback_checkpoint_at_the_pmu_epsilon_ends_an_expired_deadline_once
     // and tool_global::tests::legacy_chaos_replay_ends_an_expired_deadline_as_without_chaos
     // (the same two fixes through the hooks): 3005, listed.
-    ("test.detcore_unit", 3005),
+    // And tool_local::timeslice_tests::a_schedule_deadline_on_the_backstop_keeps_its_place
+    // (a schedule deadline that falls on the backstop is still the schedule's): 3006, listed.
+    ("test.detcore_unit", 3006),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5552,7 +5554,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same chaos schedule-replay unit: 3001, listed.
     // And the same two callback-checkpoint replay units: 2814, listed.
     // And the same two hook-level replay units: 3005, listed.
-    ("test.detcore_unit_on_host", 3005),
+    // And the same backstop-coincidence unit: 3006, listed.
+    ("test.detcore_unit_on_host", 3006),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
