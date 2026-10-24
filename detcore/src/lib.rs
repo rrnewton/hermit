@@ -4109,6 +4109,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                     end_of_timeslice: None,
                     replay_rcb_end: None,
+                    replay_ends_at_check_in: false,
                     // AUTONOMOUS-BOT-IMPLEMENTED
                     // TODO-HUMAN-REVIEW(PR-1151)
                     chaos_epoch: tool_local::chaos_epoch_sentinel(),
