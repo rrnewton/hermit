@@ -71,6 +71,15 @@ pub struct PreemptionRecord {
     /// Absent in old/edited recordings; never inferred from time or branch counts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
+    /// The `--rng-seed` of the run that produced this record.
+    ///
+    /// It decides what the guest reads as randomness, so the recorded schedule
+    /// only describes a guest that read the same values: `--seed` sets it too, so
+    /// a replay at another `--seed` would otherwise hand the guest other values.
+    /// `None` for records written before the field existed, and for records
+    /// synthesized in memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rng_seed: Option<u64>,
 }
 
 impl std::fmt::Display for PreemptionRecord {
@@ -90,6 +99,7 @@ impl PreemptionRecord {
             pipe_wake_latency: None,
             signal_state_copy: None,
             callback_checkpoints: BTreeMap::new(),
+            rng_seed: None,
         }
     }
 
@@ -194,6 +204,7 @@ impl PreemptionRecord {
             pipe_wake_latency: self.pipe_wake_latency,
             signal_state_copy: self.signal_state_copy,
             callback_checkpoints: BTreeMap::new(),
+            rng_seed: self.rng_seed,
         }
     }
 
@@ -254,6 +265,7 @@ impl PreemptionRecord {
             pipe_wake_latency: None,
             signal_state_copy: None,
             callback_checkpoints: BTreeMap::new(),
+            rng_seed: None,
         }
     }
 
@@ -1287,6 +1299,13 @@ impl PreemptionWriter {
         self
     }
 
+    /// Store the seed of the guest's randomness, so a replay can hand the guest
+    /// the same values.
+    pub fn with_rng_seed(mut self, rng_seed: u64) -> Self {
+        self.inner.rng_seed = Some(rng_seed);
+        self
+    }
+
     /// Does the record have zero entries?
     pub fn is_empty(&self) -> bool {
         self.inner.per_thread.is_empty()
@@ -1546,6 +1565,18 @@ pub fn read_recorded_epoch(path: &Path) -> Result<Option<DateTime<Utc>>, String>
         epoch: Option<DateTime<Utc>>,
     }
     Ok(boundary_recording::read_settings::<EpochOnly>(path)?.epoch)
+}
+
+/// Read only the `--rng-seed` stored in a preemption record file, as
+/// [`read_recorded_epoch`] reads the epoch. `Ok(None)` means the record predates
+/// the field.
+pub fn read_recorded_rng_seed(path: &Path) -> Result<Option<u64>, String> {
+    #[derive(Deserialize)]
+    struct RngSeedOnly {
+        #[serde(default)]
+        rng_seed: Option<u64>,
+    }
+    Ok(boundary_recording::read_settings::<RngSeedOnly>(path)?.rng_seed)
 }
 
 /// Read only the `--pipe-wake-latency` stored in a preemption record file, as
