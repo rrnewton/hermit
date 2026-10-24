@@ -155,6 +155,7 @@ deterministic execution.
 | Message | Class | Trigger | Fix |
 | --- | --- | --- | --- |
 | `cannot search through executions with --no-sequentialize-threads. Determinism required` | Configuration | Analyze was asked to search without deterministic scheduling. | Remove `--no-sequentialize-threads`. |
+| `the replay of --run1-preemptions ... did not meet the target criteria` | Configuration | The record did not reproduce the target under these run arguments. | Pass the run arguments the record was made with after `--`, `--seed` included, or identify the target with `--run1-seed`. |
 | `FAILED. The run did not match the target criteria. Try --search.` | Configuration | A single analyze execution did not satisfy its target predicate. | Correct the predicate/input or add `--search`. |
 | `First run matched criteria but second run did not` | Configuration | A supposed target execution is not reproducible. | Fix external inputs and unsupported calls before minimizing. Pin `--analyze-seed` and workload inputs. |
 | `--selfcheck requires perfect reproducibility` | Configuration | Repeated logs differed during analyzer self-check. | Stabilize the workload. Removing `--selfcheck` only disables the diagnostic. |

@@ -152,6 +152,9 @@ pub struct AnalyzeOpts {
     pub run1_seed: Option<u64>,
 
     /// Load target execution from hermit run --record-preemptions-to.
+    ///
+    /// Analyze replays the record as the target run. It is an error if that replay does not meet
+    /// the indicated target criteria.
     #[clap(
         long,
         conflicts_with = "run1_seed",
@@ -232,12 +235,13 @@ pub struct AnalyzeOpts {
     #[clap(long, value_name = "PATH")]
     pub tmp_dir: Option<PathBuf>,
 
-    /// Wall-clock bound, in seconds, on each run after the target run: `auto` (the default), a
-    /// number of seconds, or `off`.
+    /// Wall-clock bound, in seconds, on each run after the target run (and, when explicit, on the
+    /// replay of a `--run1-preemptions` record): `auto` (the default), a number of seconds, or
+    /// `off`.
     ///
     /// A replayed or spliced schedule can leave the guest spinning, or waiting for an event that
-    /// never comes. The endpoint runs are measured: the target run (or, with
-    /// `--run1-preemptions`, the first replay of its record) and the baseline run (from
+    /// never comes. The endpoint runs are measured: the target run (with `--run1-preemptions`, the
+    /// replay of its record) and the baseline run (from
     /// `--run2-seed`, `--run2-preemptions`, or the run without chaos). With `auto`, every run
     /// after the first measured one is bounded at max(60 s, 10 times the slowest endpoint run so
     /// far), the baseline run included. A trial that reaches the bound did not reach the target:

@@ -641,14 +641,14 @@ A replayed or spliced schedule can leave the guest spinning or waiting for an
 event that never comes, so once the target run has been measured, every later
 run is bounded: by default at max(60 s, 10 times the slowest endpoint run),
 which analyze prints (`--trial-timeout=SECONDS|auto|off`). With
-`--run1-preemptions` there is no target run to measure, so pass an explicit
-`--trial-timeout`; on a backend that does not enforce `--timeout`, bound the
-whole analysis from outside. A trial that reaches the
-bound counts as not reaching the target, and a baseline run that reaches it
-makes analyze search within the target schedule instead, as `--prefix-search`
-does. A trial that Hermit refuses when its guest reaches an operation Hermit
-does not support (exit 122) counts as not reaching the target too, with a
-warning; a refused target run still ends the analysis.
+`--run1-preemptions` the target run is a replay of the record, which an
+explicit `--trial-timeout=SECONDS` bounds too. On a backend that does not
+enforce `--timeout`, bound the whole analysis from outside. A trial that
+reaches the bound counts as not reaching the target, and a baseline run that
+reaches it makes analyze search within the target schedule instead, as
+`--prefix-search` does. A trial that Hermit refuses when its guest reaches an
+operation Hermit does not support (exit 122) counts as not reaching the target
+too, with a warning; a refused target run still ends the analysis.
 
 By default analyze bisects between the failing schedule and a passing one from
 another run. When the two runs differ in events only one of them executed (for
