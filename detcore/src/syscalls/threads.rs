@@ -58,6 +58,11 @@ use crate::syscalls::helpers::keep_restart_block;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::pi_futex;
+use crate::syscalls::pi_futex::LockPiStep;
+use crate::syscalls::pi_futex::PiFutexState;
+use crate::syscalls::pi_futex::PiHandOver;
+use crate::syscalls::pi_futex::UnlockPiStep;
 use crate::syscalls::robust_list;
 use crate::tool_global::FutexAction;
 use crate::tool_global::ResumeStatus;
@@ -1756,12 +1761,32 @@ fn parse_futex_timeout(futex_op: i32, timeout: Timespec) -> Result<FutexTimeout,
     // FUTEX_WAIT_BITSET (e.g. 0x89) must still be recognized as the BITSET
     // command; comparing the raw op would misclassify it as relative and add
     // the absolute deadline to the current time (leaking the epoch).
-    if futex_op & libc::FUTEX_CMD_MASK == libc::FUTEX_WAIT_BITSET {
+    //
+    // FUTEX_LOCK_PI and FUTEX_LOCK_PI2 take absolute deadlines too
+    // (`futex_init_timeout`, kernel/futex/syscalls.c:147-157 at v6.16).
+    if matches!(
+        futex_op & libc::FUTEX_CMD_MASK,
+        libc::FUTEX_WAIT_BITSET | libc::FUTEX_LOCK_PI | libc::FUTEX_LOCK_PI2
+    ) {
         Ok(FutexTimeout::Absolute(LogicalTime::from_nanos(
             timeout_nanos,
         )))
     } else {
         Ok(FutexTimeout::Relative(timeout_nanos))
+    }
+}
+
+/// The clock an absolute futex deadline is measured on: CLOCK_REALTIME with
+/// FUTEX_CLOCK_REALTIME, and always for FUTEX_LOCK_PI, which `do_futex` gives
+/// `FLAGS_CLOCKRT` (kernel/futex/syscalls.c:114-116 at v6.16); otherwise
+/// CLOCK_MONOTONIC.
+fn futex_deadline_clock(futex_op: i32) -> syscalls::ClockId {
+    if futex_op & libc::FUTEX_CLOCK_REALTIME != 0
+        || futex_op & libc::FUTEX_CMD_MASK == libc::FUTEX_LOCK_PI
+    {
+        syscalls::ClockId::CLOCK_REALTIME
+    } else {
+        syscalls::ClockId::CLOCK_MONOTONIC
     }
 }
 
@@ -1880,11 +1905,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(Some(deadline))
             }
             FutexTimeout::Absolute(deadline) => {
-                let clockid = if futex_flags & libc::FUTEX_CLOCK_REALTIME != 0 {
-                    syscalls::ClockId::CLOCK_REALTIME
-                } else {
-                    syscalls::ClockId::CLOCK_MONOTONIC
-                };
+                let clockid = futex_deadline_clock(futex_flags);
 
                 let mut stack = guest.stack().await;
                 let clock_output = syscalls::TimespecMutPtr(stack.reserve());
@@ -2844,12 +2865,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             match classify_futex_command(call.futex_op()) {
                 FutexCommand::Served => {}
                 FutexCommand::NoSys => return Err(Error::Errno(Errno::ENOSYS)),
-                FutexCommand::PriorityInheritance(name) => {
+                FutexCommand::RequeuePi(name) => {
                     return self
                         .refuse_futex_command(
                             guest,
                             name,
-                            "Detcore does not emulate priority-inheritance futexes",
+                            "Detcore does not emulate requeue-PI futexes (PI condition variables)",
                         )
                         .await;
                 }
@@ -2863,6 +2884,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             && !matches!(self.cfg.debug_futex_mode, BlockingMode::External)
         {
             let command = call.futex_op() & libc::FUTEX_CMD_MASK;
+            // The priority-inheritance lock commands read and write their word
+            // themselves, NULL included (EFAULT), and park on the precise
+            // model's waiter pool, which polling mode does not keep.
+            if let Some(name) = pi_lock_command_name(command) {
+                if matches!(self.cfg.debug_futex_mode, BlockingMode::Polling) {
+                    return self
+                        .refuse_futex_command(guest, name, POLLING_REFUSAL)
+                        .await;
+                }
+                // AUTONOMOUS-BOT-IMPLEMENTED
+                return if command == libc::FUTEX_UNLOCK_PI {
+                    self.handle_futex_unlock_pi(guest, call).await
+                } else {
+                    self.handle_futex_lock_pi(guest, call, command).await
+                };
+            }
             // FUTEX_WAKE and FUTEX_WAKE_BITSET only key their word too, and a
             // requeue can leave a modeled waiter on any admitted private key,
             // NULL or unmapped included, which a wake must still reach.
@@ -3055,86 +3092,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // can change the dispositions at any time, so the scheduler
                         // reads them when it commits a wake, not here
                         // (https://github.com/rrnewton/hermit/issues/3146).
-                        let signal_watch = if gated {
-                            // Under the gate: a deliverable signal pending at
-                            // the park, or still pending after a wake, ends the
-                            // wait with the futex's restart errno, its end
-                            // recorded for the restart checkpoint (D40).
-                            let state = match read_wait_signal_state(guest.pid(), guest.tid()) {
-                                Ok(state) => state,
-                                Err(error) => break Err(error),
-                            };
-                            let mask = super::helpers::gated_own_mask(guest, state.blocked);
-                            if let Some(end) = crate::wait_signal_end::wait_end(
-                                &state,
-                                mask,
-                                guest.config().in_guest_reserved_signals,
-                            ) {
-                                let errno = call.kernel_restart_errno();
-                                trace!(
-                                    "[detcore, dtid {}] futex wait ended under the in-guest delivery gate by {:?}: {:?}",
-                                    &dettid, end, errno
-                                );
-                                guest.thread_state_mut().wait_signal_end = Some(end);
-                                break Err(Error::Errno(errno));
-                            }
-                            // The futex wait files no `Resources` request, so
-                            // it publishes the guest's mask itself, before its
-                            // wait request, as every request does under the gate
-                            // (step 3c.1b, carried into 3c.1c): the scheduler's
-                            // readers then see this wait's mask, not an earlier
-                            // request's. None clears the entry, as at a request.
-                            let published = crate::tool_global::publish_request_guest_mask(
+                        let signal_watch = match self
+                            .futex_wait_signal_watch(
                                 guest,
-                                &Resources::new(dettid),
-                            );
-                            crate::tool_global::set_saved_guest_sigmask(guest, published).await;
-                            Some(FutexSignalWatch {
-                                unblocked: !mask
-                                    & !kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32),
-                                defers_default_stops: call.restart_keeps_deadline(),
-                                pid: guest.pid().as_raw(),
-                                tid: guest.tid().as_raw(),
-                            })
-                        } else if signal_interruption {
-                            // A failed read is never the call's errno
-                            // (`read_wait_signal_state`).
-                            let state = match read_wait_signal_state(guest.pid(), guest.tid()) {
-                                Ok(state) => state,
-                                Err(error) => break Err(error),
-                            };
-                            // A timed futex wait lets a default job-control stop
-                            // wait for its deadline (`KernelSignalState::interrupting_wait`).
-                            let defers_default_stops = call.restart_keeps_deadline();
-                            let host_timed = host_timed_signals(guest).await;
-                            let committed = std::mem::take(&mut committed_wake);
-                            let held = futex_wait_held_after_wake(host_timed, committed);
-                            let pending = futex_wait_pending_signals(
-                                guest,
-                                &state,
-                                state.pending_interrupting(state.blocked, defers_default_stops),
-                                held,
-                                host_timed,
-                                committed,
+                                call,
+                                gated,
+                                signal_interruption,
+                                &mut committed_wake,
                             )
-                            .await;
-                            if pending != 0 {
-                                let errno = call.kernel_restart_errno();
-                                trace!(
-                                    "[detcore, dtid {}] futex wait interrupted by pending signals {:#x}: {:?}",
-                                    &dettid, pending, errno
-                                );
-                                break Err(Error::Errno(errno));
-                            }
-                            Some(FutexSignalWatch {
-                                unblocked: !state.blocked
-                                    & !kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32),
-                                defers_default_stops,
-                                pid: guest.pid().as_raw(),
-                                tid: guest.tid().as_raw(),
-                            })
-                        } else {
-                            None
+                            .await
+                        {
+                            Ok(watch) => watch,
+                            Err(error) => break Err(error),
                         };
                         if rewait {
                             // No signal is pending for this thread, so Linux's
@@ -3223,6 +3192,377 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// The check a precise futex wait makes before it parks, and again in its
+    /// own turn after the scheduler woke it for a signal (see
+    /// `Self::handle_futex_blocking`): `Err` with the call's restart errno
+    /// when a signal pending for this thread ends the wait, otherwise what the
+    /// scheduler watches while the thread is parked. `committed_wake` holds the
+    /// signals the scheduler committed to this waiter at its last wake, which
+    /// this check counts and clears.
+    async fn futex_wait_signal_watch<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Futex,
+        gated: bool,
+        signal_interruption: bool,
+        committed_wake: &mut KernelSigset,
+    ) -> Result<Option<FutexSignalWatch>, Error> {
+        let dettid = guest.thread_state().dettid;
+        if gated {
+            // Under the gate: a deliverable signal pending at
+            // the park, or still pending after a wake, ends the
+            // wait with the futex's restart errno, its end
+            // recorded for the restart checkpoint (D40).
+            let state = read_wait_signal_state(guest.pid(), guest.tid())?;
+            let mask = super::helpers::gated_own_mask(guest, state.blocked);
+            if let Some(end) = crate::wait_signal_end::wait_end(
+                &state,
+                mask,
+                guest.config().in_guest_reserved_signals,
+            ) {
+                let errno = call.kernel_restart_errno();
+                trace!(
+                    "[detcore, dtid {}] futex wait ended under the in-guest delivery gate by {:?}: {:?}",
+                    &dettid, end, errno
+                );
+                guest.thread_state_mut().wait_signal_end = Some(end);
+                return Err(Error::Errno(errno));
+            }
+            // The futex wait files no `Resources` request, so
+            // it publishes the guest's mask itself, before its
+            // wait request, as every request does under the gate
+            // (step 3c.1b, carried into 3c.1c): the scheduler's
+            // readers then see this wait's mask, not an earlier
+            // request's. None clears the entry, as at a request.
+            let published =
+                crate::tool_global::publish_request_guest_mask(guest, &Resources::new(dettid));
+            crate::tool_global::set_saved_guest_sigmask(guest, published).await;
+            Ok(Some(FutexSignalWatch {
+                unblocked: !mask & !kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32),
+                defers_default_stops: call.restart_keeps_deadline(),
+                pid: guest.pid().as_raw(),
+                tid: guest.tid().as_raw(),
+            }))
+        } else if signal_interruption {
+            // A failed read is never the call's errno
+            // (`read_wait_signal_state`).
+            let state = read_wait_signal_state(guest.pid(), guest.tid())?;
+            // A timed futex wait lets a default job-control stop
+            // wait for its deadline (`KernelSignalState::interrupting_wait`).
+            let defers_default_stops = call.restart_keeps_deadline();
+            let host_timed = host_timed_signals(guest).await;
+            let committed = std::mem::take(committed_wake);
+            let held = futex_wait_held_after_wake(host_timed, committed);
+            let pending = futex_wait_pending_signals(
+                guest,
+                &state,
+                state.pending_interrupting(state.blocked, defers_default_stops),
+                held,
+                host_timed,
+                committed,
+            )
+            .await;
+            if pending != 0 {
+                let errno = call.kernel_restart_errno();
+                trace!(
+                    "[detcore, dtid {}] futex wait interrupted by pending signals {:#x}: {:?}",
+                    &dettid, pending, errno
+                );
+                return Err(Error::Errno(errno));
+            }
+            Ok(Some(FutexSignalWatch {
+                unblocked: !state.blocked & !kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32),
+                defers_default_stops,
+                pid: guest.pid().as_raw(),
+                tid: guest.tid().as_raw(),
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// What the scheduler holds for the PI futex `futexid`, whose word holds
+    /// `word` (`Scheduler::pi_futex_state`), or `None` for a logically killed
+    /// caller, which the scheduler answers with a plain value and which never
+    /// returns to the guest.
+    async fn pi_futex_state<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        futexid: &FutexID,
+        word: u32,
+    ) -> Option<PiFutexState> {
+        match futex_action(
+            guest,
+            FutexAction::PiState(pi_futex::word_owner(word)),
+            futexid,
+            word as i32,
+            u32::MAX,
+        )
+        .await
+        {
+            Some(SchedValue::PiFutex(state)) => Some(state),
+            _ => None,
+        }
+    }
+
+    /// FUTEX_LOCK_PI, FUTEX_LOCK_PI2 and FUTEX_TRYLOCK_PI, as Linux's
+    /// `futex_lock_pi` (kernel/futex/pi.c:918-1125 at v6.16), in its order:
+    /// - a LOCK_PI or LOCK_PI2 timeout is copied and checked first (`EFAULT`,
+    ///   `EINVAL`), by `sys_futex` (kernel/futex/syscalls.c:168-175). It is an
+    ///   absolute deadline, on CLOCK_REALTIME for LOCK_PI and on CLOCK_MONOTONIC
+    ///   for LOCK_PI2 unless it sets FUTEX_CLOCK_REALTIME (`futex_init_timeout`,
+    ///   syscalls.c:147-157). TRYLOCK_PI takes none (`futex_cmd_has_timeout`);
+    /// - the word is keyed for writing (`get_futex_key`: `EINVAL` misaligned,
+    ///   `EFAULT`) and read (`EFAULT`);
+    /// - `pi_futex::lock_pi_step` decides, as `futex_lock_pi_atomic` does, from
+    ///   the word and the scheduler's state for it; a word it changes is written
+    ///   with the guest's permissions (`EFAULT`);
+    /// - a blocked caller parks as a PI waiter behind the owner. It ends handed
+    ///   the lock (0), at its deadline (`ETIMEDOUT`), or for a pending signal
+    ///   with `ERESTARTNOINTR`, which the kernel always restarts (pi.c:1124);
+    ///   the restarted call starts over and reads its absolute deadline again,
+    ///   as Linux's does.
+    ///
+    /// A waiter handed the lock by its owner's death writes its own TID into the
+    /// word (`pi_futex::owner_death_word`). A waiter handed the lock and then
+    /// signalled before its turn keeps the lock, as Linux's
+    /// `rt_mutex_cleanup_proxy_lock` keeps it (pi.c:1067-1068).
+    ///
+    /// The word holds a TID as the caller's PID namespace numbers it. Detcore's
+    /// thread IDs are the container namespace's, so a caller in a nested PID
+    /// namespace is refused by name.
+    ///
+    /// The read and write of the word are atomic with respect to the guest:
+    /// Detcore runs one guest thread at a time and this one holds the turn, so
+    /// none of the kernel's compare-and-exchange retries arises. A word in a
+    /// file-backed shared mapping, which a process outside Hermit could change,
+    /// is refused by name, as FUTEX_WAKE_OP's is.
+    // TODO-HUMAN-REVIEW(#4616): Review the emulated priority-inheritance lock:
+    // its word transitions, first-in-first-out waiter order and owner-death
+    // hand-over.
+    async fn handle_futex_lock_pi<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Futex,
+        command: i32,
+    ) -> Result<i64, Error> {
+        let trylock = command == libc::FUTEX_TRYLOCK_PI;
+        let name = pi_lock_command_name(command).expect("a PI lock command");
+        if guest.thread_state().nested_pid_namespace {
+            return self
+                .refuse_futex_command(guest, name, NESTED_PID_NAMESPACE_REFUSAL)
+                .await;
+        }
+        if !trylock && let Some(timeout) = call.timeout() {
+            let timeout = read_user_timespec(guest, timeout.as_raw())?;
+            if !futex_timespec_is_valid(timeout) {
+                return Err(Error::Errno(Errno::EINVAL));
+            }
+        }
+        let private = call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0;
+        let uaddr = futex_uaddr(&call);
+        let futexid = futex_key(guest, uaddr, private, KeyAccess::Write).await?;
+        if futex_word_is_file_backed(guest, uaddr) {
+            return self
+                .refuse_futex_command(guest, name, FILE_BACKED_WORD_REFUSAL)
+                .await;
+        }
+        let dettid = guest.thread_state().dettid;
+        let caller = pi_futex::guest_tid(dettid);
+        let gated = guest.config().in_guest_signal_delivery;
+        let signal_interruption = guest
+            .config()
+            .backend
+            .supports_blocked_wait_signal_interruption
+            || gated;
+        // The deadline, computed once, at the first park.
+        let mut deadline: Option<Option<LogicalTime>> = None;
+        let mut committed_wake: KernelSigset = 0;
+        // The signal check made after a wake for a signal, before the word is
+        // read again.
+        let mut rewait_watch: Option<Option<FutexSignalWatch>> = None;
+        let mut requested = false;
+        let res = loop {
+            let word = match read_futex_word(guest, uaddr) {
+                Ok(word) => word as u32,
+                Err(error) => break Err(error),
+            };
+            let Some(state) = self.pi_futex_state(guest, &futexid, word).await else {
+                break Err(Error::Errno(Errno::ERESTARTNOINTR));
+            };
+            let step = pi_futex::lock_pi_step(word, caller, state, trylock);
+            trace!(
+                "[detcore, dtid {}] {:?} on the word at {:#x}, holding {:#x}, with {:?}: {:?}",
+                dettid,
+                pi_lock_command_name(command),
+                uaddr,
+                word,
+                state,
+                step
+            );
+            let (owner, write) = match step {
+                LockPiStep::Fail { errno, write } => {
+                    break write
+                        .map_or(Ok(()), |value| write_futex_word(guest, uaddr, value))
+                        .and(Err(Error::Errno(errno)));
+                }
+                LockPiStep::Acquire(value) => {
+                    break write_futex_word(guest, uaddr, value).map(|()| 0);
+                }
+                LockPiStep::Block { owner, write } => (owner, write),
+            };
+            if let Some(value) = write
+                && let Err(error) = write_futex_word(guest, uaddr, value)
+            {
+                break Err(error);
+            }
+            let signal_watch = match rewait_watch.take() {
+                Some(watch) => watch,
+                None => match self
+                    .futex_wait_signal_watch(
+                        guest,
+                        call,
+                        gated,
+                        signal_interruption,
+                        &mut committed_wake,
+                    )
+                    .await
+                {
+                    Ok(watch) => watch,
+                    Err(error) => break Err(error),
+                },
+            };
+            let timeout = match deadline {
+                Some(timeout) => timeout,
+                None => {
+                    let timeout = if trylock {
+                        None
+                    } else {
+                        match self
+                            .futex_timeout_deadline(guest, call.futex_op(), call.timeout())
+                            .await
+                        {
+                            Ok(timeout) => timeout,
+                            Err(error) => break Err(error),
+                        }
+                    };
+                    *deadline.insert(timeout)
+                }
+            };
+            requested = true;
+            let answer = futex_action(
+                guest,
+                FutexAction::PiLockWait(timeout, signal_watch, owner),
+                &futexid,
+                word as i32,
+                u32::MAX,
+            )
+            .await;
+            match futex_action(guest, FutexAction::PiTake, &futexid, 0, u32::MAX).await {
+                Some(SchedValue::PiTaken(Some(PiHandOver::Unlock))) => break Ok(0),
+                Some(SchedValue::PiTaken(Some(PiHandOver::OwnerDeath))) => {
+                    break write_futex_word(guest, uaddr, pi_futex::owner_death_word(caller))
+                        .map(|()| 0);
+                }
+                _ => {}
+            }
+            match answer {
+                Some(SchedValue::TimeOut) => break Err(Error::Errno(Errno::ETIMEDOUT)),
+                Some(SchedValue::Signaled(committed)) if signal_interruption => {
+                    // Linux's waiter stays queued unless the signal is still
+                    // pending in its own turn: check that first, then decide
+                    // again from the word.
+                    committed_wake = committed;
+                    match self
+                        .futex_wait_signal_watch(
+                            guest,
+                            call,
+                            gated,
+                            signal_interruption,
+                            &mut committed_wake,
+                        )
+                        .await
+                    {
+                        Ok(watch) => rewait_watch = Some(watch),
+                        Err(error) => break Err(error),
+                    }
+                }
+                // A wake for a signal where the backend does not report the
+                // kernel's signal state, or a logically killed caller, which
+                // never returns to the guest: the kernel restarts the call.
+                _ => break Err(Error::Errno(Errno::ERESTARTNOINTR)),
+            }
+        };
+        if requested {
+            futex_action(guest, FutexAction::WaitFinished, &futexid, 0, u32::MAX).await;
+        }
+        res
+    }
+
+    /// FUTEX_UNLOCK_PI, as Linux's `futex_unlock_pi` (kernel/futex/pi.c:1132-1293
+    /// at v6.16), in its order: the word is read first (`EFAULT`), only the
+    /// thread it names may unlock it (`EPERM`), then it is keyed for writing
+    /// (`EINVAL` misaligned, `EFAULT`), and `pi_futex::unlock_pi_step` decides:
+    /// 0 for a word with no waiter, a hand-over to the longest PI waiter, whose
+    /// TID is written with `FUTEX_WAITERS` before it is woken (`wake_futex_pi`),
+    /// or `EINVAL` where the word and the queued waiters disagree. The word is
+    /// written with the guest's permissions (`EFAULT`), atomically with respect
+    /// to the guest for the reason `Self::handle_futex_lock_pi` gives.
+    // TODO-HUMAN-REVIEW(#4616): Review the emulated priority-inheritance unlock
+    // and its hand-over to the longest waiter.
+    async fn handle_futex_unlock_pi<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Futex,
+    ) -> Result<i64, Error> {
+        if guest.thread_state().nested_pid_namespace {
+            return self
+                .refuse_futex_command(guest, "FUTEX_UNLOCK_PI", NESTED_PID_NAMESPACE_REFUSAL)
+                .await;
+        }
+        let uaddr = futex_uaddr(&call);
+        let word = read_futex_word(guest, uaddr)? as u32;
+        let dettid = guest.thread_state().dettid;
+        if pi_futex::word_owner(word) != pi_futex::guest_tid(dettid) {
+            return Err(Error::Errno(Errno::EPERM));
+        }
+        let private = call.futex_op() & libc::FUTEX_PRIVATE_FLAG != 0;
+        let futexid = futex_key(guest, uaddr, private, KeyAccess::Write).await?;
+        if futex_word_is_file_backed(guest, uaddr) {
+            return self
+                .refuse_futex_command(guest, "FUTEX_UNLOCK_PI", FILE_BACKED_WORD_REFUSAL)
+                .await;
+        }
+        let Some(state) = self.pi_futex_state(guest, &futexid, word).await else {
+            return Err(Error::Errno(Errno::ERESTARTNOINTR));
+        };
+        let step = pi_futex::unlock_pi_step(dettid, state);
+        trace!(
+            "[detcore, dtid {}] FUTEX_UNLOCK_PI on the word at {:#x}, holding {:#x}, with {:?}: {:?}",
+            dettid, uaddr, word, state, step
+        );
+        match step {
+            UnlockPiStep::Fail(errno) => Err(Error::Errno(errno)),
+            UnlockPiStep::Release => write_futex_word(guest, uaddr, 0).map(|()| 0),
+            UnlockPiStep::HandOff { write, .. } => {
+                write_futex_word(guest, uaddr, write)?;
+                // The state was read in this turn, so its next owner is still
+                // queued; a logically killed caller is answered EINTR instead.
+                let woken = match futex_action(guest, FutexAction::PiHandOff, &futexid, 0, u32::MAX)
+                    .await
+                {
+                    Some(SchedValue::Value(1)) => 1,
+                    Some(SchedValue::Value(e)) if e == nix::errno::Errno::EINTR as u64 => 0,
+                    other => panic!("impossible answer to a PI futex hand-over: {:?}", other),
+                };
+                if self.cfg.yields_after_futex_wake(woken) {
+                    guest.thread_state_mut().yield_after_futex_wake = true;
+                }
+                Ok(0)
+            }
+        }
+    }
+
     /// FUTEX_WAKE and FUTEX_WAKE_BITSET, as Linux's `futex_wake`
     /// (kernel/futex/waitwake.c): `-EINVAL` for a zero bitset, then the word is
     /// keyed for reading (`futex_key`) and never read, and up to `val` modeled
@@ -3254,6 +3594,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         .expect("futex wake must return value")
         {
             SchedValue::Value(num) => num,
+            // `futex_wake` stops with EINVAL at a PI waiter, after waking those
+            // before it (kernel/futex/waitwake.c:180-199).
+            SchedValue::PiWaiterReached { woken } => {
+                if self.cfg.yields_after_futex_wake(woken) {
+                    guest.thread_state_mut().yield_after_futex_wake = true;
+                }
+                return Err(Error::Errno(Errno::EINVAL));
+            }
             other => panic!("impossible answer to a futex wake: {:?}", other),
         };
         let _ = futex_action(guest, FutexAction::WakeFinished(0), &futexid, 0, bitset).await;
@@ -3318,6 +3666,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A logically killed or replaced caller is answered with a plain value, as
             // its wakes are; it never returns to the guest.
             Some(SchedValue::Value(num)) => num,
+            // `futex_requeue` stops with EINVAL at a PI waiter, keeping what it
+            // woke and moved before it (kernel/futex/requeue.c:585-603).
+            Some(SchedValue::PiWaiterReached { woken }) => {
+                if self.cfg.yields_after_futex_wake(woken) {
+                    guest.thread_state_mut().yield_after_futex_wake = true;
+                }
+                return Err(Error::Errno(Errno::EINVAL));
+            }
             other => panic!("impossible answer to a futex requeue: {:?}", other),
         };
         let _ = futex_action(
@@ -3371,29 +3727,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !op.has_known_operation() {
             return Err(Error::Errno(Errno::ENOSYS));
         }
-        if matches!(
-            guest.thread_state().futex_id(uaddr2, false),
-            FutexID::Shared {
-                object: SharedMemoryObjectId::File { .. } | SharedMemoryObjectId::OpenFile { .. },
-                ..
-            }
-        ) {
+        if futex_word_is_file_backed(guest, uaddr2) {
             return self
-                .refuse_futex_command(
-                    guest,
-                    "FUTEX_WAKE_OP",
-                    "its word is in a file-backed shared mapping that a process outside Hermit \
-                     could update concurrently, and Detcore cannot apply the operation atomically",
-                )
+                .refuse_futex_command(guest, "FUTEX_WAKE_OP", FILE_BACKED_WORD_REFUSAL)
                 .await;
         }
         let old = read_futex_word(guest, uaddr2)?;
         let new = op.apply(old).expect("operation was checked to be known");
-        let word2 = AddrMut::<libc::c_int>::from_raw(uaddr2).ok_or(Errno::EFAULT)?;
-        guest
-            .memory()
-            .write_value(word2, &new)
-            .map_err(|_| Error::Errno(Errno::EFAULT))?;
+        write_futex_word(guest, uaddr2, new as u32)?;
         let Some(wake2) = op.compare(old) else {
             return Err(Error::Errno(Errno::ENOSYS));
         };
@@ -3406,6 +3747,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await
             {
                 Some(SchedValue::Value(num)) => num,
+                // `futex_wake_op` stops with EINVAL at a PI waiter, after the
+                // operation (kernel/futex/waitwake.c:301-303, 315-317).
+                Some(SchedValue::PiWaiterReached { woken: num }) => {
+                    if self.cfg.yields_after_futex_wake(woken + num) {
+                        guest.thread_state_mut().yield_after_futex_wake = true;
+                    }
+                    return Err(Error::Errno(Errno::EINVAL));
+                }
                 other => panic!("impossible answer to a futex wake: {:?}", other),
             };
             let _ = futex_action(guest, FutexAction::WakeFinished(0), &futex, 0, u32::MAX).await;
@@ -5365,10 +5714,15 @@ where
         .await
         {
             Some(SchedValue::Value(count)) => count,
+            // A FUTEX_LOCK_PI waiter first in the queue stops the wake: Linux's
+            // `futex_wake` answers EINVAL, which `handle_futex_death` ignores.
+            Some(SchedValue::PiWaiterReached { woken }) => woken,
             // A wake never carries a timeout, and a cancelled RPC wakes nobody.
             Some(SchedValue::TimeOut)
             | Some(SchedValue::Signaled(_))
             | Some(SchedValue::Requeued { .. })
+            | Some(SchedValue::PiFutex(_))
+            | Some(SchedValue::PiTaken(_))
             | None => 0,
         };
         // Guest-level identities only: dettid, the modeled futex key, and a
@@ -5451,15 +5805,21 @@ enum OwnerDeathPath {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FutexCommand {
     /// Emulated: FUTEX_WAIT, FUTEX_WAIT_BITSET, FUTEX_WAKE, FUTEX_WAKE_BITSET,
-    /// FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and FUTEX_WAKE_OP.
+    /// FUTEX_REQUEUE, FUTEX_CMP_REQUEUE, FUTEX_WAKE_OP, and the
+    /// priority-inheritance lock commands FUTEX_LOCK_PI, FUTEX_LOCK_PI2,
+    /// FUTEX_TRYLOCK_PI and FUTEX_UNLOCK_PI (`Detcore::handle_futex_lock_pi`,
+    /// `Detcore::handle_futex_unlock_pi`).
     Served,
     /// `-ENOSYS`, exactly as Linux: FUTEX_CLOCK_REALTIME with any command but
     /// FUTEX_WAIT_BITSET, FUTEX_WAIT_REQUEUE_PI or FUTEX_LOCK_PI2; the removed
     /// FUTEX_FD; and any unknown command.
     NoSys,
-    /// A priority-inheritance command, which Detcore does not emulate; refused
-    /// by name (`Detcore::refuse_futex_command`).
-    PriorityInheritance(&'static str),
+    /// FUTEX_WAIT_REQUEUE_PI or FUTEX_CMP_REQUEUE_PI, the requeue-PI pair that
+    /// moves a condition variable's waiters onto a PI mutex. Detcore does not
+    /// emulate it; refused by name (`Detcore::refuse_futex_command`). glibc's
+    /// condition variables have not issued it since glibc 2.25: they wait on
+    /// their own words and then lock the mutex.
+    RequeuePi(&'static str),
 }
 
 /// [`FutexCommand`] for a raw `futex_op`.
@@ -5481,20 +5841,76 @@ pub(crate) fn classify_futex_command(futex_op: i32) -> FutexCommand {
         | libc::FUTEX_WAKE_BITSET
         | libc::FUTEX_REQUEUE
         | libc::FUTEX_CMP_REQUEUE
-        | libc::FUTEX_WAKE_OP => FutexCommand::Served,
-        libc::FUTEX_LOCK_PI => FutexCommand::PriorityInheritance("FUTEX_LOCK_PI"),
-        libc::FUTEX_LOCK_PI2 => FutexCommand::PriorityInheritance("FUTEX_LOCK_PI2"),
-        libc::FUTEX_UNLOCK_PI => FutexCommand::PriorityInheritance("FUTEX_UNLOCK_PI"),
-        libc::FUTEX_TRYLOCK_PI => FutexCommand::PriorityInheritance("FUTEX_TRYLOCK_PI"),
-        libc::FUTEX_WAIT_REQUEUE_PI => FutexCommand::PriorityInheritance("FUTEX_WAIT_REQUEUE_PI"),
-        libc::FUTEX_CMP_REQUEUE_PI => FutexCommand::PriorityInheritance("FUTEX_CMP_REQUEUE_PI"),
+        | libc::FUTEX_WAKE_OP
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        | libc::FUTEX_LOCK_PI
+        | libc::FUTEX_LOCK_PI2
+        | libc::FUTEX_TRYLOCK_PI
+        | libc::FUTEX_UNLOCK_PI => FutexCommand::Served,
+        libc::FUTEX_WAIT_REQUEUE_PI => FutexCommand::RequeuePi("FUTEX_WAIT_REQUEUE_PI"),
+        libc::FUTEX_CMP_REQUEUE_PI => FutexCommand::RequeuePi("FUTEX_CMP_REQUEUE_PI"),
         _ => FutexCommand::NoSys,
     }
 }
 
-/// Why `--debug-futex-mode polling` refuses FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and
-/// FUTEX_WAKE_OP.
+/// Why `--debug-futex-mode polling` refuses FUTEX_REQUEUE, FUTEX_CMP_REQUEUE,
+/// FUTEX_WAKE_OP and the priority-inheritance lock commands.
 const POLLING_REFUSAL: &str = "--debug-futex-mode polling does not model futex waiter lists";
+
+/// The name of a priority-inheritance lock command (FUTEX_LOCK_PI,
+/// FUTEX_LOCK_PI2, FUTEX_TRYLOCK_PI, FUTEX_UNLOCK_PI), or `None` for any other.
+fn pi_lock_command_name(command: i32) -> Option<&'static str> {
+    match command {
+        libc::FUTEX_LOCK_PI => Some("FUTEX_LOCK_PI"),
+        libc::FUTEX_LOCK_PI2 => Some("FUTEX_LOCK_PI2"),
+        libc::FUTEX_TRYLOCK_PI => Some("FUTEX_TRYLOCK_PI"),
+        libc::FUTEX_UNLOCK_PI => Some("FUTEX_UNLOCK_PI"),
+        _ => None,
+    }
+}
+
+/// Whether the futex word at `address` lies in a file-backed shared mapping,
+/// which a process outside Hermit can update concurrently. Detcore changes a
+/// word with a separate read and write, which Linux's locked instruction does
+/// not, so the commands that change their word refuse such a one.
+fn futex_word_is_file_backed<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    guest: &G,
+    address: usize,
+) -> bool {
+    matches!(
+        guest.thread_state().futex_id(address, false),
+        FutexID::Shared {
+            object: SharedMemoryObjectId::File { .. } | SharedMemoryObjectId::OpenFile { .. },
+            ..
+        }
+    )
+}
+
+/// Write a futex word as a user-mode store does, which is what Linux's
+/// `futex_cmpxchg_value_locked` and `futex_atomic_op_inuser` do: exactly four
+/// bytes with the guest's own permissions, `-EFAULT` if the word cannot be
+/// written.
+fn write_futex_word<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+    guest: &mut G,
+    address: usize,
+    value: u32,
+) -> Result<(), Error> {
+    let word = AddrMut::<u32>::from_raw(address).ok_or(Errno::EFAULT)?;
+    guest
+        .memory()
+        .write_value(word, &value)
+        .map_err(|_| Error::Errno(Errno::EFAULT))
+}
+
+/// Why the priority-inheritance lock commands refuse a caller in a nested PID
+/// namespace, whose futex words hold TIDs Detcore does not translate.
+const NESTED_PID_NAMESPACE_REFUSAL: &str = "the caller is in a nested PID namespace, whose \
+     priority-inheritance futex words hold TIDs Detcore does not translate";
+
+/// Why a command that changes its futex word refuses a word in a file-backed
+/// shared mapping (`futex_word_is_file_backed`).
+const FILE_BACKED_WORD_REFUSAL: &str = "its word is in a file-backed shared mapping that a process \
+     outside Hermit could update concurrently, and Detcore cannot apply the operation atomically";
 
 /// The `val2` of FUTEX_REQUEUE, FUTEX_CMP_REQUEUE and FUTEX_WAKE_OP, which the
 /// syscall passes in the timeout argument: `sys_futex` hands
@@ -7195,9 +7611,9 @@ mod tests {
 
     /// `do_futex` (kernel/futex/syscalls.c): FUTEX_CLOCK_REALTIME only with
     /// FUTEX_WAIT_BITSET, FUTEX_WAIT_REQUEUE_PI or FUTEX_LOCK_PI2, else -ENOSYS;
-    /// the removed FUTEX_FD and unknown commands are -ENOSYS; the PI commands are
-    /// refused by name; the rest are emulated
-    /// (https://github.com/rrnewton/hermit/issues/3958).
+    /// the removed FUTEX_FD and unknown commands are -ENOSYS; the requeue-PI
+    /// commands are refused by name; the rest, the PI lock commands included,
+    /// are emulated (https://github.com/rrnewton/hermit/issues/3958).
     #[test]
     fn futex_commands_are_classified_as_linux_dispatches_them() {
         use FutexCommand::*;
@@ -7230,26 +7646,87 @@ mod tests {
         for cmd in [libc::FUTEX_FD, 14, 99, libc::FUTEX_CMD_MASK] {
             assert_eq!(classify_futex_command(cmd), NoSys, "cmd {cmd}");
         }
-        assert_eq!(
-            classify_futex_command(libc::FUTEX_LOCK_PI | private),
-            PriorityInheritance("FUTEX_LOCK_PI")
-        );
+        for cmd in [
+            libc::FUTEX_LOCK_PI,
+            libc::FUTEX_LOCK_PI2,
+            libc::FUTEX_TRYLOCK_PI,
+            libc::FUTEX_UNLOCK_PI,
+        ] {
+            assert_eq!(classify_futex_command(cmd), Served, "cmd {cmd}");
+            assert_eq!(classify_futex_command(cmd | private), Served, "cmd {cmd}");
+        }
         assert_eq!(
             classify_futex_command(libc::FUTEX_LOCK_PI2 | realtime),
-            PriorityInheritance("FUTEX_LOCK_PI2")
+            Served
         );
+        for cmd in [
+            libc::FUTEX_LOCK_PI,
+            libc::FUTEX_TRYLOCK_PI,
+            libc::FUTEX_UNLOCK_PI,
+        ] {
+            assert_eq!(classify_futex_command(cmd | realtime), NoSys, "cmd {cmd}");
+        }
         assert_eq!(
-            classify_futex_command(libc::FUTEX_LOCK_PI | realtime),
-            NoSys
+            classify_futex_command(libc::FUTEX_WAIT_REQUEUE_PI | realtime),
+            RequeuePi("FUTEX_WAIT_REQUEUE_PI")
         );
         for (cmd, name) in [
-            (libc::FUTEX_UNLOCK_PI, "FUTEX_UNLOCK_PI"),
-            (libc::FUTEX_TRYLOCK_PI, "FUTEX_TRYLOCK_PI"),
             (libc::FUTEX_WAIT_REQUEUE_PI, "FUTEX_WAIT_REQUEUE_PI"),
             (libc::FUTEX_CMP_REQUEUE_PI, "FUTEX_CMP_REQUEUE_PI"),
         ] {
-            assert_eq!(classify_futex_command(cmd), PriorityInheritance(name));
+            assert_eq!(classify_futex_command(cmd), RequeuePi(name));
         }
+        assert_eq!(
+            classify_futex_command(libc::FUTEX_CMP_REQUEUE_PI | realtime),
+            NoSys
+        );
+    }
+
+    /// `futex_init_timeout` and `do_futex` (kernel/futex/syscalls.c:114-116,
+    /// 147-157 at v6.16): FUTEX_WAIT's timeout is relative; FUTEX_WAIT_BITSET's,
+    /// FUTEX_LOCK_PI's and FUTEX_LOCK_PI2's are absolute. FUTEX_LOCK_PI's is
+    /// always on CLOCK_REALTIME, the others' only with FUTEX_CLOCK_REALTIME.
+    #[test]
+    fn futex_deadlines_are_measured_as_linux_measures_them() {
+        let one_second = Timespec {
+            tv_sec: 1,
+            tv_nsec: 0,
+        };
+        let realtime = libc::FUTEX_CLOCK_REALTIME;
+        assert_eq!(
+            parse_futex_timeout(libc::FUTEX_WAIT, one_second),
+            Ok(FutexTimeout::Relative(1_000_000_000))
+        );
+        for cmd in [
+            libc::FUTEX_WAIT_BITSET,
+            libc::FUTEX_LOCK_PI,
+            libc::FUTEX_LOCK_PI2,
+            libc::FUTEX_LOCK_PI | libc::FUTEX_PRIVATE_FLAG,
+        ] {
+            assert_eq!(
+                parse_futex_timeout(cmd, one_second),
+                Ok(FutexTimeout::Absolute(LogicalTime::from_nanos(
+                    1_000_000_000
+                ))),
+                "cmd {cmd}"
+            );
+        }
+        assert_eq!(
+            futex_deadline_clock(libc::FUTEX_LOCK_PI),
+            syscalls::ClockId::CLOCK_REALTIME
+        );
+        assert_eq!(
+            futex_deadline_clock(libc::FUTEX_LOCK_PI2),
+            syscalls::ClockId::CLOCK_MONOTONIC
+        );
+        assert_eq!(
+            futex_deadline_clock(libc::FUTEX_LOCK_PI2 | realtime),
+            syscalls::ClockId::CLOCK_REALTIME
+        );
+        assert_eq!(
+            futex_deadline_clock(libc::FUTEX_WAIT_BITSET),
+            syscalls::ClockId::CLOCK_MONOTONIC
+        );
     }
 
     /// FUTEX_WAKE_OP's encoding, as `futex_atomic_op_inuser` decodes it: 12-bit

@@ -662,15 +662,39 @@
     },
     {
       "disposition": "guest-fixture",
-      "path": "tests/c/futex_lock_pi_refused.c",
+      "path": "tests/c/futex_pi_commands.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/futex_lock_pi_refused.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test futex_lock_pi_is_refused_by_name compiles this guest, which takes a priority-inheritance futex with FUTEX_LOCK_PI and requires the policy-refusal status naming the command under a fail-closed run, and ENOSYS with --allow-unsupported-syscalls (https://github.com/rrnewton/hermit/issues/3958); it remains a guest fixture because a generic manifest cannot assert this exact output or refusal status."
+      "why": "tests/c/futex_pi_commands.c is owned by hermit-cli/tests/cli.rs: the integration test futex_pi_lock_commands_match_linux compiles this guest, which calls FUTEX_LOCK_PI, FUTEX_LOCK_PI2, FUTEX_TRYLOCK_PI and FUTEX_UNLOCK_PI directly and prints each result and the word it leaves with owner TIDs replaced by thread names, and requires the output under run --strict to equal native and native to equal a fixed expectation; it stays a guest fixture because a generic manifest cannot pin both."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/futex_pi_condvar.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/futex_pi_condvar.c is owned by hermit-cli/tests/cli.rs: the integration test a_pi_mutex_condition_variable_queue_matches_linux compiles this guest, a bounded queue under a PTHREAD_PRIO_INHERIT mutex and two condition variables, and requires its totals to equal native under ptrace run --strict --verify --verify-strict at bitwise parity, with the default schedule and a chaos seed."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/futex_pi_mutex_contended.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/futex_pi_mutex_contended.c is owned by hermit-cli/tests/cli.rs: the integration test a_contended_pi_mutex_keeps_mutual_exclusion_at_bitwise_parity compiles this guest, four threads contending a PTHREAD_PRIO_INHERIT mutex through FUTEX_LOCK_PI and FUTEX_UNLOCK_PI, and requires the count and overlap report to equal native under ptrace run --strict --verify --verify-strict at bitwise parity, with the default schedule and a chaos seed."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/futex_pi_robust_owner_death.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/futex_pi_robust_owner_death.c is owned by hermit-cli/tests/cli.rs: the integration test a_robust_pi_mutex_reports_its_owners_death_as_linux compiles this guest, whose robust PTHREAD_PRIO_INHERIT mutex is abandoned by its owner with and without a waiter, and requires EOWNERDEAD and the recovery to equal native under ptrace run --strict --verify --verify-strict at bitwise parity."
     },
     {
       "disposition": "manifest-test",
       "path": "tests/c/futex_requeue_enosys.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/futex_requeue_enosys.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/futex_requeue_pi_refused.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/futex_requeue_pi_refused.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test futex_requeue_pi_is_refused_by_name compiles this guest, which issues FUTEX_CMP_REQUEUE_PI, and requires the policy-refusal status naming the command under a fail-closed run, and ENOSYS with --allow-unsupported-syscalls (https://github.com/rrnewton/hermit/issues/3958); it remains a guest fixture because a generic manifest cannot assert this exact output or refusal status."
     },
     {
       "disposition": "guest-fixture",
