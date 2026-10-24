@@ -1242,15 +1242,19 @@ pub enum IOAction {
 pub fn ioaction_based_on_fd_status<
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
-    C: SyscallInfo + Into<Syscall>,
+    C: NonblockableSyscall + Into<Syscall>,
 >(
     guest: &mut G,
     call: C,
 ) -> Result<IOAction, Errno> {
     let wrapped: Syscall = call.into();
     let fd = get_fd(wrapped).unwrap_or_else(|| panic!("Failed to get fd for {}", call.name()));
-    let (phys, virt) = guest.thread_state().with_detfd(fd, |detfd| {
-        (detfd.physically_nonblocking(), detfd.is_nonblocking())
+    let (phys, virt, error_queue_never_waits) = guest.thread_state().with_detfd(fd, |detfd| {
+        (
+            detfd.physically_nonblocking(),
+            detfd.is_nonblocking(),
+            detfd.error_queue_never_waits(),
+        )
     })?;
     tracing::trace!(
         "Checking FD {} for nonblocking: physical {} / virtual {}",
@@ -1269,6 +1273,11 @@ pub fn ioaction_based_on_fd_status<
         Ok(IOAction::Blocking)
     } else if virt && phys {
         // TT: both nonblocking, so firing once is sufficient
+        Ok(IOAction::PassThru)
+    } else if call.flags_forbid_waiting() || (error_queue_never_waits && call.reads_error_queue()) {
+        // FT, but the call itself does not wait (MSG_DONTWAIT, or MSG_ERRQUEUE
+        // on a socket whose protocol reads that queue without waiting), so
+        // firing once is what Linux does.
         Ok(IOAction::PassThru)
     } else {
         // FT: Need to simulate blocking on top of nonblocking.
@@ -1591,6 +1600,26 @@ pub trait NonblockableSyscall: SyscallInfo {
     /// I.e. the result means "try again".
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Ok(0)
+    }
+
+    /// Whether the call's own flags keep it from waiting on a file the guest
+    /// left blocking: `MSG_DONTWAIT` on a socket send or receive, which Linux
+    /// turns into a zero timeout (`sock_rcvtimeo`, `sock_sndtimeo`), so the
+    /// call returns at once, failing with `EAGAIN` where it would wait. Linux
+    /// adds the same flag to every call on an `O_NONBLOCK` socket, so such a
+    /// call runs once, as on a nonblocking file (`IOAction::PassThru`), instead
+    /// of being retried until it stops failing with `EAGAIN`.
+    fn flags_forbid_waiting(&self) -> bool {
+        false
+    }
+
+    /// Whether the call is a receive with `MSG_ERRQUEUE`, which reads the
+    /// socket's error queue. Whether that waits depends on the socket's
+    /// protocol (`crate::fd::error_queue_read_never_waits`): a UDP or TCP socket
+    /// fails with `EAGAIN` at once when the queue is empty, while AF_UNIX
+    /// ignores the flag and receives as usual.
+    fn reads_error_queue(&self) -> bool {
+        false
     }
 
     /// Return the errno used when a signal interrupts this internally polled syscall.
@@ -2026,6 +2055,12 @@ impl NonblockableSyscall for reverie::syscalls::Writev {
     }
 }
 
+/// Whether socket call flags, which Linux reads as an `unsigned int`, carry
+/// `MSG_DONTWAIT`.
+fn has_msg_dontwait(flags: u32) -> bool {
+    flags & libc::MSG_DONTWAIT as u32 != 0
+}
+
 /// A common helper shared among several network syscalls.
 /// We can't actually CONVERT these syscalls into nonblocking, but we can assert that they are by
 /// checking the status of their file descriptor.
@@ -2084,6 +2119,14 @@ impl NonblockableSyscall for reverie::syscalls::Recvfrom {
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
     }
+
+    fn flags_forbid_waiting(&self) -> bool {
+        has_msg_dontwait(self.flags() as u32)
+    }
+
+    fn reads_error_queue(&self) -> bool {
+        self.flags() & libc::MSG_ERRQUEUE != 0
+    }
 }
 
 #[async_trait]
@@ -2097,6 +2140,14 @@ impl NonblockableSyscall for reverie::syscalls::Recvmsg {
 
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+
+    fn flags_forbid_waiting(&self) -> bool {
+        has_msg_dontwait(self.flags() as u32)
+    }
+
+    fn reads_error_queue(&self) -> bool {
+        self.flags() & libc::MSG_ERRQUEUE != 0
     }
 }
 
@@ -2114,6 +2165,17 @@ impl NonblockableSyscall for reverie::syscalls::Recvmmsg {
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
     }
+
+    /// `MSG_WAITFORONE` does not count: Linux waits for the first datagram and
+    /// adds `MSG_DONTWAIT` only after it (`do_recvmmsg`), which is what a
+    /// polled attempt that returns at least one datagram gives.
+    fn flags_forbid_waiting(&self) -> bool {
+        has_msg_dontwait(self.flags())
+    }
+
+    fn reads_error_queue(&self) -> bool {
+        self.flags() & libc::MSG_ERRQUEUE as u32 != 0
+    }
 }
 
 #[async_trait]
@@ -2127,6 +2189,10 @@ impl NonblockableSyscall for reverie::syscalls::Sendto {
 
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+
+    fn flags_forbid_waiting(&self) -> bool {
+        has_msg_dontwait(self.flags())
     }
 }
 
@@ -2142,6 +2208,10 @@ impl NonblockableSyscall for reverie::syscalls::Sendmmsg {
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
     }
+
+    fn flags_forbid_waiting(&self) -> bool {
+        has_msg_dontwait(self.flags() as u32)
+    }
 }
 
 #[async_trait]
@@ -2155,6 +2225,10 @@ impl NonblockableSyscall for reverie::syscalls::Sendmsg {
 
     fn syscall_would_have_blocked(&self, res: Result<i64, Errno>) -> bool {
         res == Err(Errno::EAGAIN) || res == Err(Errno::EWOULDBLOCK)
+    }
+
+    fn flags_forbid_waiting(&self) -> bool {
+        has_msg_dontwait(self.flags() as u32)
     }
 }
 
@@ -5232,6 +5306,110 @@ mod tests {
             call.normalize_nonblocking_result(Err(Errno::EISCONN), false),
             Err(Errno::EISCONN)
         );
+    }
+
+    /// `MSG_DONTWAIT` keeps every socket send and receive from waiting,
+    /// whatever else its flags carry, and no other flag does: recvmmsg's
+    /// `MSG_WAITFORONE` still waits for the first datagram. Calls with no
+    /// per-call flags always follow the file.
+    #[test]
+    fn only_msg_dontwait_keeps_a_socket_call_from_waiting() {
+        use reverie::syscalls::*;
+        let dontwait = libc::MSG_DONTWAIT;
+        let others = libc::MSG_PEEK | libc::MSG_WAITALL | libc::MSG_NOSIGNAL | libc::MSG_TRUNC;
+        let cases: [(&str, bool, bool); 6] = [
+            (
+                "recvfrom",
+                Recvfrom::new()
+                    .with_flags(others | dontwait)
+                    .flags_forbid_waiting(),
+                Recvfrom::new().with_flags(others).flags_forbid_waiting(),
+            ),
+            (
+                "recvmsg",
+                Recvmsg::new().with_flags(dontwait).flags_forbid_waiting(),
+                Recvmsg::new().with_flags(others).flags_forbid_waiting(),
+            ),
+            (
+                "recvmmsg",
+                Recvmmsg::new()
+                    .with_flags((libc::MSG_WAITFORONE | dontwait) as u32)
+                    .flags_forbid_waiting(),
+                Recvmmsg::new()
+                    .with_flags(libc::MSG_WAITFORONE as u32)
+                    .flags_forbid_waiting(),
+            ),
+            (
+                "sendto",
+                Sendto::new()
+                    .with_flags(dontwait as u32)
+                    .flags_forbid_waiting(),
+                Sendto::new()
+                    .with_flags(others as u32)
+                    .flags_forbid_waiting(),
+            ),
+            (
+                "sendmsg",
+                Sendmsg::new().with_flags(dontwait).flags_forbid_waiting(),
+                Sendmsg::new().with_flags(others).flags_forbid_waiting(),
+            ),
+            (
+                "sendmmsg",
+                Sendmmsg::new().with_flags(dontwait).flags_forbid_waiting(),
+                Sendmmsg::new().with_flags(others).flags_forbid_waiting(),
+            ),
+        ];
+        for (name, with_dontwait, without) in cases {
+            assert!(with_dontwait, "{name} with MSG_DONTWAIT may wait");
+            assert!(!without, "{name} without MSG_DONTWAIT never waits");
+        }
+        assert!(!Read::new().flags_forbid_waiting());
+        assert!(!Accept4::new().flags_forbid_waiting());
+        assert!(!Connect::new().flags_forbid_waiting());
+    }
+
+    /// The three receive calls read the error queue exactly when their flags
+    /// carry `MSG_ERRQUEUE`, which does not by itself keep them from waiting;
+    /// a send's flags never read it.
+    #[test]
+    fn msg_errqueue_marks_only_a_receive_as_an_error_queue_read() {
+        use reverie::syscalls::*;
+        let errqueue = libc::MSG_ERRQUEUE;
+        assert!(Recvfrom::new().with_flags(errqueue).reads_error_queue());
+        assert!(
+            Recvmsg::new()
+                .with_flags(errqueue | libc::MSG_PEEK)
+                .reads_error_queue()
+        );
+        assert!(
+            Recvmmsg::new()
+                .with_flags(errqueue as u32)
+                .reads_error_queue()
+        );
+        assert!(
+            !Recvfrom::new()
+                .with_flags(libc::MSG_DONTWAIT)
+                .reads_error_queue()
+        );
+        assert!(
+            !Recvmsg::new()
+                .with_flags(libc::MSG_PEEK)
+                .reads_error_queue()
+        );
+        assert!(
+            !Recvmmsg::new()
+                .with_flags(libc::MSG_WAITFORONE as u32)
+                .reads_error_queue()
+        );
+        assert!(!Recvmsg::new().with_flags(errqueue).flags_forbid_waiting());
+        assert!(
+            !Sendto::new()
+                .with_flags(errqueue as u32)
+                .reads_error_queue()
+        );
+        assert!(!Sendmsg::new().with_flags(errqueue).reads_error_queue());
+        assert!(!Sendmmsg::new().with_flags(errqueue).reads_error_queue());
+        assert!(!Read::new().reads_error_queue());
     }
 
     #[test]

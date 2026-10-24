@@ -223,6 +223,8 @@ static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SELECT_TIMEOUT_NORMALIZATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TOOL_OUTPUT_PROTECTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SOCKET_DONTWAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static SOCKET_ERRQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "dbt")]
 static CLOCK_RLIMIT_PARITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "dbt")]
@@ -28937,6 +28939,180 @@ fn tool_output_respects_page_protection_and_the_private_page() {
     }
 }
 
+/// `MSG_DONTWAIT` makes one send or receive nonblocking on a socket the guest
+/// left blocking: Linux gives the call a zero timeout (`sock_rcvtimeo` and
+/// `sock_sndtimeo`, `include/net/sock.h`), so it returns at once, -1 EAGAIN
+/// where it would wait. Detcore retried such a call on the socket it had made
+/// physically nonblocking until it stopped failing with EAGAIN, which on an
+/// empty queue or a full peer was forever. The guest
+/// (`tests/c/socket_dontwait.c`) covers recvfrom, recvmsg, recvmmsg (with and
+/// without `MSG_WAITFORONE`), sendto, sendmsg and sendmmsg on UDP, AF_UNIX
+/// datagram and stream socketpairs and TCP, with nothing queued, with data,
+/// and with a full peer, and calls without the flag on the same sockets, which
+/// still wait. Its native output is the oracle, under `hermit run` with and
+/// without `--strict`, and its socketpair sections without the batched calls,
+/// which record and replay do not record, under `record start --verify`.
+#[test]
+fn msg_dontwait_returns_at_once_on_a_blocking_socket() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&SOCKET_DONTWAIT_GUEST, "socket_dontwait");
+    let eagain = "-1 (Resource temporarily unavailable)";
+    let receives = |kind: &str, batched: bool| {
+        let mut lines = format!("{kind} recvfrom: {eagain}\n{kind} recvmsg: {eagain}\n");
+        if batched {
+            lines +=
+                &format!("{kind} recvmmsg: {eagain}\n{kind} recvmmsg MSG_WAITFORONE: {eagain}\n");
+        }
+        lines
+    };
+    let sends = |kind: &str, batched: bool| {
+        let mut lines = format!("{kind} sendto: {eagain}\n{kind} sendmsg: {eagain}\n");
+        if batched {
+            lines += &format!("{kind} sendmmsg: {eagain}\n");
+        }
+        lines
+    };
+    let socketpairs = |batched: bool| {
+        [
+            receives("unix datagram empty", batched),
+            "unix datagram send: 3\nunix datagram queued recv: 3\n".to_owned(),
+            if batched {
+                "unix datagram two queued recvmmsg: 2\n\
+                 unix datagram two queued data: one!two!\n"
+                    .to_owned()
+            } else {
+                String::new()
+            },
+            "unix datagram fill ends after some sends: Resource temporarily unavailable\n"
+                .to_owned(),
+            sends("unix datagram full", batched),
+            "unix datagram drained every send: yes (Resource temporarily unavailable)\n".to_owned(),
+            receives("unix stream empty", batched),
+            "unix stream fill ends after some bytes: Resource temporarily unavailable\n".to_owned(),
+            sends("unix stream full", batched),
+            "unix stream blocking send: 4096\n".to_owned(),
+            receives("unix stream drained", batched),
+        ]
+        .concat()
+    };
+    let expected = [
+        receives("udp empty", true),
+        "udp queued recv: 4\nudp queued data: ping\n\
+         udp blocking recvmmsg MSG_WAITFORONE: 1\nudp late data: late\n"
+            .to_owned(),
+        socketpairs(true),
+        receives("tcp connected", true),
+        receives("tcp accepted", true),
+    ]
+    .concat();
+    assert_eq!(native_stdout(guest), expected);
+    let guest = guest.to_str().unwrap();
+    for strict in [true, false] {
+        let mut args = vec!["run", "--timeout", "120"];
+        if strict {
+            args.push("--strict");
+        }
+        args.extend(["--base-env=minimal", "--", guest]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+    }
+
+    let data = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let data_dir = format!("--data-dir={}", data.path().display());
+    let args = [
+        "record",
+        "start",
+        "--verify",
+        "--verify-strict",
+        "--record-timeout",
+        "120",
+        data_dir.as_str(),
+        "--",
+        guest,
+        "unbatched",
+        "unix_datagram",
+        "unix_stream",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), socketpairs(false), "{args:?}");
+    let log = stderr(&output);
+    assert!(
+        log.contains("Success: replay matched recording."),
+        "the replay must match the recording:\n{log}"
+    );
+}
+
+/// A receive with `MSG_ERRQUEUE` reads the socket's error queue, and on an
+/// IPv4 or IPv6 socket Linux never waits for it: an empty queue is -1 EAGAIN
+/// at once, blocking socket or not (`ip_recv_error`, `ipv6_recv_error`).
+/// Detcore polled such a receive on the socket it had made physically
+/// nonblocking until it stopped failing with EAGAIN, which was forever.
+/// AF_UNIX ignores the flag, so there the call stays a plain receive that
+/// waits for data. The guest (`tests/c/socket_errqueue.c`) reads the error
+/// queue of UDP, UDPv6 and TCP sockets (unconnected, connected and accepted)
+/// with recvfrom, recvmsg and recvmmsg, empty and holding the ICMP port
+/// unreachable that `IP_RECVERR` queues for a send to a closed port, and
+/// makes blocking `MSG_ERRQUEUE` receives on AF_UNIX datagram and stream
+/// socketpairs and on AF_UNIX sockets from socket(2), which must wait for a
+/// later sender. Its native output is the oracle, under `hermit run` with and
+/// without `--strict`.
+#[test]
+fn msg_errqueue_returns_at_once_on_inet_sockets_and_waits_on_unix_sockets() {
+    let _lock = hermit_run_guard();
+    let guest = futex_c_guest(&SOCKET_ERRQUEUE_GUEST, "socket_errqueue");
+    let eagain = "-1 (Resource temporarily unavailable)";
+    let empty = |kind: &str| {
+        format!("{kind} recvfrom: {eagain}\n{kind} recvmsg: {eagain}\n{kind} recvmmsg: {eagain}\n")
+    };
+    let unix = |kind: &str| {
+        let mut lines =
+            format!("{kind} queued recv: 3\n{kind} empty recv MSG_DONTWAIT: {eagain}\n");
+        for (call, length) in [("recvfrom", 4), ("recvmsg", 4), ("recvmmsg", 1)] {
+            lines +=
+                &format!("{kind} blocking {call}: {length}\n{kind} blocking {call} data: late\n");
+        }
+        lines
+    };
+    let native = native_stdout(guest);
+    // A host booted without IPv6 cannot make the UDPv6 socket; Hermit's output
+    // must still match native's.
+    let udp6 = if native.contains("udp6 socket: ") {
+        "udp6 socket: Address family not supported by protocol\n".to_owned()
+    } else {
+        empty("udp6 unbound")
+    };
+    let expected = [
+        empty("udp unbound"),
+        "udp poll after a send to a closed port: 1\nudp poll revents POLLERR: yes\n\
+         udp error queue recvmsg: 4\nudp error queue msg_flags MSG_ERRQUEUE: yes\n\
+         udp error: Connection refused, origin 2, ICMP type 3 code 3\n"
+            .to_owned(),
+        empty("udp drained"),
+        udp6,
+        empty("tcp unconnected"),
+        empty("tcp connected"),
+        empty("tcp accepted"),
+        unix("unix datagram pair"),
+        unix("unix stream pair"),
+        unix("unix datagram socket"),
+    ]
+    .concat();
+    assert_eq!(native, expected);
+    let guest = guest.to_str().unwrap();
+    for strict in [true, false] {
+        let mut args = vec!["run", "--timeout", "120"];
+        if strict {
+            args.push("--strict");
+        }
+        args.extend(["--base-env=minimal", "--", guest]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+    }
+}
+
 /// `select`'s timeout is read as Linux v7.1 reads it: `kern_select`
 /// (`fs/select.c`) refuses a negative field, then folds `tv_usec >= 1000000`
 /// into the seconds before `poll_select_set_timeout`, so `{0, 1500000}` is a
@@ -32904,7 +33080,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x186, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x18b, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];
