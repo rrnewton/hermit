@@ -44,6 +44,14 @@
 //! of attempts. After enough queueing operations are performed, however,
 //! polling tasks are upgraded to their original priority to prevent complete
 //! starvation. The frequency of upgrades is controlled by `POLLING_UPGRADE_INTERVAL`.
+//!
+//! An upgraded poller competes as ordinary runnable work, which under chaos
+//! includes the bound on how often a change point may pass it over
+//! (`Scheduler::bound_chaos_starvation`). A poller whose normal priority is
+//! the last band already sits there, so its upgrade cannot move it; it
+//! records the upgrade instead (`QueueValue::upgraded_in_place`), which
+//! gives it the same protection from starvation while the
+//! deterministic-work-first gates keep counting it as a poller.
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -177,9 +185,31 @@ struct QueueValue {
     /// the gates, and stays so
     /// (<https://github.com/rrnewton/hermit/issues/3952>).
     deadline_restored: bool,
+    /// Set by a poll upgrade that reached this entry but could not move it:
+    /// a backed-off poller, or a deadline-restored one, whose normal priority
+    /// is the last band, where it already sits. Every other poller a poll
+    /// upgrade reaches becomes ordinary work, which a chaos change point can
+    /// pass over only a bounded number of times
+    /// (`Scheduler::bound_chaos_starvation`). Without this mark such a poller
+    /// was never upgraded and never counted, so two threads that sleep in
+    /// turns at better priorities kept it from its next retry forever, even
+    /// after another thread wrote what it polled for. It stays a poller for
+    /// the deterministic-work-first gates (`counts_as_poller`) and the yield
+    /// epoch, as the upgrade leaves it in the last band; it only joins the
+    /// change-point bound (`RunQueue::can_be_passed_over`). A requeue makes a
+    /// fresh entry without it, so it lasts until the poller's next retry;
+    /// `suspend`/`restore` keep the entry, and the mark with it.
+    upgraded_in_place: bool,
 }
 
 impl QueueValue {
+    /// Whether this entry is a thread that will run its turn, not a polling
+    /// thread retrying a call that is not ready: neither a backed-off poller
+    /// (`push_poller`) nor one a deadline restored and that has not run since.
+    fn is_non_polling(&self) -> bool {
+        self.poll_upgrade.is_none() && !self.deadline_restored
+    }
+
     /// Whether this entry counts as a poller for the deterministic-work-first
     /// gates, given its queue priority: a polling thread whose backoff has
     /// reached the last band, or one `restore_poller_priority` restored from
@@ -512,6 +542,7 @@ impl RunQueue {
             tid,
             poll_upgrade,
             deadline_restored: false,
+            upgraded_in_place: false,
         };
         let old = self.queue.insert(prio, qval);
         assert!(old.is_none()); // last_*_turn should be monotonic
@@ -548,7 +579,20 @@ impl RunQueue {
     pub fn contains_non_polling_tid(&self, tid: DetTid) -> bool {
         self.queue
             .iter()
-            .any(|(_, v)| v.tid == tid && v.poll_upgrade.is_none() && !v.deadline_restored)
+            .any(|(_, v)| v.tid == tid && v.is_non_polling())
+    }
+
+    /// Whether `tid` is queued as work that a chaos change point can pass
+    /// over (`Scheduler::bound_chaos_starvation`): a thread that will run its
+    /// turn ([`Self::contains_non_polling_tid`]), which includes every poller
+    /// a poll upgrade has moved back to its normal priority, or a poller the
+    /// upgrade reached in the last band, where it could not move
+    /// (`QueueValue::upgraded_in_place`). A poller still backed off is not:
+    /// its backoff, not the bound, decides when it retries. Read-only.
+    pub fn can_be_passed_over(&self, tid: DetTid) -> bool {
+        self.queue
+            .values()
+            .any(|v| v.tid == tid && (v.is_non_polling() || v.upgraded_in_place))
     }
 
     pub(super) fn suspend(
@@ -857,6 +901,12 @@ impl RunQueue {
         self.sched_strategy.is_priority_ordered()
     }
 
+    /// Run a poll upgrade now, as the `POLLING_UPGRADE_INTERVAL`th push would.
+    #[cfg(test)]
+    pub fn poll_upgrade_now(&mut self) {
+        self.do_poll_upgrade();
+    }
+
     /// The priority `tid` is queued at, if it is queued.
     #[cfg(test)]
     pub fn queued_priority(&self, tid: DetTid) -> Option<Priority> {
@@ -917,8 +967,15 @@ impl RunQueue {
             // work for the gates, and with `POLLING_UPGRADE_INTERVAL` pollers
             // like it queued, every one could lose the marker again before
             // the next push restored it, so that no gate ever opened (Codex
-            // review of https://github.com/rrnewton/hermit/pull/4314).
+            // review of https://github.com/rrnewton/hermit/pull/4314). It
+            // keeps the marker and records the upgrade instead, which lets
+            // the chaos change-point bound count it as it counts every other
+            // upgraded poller (`QueueValue::upgraded_in_place`).
             if upgrade_prio >= LAST_PRIORITY {
+                self.queue
+                    .get_mut(&key)
+                    .expect("located queue entry")
+                    .upgraded_in_place = true;
                 continue;
             }
             let mut new_key = key;
@@ -932,10 +989,13 @@ impl RunQueue {
         // deterministic-work-first gates. A poller its deadline restored
         // earlier would have been upgraded here too, so it stops counting as
         // a poller now as well (https://github.com/rrnewton/hermit/issues/3952),
-        // unless it is already in the last band, where an upgrade is a no-op.
+        // unless it is already in the last band, where an upgrade cannot move
+        // it: there it keeps counting as a poller, and records the upgrade.
         for (key, value) in self.queue.iter_mut() {
             if key.priority < LAST_PRIORITY {
                 value.deadline_restored = false;
+            } else if value.deadline_restored {
+                value.upgraded_in_place = true;
             }
         }
     }
@@ -1141,6 +1201,51 @@ mod tests {
             queue.push_poller(tid, LAST_PRIORITY, 1);
         }
         assert!(queue.only_pollers());
+    }
+
+    /// A poll upgrade reaches a poller in the last band without moving it,
+    /// and records that it did: from then on the chaos change-point bound can
+    /// count it (`can_be_passed_over`), as it counts every poller an upgrade
+    /// moved back to its normal priority, while the gates and the queue key
+    /// still see a backed-off poller. The same holds for one its deadline
+    /// restored there. A poller still backed off is not counted, and the mark
+    /// goes with the entry when the thread is requeued after its retry.
+    #[test]
+    fn a_poll_upgrade_lets_the_change_point_bound_count_a_last_band_poller() {
+        let poller = DetTid::from_raw(1);
+        let other = DetTid::from_raw(2);
+        let mut queue = RunQueue::default();
+        queue.push_poller(poller, LAST_PRIORITY, 5);
+        queue.push_poller(other, DEFAULT_PRIORITY, 30);
+        assert!(!queue.can_be_passed_over(poller), "backed off: not yet");
+        assert!(!queue.can_be_passed_over(other));
+        queue.do_poll_upgrade();
+        assert!(queue.can_be_passed_over(poller), "the upgrade reached it");
+        assert!(queue.can_be_passed_over(other), "moved, as on main");
+        assert!(!queue.contains_non_polling_tid(poller));
+        assert_eq!(queue.queued_priority(poller), Some(LAST_PRIORITY));
+        assert!(queue.remove_tid(other));
+        assert!(queue.only_pollers(), "still a poller for the gates");
+        assert!(!queue.has_runnable_besides(other));
+
+        assert_eq!(queue.tentative_pop_next(), Some(poller));
+        assert_eq!(queue.commit_tentative_pop(), poller);
+        queue.push_poller(poller, LAST_PRIORITY, 6);
+        assert!(!queue.can_be_passed_over(poller), "requeued: backed off");
+
+        let restored = DetTid::from_raw(3);
+        let mut queue = RunQueue::default();
+        queue.push_poller(restored, LAST_PRIORITY, 3);
+        assert_eq!(
+            queue.restore_poller_priority(restored),
+            PollerRestore::Restored
+        );
+        assert!(!queue.can_be_passed_over(restored));
+        queue.do_poll_upgrade();
+        assert!(queue.can_be_passed_over(restored));
+        assert!(queue.only_pollers());
+        assert!(!queue.contains_tid(DetTid::from_raw(9)));
+        assert!(!queue.can_be_passed_over(DetTid::from_raw(9)));
     }
 
     /// A chaos `sched_yield` requeue marks its thread as a yielder, as the

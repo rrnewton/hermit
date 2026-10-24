@@ -14283,15 +14283,28 @@ impl Scheduler {
     /// threads, so a thread that never runs is not held back by a draw it made
     /// once.
     ///
-    /// Each runnable (non-polling) thread that `dettid`'s new priority still
-    /// beats counts one more pass. A thread passed over at
-    /// [`CHAOS_PASSOVER_BOUND`] such change points since its last committed
-    /// turn moves ahead: `dettid` takes the priority one below it (numerically
-    /// one greater, capped at `LAST_PRIORITY`), so the passed-over thread keeps
-    /// the lead for all its turns until it blocks, or until `dettid`'s next
-    /// change point draws again. A thread's count restarts at its committed
-    /// turn and goes when its blocking entries are removed (it retires, or a
-    /// forced wake requeues it).
+    /// Each runnable thread that `dettid`'s new priority still beats counts
+    /// one more pass. A thread passed over at [`CHAOS_PASSOVER_BOUND`] such
+    /// change points since its last committed turn moves ahead: `dettid` takes
+    /// the priority one below it (numerically one greater, capped at
+    /// `LAST_PRIORITY`), so the passed-over thread keeps the lead for all its
+    /// turns until it blocks, or until `dettid`'s next change point draws
+    /// again. A thread's count restarts at its committed turn and goes when
+    /// its blocking entries are removed (it retires, or a forced wake requeues
+    /// it).
+    ///
+    /// A poller counts once a poll upgrade has reached it
+    /// (`RunQueue::can_be_passed_over`), as it then competes as ordinary work;
+    /// one still backed off does not. That includes a poller whose normal
+    /// priority is the last band, which the upgrade reaches but cannot move:
+    /// before it counted, two threads sleeping in turns at better priorities
+    /// kept such a poller from its next retry forever, so it never saw a pipe
+    /// write it was polling for. In the last band the lead is by round-robin
+    /// turn alone, and a thread woken from a timed wait is pushed to the front
+    /// of its band (`wake_timed_event`). At the change point itself, though,
+    /// the changing thread is requeued behind the passed-over one, and every
+    /// other thread that keeps running ahead of it is demoted the same way at
+    /// its own next change point, so the passed-over thread runs eventually.
     ///
     /// Deterministic: it reads only the priority map and run-queue membership
     /// at this change point, in thread-ID order, and counts change only at
@@ -14305,18 +14318,19 @@ impl Scheduler {
         let queued: Vec<(DetTid, Priority)> = self
             .priorities
             .iter()
-            .filter(|(tid, _)| **tid != dettid && self.run_queue.contains_non_polling_tid(**tid))
+            .filter(|(tid, _)| **tid != dettid && self.run_queue.can_be_passed_over(**tid))
             .map(|(tid, prio)| (*tid, *prio))
             .collect();
-        let starving = queued
+        let starving_threads: Vec<(DetTid, Priority)> = queued
             .iter()
             .filter(|(tid, prio)| {
                 *prio > drawn
                     && self.chaos_passed_over.get(tid).copied().unwrap_or(0) + 1
                         >= CHAOS_PASSOVER_BOUND
             })
-            .map(|(_, prio)| *prio)
-            .max();
+            .copied()
+            .collect();
+        let starving = starving_threads.iter().map(|(_, prio)| *prio).max();
         let priority = starving.map_or(drawn, |prio| (prio + 1).min(runqueue::LAST_PRIORITY));
         for (tid, prio) in queued {
             if prio > priority {
@@ -14324,10 +14338,26 @@ impl Scheduler {
             }
         }
         if priority != drawn {
-            info!(
-                "[scheduler] chaos change point of dettid {}: priority {} drawn, {} taken, behind a thread passed over at {} change points",
-                dettid, drawn, priority, CHAOS_PASSOVER_BOUND
-            );
+            // A poller the bound counts only because a poll upgrade reached it
+            // in the last band (`RunQueue::can_be_passed_over`) is named, so
+            // that a log shows when the bound, and nothing else, retried it.
+            let last_band_poller = starving_threads
+                .iter()
+                .find(|(tid, prio)| {
+                    Some(*prio) == starving && !self.run_queue.contains_non_polling_tid(*tid)
+                })
+                .map(|(tid, _)| *tid);
+            if let Some(poller) = last_band_poller {
+                info!(
+                    "[scheduler] chaos change point of dettid {}: priority {} drawn, {} taken, behind poller dettid {}, passed over at {} change points after a poll upgrade reached it in the last band",
+                    dettid, drawn, priority, poller, CHAOS_PASSOVER_BOUND
+                );
+            } else {
+                info!(
+                    "[scheduler] chaos change point of dettid {}: priority {} drawn, {} taken, behind a thread passed over at {} change points",
+                    dettid, drawn, priority, CHAOS_PASSOVER_BOUND
+                );
+            }
         }
         priority
     }
@@ -24018,6 +24048,42 @@ mod test {
         );
         spinner_changepoint(&mut scheduler, spinner, 136, 1);
         spinner_changepoint(&mut scheduler, spinner, 7043, 2);
+        assert_eq!(scheduler.priorities[&spinner], runqueue::LAST_PRIORITY);
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(waiter));
+    }
+
+    /// A poller whose normal priority is the last band is counted by the
+    /// bound once a poll upgrade has reached it, like every upgraded poller,
+    /// although the upgrade cannot move it: after two passes the spinner
+    /// shares its band, behind it, so its retry runs next. While it is backed
+    /// off, change points keep their draws. Before, such a poller was never
+    /// counted, so threads at better priorities kept it from its retry
+    /// forever; in `tests/c/chaos_poller_beside_sleepers.c` two sleepers did,
+    /// and it never saw the pipe write it polled for.
+    #[test]
+    fn a_chaos_change_point_yields_to_an_upgraded_last_band_poller() {
+        let (mut scheduler, spinner, waiter) = chaos_spinner_and_waiter(
+            Config {
+                chaos: true,
+                ..Config::default()
+            },
+            500,
+            runqueue::LAST_PRIORITY,
+        );
+        assert!(scheduler.run_queue.remove_tid(waiter));
+        scheduler
+            .run_queue
+            .push_poller(waiter, runqueue::LAST_PRIORITY, 5);
+        spinner_changepoint(&mut scheduler, spinner, 136, 1);
+        spinner_changepoint(&mut scheduler, spinner, 7043, 2);
+        assert_eq!(scheduler.priorities[&spinner], 7043, "backed off");
+        assert!(scheduler.chaos_passed_over.is_empty());
+
+        scheduler.run_queue.poll_upgrade_now();
+        spinner_changepoint(&mut scheduler, spinner, 136, 3);
+        assert_eq!(scheduler.priorities[&spinner], 136);
+        assert_eq!(scheduler.chaos_passed_over.get(&waiter), Some(&1));
+        spinner_changepoint(&mut scheduler, spinner, 4756, 4);
         assert_eq!(scheduler.priorities[&spinner], runqueue::LAST_PRIORITY);
         assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(waiter));
     }
