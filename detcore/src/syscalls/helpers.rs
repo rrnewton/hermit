@@ -1273,6 +1273,21 @@ pub fn ioaction_based_on_fd_status<
 ) -> Result<IOAction, Errno> {
     let wrapped: Syscall = call.into();
     let fd = get_fd(wrapped).unwrap_or_else(|| panic!("Failed to get fd for {}", call.name()));
+    match ioaction_based_on_fd(guest, fd)? {
+        // FT, but the call itself does not wait (MSG_DONTWAIT), so firing once
+        // is what Linux does.
+        IOAction::NonblockizeRetry if call.flags_forbid_waiting() => Ok(IOAction::PassThru),
+        action => Ok(action),
+    }
+}
+
+/// [`ioaction_based_on_fd_status`] for the descriptor `fd` alone, before any
+/// flag of the call itself, for a caller whose call does not implement
+/// [`NonblockableSyscall`].
+pub(crate) fn ioaction_based_on_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    fd: i32,
+) -> Result<IOAction, Errno> {
     let (phys, virt) = guest.thread_state().with_detfd(fd, |detfd| {
         (detfd.physically_nonblocking(), detfd.is_nonblocking())
     })?;

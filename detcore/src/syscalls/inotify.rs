@@ -681,8 +681,11 @@ where
     if !config.sequentialize_threads || config.recordreplay_modes {
         return None;
     }
+    let wrapped: Syscall = call.into();
+    let call_fd = crate::syscalls::helpers::get_fd(wrapped)
+        .unwrap_or_else(|| panic!("Failed to get fd for {}", call.name()));
     if !matches!(
-        crate::syscalls::helpers::ioaction_based_on_fd_status(guest, call),
+        crate::syscalls::helpers::ioaction_based_on_fd(guest, call_fd),
         Ok(crate::syscalls::helpers::IOAction::PassThru)
     ) {
         return None;

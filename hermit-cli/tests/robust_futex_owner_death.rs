@@ -1599,6 +1599,12 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // the exact-match gate.
     assert_eq!(
         metadata["version"], 0x190,
+    // 0x187 chaos recordings store their schedule,
+    // and 0x18b runs a MSG_DONTWAIT call on a socketpair end once),
+    // and a recording from before the change, 0x14f, is still refused by
+    // the exact-match gate.
+    assert_eq!(
+        metadata["version"], 0x18b,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);

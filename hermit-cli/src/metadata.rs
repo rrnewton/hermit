@@ -878,7 +878,16 @@ impl RecordVersion {
 // signal's delivery Detcore now retires the process's other threads in that
 // turn, where it left them to the host. An older recording's schedule has
 // those threads running on, so it is refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x190);
+// 0x190 -> 0x191 (ledger-assigned for this change; PMU-H moves to 0x192):
+// a send or receive with MSG_DONTWAIT on a socketpair end the guest
+// left blocking runs once, as on Linux, where Detcore polled it until it
+// stopped failing with EAGAIN. A recording of such a call that polled until
+// another thread wrote holds those retries and the data, while this build
+// returns the first EAGAIN to the guest and falls out of step. One that
+// succeeded at once also took a polling turn that this build no longer
+// takes, so its schedule differs. Both are refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x191);
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18b);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -903,7 +912,8 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x190);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x190;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x191;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x18b;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -2374,6 +2384,7 @@ mod tests {
     }
 
     /// A 0x186 recording polled a MSG_DONTWAIT send or receive on a
+    /// A 0x187 recording polled a MSG_DONTWAIT send or receive on a
     /// socketpair end until it stopped failing with EAGAIN; this replayer runs
     /// it once, so the version gate must refuse it.
     #[test]
@@ -2382,6 +2393,7 @@ mod tests {
         // was rebased onto, not only the version before the original bump.
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
         assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x186)));
+        assert!(!RECORD_VERSION.compatible_with(&RecordVersion(0x187)));
     }
 
     #[test]
