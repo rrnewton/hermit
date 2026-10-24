@@ -9,6 +9,7 @@
 //! A mode for analyzing a hermit run.
 
 use std::cmp;
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::num::NonZeroU64;
 use std::path::Path;
@@ -38,6 +39,7 @@ use crate::analyze::rundata::Stop;
 use crate::analyze::rundata::TrialEnd;
 use crate::analyze::rundata::guest_reached_a_refusal;
 use crate::analyze::types::AnalyzeOpts;
+use crate::analyze::types::CONFIRM_BOUND_FACTOR;
 use crate::analyze::types::ContinuationTimeslice;
 use crate::analyze::types::ExitStatusConstraint;
 use crate::analyze::types::Report;
@@ -173,14 +175,139 @@ pub struct PrefixDecision {
     pub continuation: MaybeTimeslice,
     /// [`refused_trials_warning`], if any trial was refused.
     pub refused: Option<String>,
+    /// [`unfinished_boundary_warning`], when the last trial of the first
+    /// `decision` events did not finish.
+    pub unfinished: Option<String>,
+}
+
+/// The bound a confirmation of a prefix's trial gets, in seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmationBound {
+    /// The first confirmation: it raises every later run's bound to this.
+    Raise(u64),
+    /// The bound was raised already, but this prefix's last trial ran under
+    /// a shorter one (the empty prefix's, say): it runs again under this.
+    Rerun(u64),
+    /// No longer bound can be given.
+    Unavailable,
+}
+
+/// Which [`ConfirmationBound`] a prefix whose last trial ran under `earlier`
+/// seconds gets: `raised` is [`AnalyzeOpts::confirmation_bound`], `factor`
+/// [`AnalyzeOpts::trial_bound_factor`] and `now` the bound a trial created
+/// now runs under ([`AnalyzeOpts::effective_trial_bound`]).
+fn confirmation_bound(
+    raised: Option<u64>,
+    factor: u32,
+    now: Option<u64>,
+    earlier: Option<u64>,
+) -> ConfirmationBound {
+    match (raised, now) {
+        (Some(longer), _) => ConfirmationBound::Raise(longer),
+        (None, Some(now)) if factor != 1 && earlier < Some(now) => ConfirmationBound::Rerun(now),
+        _ => ConfirmationBound::Unavailable,
+    }
+}
+
+/// The bound factor after a confirmation that `raised` it ended `end`: a
+/// confirmation stopped again goes back to the usual bound, since the
+/// boundary rests on a bound either way and the shorter one costs less; one
+/// that finished keeps the longer bound, so the recheck and the stack-trace
+/// runs of that prefix can finish too.
+fn factor_after_confirmation(factor: u32, raised: bool, end: TrialEnd) -> u32 {
+    if raised && end == TrialEnd::Unfinished(Stop::Bound) {
+        1
+    } else {
+        factor
+    }
+}
+
+/// The longest prefix shorter than `passing` whose last trial at
+/// `continuation` finished, and how it ended, from each prefix's last trial
+/// (`ends`).
+fn longest_finished_below(
+    ends: &BTreeMap<(usize, MaybeTimeslice), (TrialEnd, Option<u64>)>,
+    continuation: MaybeTimeslice,
+    passing: usize,
+) -> Option<(usize, TrialEnd)> {
+    ends.iter()
+        .rev()
+        .filter(|((prefix, timeslice), _)| *timeslice == continuation && *prefix < passing)
+        .map(|(&(prefix, _), &(end, _))| (prefix, end))
+        .find(|&(_, end)| end.finished())
+}
+
+/// Which flag raises the bound that stopped a trial, as advice: the run
+/// arguments' own `--timeout` (`own`, in seconds) where that is the bound
+/// trials ran under, `last` (none when `--trial-timeout` is `off`), else
+/// `--trial-timeout`.
+fn bound_remedy(own: Option<u64>, trial_timeout_off: bool, last: Option<u64>) -> &'static str {
+    if own.is_some() && (trial_timeout_off || own <= last) {
+        "raise the run arguments' --timeout"
+    } else {
+        "raise --trial-timeout"
+    }
+}
+
+/// What a search should say about its result when the last trial of the
+/// first `passing` events, the boundary's baseline side, did not finish:
+/// first within `bound` seconds of wall-clock time and then, when it ran
+/// again to confirm it, within `confirmed` seconds (`None`: no longer bound
+/// could be given). `below` is the longest shorter prefix the search
+/// replayed whose trial finished, and how it ended. It names only prefixes
+/// the search replayed: the search assumes the outcome changes once along
+/// the schedule, so it claims nothing about the prefixes in between.
+/// `remedy` is [`bound_remedy`]'s advice.
+fn unfinished_boundary_warning(
+    passing: usize,
+    bound: Option<u64>,
+    confirmed: Option<u64>,
+    below: Option<(usize, TrialEnd)>,
+    remedy: &str,
+) -> String {
+    let confirmation = match confirmed {
+        Some(longer) => format!(", nor within {longer} s when it ran again to confirm it"),
+        None => ", and no longer bound could be given to confirm it".to_owned(),
+    };
+    let below = match below {
+        Some((prefix, end)) => format!(
+            "The longest shorter prefix the search replayed that finished is the prefix of \
+             {prefix} events, which {}.",
+            describe_trial_end(end, None)
+        ),
+        None => "No shorter prefix the search replayed finished.".to_owned(),
+    };
+    format!(
+        "replaying the first {passing} events and then scheduling without chaos \
+         {}{confirmation}: the guest hangs (for example in a deadlock while other threads keep \
+         polling), or needs longer still. A hang is a third outcome, not a run that misses the \
+         target, yet the search counted it as not meeting the target: this boundary rests on a \
+         wall-clock bound, not on an outcome. Given longer, that trial may meet the target, and \
+         an earlier event decide the outcome ({remedy}). {below}",
+        describe_trial_end(TrialEnd::Unfinished(Stop::Bound), bound)
+    )
+}
+
+/// How a trial ended, for a message; `bound` is the wall-clock bound it ran
+/// under, in seconds.
+fn describe_trial_end(end: TrialEnd, bound: Option<u64>) -> String {
+    match end {
+        TrialEnd::Met => "met the target".to_owned(),
+        TrialEnd::Missed => "missed the target".to_owned(),
+        TrialEnd::Unfinished(Stop::Bound) => match bound {
+            Some(bound) => format!("did not finish within {bound} s"),
+            None => "did not finish".to_owned(),
+        },
+        TrialEnd::Unfinished(Stop::Refusal) => "was refused by Hermit".to_owned(),
+    }
 }
 
 /// What a search with `refused` trials Hermit refused at run time, all
-/// counted as not reaching the target, should say about its result.
+/// counted as not meeting the target, should say about its result.
 fn refused_trials_warning(refused: usize) -> Option<String> {
     (refused > 0).then(|| {
         format!(
-            "{refused} trial(s) were refused by Hermit (exit 122) and counted as not reaching \
+            "{refused} trial(s) were refused by Hermit (exit 122) and counted as not meeting \
              the target, so the deciding event may separate the target from a path Hermit does \
              not support rather than from a run that misses the target."
         )
@@ -322,24 +449,112 @@ fn describe_outcome(outcome: Continuation) -> &'static str {
     }
 }
 
+/// The trial of the empty prefix, which a bound had stopped, met the target
+/// when [`search_prefix_boundary`] confirmed it: the scheduler alone meets it.
+#[derive(Debug)]
+struct EmptyPrefixMeetsTarget;
+
+impl std::fmt::Display for EmptyPrefixMeetsTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "given longer than the bound that stopped it, the trial of the empty prefix meets \
+             the target criteria"
+        )
+    }
+}
+
+impl std::error::Error for EmptyPrefixMeetsTarget {}
+
+/// Why [`search_prefix_boundary`] runs a trial.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrialPurpose {
+    /// To narrow the search.
+    Search,
+    /// To confirm the boundary: the prefix's last trial did not finish, and
+    /// it runs again with a longer bound.
+    Confirm,
+}
+
+/// The boundary a prefix search settled on: the prefix of `passing` events
+/// does not meet the target, the prefix of `passing + 1` events meets it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Boundary {
+    passing: usize,
+    /// How the last trial of the prefix of `passing` events ended: it missed
+    /// the target, or it did not finish.
+    passing_end: TrialEnd,
+}
+
 /// The binary search of `--prefix-search` over a schedule of `len` events
-/// whose endpoints [`check_continuation`] found usable: returns `k` such that
-/// the prefix of `k` events misses the target and the prefix of `k + 1` meets
-/// it. Uses about log2(len) trials.
+/// whose endpoints [`check_continuation`] found usable, the trial of the
+/// empty prefix having ended `empty`. Uses about log2(len) trials when they
+/// all finish.
+///
+/// Only a trial that finished has an outcome: a wall-clock bound stops a
+/// trial at a time the host decides, so one run of a prefix can finish and
+/// meet the target and the next be stopped. While the search narrows, a
+/// stopped trial counts as not meeting the target, since a guest can spin
+/// for ever on the baseline side. It does not decide the boundary, though:
+/// when the search settles on one, `trial(k, Confirm)` runs it again with a
+/// longer bound. If it then meets the target, the boundary is below it, and
+/// the search goes on above the longest prefix that did not meet the target
+/// and was not stopped (or the empty prefix), every stopped trial in between
+/// open again. `Confirm` returns `None` when no longer bound can be given,
+/// and the boundary stays on the stopped trial. A search trial always
+/// returns `Some`.
+///
+/// Confirming the boundary's trial is enough when a prefix that meets the
+/// target stays met when it grows: a stopped trial that steered the search
+/// past the deciding event left a passing side at or after that event, which
+/// meets the target when given long enough, so its confirmation shows it.
 fn search_prefix_boundary(
     len: usize,
-    mut meets_target: impl FnMut(usize) -> anyhow::Result<bool>,
-) -> anyhow::Result<usize> {
-    let (mut passing, mut failing) = (0, len);
-    while failing - passing > 1 {
-        let mid = passing + (failing - passing) / 2;
-        if meets_target(mid)? {
-            failing = mid;
-        } else {
-            passing = mid;
+    empty: TrialEnd,
+    mut trial: impl FnMut(usize, TrialPurpose) -> anyhow::Result<Option<TrialEnd>>,
+) -> anyhow::Result<Boundary> {
+    // How each prefix shorter than `failing` that did not meet the target
+    // ended, the empty prefix included.
+    let mut missed = BTreeMap::from([(0, empty)]);
+    let mut failing = len;
+    loop {
+        let mut passing = *missed.keys().next_back().expect("the empty prefix is kept");
+        while failing - passing > 1 {
+            let mid = passing + (failing - passing) / 2;
+            let end = trial(mid, TrialPurpose::Search)?
+                .context("a search trial always ends one way or another")?;
+            if end.reached_target() {
+                failing = mid;
+            } else {
+                missed.insert(mid, end);
+                passing = mid;
+            }
+        }
+        let passing_end = missed[&passing];
+        if passing_end != TrialEnd::Unfinished(Stop::Bound) {
+            return Ok(Boundary {
+                passing,
+                passing_end,
+            });
+        }
+        match trial(passing, TrialPurpose::Confirm)? {
+            Some(TrialEnd::Met) if passing == 0 => return Err(EmptyPrefixMeetsTarget.into()),
+            Some(TrialEnd::Met) => {
+                failing = passing;
+                // A stopped trial is no more an outcome than the one just
+                // refuted, so only the others bound the search from below.
+                missed.retain(|&prefix, end| {
+                    prefix == 0 || *end != TrialEnd::Unfinished(Stop::Bound)
+                });
+            }
+            confirmed => {
+                return Ok(Boundary {
+                    passing,
+                    passing_end: confirmed.unwrap_or(passing_end),
+                });
+            }
         }
     }
-    Ok(passing)
 }
 
 /// Why the critical pair a search settled on may not be a race, if there is a reason.
@@ -347,7 +562,7 @@ fn search_prefix_boundary(
 /// Swapping two events of one thread is no interleaving any execution can take, so
 /// the outcome change at such a pair comes from the replay falling off the schedule.
 /// Trials that did not finish (a bound or a refusal ended them) were counted as
-/// not reaching the target, which can steer the search onto exactly such a pair.
+/// not meeting the target, which can steer the search onto exactly such a pair.
 fn critical_pair_caveat(crit: &CriticalSchedule) -> Option<String> {
     let index = crit.critical_event_index;
     let schedule = &crit.failing_schedule;
@@ -372,7 +587,7 @@ fn search_warnings(crit: &CriticalSchedule, timed_out: usize) -> Vec<String> {
     if timed_out > 0 {
         warnings.push(format!(
             "{timed_out} trial(s) did not finish within the run arguments' --timeout. Each was \
-             counted as the baseline condition, with the schedule it was asked to replay taken \
+             counted as not meeting the target, with the schedule it was asked to replay taken \
              as the one it realized, so the critical pair may rest on them."
         ));
     }
@@ -949,59 +1164,219 @@ impl AnalyzeOpts {
     /// replayed and then continued without chaos, still meets the target
     /// criteria. Returns the index of that prefix's last event.
     pub fn phase5_prefix_search(
-        &self,
+        &mut self,
         target_record: &PreemptionRecord,
     ) -> anyhow::Result<PrefixDecision> {
         let target = target_record.schedevents();
-        let mut trial = 0;
-        let mut refused = 0;
-        let mut meets_target =
-            |len: usize, continuation: MaybeTimeslice| -> anyhow::Result<TrialEnd> {
-                trial += 1;
-                let mut run = self.prefix_trial(
-                    &format!("prefix_round_{trial:03}"),
-                    target_record,
-                    len,
-                    continuation,
-                )?;
-                let end = self.launch_prefix_trial(&mut run)?;
-                refused += usize::from(end == TrialEnd::Unfinished(Stop::Refusal));
-                let is_match = end.reached_target();
-                eprintln!(
-                    ":: Prefix of {len} of {} events => {}",
-                    target.len(),
-                    if is_match {
-                        format!("target condition ({})", self.display_criteria())
-                    } else {
-                        "baseline condition".to_string()
-                    }
-                );
-                Ok(end)
-            };
-
         let candidates = match self.continuation_timeslice {
             ContinuationTimeslice::Auto => continuation_candidates(self.trial_max_timeslice()),
             ContinuationTimeslice::Nanos(nanos) => vec![Some(nanos)],
         };
-        let continuation = choose_continuation(&candidates, target.len(), &mut meets_target)?;
+        let mut trial = 0;
+        let mut refused = 0;
+        // How the last trial of each prefix ended, per continuation, and the
+        // wall-clock bound it ran under, in seconds.
+        type Ends = BTreeMap<(usize, MaybeTimeslice), (TrialEnd, Option<u64>)>;
+        let ends = std::cell::RefCell::new(Ends::new());
+        // For each prefix confirmed, the bound its trial ran under before and
+        // the one the confirmation ran under, in seconds.
+        let confirmations = std::cell::RefCell::new(BTreeMap::new());
+        let bound_of = |len: usize, continuation: MaybeTimeslice| {
+            ends.borrow()
+                .get(&(len, continuation))
+                .and_then(|&(_, bound)| bound)
+        };
+        let mut run_trial = |len: usize,
+                             continuation: MaybeTimeslice,
+                             purpose: TrialPurpose|
+         -> anyhow::Result<Option<TrialEnd>> {
+            let mut raised = false;
+            if purpose == TrialPurpose::Confirm {
+                let earlier = bound_of(len, continuation);
+                let longer = match confirmation_bound(
+                    self.confirmation_bound(),
+                    self.trial_bound_factor,
+                    self.effective_trial_bound(),
+                    earlier,
+                ) {
+                    ConfirmationBound::Raise(longer) => {
+                        self.trial_bound_factor = CONFIRM_BOUND_FACTOR;
+                        raised = true;
+                        longer
+                    }
+                    ConfirmationBound::Rerun(now) => now,
+                    ConfirmationBound::Unavailable => {
+                        eprintln!(
+                            ":: The search settled next to the prefix of {len} events, whose \
+                             trial {}; no longer bound can be given to confirm it",
+                            describe_trial_end(TrialEnd::Unfinished(Stop::Bound), earlier),
+                        );
+                        return Ok(None);
+                    }
+                };
+                eprintln!(
+                    ":: The search settled next to the prefix of {len} events, whose trial {}; \
+                     running it again with a bound of {longer} s, so that a finished trial \
+                     decides the boundary",
+                    describe_trial_end(TrialEnd::Unfinished(Stop::Bound), earlier),
+                );
+                confirmations.borrow_mut().insert(len, (earlier, longer));
+            }
+            trial += 1;
+            let mut run = self.prefix_trial(
+                &format!("prefix_round_{trial:03}"),
+                target_record,
+                len,
+                continuation,
+            )?;
+            let bound = run.runopts.run_timeout().map(|bound| bound.as_secs());
+            let end = self.launch_prefix_trial(&mut run)?;
+            if purpose == TrialPurpose::Confirm {
+                if end == TrialEnd::Met && len > 0 {
+                    eprintln!(
+                        ":: Given longer, it met the target: the boundary is below it, and runs \
+                         from here on get the longer bound"
+                    );
+                }
+                self.trial_bound_factor =
+                    factor_after_confirmation(self.trial_bound_factor, raised, end);
+            }
+            refused += usize::from(end == TrialEnd::Unfinished(Stop::Refusal));
+            eprintln!(
+                ":: Prefix of {len} of {} events => {}",
+                target.len(),
+                match end {
+                    TrialEnd::Met => format!("target condition ({})", self.display_criteria()),
+                    TrialEnd::Missed => "baseline condition".to_string(),
+                    TrialEnd::Unfinished(_) => format!(
+                        "no outcome: it {}, counted as not meeting the target",
+                        describe_trial_end(end, bound)
+                    ),
+                }
+            );
+            ends.borrow_mut().insert((len, continuation), (end, bound));
+            Ok(Some(end))
+        };
+        let ended = "a search trial always ends one way or another";
+
+        let continuation = choose_continuation(&candidates, target.len(), |len, continuation| {
+            run_trial(len, continuation, TrialPurpose::Search)?.context(ended)
+        })?;
         eprintln!(
             ":: Searching the prefixes continued without chaos {}",
             describe_continuation(continuation)
         );
-        let mut meets_target = |len| Ok(meets_target(len, continuation)?.reached_target());
-        let passing = search_prefix_boundary(target.len(), &mut meets_target)?;
+        let empty = ends.borrow()[&(0, continuation)].0;
+        let searched = search_prefix_boundary(target.len(), empty, |len, purpose| {
+            run_trial(len, continuation, purpose)
+        });
+        let Boundary {
+            passing,
+            passing_end,
+        } = match searched {
+            Err(error) if error.downcast_ref::<EmptyPrefixMeetsTarget>().is_some() => {
+                // The empty prefix's first trial was stopped, so the
+                // continuation looked usable and any coarser candidate went
+                // untried; name it rather than let the host's speed decide.
+                let untried: Vec<String> = candidates
+                    .iter()
+                    .skip_while(|&&candidate| candidate != continuation)
+                    .skip(1)
+                    .map(|&candidate| describe_continuation(candidate))
+                    .collect();
+                let untried = if untried.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        " The search did not try continuing {}, because the empty prefix's \
+                         first trial did not finish; --continuation-timeslice selects one.",
+                        untried.join(" or ")
+                    )
+                };
+                bail!(
+                    "no event of the target schedule decides the outcome: {error}, so without \
+                     chaos {}, the scheduler alone, replaying none of the target schedule, meets \
+                     the target. The outcome does not depend on a chaos decision, so debug that \
+                     run directly: the reproducer of the last trial in the workspace runs it. To \
+                     bisect against a run that misses the target instead, pass \
+                     --continuation-timeslice with a timeslice at which the scheduler alone \
+                     misses it, or use the default search with a passing --run2-seed.{untried}",
+                    describe_continuation(continuation)
+                )
+            }
+            searched => searched?,
+        };
         let failing = passing + 1;
         // On a host whose branch counter is not exact, two replays of one
-        // prefix can differ, so the boundary is checked once more.
-        if meets_target(passing)? || !meets_target(failing)? {
+        // prefix can differ, so the boundary is checked once more. A trial
+        // the bound stopped has no outcome to repeat, so such a baseline side
+        // is not run again, and a check the bound stops shows a trial close
+        // to the bound, not another outcome.
+        let mut rechecks = vec![(failing, TrialEnd::Met)];
+        if passing_end != TrialEnd::Unfinished(Stop::Bound) {
+            rechecks.insert(0, (passing, passing_end));
+        }
+        let (mut changed, mut unfinished_again) = (Vec::new(), Vec::new());
+        for (len, first) in rechecks {
+            let first_bound = bound_of(len, continuation);
+            let again = run_trial(len, continuation, TrialPurpose::Search)?.context(ended)?;
+            if again == first {
+                continue;
+            }
+            let what = format!(
+                "the prefix of {len} events {} and then {}",
+                describe_trial_end(first, first_bound),
+                describe_trial_end(again, bound_of(len, continuation))
+            );
+            if again == TrialEnd::Unfinished(Stop::Bound) {
+                unfinished_again.push(what);
+            } else if again.reached_target() != first.reached_target() {
+                changed.push(what);
+                // As before: one other outcome is enough to warn.
+                break;
+            }
+        }
+        if !changed.is_empty() {
             eprintln!(
                 ":: {} replaying the prefixes of {passing} and {failing} events again gave other \
-                 outcomes; the decision below may not repeat",
-                "WARNING:".yellow().bold()
+                 outcomes ({}); the decision below may not repeat",
+                "WARNING:".yellow().bold(),
+                changed.join("; ")
+            );
+        }
+        if !unfinished_again.is_empty() {
+            eprintln!(
+                ":: {} {}: these trials run close to their wall-clock bound, so the search may \
+                 have counted trials that meet the target given longer as not meeting it, and an \
+                 earlier event decide the outcome ({})",
+                "WARNING:".yellow().bold(),
+                unfinished_again.join("; "),
+                bound_remedy(
+                    self.run_args_timeout(),
+                    self.trial_timeout == TrialTimeout::Off,
+                    self.effective_trial_bound(),
+                )
             );
         }
         let refused = refused_trials_warning(refused);
         if let Some(warning) = &refused {
+            eprintln!(":: {} {warning}", "WARNING:".yellow().bold());
+        }
+        let unfinished = (passing_end == TrialEnd::Unfinished(Stop::Bound)).then(|| {
+            let below = longest_finished_below(&ends.borrow(), continuation, passing);
+            let confirmed = confirmations.borrow().get(&passing).copied();
+            let (bound, longer) = match confirmed {
+                Some((earlier, longer)) => (earlier, Some(longer)),
+                None => (bound_of(passing, continuation), None),
+            };
+            let remedy = bound_remedy(
+                self.run_args_timeout(),
+                self.trial_timeout == TrialTimeout::Off,
+                longer.or(bound),
+            );
+            unfinished_boundary_warning(passing, bound, longer, below, remedy)
+        });
+        if let Some(warning) = &unfinished {
             eprintln!(":: {} {warning}", "WARNING:".yellow().bold());
         }
         eprintln!(
@@ -1013,6 +1388,7 @@ impl AnalyzeOpts {
             schedule: target_record.clone(),
             decision: passing,
             refused,
+            unfinished,
             continuation,
         })
     }
@@ -1079,8 +1455,13 @@ impl AnalyzeOpts {
             schedule,
             decision,
             refused,
+            unfinished,
             continuation,
         } = found;
+        let notes: Vec<String> = [refused, unfinished.clone()]
+            .into_iter()
+            .flatten()
+            .collect();
         let (target_met, chosen) = self.prefix_stack(
             "final_target_for_stacktraces",
             &schedule,
@@ -1104,7 +1485,7 @@ impl AnalyzeOpts {
                 continuation,
                 (target_met, &chosen),
                 (&continued, &continued_path),
-                &refused,
+                &notes,
             )?
         {
             return Ok(report);
@@ -1118,6 +1499,13 @@ impl AnalyzeOpts {
                 decision,
                 continuation,
             )?
+        } else if unfinished.is_some() && continued.is_empty() {
+            eprintln!(
+                ":: {} the run without event #{decision} did not finish and recorded no \
+                 schedule, so stack2 is empty",
+                "Note:".yellow().bold(),
+            );
+            (false, None)
         } else {
             eprintln!(
                 ":: {} the run without event #{decision} ended after {} events, so no thread \
@@ -1137,21 +1525,35 @@ impl AnalyzeOpts {
             );
         }
 
+        let misses = if unfinished.is_some() {
+            "does not finish, which the search counts as not meeting the target criteria (a hang, \
+             see the note below)"
+        } else {
+            "does not meet the target criteria"
+        };
         let mut header = format!(
             "The scheduling decision at event #{decision} of the target schedule decides the \
              outcome.\nReplaying the first {decision} events and then scheduling without chaos \
-             {} does not meet the target criteria; replaying event #{decision} too ({}) does \
-             ({}).\n",
+             {} {misses}; replaying event #{decision} too ({}) meets them ({}).\n",
             describe_continuation(continuation),
             schedule.schedevents()[decision],
             self.display_criteria()
         );
-        header.push_str(&stack_pair_sentences(
-            schedule.schedevents()[decision].dettid,
-            continued.get(decision).map(|event| event.dettid),
-        ));
-        if let Some(refused) = refused {
-            header.push_str(&format!("Note: {refused}\n"));
+        if unfinished.is_some() && continued.is_empty() {
+            header.push_str(
+                "stack1 is the thread the target schedule runs at that point; stack2 is empty: the \
+                 run without the event did not finish and recorded no schedule.\nWithout the event \
+                 the guest may wait for something that never comes: look for the wait it hangs in \
+                 (a lock or a join that nothing releases), which the event avoids.\n",
+            );
+        } else {
+            header.push_str(&stack_pair_sentences(
+                schedule.schedevents()[decision].dettid,
+                continued.get(decision).map(|event| event.dettid),
+            ));
+        }
+        for note in &notes {
+            header.push_str(&format!("Note: {note}\n"));
         }
         let context = Self::generate_context(
             schedule.schedevents(),
@@ -1203,7 +1605,7 @@ impl AnalyzeOpts {
         continuation: MaybeTimeslice,
         (target_met, deciding): (bool, &Option<PrettyBacktrace>),
         (continued, continued_path): (&[SchedEvent], &Path),
-        refused: &Option<String>,
+        notes: &[String],
     ) -> anyhow::Result<Option<Report>> {
         let events = schedule.schedevents();
         let thread = events[decision].dettid;
@@ -1324,8 +1726,8 @@ impl AnalyzeOpts {
             name(&target_continued_path),
             name(continued_path),
         ));
-        if let Some(refused) = refused {
-            header.push_str(&format!("Note: {refused}\n"));
+        for note in notes {
+            header.push_str(&format!("Note: {note}\n"));
         }
         let context = format!(
             "With event #{decision} replayed:\n{}\nWithout it:\n{}",
@@ -2215,7 +2617,7 @@ impl AnalyzeOpts {
 
     /// `--prefix-search` over the target endpoint's schedule, and its report.
     fn prefix_search_and_report(
-        &self,
+        &mut self,
         target_endpoint_run: &mut RunData,
     ) -> anyhow::Result<ExitStatus> {
         let target = target_endpoint_run.preempts_out().clone();
@@ -2600,17 +3002,324 @@ mod tests {
             (37_710, 37_709),
         ] {
             let mut trials = 0;
-            let found = search_prefix_boundary(len, |prefix| {
+            let found = search_prefix_boundary(len, TrialEnd::Missed, |prefix, purpose| {
+                assert_eq!(purpose, TrialPurpose::Search);
                 trials += 1;
-                Ok(prefix > decision)
+                Ok(Some(if prefix > decision {
+                    TrialEnd::Met
+                } else {
+                    TrialEnd::Missed
+                }))
             })
             .unwrap();
-            assert_eq!(found, decision, "len {len}");
+            assert_eq!(
+                found,
+                Boundary {
+                    passing: decision,
+                    passing_end: TrialEnd::Missed
+                },
+                "len {len}"
+            );
             assert!(
                 trials <= (len as f64).log2().ceil() as usize,
                 "{trials} trials"
             );
         }
+    }
+
+    /// The shape of the case that showed it (37,407 events, decided between
+    /// #28,055 and #30,393): every prefix past `decision` meets the target,
+    /// but under the usual bound only those past `quick` finish; the trials
+    /// of the prefixes in between, whose continuations run longer, are
+    /// stopped, and so are all those on the baseline side. A trial stopped by
+    /// a bound does not decide the boundary: confirmed with a longer bound it
+    /// meets the target, and the search goes on below it, under the longer
+    /// bound. Counting stopped trials as outcomes ends next to `quick`
+    /// instead, on a run that never finished. Returns the boundary and the
+    /// number of confirmations.
+    fn search_with_slow_continuations(
+        len: usize,
+        decision: usize,
+        quick: usize,
+        confirm: bool,
+    ) -> (Boundary, usize) {
+        let (mut longer, mut confirmations) = (false, 0);
+        let found =
+            search_prefix_boundary(len, TrialEnd::Unfinished(Stop::Bound), |prefix, purpose| {
+                if purpose == TrialPurpose::Confirm {
+                    if !confirm || longer {
+                        return Ok(None);
+                    }
+                    confirmations += 1;
+                    longer = true;
+                }
+                let end = if prefix > decision && (prefix > quick || longer) {
+                    TrialEnd::Met
+                } else {
+                    TrialEnd::Unfinished(Stop::Bound)
+                };
+                if purpose == TrialPurpose::Confirm && end != TrialEnd::Met {
+                    longer = false;
+                }
+                Ok(Some(end))
+            })
+            .unwrap();
+        (found, confirmations)
+    }
+
+    /// When even the confirmation leaves the boundary's trial unfinished, the
+    /// report calls it a hang, a third outcome rather than a run that misses,
+    /// says that the boundary rests on a wall-clock bound, and names the
+    /// longest shorter prefix the search replayed that finished, or that none
+    /// did. Before, the progress line and the header called such a trial the
+    /// baseline condition.
+    #[test]
+    fn a_boundary_trial_still_stopped_is_reported_as_a_hang() {
+        let note = unfinished_boundary_warning(
+            35_631,
+            Some(60),
+            Some(240),
+            Some((9_000, TrialEnd::Missed)),
+            "raise --trial-timeout",
+        );
+        for expected in [
+            "replaying the first 35631 events and then scheduling without chaos did not finish \
+             within 60 s, nor within 240 s when it ran again to confirm it",
+            "A hang is a third outcome, not a run that misses the target",
+            "this boundary rests on a wall-clock bound, not on an outcome",
+            "(raise --trial-timeout)",
+            "the prefix of 9000 events, which missed the target.",
+        ] {
+            assert!(note.contains(expected), "no {expected:?} in {note}");
+        }
+        let unconfirmed = unfinished_boundary_warning(
+            1,
+            Some(120),
+            None,
+            None,
+            "raise the run arguments' --timeout",
+        );
+        for expected in [
+            "did not finish within 120 s, and no longer bound could be given to confirm it",
+            "(raise the run arguments' --timeout)",
+            "No shorter prefix the search replayed finished.",
+        ] {
+            assert!(
+                unconfirmed.contains(expected),
+                "no {expected:?} in {unconfirmed}"
+            );
+        }
+    }
+
+    /// The longest shorter prefix the hang note names finished: a stopped or
+    /// a refused trial does not count, nor a prefix at or past the boundary,
+    /// nor another continuation's trial, and a prefix's last trial (a
+    /// confirmation, say) is the one that counts.
+    #[test]
+    fn the_longest_finished_prefix_below_the_boundary_is_named() {
+        let ns = NonZeroU64::new(100_000);
+        let other = NonZeroU64::new(200_000_000);
+        let bound = TrialEnd::Unfinished(Stop::Bound);
+        let refusal = TrialEnd::Unfinished(Stop::Refusal);
+        let ends = BTreeMap::from([
+            ((0, ns), (TrialEnd::Missed, Some(60))),
+            ((10, ns), (TrialEnd::Missed, Some(240))),
+            ((20, ns), (refusal, Some(60))),
+            ((25, other), (TrialEnd::Missed, Some(60))),
+            ((30, ns), (bound, Some(60))),
+            ((40, ns), (bound, Some(240))),
+            ((41, ns), (TrialEnd::Met, Some(60))),
+        ]);
+        assert_eq!(
+            longest_finished_below(&ends, ns, 40),
+            Some((10, TrialEnd::Missed))
+        );
+        assert_eq!(
+            longest_finished_below(&ends, ns, 10),
+            Some((0, TrialEnd::Missed))
+        );
+        assert_eq!(longest_finished_below(&ends, ns, 0), None);
+        assert_eq!(
+            longest_finished_below(&ends, other, 40),
+            Some((25, TrialEnd::Missed))
+        );
+    }
+
+    /// The confirmation's bound and what it leaves behind: the first raises
+    /// every later run's bound; once raised, a prefix whose trial ran under
+    /// the shorter bound runs again under the longer one, and one that ran
+    /// under the longer one cannot be confirmed; a confirmation stopped again
+    /// returns to the usual bound, and one that finished keeps the longer
+    /// one whatever its outcome (the earlier blocker was dropping it after a
+    /// confirmation that finished and missed).
+    #[test]
+    fn a_confirmation_raises_the_bound_and_keeps_it_once_finished() {
+        use ConfirmationBound::*;
+        assert_eq!(
+            confirmation_bound(Some(240), 1, Some(60), Some(60)),
+            Raise(240)
+        );
+        assert_eq!(confirmation_bound(None, 4, Some(240), Some(60)), Rerun(240));
+        assert_eq!(
+            confirmation_bound(None, 4, Some(240), Some(240)),
+            Unavailable
+        );
+        assert_eq!(confirmation_bound(None, 1, Some(60), Some(60)), Unavailable);
+        assert_eq!(confirmation_bound(None, 4, None, Some(60)), Unavailable);
+
+        let bound = TrialEnd::Unfinished(Stop::Bound);
+        let refusal = TrialEnd::Unfinished(Stop::Refusal);
+        assert_eq!(factor_after_confirmation(4, true, bound), 1);
+        for end in [TrialEnd::Met, TrialEnd::Missed, refusal] {
+            assert_eq!(factor_after_confirmation(4, true, end), 4, "{end:?}");
+        }
+        // A rerun under the raised bound leaves it raised either way.
+        assert_eq!(factor_after_confirmation(4, false, bound), 4);
+
+        // The advice names the flag whose bound stopped the trial.
+        let own = "raise the run arguments' --timeout";
+        let trial = "raise --trial-timeout";
+        assert_eq!(bound_remedy(Some(120), false, Some(120)), own);
+        assert_eq!(bound_remedy(Some(120), false, Some(240)), own);
+        assert_eq!(bound_remedy(Some(120), true, None), own);
+        assert_eq!(bound_remedy(Some(600), false, Some(240)), trial);
+        assert_eq!(bound_remedy(None, false, Some(60)), trial);
+    }
+
+    #[test]
+    fn a_trial_a_bound_stopped_does_not_decide_the_boundary() {
+        let unfinished = |passing| Boundary {
+            passing,
+            passing_end: TrialEnd::Unfinished(Stop::Bound),
+        };
+        assert_eq!(
+            search_with_slow_continuations(37_407, 30_000, 32_117, false),
+            (unfinished(32_117), 0),
+            "without confirmation"
+        );
+        assert_eq!(
+            search_with_slow_continuations(37_407, 30_000, 32_117, true),
+            (unfinished(30_000), 1),
+        );
+        // When the search already ends at the decision, the one confirmation
+        // finds nothing longer to change it.
+        assert_eq!(
+            search_with_slow_continuations(37_407, 30_000, 30_000, true),
+            (unfinished(30_000), 1),
+        );
+    }
+
+    /// A confirmation that finishes and misses the target, or that is still
+    /// stopped, leaves the boundary where the search put it, and says how
+    /// that trial ended; a prefix the search saw finish is not confirmed.
+    #[test]
+    fn a_confirmed_trial_keeps_the_boundary() {
+        for (confirmed, passing_end) in [
+            (Some(TrialEnd::Missed), TrialEnd::Missed),
+            (
+                Some(TrialEnd::Unfinished(Stop::Bound)),
+                TrialEnd::Unfinished(Stop::Bound),
+            ),
+            (None, TrialEnd::Unfinished(Stop::Bound)),
+        ] {
+            let mut confirmations = Vec::new();
+            let found = search_prefix_boundary(100, TrialEnd::Missed, |prefix, purpose| {
+                Ok(match purpose {
+                    TrialPurpose::Confirm => {
+                        confirmations.push(prefix);
+                        confirmed
+                    }
+                    TrialPurpose::Search if prefix > 40 => Some(TrialEnd::Met),
+                    TrialPurpose::Search if prefix == 40 => Some(TrialEnd::Unfinished(Stop::Bound)),
+                    TrialPurpose::Search => Some(TrialEnd::Missed),
+                })
+            })
+            .unwrap();
+            assert_eq!(
+                found,
+                Boundary {
+                    passing: 40,
+                    passing_end
+                }
+            );
+            assert_eq!(confirmations, [40]);
+        }
+        let found = search_prefix_boundary(100, TrialEnd::Missed, |prefix, purpose| {
+            assert_eq!(purpose, TrialPurpose::Search, "prefix {prefix}");
+            Ok(Some(if prefix > 40 {
+                TrialEnd::Met
+            } else if prefix == 40 {
+                TrialEnd::Unfinished(Stop::Refusal)
+            } else {
+                TrialEnd::Missed
+            }))
+        })
+        .unwrap();
+        assert_eq!(found.passing_end, TrialEnd::Unfinished(Stop::Refusal));
+    }
+
+    /// After a confirmation meets the target, the search goes on above the
+    /// longest prefix that missed it and was not stopped (500 here), not
+    /// above a stopped one, and a prefix whose trial already ran under the
+    /// longer bound is not run again.
+    #[test]
+    fn a_refuted_boundary_resumes_above_the_last_finished_miss() {
+        let (mut longer, mut log) = (false, Vec::new());
+        let found = search_prefix_boundary(1000, TrialEnd::Missed, |prefix, purpose| {
+            log.push((prefix, purpose));
+            if purpose == TrialPurpose::Confirm {
+                if longer {
+                    return Ok(None);
+                }
+                longer = true;
+            }
+            Ok(Some(if prefix > 600 && (prefix > 900 || longer) {
+                TrialEnd::Met
+            } else if prefix == 500 {
+                TrialEnd::Missed
+            } else {
+                TrialEnd::Unfinished(Stop::Bound)
+            }))
+        })
+        .unwrap();
+        assert_eq!(
+            found,
+            Boundary {
+                passing: 600,
+                passing_end: TrialEnd::Unfinished(Stop::Bound)
+            }
+        );
+        let confirmations: Vec<usize> = log
+            .iter()
+            .filter(|(_, purpose)| *purpose == TrialPurpose::Confirm)
+            .map(|(prefix, _)| *prefix)
+            .collect();
+        assert_eq!(confirmations, [900, 600]);
+        let first = log
+            .iter()
+            .position(|&entry| entry == (900, TrialPurpose::Confirm))
+            .unwrap();
+        assert_eq!(log[first + 1], (700, TrialPurpose::Search), "{log:?}");
+    }
+
+    /// The empty prefix's trial is confirmed like any other; if it meets the
+    /// target given longer, the scheduler alone does, and the search ends
+    /// with an error instead of naming event #0.
+    #[test]
+    fn an_empty_prefix_that_meets_the_target_given_longer_ends_the_search() {
+        let error =
+            search_prefix_boundary(10, TrialEnd::Unfinished(Stop::Bound), |prefix, purpose| {
+                Ok(Some(match purpose {
+                    TrialPurpose::Confirm => TrialEnd::Met,
+                    TrialPurpose::Search if prefix > 0 => TrialEnd::Met,
+                    TrialPurpose::Search => TrialEnd::Missed,
+                }))
+            })
+            .unwrap_err();
+        assert!(
+            error.downcast_ref::<EmptyPrefixMeetsTarget>().is_some(),
+            "{error}"
+        );
     }
 
     /// `auto` continues at the run's own timeslice, then at hermit's default

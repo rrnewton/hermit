@@ -134,6 +134,7 @@ impl BisectOpts {
             // the run arguments' --timeout alone.
             trial_timeout: crate::analyze::TrialTimeout::Off,
             endpoints: Default::default(),
+            trial_bound_factor: 1,
         };
         // Before the schedules are read: a refused cap or counter reads and
         // starts nothing.
