@@ -11,9 +11,12 @@
 
 use std::fs::File;
 use std::io::Write;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::Duration;
+use std::time::Instant;
 
 use anyhow::Context;
 use anyhow::bail;
@@ -32,8 +35,53 @@ use tracing::metadata::LevelFilter;
 
 use crate::analyze::consts::*;
 use crate::analyze::types::AnalyzeOpts;
+use crate::analyze::types::TRIAL_LOG_FACTOR;
+use crate::analyze::types::TRIAL_LOG_FLOOR;
+use crate::analyze::types::TRIAL_TIMEOUT_FACTOR;
+use crate::analyze::types::TRIAL_TIMEOUT_FLOOR;
+use crate::analyze::types::TrialTimeout;
+use crate::container::RunTimeoutMarker;
 use crate::global_opts::GlobalOpts;
 use crate::run::RunOpts;
+
+/// How a trial ended ([`RunData::launch_trial`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrialEnd {
+    /// It finished and met the target criteria.
+    Met,
+    /// It finished and did not meet them.
+    Missed,
+    /// A wall-clock bound ended it before it finished, so it did not reach
+    /// the target.
+    Unfinished,
+}
+
+impl TrialEnd {
+    /// Whether the trial met the target criteria.
+    pub fn reached_target(self) -> bool {
+        self == TrialEnd::Met
+    }
+
+    /// How a trial that `launched` with this result ended: a trial that a
+    /// wall-clock bound (`--trial-timeout`, or a `--timeout` in the run
+    /// arguments) stopped is [`TrialEnd::Unfinished`]; any other error is
+    /// returned unchanged. `matched` says whether a finished trial met the
+    /// criteria.
+    fn classify(
+        launched: anyhow::Result<()>,
+        matched: impl FnOnce() -> bool,
+    ) -> anyhow::Result<Self> {
+        match launched {
+            Ok(()) if matched() => Ok(TrialEnd::Met),
+            Ok(()) => Ok(TrialEnd::Missed),
+            Err(error) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
+                eprintln!(" => Timed out ({error}); counted as the baseline condition");
+                Ok(TrialEnd::Unfinished)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
 
 /// A single run plus the results of the run, either in memory or on disk.
 pub struct RunData {
@@ -58,6 +106,12 @@ pub struct RunData {
     in_mem_sched_out: Option<PreemptionRecord>,
 
     is_a_match: Option<bool>,
+
+    /// The `--trial-timeout` bound this run took, when it is shorter than the
+    /// run arguments' own `--timeout` ([`AnalyzeOpts::trial_bound`]).
+    trial_bound: Option<NonZeroU64>,
+    /// How long the run took, once it finished.
+    wall: Option<Duration>,
 }
 
 impl RunData {
@@ -188,6 +242,11 @@ impl RunData {
                 None
             },
             backend: self.analyze_opts.backend,
+            // A run analyze bounds in time also gets the log bound.
+            log_file_limit: self
+                .analyze_opts
+                .trial_bound(&self.runopts)
+                .and(self.analyze_opts.trial_log_limit()),
             // Every trial charges the invocation's ONE budget, as verify's
             // per-run logs do. Without --verbose/--selfcheck a trial traces to
             // hermit's own stderr -- the public stream the cap exists to bound.
@@ -228,8 +287,13 @@ impl RunData {
         std::fs::write(repro_file, self.to_repro() + "\n")?;
         self.runopts.write_debug_options_dump()?;
 
-        let (_, output) = self.runopts.run(&gopts, true)?;
+        let started = Instant::now();
+        let (_, output) = self
+            .runopts
+            .run(&gopts, true)
+            .map_err(|error| self.name_the_trial_bound(error))?;
         let output: Output = output.context("expected captured output")?;
+        self.wall = Some(started.elapsed());
 
         File::create(root.with_extension("stdout"))
             .unwrap()
@@ -267,6 +331,61 @@ impl RunData {
         Ok(())
     }
 
+    /// Launch a trial and say how it ended ([`TrialEnd::classify`]).
+    pub fn launch_trial(&mut self) -> anyhow::Result<TrialEnd> {
+        let launched = self.launch();
+        TrialEnd::classify(launched, || self.is_a_match())
+    }
+
+    /// Bound the run's wall-clock time ([`AnalyzeOpts::trial_bound`]) by the
+    /// endpoint runs measured before it was created.
+    fn apply_trial_bound(&mut self) {
+        let Some(bound) = self.analyze_opts.trial_bound(&self.runopts) else {
+            return;
+        };
+        if self
+            .runopts
+            .run_timeout()
+            .is_none_or(|own| own.as_secs() > bound.get())
+        {
+            self.trial_bound = Some(bound);
+        }
+        self.runopts.bound_run_timeout(bound);
+    }
+
+    /// A run that `--trial-timeout`'s bound ended says so, and how to change
+    /// the bound: the error itself names only the run's `--timeout`, which
+    /// the user did not pass.
+    fn name_the_trial_bound(&self, error: anyhow::Error) -> anyhow::Error {
+        match self.trial_bound {
+            Some(bound) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
+                error.context(format!(
+                    "{} reached hermit analyze's bound of {bound} s per run \
+                     (--trial-timeout=SECONDS raises it, --trial-timeout=off lifts it)",
+                    self.runname
+                ))
+            }
+            _ => error,
+        }
+    }
+
+    /// How long the run took and how large its log file grew, once it
+    /// finished: what an endpoint run contributes to the trials' bounds.
+    pub fn measurement(&self) -> Option<(Duration, Option<u64>)> {
+        let wall = self.wall?;
+        let log_bytes = self
+            .trial_global_opts()
+            .log_file
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map(|metadata| metadata.len());
+        Some((wall, log_bytes))
+    }
+
+    /// This run's name in the workspace.
+    pub fn name(&self) -> &str {
+        &self.runname
+    }
+
     /// Any post-processing that needs to be applied to a recorded file of SchedEvents
     pub fn post_process_events_file(sched_path: &Path, dest: &Path) -> anyhow::Result<()> {
         let _ = strip_times_from_events_file(sched_path, Some(dest.to_owned()))?;
@@ -294,7 +413,16 @@ impl RunData {
         lvl
     }
 
+    /// A run with `runopts`, bounded by the endpoint runs measured so far
+    /// ([`AnalyzeOpts::trial_bound`]).
     pub fn new(aopts: &AnalyzeOpts, runname: String, runopts: RunOpts) -> Self {
+        let mut run = Self::new_unbounded(aopts, runname, runopts);
+        run.apply_trial_bound();
+        run
+    }
+
+    /// A run with `runopts` that no `--trial-timeout` bounds: the target run.
+    fn new_unbounded(aopts: &AnalyzeOpts, runname: String, runopts: RunOpts) -> Self {
         let log_level: LevelFilter = Self::log_level(aopts);
         let mut rd = RunData {
             runname,
@@ -308,6 +436,8 @@ impl RunData {
             in_mem_sched_out: None,
             is_a_match: None,
             log_level,
+            trial_bound: None,
+            wall: None,
         };
 
         // By default we save the config for every run.
@@ -326,10 +456,11 @@ impl RunData {
         Ok(Self::new(aopts, runname, ro))
     }
 
-    /// Create a run for the initial on-target execution.
+    /// Create a run for the initial on-target execution. It is the first
+    /// run, and the trials' bound derives from it, so nothing bounds it.
     pub fn new_run1_target(aopts: &AnalyzeOpts, runname: String) -> anyhow::Result<Self> {
         let ro = Self::get_run1_runopts(aopts)?;
-        Ok(Self::new(aopts, runname, ro))
+        Ok(Self::new_unbounded(aopts, runname, ro))
     }
 
     /// Replay with the selected run's seeds and the original replay policy.
@@ -348,6 +479,8 @@ impl RunData {
         config.rng_seed = target.rng_seed;
         config.fuzz_seed = target.fuzz_seed;
         config.sched_seed = target.sched_seed;
+        // A replay of the target run is a trial, bounded like the others.
+        replay.apply_trial_bound();
         Ok(replay)
     }
 
@@ -510,6 +643,8 @@ impl RunData {
             in_mem_preempts_in: None,
             // Invariant: minimize should always return an on-target configuration:
             is_a_match: Some(true),
+            trial_bound: None,
+            wall: None,
         }
     }
 
@@ -534,6 +669,8 @@ impl RunData {
             in_mem_preempts_in: None,
             // Don't claim that it was run:
             is_a_match: None,
+            trial_bound: None,
+            wall: None,
         }
     }
 
@@ -607,6 +744,105 @@ impl RunData {
 }
 
 impl AnalyzeOpts {
+    /// The wall-clock bound, in whole seconds, on a run with `trial`'s
+    /// options (`--trial-timeout`): none where `--timeout` cannot be
+    /// enforced, and with `auto` max(60 s, 10 times the slowest endpoint run
+    /// measured so far), none before one was.
+    pub fn trial_bound(&self, trial: &RunOpts) -> Option<NonZeroU64> {
+        if !trial.accepts_run_timeout() {
+            return None;
+        }
+        match self.trial_timeout {
+            TrialTimeout::Off => None,
+            TrialTimeout::Seconds(seconds) => Some(seconds),
+            TrialTimeout::Auto => {
+                let bound = self
+                    .endpoints
+                    .slowest?
+                    .saturating_mul(TRIAL_TIMEOUT_FACTOR)
+                    .max(TRIAL_TIMEOUT_FLOOR);
+                NonZeroU64::new(bound.as_secs() + u64::from(bound.subsec_nanos() > 0))
+            }
+        }
+    }
+
+    /// The cap on a trial's log file while trials are bounded: max(64 MiB,
+    /// 10 times the largest endpoint log), once an endpoint run has written
+    /// one.
+    pub fn trial_log_limit(&self) -> Option<u64> {
+        if self.trial_timeout == TrialTimeout::Off {
+            return None;
+        }
+        let largest = self.endpoints.largest_log?;
+        Some(
+            largest
+                .saturating_mul(TRIAL_LOG_FACTOR)
+                .max(TRIAL_LOG_FLOOR),
+        )
+    }
+
+    /// Record a finished endpoint `run`, and say what bound the runs after it
+    /// now get, when that changed.
+    pub fn record_endpoint(&mut self, run: &RunData) {
+        let Some((wall, log_bytes)) = run.measurement() else {
+            return;
+        };
+        let trial = RunData::get_raw_runopts(self);
+        let first = self.endpoints.slowest.is_none();
+        let before = self.trial_bound(&trial);
+        if !self.endpoints.record(wall, log_bytes) || self.trial_timeout != TrialTimeout::Auto {
+            return;
+        }
+        let Some(bound) = self.trial_bound(&trial) else {
+            if !first {
+                return;
+            }
+            eprintln!(
+                ":: {} the runs' backend does not enforce hermit run --timeout, so analyze \
+                 does not bound them (--trial-timeout). Bound the whole analysis from outside \
+                 instead, for example with timeout(1).",
+                "WARNING:".yellow().bold()
+            );
+            return;
+        };
+        if before == Some(bound) {
+            return;
+        }
+        let shorter = trial
+            .run_timeout()
+            .filter(|own| own.as_secs() < bound.get())
+            .map_or(String::new(), |own| {
+                format!(
+                    "; the run arguments' shorter --timeout={} applies instead",
+                    own.as_secs()
+                )
+            });
+        eprintln!(
+            ":: Runs from here on are bounded at {bound} s of wall-clock time: max(60 s, 10 x \
+             the slowest endpoint run, {} at {:.1} s) (--trial-timeout{shorter}).",
+            run.name(),
+            wall.as_secs_f64(),
+        );
+    }
+
+    /// Refuses (exit 122) an explicit `--trial-timeout=SECONDS` where the
+    /// trials' backend does not enforce `hermit run --timeout`
+    /// (`RunOpts::ensure_timeout_supported`), before any workspace or trial
+    /// exists: the bound could not be kept.
+    pub fn refuse_unenforceable_trial_timeout(&self) -> anyhow::Result<()> {
+        let trial = RunData::get_raw_runopts(self);
+        match self.trial_timeout {
+            TrialTimeout::Seconds(seconds) if !trial.accepts_run_timeout() => Err(
+                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                    "--trial-timeout={seconds} cannot be enforced: the trials run on a backend \
+                     on which `hermit run --timeout` is not qualified. Use --trial-timeout=off \
+                     and an outer bound (see docs/TIMEOUT_LADDER.md)."
+                )),
+            ),
+            _ => Ok(()),
+        }
+    }
+
     /// Refuses `--max-log-bytes` (exit 122) where the cap's `_exit(123)` could
     /// leave a trial's guest running (`RunOpts::log_cap_refusal`). `run` makes
     /// this check in `RunOpts::main`, but trials go straight to `RunOpts::run`,
@@ -2100,5 +2336,221 @@ mod tests {
                 Some(&workspace.path().join("replay_out.preempts")),
             );
         }
+    }
+
+    /// `--trial-timeout=auto` bounds a run at max(60 s, 10 times the
+    /// slowest endpoint run measured so far), rounded up to whole seconds,
+    /// and gives no bound before an endpoint was measured; a number of
+    /// seconds bounds every run but the target run, and `off` none.
+    #[test]
+    fn the_trial_bound_derives_from_the_slowest_endpoint_run() {
+        use std::time::Duration;
+        let options = |extra: &[&str]| {
+            let mut argv = vec!["analyze"];
+            argv.extend(extra);
+            argv.extend(["--", "/bin/true"]);
+            AnalyzeOpts::try_parse_from(argv).unwrap()
+        };
+        let mut auto = options(&[]);
+        let trial = RunData::get_raw_runopts(&auto);
+        assert_eq!(auto.trial_bound(&trial), None, "nothing measured yet");
+        assert!(auto.endpoints.record(Duration::from_secs(2), None));
+        assert_eq!(auto.trial_bound(&trial), NonZeroU64::new(60), "the floor");
+        assert!(auto.endpoints.record(Duration::from_millis(30_150), None));
+        assert_eq!(auto.trial_bound(&trial), NonZeroU64::new(302));
+        assert!(
+            !auto.endpoints.record(Duration::from_secs(1), None),
+            "a faster endpoint changes nothing"
+        );
+        assert_eq!(auto.trial_bound(&trial), NonZeroU64::new(302));
+
+        let explicit = options(&["--trial-timeout=5"]);
+        assert_eq!(
+            explicit.trial_bound(&trial),
+            NonZeroU64::new(5),
+            "an explicit bound needs no measurement"
+        );
+        let mut off = options(&["--trial-timeout=off"]);
+        off.endpoints.record(Duration::from_secs(30), None);
+        assert_eq!(off.trial_bound(&trial), None);
+        for refused in ["--trial-timeout=0", "--trial-timeout=soon"] {
+            let error = AnalyzeOpts::try_parse_from(["analyze", refused, "--", "/bin/true"])
+                .expect_err(refused);
+            assert!(
+                error.to_string().contains("positive number of seconds"),
+                "{refused}: {error}"
+            );
+        }
+    }
+
+    /// A run created after an endpoint run was measured runs under the
+    /// bound, or under the run arguments' own `--timeout` where that is
+    /// shorter, and so does its printed reproducer; the target run is not
+    /// bounded.
+    #[test]
+    fn runs_take_the_bound_and_the_target_run_does_not() {
+        let created = |run_args: &[&str], explicit: Option<&str>| {
+            let mut argv = vec!["analyze"];
+            argv.extend(explicit);
+            argv.push("--");
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let mut options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            options
+                .endpoints
+                .record(std::time::Duration::from_secs(10), None);
+            let trial = RunData::new_baseline(&options, "bounded".to_owned()).unwrap();
+            let target = RunData::new_run1_target(&options, "target".to_owned()).unwrap();
+            let seconds = |run: &RunData| run.runopts.run_timeout().map(|bound| bound.as_secs());
+            assert_eq!(
+                trial.to_repro().contains(" --timeout="),
+                seconds(&trial).is_some(),
+                "{}",
+                trial.to_repro()
+            );
+            (seconds(&trial), seconds(&target), trial.trial_bound)
+        };
+        assert_eq!(created(&[], None), (Some(100), None, NonZeroU64::new(100)));
+        assert_eq!(created(&["--timeout=30"], None), (Some(30), Some(30), None));
+        assert_eq!(
+            created(&["--timeout=300"], None),
+            (Some(100), Some(300), NonZeroU64::new(100))
+        );
+        assert_eq!(
+            created(&[], Some("--trial-timeout=off")),
+            (None, None, None)
+        );
+    }
+
+    /// A run that the bound ended says which bound it was and how to change
+    /// it; one that its own `--timeout` ended, or that failed otherwise, is
+    /// left as it was.
+    #[test]
+    fn a_run_the_trial_bound_ends_names_the_bound() {
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        options
+            .endpoints
+            .record(std::time::Duration::from_secs(1), None);
+        let run = RunData::new_baseline(&options, "run2_baseline".to_owned()).unwrap();
+        let timed_out = run.name_the_trial_bound(anyhow::Error::new(RunTimeoutMarker));
+        assert!(timed_out.downcast_ref::<RunTimeoutMarker>().is_some());
+        let message = format!("{timed_out:#}");
+        assert!(
+            message.starts_with(
+                "run2_baseline reached hermit analyze's bound of 60 s per run \
+                 (--trial-timeout=SECONDS raises it, --trial-timeout=off lifts it)"
+            ),
+            "{message}"
+        );
+        let other = run.name_the_trial_bound(anyhow::anyhow!("no such file"));
+        assert_eq!(format!("{other:#}"), "no such file");
+    }
+
+    /// While trials are bounded, a trial's log file is capped at
+    /// max(64 MiB, 10 times the largest endpoint log); before an endpoint
+    /// wrote one, or with `--trial-timeout=off`, by HERMIT_LOG_MAX_BYTES alone.
+    #[test]
+    fn a_trials_log_is_capped_by_the_largest_endpoint_log() {
+        use std::time::Duration;
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        assert_eq!(options.trial_log_limit(), None);
+        options
+            .endpoints
+            .record(Duration::from_secs(1), Some(1 << 20));
+        assert_eq!(options.trial_log_limit(), Some(64 << 20));
+        options
+            .endpoints
+            .record(Duration::from_secs(1), Some(100 << 20));
+        assert_eq!(options.trial_log_limit(), Some(1000 << 20));
+        options
+            .endpoints
+            .record(Duration::from_secs(1), Some(2 << 20));
+        assert_eq!(options.trial_log_limit(), Some(1000 << 20));
+        options.trial_timeout = TrialTimeout::Off;
+        assert_eq!(options.trial_log_limit(), None);
+    }
+
+    /// A trial that a wall-clock bound ended did not reach the target; a
+    /// trial that failed otherwise (here: the log cap) ends the analysis with
+    /// its error, still of its type.
+    #[test]
+    fn a_trial_that_a_bound_ends_did_not_reach_the_target() {
+        let classify =
+            |launched: anyhow::Result<()>, matched: bool| TrialEnd::classify(launched, || matched);
+        assert_eq!(classify(Ok(()), true).unwrap(), TrialEnd::Met);
+        assert_eq!(classify(Ok(()), false).unwrap(), TrialEnd::Missed);
+        let timed_out = anyhow::Error::new(RunTimeoutMarker)
+            .context("Guest exceeded the --timeout bound of 3 seconds");
+        let end = classify(Err(timed_out), true).unwrap();
+        assert_eq!(end, TrialEnd::Unfinished);
+        assert!(!end.reached_target());
+        let capped = classify(
+            Err(anyhow::Error::new(crate::container::LogCapExceeded)),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            capped
+                .downcast_ref::<crate::container::LogCapExceeded>()
+                .is_some(),
+            "{capped:#}"
+        );
+    }
+
+    /// An explicit `--trial-timeout` that the runs cannot keep (KVM, which
+    /// does not enforce `--timeout`, and the in-guest runtime, which refuses
+    /// one) is refused before any workspace or run; `auto` does without it.
+    #[test]
+    fn an_unenforceable_trial_timeout_is_refused_and_auto_does_without() {
+        let options = |argv: &[&str]| {
+            let args = crate::Args::try_parse_from(argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.apply_global(&args.global);
+            options
+        };
+        let mut backends = vec!["kvm"];
+        if cfg!(feature = "liteinst") {
+            backends.push("liteinst");
+        }
+        for backend in backends {
+            let backend = format!("--backend={backend}");
+            let explicit = options(&[
+                "hermit",
+                &backend,
+                "analyze",
+                "--trial-timeout=5",
+                "--",
+                "/bin/true",
+            ]);
+            let error = explicit
+                .refuse_unenforceable_trial_timeout()
+                .expect_err("the runs cannot keep a --timeout");
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{backend}: {error:#}"
+            );
+            assert!(error.to_string().contains("--trial-timeout=5"), "{error:#}");
+
+            let mut auto = options(&["hermit", &backend, "analyze", "--", "/bin/true"]);
+            auto.refuse_unenforceable_trial_timeout().unwrap();
+            auto.endpoints
+                .record(std::time::Duration::from_secs(10), None);
+            assert_eq!(
+                auto.trial_bound(&RunData::get_raw_runopts(&auto)),
+                None,
+                "{backend}"
+            );
+        }
+        options(&["hermit", "analyze", "--trial-timeout=5", "--", "/bin/true"])
+            .refuse_unenforceable_trial_timeout()
+            .unwrap();
     }
 }

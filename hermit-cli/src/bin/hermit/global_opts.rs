@@ -140,6 +140,12 @@ pub struct GlobalOpts {
     #[clap(skip)]
     pub log_file_handle: Option<Arc<File>>,
 
+    /// A tighter bound than HERMIT_LOG_MAX_BYTES on this run's log file, in
+    /// bytes. `hermit analyze` sets it for its trials
+    /// (`AnalyzeOpts::trial_log_limit`).
+    #[clap(skip)]
+    pub log_file_limit: Option<u64>,
+
     /// Select the process instrumentation backend. This is a global option and
     /// must come before the subcommand, e.g. `hermit --backend ptrace run ...`.
     #[clap(long, value_enum, value_name = "BACKEND")]
@@ -156,7 +162,22 @@ pub struct GlobalOpts {
     pub unsafe_ignore_host_seccomp: bool,
 }
 
+/// The bound on one log file: HERMIT_LOG_MAX_BYTES (`env`), or `tighter`
+/// where that is smaller. `env` 0 lifts both, as the variable documents.
+fn tighter_log_limit(env: u64, tighter: Option<u64>) -> u64 {
+    match (env, tighter) {
+        (0, _) | (_, None) => env,
+        (env, Some(tighter)) => env.min(tighter),
+    }
+}
+
 impl GlobalOpts {
+    /// The bound on this run's log file (0 for none): HERMIT_LOG_MAX_BYTES,
+    /// within [`Self::log_file_limit`].
+    fn file_log_limit(&self) -> Result<u64, String> {
+        Ok(tighter_log_limit(log_max_bytes()?, self.log_file_limit))
+    }
+
     /// Open `--log-file` in the HOST's filename namespace.
     ///
     /// Call this from `main`, before any container exists. That placement is the
@@ -277,7 +298,7 @@ impl GlobalOpts {
                 let file = handle
                     .try_clone()
                     .context("cannot duplicate the host log file descriptor")?;
-                let limit = log_max_bytes().map_err(Error::msg)?;
+                let limit = self.file_log_limit().map_err(Error::msg)?;
                 EarlyLog::File(CappedWriter::file(file, limit, self.log_budget()))
             }
             None => EarlyLog::Stderr(self.log_budget()),
@@ -331,7 +352,7 @@ impl GlobalOpts {
             let file_writer = handle
                 .try_clone()
                 .expect("cannot duplicate the host log file descriptor");
-            let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
+            let limit = self.file_log_limit().unwrap_or_else(|e| panic!("{e}"));
             let file_writer = CappedWriter::file(file_writer, limit, self.log_budget());
             Some(init_sync_file_tracing(self.log, file_writer, backend))
         } else if let Some(path) = &self.log_file {
@@ -347,7 +368,7 @@ impl GlobalOpts {
             // A malformed bound is fatal rather than silently defaulted, so a
             // typo in the value meant to DISABLE the bound cannot quietly
             // re-enable it.
-            let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
+            let limit = self.file_log_limit().unwrap_or_else(|e| panic!("{e}"));
             let file_writer = CappedWriter::file(file_writer, limit, self.log_budget());
             Some(init_sync_file_tracing(self.log, file_writer, backend))
         } else {
@@ -370,9 +391,21 @@ mod tests {
             max_log_bytes: None,
             log_budget: None,
             log_file_handle: None,
+            log_file_limit: None,
             unsafe_ignore_host_seccomp: false,
             backend: None,
         }
+    }
+
+    /// A run's own log bound narrows HERMIT_LOG_MAX_BYTES and never widens
+    /// it; HERMIT_LOG_MAX_BYTES=0 lifts it too, as it lifts every bound.
+    #[test]
+    fn a_runs_log_bound_only_tightens_the_environment_bound() {
+        assert_eq!(tighter_log_limit(1 << 30, None), 1 << 30);
+        assert_eq!(tighter_log_limit(1 << 30, Some(64 << 20)), 64 << 20);
+        assert_eq!(tighter_log_limit(1 << 20, Some(64 << 20)), 1 << 20);
+        assert_eq!(tighter_log_limit(0, Some(64 << 20)), 0);
+        assert_eq!(tighter_log_limit(0, None), 0);
     }
 
     /// A reported event is a real tracing record in the run's log file, at
