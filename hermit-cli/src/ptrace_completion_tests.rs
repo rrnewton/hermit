@@ -796,3 +796,35 @@ async fn finalization_secondary_preserves_nested_cleanup_kind_and_stage() {
     assert!(diagnostic.contains("Incomplete"));
     assert!(diagnostic.contains("another output failure"));
 }
+
+/// A run torn down for a guest deadlock completes with the deadlock's status
+/// in place of a guest status it never had, keeping the output the guest
+/// wrote. It does only when the deadlock is the run's primary cause and the
+/// teardown recorded no failure of its own; an output run with no captured
+/// bytes has nothing honest to report and stays a failure too.
+#[test]
+fn a_guest_deadlock_completes_with_its_status_and_the_captured_output() {
+    let deadlocked = || reverie::Error::Tool(Error::new(GuestDeadlocked::new(None)));
+    assert!(is_clean_guest_deadlock(&deadlocked(), 0));
+    assert!(
+        !is_clean_guest_deadlock(&deadlocked(), 1),
+        "a teardown failure"
+    );
+    assert!(!is_clean_guest_deadlock(
+        &reverie::Error::Tool(Error::msg("an earlier failure")),
+        0
+    ));
+
+    let deadlock = reverie::ExitStatus::Exited(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT);
+    assert_eq!(
+        <reverie::ExitStatus as GuestDeadlockResult>::guest_deadlock(None),
+        Some(deadlock)
+    );
+    let output = <reverie::process::Output as GuestDeadlockResult>::guest_deadlock(Some(
+        &CapturedPrefix::default(),
+    ))
+    .expect("captured bytes make an output");
+    assert_eq!(output.status, deadlock);
+    assert!(output.stdout.is_empty() && output.stderr.is_empty());
+    assert!(<reverie::process::Output as GuestDeadlockResult>::guest_deadlock(None).is_none());
+}
