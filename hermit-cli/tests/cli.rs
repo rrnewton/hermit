@@ -50918,3 +50918,32 @@ fn a_run_without_namespaces_is_not_refused_where_user_namespaces_are_denied() {
     assert_success(&ran, &args);
     assert_eq!(stdout(&ran), "ran\n", "stderr:\n{}", stderr(&ran));
 }
+
+/// `hermit run --max-timeslice=1000` writes one stderr notice that a CPU-bound
+/// guest runs orders of magnitude slower and that a `--timeout` that expires
+/// may not mean a hang; the default writes none. The notice comes before the
+/// program is checked, so a missing program runs no guest and the case needs
+/// no PMU: where perf counters are unavailable Hermit disables the maximum,
+/// says so, and writes no notice, which the case then checks instead.
+#[test]
+fn a_small_max_timeslice_gets_one_notice() {
+    const GUEST: &str = "/nonexistent-small-max-timeslice-guest";
+    for (maximum, small) in [(Some("--max-timeslice=1000"), true), (None, false)] {
+        let mut args = vec!["run"];
+        args.extend(maximum);
+        args.extend(["--", GUEST]);
+        let output = hermit_test::hermit_output(
+            &format!("hermit {args:?}"),
+            hermit_command(&args).stdin(Stdio::null()),
+        );
+        let log = stderr(&output);
+        assert!(!output.status.success(), "{args:?}: {log}");
+        assert!(log.contains(GUEST), "the missing program is named: {log}");
+        let timer = !log.contains("continuing with --max-timeslice=disabled");
+        assert_eq!(
+            log.matches("NOTICE: --max-timeslice=").count(),
+            usize::from(small && timer),
+            "{args:?}: {log}"
+        );
+    }
+}

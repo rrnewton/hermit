@@ -416,6 +416,16 @@ available. `--max-timeslice=N` controls the longest uninterrupted virtual
 time slice. Smaller values create more scheduling opportunities at additional
 runtime cost; positive values must be at least one RCB, which is 10 virtual
 nanoseconds at the default clock multiplier and scales with that multiplier.
+The cost grows steeply: each slice of a thread that computes without a syscall
+ends with a timer event, which the ptrace backend places by stepping the guest
+through up to the processor's skid margin (100 to 10000 RCBs, or
+`--skid-margin`), so a CPU-bound guest can run thousands of times slower at
+`--max-timeslice=1000` than at the default. When a slice is at most ten skid
+margins long (on a processor with a 10000-RCB margin, `--max-timeslice` of
+1000000 or less at the default clock multiplier), `hermit run`, `hermit
+analyze` and `hermit bisect` print a `NOTICE:` line saying so; there, a run that
+`--timeout` cuts off may be slow rather than hung, and `--summary` reports how
+many timeslices it had.
 `--target-timeslice=N` adds a cheaper logical deadline checked at syscall
 boundaries; it is useful for workloads that enter the kernel frequently.
 `--max-timeslice=disabled` avoids PMU use but can miss bugs in

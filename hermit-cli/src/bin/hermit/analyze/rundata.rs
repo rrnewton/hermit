@@ -674,6 +674,16 @@ impl AnalyzeOpts {
         Ok(())
     }
 
+    /// The notice `hermit run` writes for a small `--max-timeslice`
+    /// (`RunOpts::small_max_timeslice_notice`), for the run arguments every
+    /// trial shares. Trials go straight to `RunOpts::run`, so `analyze` and
+    /// `bisect` write it once here, after the trials' PMU configuration is
+    /// installed, rather than once per trial. `skid_margin` is normally
+    /// `run::installed_skid_margin`.
+    pub fn small_trial_max_timeslice_notice(&self, skid_margin: fn() -> u64) -> Option<String> {
+        RunData::get_raw_runopts(self).small_trial_max_timeslice_notice(skid_margin)
+    }
+
     /// Installs the trials' `--skid-margin`, as `RunOpts::main` does for a
     /// run: Reverie's PMU configuration is per process, and every trial of
     /// one `analyze` or `bisect` runs in this process with the same run

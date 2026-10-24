@@ -122,6 +122,24 @@ use super::verify_run;
 
 const TMP_DIR: &str = "/tmp";
 
+/// A timeslice of at most this many skid margins gets
+/// [`RunOpts::small_max_timeslice_notice`]: Reverie steps the guest through up
+/// to one margin of every slice to place its precise timer event, so at least
+/// a tenth of such a slice is stepped, and a ptrace step costs thousands of
+/// times a native branch.
+const SMALL_TIMESLICE_SKID_MARGINS: u64 = 10;
+
+/// The skid margin this process's precise timers use: the processor's, or
+/// `--skid-margin` once [`RunOpts::install_pmu_config`] has recorded it. A
+/// processor outside Reverie's table has no precise timer; the largest margin
+/// in the table stands in for it.
+pub(crate) fn installed_skid_margin() -> u64 {
+    reverie::pmu_config::try_get_pmu_config().map_or(
+        reverie::pmu_config::LARGEST_TABLE_SKID_MARGIN,
+        reverie::pmu_config::PmuConfig::skid_margin,
+    )
+}
+
 #[cfg(feature = "native-exec")]
 type NativeContainerRun = super::native_exec_cli::PhysicalContainer;
 #[cfg(not(feature = "native-exec"))]
@@ -180,6 +198,13 @@ enum TimerUnavailable {
 }
 
 /// Whether this host can arm Reverie's ptrace PMU timer.
+/// Whether [`reverie_timer_support`] finds this host's timer, for tests
+/// elsewhere in the binary whose expectation depends on it.
+#[cfg(test)]
+pub(crate) fn reverie_timer_support_for_tests() -> bool {
+    reverie_timer_support().is_ok()
+}
+
 fn reverie_timer_support() -> Result<(), TimerUnavailable> {
     if !reverie_ptrace::is_perf_supported() {
         return Err(TimerUnavailable::NoPerfEvents);
@@ -6088,6 +6113,145 @@ fn strict_rejects_every_route_to_host_networking() {
     }
 }
 
+/// A timeslice of at most `SMALL_TIMESLICE_SKID_MARGINS` skid margins gets one
+/// notice line naming the value, the branches per slice, the margin,
+/// `--timeout` and `--summary`; a longer one, a disabled maximum, a launch that
+/// arms no PMU timer, a preemption replay, `--imprecise-timers` or
+/// `--hb-list-events` gets none. Slices are counted at the clock multiplier and,
+/// under `--chaos` with a per-thread slowdown, at its largest factor (the
+/// slowdown alone, without `--chaos`, changes nothing).
+#[test]
+fn a_small_max_timeslice_gets_a_notice() {
+    fn zen() -> u64 {
+        10_000
+    }
+    fn intel() -> u64 {
+        100
+    }
+    let notice =
+        |argv: &[&str], margin: fn() -> u64| run_opts_for(argv).small_max_timeslice_notice(margin);
+    for (argv, margin, rcbs, slowed) in [
+        (vec!["--max-timeslice=1000"], zen as fn() -> u64, 100, false),
+        (vec!["--preemption-timeout=1000"], zen, 100, false),
+        (vec!["--max-timeslice=1000000"], zen, 100_000, false),
+        (vec!["--max-timeslice=10000"], intel, 1000, false),
+        (vec!["--chaos", "--max-timeslice=10"], intel, 1, false),
+        (
+            vec!["--clock-multiplier=100", "--max-timeslice=1000000"],
+            intel,
+            1000,
+            false,
+        ),
+        (
+            vec![
+                "--chaos",
+                "--chaos-per-thread-slowdown",
+                "--chaos-slowdown-max-factor=10",
+                "--max-timeslice=10000000",
+            ],
+            zen,
+            100_000,
+            true,
+        ),
+        (
+            vec![
+                "--replay-schedule-from=unused-schedule",
+                "--max-timeslice=1000",
+            ],
+            zen,
+            100,
+            false,
+        ),
+    ] {
+        let mut full = vec!["hermit", "run"];
+        full.extend(&argv);
+        full.push("fakeprog");
+        let line = notice(&full, margin).unwrap_or_else(|| panic!("{argv:?} gets a notice"));
+        assert!(line.starts_with("NOTICE: --max-timeslice="), "{line}");
+        assert!(
+            line.contains(&format!(
+                "at most about {rcbs} retired conditional branches"
+            )),
+            "{argv:?}: {line}"
+        );
+        assert_eq!(
+            line.contains("(at the largest chaos slowdown factor)"),
+            slowed,
+            "{argv:?}: {line}"
+        );
+        assert!(
+            line.contains(&format!("up to {} branches (the skid margin)", margin())),
+            "{line}"
+        );
+        assert!(
+            line.contains("can run orders of magnitude slower"),
+            "{line}"
+        );
+        assert!(line.contains("(--max-timeslice=200000000)"), "{line}");
+        assert!(line.contains("--timeout that expires"), "{line}");
+        assert!(line.contains("--summary"), "{line}");
+        assert_eq!(line.matches('\n').count(), 1, "one line: {line:?}");
+        assert!(line.ends_with('\n'), "{line:?}");
+    }
+    let e9patch = run_opts_for(&[
+        "hermit",
+        "--backend=e9patch",
+        "run",
+        "--max-timeslice=1000",
+        "fakeprog",
+    ]);
+    assert!(e9patch.small_max_timeslice_notice(zen).is_some());
+    for (argv, margin) in [
+        (vec![], zen as fn() -> u64),
+        (vec!["--max-timeslice=1000010"], zen),
+        (vec!["--max-timeslice=10010"], intel),
+        (vec!["--max-timeslice=disabled"], zen),
+        (
+            vec!["--clock-multiplier=0.01", "--max-timeslice=20000"],
+            zen,
+        ),
+        (vec!["--namespace-only", "--max-timeslice=1000"], zen),
+        (
+            vec![
+                "--chaos",
+                "--replay-preemptions-from=unused-preemptions",
+                "--max-timeslice=1000",
+            ],
+            zen,
+        ),
+        (vec!["--imprecise-timers", "--max-timeslice=1000"], zen),
+        (
+            vec![
+                "--happens-before=unused-spec",
+                "--hb-list-events",
+                "--max-timeslice=1000",
+            ],
+            zen,
+        ),
+        (
+            vec![
+                "--chaos-per-thread-slowdown",
+                "--chaos-slowdown-max-factor=10",
+                "--max-timeslice=10000000",
+            ],
+            zen,
+        ),
+    ] {
+        let mut full = vec!["hermit", "run"];
+        full.extend(&argv);
+        full.push("fakeprog");
+        assert_eq!(notice(&full, margin), None, "{argv:?}");
+    }
+    let kvm = run_opts_for(&[
+        "hermit",
+        "--backend=kvm",
+        "run",
+        "--max-timeslice=1000",
+        "fakeprog",
+    ]);
+    assert_eq!(kvm.small_max_timeslice_notice(zen), None);
+}
+
 /// `main`'s branch-counter check: a run without `--strict` on a host whose
 /// counter failed validation goes on and writes one warning line, even when
 /// Reverie's reason spans lines; with `--strict` it is refused and writes
@@ -8598,6 +8762,12 @@ impl RunOpts {
             crate::verify::write_pending_verification_json(path)?;
         }
         self.admit_branch_counter(&mut crate::tracing::write_stderr_diagnostic)?;
+        // After the PMU configuration, whose skid margin it reads, and before
+        // every check below that can still refuse the run, like the warning
+        // above, so the cost is stated once whatever happens next.
+        if let Some(notice) = self.small_max_timeslice_notice(installed_skid_margin) {
+            crate::tracing::write_stderr_diagnostic(&notice);
+        }
         // The KVM backend reaches real reverie-kvm code from its dispatch path
         // and reports an accurate, program-specific error there, so it is not
         // pre-empted by the generic availability probe above. E9patch is a CLI
@@ -12488,6 +12658,69 @@ impl RunOpts {
             return None;
         }
         warning_for_an_inexact_branch_counter(CounterReader::Run, self.inexact_branch_counter)
+    }
+
+    /// The one-line stderr notice for a timeslice of at most
+    /// [`SMALL_TIMESLICE_SKID_MARGINS`] skid margins (`skid_margin`, normally
+    /// [`installed_skid_margin`]). A thread that computes without returning to
+    /// Detcore is stopped by a timer event at the end of every timeslice, and on
+    /// the ptrace backend a precise timer is placed by stepping the guest through
+    /// up to the margin, so at least a tenth of such a slice is stepped: a
+    /// CPU-bound guest runs orders of magnitude slower, and a run cut off by
+    /// `--timeout` may not be hung.
+    ///
+    /// A slice is counted in RCBs at [`detcore::Config::largest_nanos_per_rcb`],
+    /// the fewest any thread gets. `None` where the maximum does not decide how
+    /// much is stepped: where the run arms no PMU timer, as
+    /// [`Self::reads_the_branch_counter`] decides (a disabled maximum, given or
+    /// set because the host has no usable counters, or a backend without the
+    /// timer); in a preemption replay, whose recording sets the slices; with
+    /// `--imprecise-timers`, which steps nothing; and with `--hb-list-events`,
+    /// which runs no guest.
+    pub(crate) fn small_max_timeslice_notice(&self, skid_margin: fn() -> u64) -> Option<String> {
+        let config = &self.det_opts.det_config;
+        if !self.reads_the_branch_counter()
+            || config.replay_preemptions_from.is_some()
+            || config.imprecise_timers
+            || self.hb_list_events
+        {
+            return None;
+        }
+        let maximum = config.max_timeslice?.get();
+        let rcbs = (maximum as f64 / config.largest_nanos_per_rcb()).floor() as u64;
+        let margin = skid_margin();
+        (rcbs <= SMALL_TIMESLICE_SKID_MARGINS.saturating_mul(margin)).then(|| {
+            let slowed = if config.chaos && config.chaos_per_thread_slowdown {
+                " (at the largest chaos slowdown factor)"
+            } else {
+                ""
+            };
+            format!(
+                "NOTICE: --max-timeslice={maximum} lets a thread that computes without a syscall \
+                 run at most about {rcbs} retired conditional branches{slowed} before a timer \
+                 event stops it, and the guest is stepped through up to {margin} branches (the \
+                 skid margin) to place each event, so a CPU-bound guest can run orders of \
+                 magnitude slower than at the default (--max-timeslice={default}), and a \
+                 --timeout that expires may mean a slow run rather than a hung one. Omit \
+                 --max-timeslice, or raise it, for a faster run; --summary reports how many \
+                 timeslices the run had.\n",
+                default = detcore::Config::default()
+                    .max_timeslice
+                    .map_or_else(|| "disabled".to_owned(), |maximum| maximum.to_string())
+            )
+        })
+    }
+
+    /// [`Self::small_max_timeslice_notice`] for the trials of `hermit analyze`
+    /// and `hermit bisect`, which take these options without `main`'s
+    /// validation: where the host cannot arm the timer, the trials run with the
+    /// maximum disabled, so there is no notice.
+    pub(crate) fn small_trial_max_timeslice_notice(
+        &self,
+        skid_margin: fn() -> u64,
+    ) -> Option<String> {
+        reverie_timer_support().ok()?;
+        self.small_max_timeslice_notice(skid_margin)
     }
 
     /// `main`'s branch-counter check: a `--strict` run on a counter that failed
