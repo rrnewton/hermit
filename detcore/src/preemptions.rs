@@ -67,6 +67,13 @@ pub struct PreemptionRecord {
     /// in memory, which are replayed under either setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     signal_state_copy: Option<bool>,
+    /// Whether the run that produced this record charged preemptions at most
+    /// the time their slice ran (`--cap-preemption-charge`). Turn charges
+    /// move timers and timeouts, so a replay under the other setting cannot
+    /// reproduce the run, and is refused. Off writes the record exactly as
+    /// before the field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    cap_preemption_charge: bool,
     /// Actual callback expirations associated with existing priority-history rows.
     /// Absent in old/edited recordings; never inferred from time or branch counts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -98,6 +105,7 @@ impl PreemptionRecord {
             epoch: None,
             pipe_wake_latency: None,
             signal_state_copy: None,
+            cap_preemption_charge: false,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
         }
@@ -135,6 +143,18 @@ impl PreemptionRecord {
     pub fn with_signal_state_copy(mut self, on: Option<bool>) -> Self {
         self.signal_state_copy = on;
         self
+    }
+
+    /// The same record, stating whether the trials it came from capped
+    /// preemption charges, as it states the pipe-wake latency.
+    pub fn with_cap_preemption_charge(mut self, on: bool) -> Self {
+        self.cap_preemption_charge = on;
+        self
+    }
+
+    /// Whether this record was produced under `--cap-preemption-charge`.
+    pub fn cap_preemption_charge(&self) -> bool {
+        self.cap_preemption_charge
     }
 
     /// Make a copy of everything in the `PreemptionRecord` in a public format.
@@ -203,6 +223,7 @@ impl PreemptionRecord {
             epoch: self.epoch,
             pipe_wake_latency: self.pipe_wake_latency,
             signal_state_copy: self.signal_state_copy,
+            cap_preemption_charge: self.cap_preemption_charge,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: self.rng_seed,
         }
@@ -264,6 +285,7 @@ impl PreemptionRecord {
             epoch: None,
             pipe_wake_latency: None,
             signal_state_copy: None,
+            cap_preemption_charge: false,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
         }
@@ -819,6 +841,44 @@ mod tests {
         }
     }
 
+    /// `--cap-preemption-charge` round-trips through the writer, the record
+    /// and the settings reader; off writes the record as before; a replay
+    /// under the other setting is refused.
+    #[test]
+    fn the_cap_preemption_charge_setting_round_trips_and_is_compared() {
+        let off = PreemptionWriter::new(None).into_string();
+        assert!(!off.contains("cap_preemption_charge"), "{off}");
+        let written = PreemptionWriter::new(None)
+            .with_cap_preemption_charge(true)
+            .into_string();
+        assert!(
+            written.contains("\"cap_preemption_charge\":true"),
+            "{written}"
+        );
+        let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert!(back.cap_preemption_charge());
+        assert!(back.clone_preemptions_only().cap_preemption_charge());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        std::fs::write(&path, &written).unwrap();
+        assert_eq!(read_recorded_cap_preemption_charge(&path), Ok(true));
+        std::fs::write(&path, &off).unwrap();
+        assert_eq!(read_recorded_cap_preemption_charge(&path), Ok(false));
+        for (recorded, replay, refused) in [
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+            (false, true, true),
+        ] {
+            assert_eq!(
+                cap_preemption_charge_mismatch("--replay-schedule-from=x", recorded, replay)
+                    .is_some(),
+                refused,
+                "{recorded} replayed with {replay}"
+            );
+        }
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
@@ -1313,6 +1373,14 @@ impl PreemptionWriter {
         self
     }
 
+    /// Store whether the run capped preemption charges
+    /// (`--cap-preemption-charge`; off leaves the record as it was before
+    /// the field existed).
+    pub fn with_cap_preemption_charge(mut self, on: bool) -> Self {
+        self.inner.cap_preemption_charge = on;
+        self
+    }
+
     /// Does the record have zero entries?
     pub fn is_empty(&self) -> bool {
         self.inner.per_thread.is_empty()
@@ -1615,6 +1683,45 @@ pub fn pipe_wake_latency_mismatch(
             "{source} was recorded with {} and would be replayed with {}. A hand-off moves \
              turns and the time they charge, so the replay cannot reproduce the run. Replay \
              with {}.",
+            show(recorded),
+            show(replay),
+            show(recorded),
+        )
+    })
+}
+
+/// Read only whether the run that wrote a preemption record file capped
+/// preemption charges, as [`read_recorded_epoch`] reads the epoch. A record
+/// without the field was made with the option off.
+pub fn read_recorded_cap_preemption_charge(path: &Path) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct CapOnly {
+        #[serde(default)]
+        cap_preemption_charge: bool,
+    }
+    Ok(boundary_recording::read_settings::<CapOnly>(path)?.cap_preemption_charge)
+}
+
+/// The refusal of a replay whose `--cap-preemption-charge` differs from the
+/// one a record stores, naming the record by `source` (an option and a
+/// path), or `None` when they agree.
+pub fn cap_preemption_charge_mismatch(
+    source: &str,
+    recorded: bool,
+    replay: bool,
+) -> Option<String> {
+    let show = |on: bool| {
+        if on {
+            "--cap-preemption-charge"
+        } else {
+            "no --cap-preemption-charge"
+        }
+    };
+    (recorded != replay).then(|| {
+        format!(
+            "{source} was recorded with {} and would be replayed with {}. The option changes \
+             what each preemption charges the clock, so timers and timeouts move and the replay \
+             cannot reproduce the run. Replay with {}.",
             show(recorded),
             show(replay),
             show(recorded),

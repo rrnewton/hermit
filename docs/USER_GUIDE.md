@@ -455,6 +455,18 @@ depending on the processor) of every slice. The option needs the PMU timer of
 the ptrace backend; on other backends, set chaos's cooperative deadline with
 `--target-timeslice`.
 
+Every scheduler turn adds a fixed charge to the guest-visible clock
+(`--scheduler-turn-cost`, 500000 virtual nanoseconds by default), including
+the turn that ends a timeslice. With slices far shorter than the charge,
+CPU-bound work therefore appears about `1 + charge / slice` times slower to
+the guest: 501 times at `--max-timeslice=1000`, so a test's own timeouts can
+expire before the code under test runs. `--cap-preemption-charge` charges a
+turn that ends an expired slice at most the virtual time its thread ran since
+its previous turn, which bounds that factor at 2; slices at least one charge
+long are charged as before. It changes the guest-visible time of short-slice
+runs, so a recorded schedule stores the setting and a replay under the other
+is refused.
+
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with
 `--replay-preemptions-from=FILE`.
@@ -714,6 +726,7 @@ reproducible target condition.
 | `--max-timeslice=N` | Sets the maximum virtual time slice (minimum one scaled RCB) and requires PMU support. |
 | `--max-timeslice=disabled` | Disables PMU timer preemption. |
 | `--preemption-timeout=N` | Deprecated alias for `--max-timeslice=N`. |
+| `--cap-preemption-charge` | Charges a turn that ends an expired timeslice at most the time its thread ran since its previous turn. |
 
 `--no-sequentialize-threads` is useful for compatibility experiments and
 workloads such as virtual machines that need real host parallelism. It removes

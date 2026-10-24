@@ -756,6 +756,16 @@ pub struct Resources {
     /// skip_serializing_if, for the same positional RPCs.
     #[serde(default)]
     pub(crate) priority_row: Option<u64>,
+    /// Set on the request that ends a timeslice because the slice's time ran
+    /// out: its logical target, its PMU maximum, or a replayed slice end
+    /// (`Detcore::end_timeslice_with_checkpoint`). An explicit `sched_yield`
+    /// ends a slice too but is a syscall the guest asked for, so it is not
+    /// marked. Under `--cap-preemption-charge` the scheduler charges such a
+    /// turn at most the virtual time its thread ran since its previous turn
+    /// (`Scheduler::bump_global_time`). Appended last, like the fields above,
+    /// because `Resources` crosses positional RPCs.
+    #[serde(default)]
+    pub(crate) slice_expired: bool,
 }
 
 impl fmt::Debug for Resources {
@@ -820,6 +830,9 @@ impl fmt::Debug for Resources {
         if let Some(mask) = self.guest_signal_mask {
             debug.field("guest_signal_mask", &mask);
         }
+        if self.slice_expired {
+            debug.field("slice_expired", &true);
+        }
         debug.finish()
     }
 }
@@ -868,6 +881,7 @@ impl Resources {
             guest_signal_mask: None,
             callback_checkpoint: None,
             priority_row: None,
+            slice_expired: false,
         }
     }
 

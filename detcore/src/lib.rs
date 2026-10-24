@@ -2747,6 +2747,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             req.slice_boundary = boundary;
             req.callback_checkpoint = checkpoint.clone().map(Box::new);
             req.priority_row = priority_row;
+            req.slice_expired = !explicit_sched_yield;
             resource_request(guest, req).await;
 
             if self.cfg.replay_schedule_from.is_some()

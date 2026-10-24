@@ -1249,6 +1249,25 @@ pub struct Scheduler {
     /// that switches threads (<https://github.com/rrnewton/hermit/issues/4139>).
     previous_turn_tid: Option<DetTid>,
 
+    /// A cached copy of the same (immutable) field in Config: charge a turn
+    /// that ends a timeslice at most the time its thread ran since its
+    /// previous turn (`Scheduler::preemption_charge_cap`).
+    cap_preemption_charge: bool,
+
+    /// Under `cap_preemption_charge`, each live thread's clock
+    /// (`GlobalTime::threads_duration`) when its last committed turn that was
+    /// not a host-timed polling retry was granted, while the thread was still
+    /// stopped at that turn's request (`Scheduler::note_granted_turn`). Empty
+    /// otherwise.
+    turn_clocks: BTreeMap<DetTid, LogicalTime>,
+
+    /// The cap on the charge of the turn granted last, when that turn ended
+    /// an expired timeslice: its thread and the virtual time the thread ran
+    /// in that slice (`Scheduler::note_granted_turn`). The charge is applied
+    /// at the next pass (`bump_global_time`), after the thread has already
+    /// run on, which is why the length is taken at the grant.
+    preemption_cap: Option<(DetTid, u64)>,
+
     /// INVARIANT: Thread IDs in `blocked` are absent from `run_queue`.
     pub blocked: BlockedPool,
 
@@ -3991,6 +4010,7 @@ pub(crate) async fn finish_selected_turn(
     // The logical COMMIT point for the turn is during step4:
     mg.step4_resource_block(next_dtid, &rsrcs, &resp)?;
     mg.step5_guest_unblock(next_dtid, &rsrcs, &resp)?;
+    mg.note_granted_turn(&rsrcs, &global_time);
     let requeue = mg.requeue_after(&rsrcs);
     mg.step6_reenquue(next_dtid, requeue);
     if let Some(call) = rsrcs.as_exit_syscall() {
@@ -4212,7 +4232,8 @@ impl Scheduler {
                 .with_epoch(cfg.epoch)
                 .with_pipe_wake_latency(cfg.pipe_wake_latency_in_effect())
                 .with_signal_state_copy(cfg.signal_state_copy)
-                .with_rng_seed(cfg.rng_seed());
+                .with_rng_seed(cfg.rng_seed())
+                .with_cap_preemption_charge(cfg.cap_preemption_charge);
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -4270,6 +4291,9 @@ impl Scheduler {
             bg_action_pool: Default::default(),
             committed_time: Default::default(),
             previous_turn_tid: None,
+            cap_preemption_charge: cfg.cap_preemption_charge,
+            turn_clocks: BTreeMap::new(),
+            preemption_cap: None,
             blocked: Default::default(),
             vfork_barriers: Default::default(),
             background_entry_barriers: Default::default(),
@@ -5390,6 +5414,7 @@ impl Scheduler {
         self.retire_parked_requests(*dtid);
 
         let _ = self.priorities.remove(dtid);
+        self.turn_clocks.remove(dtid);
         let first_removal = self.next_turns.contains_key(dtid);
         match self.next_turns.remove(dtid) {
             None => {
@@ -6205,6 +6230,11 @@ impl Scheduler {
         }
         self.started_up.try_put(());
 
+        // The survivor's clock moves to the leader's identity
+        // (`GlobalTime::reassign_thread`), and so does its last turn's clock.
+        if let Some(clock) = self.turn_clocks.remove(&caller) {
+            self.turn_clocks.insert(new_leader, clock);
+        }
         self.logically_kill_thread(&caller, &detpid, pre_exec_mm);
         self.timeslices.remove(&caller);
         retired.push(caller);
@@ -14648,13 +14678,21 @@ impl Scheduler {
         );
 
         // Update request to be empty so the thread is unconditionally
-        // runnable when it next comes up in the queue.
-        let empty_req = Ivar::full(Ok(Resources::new(dettid)));
+        // runnable when it next comes up in the queue. It keeps the
+        // slice-expiry mark of the change point it replaces: the turn that
+        // commits it is the one charged for this preemption
+        // (`preemption_charge_cap`).
+        assert!(self.next_turns.contains_key(&dettid), "nextturn present");
+        let mut runnable = Resources::new(dettid);
+        runnable.slice_expired = self.next_turns[&dettid]
+            .req
+            .try_read_with(|request| request.as_ref().is_ok_and(|rs| rs.slice_expired))
+            .unwrap_or(false);
+        let empty_req = Ivar::full(Ok(runnable));
         trace!(
             "[dettid {}] Priority change point emplaced empty resource request at new {}",
             dettid, empty_req
         );
-        assert!(self.next_turns.contains_key(&dettid), "nextturn present");
         self.substitute_request_ivar(dettid, empty_req);
         info!(
             "[scheduler] >>>>>>>\n\n NONCOMMIT turn {}, dettid {} changed priority to {}",
@@ -14922,7 +14960,8 @@ impl Scheduler {
                     "[scheduler] skipping scheduler time advance because just-finished turn delivered a signal to the thread already running"
                 );
             } else {
-                let newtime = match gtime.add_scheduler_time() {
+                let cap = self.preemption_charge_cap(last_turn);
+                let newtime = match gtime.add_capped_scheduler_time(cap) {
                     Ok(newtime) => newtime,
                     Err(exhausted) => {
                         // Keep the first report; the clock did not move.
@@ -14981,6 +15020,56 @@ impl Scheduler {
         // O3: every turn of an observable process has quiesced, and no pop or
         // grant of the next pass has run yet.
         self.reconcile_inactive_alarms(self.committed_time);
+    }
+
+    /// Record a granted turn for `--cap-preemption-charge`: the thread's
+    /// clock now, while it is still stopped at the turn's request, becomes
+    /// its last turn's clock (`turn_clocks`), and when the request ends an
+    /// expired timeslice (`Resources::slice_expired`), the difference from
+    /// its previous turn's clock, the virtual time it ran in that slice,
+    /// caps the turn's charge (`preemption_cap`). A host-timed polling retry
+    /// is not recorded, so how many retries ran cannot change a cap. Called
+    /// at the commit of every turn, so the cap always belongs to the turn
+    /// granted last.
+    fn note_granted_turn(&mut self, granted: &Resources, global_time: &Mutex<GlobalTime>) {
+        self.preemption_cap = None;
+        if !self.cap_preemption_charge || Self::is_polling_turn(granted) {
+            return;
+        }
+        let clock = {
+            let gtime = global_time.lock().unwrap();
+            if !gtime.contains_thread(granted.tid) {
+                return;
+            }
+            gtime.threads_duration(granted.tid)
+        };
+        let previous = self.turn_clocks.insert(granted.tid, clock);
+        if granted.slice_expired
+            && let Some(previous) = previous
+        {
+            let ran = clock.as_nanos().saturating_sub(previous.as_nanos());
+            self.preemption_cap = Some((granted.tid, ran));
+        }
+    }
+
+    /// The most the committed turn `last_turn` may be charged, in virtual
+    /// nanoseconds (`GlobalTime::add_capped_scheduler_time`): under
+    /// `--cap-preemption-charge`, a turn that ended an expired timeslice is
+    /// charged at most the virtual time its thread ran in that slice
+    /// (`note_granted_turn`). Every preemption otherwise costs a full turn
+    /// charge however short its slice, so slices far shorter than the charge
+    /// multiplied guest-visible time by about `1 + charge / slice`; capped,
+    /// a slice costs at most its own length again. A thread with no earlier
+    /// turn on record, every other turn, and the option off: no cap.
+    ///
+    /// Both clocks are read at grants, a function of the turns both runs of
+    /// `--verify` share, and a recording and its replay grant the same turns
+    /// with the same per-thread clocks, so they charge alike.
+    fn preemption_charge_cap(&mut self, last_turn: &Result<Resources, SkipTurn>) -> u64 {
+        match (self.preemption_cap.take(), last_turn) {
+            (Some((tid, ran)), Ok(resources)) if tid == resources.tid => ran,
+            _ => u64::MAX,
+        }
     }
 
     /// Step 4: unblock enabled actions to actually, physically run.
@@ -20301,6 +20390,135 @@ mod test {
         );
     }
 
+    /// `--cap-preemption-charge`: a committed turn whose request ends an
+    /// expired timeslice is charged the virtual time its thread ran in that
+    /// slice, from its previous granted turn to this request, at most the
+    /// full charge and at least one nanosecond. As in production, the charge
+    /// is applied only after the granted thread has run on to its next
+    /// request, and that later run does not count. Another thread's work, an
+    /// unmarked turn, a thread with no earlier turn and the option off keep
+    /// the full charge, and a host-timed polling retry does not restart the
+    /// measure.
+    #[test]
+    fn a_preemption_is_charged_at_most_the_time_its_thread_ran() {
+        let full = Config::default().scheduler_turn_charge().unwrap();
+        let thread = DetTid::from_raw(13);
+        let other = DetTid::from_raw(14);
+        let expired = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.slice_expired = true;
+            request
+        };
+        let retry = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            request
+        };
+        // The charge of the last of `turns`, in production order: each turn's
+        // thread runs `before` virtual nanoseconds and files the request,
+        // which is granted; it runs `after` more to its next request; then
+        // the next pass charges the turn.
+        let charge = |cap: bool, turns: &[(Resources, u64, u64)]| {
+            let config = Config {
+                cap_preemption_charge: cap,
+                ..Config::default()
+            };
+            let mut sched = Scheduler::new(&config);
+            for tid in [thread, other] {
+                sched.priorities.insert(tid, DEFAULT_PRIORITY);
+                sched.runqueue_push_back(tid);
+            }
+            let time = Mutex::new(GlobalTime::new(&config));
+            let start = time.lock().unwrap().as_nanos();
+            let mut clocks: BTreeMap<DetTid, u64> = BTreeMap::new();
+            let mut run = |tid: DetTid, ran: u64| {
+                let clock = clocks.entry(tid).or_default();
+                *clock += ran;
+                time.lock().unwrap().update_global_time(
+                    tid,
+                    start + LogicalTime::from_nanos(*clock),
+                    LogicalTime::ZERO,
+                );
+            };
+            let mut last = 0;
+            for (turn, before, after) in turns {
+                run(turn.tid, *before);
+                sched.note_granted_turn(turn, &time);
+                run(turn.tid, *after);
+                let before_charge = time.lock().unwrap().as_nanos();
+                sched.bump_global_time(&time, &Ok(turn.clone()));
+                last = time
+                    .lock()
+                    .unwrap()
+                    .as_nanos()
+                    .duration_since(before_charge)
+                    .as_nanos() as u64;
+            }
+            last
+        };
+        let plain = Resources::new;
+        assert_eq!(
+            charge(
+                true,
+                &[(plain(thread), 0, 0), (expired(thread), 1_000, 7_000)]
+            ),
+            1_000,
+            "the slice the turn ended, not the run after its grant"
+        );
+        assert_eq!(
+            charge(true, &[(plain(thread), 0, 0), (expired(thread), 0, 0)]),
+            1,
+            "a capped turn still advances the clock"
+        );
+        assert_eq!(
+            charge(
+                true,
+                &[(plain(thread), 0, 0), (expired(thread), 2 * full, 2_000)]
+            ),
+            full,
+            "a slice longer than one charge is charged as before"
+        );
+        assert_eq!(
+            charge(true, &[(expired(thread), 1_000, 0)]),
+            full,
+            "no earlier turn on record"
+        );
+        assert_eq!(
+            charge(true, &[(plain(thread), 0, 0), (plain(thread), 1_000, 0)]),
+            full,
+            "a turn that does not end an expired slice"
+        );
+        assert_eq!(
+            charge(false, &[(plain(thread), 0, 0), (expired(thread), 1_000, 0)]),
+            full,
+            "the option off"
+        );
+        assert_eq!(
+            charge(
+                true,
+                &[
+                    (plain(thread), 0, 0),
+                    (plain(other), 5_000, 0),
+                    (expired(thread), 1_000, 0)
+                ]
+            ),
+            1_000,
+            "another thread's work is not the preempted thread's"
+        );
+        assert_eq!(
+            charge(
+                true,
+                &[
+                    (plain(thread), 0, 0),
+                    (retry(thread), 500, 0),
+                    (expired(thread), 1_000, 0)
+                ]
+            ),
+            1_500,
+            "a host-timed retry does not restart the measure"
+        );
+    }
+
     /// https://github.com/rrnewton/hermit/issues/3517: a committed turn that
     /// served a backend-runtime bootstrap syscall whose cost is withheld does not
     /// advance virtual time. The identical request without the mark does, so the
@@ -24488,6 +24706,45 @@ mod test {
                 .is_err()
         );
         assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(yielder));
+    }
+
+    /// A chaos change point never commits; the empty request it leaves in its
+    /// place commits the thread's next turn, which is the one charged for
+    /// the preemption. So that request keeps the change point's slice-expiry
+    /// mark (`--cap-preemption-charge`), and a change point of an explicit
+    /// `sched_yield`, which has none, leaves none.
+    #[test]
+    fn a_change_point_hands_its_slice_expiry_to_the_request_it_leaves() {
+        for expired in [true, false] {
+            let (mut scheduler, spinner, _) = chaos_spinner_and_waiter(
+                Config {
+                    chaos: true,
+                    ..Config::default()
+                },
+                DEFAULT_PRIORITY,
+                DEFAULT_PRIORITY,
+            );
+            let mut request = Resources::new(spinner);
+            request.insert(
+                ResourceID::PriorityChangePoint(
+                    DEFAULT_PRIORITY,
+                    LogicalTime::from_nanos(1),
+                    1,
+                    Vec::new(),
+                ),
+                Permission::W,
+            );
+            request.slice_expired = expired;
+            scheduler.next_turns[&spinner].req.put(Ok(request));
+            spinner_changepoint(&mut scheduler, spinner, DEFAULT_PRIORITY, 1);
+            let left = scheduler.next_turns[&spinner]
+                .req
+                .try_read()
+                .unwrap()
+                .unwrap();
+            assert!(left.resources.is_empty());
+            assert_eq!(left.slice_expired, expired);
+        }
     }
 
     /// Two threads, spinner and waiter, at the given priorities, both queued,
