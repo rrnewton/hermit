@@ -2673,8 +2673,18 @@ fi
 # reverie-dbt/ and third-party/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so the inventory, SDK and native inputs, calibrated
 # budget, job width and limits carry unchanged from the 0e2bf15a entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6f8fc22eea171058f135b47bc8dc515554e613f2 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 6f8fc22eea171058f135b47bc8dc515554e613f2 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 8b7ab5f3cbd2af2438d9c142aef486c5958ba05c (2026-10-24): from
+# 6f8fc22eea171058f135b47bc8dc515554e613f2. Three commits: a52315cb changes only a
+# reverie-ptrace job-control test fixture, b2f15782 repairs Clippy source
+# diagnostics in reverie-ptrace tests, reverie-rpc-transport and the root
+# tests/ and experimental/ trees, and 8b7ab5f3 gives reverie-kvm's
+# ZEROED_USER_REGISTERS the native-test-support cfg its user already has.
+# git diff is empty under reverie-dbt/ and third-party/ and for the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml, so the inventory, SDK and
+# native inputs, calibrated budget, job width and limits carry unchanged from
+# the 6f8fc22e entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 8b7ab5f3cbd2af2438d9c142aef486c5958ba05c ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 8b7ab5f3cbd2af2438d9c142aef486c5958ba05c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
