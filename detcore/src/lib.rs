@@ -2271,8 +2271,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             let current_pmu_rcbs = guest.thread_state().committed_clock_value;
             let (ns_remaining, max_rcbs_remaining) = if let Some(replay_rcb_end) = replay_rcb_end {
                 assert!(
-                    replay_rcb_end > current_pmu_rcbs,
-                    "recorded PMU RCB deadline {} is not ahead of current {}",
+                    replay_rcb_end >= current_pmu_rcbs,
+                    "recorded PMU RCB deadline {} is behind current {}",
                     replay_rcb_end,
                     current_pmu_rcbs
                 );
@@ -2281,7 +2281,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                 } else {
                     LogicalTime::ZERO
                 };
-                (logical_remaining, replay_rcb_end - current_pmu_rcbs)
+                let rcbs_remaining = if replay_rcb_end > current_pmu_rcbs {
+                    // One past the count when the slice cannot end there on a
+                    // branch: the bound then only catches a replay that left
+                    // its record (`replay_slice_can_end_on_a_branch`).
+                    replay_rcb_end - current_pmu_rcbs
+                        + u64::from(
+                            !guest
+                                .thread_state()
+                                .replay_slice_can_end_on_a_branch(self.cfg.use_rcb_time()),
+                        )
+                } else {
+                    // The recorded count is reached and the slice ends at a
+                    // later syscall boundary, when the thread's logical time
+                    // reaches the recorded end (`timeslice_expired`). A replay
+                    // that follows its record runs no branch before then; the
+                    // timer only bounds one that does not.
+                    logical_remaining
+                        .into_rcbs_with_multiplier(clock_multiplier)
+                        .max(1)
+                };
+                (logical_remaining, rcbs_remaining)
             } else {
                 let logical_remaining = max_timeslice_end - current_time;
                 (
@@ -2330,13 +2350,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                     rcbs_remaining,
                     guest.thread_state().thread_logical_time.rcbs()
                 );
+                // A replayed slice that cannot end on a branch at its recorded
+                // count ends at a check-in, so its timer is only a bound and
+                // may land late (`replay_slice_can_end_on_a_branch`): it has no
+                // exact target to overshoot.
+                let bound_only = timer_is_max
+                    && replay_rcb_end.is_some()
+                    && !guest
+                        .thread_state()
+                        .replay_slice_can_end_on_a_branch(self.cfg.use_rcb_time());
                 {
                     let thread_state = guest.thread_state_mut();
-                    thread_state.last_rcb_timer = Some(rcbs_remaining);
+                    thread_state.last_rcb_timer = (!bound_only).then_some(rcbs_remaining);
                     thread_state.last_rcb_timer_is_max = timer_is_max;
                 }
 
-                if guest.config().imprecise_timers {
+                if guest.config().imprecise_timers || bound_only {
                     guest
                         .set_timer(TimerSchedule::Rcbs(rcbs_remaining))
                         .expect("Failed to set timer");
@@ -4080,6 +4109,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 
                     end_of_timeslice: None,
                     replay_rcb_end: None,
+                    replay_ends_at_check_in: false,
                     // AUTONOMOUS-BOT-IMPLEMENTED
                     // TODO-HUMAN-REVIEW(PR-1151)
                     chaos_epoch: tool_local::chaos_epoch_sentinel(),
