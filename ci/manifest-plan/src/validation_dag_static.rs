@@ -1221,7 +1221,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
     // The #4682 re-land's two detcore-model config units and hermit-verify's
     // interpolation unit: 1929 + 3 = 1932.
-    ("test.regular_crates", 1932),
+    // And detcore-model's two config::tests of --chaos-timed-wait-spread
+    // (legacy form, round trip): 1934.
+    ("test.regular_crates", 1934),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1906,7 +1908,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The #4682 re-land's eight hermit units (the sleep-registration admission
     // and loader-route refusals, its error class, metadata, and the run,
     // analyze and bisect plumbing): 1289 + 8 = 1297.
-    ("test.hermit_unit", 1297),
+    // And run::chaos_timed_wait_spread_parses_round_trips_and_is_refused_where_inert and
+    // run::a_replay_under_another_timed_wait_spread_is_refused: 1299.
+    ("test.hermit_unit", 1299),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3157,7 +3161,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // parked-sleep deadline and send time, the readable-state rule, the
     // controlled loop, the schedule prefix and the record envelope):
     // 3000 + 16 = 3016.
-    ("test.detcore_unit", 3016),
+    // And --chaos-timed-wait-spread: three scheduler::timed_wait_spread::tests, one
+    // timed_waiters test, two scheduler tests and one preemptions test: 3023.
+    ("test.detcore_unit", 3023),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4483,7 +4489,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The #4682 re-land's two sleep CLI tests,
     // an_ignored_or_blocked_sigchld_does_not_end_a_sleep and
     // a_signal_after_a_sleeps_deadline_does_not_interrupt_it: 742 + 2 = 744.
-    ("test.cli", 744),
+    // And chaos_timed_wait_spread_reorders_a_wait_against_work_and_keeps_the_clock_honest: 745.
+    ("test.cli", 745),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5052,7 +5059,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same 4843 overshoot fix case: 658 + 1 = 659.
     // The same two PR 4912 cases: 659 + 2 = 661.
     // And the same two #4682 re-land tests: 661 + 2 = 663.
-    ("test.cli_on_host", 663),
+    // And the same --chaos-timed-wait-spread guest test: 664.
+    ("test.cli_on_host", 664),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5548,7 +5556,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same eighteen 4843 overshoot fix units: 2981 + 18 = 2999.
     // The same socketpair readiness unit: 2999 + 1 = 3000.
     // And the same sixteen #4682 re-land units: 3000 + 16 = 3016.
-    ("test.detcore_unit_on_host", 3016),
+    // And the same seven --chaos-timed-wait-spread tests: 3023.
+    ("test.detcore_unit_on_host", 3023),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5940,7 +5949,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same detlog correction unit: 1281 + 1 = 1282.
     // The same PR 4912 unit: 1282 + 1 = 1283.
     // And the same eight #4682 re-land units: 1283 + 8 = 1291.
-    ("test.hermit_unit_on_host", 1291),
+    // And the same two --chaos-timed-wait-spread run tests: 1293.
+    ("test.hermit_unit_on_host", 1293),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6168,7 +6178,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
     // And the same three #4682 re-land units: 1915 + 3 = 1918.
-    ("test.regular_crates_on_host", 1918),
+    // And the same two --chaos-timed-wait-spread config tests: 1920.
+    ("test.regular_crates_on_host", 1920),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

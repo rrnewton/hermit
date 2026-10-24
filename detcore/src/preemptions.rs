@@ -36,6 +36,36 @@ use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::SchedEvent;
 
+/// The `--chaos-timed-wait-spread` a record was produced under
+/// ([`PreemptionRecord`]): the spread, and the scheduler seed of the run when
+/// the scheduler wrote the record (`None` in a record `hermit analyze`
+/// assembles from its trials, whose seeds it keeps itself).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RecordedTimedWaitSpread {
+    /// The spread `R`: factors are drawn from `[1/R, R]`.
+    pub spread: f64,
+    /// The scheduler seed the factors were drawn from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+}
+
+/// Compared bit for bit: a spread is a configuration value read back exactly,
+/// not a measurement.
+impl PartialEq for RecordedTimedWaitSpread {
+    fn eq(&self, other: &Self) -> bool {
+        self.spread.to_bits() == other.spread.to_bits() && self.seed == other.seed
+    }
+}
+
+impl Eq for RecordedTimedWaitSpread {}
+
+impl std::hash::Hash for RecordedTimedWaitSpread {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.spread.to_bits().hash(state);
+        self.seed.hash(state);
+    }
+}
+
 /// A record of all the preemptions and other scheduling events that occur during execution.
 #[derive(PartialEq, Default, Debug, Eq, Clone, Hash)]
 pub struct PreemptionRecord {
@@ -99,6 +129,13 @@ pub struct PreemptionRecord {
     /// completeness. Newly marked JSON uses a mandatory envelope that old
     /// readers reject, and marked non-human serialization is refused.
     replay_departed_at: Option<u64>,
+    /// The `--chaos-timed-wait-spread` of the run that produced this record,
+    /// and the scheduler seed its draws came from when the scheduler wrote
+    /// it. Every spread wait's factor is a pure function of the two, so a
+    /// replay under the same values redraws exactly the recorded factors, and
+    /// one under others is refused. `None` when the option was off, which
+    /// writes the record exactly as before the field existed.
+    timed_wait_spread: Option<RecordedTimedWaitSpread>,
     /// Actual callback expirations associated with existing priority-history rows.
     /// Absent in old/edited recordings; never inferred from time or branch counts.
     callback_checkpoints: BTreeMap<DetTid, Vec<callback_history::Checkpoint>>,
@@ -192,6 +229,7 @@ impl PreemptionRecord {
             chaos_timeslice: None,
             guest_ids: None,
             replay_departed_at: None,
+            timed_wait_spread: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
@@ -458,6 +496,19 @@ impl PreemptionRecord {
         self
     }
 
+    /// The same record, stating the `--chaos-timed-wait-spread` of the
+    /// trials it came from, as it states the pipe-wake latency.
+    pub fn with_timed_wait_spread(mut self, spread: Option<RecordedTimedWaitSpread>) -> Self {
+        self.timed_wait_spread = spread;
+        self
+    }
+
+    /// The `--chaos-timed-wait-spread` this record was produced under
+    /// (`None` for off).
+    pub fn timed_wait_spread(&self) -> Option<RecordedTimedWaitSpread> {
+        self.timed_wait_spread
+    }
+
     /// Make a copy of everything in the `PreemptionRecord` in a public format.
     pub fn extract_all(&self) -> BTreeMap<DetTid, ThreadHistory> {
         self.per_thread.clone()
@@ -529,6 +580,7 @@ impl PreemptionRecord {
             guest_ids: self.guest_ids,
             // A record derived from an inexact one is inexact too.
             replay_departed_at: self.replay_departed_at,
+            timed_wait_spread: self.timed_wait_spread,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: self.rng_seed,
             expired_wait_runs_charged_once: self.expired_wait_runs_charged_once,
@@ -599,6 +651,7 @@ impl PreemptionRecord {
             chaos_timeslice: None,
             guest_ids: None,
             replay_departed_at: None,
+            timed_wait_spread: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
@@ -1474,6 +1527,72 @@ mod tests {
         assert_eq!(hash(&back), hash(&without));
     }
 
+    /// The timed-wait spread and its seed round-trip through the writer, the
+    /// record and the settings reader; a record without them is written as
+    /// before; a replay under another spread, or another seed where both
+    /// name one, is refused.
+    #[test]
+    fn the_timed_wait_spread_round_trips_and_is_compared() {
+        let unsaid = PreemptionRecord::from_sched_events(Vec::new());
+        assert_eq!(unsaid.timed_wait_spread(), None);
+        assert!(
+            !serde_json::to_string(&unsaid)
+                .unwrap()
+                .contains("timed_wait_spread")
+        );
+        let setting = RecordedTimedWaitSpread {
+            spread: 12.5,
+            seed: Some(7),
+        };
+        let written = PreemptionWriter::new(None)
+            .with_timed_wait_spread(Some(setting))
+            .into_string();
+        assert!(
+            written.contains(r#""timed_wait_spread":{"spread":12.5,"seed":7}"#),
+            "{written}"
+        );
+        let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert_eq!(back.timed_wait_spread(), Some(setting));
+        assert_eq!(
+            back.clone_preemptions_only().timed_wait_spread(),
+            Some(setting)
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        std::fs::write(&path, &written).unwrap();
+        assert_eq!(read_recorded_timed_wait_spread(&path), Ok(Some(setting)));
+        let unseeded = RecordedTimedWaitSpread {
+            spread: 12.5,
+            seed: None,
+        };
+        for (recorded, spread, seed, refused) in [
+            (None, None, Some(1), false),
+            (Some(setting), Some(12.5), Some(7), false),
+            (Some(setting), Some(12.5), None, false),
+            (Some(unseeded), Some(12.5), Some(1), false),
+            (Some(setting), None, Some(7), true),
+            (None, Some(12.5), Some(7), true),
+            (Some(setting), Some(12.0), Some(7), true),
+            (Some(setting), Some(12.5), Some(8), true),
+        ] {
+            let refusal =
+                timed_wait_spread_mismatch("--replay-schedule-from=x", recorded, spread, seed);
+            assert_eq!(
+                refusal.is_some(),
+                refused,
+                "{recorded:?} replayed with {spread:?} and seed {seed:?}: {refusal:?}"
+            );
+        }
+        let refusal = timed_wait_spread_mismatch(
+            "--replay-schedule-from=x",
+            Some(setting),
+            Some(12.5),
+            Some(8),
+        )
+        .unwrap();
+        assert!(refusal.contains("Replay with --sched-seed=7"), "{refusal}");
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
@@ -2204,6 +2323,14 @@ impl PreemptionWriter {
         self
     }
 
+    /// Store the run's `--chaos-timed-wait-spread` and scheduler seed
+    /// (`None` for off, which leaves the record as it was before the field
+    /// existed).
+    pub fn with_timed_wait_spread(mut self, spread: Option<RecordedTimedWaitSpread>) -> Self {
+        self.inner.timed_wait_spread = spread;
+        self
+    }
+
     /// Does the record have zero entries?
     pub fn is_empty(&self) -> bool {
         self.inner.per_thread.is_empty()
@@ -2598,6 +2725,59 @@ pub fn cap_preemption_charge_mismatch(
             show(recorded),
         )
     })
+}
+
+/// Read only the `--chaos-timed-wait-spread` stored in a preemption record
+/// file, as [`read_recorded_epoch`] reads the epoch. `Ok(None)` means the
+/// record was made with the option off, or before the field existed.
+pub fn read_recorded_timed_wait_spread(
+    path: &Path,
+) -> Result<Option<RecordedTimedWaitSpread>, String> {
+    #[derive(Deserialize)]
+    struct SpreadOnly {
+        #[serde(default)]
+        timed_wait_spread: Option<RecordedTimedWaitSpread>,
+    }
+    Ok(boundary_recording::read_settings::<SpreadOnly>(path)?.timed_wait_spread)
+}
+
+/// The refusal of a replay that would not redraw a record's spread-wait
+/// factors, naming the record by `source` (an option and a path), or `None`
+/// when it would: the replay's `--chaos-timed-wait-spread` (`spread`) must be
+/// the recorded one, and where both the record and the replay name a
+/// scheduler seed (`seed`), so must the seed. Absent and off are the same.
+pub fn timed_wait_spread_mismatch(
+    source: &str,
+    recorded: Option<RecordedTimedWaitSpread>,
+    spread: Option<f64>,
+    seed: Option<u64>,
+) -> Option<String> {
+    let show = |spread: Option<f64>| match spread {
+        Some(spread) => format!("--chaos-timed-wait-spread={spread}"),
+        None => "no --chaos-timed-wait-spread".to_owned(),
+    };
+    let redirect = |spread: Option<f64>| match spread {
+        Some(spread) => format!("Replay with --chaos-timed-wait-spread={spread}"),
+        None => "Drop --chaos-timed-wait-spread".to_owned(),
+    };
+    let recorded_spread = recorded.map(|recorded| recorded.spread);
+    if recorded_spread.map(f64::to_bits) != spread.map(f64::to_bits) {
+        return Some(format!(
+            "{source} was recorded with {} and would be replayed with {}. The spread draws \
+             every timed wait's wake time, so the replay cannot reproduce the run. {}.",
+            show(recorded_spread),
+            show(spread),
+            redirect(recorded_spread),
+        ));
+    }
+    match (recorded.and_then(|recorded| recorded.seed), seed) {
+        (Some(recorded), Some(seed)) if recorded != seed => Some(format!(
+            "{source} was recorded with --chaos-timed-wait-spread drawn from scheduler seed \
+             {recorded} and would be replayed with seed {seed}, which draws other timed-wait \
+             wake times. Replay with --sched-seed={recorded}."
+        )),
+        _ => None,
+    }
 }
 
 /// Read only whether the signal-state copy was on in the run that wrote a

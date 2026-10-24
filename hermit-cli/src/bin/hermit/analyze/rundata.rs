@@ -501,6 +501,14 @@ impl RunData {
         // want to make it possible to do analyze with the stick random scheduler instead of the
         // one.
         ro.det_opts.det_config.chaos = true;
+        if ro.det_opts.det_config.chaos_timed_wait_spread.is_some() {
+            bail!(
+                "hermit analyze cannot replay --chaos-timed-wait-spread yet: its bisect and \
+                 minimize replays mix schedules found under different seeds, and the spread's \
+                 wake times are drawn from the seed. Find the failure with hermit run --chaos \
+                 --chaos-timed-wait-spread=R --seed=N, or drop --chaos-timed-wait-spread"
+            );
+        }
 
         // Trials may differ only in their schedule. `--seed` also seeds what the guest reads
         // as randomness (getrandom, /dev/urandom) and syscall fuzzing, so a run2 seed or a
@@ -1395,6 +1403,16 @@ impl AnalyzeOpts {
                 recorded,
                 Some(self.trial_sleep_registration()),
                 true,
+            ) {
+                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+            }
+            let recorded = detcore::preemptions::read_recorded_timed_wait_spread(path)
+                .map_err(anyhow::Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::timed_wait_spread_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                config.chaos_timed_wait_spread,
+                None,
             ) {
                 return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
             }

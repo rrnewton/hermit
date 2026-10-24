@@ -525,6 +525,21 @@ preemptions or events, manual interrupt points, a happens-before program or
 `--gdbserver` (a debugger stopping the thread between skipped ends would see
 Hermit's slice bookkeeping behind its program counter).
 
+Chaos reorders threads but never changes how long a timed wait lasts against
+other threads' work: a sleeping thread wakes when the virtual clock, which
+advances with that work, reaches its deadline. A race ordered by that ratio
+(a test that sleeps while a worker computes, a periodic timer against a
+teardown) therefore keeps one order under every seed.
+`--chaos-timed-wait-spread=R` ends each sleep, and each futex wait with a
+timeout (in the default precise futex mode), after its remaining duration
+times a seeded factor drawn log-uniformly from `[1/R, R]` of the clock's
+progress. When the factor is below one, the clock
+first jumps to the wait's deadline, as if the other threads had been
+descheduled, so the waiter still observes its full duration; above one, the
+wait oversleeps. Poll, epoll and select timeouts and signal timers are not
+spread. A recorded schedule stores the spread and seed, and a replay under
+others is refused; `hermit analyze` does not support the option yet.
+
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with
 `--replay-preemptions-from=FILE`. A record edited after it was recorded (for
@@ -905,6 +920,7 @@ hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
 | `--max-timeslice=disabled` | Disables PMU timer preemption. |
 | `--preemption-timeout=N` | Deprecated alias for `--max-timeslice=N`. |
 | `--cap-preemption-charge` | Charges a turn that ends an expired timeslice at most the time its thread ran since its previous turn. |
+| `--chaos-timed-wait-spread=R` | Ends each sleep and futex timeout after its duration times a seeded factor in `[1/R, R]`, never before its deadline on the guest's clock. |
 
 `--no-sequentialize-threads` is useful for compatibility experiments and
 workloads such as virtual machines that need real host parallelism. It removes

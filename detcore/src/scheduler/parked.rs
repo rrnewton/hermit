@@ -1277,8 +1277,7 @@ impl Scheduler {
         if let Some((parent, spec)) = self.blocked.child_waiters.remove(&tid) {
             return SavedMembership::ChildWait { parent, spec };
         }
-        if let Some(deadline) = self.blocked.timed_waiters.thread_deadline(tid) {
-            self.blocked.timed_waiters.remove(tid);
+        if let Some(deadline) = self.blocked.timed_waiters.suspend_thread(tid) {
             return SavedMembership::Timed(deadline);
         }
         let priority = self.get_priority(tid);
@@ -1632,7 +1631,7 @@ impl Scheduler {
             match membership {
                 SavedMembership::Timed(deadline) => {
                     self.run_queue.remove_tid(tid);
-                    self.blocked.timed_waiters.insert(deadline, tid);
+                    self.blocked.timed_waiters.resume_thread(deadline, tid);
                 }
                 SavedMembership::Queued(entry) => {
                     let priority = self.get_priority(tid);
