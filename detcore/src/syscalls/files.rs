@@ -12054,6 +12054,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await?;
             self.mark_sock_diag_fd(guest, fd, &call);
+            self.mark_error_queue_reads(guest, fd, &call)?;
             // Linux's SOCK_TYPE_MASK: the type without SOCK_NONBLOCK and SOCK_CLOEXEC.
             const SOCK_TYPE_MASK: i32 = 0xf;
             if self.accept_in_turn_enabled() && call.r#type() & SOCK_TYPE_MASK == libc::SOCK_STREAM
@@ -12082,6 +12083,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await?;
             self.maybe_set_nonblocking_fd(guest, fd);
             self.mark_sock_diag_fd(guest, fd, &call);
+            self.mark_error_queue_reads(guest, fd, &call)?;
 
             Ok(fd as i64)
         }
@@ -12098,6 +12100,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.cfg.recordreplay_modes
             && self.cfg.use_nonblocking_sockets()
             && !self.cfg.backend.tool_shares_guest_descriptor_table
+    }
+
+    /// Record whether a receive with `MSG_ERRQUEUE` on the socket `call`
+    /// created never waits (`crate::fd::error_queue_read_never_waits`), so that
+    /// such a receive runs once even on a socket the guest left blocking.
+    fn mark_error_queue_reads<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        call: &syscalls::Socket,
+    ) -> Result<(), Error> {
+        let never_waits =
+            crate::fd::error_queue_read_never_waits(call.family(), call.r#type(), call.protocol());
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.set_error_queue_never_waits(never_waits))?;
+        Ok(())
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -13451,6 +13470,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .thread_state()
                 .with_detfd(call.sockfd(), |detfd| detfd.is_accept_in_turn_listener())
                 .unwrap_or(false);
+        // A connection reads its error queue as its listener does. Read before
+        // the accept, which may wait while other threads change the table.
+        let error_queue_never_waits = guest
+            .thread_state()
+            .with_detfd(call.sockfd(), |detfd| detfd.error_queue_never_waits())
+            .unwrap_or(false);
         let fd = if in_turn {
             // Record and replay run the accept in the caller's turn, so the new descriptor's
             // number is allocated deterministically (https://github.com/rrnewton/hermit/issues/3880).
@@ -13468,9 +13493,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Socket,
         )
         .await?;
-        guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.set_accepted_connection())?;
+        guest.thread_state().with_detfd(fd, |detfd| {
+            detfd.set_accepted_connection();
+            detfd.set_error_queue_never_waits(error_queue_never_waits);
+        })?;
 
         if physically_nonblocking {
             self.maybe_set_nonblocking_fd(guest, fd);

@@ -3053,7 +3053,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And syscalls::helpers::tests::only_msg_dontwait_keeps_a_socket_call_from_waiting: 2723.
     // And the decision it feeds, syscalls::helpers::kernel_signal_wait_failures::
     // msg_dontwait_runs_a_call_once_on_a_socket_the_guest_left_blocking: 2724.
-    ("test.detcore_unit", 2724),
+    // And syscalls::helpers::tests::msg_errqueue_marks_only_a_receive_as_an_error_queue_read
+    // and fd::tests::error_queue_reads_never_wait_on_the_protocols_that_read_the_queue: 2726.
+    ("test.detcore_unit", 2726),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4333,7 +4335,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // halves of https://github.com/rrnewton/hermit/issues/4798's two run_kvm_
     // tests: 632 + 2 = 634.
     // And msg_dontwait_returns_at_once_on_a_blocking_socket: 645.
-    ("test.cli", 645),
+    // And msg_errqueue_returns_at_once_on_inet_sockets_and_waits_on_unix_sockets: 646.
+    ("test.cli", 646),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4864,7 +4867,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two ptrace group-exit signal-wait tests, not excluded:
     // 551 + 2 = 553.
     // And msg_dontwait_returns_at_once_on_a_blocking_socket: 564.
-    ("test.cli_on_host", 564),
+    // And msg_errqueue_returns_at_once_on_inet_sockets_and_waits_on_unix_sockets: 565.
+    ("test.cli_on_host", 565),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5330,7 +5334,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same P2b deletion of the anchor device unit: 2694, listed.
     // And the same MSG_DONTWAIT unit: 2723.
     // And the same MSG_DONTWAIT decision unit: 2724.
-    ("test.detcore_unit_on_host", 2724),
+    // And the same two MSG_ERRQUEUE units: 2726.
+    ("test.detcore_unit_on_host", 2726),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
