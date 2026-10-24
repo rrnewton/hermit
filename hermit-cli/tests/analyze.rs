@@ -479,3 +479,54 @@ fn analyze_searches_the_target_schedule_when_the_baseline_never_ends() {
         "{label}: no fallback\n{combined}"
     );
 }
+
+/// Every prefix trial in which thread a wins the race asks for something
+/// Hermit refuses at run time (exit 122), the run without chaos (the prefix
+/// search's baseline) among them. Each counts as the baseline condition, with
+/// a warning, and the report says how many were refused. Before, the first
+/// refused trial ended the whole analysis with exit 122. The refusal is
+/// Detcore's for a process-directed signal while several threads live
+/// (https://github.com/rrnewton/hermit/issues/4034); once that is supported,
+/// the fixture needs another refused operation.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_counts_a_refused_trial_as_the_baseline() {
+    let label = "analyze --prefix-search analyze_race_then refuse";
+    let (combined, report) = analyze_race_then(label, "refuse", &["--prefix-search"]);
+    assert!(
+        combined.contains(
+            "Hermit refused this trial when the guest reached an operation it does not support"
+        ),
+        "{label}: no trial was refused\n{combined}"
+    );
+    assert!(
+        report["header"]
+            .as_str()
+            .unwrap()
+            .contains("trial(s) were refused by Hermit (exit 122) and counted as not reaching"),
+        "{label}: {report}"
+    );
+}
+
+/// The target run itself is refused: it cannot be studied, so analyze ends
+/// with Hermit's refusal (exit 122) rather than counting it.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_ends_with_a_refused_target_run() {
+    let label = "analyze analyze_race_then refuse, target refused";
+    let guest = &workloads().race_then;
+    // The run without chaos takes the order Hermit refuses.
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .args(["analyze", "--prefix-search", "--target-stdout=a-first"])
+        .args(["--", "--timeout=30", "--"])
+        .arg(guest)
+        .arg("refuse");
+    let output = hermit_test::hermit_output(label, &mut command);
+    let combined = combined_output(&output);
+    assert_eq!(output.status.code(), Some(122), "{label}\n{combined}");
+    assert!(
+        combined.contains("HERMIT_POLICY_REFUSAL"),
+        "{label}\n{combined}"
+    );
+}
