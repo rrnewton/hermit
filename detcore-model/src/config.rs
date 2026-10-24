@@ -5925,7 +5925,7 @@ mod tests {
     }
 
     /// `chaos_timed_wait_spread` never enters the legacy form, whatever its
-    /// value: the guest-visible string stays the legacy bytes, and it reads
+    /// value: the legacy string keeps its bytes, and it reads
     /// back as unset from both the object and the array form.
     #[test]
     fn chaos_timed_wait_spread_never_enters_the_legacy_form() {
