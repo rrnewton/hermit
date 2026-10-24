@@ -43,7 +43,9 @@
 //! initially queued, there is exponential backoff in priority with the number
 //! of attempts. After enough queueing operations are performed, however,
 //! polling tasks are upgraded to their original priority to prevent complete
-//! starvation. The frequency of upgrades is controlled by `POLLING_UPGRADE_INTERVAL`.
+//! starvation. The frequency of upgrades is controlled by `POLLING_UPGRADE_INTERVAL`,
+//! and the scheduler also runs one when none has run for a poll-upgrade period
+//! of virtual time, at least 200 ms (`Scheduler::upgrade_pollers_on_time`).
 //!
 //! An upgraded poller competes as ordinary runnable work, which under chaos
 //! includes the bound on how often a change point may pass it over
@@ -166,7 +168,7 @@ pub enum PollerRestore {
 /// After queueing this many new tasks, perform a "poll upgrade," in which
 /// we upgrade all outstanding polling tasks their original priority levels,
 /// temporarily negating backoff behavior.
-const POLLING_UPGRADE_INTERVAL: u64 = 200;
+pub(crate) const POLLING_UPGRADE_INTERVAL: u64 = 200;
 
 #[derive(Debug, Copy, Clone)]
 struct QueueValue {
@@ -258,6 +260,11 @@ pub struct RunQueue {
     last_back_turn: RoundRobinTurn,
     last_front_turn: RoundRobinTurn,
 
+    /// How many poll upgrades have run, from the queueing-operation interval
+    /// or [`Self::upgrade_pollers`], so the scheduler can tell how long ago
+    /// the last one was.
+    poll_upgrades: u64,
+
     /// Used to lock the queue from other changes while we are tentatively popping from it, and also
     /// cache the result.
     tentative_selection: Option<DetTid>,
@@ -329,6 +336,7 @@ impl RunQueue {
             // For clarity, 0 is unused so that positive/negative == back/front:
             last_back_turn: 0,
             last_front_turn: 0,
+            poll_upgrades: 0,
             sched_strategy: ss,
             tentative_selection: None,
             tentative_selection_is_exact: false,
@@ -891,7 +899,7 @@ impl RunQueue {
 
     fn check_poll_upgrade(&mut self) {
         if self.turn_counter().is_multiple_of(POLLING_UPGRADE_INTERVAL) {
-            self.do_poll_upgrade()
+            self.do_poll_upgrade();
         }
     }
 
@@ -950,9 +958,27 @@ impl RunQueue {
         PollerRestore::Restored
     }
 
-    /// Upgrade polled tasks to their specified normal priority.
+    /// How many poll upgrades have run so far.
+    pub fn poll_upgrade_count(&self) -> u64 {
+        self.poll_upgrades
+    }
+
+    /// Run a poll upgrade now, outside the queueing-operation interval, and
+    /// answer which backed-off pollers it restored to their normal priority.
+    /// The scheduler calls this when virtual time, not queueing operations,
+    /// says an upgrade is due.
+    ///
+    /// Mutating operation: this will error if a tentative_pop/commit transaction is underway.
+    pub fn upgrade_pollers(&mut self) -> Vec<DetTid> {
+        assert!(self.tentative_selection.is_none());
+        self.do_poll_upgrade()
+    }
+
+    /// Upgrade polled tasks to their specified normal priority, and answer
+    /// which it restored.
     #[cold]
-    fn do_poll_upgrade(&mut self) {
+    fn do_poll_upgrade(&mut self) -> Vec<DetTid> {
+        self.poll_upgrades += 1;
         let upgrades = self
             .queue
             .iter()
@@ -961,6 +987,7 @@ impl RunQueue {
         // TODO(T100400409): if all polling threads are below a certain priority, this
         // can use a range query rather than iterating over all threads in the
         // run queue:
+        let mut restored = Vec::new();
         for (key, upgrade_prio) in upgrades {
             // A poller whose normal priority is the last band has nowhere to
             // be upgraded to. Clearing its marker would only make it ordinary
@@ -982,6 +1009,7 @@ impl RunQueue {
             new_key.priority = upgrade_prio;
             let mut qval = self.queue.remove(&key).unwrap();
             qval.poll_upgrade = None; // there's no need to upgrade to the same priority twice
+            restored.push(qval.tid);
             let old = self.queue.insert(new_key, qval);
             assert!(old.is_none()); // round robin turns should ensure uniqueness
         }
@@ -998,6 +1026,7 @@ impl RunQueue {
                 value.upgraded_in_place = true;
             }
         }
+        restored
     }
 }
 

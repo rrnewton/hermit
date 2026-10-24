@@ -3044,7 +3044,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // copy only where the count proves it): 2691, listed.
     // And passthru_opt_intercepts_the_protection_key_calls (the inotify
     // fault path's protection-key record under --passthru-opt): 2692, listed.
-    ("test.detcore_unit", 2695),
+    // And scheduler::test::a_backed_off_poller_is_upgraded_once_a_poll_upgrade_period_passes_without_one
+    // scheduler::test::a_timed_poll_upgrade_readies_a_live_pollers_filed_retry and
+    // scheduler::test::a_timed_poll_upgrade_readies_nothing_after_an_unresolved_sigkill
+    // (a backed-off socket reader starved beside a spinner): 2698.
+    ("test.detcore_unit", 2698),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4323,7 +4327,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity, the ptrace
     // halves of https://github.com/rrnewton/hermit/issues/4798's two run_kvm_
     // tests: 632 + 2 = 634.
-    ("test.cli", 637),
+    // And a_socket_reader_beside_a_spinner_is_retried_within_a_poll_upgrade_period: 638.
+    ("test.cli", 638),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4850,7 +4855,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed.
     // And the same two ptrace group-exit signal-wait tests, not excluded:
     // 551 + 2 = 553.
-    ("test.cli_on_host", 556),
+    // And a_socket_reader_beside_a_spinner_is_retried_within_a_poll_upgrade_period,
+    // which is not among them: 557.
+    ("test.cli_on_host", 557),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5313,7 +5320,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 3c.1e B unit: 2682, listed.
     // And the same nine units for a read that faults: 2691, listed.
     // And the same protection-key subscription unit: 2692, listed.
-    ("test.detcore_unit_on_host", 2695),
+    // And the same three timed poll-upgrade units: 2698.
+    ("test.detcore_unit_on_host", 2698),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
