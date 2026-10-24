@@ -1791,7 +1791,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And --minimize's replay of its own record:
     // rundata::tests::a_normalized_record_is_written_for_reading_and_not_replayed and
     // phases::tests::the_baseline_knock_out_removes_a_real_intervention_until_none_is_left: 1125.
-    ("test.hermit_unit", 1125),
+    // And --minimize's baseline search and minimization: phases::tests::the_baseline_search_knocks_out_the_replayed_record_until_a_replay_misses and
+    // minimize::tests::a_failed_cut_of_a_threads_last_interventions_is_tested_again: 1127.
+    ("test.hermit_unit", 1127),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2829,7 +2831,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unit, rendered_procfs's write-open and mode unit, its write-open
     // refusal unit and its `..` alias walk unit, and tool_global's four
     // comm_alias_open_tests through handle_openat): 2527, listed.
-    ("test.detcore_unit", 2527),
+    // And preemptions::tests::a_record_too_varied_to_renumber_keeps_its_priorities: 2528.
+    ("test.detcore_unit", 2528),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4947,7 +4950,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/4582: 2500.
     // And the same fifteen D4c-1 units: 2515, listed.
     // And the same twelve A+ units: 2527, listed.
-    ("test.detcore_unit_on_host", 2527),
+    // And the same normalize test: 2528.
+    ("test.detcore_unit_on_host", 2528),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5297,7 +5301,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same six report-stack tests: 1122.
     // And the same slice-end test: 1123.
     // And the same two minimize tests: 1125.
-    ("test.hermit_unit_on_host", 1125),
+    // And the same two --minimize tests: 1127.
+    ("test.hermit_unit_on_host", 1127),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
