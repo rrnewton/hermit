@@ -716,6 +716,21 @@ const SCM_TIMESTAMPNS_NEW: libc::c_int = 64;
 const SCM_TIMESTAMPING_NEW: libc::c_int = 65;
 const MAX_CONTROL_BYTES: usize = 64 * 1024;
 
+/// A control buffer supplied to a receive: its address and the number of
+/// bytes Detcore inspects. The address stays a plain integer so the value can
+/// be held across the receive's await.
+type ControlBuffer = (usize, usize);
+
+fn control_buffer(message: &Msghdr) -> Option<ControlBuffer> {
+    if message.msg_control.is_null() || message.msg_controllen == 0 {
+        return None;
+    }
+    Some((
+        message.msg_control as usize,
+        message.msg_controllen.min(MAX_CONTROL_BYTES),
+    ))
+}
+
 #[derive(Clone, Copy)]
 enum SocketTimestampKind {
     Timeval,
@@ -3535,7 +3550,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         if !self.cfg.virtualize_time {
-            return self.execute_nonblockable_fd_syscall(guest, call).await;
+            let control = call
+                .msg()
+                .and_then(|address| guest.memory().read_value(address).ok())
+                .and_then(|message: Msghdr| control_buffer(&message));
+            let message_raw = call.msg().map(|address| address.as_raw());
+            let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
+            if let (Some(header), Some(control)) = (message_raw, control) {
+                self.register_scm_rights(guest, &[(header, control)], call.flags())
+                    .await;
+            }
+            return Ok(result);
         }
 
         let Some(message_address) = call.msg() else {
@@ -3559,16 +3584,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Validate the output region before consuming a datagram.
         guest.memory().read_exact(control_address, &mut control)?;
 
+        let message_raw = message_address.as_raw();
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
         let now = self.observe_socket_receive(guest, call.sockfd()).await?;
+        self.register_scm_rights(
+            guest,
+            &[(message_raw, (control_address.as_raw(), control_len))],
+            call.flags(),
+        )
+        .await;
         let mut control = vec![0; control_len];
         guest.memory().read_exact(control_address, &mut control)?;
-        // A descriptor received over `SCM_RIGHTS` that Detcore models (an
-        // in-guest backend discovers it as it is used) joins this process's
-        // table in `procfs::locks::LockLedger` with whatever OFD or flock
-        // locks its description holds. One Detcore keeps no model of (ptrace)
-        // is left out, so its locks are hidden once no modelled table names
-        // the description (a named residual).
+        // A descriptor received over `SCM_RIGHTS` that Detcore models
+        // (`register_scm_rights` has just added it, or an in-guest backend
+        // discovers it as it is used) joins this process's table in
+        // `procfs::locks::LockLedger` with whatever OFD or flock locks its
+        // description holds. One Detcore keeps no model of (one ptrace leaves
+        // untracked, see `register_received_fds`) is left out, so its locks
+        // are hidden once no modelled table names the description (a named
+        // residual).
         for fd in received_descriptors(&control) {
             self.refresh_description_locks(guest, fd, super::files::LockCall::Recvmsg)
                 .await?;
@@ -3580,6 +3614,44 @@ impl<T: RecordOrReplay> Detcore<T> {
         canonicalize_socket_timestamps(&mut control, now);
         guest.memory().write_exact(control_address, &control)?;
         Ok(result)
+    }
+
+    /// Track the descriptors that `SCM_RIGHTS` messages installed during a
+    /// receive. Each entry names a message header and the control buffer its
+    /// caller supplied.
+    ///
+    /// The kernel stores the length of the control data it wrote in each
+    /// header's `msg_controllen`, so only those bytes are parsed: the rest of
+    /// the buffer holds whatever the guest left there. Failures are logged
+    /// rather than returned because the receive has already completed.
+    async fn register_scm_rights<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        messages: &[(usize, ControlBuffer)],
+        flags: i32,
+    ) {
+        let mut fds = Vec::new();
+        for &(header, (control, capacity)) in messages {
+            let Some(written) = AddrMut::<Msghdr>::from_raw(header)
+                .and_then(|header| guest.memory().read_value(header).ok())
+                .map(|message: Msghdr| message.msg_controllen.min(capacity))
+            else {
+                continue;
+            };
+            let Some(control) = AddrMut::<u8>::from_raw(control) else {
+                continue;
+            };
+            let mut bytes = vec![0; written];
+            if guest.memory().read_exact(control, &mut bytes).is_ok() {
+                fds.extend(
+                    received_descriptors(&bytes)
+                        .into_iter()
+                        .filter(|&fd| fd >= 0),
+                );
+            }
+        }
+        self.register_received_fds(guest, &fds, flags & libc::MSG_CMSG_CLOEXEC != 0)
+            .await;
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3874,14 +3946,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         if self.cfg.recordreplay_modes && is_accepted_connection(guest, call.fd()) {
             return self.refuse_log_served_mmsg(guest, Sysno::recvmmsg).await;
         }
-        if !self.cfg.virtualize_time || call.vlen() > libc::UIO_MAXIOV as u32 {
-            return self.execute_nonblockable_fd_syscall(guest, call).await;
-        }
-
-        let Some(messages_address) = call.mmsg() else {
+        // Socket timestamps are canonicalized only for batches of at most
+        // UIO_MAXIOV messages, whose control buffers are read before the call.
+        // Linux does not clamp a recvmmsg batch (do_recvmmsg loops up to vlen),
+        // so the descriptors SCM_RIGHTS installed are looked up in the header
+        // of every message the call delivered.
+        let canonicalize = self.cfg.virtualize_time && call.vlen() <= libc::UIO_MAXIOV as u32;
+        let Some(messages_address) = call.mmsg().filter(|_| call.vlen() > 0) else {
             return self.execute_nonblockable_fd_syscall(guest, call).await;
         };
-        let controls = {
+        let controls: Vec<Option<ControlBuffer>> = if canonicalize {
             // SAFETY: `mmsghdr` is a plain C record and an all-zero value is a valid
             // initialized staging value that is immediately overwritten by `read_values`.
             let mut messages: Vec<Mmsghdr> = (0..call.vlen())
@@ -3890,27 +3964,36 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest
                 .memory()
                 .read_values(messages_address.into(), &mut messages)?;
-
-            let mut controls = Vec::with_capacity(messages.len());
-            for message in &messages {
-                let header = &message.msg_hdr;
-                if header.msg_control.is_null() || header.msg_controllen == 0 {
-                    controls.push(None);
-                    continue;
-                }
-                controls.push(Some((
-                    header.msg_control as usize,
-                    header.msg_controllen.min(MAX_CONTROL_BYTES),
-                )));
-            }
-            controls
+            messages
+                .iter()
+                .map(|message| control_buffer(&message.msg_hdr))
+                .collect()
+        } else {
+            Vec::new()
         };
 
+        let messages_raw = messages_address.as_raw();
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
-        let delivered = usize::try_from(result).unwrap_or(0).min(controls.len());
+        let delivered = usize::try_from(result).unwrap_or(0);
         if delivered == 0 {
             return Ok(result);
         }
+        // The kernel leaves each delivered header's msg_control as the guest set
+        // it and stores the length of the control data it wrote in msg_controllen.
+        let headers: Vec<_> = (0..delivered)
+            .filter_map(|index| {
+                let header = messages_raw + index * std::mem::size_of::<Mmsghdr>();
+                let message: Mmsghdr = AddrMut::<Mmsghdr>::from_raw(header)
+                    .and_then(|address| guest.memory().read_value(address).ok())?;
+                Some((header, control_buffer(&message.msg_hdr)?))
+            })
+            .collect();
+        self.register_scm_rights(guest, &headers, call.flags() as i32)
+            .await;
+        if !canonicalize {
+            return Ok(result);
+        }
+        let delivered = delivered.min(controls.len());
         let now = self.observe_socket_receive(guest, call.fd()).await?;
         let mut timestamped = Vec::new();
         for (address, length) in controls.into_iter().take(delivered).flatten() {
