@@ -2359,7 +2359,10 @@ where
 /// absolute deadline in the thread's restart block (`do_restart_poll`,
 /// `futex_wait_restart`). Detcore emulates the wait, so the kernel's restart block
 /// does not describe it, and Detcore keeps its own
-/// (https://github.com/rrnewton/hermit/issues/3358).
+/// (https://github.com/rrnewton/hermit/issues/3358). A `poll` with a positive
+/// timeout that Detcore runs in the kernel keeps one too: the kernel's restart
+/// block describes that poll, but Detcore runs the restart through its
+/// recorder (`RestartCall::KernelPoll`).
 ///
 /// The record lives until the thread's next syscall, which takes it
 /// (`Detcore::handle_syscall_event`). Other first syscalls, sigreturn and exec
@@ -2381,7 +2384,8 @@ pub(crate) struct RestartBlock {
     /// pointer back onto that instruction with `restart_syscall` in `rax`, so the
     /// restart stops at the same address.
     pub(crate) rip: u64,
-    /// The wait's absolute deadline.
+    /// The wait's absolute deadline, or `None` for a wait without one and for a
+    /// kernel-run poll, which keeps its own (`RestartCall::KernelPoll`).
     pub(crate) deadline: Option<LogicalTime>,
     /// The interrupted call.
     pub(crate) call: RestartCall,
@@ -2391,11 +2395,31 @@ pub(crate) struct RestartBlock {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RestartCall {
     Poll(syscalls::Poll),
+    /// A `poll` with a positive timeout that Detcore ran in the kernel
+    /// (`Detcore::handle_external_poll`: record and replay, and
+    /// `--no-sequentialize-threads`), with the end of its timeout. Its restart
+    /// runs the poll again in the kernel, through the recorder, with the time
+    /// left (`Detcore::resume_kernel_poll`).
+    KernelPoll(syscalls::Poll, KernelPollDeadline),
     Futex(syscalls::Futex),
     /// A relative `nanosleep` or `clock_nanosleep` that ended for a claimed
     /// `SIGCHLD` (`syscalls::signal::SleepSignal::Claimed`).
     Nanosleep(reverie::syscalls::family::NanosleepFamily),
 }
+
+/// Where the timeout of a `poll` Detcore runs in the kernel ends
+/// (`RestartCall::KernelPoll`), on the host's monotonic clock. That clock is
+/// the one the kernel wait runs on and the one Linux's restart keeps its end
+/// time on (`poll_select_set_timeout`, `do_restart_poll`), while the thread's
+/// logical time stands still as long as it blocks in the kernel, so an end on
+/// logical time would let every restart wait the whole timeout again.
+///
+/// `None` under record and replay: there the restart reruns the poll with the
+/// timeout it was issued with. The recording holds each poll's arguments and
+/// replay checks them, and no clock that replay reproduces moves while the
+/// poll blocks, so a time left is not replayed today.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct KernelPollDeadline(pub(crate) Option<std::time::Instant>);
 
 impl RestartBlock {
     /// The record, if a `restart_syscall` that stopped at `rip` is the kernel's

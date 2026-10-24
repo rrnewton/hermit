@@ -1276,7 +1276,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// interrupted call's address, and the wait resumes with its original deadline
     /// (https://github.com/rrnewton/hermit/issues/3358). Detcore emulates those
     /// waits, so it resumes them from the record the wait kept
-    /// (`syscalls::helpers::RestartBlock`). Any other `restart_syscall` keeps the
+    /// (`syscalls::helpers::RestartBlock`), as it does a `poll` with a positive
+    /// timeout that it ran in the kernel. Any other `restart_syscall` keeps the
     /// unsupported-syscall policy.
     // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3361): Review the
     // emulated `restart_syscall` resumption and the record it consumes.
@@ -1306,6 +1307,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             syscalls::helpers::RestartCall::Poll(poll) => {
                 self.handle_internal_poll_until(guest, poll, block.deadline)
                     .await
+            }
+            syscalls::helpers::RestartCall::KernelPoll(poll, deadline) => {
+                self.resume_kernel_poll(guest, poll, deadline).await
             }
             syscalls::helpers::RestartCall::Futex(futex) => {
                 self.handle_futex_from(
