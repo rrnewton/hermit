@@ -3079,7 +3079,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // MSG_DONTWAIT): 2883 + 14 = 2897, measured with `cargo nextest list`
     // at 16fb7fbec04 and re-measured at this head.
     // And the TracerPid unit (32e9ef22f60): 2897 + 1 = 2898.
-    ("test.detcore_unit", 2898),
+    // And nine fatal_core::tests for cores that hold every thread (one
+    // decision per death, a reused TGID, the PF_DUMPCORE thread as the
+    // dumper, a core without its dumping thread refused, the thread order, the
+    // leader's state, the kernel's note order, the offered thread's
+    // registers, every thread's frames in the Stack tier): 2907, listed.
+    ("test.detcore_unit", 2907),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3423,7 +3428,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_fault_ends_the_run_while_the_leader_waits_on_a_condition_variable (a
     // thread's fault ends the run by its signal while main waits on a
     // condition variable): 287, listed.
-    ("test.hermit_integration_2", 290),
+    // And fatal_core_capture's three tests of cores that hold every thread
+    // (the note layout and each thread's registers, gdb, two identical runs):
+    // 293, listed.
+    ("test.hermit_integration_2", 293),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -5411,7 +5419,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same fourteen train-12 detcore units: 2883 + 14 = 2897,
     // measured with `cargo nextest list` at this head.
     // And the same TracerPid unit: 2898.
-    ("test.detcore_unit_on_host", 2898),
+    // And the same nine fatal_core::tests: 2907, listed.
+    ("test.detcore_unit_on_host", 2907),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5527,7 +5536,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two-run syscall-histogram test: 693, listed.
     // And the same random_determinism schedule-replay test: 694, listed.
     // Train 6 recount (measured on 21f770f6 base): 695.
-    ("test.hermit_integration_on_host", 698),
+    // And the same three fatal_core_capture tests: 701, listed.
+    ("test.hermit_integration_on_host", 701),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
