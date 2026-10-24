@@ -329,6 +329,7 @@ pub(crate) fn compare(
         status: status1,
         skid_overshoots: skid1,
         forwarded_syscalls: forwarded1,
+        guest_deadlock: guest_deadlock1,
     } = record1.outcome
     else {
         retain(&[&run1])?;
@@ -346,8 +347,11 @@ pub(crate) fn compare(
     // by every return below that does not verify the runs.
     let mut signal_reports = SignalTerminationReports::default();
     signal_reports.prepare("run 1", out1.status, &run1.directory.join(LOG));
-    if let Some(error) =
-        reject_first_run(verify_json, verify_allow, &out1, skid1, summary1.as_ref())
+    // A deadlocked run 1 is compared under every `--verify-allow`, as
+    // `run --verify` compares it: its guest exited with no status of its own.
+    if !guest_deadlock1
+        && let Some(error) =
+            reject_first_run(verify_json, verify_allow, &out1, skid1, summary1.as_ref())
     {
         retain(&[&run1])?;
         return Err(error);
@@ -394,6 +398,7 @@ pub(crate) fn compare(
         status: status2,
         skid_overshoots: skid2,
         forwarded_syscalls: forwarded2,
+        guest_deadlock: guest_deadlock2,
     } = record2.outcome
     else {
         retain(&[&run1, &run2])?;
@@ -490,6 +495,11 @@ pub(crate) fn compare(
         eprintln!(":: Backend: KVM (reverie-kvm KvmGuest<Detcore>)");
     }
     emit_compared_guest_output(true, &out1, &out2)?;
+    // Verified runs that both deadlocked end with that outcome, as
+    // `run --verify` ends.
+    if guest_deadlock1 && guest_deadlock2 {
+        return Err(Error::new(super::container::GuestDeadlock));
+    }
     Ok(outcome.guest_status)
 }
 
@@ -505,10 +515,14 @@ fn compare_recording_and_replay(
     retain: &dyn Fn(&[&VerifyRunDirectory]) -> Result<(), Error>,
 ) -> Result<ExitStatus, Error> {
     let completed = |run: &VerifyRunDirectory, label: &str| match &run.record.outcome {
-        VerifyRunOutcome::Completed { status, .. } => run.output(*status),
+        VerifyRunOutcome::Completed {
+            status,
+            guest_deadlock,
+            ..
+        } => run.output(*status).map(|output| (output, *guest_deadlock)),
         outcome => Err(Error::msg(format!("{label} did not complete: {outcome:?}"))),
     };
-    let recording = match completed(run1, "the recording") {
+    let (recording, recording_deadlocked) = match completed(run1, "the recording") {
         Ok(output) => output,
         Err(error) => {
             retain(&[run1])?;
@@ -536,7 +550,7 @@ fn compare_recording_and_replay(
             record2.comparison,
         );
     }
-    let replay = match completed(&run2, "the replay") {
+    let (replay, replay_deadlocked) = match completed(&run2, "the replay") {
         Ok(output) => output,
         Err(error) => {
             retain(&[run1, &run2])?;
@@ -568,7 +582,10 @@ fn compare_recording_and_replay(
         Ok(_) if read_verified(verify_json) => retain(&[run1])?,
         _ => retain(&[run1, &run2])?,
     }
-    status
+    // A matched pair returns the recording's status; when both runs
+    // deadlocked that status is the deadlock's, reported as the outcome, as
+    // `record start --verify` reports it.
+    super::record_start::deadlocked_pair_outcome(status?, recording_deadlocked, replay_deadlocked)
 }
 
 /// Whether the report at `verify_json` says the runs were verified; false
@@ -697,6 +714,7 @@ mod tests {
                 status: RecordedStatus::Exited { code: 0 },
                 skid_overshoots: 0,
                 forwarded_syscalls: None,
+                guest_deadlock: false,
             },
         };
         let json = serde_json::to_value(&record).unwrap();

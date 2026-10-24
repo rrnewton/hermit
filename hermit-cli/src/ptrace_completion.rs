@@ -35,6 +35,7 @@ use std::thread::ThreadId;
 use std::time::Duration;
 use std::time::Instant;
 
+use reverie_ptrace::CapturedPrefix;
 use reverie_ptrace::PtraceCallbackDiagnostic;
 use reverie_ptrace::PtraceRunFailure;
 use reverie_ptrace::PtraceTerminationHandle;
@@ -44,6 +45,7 @@ use serde::Serialize;
 
 use crate::Error;
 use crate::FailureKind;
+use crate::GuestDeadlocked;
 use crate::GuestTimedOut;
 
 const ATTEMPT_BUDGET: Duration = Duration::from_secs(2);
@@ -387,6 +389,30 @@ impl OriginalProcess {
     }
 }
 
+/// The result a completed guest-deadlock run reports in place of the guest
+/// status it never had: `HERMIT_GUEST_DEADLOCK_EXIT`, with the output it
+/// wrote before the deadlock. `None` when the run kept no output to report.
+pub(crate) trait GuestDeadlockResult: Sized {
+    fn guest_deadlock(captured: Option<&CapturedPrefix>) -> Option<Self>;
+}
+impl GuestDeadlockResult for reverie::ExitStatus {
+    fn guest_deadlock(_: Option<&CapturedPrefix>) -> Option<Self> {
+        Some(reverie::ExitStatus::Exited(
+            detcore_model::HERMIT_GUEST_DEADLOCK_EXIT,
+        ))
+    }
+}
+impl GuestDeadlockResult for reverie::process::Output {
+    fn guest_deadlock(captured: Option<&CapturedPrefix>) -> Option<Self> {
+        let captured = captured?;
+        Some(reverie::process::Output {
+            status: reverie::ExitStatus::Exited(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+            stdout: captured.stdout().to_vec(),
+            stderr: captured.stderr().to_vec(),
+        })
+    }
+}
+
 pub(crate) struct Control {
     termination: RefCell<Option<PtraceTerminationHandle>>,
     timeout: Option<(Instant, Duration)>,
@@ -420,6 +446,19 @@ impl Control {
         if self.expired.get() {
             self.publish_timeout();
         }
+    }
+    /// Let the scheduler hand this run's guest deadlock to the run instead of
+    /// exiting the process, while the returned guard lives: the unwind
+    /// publishes the termination that tears the parked guest down, as
+    /// `--timeout` does, and reports whether it became the run's cause. Only
+    /// a run with a termination handle installs it. The scheduler task runs
+    /// on this thread (the run's current-thread runtime), where the guard
+    /// installs it.
+    fn unwind_guest_deadlocks(&self) -> Option<detcore::GuestDeadlockUnwindGuard> {
+        let handle = self.termination.borrow().clone()?;
+        Some(detcore::GuestDeadlockUnwindGuard::install(Box::new(
+            move || handle.terminate(reverie::Error::Tool(Error::new(GuestDeadlocked::new(None)))),
+        )))
     }
     fn publish_timeout(&self) {
         if let (Some(handle), Some((_, limit))) = (self.termination.borrow().as_ref(), self.timeout)
@@ -711,21 +750,40 @@ fn drive<T: 'static>(entry: Rc<Entry>, recovery: bool) -> Result<T, Error> {
     }
 }
 
+/// Wait for the run. A guest deadlock the scheduler hands this run
+/// (`detcore::GuestDeadlockUnwindGuard`) is torn down like a `--timeout` and
+/// completes with `HERMIT_GUEST_DEADLOCK_EXIT` as its status;
+/// `GlobalState::guest_deadlocked` then says the status is that, not the
+/// guest's.
 pub(crate) async fn wait(
     tracer: reverie_ptrace::Tracer<detcore::GlobalState>,
     control: Rc<Control>,
 ) -> Result<(reverie::ExitStatus, detcore::GlobalState), Error> {
     control.register(tracer.termination_handle());
+    let _unwind = control.unwind_guest_deadlocks();
     consume(tracer.wait_completion().await, control).await
 }
+/// [`wait`], with the guest's output; a guest deadlock keeps the output the
+/// guest wrote before it.
 pub(crate) async fn wait_with_output(
     tracer: reverie_ptrace::Tracer<detcore::GlobalState>,
     control: Rc<Control>,
 ) -> Result<(reverie::process::Output, detcore::GlobalState), Error> {
     control.register(tracer.termination_handle());
+    let _unwind = control.unwind_guest_deadlocks();
     consume(tracer.wait_with_output_completion().await, control).await
 }
-async fn consume<R>(
+/// Whether a failed run is a clean guest-deadlock teardown: the unwind's cause
+/// is the `primary`, so no earlier failure of the run is hidden, and the
+/// teardown recorded no failure of its own (`secondaries`: a capture drain or
+/// cleanup error), so the captured output is the whole output. Any other
+/// teardown stays a failed run, which `classify_ptrace_primary` reports as
+/// Hermit's.
+pub(crate) fn is_clean_guest_deadlock(primary: &reverie::Error, secondaries: usize) -> bool {
+    secondaries == 0
+        && matches!(primary, reverie::Error::Tool(inner) if inner.is::<GuestDeadlocked>())
+}
+async fn consume<R: GuestDeadlockResult>(
     mut outcome: ToolRunOutcome<detcore::GlobalState, R>,
     control: Rc<Control>,
 ) -> Result<(R, detcore::GlobalState), Error> {
@@ -736,6 +794,16 @@ async fn consume<R>(
                 control.termination.borrow_mut().take();
                 return match completion.result {
                     Ok(result) => Ok((result, completion.global_state)),
+                    Err(failure)
+                        if is_clean_guest_deadlock(
+                            failure.primary(),
+                            failure.secondary().len(),
+                        ) && let Some(result) = R::guest_deadlock(failure.captured_prefix()) =>
+                    {
+                        // The guest's outcome, not a failed run: the caller
+                        // finishes the run (summary, recording) as for an exit.
+                        Ok((result, completion.global_state))
+                    }
                     Err(failure) => {
                         control.global_failure(&failure, callbacks.clone());
                         let cleanup = completion

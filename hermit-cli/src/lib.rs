@@ -226,9 +226,17 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //   0          success.
 //   1          HERMIT_VERIFICATION_DIVERGENCE_EXIT, matching `diff`; also a
 //              legal guest status. Read the verification JSON to distinguish.
-//   2 ..= 121  THE GUEST'S OWN STATUS, passed through untouched. (The range
-//              stops at 121 because 122 is reserved below; a guest may still
+//   2 ..= 120  THE GUEST'S OWN STATUS, passed through untouched. (The range
+//              stops at 120 because 121 is reserved below; a guest may still
 //              CHOOSE any value, see the caveat at the end.)
+//   121        HERMIT_GUEST_DEADLOCK_EXIT -- the GUEST DEADLOCKED: Detcore's
+//              scheduler found every remaining thread blocked with no possible
+//              wake and printed its "Deadlock detected" report. A guest
+//              outcome (natively the program hangs forever), not a hermit
+//              failure; the virtual-time analogue of 124. Prints
+//              `HERMIT_GUEST_DEADLOCK class=guest-deadlock`. The scheduler's
+//              own `HERMIT_DEADLOCK:` verdicts are NOT this: they stay 125.
+//              Defined in `detcore-model` for the reason 122 is.
 //   122        HERMIT_POLICY_REFUSAL_EXIT -- hermit REFUSED the run under a
 //              fail-closed policy. Hermit WORKED; the run was stopped on
 //              purpose and the reason was printed. Distinct from 125 because
@@ -5012,6 +5020,93 @@ impl std::fmt::Display for GuestTimedOut {
 
 impl std::error::Error for GuestTimedOut {}
 
+/// The guest deadlocked: Detcore's scheduler found every remaining thread
+/// blocked with no possible wake and printed its report.
+///
+/// The ptrace runtime publishes it as the termination that tears the parked
+/// guest down, as `--timeout` publishes [`GuestTimedOut`]. Once the run is
+/// finished (summary printed, recording metadata written) the run functions
+/// return it as their error, carrying the output the guest wrote before the
+/// deadlock when the run captured it; that output's status is
+/// `HERMIT_GUEST_DEADLOCK_EXIT`. A run whose teardown failed is not this but
+/// a ptrace failure, reported as Hermit's. The CLI reports it as the guest's
+/// outcome rather than a guest exit status or an internal failure. Backends
+/// whose scheduler cannot hand the deadlock back to the run exit the process
+/// with `HERMIT_GUEST_DEADLOCK_EXIT` instead.
+#[non_exhaustive]
+pub struct GuestDeadlocked {
+    /// The captured output, for a run that captured it.
+    pub output: Option<Output>,
+}
+
+impl GuestDeadlocked {
+    /// A finished deadlocked run, with its output when it captured one.
+    pub fn new(output: Option<Output>) -> Self {
+        Self { output }
+    }
+
+    /// Separate a finished run's guest deadlock from its other errors. A
+    /// deadlock beside a skid overshoot stays the overshoot's error, which
+    /// refuses the run.
+    pub fn split<T>(result: Result<T, Error>) -> Result<Result<T, GuestDeadlocked>, Error> {
+        match result {
+            Ok(value) => Ok(Ok(value)),
+            Err(error) if error.downcast_ref::<SkidOvershootError>().is_some() => Err(error),
+            Err(error) => error.downcast::<GuestDeadlocked>().map(Err),
+        }
+    }
+
+    /// The output of a deadlocked run that captured it.
+    pub fn into_output(self) -> Result<Output, Error> {
+        self.output
+            .ok_or_else(|| Error::msg("a deadlocked run that captured output returned none"))
+    }
+
+    /// A finished run's status, and whether its guest deadlocked, in which
+    /// case the status is `HERMIT_GUEST_DEADLOCK_EXIT`.
+    pub fn status_of(result: Result<ExitStatus, Error>) -> Result<(ExitStatus, bool), Error> {
+        Ok(match Self::split(result)? {
+            Ok(status) => (status, false),
+            Err(_) => (
+                ExitStatus::Exited(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+                true,
+            ),
+        })
+    }
+
+    /// A finished run's output, and whether its guest deadlocked, in which
+    /// case the output's status is `HERMIT_GUEST_DEADLOCK_EXIT`.
+    pub fn output_of(result: Result<Output, Error>) -> Result<(Output, bool), Error> {
+        Ok(match Self::split(result)? {
+            Ok(output) => (output, false),
+            Err(deadlock) => (deadlock.into_output()?, true),
+        })
+    }
+}
+
+impl std::fmt::Debug for GuestDeadlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("GuestDeadlocked");
+        if let Some(output) = &self.output {
+            debug
+                .field("stdout_bytes", &output.stdout.len())
+                .field("stderr_bytes", &output.stderr.len());
+        }
+        debug.finish()
+    }
+}
+
+impl std::fmt::Display for GuestDeadlocked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Guest deadlocked: every remaining thread is blocked with no possible wake"
+        )
+    }
+}
+
+impl std::error::Error for GuestDeadlocked {}
+
 /// Nonordinary backends retain their existing cooperative timeout behavior.
 /// There is no process-wide alarm in this library. A caller needing a bound on
 /// synchronous stalls must own external supervision; the CLI arms its own
@@ -5239,6 +5334,7 @@ async fn dispatch_backend(
     .await?;
     let stats_source = tracer.backend_stats();
     let (exit_status, global_state) = ptrace_completion::wait(tracer, control).await?;
+    let guest_deadlocked = global_state.guest_deadlocked();
     let dispatch_stats =
         backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
     global_state
@@ -5249,6 +5345,9 @@ async fn dispatch_backend(
                 "ptrace cleanup after observed guest status {exit_status:?}"
             ))
         })?; // Before it's dropped by this function.
+    if guest_deadlocked {
+        return Err(Error::new(GuestDeadlocked::new(None)));
+    }
     Ok(exit_status)
 }
 
@@ -5590,6 +5689,7 @@ async fn dispatch_output_backend(
     .await?;
     let stats_source = tracer.backend_stats();
     let (output, global_state) = ptrace_completion::wait_with_output(tracer, control).await?;
+    let guest_deadlocked = global_state.guest_deadlocked();
     let dispatch_stats =
         backend_stats::report_if_collected(backend, stats_request, stats_source.as_ref());
     global_state
@@ -5601,6 +5701,9 @@ async fn dispatch_output_backend(
                 output.status
             ))
         })?;
+    if guest_deadlocked {
+        return Err(Error::new(GuestDeadlocked::new(Some(output))));
+    }
     Ok(output)
 }
 

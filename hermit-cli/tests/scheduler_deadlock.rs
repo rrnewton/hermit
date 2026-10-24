@@ -31,7 +31,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use std::time::Instant;
 
-use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
+use detcore_model::HERMIT_GUEST_DEADLOCK_EXIT;
 
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(10);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -1042,8 +1042,8 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
 
     assert_eq!(
         status.code(),
-        Some(HERMIT_INTERNAL_FAILURE_EXIT),
-        "terminal scheduler deadlock must exit exactly 1, not timeout/signal/success: {status}"
+        Some(HERMIT_GUEST_DEADLOCK_EXIT),
+        "terminal scheduler deadlock must exit the guest-deadlock status, not timeout/signal/success: {status}"
     );
     assert!(
         started.elapsed() < TOTAL_TIMEOUT,
@@ -1082,6 +1082,12 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
     assert!(
         stderr_text
             .lines()
+            .any(|line| line == "HERMIT_GUEST_DEADLOCK class=guest-deadlock"),
+        "missing the guest-deadlock class line\nstderr:\n{stderr_text}"
+    );
+    assert!(
+        stderr_text
+            .lines()
             .any(|line| line == "  run queue: 0 runnable"),
         "missing empty run-queue evidence\nstderr:\n{stderr_text}"
     );
@@ -1099,7 +1105,7 @@ fn terminal_scheduler_deadlock_reports_and_tears_down_tracees() {
     owned.disarm();
 
     eprintln!(
-        "scheduler deadlock rc=1 release_to_exit={:.3}s total={:.3}s; tracee roots 0/{root_process_count}; nested process descendants 0/{descendant_process_count}; all tracee processes 0/{process_count}; tracee tasks 0/{task_count}; 0 adopted child process roots at the post-exit observation",
+        "scheduler deadlock rc={HERMIT_GUEST_DEADLOCK_EXIT} release_to_exit={:.3}s total={:.3}s; tracee roots 0/{root_process_count}; nested process descendants 0/{descendant_process_count}; all tracee processes 0/{process_count}; tracee tasks 0/{task_count}; 0 adopted child process roots at the post-exit observation",
         release_elapsed.as_secs_f64(),
         started.elapsed().as_secs_f64()
     );
