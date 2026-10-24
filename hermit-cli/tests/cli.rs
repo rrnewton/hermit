@@ -172,6 +172,7 @@ static SIGCHLD_BOOKKEEPING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_POSTHOOK_FUTEX_INTERRUPT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_PIPE_READ_HELD_WRITER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static POLL_ZERO_TIMEOUT_RESTART_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_PARENT_KILLED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_KILL_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_EXEC_RESUME_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -33382,6 +33383,61 @@ fn run_kvm_waitid_parked_foreign_waiters_contend_for_one_child() {
 #[test]
 fn run_kvm_wait4_parked_foreign_waiters_contend_for_one_child() {
     kvm_waitid_copyout::run_parked_foreign_waiters("wait4");
+}
+
+/// A signal pending while a `poll` runs ends it with `ERESTART_RESTARTBLOCK`
+/// even with a zero timeout (`do_poll`, `fs/select.c`, checks for one before it
+/// honours the timeout), and with no handler to run Linux restarts it with the
+/// same zero timeout (`do_restart_poll`). Under ptrace a default-ignored
+/// `SIGCHLD` is still queued, so in the guest (`tests/c/poll_zero_timeout_restart.c`)
+/// the 200 children that exit while their parent polls an empty pipe with a
+/// zero timeout end some of those polls in the kernel. Detcore passed the code
+/// on, the kernel restarted the poll through `restart_syscall`, and Detcore
+/// refused that as an unsupported syscall (exit 122) in every mode below. Now
+/// each run, record and replay prints native's line.
+#[test]
+fn a_zero_timeout_poll_ended_by_a_signal_restarts_as_on_linux() {
+    let _lock = hermit_run_guard();
+    let guest = compiled_c_guest(
+        &POLL_ZERO_TIMEOUT_RESTART_GUEST,
+        "poll_zero_timeout_restart",
+    );
+    let expected = "2000 zero-timeout polls: 0 ready, 0 failed, 200 children\n";
+    assert_eq!(native_stdout(guest), expected);
+    let guest = guest.to_str().unwrap();
+    // As in run_strict_flag_is_accepted_and_runs, the strict leg disables the
+    // PMU timer and CPUID faulting so it runs where those are unavailable; the
+    // signal here is a child's SIGCHLD, not the timer.
+    let strict = [
+        "--strict",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+    ];
+    for mode in [&strict[..], &[], &["--no-sequentialize-threads"]] {
+        let mut args = vec!["run", "--timeout", "120", "--base-env=minimal"];
+        args.extend_from_slice(mode);
+        args.extend(["--", guest]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+    }
+    let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the recording data dir");
+    let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+    let args = [
+        "record",
+        "start",
+        "--verify",
+        "--verify-strict",
+        "--record-timeout",
+        "120",
+        &data_dir_arg,
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), expected, "{args:?}");
 }
 
 /// A `ppoll` with a timeout returns on time while another thread spins without
