@@ -10,34 +10,46 @@
 
 use std::cmp;
 use std::fs::File;
+use std::num::NonZeroU64;
 use std::path::Path;
 use std::path::PathBuf;
 
+use anyhow::Context as _;
 use anyhow::bail;
 use colored::Colorize;
 use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
+use detcore::types::DetTid;
 use detcore::types::SchedEvent;
 use detcore::util::truncated;
+use detcore_model::config::MaybeTimeslice;
 use hermit::Error;
 use rand::RngExt as _;
 use rand::SeedableRng;
 use rand_pcg::Pcg64Mcg;
+use regex::Regex;
 use reverie::PrettyBacktrace;
 use reverie::process::ExitStatus;
 use reverie::process::Output;
 
 use crate::analyze::consts::*;
 use crate::analyze::rundata::RunData;
+use crate::analyze::rundata::Stop;
+use crate::analyze::rundata::TrialEnd;
+use crate::analyze::rundata::guest_reached_a_refusal;
 use crate::analyze::types::AnalyzeOpts;
+use crate::analyze::types::ContinuationTimeslice;
 use crate::analyze::types::ExitStatusConstraint;
 use crate::analyze::types::Report;
 use crate::analyze::types::ReportCriticalEvent;
+use crate::analyze::types::TrialTimeout;
+use crate::container::RunTimeoutMarker;
 use crate::global_opts::GlobalOpts;
 use crate::logdiff::LogDiffCLIOpts;
 use crate::run::RunOpts;
 use crate::schedule_search::Config;
 use crate::schedule_search::CriticalSchedule;
+use crate::schedule_search::NoSingleSwap;
 use crate::schedule_search::TrialOutcome;
 use crate::schedule_search::search_for_critical_schedule;
 
@@ -52,6 +64,616 @@ fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
 
 fn yellow_msg(msg: &str) {
     eprintln!(":: {}", msg.yellow().bold());
+}
+
+/// The baseline run (from `.0`) did not finish: a wall-clock bound ended it,
+/// or Hermit refused it, so it recorded no schedule to bisect against.
+#[derive(Debug)]
+pub struct BaselineUnfinished(&'static str);
+
+impl std::fmt::Display for BaselineUnfinished {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the baseline run ({}) did not finish, so it recorded no schedule to bisect against",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for BaselineUnfinished {}
+
+/// `--minimize`'s knock-outs removed every intervention and the replay still
+/// meets the target, so there is no baseline schedule to bisect against.
+#[derive(Debug)]
+pub struct NothingToKnockOut;
+
+impl std::fmt::Display for NothingToKnockOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "--minimize knocked out every intervention and the run still meets the target, so \
+             there is no baseline schedule to bisect against"
+        )
+    }
+}
+
+impl std::error::Error for NothingToKnockOut {}
+
+/// `--minimize`'s baseline: knock interventions out of `record`, the latest
+/// first, until `replay(try, knocked_out)` misses the target and returns the
+/// run that did; [`NothingToKnockOut`] when none is left. Each knock-out
+/// starts from the record the previous one replayed, not from what that run
+/// recorded: a run's recording also holds the priority changes chaos makes
+/// after the replayed record ends, which every run makes again, so knocking
+/// those out never ends.
+fn knock_out_until_missed<T>(
+    mut record: PreemptionRecord,
+    mut replay: impl FnMut(usize, &PreemptionRecord) -> anyhow::Result<Option<T>>,
+) -> anyhow::Result<T> {
+    for attempt in 1.. {
+        let Some(knocked_out) = knock_out_latest(&record) else {
+            break;
+        };
+        if let Some(missed) = replay(attempt, &knocked_out)? {
+            return Ok(missed);
+        }
+        record = knocked_out;
+    }
+    Err(NothingToKnockOut.into())
+}
+
+/// `record` with its latest intervention knocked out, for `--minimize`'s
+/// baseline; `None` when it has none left. Threads at the default priority
+/// with no change are dropped first: replay gives a thread the record does
+/// not name that same priority, and a knock-out that removes a whole thread
+/// (once no priority change is left) must not pick one of them, which would
+/// change nothing.
+fn knock_out_latest(record: &PreemptionRecord) -> Option<PreemptionRecord> {
+    let pruned = record.without_default_threads();
+    let knocked_out = pruned.with_latest_preempt_removed();
+    (knocked_out != pruned).then_some(knocked_out)
+}
+
+/// The result of `--prefix-search`: replaying the first `decision` events of
+/// `schedule` and then scheduling without chaos, with timeslices of
+/// `continuation`, misses the target, while replaying event `decision` too
+/// meets it.
+pub struct PrefixDecision {
+    pub schedule: Vec<SchedEvent>,
+    pub decision: usize,
+    pub continuation: MaybeTimeslice,
+    /// [`refused_trials_warning`], if any trial was refused.
+    pub refused: Option<String>,
+}
+
+/// What a search with `refused` trials Hermit refused at run time, all
+/// counted as not reaching the target, should say about its result.
+fn refused_trials_warning(refused: usize) -> Option<String> {
+    (refused > 0).then(|| {
+        format!(
+            "{refused} trial(s) were refused by Hermit (exit 122) and counted as not reaching \
+             the target, so the deciding event may separate the target from a path Hermit does \
+             not support rather than from a run that misses the target."
+        )
+    })
+}
+
+/// The coarsest timeslice `--continuation-timeslice=auto` tries, in virtual
+/// nanoseconds: `hermit run`'s default `--max-timeslice` (200 ms).
+pub const COARSEST_CONTINUATION_TIMESLICE: NonZeroU64 = NonZeroU64::new(200_000_000).unwrap();
+
+/// The continuation timeslices `--continuation-timeslice=auto` tries, in
+/// order, for a run whose own maximum is `run`: that, then
+/// [`COARSEST_CONTINUATION_TIMESLICE`] if it is coarser. Never a shorter one:
+/// a trial's `--max-timeslice` also ends the replayed prefix's slices that
+/// its schedule does not end, so a shorter one would change the prefix. A run
+/// without PMU timeslices (`None`) continues as it is.
+fn continuation_candidates(run: MaybeTimeslice) -> Vec<MaybeTimeslice> {
+    let Some(run) = run else {
+        return vec![None];
+    };
+    let mut candidates = vec![Some(run), Some(run.max(COARSEST_CONTINUATION_TIMESLICE))];
+    candidates.dedup();
+    candidates
+}
+
+/// What the endpoint trials of a prefix search showed for one continuation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Continuation {
+    /// Replaying none of the schedule misses the target, and replaying all
+    /// of it meets it: a search can find the event in between that decides.
+    Usable,
+    /// The scheduler alone, replaying none of the schedule, meets the target.
+    MeetsTargetAlone,
+    /// Replaying the whole schedule finished and missed the target.
+    ReplayMisses,
+    /// Replaying the whole schedule did not finish (a bound or a refusal
+    /// stopped it).
+    ReplayUnfinished,
+}
+
+/// Check the two endpoint trials of a prefix search over `len` events.
+fn check_continuation(
+    len: usize,
+    mut trial: impl FnMut(usize) -> anyhow::Result<TrialEnd>,
+) -> anyhow::Result<Continuation> {
+    if trial(0)?.reached_target() {
+        return Ok(Continuation::MeetsTargetAlone);
+    }
+    Ok(match trial(len)? {
+        TrialEnd::Met => Continuation::Usable,
+        TrialEnd::Missed => Continuation::ReplayMisses,
+        TrialEnd::Unfinished(_) => Continuation::ReplayUnfinished,
+    })
+}
+
+/// Pick the first of `candidates` (continuation timeslices) whose endpoint
+/// trials allow a prefix search over `len` events, each candidate's trials
+/// run by `trial(prefix, timeslice)`. When none does, the error says what
+/// each one showed and what to do instead.
+fn choose_continuation(
+    candidates: &[MaybeTimeslice],
+    len: usize,
+    mut trial: impl FnMut(usize, MaybeTimeslice) -> anyhow::Result<TrialEnd>,
+) -> anyhow::Result<MaybeTimeslice> {
+    let mut outcomes = Vec::new();
+    for &timeslice in candidates {
+        match check_continuation(len, |prefix| trial(prefix, timeslice))? {
+            Continuation::Usable => return Ok(timeslice),
+            outcome => {
+                eprintln!(
+                    ":: Continuing without chaos {}, {}",
+                    describe_continuation(timeslice),
+                    describe_outcome(outcome)
+                );
+                outcomes.push((timeslice, outcome));
+            }
+        }
+    }
+    let alone: Vec<String> = outcomes
+        .iter()
+        .filter(|(_, outcome)| *outcome == Continuation::MeetsTargetAlone)
+        .map(|(timeslice, _)| describe_continuation(*timeslice))
+        .collect();
+    if alone.len() == outcomes.len() {
+        bail!(
+            "no event of the target schedule decides the outcome: without chaos, the scheduler \
+             alone already meets the target criteria {}. The outcome does not depend on a chaos \
+             decision, so debug that run directly: the reproducer of the first trial \
+             (prefix_round_001.repro in the workspace) runs it. To bisect against a run that \
+             misses the target instead, pass --continuation-timeslice with a timeslice at which \
+             the scheduler alone misses it, or use the default search with a passing \
+             --run2-seed.",
+            alone.join(" and ")
+        );
+    }
+    let remedy = if outcomes
+        .iter()
+        .any(|(_, outcome)| *outcome == Continuation::ReplayUnfinished)
+    {
+        "A replay that did not finish was ended by a bound (raise --trial-timeout) or refused \
+         by Hermit (its reason is in its log)."
+    } else {
+        "Schedule replay does not reproduce this run where replaying the whole target schedule \
+         misses the target; check that the target run replays (--selfcheck)."
+    };
+    bail!(
+        "no continuation allows a prefix search: {}. {remedy} The default search with a \
+         passing --run2-seed needs no continuation.",
+        outcomes
+            .iter()
+            .map(|(timeslice, outcome)| format!(
+                "{} {}",
+                describe_continuation(*timeslice),
+                describe_outcome(*outcome)
+            ))
+            .collect::<Vec<_>>()
+            .join("; ")
+    )
+}
+
+/// "at a 200000000 ns timeslice", or "without PMU timeslices".
+fn describe_continuation(timeslice: MaybeTimeslice) -> String {
+    match timeslice {
+        Some(nanos) => format!("at a {nanos} ns timeslice"),
+        None => "without PMU timeslices".to_owned(),
+    }
+}
+
+fn describe_outcome(outcome: Continuation) -> &'static str {
+    match outcome {
+        Continuation::Usable => "a prefix search can run",
+        Continuation::MeetsTargetAlone => {
+            "the scheduler alone, replaying none of the target schedule, meets the target"
+        }
+        Continuation::ReplayMisses => "replaying the whole target schedule misses the target",
+        Continuation::ReplayUnfinished => {
+            "replaying the whole target schedule did not finish (a bound or a refusal stopped it)"
+        }
+    }
+}
+
+/// The binary search of `--prefix-search` over a schedule of `len` events
+/// whose endpoints [`check_continuation`] found usable: returns `k` such that
+/// the prefix of `k` events misses the target and the prefix of `k + 1` meets
+/// it. Uses about log2(len) trials.
+fn search_prefix_boundary(
+    len: usize,
+    mut meets_target: impl FnMut(usize) -> anyhow::Result<bool>,
+) -> anyhow::Result<usize> {
+    let (mut passing, mut failing) = (0, len);
+    while failing - passing > 1 {
+        let mid = passing + (failing - passing) / 2;
+        if meets_target(mid)? {
+            failing = mid;
+        } else {
+            passing = mid;
+        }
+    }
+    Ok(passing)
+}
+
+/// Why the critical pair a search settled on may not be a race, if there is a reason.
+///
+/// Swapping two events of one thread is no interleaving any execution can take, so
+/// the outcome change at such a pair comes from the replay falling off the schedule.
+/// Trials that did not finish (a bound or a refusal ended them) were counted as
+/// not reaching the target, which can steer the search onto exactly such a pair.
+fn critical_pair_caveat(crit: &CriticalSchedule, unfinished: usize) -> Option<String> {
+    let index = crit.critical_event_index;
+    let schedule = &crit.failing_schedule;
+    let same_thread =
+        index > 0 && index < schedule.len() && schedule[index - 1].dettid == schedule[index].dettid;
+    if !same_thread {
+        return None;
+    }
+    Some(format!(
+        "the critical events #{} and #{index} both belong to thread {}, so swapping them is \
+         not an interleaving and this pair is not a race. {unfinished} trial(s) did not finish \
+         (a bound or a refusal ended them) and were counted as the baseline condition.",
+        index - 1,
+        schedule[index].dettid,
+    ))
+}
+
+/// How long one thread runs from an event on, in one schedule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Slice {
+    /// Its events, from the first one on.
+    events: usize,
+    /// The retired conditional branches among them.
+    branches: u64,
+    /// The event at which another thread runs next, and that thread; `None`
+    /// if none does before the schedule ends.
+    next: Option<(usize, DetTid)>,
+}
+
+/// The run of `thread`'s events in `schedule` from event `from` on.
+fn slice_from(schedule: &[SchedEvent], from: usize, thread: DetTid) -> Slice {
+    let mut slice = Slice {
+        events: 0,
+        branches: 0,
+        next: None,
+    };
+    for (index, event) in schedule.iter().enumerate().skip(from) {
+        if event.dettid != thread {
+            slice.next = Some((index, event.dettid));
+            break;
+        }
+        slice.events += 1;
+        if event.op == detcore_model::schedule::Op::Branch {
+            slice.branches += u64::from(event.count);
+        }
+    }
+    slice
+}
+
+/// Whether two stacks have the same frames, whichever threads they belong
+/// to.
+fn same_frames(first: &PrettyBacktrace, second: &PrettyBacktrace) -> bool {
+    first.iter().eq(second.iter())
+}
+
+/// The events at which the deciding thread's slice ends in the continuation
+/// with the deciding event and in the one without it, when the stacks of the
+/// threads that run next (`next_stacks`) tell nothing apart: both captured,
+/// with the same frames (often threads just started, at their first
+/// instruction). `None` otherwise.
+fn slice_end_events(
+    with: &Slice,
+    without: &Slice,
+    next_stacks: [Option<&PrettyBacktrace>; 2],
+) -> Option<[usize; 2]> {
+    match (next_stacks, with.next, without.next) {
+        ([Some(first), Some(second)], Some((with_next, _)), Some((without_next, _)))
+            if same_frames(first, second) =>
+        {
+            Some([with_next - 1, without_next - 1])
+        }
+        _ => None,
+    }
+}
+
+/// The header of a `--prefix-search` report whose deciding event `event`,
+/// #`decision`, is a timing decision: `with` and `without` are how long its
+/// thread then runs with and without that event replayed. `slice_ends`, the
+/// last events of those slices, is set when stack1 and stack2 show where the
+/// deciding thread stops instead of the thread that runs next.
+fn timing_decision_header(
+    decision: usize,
+    event: &SchedEvent,
+    (with, without): (&Slice, &Slice),
+    criteria: &str,
+    continuation: MaybeTimeslice,
+    slice_ends: Option<[usize; 2]>,
+) -> String {
+    let thread = event.dettid;
+    let then = |slice: &Slice, stack: &str| match slice.next {
+        Some((index, next)) if slice_ends.is_none() => {
+            format!("then thread {next} runs at event #{index} ({stack})")
+        }
+        Some((index, next)) => format!("then thread {next} runs at event #{index}"),
+        None => "and no other thread runs after it".to_owned(),
+    };
+    let mut header = format!(
+        "The scheduling decision at event #{decision} of the target schedule decides the \
+         outcome, and it is a timing decision: with or without it, the scheduler runs thread \
+         {thread} there, so what decides is how long thread {thread} runs, not which thread \
+         runs.\nWith event #{decision} replayed ({event}), thread {thread} runs {} events ({} \
+         retired conditional branches) from event #{decision} on, {}, and the run meets the \
+         target criteria ({criteria}).\nWithout it, scheduling without chaos {}, thread {thread} \
+         runs {} events ({} retired conditional branches), {}, and the run does not.\n",
+        with.events,
+        with.branches,
+        then(with, "stack1"),
+        describe_continuation(continuation),
+        without.events,
+        without.branches,
+        then(without, "stack2"),
+    );
+    if let Some([with_end, without_end]) = slice_ends {
+        header.push_str(&format!(
+            "The thread that runs next has the same stack in both continuations (often a \
+             thread just started), so stack1 and stack2 show where thread {thread} is when its \
+             slice ends instead: at event #{with_end} with the event, at event #{without_end} \
+             without it.\n"
+        ));
+    }
+    header.push_str(&format!(
+        "Thread {thread}'s own stack at event #{decision} is printed first (deciding_event in \
+         the report file).\nThe outcome depends on what thread {thread} does before the other \
+         thread runs: add synchronization that makes its timing irrelevant, or that enforces \
+         the passing order.\n"
+    ));
+    header
+}
+
+/// What a stack-trace replay of a critical pair gave.
+struct StackReplay {
+    /// It finished (no bound or refusal stopped it).
+    finished: bool,
+    /// It finished and met the target criteria.
+    met_target: bool,
+    /// The stacks at its schedule's events `index - 1` and `index`.
+    stacks: [Option<PrettyBacktrace>; 2],
+    /// Where it left its schedule before passing event `index`, if it did.
+    left_schedule: Option<Departure>,
+    /// The threads it ran at events `index - 1` and `index`, if it
+    /// recorded them.
+    ran: [Option<DetTid>; 2],
+}
+
+impl StackReplay {
+    /// Whether the replay followed its schedule through event `event`, so
+    /// that a stack it took there is that event's.
+    fn followed_through(&self, event: usize) -> bool {
+        match &self.left_schedule {
+            None => true,
+            Some(Departure::OtherEvent { index, .. }) => *index > event,
+            Some(Departure::Ended { events }) => *events > event,
+            Some(Departure::Unknown) => false,
+        }
+    }
+}
+
+/// Where a replay left the schedule it replayed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Departure {
+    /// At this event it ran another event than the schedule's: another
+    /// thread, operation or instruction pointer, compared as the scheduler
+    /// does when it takes a stack (the count and time aside).
+    OtherEvent {
+        index: usize,
+        expected: SchedEvent,
+        ran: SchedEvent,
+    },
+    /// It ended after this many events.
+    Ended { events: usize },
+    /// It recorded no schedule (a bound or a refusal stopped it).
+    Unknown,
+}
+
+impl std::fmt::Display for Departure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Departure::OtherEvent {
+                index,
+                expected,
+                ran,
+            } => write!(
+                f,
+                "ran {ran} at event #{index}, where the schedule has {expected}"
+            ),
+            Departure::Ended { events } => write!(f, "ended after {events} events"),
+            Departure::Unknown => write!(
+                f,
+                "did not finish (a bound or a refusal stopped it), so it recorded no schedule"
+            ),
+        }
+    }
+}
+
+/// Whether `ran` is the event `expected`, as the scheduler compares them when
+/// it takes a stack: the count and the time aside.
+fn same_event(expected: &SchedEvent, ran: &SchedEvent) -> bool {
+    expected.dettid == ran.dettid
+        && expected.op == ran.op
+        && expected.start_rip == ran.start_rip
+        && expected.end_rip == ran.end_rip
+}
+
+/// The first of the first `until` events of `requested` at which `realized`
+/// ran another event, or ended.
+fn departure(requested: &[SchedEvent], realized: &[SchedEvent], until: usize) -> Option<Departure> {
+    let until = until.min(requested.len());
+    for (index, expected) in requested[..until].iter().enumerate() {
+        match realized.get(index) {
+            None => return Some(Departure::Ended { events: index }),
+            Some(ran) if !same_event(expected, ran) => {
+                return Some(Departure::OtherEvent {
+                    index,
+                    expected: expected.clone(),
+                    ran: ran.clone(),
+                });
+            }
+            Some(_) => {}
+        }
+    }
+    None
+}
+
+/// The thread a stack was taken on, as the guest numbers it (which is the
+/// scheduler's numbering under Hermit's thread-id virtualization).
+fn stack_thread(stack: &PrettyBacktrace) -> Option<DetTid> {
+    let thread = serde_json::to_value(stack)
+        .ok()?
+        .get("thread_id")?
+        .as_i64()?;
+    Some(DetTid::from_raw(i32::try_from(thread).ok()?))
+}
+
+/// The stacks of the two racing operations, in the passing schedule's order,
+/// each with the replay it came from; `threads` are the threads of the
+/// passing schedule's events `index - 1` and `index`. Those events are the
+/// failing schedule's `index` and `index - 1`, so each stack can come from
+/// either replay: preferably one that followed its schedule through that
+/// event, else one taken on that operation's thread (the replay ran that
+/// thread there, or the stack says so), said to be possibly another
+/// occurrence of the operation. A stack taken on another thread is left
+/// out: a replay that left its schedule can take one there.
+fn merge_stacks(
+    baseline: &StackReplay,
+    target: &StackReplay,
+    index: usize,
+    threads: [DetTid; 2],
+) -> [Option<(PrettyBacktrace, String)>; 2] {
+    [0, 1].map(|slot| {
+        let other = 1 - slot;
+        let candidates = [
+            ("the baseline replay", baseline, slot, index - 1 + slot),
+            ("the target replay", target, other, index - 1 + other),
+        ];
+        candidates
+            .iter()
+            .find(|(_, replay, stack, event)| {
+                replay.stacks[*stack].is_some() && replay.followed_through(*event)
+            })
+            .map(|(name, replay, stack, _)| {
+                (replay.stacks[*stack].clone().unwrap(), (*name).to_owned())
+            })
+            .or_else(|| {
+                candidates.iter().find_map(|(name, replay, stack, _)| {
+                    let taken = replay.stacks[*stack].as_ref()?;
+                    let on_its_thread = replay.ran[*stack] == Some(threads[slot])
+                        || stack_thread(taken) == Some(threads[slot]);
+                    on_its_thread.then_some(())?;
+                    replay.stacks[*stack].clone().map(|stack| {
+                        (
+                            stack,
+                            format!(
+                                "{name}, which left its schedule before this operation, so the \
+                                 stack may be another occurrence of it"
+                            ),
+                        )
+                    })
+                })
+            })
+    })
+}
+
+/// Why neither replay captured `which` (the stack at the passing schedule's
+/// event `event`).
+fn missing_stack_reason(
+    which: &str,
+    (event, target_event): (usize, usize),
+    baseline: &StackReplay,
+    target: &StackReplay,
+) -> String {
+    let describe = |replay: &StackReplay, event: usize| match &replay.left_schedule {
+        Some(departure) if !replay.followed_through(event) => {
+            format!("left its schedule: it {departure}")
+        }
+        _ => format!(
+            "followed its schedule through event #{event}, but left no readable stack there"
+        ),
+    };
+    let unfinished = [baseline, target]
+        .iter()
+        .any(|replay| replay.left_schedule == Some(Departure::Unknown));
+    format!(
+        "{which} is not available: no stack-trace replay captured that operation (event #{event} \
+         of the passing schedule). The baseline replay {}; the target replay {}. {}",
+        describe(baseline, event),
+        describe(target, target_event),
+        if unfinished {
+            "A replay that did not finish was stopped by a bound (raise --trial-timeout) or \
+             refused by Hermit (its reason is in its log)."
+        } else {
+            "Schedule replay did not reproduce these runs; check that they replay (--selfcheck) \
+             on a host with an exact branch counter (hermit host-capabilities)."
+        },
+    )
+}
+
+/// The line of `text` that holds `pattern`'s first match.
+fn matched_line<'a>(pattern: &Regex, text: &'a str) -> Option<&'a str> {
+    let found = pattern.find(text)?;
+    let start = text[..found.start()].rfind('\n').map_or(0, |at| at + 1);
+    let end = text[found.start()..]
+        .find('\n')
+        .map_or(text.len(), |at| found.start() + at);
+    Some(&text[start..end])
+}
+
+/// Whether the replay at workspace root `replay` met the criteria with
+/// another failure than the target run at root `target`: whether the line
+/// each output pattern (`patterns`, by stream) matches differs between them.
+/// Output the patterns do not match may differ with the interleaving and is
+/// not compared.
+fn changed_output(
+    target: &Path,
+    replay: &Path,
+    patterns: [(&str, Option<&Regex>); 2],
+) -> Option<String> {
+    patterns.into_iter().find_map(|(stream, pattern)| {
+        let pattern = pattern?;
+        let read = |root: &Path| {
+            std::fs::read(root.with_extension(stream))
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        };
+        let (want, got) = (read(target)?, read(replay)?);
+        let (want, got) = (matched_line(pattern, &want)?, matched_line(pattern, &got)?);
+        (want != got).then(|| {
+            format!(
+                "the final target schedule meets the target criteria with another failure than \
+                 the target run: the {stream} line that --target-{stream} matches is {got:?}, \
+                 where the target run's is {want:?}. The critical pair may belong to that other \
+                 failure; narrow --target-{stream} to tell them apart."
+            )
+        })
+    })
 }
 
 impl AnalyzeOpts {
@@ -76,8 +698,7 @@ impl AnalyzeOpts {
         if self.imprecise_search {
             rundat.runopts.det_opts.det_config.imprecise_timers = true; // TODO: enable this by default when bugs are fixed.
         }
-        rundat.launch()?;
-        if rundat.is_a_match() {
+        if rundat.launch_trial()?.reached_target() {
             eprintln!(
                 ":: {}:\n    {}",
                 "Target run established by --search. Reproducer"
@@ -108,34 +729,530 @@ impl AnalyzeOpts {
         if let Some(path) = record_sched_path {
             run = run.with_schedule_recording_to(path.to_path_buf());
         }
-        run.launch()?;
-        let is_match = run.is_a_match();
+        let is_match = run.launch_trial()?.reached_target();
         Ok((is_match, run.into_runopts()))
     }
 
-    /// Runs the program with the specified schedule.
-    /// Returns whether the final run met the criteria as expected.
-    /// Also returns the paths to stack traces of the two critical events.
-    fn launch_for_stacktraces(
+    /// Replay `schedule` (written at `schedule_path`) for the stacks of the
+    /// critical pair, its events `index - 1` and `index`, recording the
+    /// schedule the replay realized. A replay that a bound stops or Hermit
+    /// refuses still returns what it captured.
+    fn replay_for_stacks(
         &self,
         runname: &str,
         schedule_path: &Path,
-        critical_event_index: u64,
-    ) -> anyhow::Result<(RunData, PathBuf, PathBuf)> {
+        schedule: &[SchedEvent],
+        index: usize,
+    ) -> anyhow::Result<StackReplay> {
         let mut run = RunData::new_baseline(self, runname.to_string())?
-            .with_schedule_replay_from(schedule_path.to_path_buf());
-
+            .with_schedule_replay_from(schedule_path.to_path_buf())
+            .with_schedule_recording();
         let root_path = run.root_path();
-        let stack1_path = root_path.with_extension("stack1");
-        let stack2_path = root_path.with_extension("stack2");
+        let realized = run.sched_path_out().to_path_buf();
+        let paths = [
+            root_path.with_extension("stack1"),
+            root_path.with_extension("stack2"),
+        ];
+        run.runopts.det_opts.det_config.stacktrace_event = vec![
+            (index as u64 - 1, Some(paths[0].clone())),
+            (index as u64, Some(paths[1].clone())),
+        ];
+        let finished = match run.launch() {
+            Ok(()) => true,
+            Err(error)
+                if error.downcast_ref::<RunTimeoutMarker>().is_some()
+                    || guest_reached_a_refusal(&error) =>
+            {
+                eprintln!(
+                    ":: {} the stack-trace replay {runname} did not finish ({error:#}); \
+                     using the stacks it recorded",
+                    "WARNING:".yellow().bold(),
+                );
+                false
+            }
+            Err(error) => return Err(error),
+        };
+        eprintln!(
+            "\n:: {}\n{}",
+            if finished {
+                "Stack-trace replay finished.  Repro command:"
+            } else {
+                "Stack-trace replay stopped.  Repro command:"
+            }
+            .green()
+            .bold(),
+            run.to_repro()
+        );
+        let mut stacks = [None, None];
+        for (stack, path) in stacks.iter_mut().zip(&paths) {
+            let Ok(file) = File::open(path) else {
+                continue;
+            };
+            match serde_json::from_reader(file) {
+                Ok(parsed) => *stack = Some(parsed),
+                Err(error) => eprintln!(
+                    ":: {} cannot read the stack trace in {} ({error}); it is left out",
+                    "WARNING:".yellow().bold(),
+                    path.display()
+                ),
+            }
+        }
+        let (left_schedule, ran) = if realized.exists() {
+            let realized = PreemptionReader::new(&realized).load_all().into_global();
+            let ran_at = |event: usize| realized.get(event).map(|event| event.dettid);
+            (
+                departure(schedule, &realized, index + 1),
+                [ran_at(index - 1), ran_at(index)],
+            )
+        } else {
+            (Some(Departure::Unknown), [None, None])
+        };
+        Ok(StackReplay {
+            finished,
+            met_target: finished && run.is_a_match(),
+            stacks,
+            left_schedule,
+            ran,
+        })
+    }
 
-        run.runopts.det_opts.det_config.stacktrace_event = [
-            (critical_event_index - 1, Some(stack1_path.clone())),
-            (critical_event_index, Some(stack2_path.clone())),
-        ]
-        .to_vec();
-        run.launch()?;
-        Ok((run, stack1_path, stack2_path))
+    /// One `--prefix-search` trial: replay the first `len` events of `target`,
+    /// then let the scheduler go on without chaos, with timeslices of
+    /// `continuation`.
+    fn prefix_trial(
+        &self,
+        runname: &str,
+        target: &[SchedEvent],
+        len: usize,
+        continuation: MaybeTimeslice,
+    ) -> anyhow::Result<RunData> {
+        let mut run = RunData::new_baseline(self, runname.to_string())?;
+        run.runopts.det_opts.det_config.chaos = false;
+        run.runopts.det_opts.det_config.max_timeslice = continuation;
+        let path = run.sched_path_in().to_path_buf();
+        self.write_trial_schedule(target[..len].to_vec(), &path)?;
+        Ok(run.with_schedule_replay_from(path))
+    }
+
+    /// Launch a prefix trial and say how it ended. A trial that a wall-clock
+    /// bound ends, or that Hermit refuses, did not reach the target.
+    fn launch_prefix_trial(&self, run: &mut RunData) -> anyhow::Result<TrialEnd> {
+        if self.verbose {
+            eprintln!(
+                ":: {}\n    {}",
+                "Prefix trial, repro command:".yellow().bold(),
+                run.to_repro()
+            );
+        }
+        run.launch_trial()
+    }
+
+    /// `--prefix-search`: find the shortest prefix of the target schedule that,
+    /// replayed and then continued without chaos, still meets the target
+    /// criteria. Returns the index of that prefix's last event.
+    pub fn phase5_prefix_search(&self, target: &[SchedEvent]) -> anyhow::Result<PrefixDecision> {
+        let mut trial = 0;
+        let mut refused = 0;
+        let mut meets_target =
+            |len: usize, continuation: MaybeTimeslice| -> anyhow::Result<TrialEnd> {
+                trial += 1;
+                let mut run = self.prefix_trial(
+                    &format!("prefix_round_{trial:03}"),
+                    target,
+                    len,
+                    continuation,
+                )?;
+                let end = self.launch_prefix_trial(&mut run)?;
+                refused += usize::from(end == TrialEnd::Unfinished(Stop::Refusal));
+                let is_match = end.reached_target();
+                eprintln!(
+                    ":: Prefix of {len} of {} events => {}",
+                    target.len(),
+                    if is_match {
+                        format!("target condition ({})", self.display_criteria())
+                    } else {
+                        "baseline condition".to_string()
+                    }
+                );
+                Ok(end)
+            };
+
+        let candidates = match self.continuation_timeslice {
+            ContinuationTimeslice::Auto => continuation_candidates(self.trial_max_timeslice()),
+            ContinuationTimeslice::Nanos(nanos) => vec![Some(nanos)],
+        };
+        let continuation = choose_continuation(&candidates, target.len(), &mut meets_target)?;
+        eprintln!(
+            ":: Searching the prefixes continued without chaos {}",
+            describe_continuation(continuation)
+        );
+        let mut meets_target = |len| Ok(meets_target(len, continuation)?.reached_target());
+        let passing = search_prefix_boundary(target.len(), &mut meets_target)?;
+        let failing = passing + 1;
+        // On a host whose branch counter is not exact, two replays of one
+        // prefix can differ, so the boundary is checked once more.
+        if meets_target(passing)? || !meets_target(failing)? {
+            eprintln!(
+                ":: {} replaying the prefixes of {passing} and {failing} events again gave other \
+                 outcomes; the decision below may not repeat",
+                "WARNING:".yellow().bold()
+            );
+        }
+        let refused = refused_trials_warning(refused);
+        if let Some(warning) = &refused {
+            eprintln!(":: {} {warning}", "WARNING:".yellow().bold());
+        }
+        eprintln!(
+            ":: The scheduling decision at event #{passing} of {} decides the outcome: {}",
+            target.len(),
+            target[passing]
+        );
+        Ok(PrefixDecision {
+            schedule: target.to_vec(),
+            decision: passing,
+            refused,
+            continuation,
+        })
+    }
+
+    /// Replay the first `len` events of `schedule` as a prefix trial and
+    /// return whether it met the target with the stack at schedule position
+    /// `position`: a replayed event, or, at `len`, the first event the
+    /// scheduler ran after the prefix.
+    fn prefix_stack(
+        &self,
+        runname: &str,
+        schedule: &[SchedEvent],
+        len: usize,
+        position: usize,
+        continuation: MaybeTimeslice,
+    ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)> {
+        let mut run = self.prefix_trial(runname, schedule, len, continuation)?;
+        let stack_path = run.root_path().with_extension("stack");
+        run.runopts.det_opts.det_config.stacktrace_event =
+            vec![(position as u64, Some(stack_path.clone()))];
+        let is_match = self.launch_prefix_trial(&mut run)?.reached_target();
+        eprintln!(
+            ":: {}\n{}",
+            "Stack-trace run completed.  Repro command:".green().bold(),
+            run.to_repro()
+        );
+        let stack = match File::open(&stack_path) {
+            Ok(file) => Some(serde_json::from_reader(file).with_context(|| {
+                format!("cannot parse the stack trace in {}", stack_path.display())
+            })?),
+            Err(_) => None,
+        };
+        Ok((is_match, stack))
+    }
+
+    /// The schedule a prefix trial of the first `len` events of `schedule`
+    /// realized: the replayed events, then the events the scheduler ran after
+    /// them, and the file it is recorded in. Empty if the trial wrote no
+    /// schedule (it did not finish).
+    fn prefix_continuation(
+        &self,
+        runname: &str,
+        schedule: &[SchedEvent],
+        len: usize,
+        continuation: MaybeTimeslice,
+    ) -> anyhow::Result<(Vec<SchedEvent>, PathBuf)> {
+        let mut run = self
+            .prefix_trial(runname, schedule, len, continuation)?
+            .with_schedule_recording();
+        let path = run.sched_path_out().to_path_buf();
+        self.launch_prefix_trial(&mut run)?;
+        let realized = if path.exists() {
+            PreemptionReader::new(&path).load_all().into_global()
+        } else {
+            Vec::new()
+        };
+        Ok((realized, path))
+    }
+
+    /// The report of `--prefix-search`: the stacks of the two threads that
+    /// could run at the deciding event.
+    pub fn phase6_record_prefix_outputs(&self, found: PrefixDecision) -> anyhow::Result<Report> {
+        let PrefixDecision {
+            schedule,
+            decision,
+            refused,
+            continuation,
+        } = found;
+        let (target_met, chosen) = self.prefix_stack(
+            "final_target_for_stacktraces",
+            &schedule,
+            decision + 1,
+            decision,
+            continuation,
+        )?;
+        // The thread the scheduler runs at event #decision once the prefix
+        // ends. `--stacktrace-event` names a position of the replayed schedule
+        // only, so the prefix trial without event #decision runs first with its
+        // schedule recorded, and the stack is taken from a replay of that
+        // schedule's first decision + 1 events.
+        let (continued, continued_path) =
+            self.prefix_continuation("final_baseline_schedule", &schedule, decision, continuation)?;
+        if continued
+            .get(decision)
+            .is_some_and(|event| event.dettid == schedule[decision].dettid)
+            && let Some(report) = self.report_timing_decision(
+                &schedule,
+                decision,
+                continuation,
+                (target_met, &chosen),
+                (&continued, &continued_path),
+                &refused,
+            )?
+        {
+            return Ok(report);
+        }
+        let (baseline_met, instead) = if continued.len() > decision {
+            self.prefix_stack(
+                "final_baseline_for_stacktraces",
+                &continued,
+                decision + 1,
+                decision,
+                continuation,
+            )?
+        } else {
+            eprintln!(
+                ":: {} the run without event #{decision} ended after {} events, so no thread \
+                 runs there instead and stack2 is empty",
+                "WARNING:".yellow().bold(),
+                continued.len()
+            );
+            (false, None)
+        };
+        if !target_met || baseline_met {
+            eprintln!(
+                ":: {} the stack-trace runs did not repeat the search's outcomes (target met: {}, \
+                 baseline met: {}); read the stacks with care",
+                "WARNING:".yellow().bold(),
+                target_met,
+                baseline_met
+            );
+        }
+
+        let mut header = format!(
+            "The scheduling decision at event #{decision} of the target schedule decides the \
+             outcome.\nReplaying the first {decision} events and then scheduling without chaos \
+             {} does not meet the target criteria; replaying event #{decision} too ({}) does \
+             ({}).\n",
+            describe_continuation(continuation),
+            schedule[decision],
+            self.display_criteria()
+        );
+        header.push_str(
+            "stack1 is the thread the target schedule runs at that point; stack2 is the thread \
+             that runs there instead when the scheduler continues without chaos.\nThe outcome \
+             depends on which of the two runs first: add synchronization that makes the order \
+             irrelevant, or that enforces the passing order.\n",
+        );
+        if let Some(refused) = refused {
+            header.push_str(&format!("Note: {refused}\n"));
+        }
+        let context = Self::generate_context(&schedule, decision.max(1), self.execution_context);
+
+        println!(
+            "\n------------------------------ hermit analyze report ------------------------------"
+        );
+        println!("{}", header);
+        Self::print_stack("stack1", &chosen);
+        Self::print_stack("stack2", &instead);
+        println!("\n{}", context);
+
+        Ok(Report {
+            header,
+            additional_context: context,
+            baseline_run: false,
+            critical_event1: ReportCriticalEvent {
+                event_index: decision,
+                stack: chosen,
+            },
+            critical_event2: ReportCriticalEvent {
+                event_index: decision,
+                stack: instead,
+            },
+            deciding_event: None,
+        })
+    }
+
+    /// The report of `--prefix-search` when the scheduler runs the same
+    /// thread at the deciding event without it (`continued`, recorded at
+    /// `continued_path`, is the schedule without it) as the target schedule
+    /// does: the decision is how long that thread runs, so the report shows
+    /// the thread that runs next in each continuation, and the deciding
+    /// thread's own stack (`deciding`, from a trial that met the target or
+    /// not) separately. `None` when the continuation with the event does not
+    /// bear that out (it does not run the thread there, or the thread runs
+    /// exactly as long in both): the usual report follows.
+    fn report_timing_decision(
+        &self,
+        schedule: &[SchedEvent],
+        decision: usize,
+        continuation: MaybeTimeslice,
+        (target_met, deciding): (bool, &Option<PrettyBacktrace>),
+        (continued, continued_path): (&[SchedEvent], &Path),
+        refused: &Option<String>,
+    ) -> anyhow::Result<Option<Report>> {
+        let thread = schedule[decision].dettid;
+        let (target_continued, target_continued_path) = self.prefix_continuation(
+            "final_target_schedule",
+            schedule,
+            decision + 1,
+            continuation,
+        )?;
+        let with = slice_from(&target_continued, decision, thread);
+        let without = slice_from(continued, decision, thread);
+        if with.events == 0 || (with.events, with.branches) == (without.events, without.branches) {
+            eprintln!(
+                ":: {} without event #{decision} the scheduler runs thread {thread} there too, \
+                 but the run with it {}; reporting the two threads at that event instead",
+                "WARNING:".yellow().bold(),
+                if with.events == 0 {
+                    "does not run it there (its continuation was not recorded, or left the \
+                     schedule)"
+                } else {
+                    "runs it for exactly as long"
+                }
+            );
+            return Ok(None);
+        }
+        let next_stack = |runname: &str, variant: &[SchedEvent], slice: &Slice| match slice.next {
+            Some((index, _)) => self.prefix_stack(runname, variant, index + 1, index, continuation),
+            None => Ok((false, None)),
+        };
+        let (next_target_met, stack1) = next_stack(
+            "final_target_next_for_stacktraces",
+            &target_continued,
+            &with,
+        )?;
+        let (baseline_met, stack2) =
+            next_stack("final_baseline_next_for_stacktraces", continued, &without)?;
+        if !target_met || (with.next.is_some() && !next_target_met) || baseline_met {
+            eprintln!(
+                ":: {} the stack-trace runs did not repeat the search's outcomes; read the \
+                 stacks with care",
+                "WARNING:".yellow().bold(),
+            );
+        }
+        let next_index = |variant: &[SchedEvent], slice: &Slice| {
+            slice.next.map_or(variant.len(), |(index, _)| index)
+        };
+        let mut critical = [
+            (next_index(&target_continued, &with), stack1),
+            (next_index(continued, &without), stack2),
+        ];
+        // When the threads that run next have the same stack in both
+        // continuations, those stacks tell nothing apart; where the deciding
+        // thread stops does. Its stacks replace them only when both were
+        // captured.
+        let mut slice_ends = slice_end_events(
+            &with,
+            &without,
+            [critical[0].1.as_ref(), critical[1].1.as_ref()],
+        );
+        if let Some(ends) = slice_ends {
+            let stack_at = |runname: &str, variant: &[SchedEvent], end: usize| {
+                if end == decision {
+                    // A slice of one event ends where it starts.
+                    Ok((true, deciding.clone()))
+                } else {
+                    self.prefix_stack(runname, variant, end + 1, end, continuation)
+                }
+            };
+            let (_, with_end) = stack_at(
+                "final_target_slice_end_for_stacktraces",
+                &target_continued,
+                ends[0],
+            )?;
+            let (_, without_end) = stack_at(
+                "final_baseline_slice_end_for_stacktraces",
+                continued,
+                ends[1],
+            )?;
+            match (with_end, without_end) {
+                (Some(with_end), Some(without_end)) => {
+                    critical = [(ends[0], Some(with_end)), (ends[1], Some(without_end))];
+                }
+                _ => slice_ends = None,
+            }
+        }
+        let [(event1, stack1), (event2, stack2)] = critical;
+        let mut header = timing_decision_header(
+            decision,
+            &schedule[decision],
+            (&with, &without),
+            &self.display_criteria(),
+            continuation,
+            slice_ends,
+        );
+        if slice_ends.is_some()
+            && let (Some(first), Some(second)) = (&stack1, &stack2)
+            && same_frames(first, second)
+        {
+            header.push_str(&format!(
+                "Thread {thread} has the same stack at both events: what differs is how far it \
+                 gets before the other thread runs, not where it stops.\n"
+            ));
+        }
+        let name = |path: &Path| {
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        };
+        header.push_str(&format!(
+            "Event numbers after #{decision} are positions in each continuation's recorded \
+             schedule, in the workspace: {} with the event, {} without it.\n",
+            name(&target_continued_path),
+            name(continued_path),
+        ));
+        if let Some(refused) = refused {
+            header.push_str(&format!("Note: {refused}\n"));
+        }
+        let context = format!(
+            "With event #{decision} replayed:\n{}\nWithout it:\n{}",
+            Self::generate_context(
+                &target_continued,
+                with.next.map_or(decision.max(1), |(index, _)| index),
+                self.execution_context
+            ),
+            Self::generate_context(
+                continued,
+                without.next.map_or(decision.max(1), |(index, _)| index),
+                self.execution_context
+            ),
+        );
+
+        println!(
+            "\n------------------------------ hermit analyze report ------------------------------"
+        );
+        println!("{}", header);
+        println!("Thread {thread} at the deciding event #{decision}:");
+        Self::print_stack("the deciding thread's stack", deciding);
+        Self::print_stack("stack1", &stack1);
+        Self::print_stack("stack2", &stack2);
+        println!("\n{}", context);
+
+        Ok(Some(Report {
+            header,
+            additional_context: context,
+            baseline_run: false,
+            critical_event1: ReportCriticalEvent {
+                event_index: event1,
+                stack: stack1,
+            },
+            critical_event2: ReportCriticalEvent {
+                event_index: event2,
+                stack: stack2,
+            },
+            deciding_event: Some(ReportCriticalEvent {
+                event_index: decision,
+                stack: deciding.clone(),
+            }),
+        }))
     }
 
     /// It's weird if no filter is specified.
@@ -196,9 +1313,16 @@ impl AnalyzeOpts {
 
     /// Mutates AnalyzeOpts in order to initialize some fields.
     fn phase0_initialize(&mut self) -> anyhow::Result<()> {
-        let dir = tempfile::Builder::new()
-            .prefix("hermit_analyze")
-            .tempdir()?;
+        let mut builder = tempfile::Builder::new();
+        builder.prefix("hermit_analyze");
+        let dir = match &self.tmp_dir {
+            Some(parent) => {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("cannot create --tmp-dir {}", parent.display()))?;
+                builder.tempdir_in(parent)?
+            }
+            None => builder.tempdir()?,
+        };
         let tmpdir_path = dir.keep(); // For now always keep the temporary results.
         eprintln!(":: Temp workspace: {}", tmpdir_path.display());
         self.tmp_dir = Some(tmpdir_path);
@@ -207,7 +1331,7 @@ impl AnalyzeOpts {
 
     /// Create our workspace and verify the input run matches the criteria, or find one that does.
     /// Returns the results of the target run.
-    fn phase1_establish_target_run(&self) -> Result<RunData, Error> {
+    fn phase1_establish_target_run(&mut self) -> Result<RunData, Error> {
         let mut run1data = RunData::new_run1_target(self, "run1_target".to_string())?;
         eprintln!(
             // `to_repro` is already a complete `hermit ... run ...` command.
@@ -220,6 +1344,13 @@ impl AnalyzeOpts {
             let preempts_path = run1data.preempts_path_out();
             // Copy preempts to the output location as though they were recorded by this run:
             std::fs::copy(p, preempts_path).expect("copy file to succeed");
+            if self.trial_timeout == TrialTimeout::Auto {
+                eprintln!(
+                    ":: --run1-preemptions runs no target run to measure, so runs are not \
+                     bounded until analyze replays the record to verify it (not every search \
+                     does); pass --trial-timeout=SECONDS to bound every run."
+                );
+            }
             // Careful, returning a NON-launched RunData just to contain the output path.
             return Ok(run1data);
         }
@@ -227,6 +1358,7 @@ impl AnalyzeOpts {
         // Translate the seed into a set of preemptions we can work from.
         let mut run1data = run1data.with_preemption_recording();
         run1data.launch()?;
+        self.record_endpoint(&run1data);
 
         if !run1data.is_a_match() {
             if self.search {
@@ -378,7 +1510,7 @@ impl AnalyzeOpts {
     ///
     /// Returns a path to a file containing recorded schedule events for the baseline run.
     pub fn phase4_choose_baseline_sched_events(
-        &self,
+        &mut self,
         matching_pr: PreemptionRecord,
     ) -> anyhow::Result<RunData> {
         if self.minimize {
@@ -390,19 +1522,12 @@ impl AnalyzeOpts {
             // If we're minimizing, then we know that ALL interventions in the schedule are critical.
             // Thus omitting any of them is sufficient to exit the target schedule space.
             // Omitting the last one should yield the lowest distance match/non-match schedule pair.
-            let mut pr = matching_pr;
-            let mut ix = 1;
-            loop {
+            knock_out_until_missed(matching_pr, |ix, knocked_out| {
                 let runname = format!("run2_baseline_try{:03}", ix);
-                let (still_matching, mut newrun) =
-                    self.save_nearby_non_matching_sched_events(&runname, &pr)?;
-                if still_matching {
-                    pr = newrun.preempts_out().clone();
-                    ix += 1;
-                } else {
-                    return Ok(newrun);
-                }
-            }
+                let (still_matching, newrun) =
+                    self.save_nearby_non_matching_sched_events(&runname, knocked_out)?;
+                Ok((!still_matching).then_some(newrun))
+            })
         } else {
             let runname = "run2_baseline".to_string();
             let mut newrun = RunData::new_baseline(self, runname)?.with_preemption_recording();
@@ -433,7 +1558,21 @@ impl AnalyzeOpts {
                 // Otherwise we just assume that a *baseline* (non-chaos) run will do the trick.
                 ro.det_opts.det_config.chaos = false;
             }
-            newrun.launch()?;
+            if !newrun.launch_trial()?.finished() {
+                // Without a baseline the user chose, analyze searches within
+                // the target schedule instead; one the user chose is not
+                // replaced behind their back.
+                if self.run2_seed.is_none() && self.run2_preemptions.is_none() {
+                    return Err(BaselineUnfinished(from_where).into());
+                }
+                bail!(
+                    "the baseline run ({from_where}) did not finish (a bound or a refusal \
+                     stopped it; see above). Pass a larger --trial-timeout, or another baseline; \
+                     without one, analyze bisects against the run without chaos, or searches \
+                     within the target schedule when that does not finish either."
+                );
+            }
+            self.record_endpoint(&newrun);
 
             eprintln!(
                 ":: Recorded schedule from {} as baseline run ({})",
@@ -462,10 +1601,17 @@ impl AnalyzeOpts {
         baseline: &[SchedEvent],
     ) -> anyhow::Result<CriticalSchedule> {
         let mut i = 0;
+        let mut unfinished = 0;
+        let mut refused = 0;
 
         // Each call is one trial. A trial that cannot finish (for example, one
         // that --max-log-bytes ended) returns its error unchanged, and the
-        // search stops there.
+        // search stops there. A trial that a wall-clock bound ended
+        // (--trial-timeout, or the run arguments' --timeout) or that Hermit
+        // refused is the exception: a spliced schedule can leave the guest
+        // waiting for an event that never comes, or take it down a path Hermit
+        // does not support, so it did not reach the target, and the search
+        // goes on.
         let test_fn = |sched: &[SchedEvent]| -> TrialOutcome {
             i += 1;
             let runname = format!("bisect_round_{:0wide$}", i, wide = 3);
@@ -485,8 +1631,14 @@ impl AnalyzeOpts {
                 );
             }
 
-            newrun.launch()?;
-            let is_match = newrun.is_a_match();
+            let is_match = match newrun.launch_trial()? {
+                TrialEnd::Unfinished(stop) => {
+                    unfinished += 1;
+                    refused += usize::from(stop == Stop::Refusal);
+                    return Ok((true, sched.to_owned()));
+                }
+                end => end.reached_target(),
+            };
             if is_match {
                 eprintln!(" => Target condition ({})", self.display_criteria());
             } else {
@@ -513,6 +1665,12 @@ impl AnalyzeOpts {
             "Critical event of final on-target schedule is {}",
             crit.critical_event_index
         );
+        if let Some(caveat) = critical_pair_caveat(&crit, unfinished) {
+            eprintln!(":: {} {caveat}", "WARNING:".yellow().bold());
+        }
+        if let Some(warning) = refused_trials_warning(refused) {
+            eprintln!(":: {} {warning}", "WARNING:".yellow().bold());
+        }
         Ok(crit)
     }
 
@@ -548,7 +1706,7 @@ impl AnalyzeOpts {
         );
         println!("Swapping these adjacent events reproduces the good outcome.");
 
-        let report = self.phase6_record_outputs(critical)?;
+        let report = self.phase6_record_outputs(critical, None)?;
         if let Some(path) = &self.report_file {
             let text = serde_json::to_string_pretty(&report)?;
             std::fs::write(path, text)?;
@@ -584,8 +1742,14 @@ impl AnalyzeOpts {
         additional_context
     }
 
-    /// Record the schedules on disk as reproducers and report stack-traces of critical events.
-    pub fn phase6_record_outputs(&self, crit: CriticalSchedule) -> Result<Report, Error> {
+    /// Record the schedules on disk as reproducers and report stack-traces of
+    /// critical events. `target_run` is the workspace root of the run whose
+    /// schedule was the search's target endpoint, if one ran.
+    pub fn phase6_record_outputs(
+        &self,
+        crit: CriticalSchedule,
+        target_run: Option<&Path>,
+    ) -> Result<Report, Error> {
         let tmp_dir = self.get_tmp()?;
         let CriticalSchedule {
             failing_schedule,
@@ -610,90 +1774,141 @@ impl AnalyzeOpts {
         );
 
         self.write_final_schedules(
-            failing_schedule,
+            failing_schedule.clone(),
             &final_failing_path,
-            passing_schedule,
+            passing_schedule.clone(),
             &final_passing_path,
         );
 
-        {
-            let mut header = String::new();
+        let mut header = String::new();
+        header.push_str("These two operations, on different threads, are RACING with eachother.\n");
+        header.push_str(&format!(
+            "The order of events (#{} and #{} in the schedule) determines the program outcome.\n",
+            critical_event_index - 1,
+            critical_event_index,
+        ));
+        header.push_str(
+            "You must add synchronization to prevent these operations from racing, or give them a different order.\n",
+        );
+
+        if self.is_vanilla_criteria() {
             header.push_str(
-                "These two operations, on different threads, are RACING with eachother.\n",
+                "Attached are the stacktraces in the PASSING order, but flipping the order of the two events makes the program FAIL (nonzero exit).\n",
             );
+        } else {
             header.push_str(&format!(
-                "The order of events (#{} and #{} in the schedule) determines the program outcome.\n",
-                critical_event_index - 1,
-                critical_event_index,
+                "Attached are the stacktraces in the baseline order, while flipping the order makes the program exhibit the target criteria ({}).\n",
+                self.display_criteria()
             ));
-            header.push_str(
-                "You must add synchronization to prevent these operations from racing, or give them a different order.\n",
-            );
-
-            if self.is_vanilla_criteria() {
-                header.push_str(
-                    "Attached are the stacktraces from a PASSING run, but flipping the order of the two events makes the program FAIL (nonzero exit).\n",
-                );
-            } else {
-                header.push_str(&format!(
-                    "Attached are the stacktraces from a baseline run, while flipping the order makes the program exhibit the target criteria ({}).\n",
-                    self.display_criteria()
-                ));
-            }
-
-            let (stack1, stack2) = self.run_and_retrieve_stacks(
-                runname2,
-                final_passing_path,
-                critical_event_index,
-                false,
-            )?;
-
-            // Also print to the screen:
-            println!(
-                "\n------------------------------ hermit analyze report ------------------------------"
-            );
-            println!("{}", header);
-            Self::print_stack("stack1", &stack1);
-            Self::print_stack("stack2", &stack2);
-            println!("\n{}", passing_context);
-
-            let report = Report {
-                header,
-                additional_context: passing_context,
-                baseline_run: true,
-                critical_event1: ReportCriticalEvent {
-                    event_index: critical_event_index - 1,
-                    stack: stack1,
-                },
-                critical_event2: ReportCriticalEvent {
-                    event_index: critical_event_index,
-                    stack: stack2,
-                },
-            };
-
-            if self.verbose {
-                eprintln!(
-                    "\n:: {}",
-                    "[verbose] additional TARGET (failing) run to print those stack traces as well.."
-                        .yellow()
-                        .bold()
-                );
-                let (stack1, stack2) = self.run_and_retrieve_stacks(
-                    runname1,
-                    final_failing_path,
-                    critical_event_index,
-                    true,
-                )?;
-                println!(
-                    "\n----------------------- stacks from final on-target run -----------------------"
-                );
-                Self::print_stack("stack1", &stack1);
-                Self::print_stack("stack2", &stack2);
-                println!("\n{}", failing_context);
-            }
-
-            Ok(report)
         }
+
+        // Both schedules are replayed: the passing schedule's events
+        // #index - 1 and #index are the failing schedule's #index and
+        // #index - 1, so each racing operation's stack can come from either
+        // replay when the other one leaves its schedule first.
+        let baseline = self.replay_for_stacks(
+            runname2,
+            &final_passing_path,
+            &passing_schedule,
+            critical_event_index,
+        )?;
+        let target = self.replay_for_stacks(
+            runname1,
+            &final_failing_path,
+            &failing_schedule,
+            critical_event_index,
+        )?;
+        if (baseline.finished && baseline.met_target) || (target.finished && !target.met_target) {
+            eprintln!(
+                ":: {} the stack-trace replays did not repeat the search's outcomes (baseline \
+                 met the target: {}, target met it: {}); read the stacks with care",
+                "WARNING:".yellow().bold(),
+                baseline.met_target,
+                target.met_target,
+            );
+        }
+        if target.met_target
+            && let Some(change) = target_run.and_then(|run| {
+                changed_output(
+                    run,
+                    &tmp_dir.join(runname1),
+                    [
+                        ("stdout", self.target_stdout.as_ref()),
+                        ("stderr", self.target_stderr.as_ref()),
+                    ],
+                )
+            })
+        {
+            eprintln!(":: {} {change}", "WARNING:".yellow().bold());
+            header.push_str(&format!("Note: {change}\n"));
+        }
+        let [stack1, stack2] = merge_stacks(
+            &baseline,
+            &target,
+            critical_event_index,
+            [
+                passing_schedule[critical_event_index - 1].dettid,
+                passing_schedule[critical_event_index].dettid,
+            ],
+        );
+        for (which, stack, event) in [
+            ("stack1", &stack1, critical_event_index - 1),
+            ("stack2", &stack2, critical_event_index),
+        ] {
+            match stack {
+                Some((_, source)) => header.push_str(&format!("{which} is from {source}.\n")),
+                None => {
+                    let target_event = 2 * critical_event_index - 1 - event;
+                    let reason =
+                        missing_stack_reason(which, (event, target_event), &baseline, &target);
+                    eprintln!(":: {} {reason}", "WARNING:".yellow().bold());
+                    header.push_str(&format!("{reason}\n"));
+                }
+            }
+        }
+        let (stack1, stack2) = (
+            stack1.map(|(stack, _)| stack),
+            stack2.map(|(stack, _)| stack),
+        );
+
+        // Also print to the screen:
+        println!(
+            "\n------------------------------ hermit analyze report ------------------------------"
+        );
+        println!("{}", header);
+        Self::print_stack("stack1", &stack1);
+        Self::print_stack("stack2", &stack2);
+        println!("\n{}", passing_context);
+
+        if self.verbose {
+            println!(
+                "\n----------------------- stacks from final on-target run -----------------------"
+            );
+            Self::print_stack(
+                &format!("event #{} (stack2's operation)", critical_event_index - 1),
+                &target.stacks[0],
+            );
+            Self::print_stack(
+                &format!("event #{critical_event_index} (stack1's operation)"),
+                &target.stacks[1],
+            );
+            println!("\n{}", failing_context);
+        }
+
+        Ok(Report {
+            header,
+            additional_context: passing_context,
+            baseline_run: true,
+            critical_event1: ReportCriticalEvent {
+                event_index: critical_event_index - 1,
+                stack: stack1,
+            },
+            critical_event2: ReportCriticalEvent {
+                event_index: critical_event_index,
+                stack: stack2,
+            },
+            deciding_event: None,
+        })
     }
 
     fn print_stack(which: &str, m_stack: &Option<PrettyBacktrace>) {
@@ -701,42 +1916,6 @@ impl AnalyzeOpts {
             println!("{}", s);
         } else {
             println!(" ({} not available) ", which);
-        }
-    }
-
-    fn run_and_retrieve_stacks(
-        &self,
-        runname: &str,
-        final_path: PathBuf,
-        critical_event_index: usize,
-        expected_match: bool,
-    ) -> Result<(Option<PrettyBacktrace>, Option<PrettyBacktrace>), Error> {
-        let (rundata, stack1_path, stack2_path) =
-            self.launch_for_stacktraces(runname, &final_path, critical_event_index as u64)?;
-        let res = rundata.is_a_match();
-        eprintln!(
-            "\n:: {}",
-            "Final run to print stack traces completed.  Repro command:"
-                .green()
-                .bold()
-        );
-        eprintln!("{}", rundata.to_repro());
-
-        let stack1 = File::open(stack1_path)
-            .map(|file| serde_json::from_reader(file).unwrap())
-            .ok();
-        let stack2 = File::open(stack2_path)
-            .map(|file| serde_json::from_reader(file).unwrap())
-            .ok();
-
-        if res == expected_match {
-            eprintln!(":: {}", "Completed analysis successfully.".green().bold());
-            Ok((stack1, stack2))
-        } else {
-            bail!(
-                "Internal error! Final run expected match={}, but observed the opposite!",
-                expected_match,
-            )
         }
     }
 
@@ -748,6 +1927,8 @@ impl AnalyzeOpts {
         self.refuse_options_trials_do_not_apply()?;
         self.refuse_outputs_trials_overwrite()?;
         self.refuse_unqualified_trial_timeout()?;
+        self.refuse_unenforceable_trial_timeout()?;
+        self.refuse_unsound_continuation_timeslice()?;
         self.install_trial_pmu_config()?;
         self.refuse_strict_with_inexact_branch_counter()?;
         // `--run1-schedule` and `--run2-schedule` parse but have no
@@ -814,12 +1995,18 @@ impl AnalyzeOpts {
         let mut min_run = self.phase2_minimize(global, run1data)?;
         self.phase3_strict_preempt_replay_check(global, &mut min_run)?;
 
-        min_run.normalize_preempts_out();
-        let normalized_preempts = min_run.preempts_out().clone();
+        // The record the target endpoint replays, and the one --minimize's
+        // baseline knocks a preemption out of, is the record that met the
+        // target: a normalized copy renumbers its priorities across the
+        // scheduler's fixed ones (the default priority, among others), and
+        // can run another schedule.
+        let (normalized_path, normalized) = min_run.write_normalized_preempts();
         eprintln!(
             ":: {}\n {}",
             format!(
-                "Normalized, that preemption record ({}) becomes:",
+                "Normalized for reading ({}; analyze uses {}), that preemption record \
+                 becomes:",
+                normalized_path.file_name().unwrap().to_string_lossy(),
                 min_run
                     .preempts_path_out()
                     .file_name()
@@ -830,18 +2017,45 @@ impl AnalyzeOpts {
             .bold(),
             truncated(
                 1000,
-                serde_json::to_string_pretty(&normalized_preempts.clone_preemptions_only())
-                    .unwrap()
+                serde_json::to_string_pretty(&normalized.clone_preemptions_only()).unwrap()
             )
         );
+        let target_preempts = min_run.preempts_out().clone();
 
         // One endpoint of the bisection search:
         let mut target_endpoint_run = self.save_final_target_sched_events(min_run)?;
 
+        if self.prefix_search {
+            return self.prefix_search_and_report(&mut target_endpoint_run);
+        }
+
         // The other endpoint of the bisection search:
         // What we thought was the final_pr can change here:
         let mut baseline_endpoint_run =
-            self.phase4_choose_baseline_sched_events(normalized_preempts)?;
+            match self.phase4_choose_baseline_sched_events(target_preempts) {
+                Ok(run) => run,
+                // A baseline run that did not finish, or no knock-out left,
+                // gives no schedule to bisect against; the decision is still
+                // within the target schedule, which a prefix search needs
+                // alone.
+                Err(error)
+                    if error.downcast_ref::<BaselineUnfinished>().is_some()
+                        || error.downcast_ref::<NothingToKnockOut>().is_some() =>
+                {
+                    let hint = if error.downcast_ref::<BaselineUnfinished>().is_some() {
+                        "; a larger --trial-timeout may let the baseline finish"
+                    } else {
+                        ""
+                    };
+                    eprintln!(
+                        ":: {} {error}\n:: Searching within the target schedule instead \
+                         (--prefix-search){hint}.",
+                        "No baseline:".yellow().bold(),
+                    );
+                    return self.prefix_search_and_report(&mut target_endpoint_run);
+                }
+                Err(error) => return Err(error),
+            };
 
         let baseline_sched_name = baseline_endpoint_run.sched_out_file_name();
         let target_sched_name = target_endpoint_run.sched_out_file_name();
@@ -856,9 +2070,49 @@ impl AnalyzeOpts {
             baseline_sched_name,
             target_sched_name,
         );
-        let crit_sched = self.phase5_bisect_traces(target, baseline)?;
+        let crit_sched = match self.phase5_bisect_traces(target, baseline) {
+            Ok(crit_sched) => crit_sched,
+            // The two endpoints differ in events only the failing run executed:
+            // the decision is still within the failing schedule, and a prefix
+            // search needs no baseline to find it.
+            Err(error) if error.downcast_ref::<NoSingleSwap>().is_some() => {
+                eprintln!(
+                    ":: {} {error:#}\n:: Searching within the failing schedule instead \
+                     (--prefix-search).",
+                    "No single swap separates the endpoints:".yellow().bold(),
+                );
+                return self.prefix_search_and_report(&mut target_endpoint_run);
+            }
+            Err(error) => return Err(error),
+        };
 
-        let report = self.phase6_record_outputs(crit_sched)?;
+        let target_run = target_endpoint_run.root_path();
+        let report = self.phase6_record_outputs(crit_sched, Some(&target_run))?;
+        self.write_report_and_exit(report)
+    }
+
+    /// `--prefix-search` over the target endpoint's schedule, and its report.
+    fn prefix_search_and_report(
+        &self,
+        target_endpoint_run: &mut RunData,
+    ) -> anyhow::Result<ExitStatus> {
+        let target = target_endpoint_run.sched_out().clone();
+        eprintln!(
+            ":: {} ({} events): {}",
+            "Beginning prefix search within the target schedule"
+                .yellow()
+                .bold(),
+            target.len(),
+            target_endpoint_run.sched_out_file_name(),
+        );
+        let decision = self.phase5_prefix_search(&target)?;
+        let report = self.phase6_record_prefix_outputs(decision)?;
+        self.write_report_and_exit(report)
+    }
+
+    /// Write `report` to `--report-file`, if given, and return the exit status
+    /// of a successful analysis.
+    fn write_report_and_exit(&self, report: Report) -> anyhow::Result<ExitStatus> {
         if let Some(path) = &self.report_file {
             let txt = serde_json::to_string(&report).unwrap();
             std::fs::write(path, txt).expect("Unable to write report file");
@@ -878,7 +2132,7 @@ impl AnalyzeOpts {
     /// would be unnecessary if we recorded that each time as we minimize.
     ///
     /// Argument: the last on-target run that was preemption based.
-    fn save_final_target_sched_events(&self, mut last_run: RunData) -> anyhow::Result<RunData> {
+    fn save_final_target_sched_events(&mut self, mut last_run: RunData) -> anyhow::Result<RunData> {
         let pr = last_run.preempts_out();
         if pr.contains_schedevents() {
             let path = last_run.preempts_path_out();
@@ -899,6 +2153,8 @@ impl AnalyzeOpts {
                 .with_preempts_path_in(last_run.preempts_path_out().to_path_buf())
                 .with_schedule_recording();
             newrun.launch()?;
+            // With --run1-preemptions this is the first run of the target.
+            self.record_endpoint(&newrun);
             eprintln!("    {}", newrun.to_repro());
             if !newrun.is_a_match() {
                 bail!("Final preemption record still does not match target criteria");
@@ -911,13 +2167,12 @@ impl AnalyzeOpts {
     fn save_nearby_non_matching_sched_events(
         &self,
         runname: &str,
-        matching_preempts: &PreemptionRecord,
+        non_matching_preempts: &PreemptionRecord,
     ) -> anyhow::Result<(bool, RunData)> {
         // Given preemptions that hermit analyze has determined are critical to match the criteria
-        // (most commonly, a failing execution), removing the last critical preemption should
-        // cause the minimal execution change to now no longer match the criteria (most commonly,
-        // an execution that now passes).
-        let non_matching_preempts = matching_preempts.with_latest_preempt_removed();
+        // (most commonly, a failing execution), removing the last critical preemption
+        // ([`knock_out_latest`]) should cause the minimal execution change to now no longer match
+        // the criteria (most commonly, an execution that now passes).
 
         // Validate the preemption record
         if let Err(e) = non_matching_preempts.validate() {
@@ -931,7 +2186,7 @@ impl AnalyzeOpts {
         }
 
         let mut newrun = RunData::new_baseline(self, runname.to_string())?
-            .with_preempts_in(non_matching_preempts)
+            .with_preempts_in(non_matching_preempts.clone())
             .with_schedule_recording();
 
         // Verify that the new preemption record does in fact now cause a non-matching execution,
@@ -939,7 +2194,9 @@ impl AnalyzeOpts {
         yellow_msg(
             "Verify preemption record *without* latest critical preempt causes criteria non-match. Also record sched events.",
         );
-        newrun.launch()?;
+        if !newrun.launch_trial()?.finished() {
+            return Err(BaselineUnfinished("--minimize's knock-out of its last preemption").into());
+        }
         eprintln!("    {}", newrun.to_repro());
         if newrun.is_a_match() {
             eprintln!(
@@ -1001,48 +2258,657 @@ impl AnalyzeOpts {
     }
 
     /// Does the run meet the criteria we are looking for (e.g. a particular error message).
+    /// With `--verbose`, says which criteria it misses.
     pub fn output_matches(&self, out: &Output) -> bool {
-        let mut answer = true;
-        if let Some(pat) = &self.target_stdout {
-            let str = String::from_utf8_lossy(&out.stdout);
-            if !pat.is_match(&str) {
-                if self.verbose {
-                    eprintln!("Mismatch for stdout pattern {}", pat);
-                    eprintln!("Stdout:\n{}", str);
-                }
-                answer = false;
+        let misses = self.criteria_misses(out);
+        if self.verbose {
+            for miss in &misses {
+                eprintln!("{miss}");
             }
         }
-        if let Some(pat) = &self.target_stderr {
-            let str = String::from_utf8_lossy(&out.stderr);
-            if self.verbose {
-                eprintln!("Mismatch for stderr pattern {}", pat);
-            }
-            if !pat.is_match(&str) {
-                answer = false;
-            }
-        }
+        misses.is_empty()
+    }
 
-        if !self.target_exit_code.is_match(out.status) {
-            if self.verbose {
-                eprintln!(
-                    "  Exit code {} is not what we're looking for.",
-                    out.status.into_raw()
-                );
+    /// The target criteria `out` does not meet. (`RunData::launch` prints
+    /// the guest's output under `--verbose`.)
+    fn criteria_misses(&self, out: &Output) -> Vec<String> {
+        let mut misses = Vec::new();
+        for (stream, pattern, text) in [
+            ("stdout", &self.target_stdout, &out.stdout),
+            ("stderr", &self.target_stderr, &out.stderr),
+        ] {
+            if let Some(pattern) = pattern
+                && !pattern.is_match(&String::from_utf8_lossy(text))
+            {
+                misses.push(format!("Mismatch for {stream} pattern {pattern}"));
             }
-            answer = false;
         }
-        answer
+        if !self.target_exit_code.is_match(out.status) {
+            misses.push(format!(
+                "  Exit code {} is not what we're looking for.",
+                out.status.into_raw()
+            ));
+        }
+        misses
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use clap::Parser as _;
 
     use super::*;
     use crate::container::LogCapExceeded;
     use crate::container::PolicyRefusal;
+
+    fn critical(tids: &[i32], index: usize) -> CriticalSchedule {
+        let schedule: Vec<SchedEvent> = tids
+            .iter()
+            .map(|&tid| SchedEvent::branches(detcore::types::DetTid::from_raw(tid), 1))
+            .collect();
+        CriticalSchedule {
+            failing_schedule: schedule.clone(),
+            passing_schedule: schedule,
+            critical_event_index: index,
+        }
+    }
+
+    /// `--tmp-dir` names the directory the workspace is created in, and is
+    /// created if it is missing.
+    #[test]
+    fn the_workspace_is_created_in_the_tmp_dir() {
+        let parent = tempfile::tempdir().unwrap();
+        let requested = parent.path().join("not-yet-created");
+        let tmp_dir = format!("--tmp-dir={}", requested.display());
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
+        options.phase0_initialize().unwrap();
+        let workspace = options.get_tmp().unwrap();
+        assert_eq!(workspace.parent(), Some(requested.as_path()));
+        assert!(workspace.is_dir(), "{}", workspace.display());
+    }
+
+    /// The prefix search finds the event at which the outcome flips, wherever
+    /// it lies, in about log2(len) trials once its endpoints differ.
+    #[test]
+    fn the_prefix_search_finds_the_deciding_event() {
+        for (len, decision) in [
+            (1, 0),
+            (2, 1),
+            (37_710, 0),
+            (37_710, 33_225),
+            (37_710, 37_709),
+        ] {
+            let mut trials = 0;
+            let found = search_prefix_boundary(len, |prefix| {
+                trials += 1;
+                Ok(prefix > decision)
+            })
+            .unwrap();
+            assert_eq!(found, decision, "len {len}");
+            assert!(
+                trials <= (len as f64).log2().ceil() as usize,
+                "{trials} trials"
+            );
+        }
+    }
+
+    /// `auto` continues at the run's own timeslice, then at hermit's default
+    /// 200 ms when that is coarser, never at a shorter one; a run without PMU
+    /// timeslices continues as it is.
+    #[test]
+    fn auto_continuations_only_get_coarser() {
+        let ns = |nanos: u64| NonZeroU64::new(nanos);
+        assert_eq!(continuation_candidates(ns(200_000_000)), [ns(200_000_000)]);
+        assert_eq!(
+            continuation_candidates(ns(1_000)),
+            [ns(1_000), ns(200_000_000)]
+        );
+        assert_eq!(continuation_candidates(ns(500_000_000)), [ns(500_000_000)]);
+        assert_eq!(continuation_candidates(None), [None]);
+    }
+
+    /// The search continues at the first timeslice whose endpoint trials
+    /// differ: one at which the scheduler alone meets the target, or the
+    /// whole schedule's replay misses it or does not finish, is skipped. When
+    /// every timeslice fails, the error names each, says what it showed, and
+    /// what to do.
+    #[test]
+    fn the_prefix_search_continues_at_the_first_usable_timeslice() {
+        let ns = |nanos: u64| NonZeroU64::new(nanos);
+        let candidates = [ns(1_000), ns(200_000_000)];
+        let end = |met: bool| if met { TrialEnd::Met } else { TrialEnd::Missed };
+        // At 1000 ns the scheduler alone already meets the target (a race
+        // found only at a short timeslice); at 200 ms it does not.
+        let mut trials = Vec::new();
+        let chosen = choose_continuation(&candidates, 50, |prefix, timeslice| {
+            trials.push((prefix, timeslice));
+            Ok(end(prefix > 0 || timeslice == ns(1_000)))
+        })
+        .unwrap();
+        assert_eq!(chosen, ns(200_000_000));
+        assert_eq!(
+            trials,
+            [(0, ns(1_000)), (0, ns(200_000_000)), (50, ns(200_000_000))]
+        );
+        assert_eq!(
+            choose_continuation(&candidates, 50, |prefix, _| Ok(end(prefix > 0))).unwrap(),
+            ns(1_000),
+            "the first usable one wins"
+        );
+
+        let alone = choose_continuation(&candidates, 50, |_, _| Ok(TrialEnd::Met)).unwrap_err();
+        let message = alone.to_string();
+        assert!(
+            message.contains("the scheduler alone already meets the target criteria at a 1000 ns timeslice and at a 200000000 ns timeslice"),
+            "{message}"
+        );
+        assert!(
+            message.contains("prefix_round_001.repro") && message.contains("--run2-seed"),
+            "{message}"
+        );
+        let replay = choose_continuation(&candidates, 50, |_, _| Ok(TrialEnd::Missed)).unwrap_err();
+        assert!(
+            replay.to_string().contains(
+                "at a 1000 ns timeslice replaying the whole target schedule misses the target"
+            ),
+            "{replay}"
+        );
+        assert!(replay.to_string().contains("--selfcheck"), "{replay}");
+        let unfinished = choose_continuation(&candidates, 50, |prefix, _| {
+            Ok(if prefix == 0 {
+                TrialEnd::Missed
+            } else {
+                TrialEnd::Unfinished(Stop::Bound)
+            })
+        })
+        .unwrap_err();
+        assert!(
+            unfinished
+                .to_string()
+                .contains("did not finish (a bound or a refusal stopped it)")
+                && unfinished.to_string().contains("raise --trial-timeout"),
+            "{unfinished}"
+        );
+    }
+
+    /// Only a criterion the run misses is reported. Before, `--verbose` printed "Mismatch for stderr pattern"
+    /// for every run, right before saying that the stderr matched.
+    #[test]
+    fn only_the_criteria_a_run_misses_are_reported() {
+        let options = AnalyzeOpts::try_parse_from([
+            "analyze",
+            "--target-stderr=double-close",
+            "--target-stdout=^$",
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        let output = |stdout: &str, stderr: &str, code: i32| Output {
+            status: ExitStatus::Exited(code),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        let met = output("", "fdsan: double-close of fd 5\n", 1);
+        assert!(options.criteria_misses(&met).is_empty());
+        assert!(options.output_matches(&met));
+
+        let missed = options.criteria_misses(&output("ok\n", "all good\n", 0));
+        assert_eq!(missed.len(), 3, "{missed:?}");
+        assert_eq!(missed[0], "Mismatch for stdout pattern ^$");
+        assert_eq!(missed[1], "Mismatch for stderr pattern double-close");
+        assert!(missed[2].contains("Exit code 0 is not what we're looking for"));
+    }
+
+    fn events(tids: &[i32]) -> Vec<SchedEvent> {
+        tids.iter()
+            .map(|&tid| SchedEvent::branches(DetTid::from_raw(tid), 10))
+            .collect()
+    }
+
+    /// A replay leaves its schedule at the first event that differs from the
+    /// schedule's as the scheduler compares them when it takes a stack
+    /// (another thread, operation or instruction pointer, but not another
+    /// count), or where it ends; only the events up to the critical pair
+    /// count.
+    #[test]
+    fn a_replay_leaves_its_schedule_at_the_first_other_event() {
+        let requested = events(&[3, 5, 3, 5, 7]);
+        assert_eq!(departure(&requested, &events(&[3, 5, 3, 5, 7]), 5), None);
+        let mut other_count = events(&[3, 5, 3, 5, 7]);
+        other_count[2].count = 99;
+        assert_eq!(departure(&requested, &other_count, 5), None);
+        let realized = events(&[3, 5, 9, 5, 7]);
+        assert_eq!(
+            departure(&requested, &realized, 5),
+            Some(Departure::OtherEvent {
+                index: 2,
+                expected: requested[2].clone(),
+                ran: realized[2].clone(),
+            })
+        );
+        let mut other_op = requested.clone();
+        other_op[1] = SchedEvent::syscall(
+            DetTid::from_raw(5),
+            reverie::syscalls::Sysno::write,
+            detcore_model::schedule::SyscallPhase::Posthook,
+        );
+        assert!(matches!(
+            departure(&requested, &other_op, 5),
+            Some(Departure::OtherEvent { index: 1, .. })
+        ));
+        assert_eq!(departure(&requested, &events(&[3, 5, 3, 5, 9]), 4), None);
+        assert_eq!(
+            departure(&requested, &events(&[3, 5]), 5),
+            Some(Departure::Ended { events: 2 })
+        );
+    }
+
+    /// A stack either replay captured is reported, in the passing order, with
+    /// the replay it came from: the target replay's events #index - 1 and
+    /// #index are the passing schedule's #index and #index - 1. A replay that
+    /// followed its schedule through the operation is preferred; a stack from
+    /// one that did not is kept only if that replay ran the operation's
+    /// thread there, and is said to be possibly another occurrence. One
+    /// neither gives says where each replay left its schedule. Before, a
+    /// baseline replay that left its schedule early reported both stacks as
+    /// unavailable, without a reason.
+    #[test]
+    fn each_racing_stack_comes_from_a_replay_that_reached_it() {
+        let tid = DetTid::from_raw;
+        let on = |thread: i32, name: &str| -> PrettyBacktrace {
+            serde_json::from_value(serde_json::json!({
+                "thread_id": thread, "thread_name": name, "frames": []
+            }))
+            .unwrap()
+        };
+        let replay = |finished, stacks, left_schedule, ran| StackReplay {
+            finished,
+            met_target: false,
+            stacks,
+            left_schedule,
+            ran,
+        };
+        // The passing schedule runs thread 5's read at #1093, then thread 7's
+        // close at #1094; the failing one the other way round.
+        let threads = [tid(5), tid(7)];
+        let left = Some(Departure::OtherEvent {
+            index: 735,
+            expected: SchedEvent::branches(tid(5), 10),
+            ran: SchedEvent::branches(tid(9), 10),
+        });
+        let baseline = replay(
+            true,
+            [None, None],
+            left.clone(),
+            [Some(tid(9)), Some(tid(9))],
+        );
+        let target = replay(
+            true,
+            [Some(on(7, "close")), None],
+            None,
+            [Some(tid(7)), Some(tid(5))],
+        );
+        let [first, second] = merge_stacks(&baseline, &target, 1094, threads);
+        assert_eq!(first, None);
+        assert_eq!(
+            second,
+            Some((on(7, "close"), "the target replay".to_owned())),
+            "the target's first is the passing second"
+        );
+
+        let ended = StackReplay {
+            left_schedule: Some(Departure::Ended { events: 1093 }),
+            ..target
+        };
+        let reason = missing_stack_reason("stack1", (1093, 1094), &baseline, &ended);
+        assert!(
+            reason.contains("The baseline replay left its schedule: it ran (tid9 cnt=10 Branch) at event #735, where the schedule has (tid5 cnt=10 Branch); the target replay left its schedule: it ended after 1093 events."),
+            "{reason}"
+        );
+        assert!(reason.contains("--selfcheck"), "{reason}");
+        let followed_without = replay(true, [None, None], None, [Some(tid(7)), Some(tid(5))]);
+        let reason = missing_stack_reason("stack1", (1093, 1094), &baseline, &followed_without);
+        assert!(
+            reason.contains("the target replay followed its schedule through event #1094, but left no readable stack there"),
+            "{reason}"
+        );
+        let stopped = replay(false, [None, None], Some(Departure::Unknown), [None, None]);
+        let reason = missing_stack_reason("stack1", (1093, 1094), &baseline, &stopped);
+        assert!(
+            reason.contains("did not finish") && reason.contains("--trial-timeout"),
+            "{reason}"
+        );
+
+        // The baseline replay took its stacks but left its schedule first:
+        // the target replay, which followed its own, is preferred.
+        let early = replay(
+            true,
+            [Some(on(5, "early-read")), Some(on(9, "early-write"))],
+            left,
+            [Some(tid(5)), Some(tid(9))],
+        );
+        let followed = replay(
+            true,
+            [Some(on(7, "close")), Some(on(5, "read"))],
+            None,
+            [Some(tid(7)), Some(tid(5))],
+        );
+        assert_eq!(
+            merge_stacks(&early, &followed, 1094, threads),
+            [
+                Some((on(5, "read"), "the target replay".to_owned())),
+                Some((on(7, "close"), "the target replay".to_owned())),
+            ]
+        );
+        // With no replay that followed its schedule, a stack taken on the
+        // operation's thread is kept with a caveat; one taken on another
+        // thread (thread 9 where the schedule has thread 7) is left out.
+        let [read, close] = merge_stacks(&early, &stopped, 1094, threads);
+        let (read, source) = read.unwrap();
+        assert_eq!(read, on(5, "early-read"));
+        assert!(source.contains("may be another occurrence"), "{source}");
+        assert_eq!(close, None);
+        // A stopped replay recorded no schedule; its stack still counts when
+        // it was taken on the operation's thread.
+        let stopped_with = replay(
+            false,
+            [Some(on(7, "close")), Some(on(9, "other"))],
+            Some(Departure::Unknown),
+            [None, None],
+        );
+        let [read, close] = merge_stacks(&baseline, &stopped_with, 1094, threads);
+        assert_eq!(read, None);
+        assert_eq!(close.unwrap().0, on(7, "close"));
+
+        let both = replay(
+            true,
+            [Some(on(5, "read")), Some(on(7, "close"))],
+            None,
+            [Some(tid(5)), Some(tid(7))],
+        );
+        assert_eq!(
+            merge_stacks(&both, &followed, 1094, threads).map(|stack| stack.unwrap().1),
+            ["the baseline replay", "the baseline replay"],
+            "the baseline replay's own stacks come first"
+        );
+    }
+
+    /// The final target schedule meets the criteria with another failure
+    /// when the line its output pattern matches differs from the target
+    /// run's; output the pattern does not match, which can differ with the
+    /// interleaving, and line endings around the match are not compared.
+    #[test]
+    fn a_target_replay_with_another_failure_than_the_target_run_is_named() {
+        let workspace = tempfile::tempdir().unwrap();
+        let (target, replay) = (
+            workspace.path().join("run1_target"),
+            workspace.path().join("final_target_for_stacktraces"),
+        );
+        let pattern = Regex::new("fdsan: ").unwrap();
+        let compare = |target_stderr: &str, replay_stderr: &str| {
+            std::fs::write(target.with_extension("stderr"), target_stderr).unwrap();
+            std::fs::write(replay.with_extension("stderr"), replay_stderr).unwrap();
+            changed_output(
+                &target,
+                &replay,
+                [("stdout", None), ("stderr", Some(&pattern))],
+            )
+        };
+        assert_eq!(
+            compare(
+                "start\nfdsan: double-close\n",
+                "other start\nfdsan: double-close"
+            ),
+            None
+        );
+        assert_eq!(compare("x\n\n", "x\n"), None, "no match, no comparison");
+        let change = compare(
+            "start\nfdsan: double-close\n",
+            "start\nfdsan: failed to exchange ownership\n",
+        )
+        .unwrap();
+        assert!(
+            change.contains("the stderr line that --target-stderr matches is \"fdsan: failed to exchange ownership\", where the target run's is \"fdsan: double-close\""),
+            "{change}"
+        );
+        assert!(change.contains("narrow --target-stderr"), "{change}");
+        assert_eq!(
+            changed_output(
+                &workspace.path().join("absent"),
+                &replay,
+                [("stdout", None), ("stderr", Some(&pattern))],
+            ),
+            None,
+            "no target run output (hermit bisect): no comparison"
+        );
+    }
+
+    /// `--minimize`'s baseline knock-out removes a real intervention each
+    /// time: the latest priority change, then whole threads, never a thread
+    /// left at the default priority (which would change nothing), and gives
+    /// up when none is left. Before, the records later knock-outs start
+    /// from (recorded runs) named every thread, and once no priority change
+    /// was left a knock-out could remove one of those, changing nothing.
+    #[test]
+    fn the_baseline_knock_out_removes_a_real_intervention_until_none_is_left() {
+        use std::collections::BTreeMap;
+
+        use detcore::types::LogicalTime;
+        let at = LogicalTime::from_nanos;
+        let record = PreemptionRecord::from_vecs(&BTreeMap::from([
+            (DetTid::from_raw(3), vec![(at(0), 4923), (at(500), 1200)]),
+            (DetTid::from_raw(5), vec![(at(0), 352)]),
+            (DetTid::from_raw(9), vec![]),
+        ]));
+        let threads = |record: &PreemptionRecord| -> Vec<u32> {
+            record
+                .extract_all()
+                .keys()
+                .map(|tid| tid.as_raw() as u32)
+                .collect()
+        };
+        let first = knock_out_latest(&record).unwrap();
+        assert_eq!(threads(&first), [3, 5], "thread 9 had nothing to knock out");
+        assert_ne!(
+            first,
+            record.without_default_threads(),
+            "the knock-out changed the record"
+        );
+        let mut knocked = first;
+        let mut steps = 1;
+        while let Some(next) = knock_out_latest(&knocked) {
+            assert!(!threads(&next).contains(&9));
+            knocked = next;
+            steps += 1;
+            assert!(steps < 10, "the knock-outs do not end");
+        }
+        assert_eq!(
+            threads(&knocked.without_default_threads()),
+            Vec::<u32>::new()
+        );
+    }
+
+    /// `--minimize`'s baseline search knocks out one more intervention of the
+    /// record it last replayed each time, until a replay misses the target or
+    /// none is left; it never starts again from a run's own recording, which
+    /// holds more priority changes than it replayed. Before, a target whose
+    /// replays kept meeting the target knocked out chaos's own changes
+    /// without end.
+    #[test]
+    fn the_baseline_search_knocks_out_the_replayed_record_until_a_replay_misses() {
+        use std::collections::BTreeMap;
+
+        use detcore::types::LogicalTime;
+        let at = LogicalTime::from_nanos;
+        let record = PreemptionRecord::from_vecs(&BTreeMap::from([
+            (DetTid::from_raw(3), vec![(at(0), 4923), (at(500), 1200)]),
+            (DetTid::from_raw(5), vec![(at(0), 352)]),
+        ]));
+        let mut replayed = Vec::new();
+        let missed = knock_out_until_missed(record.clone(), |attempt, knocked_out| {
+            replayed.push(knocked_out.clone());
+            Ok((attempt == 2).then_some(attempt))
+        })
+        .unwrap();
+        assert_eq!(missed, 2);
+        assert_eq!(replayed[0], knock_out_latest(&record).unwrap());
+        assert_eq!(replayed[1], knock_out_latest(&replayed[0]).unwrap());
+
+        let mut attempts = 0;
+        let error = knock_out_until_missed(record, |_, _| {
+            attempts += 1;
+            Ok(None::<()>)
+        })
+        .unwrap_err();
+        assert!(
+            error.downcast_ref::<NothingToKnockOut>().is_some(),
+            "{error:#}"
+        );
+        assert!(
+            attempts == 3,
+            "{attempts} knock-outs for three interventions"
+        );
+    }
+
+    /// A report written before the deciding event was reported still reads.
+    #[test]
+    fn a_report_without_a_deciding_event_reads() {
+        let report: Report = serde_json::from_value(serde_json::json!({
+            "header": "h",
+            "additional_context": "c",
+            "baseline_run": true,
+            "critical_event1": {"event_index": 1, "stack": null},
+            "critical_event2": {"event_index": 2, "stack": null},
+        }))
+        .unwrap();
+        assert_eq!(report.deciding_event, None);
+        assert!(
+            !serde_json::to_string(&report)
+                .unwrap()
+                .contains("deciding_event")
+        );
+    }
+
+    /// A timing decision: the deciding thread runs on in both continuations,
+    /// and the report names how long, and which thread runs next in each.
+    #[test]
+    fn a_timing_decision_names_the_thread_that_runs_next_in_each_continuation() {
+        let with = events(&[5, 3, 3, 3, 7, 5]);
+        let without = events(&[5, 3, 3, 5, 7]);
+        let thread = DetTid::from_raw(3);
+        let with = slice_from(&with, 1, thread);
+        let without = slice_from(&without, 1, thread);
+        assert_eq!(
+            with,
+            Slice {
+                events: 3,
+                branches: 30,
+                next: Some((4, DetTid::from_raw(7)))
+            }
+        );
+        assert_eq!(without.next, Some((3, DetTid::from_raw(5))));
+        assert_eq!(slice_from(&events(&[3, 3]), 0, thread).next, None);
+
+        let header = timing_decision_header(
+            1,
+            &SchedEvent::branches(thread, 10),
+            (&with, &without),
+            "matching stderr",
+            NonZeroU64::new(200_000_000),
+            None,
+        );
+        for expected in [
+            "it is a timing decision: with or without it, the scheduler runs thread 3 there",
+            "thread 3 runs 3 events (30 retired conditional branches) from event #1 on, then thread 7 runs at event #4 (stack1), and the run meets the target criteria (matching stderr)",
+            "Without it, scheduling without chaos at a 200000000 ns timeslice, thread 3 runs 2 events (20 retired conditional branches), then thread 5 runs at event #3 (stack2), and the run does not",
+        ] {
+            assert!(header.contains(expected), "no {expected:?} in\n{header}");
+        }
+
+        // The thread that runs next is where it was in both: stack1 and
+        // stack2 show where thread 3 stops instead, and the next threads are
+        // named without them.
+        let header = timing_decision_header(
+            1,
+            &SchedEvent::branches(thread, 10),
+            (&with, &without),
+            "matching stderr",
+            NonZeroU64::new(200_000_000),
+            Some([3, 2]),
+        );
+        for expected in [
+            "from event #1 on, then thread 7 runs at event #4, and the run meets",
+            "then thread 5 runs at event #3, and the run does not",
+            "so stack1 and stack2 show where thread 3 is when its slice ends instead: at event #3 with the event, at event #2 without it.",
+        ] {
+            assert!(header.contains(expected), "no {expected:?} in\n{header}");
+        }
+        assert!(!header.contains("(stack1)"), "{header}");
+    }
+
+    /// The deciding thread's slice ends replace the next threads' stacks only
+    /// when those have the same frames (whichever threads they are) and both
+    /// were captured.
+    #[test]
+    fn slice_ends_are_reported_only_when_the_next_stacks_tell_nothing_apart() {
+        let stack = |thread: i32, ips: &[u64]| -> PrettyBacktrace {
+            let frames: Vec<_> = ips
+                .iter()
+                .map(|ip| {
+                    serde_json::json!({
+                        "frame": {"ip": ip, "is_signal": false},
+                        "symbol": null,
+                        "locations": []
+                    })
+                })
+                .collect();
+            serde_json::from_value(serde_json::json!({
+                "thread_id": thread, "thread_name": null, "frames": frames
+            }))
+            .unwrap()
+        };
+        let thread = DetTid::from_raw(3);
+        let with = slice_from(&events(&[5, 3, 3, 3, 7, 5]), 1, thread);
+        let without = slice_from(&events(&[5, 3, 3, 5, 7]), 1, thread);
+        let started = [0x10, 0x20];
+        // Two different threads, both just started.
+        let (seven, five) = (stack(7, &started), stack(5, &started));
+        assert_eq!(
+            slice_end_events(&with, &without, [Some(&seven), Some(&five)]),
+            Some([3, 2])
+        );
+        let elsewhere = stack(5, &[0x30, 0x20]);
+        assert_eq!(
+            slice_end_events(&with, &without, [Some(&seven), Some(&elsewhere)]),
+            None
+        );
+        assert_eq!(
+            slice_end_events(&with, &without, [Some(&seven), None]),
+            None
+        );
+        let alone = slice_from(&events(&[5, 3, 3]), 1, thread);
+        assert_eq!(
+            slice_end_events(&alone, &without, [Some(&seven), Some(&five)]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_same_thread_critical_pair_is_flagged_and_a_cross_thread_one_is_not() {
+        let caveat = critical_pair_caveat(&critical(&[3, 3, 5], 1), 2)
+            .expect("two events of thread 3 cannot be reordered");
+        assert!(caveat.contains("both belong to thread 3"), "{caveat}");
+        assert!(caveat.contains("2 trial(s) did not finish"), "{caveat}");
+
+        assert_eq!(
+            critical_pair_caveat(&critical(&[3, 3, 5], 2), 0),
+            None,
+            "3 then 5 is a race"
+        );
+    }
 
     /// A search round whose trial `--max-log-bytes` ended stops the `--search`
     /// loop and returns that error, still a `LogCapExceeded`, so main reports

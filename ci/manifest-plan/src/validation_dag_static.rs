@@ -1762,7 +1762,38 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Eight terminal-finalization custody and classification tests.
     // And container::tests::identity_hardening_freezes_the_dynamic_linker_cache
     // (the frozen /etc/ld.so.cache, Hermit c10c2882): 1096.
-    ("test.hermit_unit", 1096),
+    // And analyze's trial-input tests: phases::tests::{the_workspace_is_created_in_the_tmp_dir,
+    // a_same_thread_critical_pair_is_flagged_and_a_cross_thread_one_is_not},
+    // rundata::tests::{trials_bind_only_a_workspace_the_private_tmp_would_hide,
+    // every_trial_hands_the_guest_the_target_seed_inputs} and
+    // schedule_search::tests::{a_failing_schedule_with_extra_events_reduces_to_the_one_swap,
+    // replays_differing_only_by_branch_skid_are_one_interleaving}: 1102.
+    // And analyze --prefix-search: phases::tests::the_prefix_search_finds_the_deciding_event
+    // and schedule_search::tests::{a_failure_on_failing_only_events_ends_with_no_single_swap,
+    // an_unstable_control_schedule_is_an_error,
+    // two_agreeing_replays_classify_a_schedule_after_an_outlier}: 1106.
+    // And analyze's per-trial bound: rundata::tests::{the_trial_bound_derives_from_the_slowest_endpoint_run,
+    // runs_take_the_bound_and_the_target_run_does_not, a_run_the_trial_bound_ends_names_the_bound,
+    // a_trials_log_is_capped_by_the_largest_endpoint_log,
+    // a_trial_that_a_bound_ends_did_not_reach_the_target,
+    // an_unenforceable_trial_timeout_is_refused_and_auto_does_without} and
+    // global_opts::tests::a_runs_log_bound_only_tightens_the_environment_bound: 1113.
+    // And the prefix search's continuation timeslice: phases::tests::{auto_continuations_only_get_coarser,
+    // the_prefix_search_continues_at_the_first_usable_timeslice} and
+    // rundata::tests::a_continuation_timeslice_that_would_change_the_prefix_is_refused: 1116.
+    // And the report's stacks: phases::tests::{only_the_criteria_a_run_misses_are_reported,
+    // a_replay_leaves_its_schedule_at_the_first_other_event,
+    // each_racing_stack_comes_from_a_replay_that_reached_it,
+    // a_target_replay_with_another_failure_than_the_target_run_is_named,
+    // a_report_without_a_deciding_event_reads,
+    // a_timing_decision_names_the_thread_that_runs_next_in_each_continuation}: 1122.
+    // And phases::tests::slice_ends_are_reported_only_when_the_next_stacks_tell_nothing_apart: 1123.
+    // And --minimize's replay of its own record:
+    // rundata::tests::a_normalized_record_is_written_for_reading_and_not_replayed and
+    // phases::tests::the_baseline_knock_out_removes_a_real_intervention_until_none_is_left: 1125.
+    // And --minimize's baseline search and minimization: phases::tests::the_baseline_search_knocks_out_the_replayed_record_until_a_replay_misses and
+    // minimize::tests::a_failed_cut_of_a_threads_last_interventions_is_tested_again: 1127.
+    ("test.hermit_unit", 1127),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2800,7 +2831,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unit, rendered_procfs's write-open and mode unit, its write-open
     // refusal unit and its `..` alias walk unit, and tool_global's four
     // comm_alias_open_tests through handle_openat): 2527, listed.
-    ("test.detcore_unit", 2527),
+    // And preemptions::tests::a_record_too_varied_to_renumber_keeps_its_priorities: 2528.
+    ("test.detcore_unit", 2528),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4918,7 +4950,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/4582: 2500.
     // And the same fifteen D4c-1 units: 2515, listed.
     // And the same twelve A+ units: 2527, listed.
-    ("test.detcore_unit_on_host", 2527),
+    // And the same normalize test: 2528.
+    ("test.detcore_unit_on_host", 2528),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5261,7 +5294,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // The same eight finalization tests, with the existing selection unchanged.
     // And the frozen ld.so.cache container test (Hermit c10c2882): 1096.
-    ("test.hermit_unit_on_host", 1096),
+    // And the same six analyze trial-input tests: 1102.
+    // And the same four analyze --prefix-search tests: 1106.
+    // And the same seven analyze per-trial bound tests: 1113.
+    // And the same three continuation-timeslice tests: 1116.
+    // And the same six report-stack tests: 1122.
+    // And the same slice-end test: 1123.
+    // And the same two minimize tests: 1125.
+    // And the same two --minimize tests: 1127.
+    ("test.hermit_unit_on_host", 1127),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
