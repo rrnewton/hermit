@@ -1443,6 +1443,29 @@ pub struct RunOpts {
     #[clap(long, value_name = "'Args'|'SystemRandom'")]
     seed_from: Option<SeedFrom>,
 
+    /// With `--chaos`, draw `--max-timeslice` from the scheduler seed instead of using one value
+    /// for every seed. Chaos ends each timeslice after a random number of retired conditional
+    /// branches whose mean is the maximum timeslice; a race whose window is a few branches long
+    /// needs a mean of about a hundred branches, and a race whose other thread must first run far
+    /// needs a mean that lets it get there. Each seed draws its maximum log-uniformly from 1000 to
+    /// 200000000 virtual nanoseconds (the `--max-timeslice` default; raised to one RCB where
+    /// `--clock-multiplier` makes that longer), so a sweep over seeds tries every scale. A seed
+    /// (`--sched-seed`, else `--seed`) always draws the same value, and the run is the run with
+    /// that value given as `--max-timeslice`, except that the guest can read Hermit's own command
+    /// line as PID 1's. Hermit prints the drawn value on stderr, and `--summary` reports it. The
+    /// draw is part of what a seed selects: a Hermit release that changed it would change every
+    /// seed's schedule, so pass the printed value as `--max-timeslice` to pin a run. Seeds that
+    /// draw small values run much slower: every timeslice ends with a timer event, and the ptrace
+    /// backend steps the guest through the last skid margin of each slice (all of a slice shorter
+    /// than the margin, which is 100 to 10000 branches depending on the processor). Needs a backend with a
+    /// PMU timer (ptrace, with or without e9patch preprocessing); elsewhere use
+    /// `--target-timeslice`. Cannot be combined with a positive `--max-timeslice` or with
+    /// `--target-timeslice`. There is nothing to draw with `--max-timeslice=disabled` or on a host
+    /// without usable performance counters, and a run that replays preemptions or a schedule keeps
+    /// the default maximum, since the recording supplies its preemption points.
+    #[clap(long, requires = "chaos")]
+    chaos_seeded_timeslice: bool,
+
     /// After running, immediately run a SECOND time, and compare the two
     /// executions. This will exit with an error if the guest process does OR if
     /// the executions do not match. In order to match, they must have the same
@@ -2140,6 +2163,16 @@ impl fmt::Display for RunOpts {
                     shell_words::quote(tar)
                 )?;
             }
+        }
+
+        // A seeded maximum is rendered as the flag the run was given, which
+        // draws the same value from the same seed; the value beside it would
+        // be refused as a conflict. Without chaos the flag draws nothing (and
+        // would need `--chaos`), and a disabled maximum is rendered as such,
+        // so neither renders the flag.
+        if self.chaos_seeded_timeslice && dop.chaos && dop.max_timeslice.is_some() {
+            write!(f, " --chaos-seeded-timeslice")?;
+            dop.max_timeslice = Some(hermit::chaos_timeslice::DEFAULT_MAX_TIMESLICE);
         }
 
         // A reproducer must retain the actual epoch, including the stable
@@ -6980,6 +7013,15 @@ impl RunOpts {
         self.refuse_strict_with_host_drawn_inputs()?;
         self.refuse_replay_under_another_pipe_wake_latency()?;
         self.refuse_replay_under_another_signal_state_copy()?;
+        // As `--seed-from` prints the seed it chose: the value pins this
+        // run's maximum with `--max-timeslice`.
+        if let Some(drawn) = self.seeded_chaos_timeslice() {
+            crate::tracing::diagnostic_eprintln!(
+                "[hermit] --chaos-seeded-timeslice: scheduler seed {} drew --max-timeslice={}",
+                self.det_opts.det_config.sched_seed(),
+                drawn
+            );
+        }
         if !self.namespace_only
             && (self.verify_verbose
                 || global
@@ -7617,6 +7659,30 @@ impl RunOpts {
         if let Err(error) = config.scheduler_turn_charge() {
             anyhow::bail!("{error}");
         }
+
+        if let Some(sf) = &self.seed_from {
+            let seed = match sf {
+                SeedFrom::Args => {
+                    let mut hasher = DefaultHasher::new();
+                    self.args.hash(&mut hasher);
+                    self.program.hash(&mut hasher);
+                    hasher.finish()
+                }
+                SeedFrom::SystemRandom => rand::random::<u64>(),
+            };
+            // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
+            crate::tracing::diagnostic_eprintln!(
+                "[hermit] auto setting --seed {0:?} --sched-seed {0:?}",
+                seed
+            );
+            config.seed = seed;
+            self.seed_from_resolved = Some(seed);
+        }
+
+        // Once the seed is final, and before the checks below, so that they
+        // check the maximum the run will use.
+        self.resolve_seeded_chaos_timeslice()?;
+        let config = &mut self.det_opts.det_config;
         let minimum_max_timeslice = config.minimum_max_timeslice_nanos();
         if let Some(max_timeslice) = config.max_timeslice
             && u64::from(max_timeslice) < minimum_max_timeslice
@@ -7656,25 +7722,6 @@ impl RunOpts {
             }
             config.max_timeslice = None;
             self.timer_downgrade = Some(unavailable.clone());
-        }
-
-        if let Some(sf) = &self.seed_from {
-            let seed = match sf {
-                SeedFrom::Args => {
-                    let mut hasher = DefaultHasher::new();
-                    self.args.hash(&mut hasher);
-                    self.program.hash(&mut hasher);
-                    hasher.finish()
-                }
-                SeedFrom::SystemRandom => rand::random::<u64>(),
-            };
-            // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
-            crate::tracing::diagnostic_eprintln!(
-                "[hermit] auto setting --seed {0:?} --sched-seed {0:?}",
-                seed
-            );
-            config.seed = seed;
-            self.seed_from_resolved = Some(seed);
         }
 
         // Deterministic RCB counts requires thread pinning.  But this only matters if
@@ -10112,6 +10159,75 @@ impl RunOpts {
     pub(crate) fn capture_max_timeslice_source(&mut self, matches: &clap::ArgMatches) {
         self.max_timeslice_explicit =
             matches.value_source("max_timeslice") != Some(clap::parser::ValueSource::DefaultValue);
+    }
+
+    /// The maximum timeslice `--chaos-seeded-timeslice` drew from the
+    /// scheduler seed, or `None` when this run does not draw one: the flag is
+    /// off, the run is not in chaos mode or replays preemptions or a schedule
+    /// (the recording supplies its preemption points), or the maximum is
+    /// disabled because the host cannot arm the timer.
+    fn seeded_chaos_timeslice(&self) -> Option<NonZeroU64> {
+        let config = &self.det_opts.det_config;
+        let draws = self.chaos_seeded_timeslice
+            && config.chaos
+            && config.replay_preemptions_from.is_none()
+            && config.replay_schedule_from.is_none()
+            && config.max_timeslice.is_some();
+        draws.then(|| {
+            hermit::chaos_timeslice::seeded_max_timeslice(
+                config.sched_seed(),
+                config.minimum_max_timeslice_nanos(),
+            )
+        })
+    }
+
+    /// Lower `--chaos-seeded-timeslice` to `--max-timeslice`: the value drawn
+    /// from the scheduler seed, or else the default the flag stands in for.
+    /// Validation runs again whenever a caller changes the options, as `hermit
+    /// analyze` does when it gives a trial a new seed, turns chaos off for its
+    /// baseline or replays a trial's preemptions, so this derives the value
+    /// afresh from the current options every time rather than from what an
+    /// earlier call stored. A disabled maximum, given or set because the host
+    /// cannot arm the timer, leaves nothing to draw and stays disabled.
+    fn resolve_seeded_chaos_timeslice(&mut self) -> Result<(), Error> {
+        if !self.chaos_seeded_timeslice {
+            return Ok(());
+        }
+        // `--chaos`, which the flag requires, already refuses `--namespace-only`.
+        if !self.backend_arms_reverie_ptrace_pmu_timer() {
+            anyhow::bail!(
+                "--chaos-seeded-timeslice draws the maximum timeslice that the PMU timer \
+                 enforces, and --backend={} has no such timer: run it on --backend=ptrace, or \
+                 give chaos a fixed cooperative deadline with --target-timeslice=N",
+                self.selected_backend().as_str()
+            );
+        }
+        let config = &self.det_opts.det_config;
+        if self.max_timeslice_explicit
+            && let Some(given) = config.max_timeslice
+        {
+            anyhow::bail!(
+                "--chaos-seeded-timeslice draws --max-timeslice from the scheduler seed, so it \
+                 cannot be combined with --max-timeslice={given}: drop --max-timeslice to draw \
+                 the value from the seed, or drop --chaos-seeded-timeslice to keep \
+                 --max-timeslice={given} for every seed"
+            );
+        }
+        if let Some(target) = config.target_timeslice {
+            anyhow::bail!(
+                "--chaos-seeded-timeslice draws --max-timeslice from the scheduler seed, but \
+                 --target-timeslice={target} would set the mean of chaos's timeslices instead: \
+                 drop --target-timeslice to draw the mean from the seed, or drop \
+                 --chaos-seeded-timeslice to keep --target-timeslice={target}"
+            );
+        }
+        if self.det_opts.det_config.max_timeslice.is_some() {
+            self.det_opts.det_config.max_timeslice = Some(
+                self.seeded_chaos_timeslice()
+                    .unwrap_or(hermit::chaos_timeslice::DEFAULT_MAX_TIMESLICE),
+            );
+        }
+        Ok(())
     }
 
     fn resolve_preemption_settings(&self) -> Result<(), Error> {
