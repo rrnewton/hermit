@@ -3066,7 +3066,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
-    ("test.detcore_unit", 2815),
+    // And the three bounded SIGCHLD-deferral units
+    // (https://github.com/rrnewton/hermit/issues/4132): 2818, listed.
+    ("test.detcore_unit", 2818),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4362,7 +4364,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 654 + 5 = 659, listed.
     // And +1 from 82cbd684: 660.
     // Train 6 recount (measured on 21f770f6 base): 666.
-    ("test.cli", 675),
+    // And a_parents_sigchld_is_not_held_behind_a_sibling_that_never_blocks
+    // (https://github.com/rrnewton/hermit/issues/4132), which needs no PMU;
+    // its PMU sibling runs in privileged-test.pmu_cli_cases: 676, listed.
+    ("test.cli", 676),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4444,7 +4449,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_schedule_replay_ends_check_in_slices_where_the_record_did, whose
     // replay needs a PMU stop on a branch count to go wrong, joins them: 17,
     // listed.
-    ("privileged-test.pmu_cli_cases", 18),
+    // a_parent_reaps_its_sigkilled_child_beside_a_contender_that_never_blocks
+    // (https://github.com/rrnewton/hermit/issues/4132), whose child spins with
+    // no syscall, joins them: 19, listed.
+    ("privileged-test.pmu_cli_cases", 19),
     // The six x86-64-v3 CLI cases that run a guest, with
     // HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 so that a refusal fails
     // (https://github.com/rrnewton/hermit/issues/4243): 6, listed with this
@@ -4905,7 +4913,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 5 = 578, listed.
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
-    ("test.cli_on_host", 594),
+    // a_parents_sigchld_is_not_held_behind_a_sibling_that_never_blocks needs
+    // neither a PMU nor CPUID faulting: 595, listed.
+    ("test.cli_on_host", 595),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5378,7 +5388,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
-    ("test.detcore_unit_on_host", 2815),
+    // And the same three bounded SIGCHLD-deferral units: 2818, listed.
+    ("test.detcore_unit_on_host", 2818),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
