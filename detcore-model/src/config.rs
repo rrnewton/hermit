@@ -786,6 +786,19 @@ pub struct Config {
     /// Set this to `disabled` or `0` to disable PMU-backed preemption. Positive values must be at
     /// least one RCB (10 virtual nanoseconds at the default clock multiplier) and require
     /// user-space hardware performance counters.
+    ///
+    /// Small values are expensive. A thread that computes without returning to Detcore is stopped
+    /// by a PMU timer event at the end of every timeslice, and on the ptrace backend a precise
+    /// timer (the default) is placed by stepping the guest through up to the last skid margin of
+    /// the slice: 100 to 10000 RCBs depending on the processor, or the `--skid-margin` override. A
+    /// slice no longer than the margin is stepped through whole. A CPU-bound guest can run
+    /// thousands of times slower than at the default (a pipeline test took 0.3 s at the default and
+    /// 994 s at 1000), and a `--timeout` that expires may mean a slow run rather than a hung one.
+    /// `hermit run`, `hermit analyze` and `hermit bisect` say so on stderr when a slice is at most
+    /// ten skid margins long, so that at least a tenth of it is stepped (100000 virtual
+    /// nanoseconds at the default clock multiplier on a processor with a 10000-RCB margin); a
+    /// preemption replay, whose recording sets the slices, and `--imprecise-timers`, which steps
+    /// nothing, say nothing. `--summary` reports how many timeslices the run had.
     #[serde(alias = "preemption_timeout")]
     #[clap(
                 long,
@@ -1279,15 +1292,22 @@ impl Config {
         self.epoch = epoch_from_host_time(now);
     }
 
-    /// Smallest PMU-backed maximum representable by one RCB at this clock multiplier.
-    pub fn minimum_max_timeslice_nanos(&self) -> u64 {
+    /// Virtual nanoseconds one RCB takes at this clock multiplier and, under a
+    /// chaos per-thread slowdown, at its largest factor: the most any thread's
+    /// RCB takes, so a timeslice of `n` virtual nanoseconds is at least
+    /// `n / largest_nanos_per_rcb()` RCBs for every thread.
+    pub fn largest_nanos_per_rcb(&self) -> f64 {
         let slowdown = if self.chaos && self.chaos_per_thread_slowdown {
             self.chaos_slowdown_max_factor
         } else {
             1.0
         };
-        let multiplier = self.clock_multiplier.unwrap_or(1.0) * slowdown;
-        ((NANOS_PER_RCB * multiplier).ceil() as u64).max(NANOS_PER_RCB as u64)
+        NANOS_PER_RCB * self.clock_multiplier.unwrap_or(1.0) * slowdown
+    }
+
+    /// Smallest PMU-backed maximum representable by one RCB at this clock multiplier.
+    pub fn minimum_max_timeslice_nanos(&self) -> u64 {
+        (self.largest_nanos_per_rcb().ceil() as u64).max(NANOS_PER_RCB as u64)
     }
 
     /// Check invariants that must hold at every execution boundary without mutating the config.

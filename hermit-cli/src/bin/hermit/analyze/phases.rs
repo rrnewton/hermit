@@ -750,6 +750,11 @@ impl AnalyzeOpts {
         self.refuse_unqualified_trial_timeout()?;
         self.install_trial_pmu_config()?;
         self.refuse_strict_with_inexact_branch_counter()?;
+        if let Some(notice) =
+            self.small_trial_max_timeslice_notice(crate::run::installed_skid_margin)
+        {
+            crate::tracing::write_stderr_diagnostic(&notice);
+        }
         // `--run1-schedule` and `--run2-schedule` parse but have no
         // implementation. Refuse them before any workspace or trial, rather
         // than panicking here.
@@ -1043,6 +1048,35 @@ mod tests {
     use super::*;
     use crate::container::LogCapExceeded;
     use crate::container::PolicyRefusal;
+
+    /// `analyze` and `bisect` take the small `--max-timeslice` notice from the
+    /// run arguments every trial shares, where the host can arm the timer the
+    /// trials need, and give none for the default.
+    #[test]
+    fn trials_get_the_small_max_timeslice_notice_from_their_run_arguments() {
+        let parse = |run: &[&str]| {
+            let mut argv = vec!["analyze", "--"];
+            argv.extend(run);
+            AnalyzeOpts::try_parse_from(argv).unwrap()
+        };
+        let timer = crate::run::reverie_timer_support_for_tests();
+        let small = parse(&["--max-timeslice=1000", "/bin/true"]);
+        // A margin of the test's own, not the process's PMU configuration,
+        // which `--skid-margin` tests in this binary must install first.
+        let margin: fn() -> u64 = || 10_000;
+        let notice = small.small_trial_max_timeslice_notice(margin);
+        assert_eq!(notice.is_some(), timer, "{notice:?}");
+        if let Some(notice) = notice {
+            assert!(
+                notice.starts_with("NOTICE: --max-timeslice=1000 "),
+                "{notice}"
+            );
+        }
+        assert_eq!(
+            parse(&["/bin/true"]).small_trial_max_timeslice_notice(margin),
+            None
+        );
+    }
 
     /// A search round whose trial `--max-log-bytes` ended stops the `--search`
     /// loop and returns that error, still a `LogCapExceeded`, so main reports
