@@ -24,6 +24,7 @@ mod dbt_placement_probe;
 mod backend_stats;
 pub mod build_info;
 pub mod canonical_verdict;
+pub mod chaos_timeslice;
 mod chroot;
 use hermit_record_format::consts;
 pub mod logdiff_report;

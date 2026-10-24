@@ -423,6 +423,33 @@ CPU-bound code that rarely makes system calls. The old
 `--preemption-timeout` spelling is a deprecated alias for
 `--max-timeslice`.
 
+The value that finds a race depends on the race. Chaos ends each timeslice
+after a random number of retired conditional branches whose mean is the
+maximum timeslice. A race whose window spans a few branches needs a mean of
+about a hundred branches (`--max-timeslice=1000`); a race whose other thread
+must first run far into its own work needs a mean long enough to get there,
+and short slices miss it. No single value finds both. Rather than guessing,
+let each seed draw its own value:
+
+```bash
+for seed in $(seq 0 63); do
+  hermit run --chaos --chaos-seeded-timeslice --sched-seed="$seed" -- ./target/debug/hello_race
+done
+```
+
+Each seed draws its maximum log-uniformly from 1000 to 200000000 virtual
+nanoseconds, so a sweep spends about a fifth of its seeds in each decade, and
+prints it: `[hermit] --chaos-seeded-timeslice: scheduler seed 7 drew
+--max-timeslice=...`. Rerunning the seed reproduces the run, and so does
+passing the printed value as `--max-timeslice` instead of the flag. The draw is
+part of what a seed selects, so a Hermit release that changed it would change
+every seed's schedule; the printed value pins it. Seeds that draw small values
+run much slower: every timeslice ends with a timer event, and the ptrace
+backend steps the guest through the last skid margin (100 to 10000 branches,
+depending on the processor) of every slice. The option needs the PMU timer of
+the ptrace backend; on other backends, set chaos's cooperative deadline with
+`--target-timeslice`.
+
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with
 `--replay-preemptions-from=FILE`.
@@ -677,6 +704,7 @@ reproducible target condition.
 | `--no-deterministic-io` | Disables Hermit's deterministic short-I/O completion behavior. |
 | `--chaos` | Uses seeded randomized deterministic scheduling. |
 | `--sched-seed=N` | Selects a reproducible chaos schedule. |
+| `--chaos-seeded-timeslice` | With `--chaos`, draws `--max-timeslice` from the scheduler seed, log-uniformly from 1000 to 200000000 virtual nanoseconds, and prints the value. |
 | `--target-timeslice=N` | Ends a logical turn at the first syscall boundary after N virtual nanoseconds. |
 | `--max-timeslice=N` | Sets the maximum virtual time slice (minimum one scaled RCB) and requires PMU support. |
 | `--max-timeslice=disabled` | Disables PMU timer preemption. |
