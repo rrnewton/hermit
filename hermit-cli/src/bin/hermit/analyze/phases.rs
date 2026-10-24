@@ -648,10 +648,15 @@ impl AnalyzeOpts {
                 false,
             )?;
 
-            // Also print to the screen:
+            // Also print to the screen, the branch-counter caveat first: the
+            // report must not read as reproducible where its trials may not
+            // have been.
             println!(
                 "\n------------------------------ hermit analyze report ------------------------------"
             );
+            if let Some(warning) = &self.branch_counter_warning {
+                println!("{warning}");
+            }
             println!("{}", header);
             Self::print_stack("stack1", &stack1);
             Self::print_stack("stack2", &stack2);
@@ -669,6 +674,7 @@ impl AnalyzeOpts {
                     event_index: critical_event_index,
                     stack: stack2,
                 },
+                branch_counter_warning: self.branch_counter_warning.clone(),
             };
 
             if self.verbose {
@@ -749,7 +755,7 @@ impl AnalyzeOpts {
         self.refuse_outputs_trials_overwrite()?;
         self.refuse_unqualified_trial_timeout()?;
         self.install_trial_pmu_config()?;
-        self.refuse_strict_with_inexact_branch_counter()?;
+        self.admit_branch_counter(&mut crate::tracing::write_stderr_diagnostic)?;
         // `--run1-schedule` and `--run2-schedule` parse but have no
         // implementation. Refuse them before any workspace or trial, rather
         // than panicking here.

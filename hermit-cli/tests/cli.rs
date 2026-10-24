@@ -27054,6 +27054,131 @@ fn ptrace_verification_reports_carry_the_exact_branch_counter_verdict() {
     }
 }
 
+/// Each command that `--strict` refuses on a retired-branch counter that
+/// fails Reverie's validation warns once when it goes on without `--strict`
+/// (https://github.com/rrnewton/hermit/issues/4515): `run`, `analyze`,
+/// `bisect` and every recording path of `record start` that the CLI reaches
+/// without gdb. The host decides which side this exercises, and no counter
+/// result is faked: where the counter fails, each strict command is refused
+/// for it, the same command without `--strict` writes the warning line exactly
+/// once, and `hermit host-capabilities` reports the counter absent; where it
+/// passes, or no counter is armed, none of that happens. `analyze` and
+/// `bisect` stop before their first trial (on an unimplemented
+/// `--run1-schedule` and on missing schedules) and `run` at its missing
+/// program, so only the recordings start a guest.
+#[test]
+fn commands_strict_refuses_on_an_inexact_branch_counter_warn_once_without_it() {
+    const WARNING: &str = "WARNING: this host's retired-branch counter failed Reverie's performance-counter \
+         validation. ";
+    const REFUSAL: &str = "--strict refuses the `";
+    let _guard = hermit_run_guard();
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the branch-counter warning test directory");
+    let dir = |name: &str| {
+        root.path()
+            .join(name)
+            .to_str()
+            .expect("test paths should be UTF-8")
+            .to_owned()
+    };
+    let capabilities = hermit_test::hermit_output(
+        "hermit host-capabilities",
+        Command::new(env!("CARGO_BIN_EXE_hermit")).args(["host-capabilities", "--json"]),
+    );
+    assert!(capabilities.status.success(), "{capabilities:?}");
+    let exact = serde_json::from_slice::<serde_json::Value>(&capabilities.stdout)
+        .expect("host-capabilities --json is JSON")["exact_branch_counter"]["present"]
+        .as_bool()
+        .expect("exact_branch_counter.present is a boolean");
+    let missing = "/nonexistent/hermit-inexact-counter-guest";
+    let run1 = "--run1-schedule=/nonexistent/schedule.json";
+    let (good, bad) = (
+        "--good=/nonexistent/good.json",
+        "--bad=/nonexistent/bad.json",
+    );
+    let data = dir("data");
+    let (verify_run_strict, verify_run) = (dir("verify-run-strict"), dir("verify-run"));
+    // Each command with `--strict`, then without it.
+    let commands: [(&str, &[&str], &[&str]); 6] = [
+        ("run", &["run", "--strict", missing], &["run", missing]),
+        (
+            "analyze",
+            &["analyze", run1, "--", "--strict", "/bin/true"],
+            &["analyze", run1, "--", "/bin/true"],
+        ),
+        (
+            "bisect",
+            &["bisect", good, bad, "--", "--strict", "/bin/true"],
+            &["bisect", good, bad, "--", "/bin/true"],
+        ),
+        (
+            "record start",
+            &[
+                "record",
+                "start",
+                "--data-dir",
+                &data,
+                "--strict",
+                "--",
+                "/bin/true",
+            ],
+            &["record", "start", "--data-dir", &data, "--", "/bin/true"],
+        ),
+        (
+            "record start --verify",
+            &["record", "start", "--verify", "--strict", "--", "/bin/true"],
+            &["record", "start", "--verify", "--", "/bin/true"],
+        ),
+        (
+            "record start --verify-run",
+            &[
+                "record",
+                "start",
+                "--verify-run",
+                &verify_run_strict,
+                "--strict",
+                "--",
+                "/bin/true",
+            ],
+            &[
+                "record",
+                "start",
+                "--verify-run",
+                &verify_run,
+                "--",
+                "/bin/true",
+            ],
+        ),
+    ];
+    for (label, strict_args, relaxed_args) in commands {
+        let stderr_of = |args: &[&str]| {
+            let output = hermit_test::hermit_output(
+                &format!("hermit {label}"),
+                Command::new(env!("CARGO_BIN_EXE_hermit")).args(args),
+            );
+            strip_ansi_sgr(&stderr(&output))
+        };
+        let strict = stderr_of(strict_args);
+        let relaxed = stderr_of(relaxed_args);
+        let refused = strict.contains(REFUSAL);
+        let warnings = relaxed
+            .lines()
+            .filter(|line| line.starts_with(WARNING))
+            .count();
+        let report = format!("strict stderr:\n{strict}\nstderr without --strict:\n{relaxed}");
+        assert_eq!(warnings, usize::from(refused), "{label}: {report}");
+        assert!(
+            !strict.contains(WARNING),
+            "{label}: refused, not warned: {report}"
+        );
+        if label.starts_with("record") {
+            // A recording reads the counter whenever one is armed, so its
+            // refusal is the host's own verdict.
+            assert_eq!(refused, !exact, "{label}: {report}");
+        }
+    }
+}
+
 /// `--keep-logs` keeps ONLY the first run's log after a matched verification.
 ///
 /// Owner rule, https://github.com/rrnewton/hermit/issues/3301: after the two

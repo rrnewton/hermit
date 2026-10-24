@@ -127,6 +127,7 @@ impl BisectOpts {
             max_log_bytes: global.max_log_bytes,
             log_budget: global.log_budget(),
             inexact_branch_counter: self.inexact_branch_counter,
+            branch_counter_warning: None,
         };
         // Before the schedules are read: a refused cap or counter reads and
         // starts nothing.
@@ -135,7 +136,7 @@ impl BisectOpts {
         analyzer.refuse_outputs_trials_overwrite()?;
         analyzer.refuse_unqualified_trial_timeout()?;
         analyzer.install_trial_pmu_config()?;
-        analyzer.refuse_strict_with_inexact_branch_counter()?;
+        analyzer.admit_branch_counter(&mut crate::tracing::write_stderr_diagnostic)?;
 
         let good = read_schedule(&self.good, "good")?;
         let bad = read_schedule(&self.bad, "bad")?;

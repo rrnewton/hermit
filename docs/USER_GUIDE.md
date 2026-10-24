@@ -391,6 +391,17 @@ for seed in 1 2 3 4 5; do
 done
 ```
 
+On a host whose retired-branch counter fails Reverie's performance-counter
+validation (`hermit host-capabilities` reports `exact-branch-counter: ABSENT`),
+the same seed is not guaranteed to reproduce a schedule when the run has a
+timeslice, because preemptions are timed with that counter. On the ptrace and
+e9patch backends `--strict` refuses such a run; without it, `hermit run`,
+`hermit analyze`, `hermit bisect` and `hermit record start` go on but first
+print one line that starts `WARNING: this host's retired-branch counter failed`.
+Rerun a finding from such a host on one where `hermit host-capabilities`
+reports `exact-branch-counter: PRESENT` with the validation passed before
+treating it as reproducible.
+
 The seed options have distinct roles:
 
 - `--sched-seed=N` controls scheduler randomness.
