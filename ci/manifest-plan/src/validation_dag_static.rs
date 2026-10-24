@@ -3796,7 +3796,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And record_replay_flocks_a_self_created_file_opened_by_relative_path
     // (https://github.com/rrnewton/hermit/issues/5007): 228 + 1 = 229.
     // And record_replay_gives_the_guest_a_private_dev_shm: 230.
-    ("test.record_replay", 230),
+    // And record_replay_gives_the_guest_a_private_ipc_namespace: 231.
+    ("test.record_replay", 231),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -4560,7 +4561,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_run_gets_a_private_empty_dev_shm,
     // concurrent_runs_do_not_share_dev_shm and
     // host_dev_shm_sources_stay_the_hosts: 779.
-    ("test.cli", 779),
+    // And a_run_gets_a_private_ipc_namespace and
+    // concurrent_runs_do_not_share_ipc: 781.
+    ("test.cli", 781),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5175,7 +5178,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same recount at bc48233db5 as test.cli: 682 + 1 = 683.
     // The same twelve N3 cli cases: 683 + 12 = 695.
     // And the three private /dev/shm tests: 698.
-    ("test.cli_on_host", 698),
+    // And the two private IPC namespace tests: 700.
+    ("test.cli_on_host", 700),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
