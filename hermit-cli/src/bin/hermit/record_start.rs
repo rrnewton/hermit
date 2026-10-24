@@ -234,9 +234,9 @@ pub struct StartOpts {
     /// Select guest networking, with the same contract as `hermit run --network`. `local`
     /// (the default) gives the recording and its verify replay an isolated loopback
     /// interface; `host` exposes the host network to the recording. The choice is
-    /// stored in the recording, and `hermit replay --autopilot` replays in the same
-    /// network. `--verify-with-gdbex` defaults to, and requires, `host`: its replay's
-    /// gdbserver must be reachable from the gdb client outside the container.
+    /// stored in the recording, and `hermit replay` replays in the same network,
+    /// served to gdb or not, as does `--verify-with-gdbex`: a replay's gdbserver
+    /// port is bound in the host's network namespace, where the gdb client reaches it.
     #[clap(long, alias = "net", value_name = "local|host")]
     network: Option<NetworkingMode>,
 
@@ -457,31 +457,9 @@ impl StartOpts {
         )
     }
 
-    /// Whether this invocation replays its recording under a gdbserver.
-    fn replays_under_gdb(&self) -> bool {
-        !self.verify && !self.gdbex.is_empty()
-    }
-
     /// The network the recording (and an immediate replay of it) runs in.
     fn network(&self) -> NetworkingMode {
-        self.network.unwrap_or(if self.replays_under_gdb() {
-            NetworkingMode::Host
-        } else {
-            NetworkingMode::Local
-        })
-    }
-
-    /// A replay served to gdb runs on the host network, where the gdb client
-    /// can reach its gdbserver port, so the recording it checks must too.
-    fn check_gdb_replay_network(&self) -> Result<(), Error> {
-        if self.replays_under_gdb() && self.network() == NetworkingMode::Local {
-            anyhow::bail!(
-                "--verify-with-gdbex replays under a gdbserver that the gdb client reaches \
-                 on the host network, so the recording must use the same network; \
-                 --network local is not supported with it"
-            );
-        }
-        Ok(())
+        self.network.unwrap_or(NetworkingMode::Local)
     }
 
     fn configured_container(
@@ -929,7 +907,6 @@ impl StartOpts {
 
     /// This is called when `--verify-with-gdbex` is passed to the command line.
     fn record_verify_debug(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        self.check_gdb_replay_network()?;
         let (mut container, identity_guard) = self.recording_container(global)?;
 
         eprintln!(":: {}", "Recording...".yellow().bold());
@@ -987,10 +964,12 @@ impl StartOpts {
         let exe = data_dir.join("exe");
         let real_exe = Shebang::new(&exe).map_or(exe, |s| s.interpreter().into());
 
-        // Not using fixed port (such as 1234) here because this is mainly
-        // intended for tests, which could be running in parallel. This could
-        // be flakey when port is already in use.
-        let gdbserver_port = 16384 + nix::unistd::gettid().as_raw() as u16 % 1024;
+        // Any free port: this is mainly for tests, which can run in parallel.
+        // Bound here, in the host's network namespace, before the container
+        // exists, so the gdb client reaches it whatever network the replay
+        // has (`hermit::gdbserver`).
+        let bound_port = hermit::gdbserver::GdbPort::bind(0)?;
+        let gdbserver_port = bound_port.port();
 
         // Run the gdb client outside of the PID namespace. This cannot be done
         // inside of the PID namespace because it would perturb the
@@ -1023,11 +1002,13 @@ impl StartOpts {
         // on that container result, unreachable in exactly the case that needed
         // it. The watch owns the reap and releases the accept.
         let gdb_watch = GdbClientWatch::spawn(gdb_command, gdbserver_port)?;
-        // The gdb client runs outside the container, so the replay's gdbserver
-        // port must live in the host network namespace, which `network()`
-        // guarantees the recording also used.
         let (mut container, identity) = self.configured_container(self.network())?;
-        let guards = Rc::new(RefCell::new((temp_data_dir, identity, gdb_watch)));
+        let guards = Rc::new(RefCell::new((
+            temp_data_dir,
+            identity,
+            gdb_watch,
+            Some(bound_port),
+        )));
         let replay_global = global.clone();
         let mounts = self.mount.clone();
         let result = super::owned_container::run(
@@ -1039,6 +1020,9 @@ impl StartOpts {
             None,
             move |guards| {
                 let _guard = replay_global.init_tracing();
+                if let Some(port) = guards.borrow_mut().3.take() {
+                    port.serve_next_gdbserver();
+                }
                 hermit::replay_with_gdbserver_and_mounts(
                     guards.borrow().0.path(),
                     gdbserver_port,
@@ -1375,7 +1359,7 @@ mod tests {
     }
 
     /// `record start` takes `run`'s networking contract, local by default,
-    /// except that a gdb-served replay needs the host network.
+    /// a gdb-served replay included.
     #[test]
     fn record_networking_defaults_to_local_like_run() {
         #[derive(clap::Parser)]
@@ -1396,6 +1380,17 @@ mod tests {
         );
         assert_eq!(
             parse(&["start", "--verify-with-gdbex", "continue", "/bin/true"]),
+            NetworkingMode::Local
+        );
+        assert_eq!(
+            parse(&[
+                "start",
+                "--network",
+                "host",
+                "--verify-with-gdbex",
+                "continue",
+                "/bin/true"
+            ]),
             NetworkingMode::Host
         );
         assert_eq!(
@@ -1419,47 +1414,6 @@ mod tests {
             ]),
             NetworkingMode::Local
         );
-    }
-
-    #[test]
-    fn a_gdb_checked_recording_refuses_local_networking() {
-        #[derive(clap::Parser)]
-        struct Cli {
-            #[clap(flatten)]
-            start: StartOpts,
-        }
-        let check = |args: &[&str]| {
-            <Cli as clap::Parser>::try_parse_from(args)
-                .unwrap()
-                .start
-                .check_gdb_replay_network()
-        };
-        let refused = check(&[
-            "start",
-            "--network",
-            "local",
-            "--verify-with-gdbex",
-            "continue",
-            "/bin/true",
-        ])
-        .unwrap_err();
-        assert!(
-            refused
-                .to_string()
-                .contains("--network local is not supported"),
-            "{refused:#}"
-        );
-        check(&["start", "--verify-with-gdbex", "continue", "/bin/true"]).unwrap();
-        check(&[
-            "start",
-            "--network",
-            "host",
-            "--verify-with-gdbex",
-            "continue",
-            "/bin/true",
-        ])
-        .unwrap();
-        check(&["start", "--network", "local", "/bin/true"]).unwrap();
     }
 
     #[test]
