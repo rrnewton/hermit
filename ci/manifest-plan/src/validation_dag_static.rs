@@ -1869,7 +1869,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // phases::tests::the_baseline_knock_out_removes_a_real_intervention_until_none_is_left: 1217.
     // And --minimize's baseline search and minimization: phases::tests::the_baseline_search_knocks_out_the_replayed_record_until_a_replay_misses and
     // minimize::tests::a_failed_cut_of_a_threads_last_interventions_is_tested_again: 1219.
-    ("test.hermit_unit", 1219),
+    // And the confirmation of a boundary trial the bound stopped:
+    // phases::tests::{a_trial_a_bound_stopped_does_not_decide_the_boundary,
+    // a_confirmed_trial_keeps_the_boundary,
+    // a_refuted_boundary_resumes_above_the_last_finished_miss,
+    // an_empty_prefix_that_meets_the_target_given_longer_ends_the_search} and
+    // rundata::tests::a_confirmation_lengthens_the_trial_bound: 1133.
+    // And phases::tests::a_boundary_trial_still_stopped_is_reported_as_a_hang,
+    // the_longest_finished_prefix_below_the_boundary_is_named and
+    // a_confirmation_raises_the_bound_and_keeps_it_once_finished: 1227.
+    ("test.hermit_unit", 1227),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5778,7 +5787,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same slice-end test: 1209.
     // And the same two minimize tests: 1211.
     // And the same two --minimize tests: 1213.
-    ("test.hermit_unit_on_host", 1213),
+    // And the same five boundary-confirmation tests: 1133.
+    // And the same three prefix-hang tests: 1221.
+    ("test.hermit_unit_on_host", 1221),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
