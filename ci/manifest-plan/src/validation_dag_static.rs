@@ -1868,7 +1868,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the prefix search's continuation timeslice: phases::tests::{auto_continuations_only_get_coarser,
     // the_prefix_search_continues_at_the_first_usable_timeslice} and
     // rundata::tests::a_continuation_timeslice_that_would_change_the_prefix_is_refused: 1191.
-    ("test.hermit_unit", 1191),
+    // And the report's stacks: phases::tests::{only_the_criteria_a_run_misses_are_reported,
+    // a_replay_leaves_its_schedule_at_the_first_other_event,
+    // each_racing_stack_comes_from_a_replay_that_reached_it,
+    // a_target_replay_with_another_failure_than_the_target_run_is_named,
+    // a_report_without_a_deciding_event_reads,
+    // a_timing_decision_names_the_thread_that_runs_next_in_each_continuation}: 1197.
+    ("test.hermit_unit", 1197),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5736,7 +5742,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same one-thread prefix report test: 1175.
     // And the same seven analyze per-trial bound tests: 1182.
     // And the same three continuation-timeslice tests: 1185.
-    ("test.hermit_unit_on_host", 1185),
+    // And the same six report-stack tests: 1191.
+    ("test.hermit_unit_on_host", 1191),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
