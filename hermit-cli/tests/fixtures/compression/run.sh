@@ -42,8 +42,12 @@ run_strict() {
 }
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-repo_root=$(git -C "$script_dir" rev-parse --show-toplevel)
-hermit_bin=${HERMIT_BIN:-$repo_root/target/release/hermit}
+# Staged sources need not include Git metadata or a Cargo toolchain.
+repo_root=${COMPRESSION_REPO_ROOT:-$script_dir/../../../..}
+repo_root=$(cd "$repo_root" && pwd) || fail "invalid compression repository root"
+[[ $repo_root/hermit-cli/tests/fixtures/compression/run.sh -ef ${BASH_SOURCE[0]} ]] ||
+  fail "COMPRESSION_REPO_ROOT does not contain this compression runner: $repo_root"
+hermit_bin=${HERMIT_BIN-$repo_root/target/release/hermit}
 artifact_root=${COMPRESSION_ARTIFACT_ROOT:-$repo_root/target/compression}
 runs=${COMPRESSION_RUNS:-3}
 input_lines=${COMPRESSION_INPUT_LINES:-24000}
@@ -52,15 +56,32 @@ require_positive_integer COMPRESSION_RUNS "$runs"
 require_positive_integer COMPRESSION_INPUT_LINES "$input_lines"
 ((runs == 3)) || fail "COMPRESSION_RUNS must be 3 for the determinism check"
 
-for tool in awk basename bzip2 bzip2recover cargo cat cmp cp date git gzip mkdir seq sha256sum uname wc; do
+for tool in awk basename bzip2 bzip2recover cat cmp cp date gzip mkdir seq sha256sum uname wc; do
   command -v "$tool" >/dev/null || fail "required command not found: $tool"
 done
+
+if [[ ${COMPRESSION_SOURCE_REVISION+x} ]]; then
+  [[ -n $COMPRESSION_SOURCE_REVISION ]] || fail "COMPRESSION_SOURCE_REVISION must not be empty"
+  repository_commit=$COMPRESSION_SOURCE_REVISION
+  repository_commit_source=explicit
+else
+  command -v git >/dev/null || fail "git is required without COMPRESSION_SOURCE_REVISION"
+  git_root=$(git -C "$repo_root" rev-parse --show-toplevel) ||
+    fail "cannot determine source revision; set COMPRESSION_SOURCE_REVISION for staged sources"
+  [[ $git_root -ef $repo_root ]] ||
+    fail "source root is not a Git checkout; set COMPRESSION_SOURCE_REVISION for staged sources"
+  repository_commit=$(git -C "$repo_root" rev-parse HEAD) ||
+    fail "cannot determine source revision; set COMPRESSION_SOURCE_REVISION for staged sources"
+  repository_commit_source=git
+fi
 
 bzip2_bin=$(command -v bzip2)
 bzip2recover_bin=$(command -v bzip2recover)
 gzip_bin=$(command -v gzip)
 
 if [[ ! -x $hermit_bin ]]; then
+  [[ ! ${HERMIT_BIN+x} ]] || fail "Hermit binary is not executable: $hermit_bin"
+  command -v cargo >/dev/null || fail "required command not found: cargo"
   cargo build --manifest-path "$repo_root/Cargo.toml" --release -p hermit-run --bin hermit
 fi
 [[ -x $hermit_bin ]] || fail "Hermit binary is not executable: $hermit_bin"
@@ -86,7 +107,8 @@ metadata=$evidence_dir/metadata.txt
 {
   printf 'schema_version=1\n'
   printf 'started_at_utc=%s\n' "$timestamp"
-  printf 'repository_commit=%s\n' "$(git -C "$repo_root" rev-parse HEAD)"
+  printf 'repository_commit=%s\n' "$repository_commit"
+  printf 'repository_commit_source=%s\n' "$repository_commit_source"
   printf 'host_kernel=%s\n' "$(uname -srmo)"
   printf 'runs=%s\n' "$runs"
   printf 'input_lines=%s\n' "$input_lines"
