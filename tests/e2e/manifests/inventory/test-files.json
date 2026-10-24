@@ -2593,6 +2593,12 @@
       "why": "tests/c/socket_epoll_ordering.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI because no backend has ever been measured for this cell -- the registration it was ported from disabled the non-ptrace backends with a host-toolchain excuse rather than a measurement"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/socket_errqueue.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/socket_errqueue.c is owned by hermit-cli/tests/cli.rs: msg_errqueue_returns_at_once_on_inet_sockets_and_waits_on_unix_sockets runs it natively and under ptrace, --strict and not, and requires byte-identical output with a fixed expectation: recvfrom, recvmsg and recvmmsg with MSG_ERRQUEUE on blocking UDP, UDPv6 and TCP sockets return -1 EAGAIN at once with the error queue empty and the queued ICMP port unreachable when IP_RECVERR holds one, while on AF_UNIX datagram and stream sockets, which ignore the flag, a blocking MSG_ERRQUEUE receive waits for data a later sender writes. It stays a fixture because the test compares native and Hermit output."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/socket_ioctl_timestamp.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
