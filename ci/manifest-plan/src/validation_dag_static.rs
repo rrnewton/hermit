@@ -1155,7 +1155,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (A5 step 3c.1a, the delivery gate's field): 1816, listed.
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // 19 boundary/config model tests, two verifier tests, and five restored replay cases.
-    ("test.regular_crates", 1842),
+    // And detcore-model's config::tests::notice_host_network_abstract_binds_never_enters_the_legacy_form
+    // and config::tests::notice_host_network_abstract_binds_round_trips_through_reverie_bincode: 1844.
+    ("test.regular_crates", 1844),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1762,7 +1764,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Eight terminal-finalization custody and classification tests.
     // And container::tests::identity_hardening_freezes_the_dynamic_linker_cache
     // (the frozen /etc/ld.so.cache, Hermit c10c2882): 1096.
-    ("test.hermit_unit", 1096),
+    // And run::abstract_bind_notice_is_on_only_for_an_explicit_host_network_run_on_ptrace: 1097.
+    ("test.hermit_unit", 1097),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2805,7 +2808,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // epoch read without copying the configuration, and its placeholder
     // gate): 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit", 2529),
+    // And syscalls::files::test::host_network_notice_names_only_abstract_unix_addresses: 2530.
+    ("test.detcore_unit", 2530),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4012,7 +4016,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (A5 step 3c slice 0c): 600, listed.
     // And liteinst_in_guest_programs::in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name
     // (A5 step 3c slice 0g): 601, listed.
-    ("test.cli", 601),
+    // And run_host_network_abstract_unix_bind_prints_one_notice,
+    // run_host_network_abstract_unix_bind_collision_names_eaddrinuse,
+    // run_host_network_unix_autobind_prints_the_notice and
+    // run_local_network_abstract_unix_bind_prints_no_notice: 605.
+    ("test.cli", 605),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4502,7 +4510,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unchanged at 520.
     // The in-guest unsequentialized-handler refusal test (slice 0g) starts the
     // in-guest runtime too and joins the hosted exclusions: unchanged at 520.
-    ("test.cli_on_host", 520),
+    // The four abstract-socket notice tests start only ptrace guests, so
+    // test.cli_on_host selects them too: 524.
+    ("test.cli_on_host", 524),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4925,7 +4935,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twelve A+ units: 2527, listed.
     // And the same three slice 7d determinize_stat_tests units: 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit_on_host", 2529),
+    // And the same host-network abstract-socket notice unit: 2530.
+    ("test.detcore_unit_on_host", 2530),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5268,7 +5279,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // The same eight finalization tests, with the existing selection unchanged.
     // And the frozen ld.so.cache container test (Hermit c10c2882): 1096.
-    ("test.hermit_unit_on_host", 1096),
+    // And the same host-network namespace unit test: 1097.
+    ("test.hermit_unit_on_host", 1097),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5459,7 +5471,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two in_guest_signal_delivery config tests: 1802, listed.
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // The same 26 tests; all existing hosted exclusions remain unchanged.
-    ("test.regular_crates_on_host", 1828),
+    // And the same two notice_host_network_abstract_binds config tests: 1830.
+    ("test.regular_crates_on_host", 1830),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

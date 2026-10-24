@@ -1166,6 +1166,10 @@ fn record_or_replay_config_with_timer_support(
         // Not measured for record and replay.
         inherited_seccomp: detcore::InheritedSeccomp::Unknown,
         has_uts_namespace: true,
+        // Record and replay print no notice for an abstract AF_UNIX bind,
+        // `hermit record start --network=host` included; only `hermit run`
+        // sets it.
+        notice_host_network_abstract_binds: false,
         // The path to the directory where syscalls will be recorded.
         replay_data: Some(data.to_path_buf()),
         clock_multiplier: None,
