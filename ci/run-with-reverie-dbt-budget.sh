@@ -2647,7 +2647,7 @@ fi
 # reverie-dbt/vendor/dynamorio, and third-party/dynamorio. Existing budget
 # values and limits are unchanged. This is source-identity carry only;
 # it supplies no new calibration, build, runtime, or landing evidence.
-expected_pin=5076ebd0622c09398c89a25f6787965afd2690bc
+expected_pin=16a709ad377314a3c9966ad7047858c7651626f2
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
@@ -2740,3 +2740,9 @@ exec "$ROOT_DIR/ci/retry-on-compiler-crash.sh" "$@"
 # CARRY TO 5076ebd0622c09398c89a25f6787965afd2690bc (2026-10-24): reviewed feature repair rebased on current Reverie main.
 # Compared with dc7f689c32c4789f801444ca012db6fec73bc4e5, all eight recorded DBT Git input objects are identical.
 # Existing calibration budgets/source recipes carry without a new timing or runtime claim.
+
+# CARRY TO 16a709ad377314a3c9966ad7047858c7651626f2 (2026-10-24): OFF getter-name qualification repair.
+# The eight DBT recipe objects match the preceding paired 5076 source exactly:
+# reverie-dbt, third-party, Cargo.toml, Cargo.lock, rust-toolchain.toml,
+# reverie-dbt/build.rs, reverie-dbt/vendor/dynamorio, third-party/dynamorio.
+# Budgets, commands, feature flags and test gates are unchanged.
