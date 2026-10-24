@@ -3148,7 +3148,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4897 adds two detcore units: 2979 + 2 = 2981, re-measured at this integration head.
     // The 4843 overshoot fix adds eighteen detcore units: 2981 + 18 = 2999, re-measured at this integration head.
     // The socketpair readiness increment adds one detcore unit: 2999 + 1 = 3000, re-measured at this integration head.
-    ("test.detcore_unit", 3000),
+    // And tool_local::timeslice_tests::chaos_schedule_replay_draws_no_slice_end
+    // (a schedule replay under --chaos draws no chaos decision): 3001, listed.
+    ("test.detcore_unit", 3001),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4474,7 +4476,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the third is new and never listed here) = 739, re-measured at this integration head.
     // The 4843 overshoot fix adds one cli case: 739 + 1 = 740, re-measured at this integration head.
     // PR 4912 adds two cli cases: 740 + 2 = 742, re-measured at this integration head.
-    ("test.cli", 742),
+    // And a_schedule_replay_under_chaos_follows_its_recording: 743, listed.
+    ("test.cli", 743),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5042,7 +5045,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same PR 4853 transplant relocation: 660 - 2 = 658.
     // The same 4843 overshoot fix case: 658 + 1 = 659.
     // The same two PR 4912 cases: 659 + 2 = 661.
-    ("test.cli_on_host", 661),
+    // And a_schedule_replay_under_chaos_follows_its_recording: 662, listed.
+    ("test.cli_on_host", 662),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5537,7 +5541,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4897 units: 2979 + 2 = 2981.
     // The same eighteen 4843 overshoot fix units: 2981 + 18 = 2999.
     // The same socketpair readiness unit: 2999 + 1 = 3000.
-    ("test.detcore_unit_on_host", 3000),
+    // And the same chaos schedule-replay unit: 3001, listed.
+    ("test.detcore_unit_on_host", 3001),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
