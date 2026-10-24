@@ -38,6 +38,7 @@
 
 mod config;
 mod consts;
+mod cpu_set;
 mod cpuid;
 mod digest;
 mod dirents;
@@ -3339,18 +3340,30 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 )
                 .await;
             }
-            intercepted.cpuid(eax, ecx).unwrap_or_else(|| {
-                warn!(
-                    "[dtid {}] cpuid leaf 0x{:x} subleaf 0x{:x} not in deterministic table; returning zero result",
-                    dettid, eax, ecx
-                );
-                CpuIdResult {
-                    eax: 0,
-                    ebx: 0,
-                    ecx: 0,
-                    edx: 0,
+            match intercepted.cpuid(eax, ecx) {
+                // Under `--virtual-cpus` each thread executes on its own
+                // virtual CPU, whose APIC IDs the answer names.
+                Some(result)
+                    if let Some(cpus) = self.cfg.virtual_cpus
+                        && cpuid::names_executing_cpu(eax) =>
+                {
+                    let cpu = self.virtual_cpu(guest, cpus.get()).await;
+                    cpuid::on_virtual_cpu(eax, result, cpu)
                 }
-            })
+                Some(result) => result,
+                None => {
+                    warn!(
+                        "[dtid {}] cpuid leaf 0x{:x} subleaf 0x{:x} not in deterministic table; returning zero result",
+                        dettid, eax, ecx
+                    );
+                    CpuIdResult {
+                        eax: 0,
+                        ebx: 0,
+                        ecx: 0,
+                        edx: 0,
+                    }
+                }
+            }
         } else {
             cpuid!(eax, ecx)
         };

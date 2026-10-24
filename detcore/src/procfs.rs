@@ -25,6 +25,7 @@ pub(crate) use fixed::FixedProcfsFile;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::cpu_set::CpuSet;
 use crate::machine::MachineDescription;
 use crate::syscalls::VIRTUAL_CPUSET_BYTES;
 
@@ -153,15 +154,16 @@ enum ProcfsKind {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
     UeventSeqnum,
-    /// `/sys/devices/system/cpu/{online,possible,present,enabled}`: the host's
-    /// CPU list, reported as Hermit's single virtual CPU.
-    CpuList,
-    /// A CPU-mask file describing Hermit's single virtual CPU: `cpu0`'s
-    /// topology masks and `node0/cpumap`.
-    CpuMask,
-    /// A CPU or node file whose contents are fixed for Hermit's single
-    /// virtual CPU on a single node (see [`SingleCpuFile`]).
-    SingleCpuConstant(SingleCpuFile),
+    /// A CPU list in `/sys` (`/sys/devices/system/cpu/{online,possible,
+    /// present,enabled}`, a CPU's topology lists and cache sharing lists,
+    /// the node lists), reported for the virtual CPUs it names.
+    CpuList(CpuFileSet),
+    /// A CPU mask in `/sys` (a CPU's topology and cache sharing masks,
+    /// `node0/cpumap`), reported for the virtual CPUs it names.
+    CpuMask(CpuFileSet),
+    /// A CPU or node file whose contents are fixed for the virtual CPUs on a
+    /// single node (see [`CpuConstantFile`]).
+    CpuConstant(CpuConstantFile),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-957): Review Btrfs reservation normalization.
     BtrfsBytesMayUse,
@@ -1494,6 +1496,11 @@ pub(crate) struct ProcfsSnapshotContext {
     /// (Codex review of R2b-2 stage 2, P2;
     /// https://github.com/rrnewton/hermit/issues/4273). Built by the caller.
     pub(crate) published_sigblk: Option<u64>,
+    /// For a status snapshot under `--virtual-cpus`, the CPU affinity of the
+    /// thread it describes (`Scheduler::cpu_affinity`), reported as
+    /// `Cpus_allowed` and `Cpus_allowed_list`. `None` reports Hermit's
+    /// historical single CPU. Built by the caller.
+    pub(crate) cpus_allowed: Option<CpuSet>,
     /// For `/proc/locks`, which of the kernel's rows, in order, the guest
     /// owns (`locks::guest_lock_rows`); the others are dropped before the
     /// sanitizer numbers identities. Built by the caller, which asks
@@ -1567,14 +1574,10 @@ impl ProcfsFile {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
             "/sys/kernel/uevent_seqnum" => ProcfsKind::UeventSeqnum,
-            "/sys/devices/system/cpu/online"
-            | "/sys/devices/system/cpu/possible"
-            | "/sys/devices/system/cpu/present"
-            | "/sys/devices/system/cpu/enabled" => ProcfsKind::CpuList,
-            other if is_virtual_cpu_list_path(other) => ProcfsKind::CpuList,
-            other if is_virtual_cpu_mask_path(other) => ProcfsKind::CpuMask,
-            other if let Some(file) = SingleCpuFile::from_path(other) => {
-                ProcfsKind::SingleCpuConstant(file)
+            other if let Some(set) = CpuFileSet::of_list(other) => ProcfsKind::CpuList(set),
+            other if let Some(set) = CpuFileSet::of_mask(other) => ProcfsKind::CpuMask(set),
+            other if let Some(file) = CpuConstantFile::from_path(other) => {
+                ProcfsKind::CpuConstant(file)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-939): Review NUMA node VM accounting normalization.
@@ -1828,6 +1831,29 @@ impl ProcfsFile {
     /// unclassified, as before Detcore rendered it.
     pub(crate) fn kernel_served(&self) -> bool {
         !self.is_plain_process_file() && !self.is_task_comm()
+    }
+
+    /// How Detcore classifies a file the kernel opened at `path`, on a
+    /// machine of `cpus` virtual CPUs: as [`Self::from_path`] does, except a
+    /// per-process file the kernel serves ([`Self::kernel_served`]) and a
+    /// file of a CPU the machine does not have ([`Self::exists_on`]), which
+    /// stay the kernel's.
+    pub(crate) fn of_kernel_open(path: &Path, cpus: u32) -> Option<Self> {
+        Self::from_path(path)
+            .filter(Self::kernel_served)
+            .filter(|file| file.exists_on(cpus))
+    }
+
+    /// Whether a machine of `cpus` virtual CPUs has this file: false only for
+    /// a file in the directory of a CPU numbered `cpus` or more, which the
+    /// listing leaves out ([`is_absent_cpu_entry`]).
+    fn exists_on(&self, cpus: u32) -> bool {
+        let cpu = match &self.kind {
+            ProcfsKind::CpuList(set) | ProcfsKind::CpuMask(set) => set.cpu(),
+            ProcfsKind::CpuConstant(file) => file.cpu(),
+            _ => None,
+        };
+        cpu.is_none_or(|cpu| cpu < cpus)
     }
 
     /// Whether this is a per-process file Linux serves with a plain `read`
@@ -2425,9 +2451,12 @@ impl ProcfsFile {
             virtual_cpuinfo,
             machine,
             published_sigblk,
+            cpus_allowed,
             lock_rows_kept,
             task_stat,
         } = context;
+        // Linux prints a task's `Cpus_allowed` with `nr_cpu_ids` bits.
+        let cpus_allowed = cpus_allowed.map(|cpus| (cpus, machine.cpus));
         let mapping_identities = &mapping_identities;
         // A process's `stat`, or a task's `comm`, Detcore opened is rendered
         // from the task's facts, which the caller looked up for this read;
@@ -2443,10 +2472,11 @@ impl ProcfsFile {
         }
         self.contents = Some(match &self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, Some((virtual_pid, virtual_ppid))),
-            ProcfsKind::Status => sanitize_status(
+            ProcfsKind::Status => sanitize_status_with_affinity(
                 &contents,
                 Some((virtual_pid, virtual_pid, virtual_ppid)),
                 published_sigblk,
+                cpus_allowed,
             ),
             ProcfsKind::ThreadStat => {
                 let (_, tid, ppid) = self
@@ -2458,7 +2488,12 @@ impl ProcfsFile {
                 let (tgid, tid, ppid) = self
                     .bound_thread_identity
                     .expect("thread-self status was not bound when opened");
-                sanitize_status(&contents, Some((tgid, tid, ppid)), published_sigblk)
+                sanitize_status_with_affinity(
+                    &contents,
+                    Some((tgid, tid, ppid)),
+                    published_sigblk,
+                    cpus_allowed,
+                )
             }
             ProcfsKind::ProcessStat => {
                 let sanitized = sanitize_stat(&contents, None);
@@ -2469,7 +2504,8 @@ impl ProcfsFile {
             }
             ProcfsKind::Statm => sanitize_statm(&contents),
             ProcfsKind::ProcessStatus => {
-                let sanitized = sanitize_status(&contents, None, published_sigblk);
+                let sanitized =
+                    sanitize_status_with_affinity(&contents, None, published_sigblk, cpus_allowed);
                 match &self.guest_numbers {
                     Some(numbers) => renumber_status(&sanitized, numbers),
                     None => sanitized,
@@ -2489,7 +2525,9 @@ impl ProcfsFile {
             // kernel's file, which the template stands in for, was never read.
             ProcfsKind::Cpuinfo if self.rendered => virtual_cpuinfo
                 .expect("Detcore renders /proc/cpuinfo only from the virtual CPUID table"),
-            ProcfsKind::Cpuinfo => virtual_cpuinfo.unwrap_or_else(|| sanitize_cpuinfo(&contents)),
+            ProcfsKind::Cpuinfo => {
+                virtual_cpuinfo.unwrap_or_else(|| sanitize_cpuinfo(&contents, machine.cpus))
+            }
             ProcfsKind::Diskstats => sanitize_diskstats(&contents),
             ProcfsKind::ProcessIo => sanitize_process_io(&contents),
             ProcfsKind::Uptime => sanitize_uptime(&contents, virtual_uptime_seconds),
@@ -2500,9 +2538,11 @@ impl ProcfsFile {
             ProcfsKind::ScalingCurFreq => sanitize_scaling_cur_freq(&contents),
             ProcfsKind::Sockstat => sanitize_sockstat(&contents),
             ProcfsKind::UeventSeqnum => sanitize_uevent_seqnum(&contents),
-            ProcfsKind::CpuList => sanitize_cpu_list(&contents),
-            ProcfsKind::CpuMask => sanitize_cpu_mask(&contents),
-            ProcfsKind::SingleCpuConstant(file) => file.contents(),
+            ProcfsKind::CpuList(set) => sanitize_cpu_list(&contents, set.cpus(machine.cpus)),
+            ProcfsKind::CpuMask(set) => {
+                sanitize_cpu_mask(&contents, set.cpus(machine.cpus), machine.cpus)
+            }
+            ProcfsKind::CpuConstant(file) => file.contents(),
             ProcfsKind::Fixed(file) => file.contents(&machine),
             ProcfsKind::BtrfsBytesMayUse => sanitize_btrfs_bytes_may_use(&contents),
             ProcfsKind::BlockInflight => sanitize_block_inflight(&contents),
@@ -2544,7 +2584,7 @@ impl ProcfsFile {
             }
             ProcfsKind::Pressure => sanitize_pressure(&contents),
             ProcfsKind::SelfSchedstat => sanitize_self_schedstat(&contents),
-            ProcfsKind::SoftnetStat => sanitize_softnet_stat(&contents),
+            ProcfsKind::SoftnetStat => sanitize_softnet_stat(machine.cpus),
             ProcfsKind::Protocols => sanitize_protocols(&contents),
             ProcfsKind::BtrfsBytesReserved => sanitize_btrfs_bytes_reserved(&contents),
             ProcfsKind::BtrfsBytesPinned => sanitize_btrfs_bytes_pinned(&contents),
@@ -2925,33 +2965,99 @@ const CPU_TOPOLOGY_ATTRIBUTES: [&str; 6] = [
     "package_cpus",
 ];
 
-/// CPU lists that describe the CPUs sharing something with Hermit's single
-/// virtual CPU: `cpu0`'s topology lists, the CPUs sharing each of `cpu0`'s
-/// caches, and `node0`'s CPU list; and the node lists, which name Hermit's
-/// single virtual node, node 0. Other CPUs'
-/// and nodes' files are left to the directory listing, which should not show
-/// them at all.
-fn is_virtual_cpu_list_path(path: &str) -> bool {
-    path == "/sys/devices/system/node/node0/cpulist"
-        || path
-            .strip_prefix("/sys/devices/system/node/")
-            .is_some_and(|list| NODE_LISTS.contains(&list))
-        || is_cpu0_cache_file(path, "shared_cpu_list")
-        || path
-            .strip_prefix("/sys/devices/system/cpu/cpu0/topology/")
-            .and_then(|attribute| attribute.strip_suffix("_list"))
-            .is_some_and(|attribute| CPU_TOPOLOGY_ATTRIBUTES.contains(&attribute))
+/// What a CPU-list or CPU-mask file in `/sys` names, on the machine
+/// `--virtual-cpus` describes: single-core sockets on one node. Each is a
+/// set of CPU numbers, except the node lists', which number nodes and print
+/// the same way.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) enum CpuFileSet {
+    /// Every CPU: `cpu/{online,possible,present,enabled}` and `node0`'s
+    /// CPUs.
+    Every,
+    /// Node 0, the only node, as the node lists ([`NODE_LISTS`]) name it: the
+    /// set `{0}` of node numbers.
+    Node0,
+    /// CPU `n` alone: every topology list of `cpuN` (its socket has one core
+    /// of one thread) and the CPUs sharing each of its caches (its socket's
+    /// own).
+    Cpu(u32),
 }
 
-/// `cpu0/cache/index<N>/<attribute>`: the CPUs sharing one of cpu0's caches.
-fn is_cpu0_cache_file(path: &str, attribute: &str) -> bool {
-    path.strip_prefix("/sys/devices/system/cpu/cpu0/cache/index")
-        .and_then(|rest| rest.split_once('/'))
-        .is_some_and(|(index, leaf)| {
-            !index.is_empty()
-                && index.bytes().all(|byte| byte.is_ascii_digit())
-                && leaf == attribute
-        })
+impl CpuFileSet {
+    /// The set a CPU-list file at `path` names.
+    fn of_list(path: &str) -> Option<Self> {
+        match path {
+            "/sys/devices/system/cpu/online"
+            | "/sys/devices/system/cpu/possible"
+            | "/sys/devices/system/cpu/present"
+            | "/sys/devices/system/cpu/enabled"
+            | "/sys/devices/system/node/node0/cpulist" => Some(Self::Every),
+            _ if path
+                .strip_prefix("/sys/devices/system/node/")
+                .is_some_and(|list| NODE_LISTS.contains(&list)) =>
+            {
+                Some(Self::Node0)
+            }
+            _ => {
+                let (cpu, attribute) = cpu_file(path)?;
+                let named = cpu_cache_attribute(attribute) == Some("shared_cpu_list")
+                    || attribute
+                        .strip_prefix("topology/")
+                        .and_then(|attribute| attribute.strip_suffix("_list"))
+                        .is_some_and(|attribute| CPU_TOPOLOGY_ATTRIBUTES.contains(&attribute));
+                named.then_some(Self::Cpu(cpu))
+            }
+        }
+    }
+
+    /// The set a CPU-mask file at `path` names: the mask forms of
+    /// [`Self::of_list`]'s files.
+    fn of_mask(path: &str) -> Option<Self> {
+        if path == "/sys/devices/system/node/node0/cpumap" {
+            return Some(Self::Every);
+        }
+        let (cpu, attribute) = cpu_file(path)?;
+        let named = cpu_cache_attribute(attribute) == Some("shared_cpu_map")
+            || attribute
+                .strip_prefix("topology/")
+                .is_some_and(|attribute| CPU_TOPOLOGY_ATTRIBUTES.contains(&attribute));
+        named.then_some(Self::Cpu(cpu))
+    }
+
+    /// The CPUs named, of a machine with `cpus` CPUs.
+    pub(crate) fn cpus(self, cpus: u32) -> CpuSet {
+        match self {
+            Self::Every => CpuSet::first(cpus),
+            Self::Node0 => CpuSet::only(0),
+            Self::Cpu(cpu) => CpuSet::only(cpu),
+        }
+    }
+
+    /// The CPU whose directory holds the file, for a CPU's own file.
+    fn cpu(self) -> Option<u32> {
+        match self {
+            Self::Cpu(cpu) => Some(cpu),
+            Self::Every | Self::Node0 => None,
+        }
+    }
+}
+
+/// The CPU and the path below its directory of a file in
+/// `/sys/devices/system/cpu/cpuN/`: `(N, "topology/core_id")`.
+fn cpu_file(path: &str) -> Option<(u32, &str)> {
+    let (cpu, attribute) = path
+        .strip_prefix("/sys/devices/system/cpu/cpu")?
+        .split_once('/')?;
+    if cpu.is_empty() || !cpu.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((cpu.parse().ok()?, attribute))
+}
+
+/// The attribute of a CPU's cache file, `cache/index<M>/<attribute>`.
+fn cpu_cache_attribute(within_cpu: &str) -> Option<&str> {
+    let (index, attribute) = within_cpu.strip_prefix("cache/index")?.split_once('/')?;
+    (!index.is_empty() && index.bytes().all(|byte| byte.is_ascii_digit())).then_some(attribute)
 }
 
 /// The node lists in `/sys/devices/system/node` that name nodes: those that
@@ -2965,10 +3071,10 @@ const NODE_LISTS: &[&str] = &[
     "has_normal_memory",
 ];
 
-/// CPU and node files whose contents Hermit fixes for its single virtual CPU
-/// on a single node, whatever the host reports.
+/// CPU and node files whose contents Hermit fixes for the virtual CPUs on
+/// its single node, whatever the host reports.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-enum SingleCpuFile {
+enum CpuConstantFile {
     /// `cpu/kernel_max`, the highest CPU number the kernel supports
     /// (`NR_CPUS - 1`): 127, the size of the 128-bit mask Detcore's
     /// `sched_getaffinity` answers with ([`VIRTUAL_CPUSET_BYTES`]), so a
@@ -2981,11 +3087,16 @@ enum SingleCpuFile {
     SmtActive,
     /// `cpu/smt/control`: `notsupported`, as for a CPU without SMT.
     SmtControl,
-    /// `cpu0`'s cluster, core, die and package IDs: 0. x86 reports a cluster
-    /// ID of 65535 when the CPU has none, but `/proc/cpuinfo`'s
-    /// `physical id` and `core id`, which Detcore reports as 0, are the same
-    /// numbering.
-    TopologyId,
+    /// `cpuN`'s package and cluster IDs: N, the socket it alone occupies,
+    /// as `/proc/cpuinfo`'s `physical id` numbers it. The cluster ID is
+    /// Hermit's choice, not Linux's output: x86 prints 65535 for a CPU whose
+    /// CPUID names no L2 sharing (`l2c_id` left `BAD_APICID`), where Hermit
+    /// keeps the 0 it always gave cpu0 and numbers each socket's cluster as
+    /// the socket, whose caches are its own.
+    PackageId(u32),
+    /// `cpuN`'s core and die IDs: 0, its socket's only core and die, as
+    /// `/proc/cpuinfo`'s `core id` numbers it.
+    CoreId(u32),
     /// `node/has_generic_initiator`: empty, as on a machine without generic
     /// initiators.
     GenericInitiators,
@@ -3001,7 +3112,7 @@ enum SingleCpuFile {
     CpufreqBoost,
 }
 
-impl SingleCpuFile {
+impl CpuConstantFile {
     fn from_path(path: &str) -> Option<Self> {
         Some(match path {
             "/sys/devices/system/cpu/kernel_max" => Self::KernelMax,
@@ -3011,17 +3122,30 @@ impl SingleCpuFile {
             "/sys/devices/system/node/node0/distance" => Self::Node0Distance,
             "/sys/devices/system/cpu/cpufreq/boost" => Self::CpufreqBoost,
             _ if cpufreq_policy_attribute(Path::new(path)) == Some("boost") => Self::CpufreqBoost,
-            _ => match path.strip_prefix("/sys/devices/system/cpu/cpu0/topology/")? {
-                "cluster_id" | "core_id" | "die_id" | "physical_package_id" => Self::TopologyId,
-                _ => return None,
-            },
+            _ => {
+                let (cpu, attribute) = cpu_file(path)?;
+                match attribute.strip_prefix("topology/")? {
+                    "cluster_id" | "physical_package_id" => Self::PackageId(cpu),
+                    "core_id" | "die_id" => Self::CoreId(cpu),
+                    _ => return None,
+                }
+            }
         })
+    }
+
+    /// The CPU whose directory holds the file, for a CPU's own file.
+    fn cpu(self) -> Option<u32> {
+        match self {
+            Self::PackageId(cpu) | Self::CoreId(cpu) => Some(cpu),
+            _ => None,
+        }
     }
 
     fn contents(self) -> Vec<u8> {
         match self {
             Self::KernelMax => format!("{}\n", VIRTUAL_CPUSET_BYTES * 8 - 1).into_bytes(),
-            Self::SmtActive | Self::TopologyId | Self::CpufreqBoost => b"0\n".to_vec(),
+            Self::PackageId(cpu) => format!("{cpu}\n").into_bytes(),
+            Self::SmtActive | Self::CoreId(_) | Self::CpufreqBoost => b"0\n".to_vec(),
             Self::SmtControl => b"notsupported\n".to_vec(),
             Self::GenericInitiators => b"\n".to_vec(),
             Self::Node0Distance => b"10\n".to_vec(),
@@ -3030,30 +3154,27 @@ impl SingleCpuFile {
 }
 
 /// Whether `name`, an entry of the directory at the canonical path
-/// `directory`, is a CPU, node or cpufreq policy other than number 0, which a
-/// machine with one CPU and one node does not have. glibc's `get_nprocs_conf`
-/// (`sysconf(_SC_NPROCESSORS_CONF)`, `nproc --all`) counts the `cpuN` entries
-/// of `/sys/devices/system/cpu`, and libnuma counts them and the `nodeN`
-/// entries of `/sys/devices/system/node`.
-pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8]) -> bool {
-    let prefix: &[u8] = match directory.to_str() {
-        Some("/sys/devices/system/cpu" | "/sys/bus/cpu/devices") => b"cpu",
-        Some("/sys/devices/system/node" | "/sys/bus/node/devices") => b"node",
-        Some("/sys/devices/system/cpu/cpufreq") => b"policy",
+/// `directory`, is a CPU or cpufreq policy numbered `cpus` or more, or a node
+/// other than number 0, which a machine with `cpus` CPUs on one node does not
+/// have. glibc's `get_nprocs_conf` (`sysconf(_SC_NPROCESSORS_CONF)`, `nproc
+/// --all`) counts the `cpuN` entries of `/sys/devices/system/cpu`, and
+/// libnuma counts them and the `nodeN` entries of `/sys/devices/system/node`.
+pub(crate) fn is_absent_cpu_entry(directory: &Path, name: &[u8], cpus: u32) -> bool {
+    let (prefix, present): (&[u8], u32) = match directory.to_str() {
+        Some("/sys/devices/system/cpu" | "/sys/bus/cpu/devices") => (b"cpu", cpus),
+        Some("/sys/devices/system/node" | "/sys/bus/node/devices") => (b"node", 1),
+        Some("/sys/devices/system/cpu/cpufreq") => (b"policy", cpus),
         _ => return false,
     };
-    name.strip_prefix(prefix).is_some_and(|number| {
-        !number.is_empty() && number.iter().all(u8::is_ascii_digit) && number != b"0"
-    })
-}
-
-/// The mask forms of [`is_virtual_cpu_list_path`]'s files.
-fn is_virtual_cpu_mask_path(path: &str) -> bool {
-    path == "/sys/devices/system/node/node0/cpumap"
-        || is_cpu0_cache_file(path, "shared_cpu_map")
-        || path
-            .strip_prefix("/sys/devices/system/cpu/cpu0/topology/")
-            .is_some_and(|attribute| CPU_TOPOLOGY_ATTRIBUTES.contains(&attribute))
+    name.strip_prefix(prefix)
+        .filter(|number| !number.is_empty() && number.iter().all(u8::is_ascii_digit))
+        .is_some_and(|number| {
+            // A number too large for a u64 is past every CPU too.
+            std::str::from_utf8(number)
+                .ok()
+                .and_then(|number| number.parse::<u64>().ok())
+                .is_none_or(|number| number >= u64::from(present))
+        })
 }
 
 fn is_numa_node_file(path: &str, filename: &str) -> bool {
@@ -3201,13 +3322,30 @@ fn sanitize_statm(contents: &[u8]) -> Vec<u8> {
     b"0 0 0 0 0 0 0\n".to_vec()
 }
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#553)
-// TODO-HUMAN-REVIEW(PR-723): Review /proc status identity field normalization.
+/// A status on Hermit's historical single CPU
+/// ([`sanitize_status_with_affinity`] with no affinity), as the tests of the
+/// status's other lines spell it.
+#[cfg(test)]
 fn sanitize_status(
     contents: &[u8],
     virtual_identity: Option<(i32, i32, i32)>,
     published_sigblk: Option<u64>,
+) -> Vec<u8> {
+    sanitize_status_with_affinity(contents, virtual_identity, published_sigblk, None)
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#553)
+// TODO-HUMAN-REVIEW(PR-723): Review /proc status identity field normalization.
+/// `cpus_allowed` is the described thread's affinity under `--virtual-cpus`
+/// and the machine's CPU count, the `nr_cpu_ids` bits Linux prints
+/// `Cpus_allowed` with (`task_cpus_allowed`, fs/proc/array.c); `None` reports
+/// Hermit's historical single CPU in a 128-bit mask.
+fn sanitize_status_with_affinity(
+    contents: &[u8],
+    virtual_identity: Option<(i32, i32, i32)>,
+    published_sigblk: Option<u64>,
+    cpus_allowed: Option<(CpuSet, u32)>,
 ) -> Vec<u8> {
     const STATE: &[u8] = b"State:";
     const TGID: &[u8] = b"Tgid:";
@@ -3294,10 +3432,20 @@ fn sanitize_status(
             normalized.extend_from_slice(format!("SigBlk:\t{mask:016x}").as_bytes());
         } else if body.starts_with(CPUS_ALLOWED) {
             normalized.extend_from_slice(CPUS_ALLOWED);
-            normalized.extend_from_slice(b"\t00000000,00000000,00000000,00000001");
+            match cpus_allowed {
+                Some((cpus, bits)) => {
+                    normalized.extend_from_slice(format!("\t{}", cpus.mask(bits)).as_bytes())
+                }
+                None => normalized.extend_from_slice(b"\t00000000,00000000,00000000,00000001"),
+            }
         } else if body.starts_with(CPUS_ALLOWED_LIST) {
             normalized.extend_from_slice(CPUS_ALLOWED_LIST);
-            normalized.extend_from_slice(b"\t0");
+            match cpus_allowed {
+                Some((cpus, _)) => {
+                    normalized.extend_from_slice(format!("\t{}", cpus.list()).as_bytes())
+                }
+                None => normalized.extend_from_slice(b"\t0"),
+            }
         } else if body.starts_with(MEMS_ALLOWED) {
             normalized.extend_from_slice(MEMS_ALLOWED);
             normalized.extend_from_slice(b"\t00000000,00000001");
@@ -3325,28 +3473,18 @@ fn sanitize_status(
     normalized
 }
 
-/// Reports `/proc/cpuinfo` for Hermit's single virtual CPU, the one
-/// `sched_getaffinity` returns. The kernel prints one block per online CPU,
-/// separated by blank lines; only the first block is kept, so the processor
-/// count no longer follows the host's. Its topology fields describe a
-/// one-core, one-thread package, and its frequency is the virtual 1 GHz.
-fn sanitize_cpuinfo(contents: &[u8]) -> Vec<u8> {
-    const TOPOLOGY: &[(&[u8], &[u8])] = &[
-        (b"cpu MHz", b"cpu MHz\t\t: 1000.000"),
-        (b"physical id", b"physical id\t: 0"),
-        (b"siblings", b"siblings\t: 1"),
-        (b"core id", b"core id\t\t: 0"),
-        (b"cpu cores", b"cpu cores\t: 1"),
-        (b"apicid", b"apicid\t\t: 0"),
-        (b"initial apicid", b"initial apicid\t: 0"),
-    ];
-
-    let mut normalized = Vec::with_capacity(contents.len());
+/// Reports `/proc/cpuinfo` for the virtual CPUs, `cpus` of them, the ones
+/// `sched_getaffinity` returns, where CPUID is the host's. The kernel prints
+/// one block per online CPU, separated by blank lines; the first block is
+/// kept, once per virtual CPU, so the processor count no longer follows the
+/// host's. Each block's topology fields describe CPU N of a machine of
+/// single-core sockets: a one-core, one-thread package numbered N, whose
+/// APIC ID is N; its frequency is the virtual 1 GHz.
+fn sanitize_cpuinfo(contents: &[u8], cpus: u32) -> Vec<u8> {
+    let mut first_block = Vec::with_capacity(contents.len());
     let mut seen_processor = false;
     for line in contents.split_inclusive(|byte| *byte == b'\n') {
-        let has_newline = line.last() == Some(&b'\n');
-        let body = line.strip_suffix(b"\n").unwrap_or(line);
-        if body.starts_with(b"processor") {
+        if line.starts_with(b"processor") {
             if seen_processor {
                 // The second CPU's block: the blank line that ended the first
                 // one has already been copied, as the kernel's file ends.
@@ -3354,13 +3492,41 @@ fn sanitize_cpuinfo(contents: &[u8]) -> Vec<u8> {
             }
             seen_processor = true;
         }
+        first_block.extend_from_slice(line);
+    }
+    (0..cpus)
+        .flat_map(|cpu| cpuinfo_block_for(&first_block, cpu))
+        .collect()
+}
+
+/// `block`, one CPU's block of `/proc/cpuinfo`, with the fields that differ
+/// from CPU to CPU of a machine of single-core sockets set for CPU `cpu`, and
+/// its frequency set to the virtual 1 GHz.
+fn cpuinfo_block_for(block: &[u8], cpu: u32) -> Vec<u8> {
+    let replacement = |key: &[u8]| -> Option<String> {
+        Some(match key {
+            b"processor" => format!("processor\t: {cpu}"),
+            b"cpu MHz" => "cpu MHz\t\t: 1000.000".to_owned(),
+            b"physical id" => format!("physical id\t: {cpu}"),
+            b"siblings" => "siblings\t: 1".to_owned(),
+            b"core id" => "core id\t\t: 0".to_owned(),
+            b"cpu cores" => "cpu cores\t: 1".to_owned(),
+            b"apicid" => format!("apicid\t\t: {cpu}"),
+            b"initial apicid" => format!("initial apicid\t: {cpu}"),
+            _ => return None,
+        })
+    };
+    let mut normalized = Vec::with_capacity(block.len());
+    for line in block.split_inclusive(|byte| *byte == b'\n') {
+        let has_newline = line.last() == Some(&b'\n');
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
         let key = body
             .split(|byte| *byte == b':')
             .next()
             .unwrap_or_default()
             .trim_ascii_end();
-        match TOPOLOGY.iter().find(|(name, _)| key == *name) {
-            Some((_, replacement)) => normalized.extend_from_slice(replacement),
+        match replacement(key) {
+            Some(replaced) => normalized.extend_from_slice(replaced.as_bytes()),
             None => normalized.extend_from_slice(body),
         }
         if has_newline {
@@ -3371,10 +3537,11 @@ fn sanitize_cpuinfo(contents: &[u8]) -> Vec<u8> {
 }
 
 /// Reports a kernel CPU mask (comma-separated groups of hex digits, as in
-/// `cpu0/topology/thread_siblings` or `node0/cpumap`) as Hermit's single
-/// virtual CPU, `1`. Anything that is not a newline-terminated hex mask is
-/// returned unchanged.
-fn sanitize_cpu_mask(contents: &[u8]) -> Vec<u8> {
+/// `cpu0/topology/thread_siblings` or `node0/cpumap`) as naming `named`, of a
+/// machine with `cpus` CPUs, which the kernel prints with `nr_cpu_ids`
+/// (`cpus`) bits: `1` for CPU 0 of one CPU. Anything that is not a
+/// newline-terminated hex mask is returned unchanged.
+fn sanitize_cpu_mask(contents: &[u8], named: CpuSet, cpus: u32) -> Vec<u8> {
     let Some(mask) = contents.strip_suffix(b"\n") else {
         return contents.to_vec();
     };
@@ -3385,16 +3552,17 @@ fn sanitize_cpu_mask(contents: &[u8]) -> Vec<u8> {
     {
         return contents.to_vec();
     }
-    b"1\n".to_vec()
+    format!("{}\n", named.mask(cpus)).into_bytes()
 }
 
 /// Reports a kernel CPU list (`/sys/devices/system/cpu/online` and its
-/// `possible` and `present` siblings) as Hermit's single virtual CPU. glibc's
-/// `get_nprocs`, and so `sysconf(_SC_NPROCESSORS_ONLN)`, `getconf` and
-/// Python's `os.cpu_count`, read `online`; reported raw, they count the host's
-/// CPUs while `sched_getaffinity` reports one. Anything that is not a cpulist
-/// of digits, commas and ranges is returned unchanged.
-fn sanitize_cpu_list(contents: &[u8]) -> Vec<u8> {
+/// `possible` and `present` siblings, a CPU's topology lists) as naming
+/// `named`. glibc's `get_nprocs`, and so `sysconf(_SC_NPROCESSORS_ONLN)`,
+/// `getconf` and Python's `os.cpu_count`, read `online`; reported raw, they
+/// count the host's CPUs while `sched_getaffinity` reports the virtual ones.
+/// Anything that is not a cpulist of digits, commas and ranges is returned
+/// unchanged.
+fn sanitize_cpu_list(contents: &[u8], named: CpuSet) -> Vec<u8> {
     let Some(list) = contents.strip_suffix(b"\n") else {
         return contents.to_vec();
     };
@@ -3405,7 +3573,7 @@ fn sanitize_cpu_list(contents: &[u8]) -> Vec<u8> {
     {
         return contents.to_vec();
     }
-    b"0\n".to_vec()
+    format!("{}\n", named.list()).into_bytes()
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5175,12 +5343,15 @@ fn sanitize_self_schedstat(contents: &[u8]) -> Vec<u8> {
 }
 
 // TODO-HUMAN-REVIEW(PR-909): Review the single-CPU softnet policy.
-/// Exposes Hermit's single virtual CPU and hides host CPU count, hotplug state,
-/// CPU identifiers, and live network backlog counters.
-fn sanitize_softnet_stat(_contents: &[u8]) -> Vec<u8> {
-    const VIRTUAL_SOFTNET_STAT: &[u8] =
-        b"00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000\n";
-    VIRTUAL_SOFTNET_STAT.to_vec()
+/// Exposes the virtual CPUs, `cpus` of them, and hides host CPU count,
+/// hotplug state, CPU identifiers, and live network backlog counters: one
+/// idle row per CPU, whose thirteenth column is the CPU's number, as
+/// `softnet_seq_show` prints it.
+fn sanitize_softnet_stat(cpus: u32) -> Vec<u8> {
+    (0..cpus)
+        .map(|cpu| format!("{}{cpu:08x} 00000000 00000000\n", "00000000 ".repeat(12)))
+        .collect::<String>()
+        .into_bytes()
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -6794,12 +6965,21 @@ Rss:                   4 kB\n" as &[u8];
     }
 
     #[test]
-    fn softnet_stat_synthesizes_one_virtual_cpu_row() {
-        let input = b"00908c97 00000002 0000009e 00000004 00000005 00000006 00000007 00000008 00000009 0000000a 0000000b 0000000c 00000003 0000000e 0000000f\n\
-00123456 00000012 00000034 00000056 00000078 0000009a 000000bc 000000de 000000f0 00000011 00000022 00000033 00000007 00000044 00000055\n";
-        let expected = b"00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000\n";
-        assert_eq!(sanitize_softnet_stat(input), expected);
-        assert_eq!(sanitize_softnet_stat(b"not a softnet row\n"), expected);
+    fn softnet_stat_synthesizes_one_idle_row_per_virtual_cpu() {
+        let row = |cpu: &str| {
+            format!(
+                "00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000 \
+                 00000000 00000000 00000000 00000000 {cpu} 00000000 00000000\n"
+            )
+        };
+        assert_eq!(
+            String::from_utf8(sanitize_softnet_stat(1)).unwrap(),
+            row("00000000")
+        );
+        assert_eq!(
+            String::from_utf8(sanitize_softnet_stat(3)).unwrap(),
+            row("00000000") + &row("00000001") + &row("00000002")
+        );
     }
 
     #[test]
@@ -7180,6 +7360,39 @@ Rss:                   4 kB\n" as &[u8];
         );
     }
 
+    /// Under `--virtual-cpus` a status reports the affinity of the thread it
+    /// describes, with `nr_cpu_ids` bits as `task_cpus_allowed` prints it;
+    /// without it, Hermit's historical single CPU in 128 bits.
+    #[test]
+    fn a_status_reports_the_described_threads_affinity() {
+        let status = b"Pid:\t5\nCpus_allowed:\tffffffff,ffffffff\nCpus_allowed_list:\t0-63\n";
+        assert_eq!(
+            String::from_utf8(sanitize_status(status, None, None)).unwrap(),
+            "Pid:\t5\nCpus_allowed:\t00000000,00000000,00000000,00000001\nCpus_allowed_list:\t0\n"
+        );
+        assert_eq!(
+            String::from_utf8(sanitize_status_with_affinity(
+                status,
+                None,
+                None,
+                Some((CpuSet::first(4), 4))
+            ))
+            .unwrap(),
+            "Pid:\t5\nCpus_allowed:\tf\nCpus_allowed_list:\t0-3\n"
+        );
+        let pinned = CpuSet::from_mask_bytes(&[0b1010_0000]);
+        assert_eq!(
+            String::from_utf8(sanitize_status_with_affinity(
+                status,
+                None,
+                None,
+                Some((pinned, 8))
+            ))
+            .unwrap(),
+            "Pid:\t5\nCpus_allowed:\ta0\nCpus_allowed_list:\t5,7\n"
+        );
+    }
+
     /// A status reports the guest's own mask, which the thread published
     /// while Detcore holds it under a private blocking mask, in place of the
     /// kernel's `SigBlk`, and leaves every other line as before; with nothing
@@ -7289,7 +7502,7 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
     fn cpuinfo_normalizes_frequency() {
         let input = b"processor\t: 0\ncpu MHz\t\t: 2994.183\ncache size\t: 1024 KB\n";
         assert_eq!(
-            sanitize_cpuinfo(input),
+            sanitize_cpuinfo(input, 1),
             b"processor\t: 0\ncpu MHz\t\t: 1000.000\ncache size\t: 1024 KB\n"
         );
     }
@@ -7308,11 +7521,11 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             );
             file.take(usize::MAX).unwrap()
         };
-        let virtual_cpuinfo = crate::cpuid::InterceptedCpuid::new().cpuinfo();
+        let virtual_cpuinfo = crate::cpuid::InterceptedCpuid::new().cpuinfo(1);
         // The host's file does not show through, whatever it says.
         assert_eq!(read(Some(virtual_cpuinfo.clone())), virtual_cpuinfo);
         // When the guest's CPUID is the host's, so is the file, normalized.
-        assert_eq!(read(None), sanitize_cpuinfo(host));
+        assert_eq!(read(None), sanitize_cpuinfo(host, 1));
     }
 
     /// Detcore renders `/proc/cpuinfo` only where it answers the guest's CPUID
@@ -7354,7 +7567,7 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
         assert!(!file.faults_on_a_short_copy());
         let template = file.rendering_template().to_vec();
         assert!(template.is_empty());
-        let virtual_cpuinfo = crate::cpuid::InterceptedCpuid::new().cpuinfo();
+        let virtual_cpuinfo = crate::cpuid::InterceptedCpuid::new().cpuinfo(1);
         file.initialize(
             template,
             ProcfsSnapshotContext {
@@ -7414,34 +7627,47 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             )
         };
         let host = format!("{}{}{}", block(0), block(1), block(2));
+        let virtual_block = |n: u32| {
+            format!(
+                "processor\t: {n}\nmodel name\t: Example CPU\ncpu MHz\t\t: 1000.000\n\
+                 physical id\t: {n}\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\n\
+                 apicid\t\t: {n}\ninitial apicid\t: {n}\nflags\t\t: fpu sse2\n\n"
+            )
+        };
         assert_eq!(
-            String::from_utf8(sanitize_cpuinfo(host.as_bytes())).unwrap(),
-            "processor\t: 0\nmodel name\t: Example CPU\ncpu MHz\t\t: 1000.000\n\
-             physical id\t: 0\nsiblings\t: 1\ncore id\t\t: 0\ncpu cores\t: 1\n\
-             apicid\t\t: 0\ninitial apicid\t: 0\nflags\t\t: fpu sse2\n\n"
+            String::from_utf8(sanitize_cpuinfo(host.as_bytes(), 1)).unwrap(),
+            virtual_block(0)
         );
         // A single-CPU host's file is already the virtual shape.
         assert_eq!(
-            sanitize_cpuinfo(b"processor\t: 0\ncpu cores\t: 1\n\n"),
+            sanitize_cpuinfo(b"processor\t: 0\ncpu cores\t: 1\n\n", 1),
             b"processor\t: 0\ncpu cores\t: 1\n\n"
+        );
+        // Under --virtual-cpus, the first block once per virtual CPU, each a
+        // single-core socket of its own: more CPUs than the host shows too.
+        assert_eq!(
+            String::from_utf8(sanitize_cpuinfo(host.as_bytes(), 4)).unwrap(),
+            (0..4).map(virtual_block).collect::<String>()
         );
     }
 
     #[test]
-    fn cpu_list_reports_one_virtual_cpu() {
-        assert_eq!(sanitize_cpu_list(b"0-315\n"), b"0\n");
-        assert_eq!(sanitize_cpu_list(b"0-3,8,10-11\n"), b"0\n");
-        assert_eq!(sanitize_cpu_list(b"0\n"), b"0\n");
+    fn cpu_list_reports_the_virtual_cpus() {
+        let one = CpuSet::first(1);
+        assert_eq!(sanitize_cpu_list(b"0-315\n", one), b"0\n");
+        assert_eq!(sanitize_cpu_list(b"0-3,8,10-11\n", one), b"0\n");
+        assert_eq!(sanitize_cpu_list(b"0\n", one), b"0\n");
+        assert_eq!(sanitize_cpu_list(b"0-1\n", CpuSet::first(8)), b"0-7\n");
         // Not the kernel's cpulist format: left alone.
-        assert_eq!(sanitize_cpu_list(b"0-3"), b"0-3");
-        assert_eq!(sanitize_cpu_list(b"\n"), b"\n");
-        assert_eq!(sanitize_cpu_list(b"all\n"), b"all\n");
+        assert_eq!(sanitize_cpu_list(b"0-3", one), b"0-3");
+        assert_eq!(sanitize_cpu_list(b"\n", one), b"\n");
+        assert_eq!(sanitize_cpu_list(b"all\n", one), b"all\n");
         for path in ["online", "possible", "present", "enabled"] {
             assert_eq!(
                 ProcfsFile::from_path(Path::new(&format!("/sys/devices/system/cpu/{path}")))
                     .unwrap()
                     .kind,
-                ProcfsKind::CpuList,
+                ProcfsKind::CpuList(CpuFileSet::Every),
                 "{path}"
             );
         }
@@ -7449,74 +7675,109 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
     }
 
     #[test]
-    fn cpu0_topology_and_node0_report_one_virtual_cpu() {
-        for path in [
-            "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
-            "/sys/devices/system/cpu/cpu0/topology/core_cpus_list",
-            "/sys/devices/system/cpu/cpu0/topology/package_cpus_list",
-            "/sys/devices/system/node/node0/cpulist",
+    fn cpu_topology_and_node0_report_single_core_sockets() {
+        let kind = |path: &str| ProcfsFile::from_path(Path::new(path)).map(|file| file.kind);
+        for (path, set) in [
+            (
+                "/sys/devices/system/cpu/cpu0/topology/thread_siblings_list",
+                CpuFileSet::Cpu(0),
+            ),
+            (
+                "/sys/devices/system/cpu/cpu0/topology/core_cpus_list",
+                CpuFileSet::Cpu(0),
+            ),
+            (
+                "/sys/devices/system/cpu/cpu3/topology/package_cpus_list",
+                CpuFileSet::Cpu(3),
+            ),
+            (
+                "/sys/devices/system/cpu/cpu5/cache/index3/shared_cpu_list",
+                CpuFileSet::Cpu(5),
+            ),
+            ("/sys/devices/system/node/node0/cpulist", CpuFileSet::Every),
         ] {
-            assert_eq!(
-                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
-                ProcfsKind::CpuList,
-                "{path}"
-            );
+            assert_eq!(kind(path), Some(ProcfsKind::CpuList(set)), "{path}");
         }
-        for path in [
-            "/sys/devices/system/cpu/cpu0/topology/thread_siblings",
-            "/sys/devices/system/cpu/cpu0/topology/package_cpus",
-            "/sys/devices/system/node/node0/cpumap",
+        for (path, set) in [
+            (
+                "/sys/devices/system/cpu/cpu0/topology/thread_siblings",
+                CpuFileSet::Cpu(0),
+            ),
+            (
+                "/sys/devices/system/cpu/cpu2/topology/package_cpus",
+                CpuFileSet::Cpu(2),
+            ),
+            (
+                "/sys/devices/system/cpu/cpu0/cache/index0/shared_cpu_map",
+                CpuFileSet::Cpu(0),
+            ),
+            ("/sys/devices/system/node/node0/cpumap", CpuFileSet::Every),
         ] {
-            assert_eq!(
-                ProcfsFile::from_path(Path::new(path)).unwrap().kind,
-                ProcfsKind::CpuMask,
-                "{path}"
-            );
+            assert_eq!(kind(path), Some(ProcfsKind::CpuMask(set)), "{path}");
         }
-        assert_eq!(
-            ProcfsFile::from_path(Path::new(
-                "/sys/devices/system/cpu/cpu0/cache/index3/shared_cpu_list"
-            ))
-            .unwrap()
-            .kind,
-            ProcfsKind::CpuList
-        );
-        assert_eq!(
-            ProcfsFile::from_path(Path::new(
-                "/sys/devices/system/cpu/cpu0/cache/index0/shared_cpu_map"
-            ))
-            .unwrap()
-            .kind,
-            ProcfsKind::CpuMask
-        );
-        // Other CPUs and nodes, and other topology attributes, are untouched.
+        // Other nodes, other topology attributes and other spellings are
+        // untouched.
         for path in [
-            "/sys/devices/system/cpu/cpu1/topology/thread_siblings_list",
-            "/sys/devices/system/cpu/cpu1/topology/core_id",
             "/sys/devices/system/node/node1/cpulist",
-            "/sys/devices/system/cpu/cpu1/cache/index3/shared_cpu_list",
             "/sys/devices/system/cpu/cpu0/cache/index3/size",
+            "/sys/devices/system/cpu/cpu0/topology/ppin",
+            "/sys/devices/system/cpu/cpux/topology/core_cpus_list",
+            "/sys/devices/system/cpu/cpu/topology/core_cpus_list",
+            "/sys/devices/system/cpu/cpu1/cache/indexx/shared_cpu_list",
         ] {
-            assert!(ProcfsFile::from_path(Path::new(path)).is_none(), "{path}");
+            assert_eq!(kind(path), None, "{path}");
         }
-        assert_eq!(sanitize_cpu_list(b"0,158\n"), b"0\n");
-        assert_eq!(sanitize_cpu_list(b"0-15,158-173\n"), b"0\n");
+        // A CPU's files exist only on a machine that has the CPU: the others
+        // are the kernel's, as the listing leaves their directory out.
+        let cpu3 = ProcfsFile::from_path(Path::new(
+            "/sys/devices/system/cpu/cpu3/topology/thread_siblings_list",
+        ))
+        .unwrap();
+        assert!(!cpu3.exists_on(1));
+        assert!(!cpu3.exists_on(3));
+        assert!(cpu3.exists_on(4));
+        let online = ProcfsFile::from_path(Path::new("/sys/devices/system/cpu/online")).unwrap();
+        assert!(online.exists_on(1));
+        let one = CpuSet::first(1);
+        assert_eq!(sanitize_cpu_list(b"0,158\n", one), b"0\n");
+        assert_eq!(sanitize_cpu_list(b"0-15,158-173\n", one), b"0\n");
         assert_eq!(
-            sanitize_cpu_mask(b"00000000,00000000,00000000,00000001,00000000,00000001\n"),
+            sanitize_cpu_list(b"0-15,158-173\n", CpuFileSet::Cpu(6).cpus(8)),
+            b"6\n"
+        );
+        assert_eq!(
+            sanitize_cpu_mask(
+                b"00000000,00000000,00000000,00000001,00000000,00000001\n",
+                one,
+                1
+            ),
             b"1\n"
         );
-        assert_eq!(sanitize_cpu_mask(b"ffffffff,ffffffff\n"), b"1\n");
+        assert_eq!(sanitize_cpu_mask(b"ffffffff,ffffffff\n", one, 1), b"1\n");
+        // The kernel prints a mask with nr_cpu_ids bits, the virtual CPUs.
+        assert_eq!(
+            sanitize_cpu_mask(b"ffffffff,ffffffff\n", CpuFileSet::Every.cpus(4), 4),
+            b"f\n"
+        );
+        assert_eq!(
+            sanitize_cpu_mask(b"ffffffff,ffffffff\n", CpuFileSet::Cpu(2).cpus(4), 4),
+            b"4\n"
+        );
+        assert_eq!(
+            sanitize_cpu_mask(b"1\n", CpuFileSet::Cpu(33).cpus(40), 40),
+            b"02,00000000\n"
+        );
         // Not a mask: left alone.
-        assert_eq!(sanitize_cpu_mask(b"ff"), b"ff");
-        assert_eq!(sanitize_cpu_mask(b"0-3\n"), b"0-3\n");
-        assert_eq!(sanitize_cpu_mask(b"\n"), b"\n");
+        assert_eq!(sanitize_cpu_mask(b"ff", one, 1), b"ff");
+        assert_eq!(sanitize_cpu_mask(b"0-3\n", one, 1), b"0-3\n");
+        assert_eq!(sanitize_cpu_mask(b"\n", one, 1), b"\n");
     }
 
     #[test]
     fn kernel_max_smt_topology_ids_and_nodes_describe_one_cpu_and_node() {
         let kind = |path: &str| ProcfsFile::from_path(Path::new(path)).map(|file| file.kind);
         let constant = |path: &str| match kind(path) {
-            Some(ProcfsKind::SingleCpuConstant(file)) => file.contents(),
+            Some(ProcfsKind::CpuConstant(file)) => file.contents(),
             other => panic!("{path} is {other:?}, not a constant"),
         };
         assert_eq!(constant("/sys/devices/system/cpu/kernel_max"), b"127\n");
@@ -7536,6 +7797,22 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
                 "{attribute}"
             );
         }
+        // CPU 5 of a machine of single-core sockets is socket 5's only core.
+        for (attribute, id) in [
+            ("cluster_id", "5"),
+            ("core_id", "0"),
+            ("die_id", "0"),
+            ("physical_package_id", "5"),
+        ] {
+            assert_eq!(
+                String::from_utf8(constant(&format!(
+                    "/sys/devices/system/cpu/cpu5/topology/{attribute}"
+                )))
+                .unwrap(),
+                format!("{id}\n"),
+                "{attribute}"
+            );
+        }
         assert_eq!(
             constant("/sys/devices/system/node/has_generic_initiator"),
             b"\n"
@@ -7548,20 +7825,26 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             "/sys/devices/system/node/has_memory",
             "/sys/devices/system/node/has_normal_memory",
         ] {
-            assert_eq!(kind(path), Some(ProcfsKind::CpuList), "{path}");
+            assert_eq!(
+                kind(path),
+                Some(ProcfsKind::CpuList(CpuFileSet::Node0)),
+                "{path}"
+            );
         }
-        // Another node's distances, another CPU's IDs and cpu0's PPIN are
-        // left to the directory listing or the host.
+        // Another node's distances and cpu0's PPIN are left to the directory
+        // listing or the host.
         for path in [
             "/sys/devices/system/node/node1/distance",
-            "/sys/devices/system/cpu/cpu1/topology/core_id",
             "/sys/devices/system/cpu/cpu0/topology/ppin",
             "/sys/devices/system/node/has_cpu_extra",
         ] {
             assert_eq!(kind(path), None, "{path}");
         }
-        assert_eq!(sanitize_cpu_list(b"0-1\n"), b"0\n");
-        assert_eq!(sanitize_cpu_list(b"\n"), b"\n");
+        assert_eq!(
+            sanitize_cpu_list(b"0-1\n", CpuFileSet::Node0.cpus(4)),
+            b"0\n"
+        );
+        assert_eq!(sanitize_cpu_list(b"\n", CpuSet::first(1)), b"\n");
     }
 
     /// Every spelling of cpufreq's boost switch reads 0 on every backend,
@@ -7576,7 +7859,7 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             "/sys/devices/system/cpu/cpu0/cpufreq/boost",
             "/sys/devices/system/cpu/cpu5/cpufreq/boost",
         ] {
-            let Some(ProcfsKind::SingleCpuConstant(file)) = kind(path) else {
+            let Some(ProcfsKind::CpuConstant(file)) = kind(path) else {
                 panic!("{path} is {:?}, not a constant", kind(path));
             };
             assert_eq!(file.contents(), b"0\n", "{path}");
@@ -7596,7 +7879,7 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
     }
 
     #[test]
-    fn directory_listings_drop_cpus_and_nodes_other_than_zero() {
+    fn directory_listings_drop_cpus_and_nodes_the_machine_lacks() {
         for (directory, absent, kept) in [
             (
                 "/sys/devices/system/cpu",
@@ -7626,16 +7909,33 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
         ] {
             for name in absent {
                 assert!(
-                    is_absent_cpu_entry(Path::new(directory), name.as_bytes()),
+                    is_absent_cpu_entry(Path::new(directory), name.as_bytes(), 1),
                     "{directory}/{name}"
                 );
             }
             for name in kept {
                 assert!(
-                    !is_absent_cpu_entry(Path::new(directory), name.as_bytes()),
+                    !is_absent_cpu_entry(Path::new(directory), name.as_bytes(), 1),
                     "{directory}/{name}"
                 );
             }
+        }
+        // A machine of 4 CPUs lists cpu0 to cpu3 and policy0 to policy3, and
+        // still one node.
+        for (directory, name, absent) in [
+            ("/sys/devices/system/cpu", "cpu3", false),
+            ("/sys/devices/system/cpu", "cpu4", true),
+            ("/sys/devices/system/cpu", "cpu99999999999999999999", true),
+            ("/sys/bus/cpu/devices", "cpu2", false),
+            ("/sys/devices/system/cpu/cpufreq", "policy3", false),
+            ("/sys/devices/system/cpu/cpufreq", "policy4", true),
+            ("/sys/devices/system/node", "node1", true),
+        ] {
+            assert_eq!(
+                is_absent_cpu_entry(Path::new(directory), name.as_bytes(), 4),
+                absent,
+                "{directory}/{name}"
+            );
         }
         // Other directories keep every entry.
         for (directory, name) in [
@@ -7644,7 +7944,7 @@ softirq 0 0 0 0 0 0 0 0 0 0 0\n";
             ("/tmp", "cpu1"),
         ] {
             assert!(
-                !is_absent_cpu_entry(Path::new(directory), name.as_bytes()),
+                !is_absent_cpu_entry(Path::new(directory), name.as_bytes(), 1),
                 "{directory}/{name}"
             );
         }
@@ -9296,6 +9596,7 @@ total_commit_ms 0\n"
             reader_is_task: true,
             ppid: 1,
             rsslim: task_stat::RLIM_INFINITY,
+            processor: 0,
         }
     }
 
