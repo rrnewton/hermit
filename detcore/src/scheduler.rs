@@ -8433,8 +8433,10 @@ impl Scheduler {
         }
         if self.replay_fast_forward_to_recorded_wake(global_time) {
             // No thread runs until the replayed thread wakes: committed time
-            // catches up in the next pass's step 1, and each pass then pops one
-            // due timed event, the replayed thread's last if others are earlier.
+            // catches up in the next pass's step 1 (a replay with callback
+            // checkpoints holds only once the wake is due), and each pass
+            // then pops one due timed event, the replayed thread's last if
+            // others pop ahead of it.
             self.step2b_process_timed(global_time);
             return Err(SkipTurn);
         }
@@ -8471,23 +8473,28 @@ impl Scheduler {
     /// recording.
     ///
     /// The pass waits only while the wake is not yet due: committed time is
-    /// behind the deadline, or an earlier timed event pops first. Once the
-    /// thread's deadline is the earliest due one, the ordinary pass pops it
+    /// behind the deadline, or another timed event pops first (an earlier
+    /// deadline, or the same deadline ordered ahead: every timer signal
+    /// sorts before every thread at one deadline, threads in thread order).
+    /// Once the thread's own wake is next to pop, the ordinary pass pops it
     /// and goes on to its turn, as the recording's pass did.
     ///
     /// A schedule that carries callback checkpoints replays its software
-    /// expiry turns from them (`callback_history_active`), so it keeps its own
-    /// time and is left alone here. One without them, such as the trials
-    /// `hermit analyze` writes, has nothing else to wake the thread on time.
+    /// expiry turns from them (`callback_history_active`), so it keeps the
+    /// recording's time and its time is never moved here. Its passes still
+    /// wait while another due timed event pops ahead of the replayed thread's
+    /// due wake: a pass pops one due event and puts a woken thread at the
+    /// front of its band, so a thread whose earlier deadline pops first would
+    /// take the turn the recording gave the replayed thread (the recording's
+    /// priorities ordered the two). One without checkpoints, such as the
+    /// trials `hermit analyze` wrote before they carried them, has nothing
+    /// else to wake the thread on time.
     /// After a hard desync the cursor stays on the event it expected, so the
     /// jump can repeat for that thread; it still only moves time forward.
     fn replay_fast_forward_to_recorded_wake(
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
     ) -> bool {
-        if self.callback_history_active {
-            return false;
-        }
         let Some((tid, _)) = self
             .replayer
             .as_ref()
@@ -8501,6 +8508,18 @@ impl Scheduler {
         if deadline.is_indefinite() {
             return false;
         }
+        // Another timed event pops ahead of the replayed thread's wake: one
+        // with an earlier deadline, or with the same deadline ordered first
+        // (`TimedEvent`'s order: timer signals, then threads by id).
+        let another_pops_first = self
+            .blocked
+            .timed_waiters
+            .iter()
+            .next()
+            .is_some_and(|(_, event)| event != TimedEvent::ThreadEvt(tid));
+        if self.callback_history_active {
+            return deadline <= self.committed_time && another_pops_first;
+        }
         let mut gt = global_time.lock().unwrap();
         let now = gt.as_nanos();
         if deadline > now {
@@ -8510,12 +8529,7 @@ impl Scheduler {
             );
             gt.add_extra_time(deadline.duration_since(now));
         }
-        deadline > self.committed_time
-            || self
-                .blocked
-                .timed_waiters
-                .next_deadline()
-                .is_some_and(|earliest| earliest < deadline)
+        deadline > self.committed_time || another_pops_first
     }
 
     /// Move global time to the earliest finite timed deadline, if it lies
@@ -24400,7 +24414,9 @@ mod test {
     /// A schedule replay whose next recorded event resumes a thread asleep in
     /// virtual time moves global time to that thread's deadline and holds the
     /// pass for its wake. A replay that resumes another thread, or a run that
-    /// is not replaying, leaves time alone.
+    /// is not replaying, leaves time alone. A replay with callback checkpoints
+    /// never moves time, but holds the pass while another due timed event
+    /// pops ahead of the replayed thread's due wake.
     #[test]
     fn a_replay_resuming_a_sleeper_moves_time_to_its_deadline() {
         let mut scheduler = Scheduler::new(&Config::default());
@@ -24445,24 +24461,70 @@ mod test {
             "an earlier deadline is still waiting to pop"
         );
         scheduler.blocked.timed_waiters.remove(early);
+        // A thread ordered ahead at the same deadline pops first too.
+        let tied = DetTid::from_raw(3);
+        scheduler.blocked.timed_waiters.insert(deadline, tied);
+        assert!(
+            scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "a tie ordered ahead is still waiting to pop"
+        );
+        scheduler.blocked.timed_waiters.remove(tied);
         assert!(
             !scheduler.replay_fast_forward_to_recorded_wake(&global_time),
             "the wake is due, so the pass runs"
         );
         assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
 
-        // A schedule with callback checkpoints replays its expiry turns from
-        // them and is left alone.
-        let (global_time, _) = add_sleeper(&mut scheduler, DetTid::from_raw(11));
+        // A schedule with callback checkpoints keeps the recording's time:
+        // a wake that is not yet due moves nothing and holds nothing.
+        let mut scheduler = Scheduler::new(&Config::default());
+        let sleeper = DetTid::from_raw(11);
+        let (global_time, deadline) = add_sleeper(&mut scheduler, sleeper);
         let before = global_time.lock().unwrap().as_nanos();
         scheduler.committed_time = before;
         scheduler.callback_history_active = true;
         scheduler.replayer = Some(replayer::Replayer::new(vec![SchedEvent::syscall(
-            DetTid::from_raw(11),
+            sleeper,
             Sysno::clock_nanosleep,
             SyscallPhase::Posthook,
         )]));
         assert!(!scheduler.replay_fast_forward_to_recorded_wake(&global_time));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), before);
+        // Nor does another event that is due when the replayed wake is not.
+        let due_first = DetTid::from_raw(13);
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(deadline - LogicalTime::from_nanos(10), due_first);
+        scheduler.committed_time = deadline - LogicalTime::from_nanos(10);
+        assert!(
+            !scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "the replayed wake is not due yet"
+        );
+        scheduler.blocked.timed_waiters.remove(due_first);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), before);
+        // Once the wake is due, the pass still waits while another due event
+        // pops ahead of it: an earlier deadline, then the same deadline
+        // ordered first. Time never moves.
+        scheduler.committed_time = deadline;
+        for (other, other_deadline) in [
+            (DetTid::from_raw(13), deadline - LogicalTime::from_nanos(10)),
+            (DetTid::from_raw(3), deadline),
+        ] {
+            scheduler
+                .blocked
+                .timed_waiters
+                .insert(other_deadline, other);
+            assert!(
+                scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+                "dtid {other} pops before the replayed wake"
+            );
+            scheduler.blocked.timed_waiters.remove(other);
+        }
+        assert!(
+            !scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "the replayed wake pops next, so the pass runs"
+        );
         assert_eq!(global_time.lock().unwrap().as_nanos(), before);
     }
 
