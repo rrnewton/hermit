@@ -3146,6 +3146,18 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/virtual_cpus.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/virtual_cpus.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration tests virtual_cpus_every_cpu_count_agrees and virtual_cpus_affinity_follows_linux compile this guest. In counts mode it prints how many CPUs sysconf, get_nprocs, sched_getaffinity, the /sys CPU lists and directories, /proc/cpuinfo, /proc/stat, Cpus_allowed, node 0, CPUID's APIC IDs, getcpu and one thread per CPU report, and the test requires 1 without --virtual-cpus and N with it at bitwise parity; in affinity mode it checks sched_setaffinity's read-back, Linux's EINVAL, EFAULT and ESRCH cases, getcpu and status on the pinned CPU, inheritance and a cross-thread mask, printing only whether each held, and the test requires Hermit's output under --virtual-cpus=4 to equal the native one; it remains a guest fixture because a generic manifest cannot assert this exact output."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/virtual_cpus_pool_race.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/virtual_cpus_pool_race.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test virtual_cpus_let_a_sysconf_sized_pool_race compiles this guest, a worker pool sized from sysconf(_SC_NPROCESSORS_ONLN) whose workers race on an unsynchronized counter with a yield between each read and write, and requires under --chaos that one worker loses no update without --virtual-cpus and that four workers lose updates with --virtual-cpus=4; it is nondeterministic natively by design, so it remains a test-owned guest fixture rather than a manifest-discovered CI program."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/virtual_kernel_files.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/virtual_kernel_files.c is owned by hermit-cli/tests/cli.rs: the CLI tests detcore_fixes_the_virtual_kernel_files_on_<backend>, one per backend, run it natively, on ptrace, and on DBT, KVM, SaBRe and e9patch preprocessing with ptrace, each compared with ptrace (LiteInst and in-guest-trap are named as not yet, https://github.com/rrnewton/hermit/issues/4450), requires the procfs files that describe the kernel and its fixed limits (/proc/version, /proc/cmdline, the kernel and vm scalars) to agree with uname, and the kernel's tables (interrupts, softirqs, zoneinfo, meminfo and the others) to describe one machine, as Linux guarantees, and requires every backend to show the same fixed contents, device and inode (https://github.com/rrnewton/hermit/issues/4266). It stays a fixture because a generic manifest cannot compare stdout across backends."

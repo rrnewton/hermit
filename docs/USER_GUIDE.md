@@ -751,9 +751,40 @@ the default equal-priority policy.
 | `--no-virtualize-cpuid` | Exposes host CPUID behavior. |
 | `--cpu-profile x86-64-v3` | Gives the guest an x86-64-v3 CPU instead of the default x86-64-v2; see below. |
 | `--cpu-profile host-no-rdrand` | Intercepts CPUID and returns host features with hardware randomness and unvirtualized timing features hidden; ptrace only, with CPUID faulting required. |
+| `--virtual-cpus=N` | Tells the guest it has N CPUs (1 to 128) instead of one, so thread pools start N workers; see below. |
 
 Disabling a virtualization feature introduces a host-dependent input. Do it to
 diagnose compatibility problems, not when asserting full reproducibility.
+
+#### Virtual CPUs
+
+Without `--virtual-cpus`, a guest sees one CPU. A program that sizes a thread
+pool from the CPU count (TBB, folly, `std::thread::hardware_concurrency`,
+`sysconf(_SC_NPROCESSORS_ONLN)`) then starts one worker, and races between
+workers cannot happen under any schedule. `--virtual-cpus=4` presents four
+CPUs everywhere a program can count them: `sched_getaffinity`, `sysconf`,
+`/sys/devices/system/cpu`, `/proc/cpuinfo`, `/proc/stat`, `Cpus_allowed` in
+`/proc/<pid>/status`, CPUID's APIC IDs and `getcpu`. They form four
+single-core sockets on one NUMA node. Hermit still runs one thread at a time,
+so `--chaos` explores the pool's interleavings deterministically:
+
+```
+hermit run --chaos --sched-seed=7 --virtual-cpus=4 -- ./pool_program
+```
+
+`sched_setaffinity` then behaves as on a four-CPU Linux machine: the mask
+reads back, and a mask naming none of the four CPUs is refused with `EINVAL`.
+A thread's `getcpu` is a CPU of its mask chosen by the order threads were
+created, and changes only when the mask leaves that CPU out. The host must
+have at least N online CPUs, because the guest sees the host's `cpuN`
+directories, rendered for the virtual CPUs. Only the ptrace backend (and
+e9patch preprocessing on it) takes the option: other backends, `--lite` and
+`hermit record` refuse it.
+
+More CPUs can change more than the pool size. Some runtimes spin-wait
+instead of sleeping when they see more than one CPU: OpenMP's spin count, Go's
+scheduler, adaptive mutexes. Under serialized threads such a spin ends only at
+a preemption, so a run can be slower than with one CPU.
 
 #### The x86-64-v3 CPU profile
 

@@ -6522,6 +6522,62 @@ pub(super) fn path_resolution_visits_prefix(path: &Path, prefix: &Path) -> Resul
     anyhow::bail!("executable path exceeded Linux's symlink traversal limit")
 }
 
+/// Refuse `--virtual-cpus cpus` on a host whose CPU directory, `directory`
+/// (`/sys/devices/system/cpu`), lacks one of `cpu0` to `cpu<cpus - 1>` or
+/// has it offline. The guest sees those directories, with their topology and
+/// cache files rendered for the virtual CPUs, in place of its own: Detcore
+/// can leave a CPU out of the listing, but cannot add one the host does not
+/// have, nor the `topology` directory Linux removes from an offline CPU's
+/// (`topology_remove_dev`).
+fn check_host_lists_virtual_cpus(cpus: u32, directory: &Path) -> Result<(), Error> {
+    let listed = (0..cpus)
+        .take_while(|cpu| directory.join(format!("cpu{cpu}/topology")).is_dir())
+        .count();
+    if listed < cpus as usize {
+        let fewer = match listed {
+            0 => "run without --virtual-cpus".to_owned(),
+            listed => format!("pass --virtual-cpus {listed} or fewer"),
+        };
+        anyhow::bail!(
+            "--virtual-cpus {cpus} shows the guest this host's cpu0 to cpu{} in {}, rendered \
+             for the virtual CPUs, but only the first {listed} are there and online; {fewer}, \
+             or run on a host with at least {cpus} online CPUs",
+            cpus - 1,
+            directory.display(),
+        );
+    }
+    Ok(())
+}
+
+/// `--virtual-cpus` is admitted where the host has an online CPU directory
+/// for each virtual CPU, and otherwise refused with the count that would be.
+#[test]
+fn virtual_cpus_need_a_host_directory_per_cpu() {
+    let host = tempfile::TempDir::new().unwrap();
+    for cpu in ["cpu0", "cpu1", "cpu2", "cpu4"] {
+        std::fs::create_dir_all(host.path().join(cpu).join("topology")).unwrap();
+    }
+    // An offline CPU keeps its directory but loses its topology.
+    std::fs::create_dir(host.path().join("cpu3")).unwrap();
+    std::fs::create_dir(host.path().join("cpufreq")).unwrap();
+    check_host_lists_virtual_cpus(1, host.path()).unwrap();
+    check_host_lists_virtual_cpus(3, host.path()).unwrap();
+    let error = check_host_lists_virtual_cpus(4, host.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("cpu0 to cpu3"), "{error}");
+    assert!(
+        error.contains("only the first 3 are there and online"),
+        "{error}"
+    );
+    assert!(error.contains("pass --virtual-cpus 3 or fewer"), "{error}");
+    let empty = tempfile::TempDir::new().unwrap();
+    let error = check_host_lists_virtual_cpus(2, empty.path())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("run without --virtual-cpus"), "{error}");
+}
+
 fn validate_e9patch_mount_target(path: &Path) -> Result<(), Error> {
     if !path.is_absolute() {
         anyhow::bail!("e9patch mount target must be absolute: {}", path.display());
@@ -8328,6 +8384,24 @@ impl RunOpts {
                 "the dbt backend cannot apply --scheduler-turn-cost: its runtime reads a frozen \
                  configuration form that predates the option"
             );
+        }
+        if let Some(cpus) = config.virtual_cpus {
+            if self.namespace_only {
+                anyhow::bail!(
+                    "--virtual-cpus is presented by Detcore, and --namespace-only (--lite) runs \
+                     the guest natively, without it, so the guest would see the host's CPUs; \
+                     drop one of the two"
+                );
+            }
+            if !matches!(backend, Backend::Ptrace | Backend::E9patch) {
+                anyhow::bail!(
+                    "--virtual-cpus has been checked on the ptrace backend only (and on e9patch \
+                     preprocessing, which runs on it); backend `{}` is refused: run with the \
+                     ptrace backend (the default) or without --virtual-cpus",
+                    backend.as_str()
+                );
+            }
+            check_host_lists_virtual_cpus(cpus.get(), Path::new("/sys/devices/system/cpu"))?;
         }
         config.deterministic_io = self.strict || !self.no_deterministic_io;
         // An unmodeled host syscall makes a successful result unqualified.

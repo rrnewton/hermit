@@ -181,6 +181,9 @@ pub struct TaskStatFacts {
     /// The task's recorded name, `None` where Detcore recorded none (a task
     /// of a process that has not exec'd an image Detcore saw).
     pub comm: Option<TaskComm>,
+    /// The CPUs the task may run on and its home (`Scheduler::task_cpus`),
+    /// which place it on a CPU (`TaskStat::processor`).
+    pub cpus: crate::cpu_set::TaskCpus,
     /// The task has exited and is not reaped: a zombie, whose state is `Z`.
     pub exited: bool,
     /// The task leads its thread group.
@@ -331,6 +334,10 @@ pub(crate) struct TaskStat {
     /// The process's `RLIMIT_RSS` soft limit ([`TaskStatFacts::rsslim`]),
     /// whoever reads it.
     pub(crate) rsslim: u64,
+    /// The CPU the task runs on, field 39: its place on the run's virtual
+    /// CPUs ([`TaskStatFacts::cpus`], `TaskCpus::current`), 0 on the single
+    /// CPU without `--virtual-cpus`.
+    pub(crate) processor: u32,
 }
 
 /// `stat`'s state letter for a task: `R` for the reader itself, which runs
@@ -381,6 +388,7 @@ fn flags(stat: &TaskStat) -> u64 {
 /// | 20 | num_threads | the process's tasks |
 /// | 25 | rsslim | the process's `RLIMIT_RSS` soft limit |
 /// | 38 | exit_signal | the leader's, -1 for another thread |
+/// | 39 | processor | the task's virtual CPU, [`TaskStat::processor`] |
 /// | 40, 41 | rt_priority, policy | 0, 0 (`SCHED_OTHER`) |
 /// | 52 | exit_code | 0 |
 ///
@@ -388,9 +396,10 @@ fn flags(stat: &TaskStat) -> u64 {
 /// `itrealvalue` (21, always 0 in Linux), the start time (22), the memory
 /// sizes and addresses (23, 24, 26-30, 45-51), the four obsolete signal
 /// words (31-34, which the sanitizer zeroed on every backend before this),
-/// `wchan` (35), `nswap` and `cnswap` (36, 37), the last CPU (39) and the
-/// block-I/O delay (42). These are the fields `sanitize_stat` zeroed in the
-/// kernel's file before Detcore rendered it.
+/// `wchan` (35), `nswap` and `cnswap` (36, 37) and the block-I/O delay
+/// (42). These are the fields `sanitize_stat` zeroed in the kernel's file
+/// before Detcore rendered it, with the last CPU (39), which is 0 on the
+/// single virtual CPU.
 pub(crate) fn render_stat(stat: &TaskStat) -> Vec<u8> {
     let facts = &stat.facts;
     let mut line = format!("{} (", stat.pid).into_bytes();
@@ -446,7 +455,7 @@ pub(crate) fn render_stat(stat: &TaskStat) -> Vec<u8> {
         "0".to_owned(),
         // 38 exit_signal, 39 processor, 40 rt_priority, 41 policy
         exit_signal.to_string(),
-        "0".to_owned(),
+        stat.processor.to_string(),
         "0".to_owned(),
         "0".to_owned(),
         // 42 delayacct_blkio_ticks .. 51 env_end
@@ -476,6 +485,7 @@ mod tests {
     fn facts() -> TaskStatFacts {
         TaskStatFacts {
             comm: Some(TaskComm::new(b"probe")),
+            cpus: Default::default(),
             exited: false,
             leads: true,
             process_exit_signal: libc::SIGCHLD,
@@ -517,12 +527,13 @@ mod tests {
             reader_is_task: true,
             ppid: 3,
             rsslim: RLIM_INFINITY,
+            processor: 3,
         };
         let line = render_stat(&stat);
         let (comm, fields) = fields(&line);
         assert_eq!(comm, "probe");
         assert_eq!(fields.len(), 52, "{fields:?}");
-        let expected: [(usize, &str); 16] = [
+        let expected: [(usize, &str); 17] = [
             (1, "7"),
             (2, "(probe)"),
             (3, "R"),
@@ -537,6 +548,7 @@ mod tests {
             (20, "2"),
             (25, "18446744073709551615"),
             (38, "17"),
+            (39, "3"),
             (41, "0"),
             (52, "0"),
         ];
@@ -552,7 +564,7 @@ mod tests {
         assert_eq!(
             String::from_utf8(line).unwrap(),
             "7 (probe) R 3 7 3 0 -1 0 0 0 0 0 0 0 0 0 20 0 2 0 0 0 0 18446744073709551615 \
-             0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
+             0 0 0 0 0 0 0 0 0 0 0 0 17 3 0 0 0 0 0 0 0 0 0 0 0 0 0\n"
         );
     }
 
@@ -572,6 +584,7 @@ mod tests {
             reader_is_task: false,
             ppid: 3,
             rsslim: 4096,
+            processor: 0,
         };
         let (_, sibling_fields) = fields(&render_stat(&sibling));
         assert_eq!(sibling_fields.len(), 52);
@@ -611,6 +624,7 @@ mod tests {
             reader_is_task: true,
             ppid: 0,
             rsslim: RLIM_INFINITY,
+            processor: 0,
         };
         let line = render_stat(&stat);
         assert!(line.starts_with(b"1 (a)b\n\\\xff c) R 0 "), "{line:?}");

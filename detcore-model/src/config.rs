@@ -11,6 +11,7 @@
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fmt;
+use std::num::NonZeroU32;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -1130,6 +1131,21 @@ pub struct Config {
     #[clap(long, default_value = "1GB", value_parser = try_parse_memory, value_name = "bytesize")]
     pub memory: u64,
 
+    /// Present a machine with this many CPUs, 1 to 128, so that `nproc`,
+    /// `sysconf(_SC_NPROCESSORS_ONLN/CONF)` and thread pools size themselves
+    /// to it. Threads still run one at a time. The affinity mask,
+    /// `getcpu`, CPUID's APIC IDs, `/proc/cpuinfo`, `/proc/stat`, a task's
+    /// `Cpus_allowed` and `/sys/devices/system/cpu` (its CPU lists, `cpuN`
+    /// directories, topology and cache files) all describe the same N
+    /// single-core sockets on one NUMA node. `sched_setaffinity` follows
+    /// Linux: a mask with none of the N CPUs is EINVAL. The host must list
+    /// at least N CPUs under `/sys/devices/system/cpu`. Without this flag the
+    /// guest sees Hermit's historical single CPU, whose `sched_setaffinity`
+    /// accepts any mask.
+    #[serde(default)]
+    #[clap(long, value_name = "count", value_parser = parse_virtual_cpus)]
+    pub virtual_cpus: Option<NonZeroU32>,
+
     /// How much of `/proc` the guest sees. Every level is the same on every
     /// backend and host. `minimal` (the default) shows a small set, modelled
     /// on gVisor's; `standard` shows every system-wide name Detcore serves or
@@ -1295,7 +1311,31 @@ fn try_parse_memory(from_str: &str) -> anyhow::Result<u64> {
         .map_err(anyhow::Error::msg)
 }
 
+/// The most CPUs `--virtual-cpus` presents: the bits of the 128-bit mask
+/// Detcore's `sched_getaffinity` answers with, whose highest CPU is the
+/// `kernel_max` (127) it reports.
+pub const MAX_VIRTUAL_CPUS: u32 = 128;
+
+fn parse_virtual_cpus(value: &str) -> Result<NonZeroU32, String> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|count| (1..=MAX_VIRTUAL_CPUS).contains(count))
+        .and_then(NonZeroU32::new)
+        .ok_or_else(|| {
+            format!(
+                "expected a CPU count from 1 to {MAX_VIRTUAL_CPUS}, for example --virtual-cpus 4"
+            )
+        })
+}
+
 impl Config {
+    /// How many CPUs the guest sees: `--virtual-cpus`, or Hermit's
+    /// historical one.
+    pub fn virtual_cpu_count(&self) -> u32 {
+        self.virtual_cpus.map_or(1, NonZeroU32::get)
+    }
+
     /// Whether the scheduler models which thread the kernel gives a signal,
     /// from the signal masks it reads from the kernel, and keeps the
     /// per-process ledger of signals discarded at send time; the guest side
@@ -1827,6 +1867,9 @@ impl fmt::Display for Config {
         }
         if self.memory != 1_000_000_000 {
             write!(f, " --memory={}", self.memory)?;
+        }
+        if let Some(cpus) = self.virtual_cpus {
+            write!(f, " --virtual-cpus={cpus}")?;
         }
         match self.proc_level {
             ProcLevel::Minimal => {}
@@ -2360,8 +2403,10 @@ impl Default for Config {
 /// `hermit run` refuses with the DBT backend, and [`Config::replaying`], set
 /// only by `hermit replay`, which runs only on the ptrace backend. So is
 /// [`Config::inherited_seccomp`], added after this form froze, which reads
-/// back as unknown. So is [`Config::in_guest_reserved_signals`], empty for
-/// DBT (it is set only for in-guest runs), which reads back as empty, and
+/// back as unknown, and [`Config::virtual_cpus`], which `hermit run`
+/// refuses with the DBT backend and reads back as unset. So is
+/// [`Config::in_guest_reserved_signals`], empty for DBT (it is set only for
+/// in-guest runs), which reads back as empty, and
 /// [`Config::in_guest_refuses_host_timed_producers`] and
 /// [`Config::in_guest_signal_delivery`], false for DBT, which read back as
 /// false. Every
@@ -2896,7 +2941,9 @@ mod legacy_backend_json {
     /// backend that reads the legacy form: priority replay needs a preemption
     /// timer, which none of them delivers, so it is never written and reads
     /// as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 28] = [
+    /// `virtual_cpus` came after it too, and `hermit run` refuses it with the
+    /// DBT backend: it is never written and reads as unset.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 29] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -2925,6 +2972,7 @@ mod legacy_backend_json {
         "signal_at",
         "in_guest_signal_delivery",
         "annotated_priority_replay",
+        "virtual_cpus",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3085,7 +3133,8 @@ mod legacy_backend_json {
                     | "mountinfo_mount_namespace"
                     | "directory_placeholder"
                     | "work_span_report"
-                    | "signal_at",
+                    | "signal_at"
+                    | "virtual_cpus",
                 ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
@@ -3375,7 +3424,8 @@ mod legacy_backend_json {
                 | "work_span_report"
                 | "signal_at"
                 | "in_guest_signal_delivery"
-                | "annotated_priority_replay" => Ok(()),
+                | "annotated_priority_replay"
+                | "virtual_cpus" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -4106,7 +4156,8 @@ mod tests {
                 | "work_span_report"
                 | "signal_at"
                 | "in_guest_signal_delivery"
-                | "annotated_priority_replay" => {}
+                | "annotated_priority_replay"
+                | "virtual_cpus" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -4127,11 +4178,11 @@ mod tests {
         // `mountinfo_mount_namespace`, `directory_placeholder`,
         // `container_procfs`, `signal_delivery_check_fatal`,
         // `work_span_report`, `signal_at`, `in_guest_signal_delivery`,
-        // `annotated_priority_replay` and `strict_schedule_boundaries` none:
-        // fourteen more keys and twenty-seven fewer, so thirteen keys fewer
-        // than fields.
+        // `annotated_priority_replay`, `virtual_cpus` and
+        // `strict_schedule_boundaries` none: fourteen more keys and
+        // twenty-eight fewer, so fourteen keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 13);
+        assert_eq!(fields.len(), keys.len() + 14);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -4750,6 +4801,47 @@ mod tests {
             .collect();
         let array = serde_json::to_string(&values).unwrap();
         assert_eq!(from_legacy_backend_json(&array).unwrap().signal_at, None);
+    }
+
+    /// `virtual_cpus` came after the legacy form froze, so it never enters
+    /// it: the DBT runtime's environment keeps its bytes, and the option
+    /// reads back as unset (`hermit run` refuses it with DBT).
+    #[test]
+    fn virtual_cpus_never_enter_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            virtual_cpus: NonZeroU32::new(4),
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("virtual_cpus"), "{json}");
+        assert_eq!(from_legacy_backend_json(&json).unwrap().virtual_cpus, None);
+    }
+
+    /// `--virtual-cpus` takes a count from 1 to the 128 CPUs Detcore's mask
+    /// holds, and names the range when refused; it reaches the reproducer
+    /// command line.
+    #[test]
+    fn virtual_cpus_parse_from_1_to_128() {
+        let parse = |count: &str| {
+            Config::try_parse_from(["detcore".to_owned(), format!("--virtual-cpus={count}")])
+        };
+        assert_eq!(parse("1").unwrap().virtual_cpus, NonZeroU32::new(1));
+        assert_eq!(parse("128").unwrap().virtual_cpus, NonZeroU32::new(128));
+        for refused in ["0", "129", "-1", "four"] {
+            let error = parse(refused).unwrap_err().to_string();
+            assert!(error.contains("from 1 to 128"), "{refused}: {error}");
+        }
+        let config = parse("8").unwrap();
+        assert_eq!(config.virtual_cpu_count(), 8);
+        assert!(config.to_string().contains(" --virtual-cpus=8"));
+        assert_eq!(Config::default().virtual_cpus, None);
+        assert_eq!(Config::default().virtual_cpu_count(), 1);
+        assert!(!Config::default().to_string().contains("virtual-cpus"));
     }
 
     /// `Config` crosses Reverie RPC as positional legacy bincode, so
