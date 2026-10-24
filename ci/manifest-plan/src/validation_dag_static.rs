@@ -1848,7 +1848,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // pinned to (https://github.com/rrnewton/hermit/issues/4824): 1135, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1172.
     // Train 6 recount (measured on 21f770f6 base): 1187.
-    ("test.hermit_unit", 1187),
+    // And run::a_small_max_timeslice_gets_a_notice and
+    // analyze::phases::tests::trials_get_the_small_max_timeslice_notice_from_their_run_arguments
+    // (the small --max-timeslice notice): 1162 (1160 on main plus two).
+    ("test.hermit_unit", 1189),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4360,7 +4363,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 654 + 5 = 659, listed.
     // And +1 from 82cbd684: 660.
     // Train 6 recount (measured on 21f770f6 base): 666.
-    ("test.cli", 666),
+    // And a_small_max_timeslice_gets_one_notice (the small --max-timeslice
+    // notice): 638 (637 on main plus one).
+    ("test.cli", 667),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4903,7 +4908,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 5 = 578, listed.
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
-    ("test.cli_on_host", 585),
+    // The small --max-timeslice notice test starts no guest and needs no PMU
+    // (without one it checks that no notice is written): 557 (556 on main plus
+    // one).
+    ("test.cli_on_host", 586),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5745,7 +5753,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fourteen pinned_cpu::tests units: 1129, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1166.
     // Train 6 recount (measured on 21f770f6 base): 1181.
-    ("test.hermit_unit_on_host", 1181),
+    // And the same two small --max-timeslice notice units: 1156 (1154 on main
+    // plus two).
+    ("test.hermit_unit_on_host", 1183),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

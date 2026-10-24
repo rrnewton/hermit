@@ -137,6 +137,11 @@ impl BisectOpts {
         analyzer.refuse_unqualified_trial_timeout()?;
         analyzer.install_trial_pmu_config()?;
         analyzer.admit_branch_counter(&mut crate::tracing::write_stderr_diagnostic)?;
+        if let Some(notice) =
+            analyzer.small_trial_max_timeslice_notice(crate::run::installed_skid_margin)
+        {
+            crate::tracing::write_stderr_diagnostic(&notice);
+        }
 
         let good = read_schedule(&self.good, "good")?;
         let bad = read_schedule(&self.bad, "bad")?;
