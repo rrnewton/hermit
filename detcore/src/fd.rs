@@ -88,6 +88,38 @@ pub(crate) fn is_random_device(mode: libc::mode_t, rdev: libc::dev_t) -> bool {
         && matches!(libc::minor(rdev), 8 | 9)
 }
 
+/// Which of Hermit's random-device streams an open file description reads.
+///
+/// Every read of a Linux random device draws fresh bytes, so no two opens read
+/// the same ones. Detcore gives each open file description of a random device
+/// a stream of its own, named by the task that opened it and by how many
+/// random devices its descriptor table had opened before. Aliases of the
+/// description (`dup`, `fork`) share the stream and its cursor. The sequence
+/// counts only the guest's own opens of random devices, which reach Detcore
+/// on every backend, so the name does not depend on what else a backend's
+/// loader opens; [`OpenFileId`]'s sequence counts those opens too. A
+/// description Detcore discovers rather than sees opened is named by its
+/// descriptor number instead ([`RandomDeviceStream::discovered`]), so that a
+/// backend that discovers descriptors does not shift the names of later opens.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RandomDeviceStream {
+    pub(crate) creator: DetTid,
+    pub(crate) sequence: u64,
+}
+
+impl RandomDeviceStream {
+    /// The sequences of discovered descriptions, apart from the count's.
+    const DISCOVERED: u64 = 1 << 63;
+
+    /// The name of a random device found at `fd` of a table owned by `owner`.
+    pub(crate) fn discovered(owner: DetTid, fd: RawFd) -> Self {
+        Self {
+            creator: owner,
+            sequence: Self::DISCOVERED | fd as u32 as u64,
+        }
+    }
+}
+
 /// How an active network trace mode classifies a socket's family and type
 /// (see `crate::syscalls::network_trace`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -438,6 +470,9 @@ struct OpenFileDescription {
     /// Cursor into Hermit's backend-independent random-device byte stream.
     #[serde(default)]
     random_device_offset: u64,
+    /// The stream this random-device open file reads.
+    #[serde(default)]
+    random_device_stream: RandomDeviceStream,
     /// resource
     resource: Option<ResourceID>,
     /// Deterministic snapshot state for selected procfs files.
@@ -646,6 +681,7 @@ impl std::fmt::Debug for OpenFileDescription {
         debug.field("fifo_awaiting_guest_peer", &self.fifo_awaiting_guest_peer);
         debug.field("stat", &self.stat);
         debug.field("random_device_offset", &self.random_device_offset);
+        debug.field("random_device_stream", &self.random_device_stream);
         debug.field("resource", &self.resource);
         debug.field("procfs", &self.procfs);
         debug.field("sigalrm_phase1", &self.sigalrm_phase1);
@@ -906,6 +942,7 @@ impl DetFd {
                 fifo_awaiting_guest_peer: false,
                 stat: None,
                 random_device_offset: 0,
+                random_device_stream: RandomDeviceStream::default(),
                 resource: None,
                 procfs: None,
                 sigalrm_phase1: None,
@@ -973,6 +1010,18 @@ impl DetFd {
     /// alias shares.
     pub(crate) fn set_type(&self, ty: FdType) {
         self.with_description(|d| d.ty = ty);
+    }
+    /// Make this descriptor's open file description a random device that
+    /// reads `stream`.
+    pub(crate) fn set_random_device(&self, stream: RandomDeviceStream) {
+        self.with_description(|d| {
+            d.ty = FdType::Rng;
+            d.random_device_stream = stream;
+        });
+    }
+    /// The stream this random-device open file reads, which every alias shares.
+    pub(crate) fn random_device_stream(&self) -> RandomDeviceStream {
+        self.with_description(|d| d.random_device_stream)
     }
     /// Set per-slot descriptor flags on a newly duplicated fd.
     pub fn with_fd_flags(mut self, flags: OFlag) -> Self {

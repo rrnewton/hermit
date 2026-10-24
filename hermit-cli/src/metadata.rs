@@ -849,7 +849,13 @@ impl RecordVersion {
 // poll's raw ERESTARTSYS, and this change maps a recorded ERESTARTSYS
 // to ERESTARTNOHAND instead of rerunning the poll, so an old recording
 // can replay a different result.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x189);
+// 0x189 -> 0x18a (ledger-assigned for this change): each open file description
+// of a random device reads a stream of its own, named by its opener and its
+// table's count of random-device opens, where every one read the run seed's
+// single stream from its start. An older recording's guest read the old
+// bytes, while this replayer serves the new ones and falls out of step, so it
+// is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18a);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -874,7 +880,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x189);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x189;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x18a;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

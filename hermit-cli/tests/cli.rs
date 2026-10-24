@@ -224,6 +224,7 @@ static CPUID_PROFILE_V3_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_PROFILE_V3_LAZY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_HOST_NO_RDRAND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RANDOM_DEVICE_HOST_NO_RDRAND_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static RANDOM_DEVICE_INDEPENDENT_OPENS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static NESTED_VFORK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static GET_MEMPOLICY_ONE_NODE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -37426,7 +37427,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x189, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x18a, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];
@@ -43339,6 +43340,50 @@ fn cpu_profile_host_no_rdrand_random_device_has_bitwise_parity() {
     );
     let report: serde_json::Value = serde_json::from_slice(&fs::read(verdict).unwrap()).unwrap();
     assert_eq!(report["bitwise_parity"], true, "{report}\n{log}");
+    for side in ["left", "right"] {
+        assert!(
+            report["compared_log_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "no {side} INFO messages compared: {report}"
+        );
+    }
+}
+
+/// Every read of a Linux random device is a fresh draw, so separate opens of
+/// /dev/urandom read different bytes: two threads' draws, one thread's two
+/// draws, and a parent's and its child's draws after a fork. Two threads that
+/// elect a leader from such draws, as libstdc++'s std::random_device makes
+/// them when RDRAND is hidden, agree on one. When every open read the run's
+/// one stream from its start, all three pairs were equal and the election tied
+/// on every attempt. Two complete strict runs agree bitwise.
+#[test]
+fn separate_random_device_opens_read_distinct_bytes_at_bitwise_parity() {
+    let guest = compiled_c_guest(
+        &RANDOM_DEVICE_INDEPENDENT_OPENS_GUEST,
+        "random_device_independent_opens",
+    );
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let output = hermit(&[
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        verdict.to_str().unwrap(),
+        "--",
+        guest.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "election: one leader\nsequential: distinct\nfork: distinct\n",
+        "{stderr}"
+    );
+    assert!(output.status.success(), "{:?}\n{stderr}", output.status);
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(verdict).unwrap()).unwrap();
+    assert_eq!(report["bitwise_parity"], true, "{report}");
     for side in ["left", "right"] {
         assert!(
             report["compared_log_messages"][side]

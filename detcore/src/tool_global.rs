@@ -8116,6 +8116,7 @@ pub async fn prepare_exec<G, T>(
         },
         channels: Default::default(),
         open_file_namespace: None,
+        random_device_sequence: guest.thread_state().random_device_sequence_for_exec(),
         exe,
     };
     // `--pipe-wake-latency` on a backend that rediscovers its descriptors
@@ -17269,6 +17270,7 @@ mod tests {
             maps: None,
             channels: Default::default(),
             open_file_namespace: None,
+            random_device_sequence: 0,
             exe: None,
         };
         state.pending_exec_states.lock().unwrap().insert(
