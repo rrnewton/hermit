@@ -74,6 +74,7 @@ use crate::syscalls::helpers::result_after_restore;
 use crate::syscalls::helpers::retry_blocking_wait_under_mask;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::helpers::unblocked_by;
+use crate::syscalls::implicit_bind::ImplicitBindCall;
 use crate::syscalls::scm_rights::ReceiveGeometry;
 use crate::syscalls::scm_rights::ReceivedFrom;
 use crate::syscalls::scm_rights::SentRights;
@@ -3921,6 +3922,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             },
         );
         let in_turn = self.completes_in_turn(guest, call);
+        if let Some(bind_call) = ImplicitBindCall::connect(&guest.memory(), uservaddr, addrlen) {
+            self.bind_implicit_port(guest, fd, bind_call).await?;
+        }
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
         if let Ok(0) = &result {
             self.note_unix_connect(guest, fd, &unix_address, in_turn);
@@ -4103,15 +4107,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// Handles sendto, sendmsg, and sendmmsg syscalls (MAYHANG).
-    pub async fn handle_sendrecv<
-        G: Guest<Self>,
-        C: SyscallInfo + NonblockableSyscall + Into<Syscall>,
-    >(
+    /// sendto syscall (MAYHANG). An unbound UDP socket first takes a port
+    /// from Detcore (`crate::syscalls::implicit_bind`).
+    pub async fn handle_sendto<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: C,
+        call: syscalls::Sendto,
     ) -> Result<i64, Error> {
+        self.bind_implicit_port(guest, call.fd(), ImplicitBindCall::Send)
+            .await?;
         self.execute_nonblockable_fd_syscall(guest, call).await
     }
 
@@ -4140,6 +4144,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             .into_iter()
             .collect();
         self.refuse_sending_virtual_timerfds(guest, &headers);
+        self.bind_implicit_port(guest, call.fd(), ImplicitBindCall::Send)
+            .await?;
         // The placeholder descriptions it sends, counted in flight, and what
         // each attempt checks again, or its refusal by name
         // (`Detcore::inspect_placeholder_send`).
@@ -4453,6 +4459,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .collect()
         });
         self.refuse_sending_virtual_timerfds(guest, &headers);
+        if call.vlen() > 0 {
+            self.bind_implicit_port(guest, call.sockfd(), ImplicitBindCall::Send)
+                .await?;
+        }
         // A placeholder sent in a batch is refused by name: which of its
         // messages the batch sent is not known (`descriptor_directory`). Each
         // attempt checks again that the batch passes none.

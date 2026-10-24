@@ -19,7 +19,6 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::collections::btree_map::Entry;
 use std::fmt::Debug;
 use std::fs;
@@ -34,7 +33,6 @@ use std::sync::OnceLock;
 use std::sync::PoisonError;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
-use std::sync::atomic::AtomicU16;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::SeqCst;
 use std::task::Poll;
@@ -90,6 +88,9 @@ use crate::config::Config;
 use crate::consts::ROOT_DETPID;
 use crate::fd::SharedOpenFileError;
 use crate::ivar::Ivar;
+use crate::port_allocator::PortAllocator;
+use crate::port_allocator::effective_port_range;
+use crate::port_allocator::parse_reserved_ports;
 use crate::preemptions::ThreadHistory;
 use crate::preemptions::boundary_recording::HistoryReader;
 use crate::procfs_inode;
@@ -1195,8 +1196,8 @@ pub struct GlobalState {
     /// Shared fdinfo mount-ID equivalence classes for this Detcore run.
     mount_ids: Mutex<MountIdPool>,
 
-    // next port to use if input port is 0
-    next_port: AtomicU16,
+    // The local ports Detcore chose for the guest's sockets.
+    ports: Mutex<PortAllocator>,
 
     /// The ID the next guest task gets when Detcore chooses the IDs
     /// (`GuestIds::Chosen`): one past the first process's at the start, one
@@ -1209,9 +1210,6 @@ pub struct GlobalState {
     /// run's IDs are then not deterministic, which the summary says and the
     /// preemption record states, so that a replay refuses it.
     host_id_tasks: AtomicU64,
-
-    // used ports
-    used_ports: Mutex<HashSet<u16>>,
 
     // Unsupported syscall names observed across every process in this run.
     unsupported_syscalls: Mutex<BTreeSet<String>>,
@@ -1274,15 +1272,9 @@ pub struct GlobalState {
     // Optional append-only sink shared by DBT fork descendants.
     unsupported_syscall_report_fd: Option<Mutex<File>>,
 
-    // Open file description to bound port.
-    open_file_to_port: Mutex<HashMap<OpenFileId, u16>>,
-
     /// Inotify rename cookies renumbered by first observation across the run
     /// (`GlobalRequest::VirtualInotifyCookies`, `crate::syscalls::inotify`).
     inotify_cookies: Mutex<crate::syscalls::inotify::CookieTable>,
-
-    port_start_range: AtomicU16,
-    port_end_range: AtomicU16,
 
     // False initially after fork, and true when we begin executing the guest binary.
     past_first_execve: AtomicBool,
@@ -1855,7 +1847,6 @@ impl GlobalState {
             })
             .flatten()
             .map(|recorded| Mutex::new(crate::host_inputs::ReplayHostInputs::new(recorded)));
-        let range = Self::read_port_range();
         let network = Self::network_engine(cfg).map(Mutex::new);
 
         let unsupported_syscall_report_fd = cfg.unsupported_syscall_report_fd.and_then(|fd| {
@@ -1886,14 +1877,13 @@ impl GlobalState {
             sched,
             #[cfg(feature = "physical-mm-test-support")]
             initial_mm_probe: Mutex::new(None),
-            next_port: AtomicU16::new(range[0]),
+            ports: Mutex::new(PortAllocator::default()),
             next_guest_id: AtomicI32::new(
                 cfg.guest_ids
                     .base()
                     .map_or(0, |base| base.saturating_add(1)),
             ),
             host_id_tasks: AtomicU64::new(0),
-            used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
             syscall_observation_gaps: Mutex::new(BTreeSet::new()),
             #[cfg(target_arch = "aarch64")]
@@ -1908,9 +1898,6 @@ impl GlobalState {
             host_inputs_settled: AtomicBool::new(false),
             shared_open_files: process_exit_cleanup.shared_open_files,
             unsupported_syscall_report_fd,
-            port_start_range: AtomicU16::new(range[0]),
-            port_end_range: AtomicU16::new(range[1]),
-            open_file_to_port: Mutex::new(HashMap::new()),
             inotify_cookies: Mutex::new(Default::default()),
             past_first_execve: AtomicBool::new(false),
             initial_descriptor_image_complete: AtomicBool::new(false),
@@ -5217,47 +5204,37 @@ impl GlobalState {
             }
             GlobalRequest::RequestPort(open_file_id) => {
                 let _sched = self.lock_rpc_scheduler(false).await;
-                let mut mut_used_ports = self.used_ports.lock().unwrap();
-                self.update_port_range();
-                let total_available =
-                    self.port_end_range.load(SeqCst) - self.port_start_range.load(SeqCst);
-                let mut index = 0;
-                while (*mut_used_ports).contains(&self.next_port.load(SeqCst))
-                    && index < total_available
-                {
-                    self.next_port.fetch_add(1, SeqCst);
-                    if self.next_port.load(SeqCst) > self.port_end_range.load(SeqCst) {
-                        self.next_port
-                            .store(self.port_start_range.load(SeqCst), SeqCst);
-                    }
-                    index += 1;
-                }
-                if index == total_available {
-                    R::PortFull
-                } else {
-                    (*mut_used_ports).insert(self.next_port.load(SeqCst));
-                    let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
-                    open_file_to_port.insert(open_file_id, self.next_port.load(SeqCst));
-                    R::RequestPort(self.next_port.load(SeqCst))
-                }
+                let (range, reserved) = (Self::read_port_range(), Self::read_reserved_ports());
+                let port = self
+                    .ports
+                    .lock()
+                    .unwrap()
+                    .request(open_file_id, range, &reserved);
+                port.map_or(R::PortFull, R::RequestPort)
+            }
+            GlobalRequest::ImplicitPort {
+                open_file,
+                refused,
+                socket_range,
+            } => {
+                let _sched = self.lock_rpc_scheduler(false).await;
+                let range = effective_port_range(Self::read_port_range(), socket_range);
+                let reserved = Self::read_reserved_ports();
+                let port = self
+                    .ports
+                    .lock()
+                    .unwrap()
+                    .request_implicit(open_file, range, &reserved, refused);
+                port.map_or(R::PortFull, R::RequestPort)
             }
             GlobalRequest::AddUsedPort(port, open_file_id) => {
                 let _sched = self.lock_rpc_scheduler(false).await;
-                let mut used_ports = self.used_ports.lock().unwrap();
-                used_ports.insert(port);
-                let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
-                open_file_to_port.insert(open_file_id, port);
+                self.ports.lock().unwrap().add_used(open_file_id, port);
                 R::AddUsedPort
             }
             GlobalRequest::ReleasePort(open_file_id) => {
                 let _sched = self.lock_rpc_scheduler(false).await;
-                let mut used_ports = self.used_ports.lock().unwrap();
-                let mut open_file_to_port = self.open_file_to_port.lock().unwrap();
-                let port = open_file_to_port.remove(&open_file_id);
-                if let Some(port) = port {
-                    used_ports.remove(&port);
-                }
-                R::ReleasePort(port)
+                R::ReleasePort(self.ports.lock().unwrap().release(open_file_id))
             }
         };
 
@@ -6854,24 +6831,27 @@ impl GlobalState {
         SchedulerRpcResult::Continue(result)
     }
 
-    // Ephemeral port range is in file /proc/sys/net/ipv4/ip_local_port_range"
-    // This function reads from the file and returns the range
-    // Start of range is at index 0, end of range is at index 1.
-    fn read_port_range() -> Vec<u16> {
+    /// The inclusive range Linux picks local ports from,
+    /// `/proc/sys/net/ipv4/ip_local_port_range`. Read at each request, so a
+    /// range the guest changed applies at once, as it does in Linux. Detcore
+    /// shares the guest's network namespace, so this is the guest's range.
+    fn read_port_range() -> (u16, u16) {
         let contents = fs::read_to_string("/proc/sys/net/ipv4/ip_local_port_range")
             .expect("File should be present");
         let range: Vec<u16> = contents
             .split_whitespace()
             .filter_map(|number| number.parse().ok())
             .collect();
-        range
+        (range[0], range[1])
     }
 
-    // Reflect ephemeral port range updated outside of the tracer program internally.
-    fn update_port_range(&self) {
-        let range = Self::read_port_range();
-        self.port_start_range.store(range[0], SeqCst);
-        self.port_end_range.store(range[1], SeqCst);
+    /// The ports Linux never picks itself,
+    /// `/proc/sys/net/ipv4/ip_local_reserved_ports`, read like
+    /// [`Self::read_port_range`]; none when the file cannot be read.
+    fn read_reserved_ports() -> Vec<std::ops::RangeInclusive<u16>> {
+        fs::read_to_string("/proc/sys/net/ipv4/ip_local_reserved_ports")
+            .map(|contents| parse_reserved_ports(&contents))
+            .unwrap_or_default()
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -7848,6 +7828,18 @@ pub enum GlobalRequest {
     /// A guest task was created with a host ID although Detcore chooses the
     /// IDs (`GlobalState::host_id_tasks`). Appended last.
     GaveHostId,
+    /// Choose the port of an implicit bind of a socket
+    /// (`crate::syscalls::implicit_bind`), answered by `RequestPort` or
+    /// `PortFull` (`PortAllocator::request_implicit`). Appended last.
+    ImplicitPort {
+        /// The socket's open file description.
+        open_file: OpenFileId,
+        /// Whether the kernel refused the port given to it before.
+        refused: bool,
+        /// The socket's `IP_LOCAL_PORT_RANGE`, 0 when unset
+        /// (`effective_port_range`).
+        socket_range: u32,
+    },
 }
 
 /// Responses from the global object
