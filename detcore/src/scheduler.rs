@@ -8022,6 +8022,13 @@ impl Scheduler {
         if std::mem::take(&mut self.fast_forward_for_alone_poller) {
             self.fast_forward_to_next_finite_deadline(global_time);
         }
+        if self.replay_fast_forward_to_recorded_wake(global_time) {
+            // No thread runs until the replayed thread wakes: committed time
+            // catches up in the next pass's step 1, and each pass then pops one
+            // due timed event, the replayed thread's last if others are earlier.
+            self.step2b_process_timed(global_time);
+            return Err(SkipTurn);
+        }
         self.step2b_process_timed(global_time);
         self.step2b_restore_due_pollers();
         // A timed signal that just armed a background thread is followed by an
@@ -8036,6 +8043,69 @@ impl Scheduler {
         self.step2c_process_io_blockers()?;
         self.step2e_process_signal_deferred();
         self.step2d_handle_empty_queue(global_time)
+    }
+
+    /// Under `--replay-schedule-from`, when the next recorded event belongs to a
+    /// thread asleep until a finite deadline, move global time to that deadline
+    /// and report that the pass must wait for the wake (true).
+    ///
+    /// The recorded schedule is authoritative: if the recording resumed that
+    /// thread here, its deadline had passed in the recording, since any wake by
+    /// another thread would already have been replayed and taken it out of the
+    /// timed waiters. A replay can reach this point with less virtual time
+    /// elapsed than the recording (its context switches are replay turns, which
+    /// charge no scheduler time, where the recording's were ordinary turns), and
+    /// it would then run another thread here and leave the schedule. Advancing
+    /// time keeps it monotonic and makes the recorded wake legal; timed waiters
+    /// with earlier deadlines wake on the way, as they would have in the
+    /// recording.
+    ///
+    /// The pass waits only while the wake is not yet due: committed time is
+    /// behind the deadline, or an earlier timed event pops first. Once the
+    /// thread's deadline is the earliest due one, the ordinary pass pops it
+    /// and goes on to its turn, as the recording's pass did.
+    ///
+    /// A schedule that carries callback checkpoints replays its software
+    /// expiry turns from them (`callback_history_active`), so it keeps its own
+    /// time and is left alone here. One without them, such as the trials
+    /// `hermit analyze` writes, has nothing else to wake the thread on time.
+    /// After a hard desync the cursor stays on the event it expected, so the
+    /// jump can repeat for that thread; it still only moves time forward.
+    fn replay_fast_forward_to_recorded_wake(
+        &mut self,
+        global_time: &Arc<Mutex<GlobalTime>>,
+    ) -> bool {
+        if self.callback_history_active {
+            return false;
+        }
+        let Some((tid, _)) = self
+            .replayer
+            .as_ref()
+            .and_then(|replayer| replayer.next_resume())
+        else {
+            return false;
+        };
+        let Some(deadline) = self.blocked.timed_waiters.thread_deadline(tid) else {
+            return false;
+        };
+        if deadline.is_indefinite() {
+            return false;
+        }
+        let mut gt = global_time.lock().unwrap();
+        let now = gt.as_nanos();
+        if deadline > now {
+            info!(
+                "[scheduler] The replayed schedule resumes dtid {} next, which sleeps until {}; skipping global time ahead to it.",
+                tid, deadline
+            );
+            gt.add_extra_time(deadline.duration_since(now));
+        }
+        deadline > self.committed_time
+            || self
+                .blocked
+                .timed_waiters
+                .next_deadline()
+                .is_some_and(|earliest| earliest < deadline)
     }
 
     /// Move global time to the earliest finite timed deadline, if it lies
@@ -22376,6 +22446,75 @@ mod test {
                 "the schedule's next event is dtid {next}"
             );
         }
+    }
+
+    /// A schedule replay whose next recorded event resumes a thread asleep in
+    /// virtual time moves global time to that thread's deadline and holds the
+    /// pass for its wake. A replay that resumes another thread, or a run that
+    /// is not replaying, leaves time alone.
+    #[test]
+    fn a_replay_resuming_a_sleeper_moves_time_to_its_deadline() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let sleeper = DetTid::from_raw(5);
+        let other = DetTid::from_raw(7);
+        let (global_time, deadline) = add_sleeper(&mut scheduler, sleeper);
+        let before = global_time.lock().unwrap().as_nanos();
+
+        assert!(
+            !scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "not replaying"
+        );
+        let resume_other = SchedEvent::syscall(other, Sysno::getpid, SyscallPhase::Prehook);
+        scheduler.replayer = Some(replayer::Replayer::new(vec![resume_other]));
+        assert!(
+            !scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "the replay resumes another thread"
+        );
+        assert_eq!(global_time.lock().unwrap().as_nanos(), before);
+
+        let wake = SchedEvent::syscall(sleeper, Sysno::clock_nanosleep, SyscallPhase::Posthook);
+        scheduler.replayer = Some(replayer::Replayer::new(vec![wake.clone()]));
+        assert!(scheduler.replay_fast_forward_to_recorded_wake(&global_time));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+        assert!(
+            scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "the pass keeps waiting until committed time reaches the deadline"
+        );
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+
+        // An earlier timed waiter pops first, then the sleeper's wake is due:
+        // the ordinary pass pops it and goes on to its turn.
+        let early = DetTid::from_raw(9);
+        let early_deadline = deadline - LogicalTime::from_nanos(10);
+        scheduler
+            .blocked
+            .timed_waiters
+            .insert(early_deadline, early);
+        scheduler.committed_time = deadline;
+        assert!(
+            scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "an earlier deadline is still waiting to pop"
+        );
+        scheduler.blocked.timed_waiters.remove(early);
+        assert!(
+            !scheduler.replay_fast_forward_to_recorded_wake(&global_time),
+            "the wake is due, so the pass runs"
+        );
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+
+        // A schedule with callback checkpoints replays its expiry turns from
+        // them and is left alone.
+        let (global_time, _) = add_sleeper(&mut scheduler, DetTid::from_raw(11));
+        let before = global_time.lock().unwrap().as_nanos();
+        scheduler.committed_time = before;
+        scheduler.callback_history_active = true;
+        scheduler.replayer = Some(replayer::Replayer::new(vec![SchedEvent::syscall(
+            DetTid::from_raw(11),
+            Sysno::clock_nanosleep,
+            SyscallPhase::Posthook,
+        )]));
+        assert!(!scheduler.replay_fast_forward_to_recorded_wake(&global_time));
+        assert_eq!(global_time.lock().unwrap().as_nanos(), before);
     }
 
     /// With a backgrounded call unfinished and nothing queued, record wakes a
