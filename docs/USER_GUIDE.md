@@ -805,6 +805,9 @@ self-check log files are capped at max(64 MiB, 10 times the largest measured
 endpoint log), within `HERMIT_LOG_MAX_BYTES`; setting that variable to `0`
 lifts both file caps. These host resource limits may stop a trial on a slow
 machine; they never change a stopped trial into a completed outcome.
+A trial that Hermit refuses when its guest reaches an operation Hermit does
+not support (exit 122) counts as not reaching the target too, with a warning;
+a refused target run still ends the analysis.
 
 By default analyze bisects between the failing schedule and a passing one from
 another run. When the two runs differ in events only one of them executed (for
