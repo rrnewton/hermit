@@ -2805,7 +2805,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // epoch read without copying the configuration, and its placeholder
     // gate): 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit", 2529),
+    // And the three signal-death units (a thread killed by a group-ending
+    // signal makes an empty run queue wait for the rest of its group):
+    // group_signal_tests::a_fatal_signal_ends_the_group_except_seccomps_sigsys,
+    // scheduler::test::a_fatal_signal_death_waits_for_its_group_so_a_blocked_leader_is_no_deadlock
+    // and
+    // tool_global::tests::sigkill_deregistration_tests::a_sigkill_deregistration_waits_for_the_rest_of_its_group:
+    // 2532, listed.
+    ("test.detcore_unit", 2532),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3133,7 +3140,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and recvmsg-import refusals and native-lock control, and
     // proc_locks_determinism's copied-child OFD unlock and stale-flock-record
     // tests: 285, listed.
-    ("test.hermit_integration_2", 285),
+    // And fatal_core_capture's
+    // a_fault_ends_the_run_while_the_leader_waits_on_a_condition_variable (a
+    // thread's fault ends the run by its signal while main waits on a
+    // condition variable): 286, listed.
+    ("test.hermit_integration_2", 286),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -4925,7 +4936,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twelve A+ units: 2527, listed.
     // And the same three slice 7d determinize_stat_tests units: 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit_on_host", 2529),
+    // And the same three signal-death units: 2532, listed.
+    ("test.detcore_unit_on_host", 2532),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5037,7 +5049,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 28 retained coherent mapping-capture controls: 685.
     // Split the five birth cases into separately bounded identities (+4): 689.
     // And two pure declared-Redis input controls in redis_strict: 691, listed.
-    ("test.hermit_integration_on_host", 691),
+    // And the same fatal_core_capture leader-waits test: 692, listed.
+    ("test.hermit_integration_on_host", 692),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

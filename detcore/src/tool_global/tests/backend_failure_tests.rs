@@ -521,6 +521,7 @@ async fn unknown_deregistration(
                     timeslice_stats: TimesliceStats::default(),
                     syscall_count: 0,
                     chaos_epochs: Vec::new(),
+                    killed_by_group_signal: false,
                 }),
             ),
         )
@@ -603,6 +604,7 @@ async fn dbt_missing_physical_id_start_preserves_tombstone_deregistration_accoun
                         timeslice_stats: stats,
                         syscall_count: count,
                         chaos_epochs: Vec::new(),
+                        killed_by_group_signal: false,
                     }),
                 ),
             )
