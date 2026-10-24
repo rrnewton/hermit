@@ -49,10 +49,15 @@ non-host platform targets that the default Hermit binary does not use.
 
 ### In-guest runtime artifacts
 
-The ordinary Hermit Buck targets select `in-guest-trap` and
-`exec-stop-launcher`. Their Reverie dependencies include the loader and the
-exec-stop libraries without enabling `liteinst2`. The release shadow target
-continues to select `liteinst` and the patching-enabled Reverie target.
+The existing `//hermit-cli:libhermit` and `//hermit-cli:hermit` targets retain
+LiteInst site patching: both select `in-guest-trap`, `exec-stop-launcher` and
+`liteinst`, with the patching-enabled Reverie runtime. Explicit trap-only builds
+use `//hermit-cli:libhermit-trap-only` and `//hermit-cli:hermit-trap-only`. Those
+select `in-guest-trap` and `exec-stop-launcher`, with
+`reverie//:reverie-liteinst-native-trap-only`; their dependency closures retain
+the loader and exec-stop libraries without enabling `liteinst2`. The release
+shadow target continues to select `liteinst` and the patching-enabled Reverie
+target.
 
 The preload and native runtime packaging still use Cargo producers. There is
 no Buck target for `detcore-liteinst` or `hermit-install`; the normal
