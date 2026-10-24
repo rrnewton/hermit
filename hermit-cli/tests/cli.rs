@@ -227,6 +227,7 @@ static KERNEL_MAX_AFFINITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CPU_TIME_CLOCKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUID_TABLE_DUMP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SELECT_TIMEOUT_NORMALIZATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static TOOL_OUTPUT_PROTECTION_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -35314,6 +35315,71 @@ fn clock_ids_are_validated_as_linux_validates_them() {
     let output = hermit(&args);
     assert_success(&output, &args);
     assert_eq!(stdout(&output), native);
+}
+
+/// The CPU-time clocks read Detcore's logical CPU accounting, the time
+/// getrusage and times report: CLOCK_THREAD_CPUTIME_ID,
+/// CLOCK_PROCESS_CPUTIME_ID, clock(), and the clocks pthread_getcpuclockid and
+/// clock_getcpuclockid name, for the caller and for another thread. The guest
+/// checks them by Linux's rules (a new thread starts near zero, a blocked one
+/// stands still, the process covers every thread, exited ones included, a
+/// fork starts afresh, an exec keeps the thread's and the process's time, and
+/// clock_nanosleep refuses the caller's own thread clock) and prints only each
+/// check's result, natively and under Hermit, and the two outputs must be
+/// equal. Its `values` mode also prints the CPU times, which two strict runs
+/// print the same (bitwise parity). Before, every CPU clock read Hermit's
+/// epoch-based virtual wall time, about 1.77e9 s, so clock() read about
+/// 1.77e15 and 14 of the 24 checks failed.
+#[test]
+fn cpu_time_clocks_read_the_logical_cpu_accounting() {
+    let guest = futex_c_guest(&CPU_TIME_CLOCKS_GUEST, "cpu_time_clocks")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let native = Command::new(&guest).output().unwrap();
+    assert!(native.status.success(), "{native:?}");
+    let native = String::from_utf8(native.stdout).unwrap();
+    assert!(
+        native.ends_with("cpu_time_clocks: 24 checks, 0 failed\n"),
+        "{native}"
+    );
+    let args = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--",
+        guest.as_str(),
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), native);
+
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let args = [
+        "run",
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        verdict.to_str().unwrap(),
+        "--base-env=minimal",
+        "--",
+        guest.as_str(),
+        "values",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let values = stdout(&output);
+    assert!(
+        values.contains("\nvalue clock ")
+            && values.ends_with("cpu_time_clocks: 24 checks, 0 failed\n"),
+        "{values}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+            .expect("the verdict must be JSON");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
 }
 
 #[test]
