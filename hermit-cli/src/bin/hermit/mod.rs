@@ -41,7 +41,7 @@ mod image;
 mod image_source;
 #[cfg(any(
     feature = "native-exec",
-    all(feature = "exec-stop-launcher", feature = "liteinst")
+    all(feature = "exec-stop-launcher", feature = "in-guest-trap")
 ))]
 mod initial_image_admission;
 mod instruction_map;
@@ -50,7 +50,7 @@ mod list;
 mod log_ring;
 mod logdiff;
 mod manifest;
-#[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+#[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
 mod mapped_first_admission;
 #[cfg(feature = "native-exec")]
 mod native_exec_artifacts;

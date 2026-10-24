@@ -16,6 +16,19 @@ use std::process::Command;
 
 const STDOUT_LINK: &str = "/proc/self/fd/1";
 
+const EXPECTED_ALIASES: &str = concat!(
+    "canonical=/tmp/hermit-proc-fd-link-aliases\n",
+    "truncated=/tmp/hermi\n",
+    "numeric=/tmp/hermit-proc-fd-link-aliases\n",
+    "dev-fd=/tmp/hermit-proc-fd-link-aliases\n",
+    "lexical=/tmp/hermit-proc-fd-link-aliases\n",
+    "readlinkat=/tmp/hermit-proc-fd-link-aliases\n",
+);
+
+#[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+const IN_GUEST_TRAP_SELECTED: &str = "hermit: [in-guest-trap] selected: the guest preload is to host the Detcore Tool, \
+     with syscall site patching off (REVERIE_LITEINST_SITE_PATCHING=0)";
+
 /// The line Hermit prints when it runs the guest under in-guest LiteInst.
 #[cfg(feature = "liteinst")]
 const IN_GUEST_SELECTED: &str =
@@ -115,8 +128,7 @@ fn proc_fd_link_consumers_verify() {
     }
 }
 
-#[test]
-fn proc_fd_link_aliases_and_truncation_verify() {
+fn build_proc_fd_alias_guest() -> PathBuf {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
@@ -137,6 +149,12 @@ fn proc_fd_link_aliases_and_truncation_verify() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
+    guest
+}
+
+#[test]
+fn proc_fd_link_aliases_and_truncation_verify() {
+    let guest = build_proc_fd_alias_guest();
     let case = ProgramCase {
         name: "proc-fd link aliases",
         candidates: &[],
@@ -146,14 +164,7 @@ fn proc_fd_link_aliases_and_truncation_verify() {
     // c7531a837a65 ("Stabilize proc-fd alias parity fixture", 2026-08-01)
     // changed it so that harness capture names could not become guest output,
     // and left this expectation naming the old pipe target.
-    let expected = concat!(
-        "canonical=/tmp/hermit-proc-fd-link-aliases\n",
-        "truncated=/tmp/hermi\n",
-        "numeric=/tmp/hermit-proc-fd-link-aliases\n",
-        "dev-fd=/tmp/hermit-proc-fd-link-aliases\n",
-        "lexical=/tmp/hermit-proc-fd-link-aliases\n",
-        "readlinkat=/tmp/hermit-proc-fd-link-aliases\n",
-    );
+    let expected = EXPECTED_ALIASES;
     // The DBT leg runs only in builds that include DBT; the ptrace leg always runs.
     let backends: &[&str] = if cfg!(feature = "dbt") {
         &["ptrace", "dbt"]
@@ -220,4 +231,33 @@ fn proc_fd_link_aliases_and_truncation_verify() {
             case.name
         );
     }
+}
+
+#[test]
+#[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+fn proc_fd_link_aliases_and_truncation_in_guest_trap() {
+    let guest = build_proc_fd_alias_guest();
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", "10s", "90s"])
+        .arg(hermit_test::hermit_binary())
+        .args(["--log", "DEBUG", "--backend=in-guest-trap", "run"])
+        .args(["--strict", "--max-timeslice=disabled", "--"])
+        .arg(&guest);
+    hermit_test::configure_guest_execution(&mut command);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "proc-fd link aliases failed under in-guest-trap\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.lines().any(|line| line == IN_GUEST_TRAP_SELECTED),
+        "proc-fd link aliases did not run under in-guest-trap\nstderr:\n{stderr}"
+    );
+    assert_eq!(
+        stdout, EXPECTED_ALIASES,
+        "proc-fd link aliases differed on in-guest-trap"
+    );
 }

@@ -73,20 +73,20 @@ mod kvm_waitid_copyout;
 
 // Its helpers test `scripts/stage-liteinst-runtime.sh`, which still stages the
 // Reverie LiteInst runtime; the in-guest backend does not load that library.
-#[cfg_attr(not(feature = "liteinst"), allow(dead_code))]
+#[cfg_attr(not(feature = "in-guest-trap"), allow(dead_code))]
 #[path = "common/liteinst.rs"]
 mod liteinst_runtime;
 
 // The LiteInst dispatch record and backend statistics are checked against
 // in-guest runs in this binary; every backend's syscall histogram is checked
 // with the same harness.
-#[cfg_attr(not(feature = "liteinst"), allow(dead_code))]
+#[cfg_attr(not(feature = "in-guest-trap"), allow(dead_code))]
 #[path = "common/dispatch_stats.rs"]
 mod dispatch_stats;
 
 // Real programs under in-guest LiteInst, formerly the liteinst_advanced test
 // binary (https://github.com/rrnewton/hermit/issues/3520).
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 #[path = "common/liteinst_in_guest_programs.rs"]
 mod liteinst_in_guest_programs;
 
@@ -110,7 +110,7 @@ mod verify_run;
 #[path = "common/verify_inputs.rs"]
 mod verify_inputs;
 
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 #[path = "common/startup_guards.rs"]
 mod startup_guards;
 
@@ -2698,9 +2698,10 @@ fn a_refused_guest_signal_handler_is_announced_once_per_run() {
     let guest = guest.to_str().expect("guest path is UTF-8");
     let mut backends = vec!["ptrace"];
     if cfg!(feature = "liteinst") {
-        backends.extend(["liteinst", "in-guest-trap"]);
-    } else {
-        eprintln!("{test}: NOT COMPARED: liteinst and in-guest-trap are not in this build");
+        backends.push("liteinst");
+    }
+    if cfg!(feature = "in-guest-trap") {
+        backends.push("in-guest-trap");
     }
     for backend in &backends {
         let in_guest = *backend != "ptrace";
@@ -6512,7 +6513,8 @@ fn procfs_backends_among(test: &str, among: &[&str]) -> Vec<&'static str> {
                 // `kvm_unavailable` does for an early return.
                 "kvm" => !Path::new("/dev/kvm").exists(),
                 "sabre" => !cfg!(feature = "sabre"),
-                "liteinst" | "in-guest-trap" => !cfg!(feature = "liteinst"),
+                "liteinst" => !cfg!(feature = "liteinst"),
+                "in-guest-trap" => !cfg!(feature = "in-guest-trap"),
                 "e9patch" => !cfg!(feature = "e9patch"),
                 _ => false,
             };
@@ -13738,6 +13740,7 @@ fn detcore_renders_process_auxv_on_every_backend() {
         let unavailable = match backend {
             "dbt" => dbt_unavailable(test),
             "sabre" => !cfg!(feature = "sabre"),
+            "in-guest-trap" => !cfg!(feature = "in-guest-trap"),
             _ => !cfg!(feature = "liteinst"),
         };
         if unavailable {

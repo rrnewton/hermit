@@ -151,7 +151,7 @@ fn liteinst_startup_guards_derive_from_at_random_and_repeat() {
     assert_startup_guards("liteinst");
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 #[test]
 #[ignore = "known failure: glibc's loader derives the stack-protector canary and pointer guard from AT_RANDOM before any preloaded constructor runs, so on this backend both still come from host entropy"]
 fn in_guest_trap_startup_guards_derive_from_at_random_and_repeat() {

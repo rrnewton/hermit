@@ -221,7 +221,7 @@ def main():
   cargo=[(p,q) for p,q in commands if q['stdout']['sha256']==build['cargo_messages_sha256']]
   need(len(metadata)==len(cargo)==1,'factory metadata/Cargo stream absent or ambiguous')
   features='exec-native-injection,exec-private-init,loader-private-runtime'
-  expected=['rustc','--locked','--offline','--manifest-path',str(h/'detcore-liteinst/Cargo.toml'),'--lib','--target','x86_64-unknown-linux-musl','--profile','liteinst-runtime','--features',features,'--crate-type','staticlib','--message-format=json-render-diagnostics','--target-dir',c['target']]
+  expected=['rustc','--locked','--offline','--no-default-features','--manifest-path',str(h/'detcore-liteinst/Cargo.toml'),'--lib','--target','x86_64-unknown-linux-musl','--profile','liteinst-runtime','--features',features,'--crate-type','staticlib','--message-format=json-render-diagnostics','--target-dir',c['target']]
   for path,q in metadata+cargo:
    need(q['program']==c['cargo'] and q['status']==0 and q['cwd']==str(h),'factory command context differs')
    files[str(path)]=sha(path)

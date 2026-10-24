@@ -61,7 +61,17 @@ use serde_json::json;
 const POINTER: &str = "target/ci/m1-allocator-fixtures.path";
 const STACK_POINTER: &str = "target/ci/m2-stack-fixtures.path";
 const COLD_POINTER: &str = "target/ci/cold-stack-fixtures.path";
-const FEATURES: [&str; 1] = ["allocator-fixture"];
+const TRAP_POINTER: &str = "target/ci/in-guest-trap/m1-allocator-fixtures.path";
+const TRAP_STACK_POINTER: &str = "target/ci/in-guest-trap/m2-stack-fixtures.path";
+const TRAP_COLD_POINTER: &str = "target/ci/in-guest-trap/cold-stack-fixtures.path";
+
+fn pointers(liteinst: bool) -> [&'static str; 3] {
+    if liteinst {
+        [POINTER, STACK_POINTER, COLD_POINTER]
+    } else {
+        [TRAP_POINTER, TRAP_STACK_POINTER, TRAP_COLD_POINTER]
+    }
+}
 
 fn require(ok: bool, message: &str) -> Result<()> {
     if ok { Ok(()) } else { Err(message.to_owned()) }
@@ -98,7 +108,10 @@ fn record_compiler_crash_retry(record: &mut Option<PathBuf>, leaf: &str, line: &
             .map_or(0, |elapsed| elapsed.as_secs());
         PathBuf::from(state)
             .join("compiler-crash-retries")
-            .join(format!("m1-producer-{leaf}-{seconds}-{}.txt", std::process::id()))
+            .join(format!(
+                "m1-producer-{leaf}-{seconds}-{}.txt",
+                std::process::id()
+            ))
     });
     let appended = path
         .parent()
@@ -153,7 +166,10 @@ fn run_cargo_build(
     let Some(crash) = compiler_crash_line(&stdout, &stderr) else {
         return Err(error);
     };
-    let failed = runner.commands.pop().expect("the failed build's evidence is present");
+    let failed = runner
+        .commands
+        .pop()
+        .expect("the failed build's evidence is present");
     let mut record = None;
     let command = format!("cargo {}", arguments.join(" "));
     for line in [
@@ -163,8 +179,12 @@ fn run_cargo_build(
         ),
         "retry-on-compiler-crash: first run's crash lines:".to_owned(),
         crash.clone(),
-        format!("retry-on-compiler-crash: first run's logs: {}", failed.stderr.path.display()),
-        "retry-on-compiler-crash: rerunning once; a second failure of any kind fails the node".to_owned(),
+        format!(
+            "retry-on-compiler-crash: first run's logs: {}",
+            failed.stderr.path.display()
+        ),
+        "retry-on-compiler-crash: rerunning once; a second failure of any kind fails the node"
+            .to_owned(),
     ] {
         record_compiler_crash_retry(&mut record, leaf, &line);
     }
@@ -209,6 +229,7 @@ fn build_leaf(
     bundle: &Path,
     oracles: &BTreeMap<String, PathBuf>,
     standalone: bool,
+    liteinst: bool,
     deadline: Instant,
 ) -> Result<Leaf> {
     let name = if standalone { "standalone" } else { "detcore" };
@@ -288,7 +309,11 @@ fn build_leaf(
     )?;
     let target = own.join("target");
     fs::create_dir(&target).map_err(|e| format!("new dedicated target: {e}"))?;
-    let profile_name = if standalone { "release" } else { "liteinst-runtime" };
+    let profile_name = if standalone {
+        "release"
+    } else {
+        "liteinst-runtime"
+    };
     let profile = cargo_profile(!standalone);
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
     let rustc_verbose = runner.text(&rustc, &["--version", "--verbose"], root)?;
@@ -299,6 +324,7 @@ fn build_leaf(
         "build".into(),
         "--locked".into(),
         "--offline".into(),
+        "--no-default-features".into(),
         "--manifest-path".into(),
         manifest.to_string_lossy().into_owned(),
         "-p".into(),
@@ -314,18 +340,15 @@ fn build_leaf(
         // Cargo can enable features only through a selected workspace member.
         // This existing inert member forwards the diagnostic ABI to the real
         // leaf; current-artifact selection below still requires only that leaf.
-        build_arguments.extend([
-            "-p".into(),
-            "hermit-liteinst-runtime-artifact".into(),
-            "--features".into(),
-            "allocator-fixture".into(),
-        ]);
-    } else {
-        build_arguments.extend(["--features".into(), "allocator-fixture".into()]);
+        build_arguments.extend(["-p".into(), "hermit-liteinst-runtime-artifact".into()]);
     }
+    let mut features = vec!["allocator-fixture".to_owned()];
+    if liteinst {
+        features.push("liteinst".into());
+    }
+    build_arguments.extend(["--features".into(), features.join(",")]);
     let output = run_cargo_build(&mut runner, name, &build_arguments, root)?;
     compiled_sources.verify_unchanged(&mut runner)?;
-    let features: Vec<String> = FEATURES.into_iter().map(str::to_owned).collect();
     let cargo_artifact = m1_artifact::select_artifact(
         std::str::from_utf8(&output).map_err(|e| e.to_string())?,
         &package,
@@ -561,13 +584,18 @@ fn produce_stack_fixture(
     Ok((binary_path, receipt_path))
 }
 
-fn produce(root: &Path) -> Result<()> {
+fn produce(root: &Path, liteinst: bool) -> Result<()> {
     require(
         std::env::var("CARGO_NET_OFFLINE").as_deref() == Ok("true"),
         "producer requires CARGO_NET_OFFLINE=true",
     )?;
     let deadline = Instant::now() + Duration::from_secs(900);
-    let parent = root.join("target/ci/m1-allocator-fixtures");
+    let [pointer, stack_pointer, cold_pointer] = pointers(liteinst);
+    let parent = root.join(if liteinst {
+        "target/ci/m1-allocator-fixtures"
+    } else {
+        "target/ci/in-guest-trap/m1-allocator-fixtures"
+    });
     fs::create_dir_all(&parent).map_err(|e| e.to_string())?;
     let generation = format!(
         "{}-{}",
@@ -657,8 +685,9 @@ fn produce(root: &Path) -> Result<()> {
     // standalone build (about 40 s at width 8) hides under the Detcore one
     // (about 95 s) instead of preceding it.
     let (standalone, detcore) = std::thread::scope(|scope| {
-        let standalone = scope.spawn(|| build_leaf(root, &bundle, &oracles, true, deadline));
-        let detcore = build_leaf(root, &bundle, &oracles, false, deadline);
+        let standalone =
+            scope.spawn(|| build_leaf(root, &bundle, &oracles, true, liteinst, deadline));
+        let detcore = build_leaf(root, &bundle, &oracles, false, liteinst, deadline);
         let standalone = standalone
             .join()
             .unwrap_or_else(|_| Err("the standalone leaf build panicked".into()));
@@ -839,21 +868,21 @@ fn produce(root: &Path) -> Result<()> {
     )?;
     // Publish only after both runtime and guest identities are closed. A failed
     // generation keeps its logs but never becomes the selected fixture bundle.
-    let pending = root.join(format!("{POINTER}.{}", std::process::id()));
+    let pending = root.join(format!("{pointer}.{}", std::process::id()));
     m1_artifact::write_new(&pending, format!("{}\n", manifest.display()).as_bytes())?;
-    fs::rename(pending, root.join(POINTER)).map_err(|e| e.to_string())?;
-    let stack_pending = root.join(format!("{STACK_POINTER}.{}", std::process::id()));
+    fs::rename(pending, root.join(pointer)).map_err(|e| e.to_string())?;
+    let stack_pending = root.join(format!("{stack_pointer}.{}", std::process::id()));
     m1_artifact::write_new(
         &stack_pending,
         format!("{}\n", stack_manifest.display()).as_bytes(),
     )?;
-    fs::rename(stack_pending, root.join(STACK_POINTER)).map_err(|e| e.to_string())?;
-    let cold_pending = root.join(format!("{COLD_POINTER}.{}", std::process::id()));
+    fs::rename(stack_pending, root.join(stack_pointer)).map_err(|e| e.to_string())?;
+    let cold_pending = root.join(format!("{cold_pointer}.{}", std::process::id()));
     m1_artifact::write_new(
         &cold_pending,
         format!("{}\n", cold_manifest.display()).as_bytes(),
     )?;
-    fs::rename(cold_pending, root.join(COLD_POINTER)).map_err(|e| e.to_string())?;
+    fs::rename(cold_pending, root.join(cold_pointer)).map_err(|e| e.to_string())?;
 
     println!(
         "{}",
@@ -865,11 +894,24 @@ fn produce(root: &Path) -> Result<()> {
 fn run() -> Result<()> {
     let root = fs::canonicalize(std::env::current_dir().map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())?;
-    let args: Vec<_> = std::env::args().skip(1).collect();
+    let mut args: Vec<_> = std::env::args().skip(1).collect();
+    const USAGE: &str = "usage: build-liteinst-allocator-fixtures.rs [--without-liteinst] [--print-standalone | --print-stack-standalone]";
+    if args
+        .iter()
+        .any(|argument| argument == "--help" || argument == "-h")
+    {
+        println!(
+            "{USAGE}\nBuild qualified allocator/stack/constructor fixtures; --without-liteinst uses separate trap-only bundles."
+        );
+        return Ok(());
+    }
+    let liteinst = !args.iter().any(|argument| argument == "--without-liteinst");
+    args.retain(|argument| argument != "--without-liteinst");
+    let [pointer, stack_pointer, _] = pointers(liteinst);
     match args.as_slice() {
-        [] => produce(&root),
+        [] => produce(&root, liteinst),
         [option] if option == "--print-standalone" => {
-            let manifest = fs::read_to_string(root.join(POINTER)).map_err(|e| e.to_string())?;
+            let manifest = fs::read_to_string(root.join(pointer)).map_err(|e| e.to_string())?;
             let bundle: Bundle =
                 serde_json::from_slice(&fs::read(manifest.trim()).map_err(|e| e.to_string())?)
                     .map_err(|e| e.to_string())?;
@@ -884,16 +926,24 @@ fn run() -> Result<()> {
             Ok(())
         }
         [option] if option == "--print-stack-standalone" => {
-            let manifest = fs::read_to_string(root.join(STACK_POINTER)).map_err(|e| e.to_string())?;
-            let bundle: m2_bundle::Bundle = serde_json::from_slice(
-                &fs::read(manifest.trim()).map_err(|e| e.to_string())?
-            ).map_err(|e| e.to_string())?;
-            require(bundle.schema == 1 && bundle.executed_tests == 0 && !bundle.full_stack_isolation_claimed,
-                "M2 envelope is not a producer-only receipt")?;
-            println!("{}", m1_artifact::real_file(&bundle.allocator.standalone.runtime)?.display());
+            let manifest =
+                fs::read_to_string(root.join(stack_pointer)).map_err(|e| e.to_string())?;
+            let bundle: m2_bundle::Bundle =
+                serde_json::from_slice(&fs::read(manifest.trim()).map_err(|e| e.to_string())?)
+                    .map_err(|e| e.to_string())?;
+            require(
+                bundle.schema == 1
+                    && bundle.executed_tests == 0
+                    && !bundle.full_stack_isolation_claimed,
+                "M2 envelope is not a producer-only receipt",
+            )?;
+            println!(
+                "{}",
+                m1_artifact::real_file(&bundle.allocator.standalone.runtime)?.display()
+            );
             Ok(())
         }
-        _ => Err("usage: build-liteinst-allocator-fixtures.rs [--print-standalone | --print-stack-standalone]".into()),
+        _ => Err(USAGE.into()),
     }
 }
 

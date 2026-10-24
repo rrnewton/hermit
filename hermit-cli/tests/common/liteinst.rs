@@ -75,6 +75,9 @@ pub(super) fn liteinst_stage_command(runtime: &Path) -> Command {
         .arg(cargo_profile)
         .arg(runtime)
         .arg(target_dir.join("liteinst-runtime-build"));
+    if !cfg!(feature = "liteinst") {
+        command.arg("--without-liteinst");
+    }
     command
 }
 
