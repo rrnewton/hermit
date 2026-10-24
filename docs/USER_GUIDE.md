@@ -717,7 +717,9 @@ which analyze prints (`--trial-timeout=SECONDS|auto|off`). With
 whole analysis from outside. A trial that reaches the
 bound counts as not reaching the target, and a baseline run that reaches it
 makes analyze search within the target schedule instead, as `--prefix-search`
-does.
+does. A trial that Hermit refuses when its guest reaches an operation Hermit
+does not support (exit 122) counts as not reaching the target too, with a
+warning; a refused target run still ends the analysis.
 
 By default analyze bisects between the failing schedule and a passing one from
 another run. When the two runs differ in events only one of them executed (for
