@@ -4868,7 +4868,7 @@ mod tests {
     }
 
     /// `cap_preemption_charge` never enters the legacy form, whatever its
-    /// value: the guest-visible string stays the legacy bytes, and it reads
+    /// value: the legacy string keeps its bytes, and it reads
     /// back as false from both the object and the array form.
     #[test]
     fn cap_preemption_charge_never_enters_the_legacy_form() {
