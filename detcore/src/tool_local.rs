@@ -87,6 +87,10 @@ pub struct FileMetadata {
     /// Socket-only sequence used for backend-independent socket cookies.
     #[serde(default)]
     next_socket_open_file_sequence: u64,
+    /// Random-device-only sequence that names each random-device open file's
+    /// stream (`crate::fd::RandomDeviceStream`).
+    #[serde(default)]
+    next_random_device_sequence: u64,
     /// A random-device or timerfd OFD from this table has been promoted.
     /// Retain this history after its final close so exec cannot reuse a
     /// canonical identity. (Serialized under its earlier name, which the
@@ -246,6 +250,12 @@ pub struct ExecFdState {
     /// channel elsewhere may still carry.
     #[serde(default)]
     pub(crate) open_file_namespace: Option<(DetTid, u64)>,
+    /// The old table's count of random-device opens. A backend that
+    /// rebuilds its descriptor table after exec starts the new one from it,
+    /// so no open after the exec reuses a stream's name
+    /// (`crate::fd::RandomDeviceStream`).
+    #[serde(default)]
+    pub(crate) random_device_sequence: u64,
     /// The image the exec runs, as Detcore resolved it from the exec's
     /// arguments before the exec ([`crate::exec_record`]), or for the
     /// registered root's first image the one its launch named
@@ -280,6 +290,9 @@ impl std::fmt::Debug for ExecFdState {
         }
         if let Some(namespace) = &self.open_file_namespace {
             debug.field("open_file_namespace", namespace);
+        }
+        if self.random_device_sequence != 0 {
+            debug.field("random_device_sequence", &self.random_device_sequence);
         }
         if let Some(exe) = &self.exe {
             debug.field("exe", &exe.exe);
@@ -380,6 +393,7 @@ impl ExecFdState {
             && self.maps.is_none()
             && self.channels.is_empty()
             && self.open_file_namespace.is_none()
+            && self.random_device_sequence == 0
             && self.exe.is_none()
     }
 }
@@ -802,6 +816,7 @@ impl FileMetadata {
             files_id: FilesId::initial(owner),
             next_open_file_sequence: 0,
             next_socket_open_file_sequence: 0,
+            next_random_device_sequence: 0,
             has_promoted_shared_files: false,
             file_handles: HashMap::new(),
             accept_waits: Vec::new(),
@@ -972,6 +987,7 @@ impl FileMetadata {
             files_id: FilesId::forked(child),
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
+            next_random_device_sequence: self.next_random_device_sequence,
             has_promoted_shared_files: self.has_promoted_shared_files,
             file_handles: self.file_handles.clone(),
             accept_waits: Vec::new(),
@@ -986,6 +1002,7 @@ impl FileMetadata {
             files_id: self.files_id.for_exec(task),
             next_open_file_sequence: self.next_open_file_sequence,
             next_socket_open_file_sequence: self.next_socket_open_file_sequence,
+            next_random_device_sequence: self.next_random_device_sequence,
             has_promoted_shared_files: self.has_promoted_shared_files,
             file_handles: self
                 .file_handles
@@ -1276,6 +1293,11 @@ impl FileMetadata {
         } else {
             owner
         };
+        if shared_guest_table {
+            self.next_random_device_sequence = self
+                .next_random_device_sequence
+                .max(state.random_device_sequence);
+        }
         self.apply_exec_blocking_overrides(owner, state.blocking);
         if !shared_guest_table {
             return Ok(());
@@ -1472,6 +1494,10 @@ impl FileMetadata {
         // This newly discovered description predates our observation. Its
         // kernel lock may be held, but no cached lock claim existed to go stale.
         self.with_detfd(fd, |detfd| detfd.mark_flock_mode_unobserved())?;
+        if ty == FdType::Rng {
+            let stream = crate::fd::RandomDeviceStream::discovered(owner, fd);
+            self.with_detfd(fd, |detfd| detfd.set_random_device(stream))?;
+        }
         // A placeholder for a procfs file Detcore renders, which the backend
         // rediscovers after `exec`: the file again, at the position the old
         // image left and with the snapshot it took, as a backend that keeps
@@ -1632,6 +1658,19 @@ impl FileMetadata {
         let id = self.allocate_open_file_id(creator, ty);
         let detfd = DetFd::new(fd, flags, ty, id).with_stat(stat);
         self.add_detfd(detfd);
+        Ok(())
+    }
+
+    /// Make `fd`, which `creator` just opened, a random device that reads a
+    /// stream named by the opener and the table's count of random-device
+    /// opens (`crate::fd::RandomDeviceStream`).
+    fn classify_random_device(&mut self, creator: DetTid, fd: RawFd) -> Result<(), Errno> {
+        let stream = crate::fd::RandomDeviceStream {
+            creator,
+            sequence: self.next_random_device_sequence,
+        };
+        self.with_detfd(fd, |detfd| detfd.set_random_device(stream))?;
+        self.next_random_device_sequence += 1;
         Ok(())
     }
 
@@ -2089,11 +2128,13 @@ mod file_metadata_tests {
         parent
             .add_fd(fd, OFlag::O_RDONLY, FdType::Rng, None)
             .unwrap();
+        parent.classify_random_device(fd).unwrap();
         parent.dup_fd(fd, alias_fd, OFlag::empty()).unwrap();
         parent.dup_fd(fd, closed_fd, OFlag::O_CLOEXEC).unwrap();
         parent
             .add_fd(distinct_fd, OFlag::O_RDONLY, FdType::Rng, None)
             .unwrap();
+        parent.classify_random_device(distinct_fd).unwrap();
         parent
             .add_fd(socket_fd, OFlag::O_RDWR, FdType::Socket, None)
             .unwrap();
@@ -2171,6 +2212,7 @@ mod file_metadata_tests {
                 creator,
                 ExecFdState {
                     open_files: Some(transfer),
+                    random_device_sequence: parent.random_device_sequence_for_exec(),
                     ..ExecFdState::default()
                 },
                 true,
@@ -2210,6 +2252,7 @@ mod file_metadata_tests {
         successor
             .add_fd(fd, OFlag::O_RDONLY, FdType::Rng, None)
             .unwrap();
+        successor.classify_random_device(fd).unwrap();
         let reopened = successor.metadata().file_handles[&fd].open_file_id();
         assert_ne!(reopened, first_id);
         assert_ne!(reopened, high);
@@ -2217,6 +2260,13 @@ mod file_metadata_tests {
             reopened,
             OpenFileId::new(creator, successor.metadata().next_open_file_sequence - 1)
         );
+        // A survivor keeps its stream, and the exec exchange carries the count
+        // of random-device opens, so the new image's first open reads a new one.
+        let stream_of = |fd| successor.metadata().file_handles[&fd].random_device_stream();
+        let named = |sequence| crate::fd::RandomDeviceStream { creator, sequence };
+        assert_eq!(stream_of(alias_fd), named(0));
+        assert_eq!(stream_of(distinct_fd), named(1));
+        assert_eq!(stream_of(fd), named(2));
         assert_ne!(
             successor
                 .metadata()
@@ -2907,6 +2957,15 @@ mod file_metadata_tests {
                 .expect("live descriptor should be discovered");
             assert_eq!(metadata.file_handles[&fd].ty(), expected, "fd {fd}");
         }
+        // A discovered random device is named by its descriptor, apart from
+        // the count of opens, which discovery leaves alone.
+        for fd in [random.as_raw_fd(), urandom.as_raw_fd()] {
+            assert_eq!(
+                metadata.file_handles[&fd].random_device_stream(),
+                crate::fd::RandomDeviceStream::discovered(owner, fd)
+            );
+        }
+        assert_eq!(metadata.next_random_device_sequence, 0);
     }
 
     #[test]
@@ -3057,6 +3116,68 @@ mod file_metadata_tests {
         // Descriptor flags stay per descriptor.
         assert!(!three.is_cloexec());
         assert!(four.is_cloexec());
+    }
+
+    /// Each open of a random device reads a stream of its own, named by its
+    /// opener and the table's count of earlier random-device opens; a dup
+    /// alias shares it. Other opens leave the count alone. Fork and exec
+    /// carry it, and so does the exec exchange of a backend that rebuilds its
+    /// table, so no later open in the table or a copy of it reuses a name.
+    #[test]
+    fn each_random_device_open_reads_its_own_stream() {
+        use crate::fd::RandomDeviceStream;
+        let owner = DetTid::from_raw(9);
+        let thread = DetTid::from_raw(11);
+        let stream = |table: &mut FileMetadata, fd| {
+            table
+                .with_detfd(fd, |detfd| detfd.random_device_stream())
+                .expect("registered descriptor")
+        };
+        let open = |table: &mut FileMetadata, creator, fd| {
+            table
+                .add_fd(creator, fd, OFlag::empty(), FdType::Regular, None)
+                .expect("register the open");
+            table
+                .classify_random_device(creator, fd)
+                .expect("classify it");
+        };
+        let mut metadata = FileMetadata::new(owner);
+        open(&mut metadata, owner, 3);
+        metadata.dup_fd(3, 4, OFlag::empty()).expect("dup it");
+        metadata
+            .add_fd(owner, 5, OFlag::empty(), FdType::Regular, None)
+            .expect("open a regular file");
+        open(&mut metadata, thread, 6);
+        assert_eq!(
+            metadata.classify_random_device(thread, 7),
+            Err(Errno::EBADF)
+        );
+        let child = DetTid::from_raw(10);
+        let mut forked = metadata.fork_for(child);
+        open(&mut forked, child, 7);
+        let mut exec = metadata.for_exec(owner);
+        open(&mut exec, owner, 7);
+        let mut rebuilt = FileMetadata::new(owner);
+        rebuilt
+            .apply_exec_fd_state(
+                owner,
+                ExecFdState {
+                    random_device_sequence: 2,
+                    ..ExecFdState::default()
+                },
+                true,
+            )
+            .expect("apply the exec exchange");
+        open(&mut rebuilt, owner, 3);
+
+        let named = |creator, sequence| RandomDeviceStream { creator, sequence };
+        assert_eq!(stream(&mut metadata, 3), named(owner, 0));
+        assert_eq!(stream(&mut metadata, 4), named(owner, 0));
+        assert_eq!(stream(&mut metadata, 6), named(thread, 1));
+        assert_eq!(stream(&mut forked, 3), named(owner, 0));
+        assert_eq!(stream(&mut forked, 7), named(child, 2));
+        assert_eq!(stream(&mut exec, 7), named(owner, 2));
+        assert_eq!(stream(&mut rebuilt, 3), named(owner, 2));
     }
 
     #[test]
@@ -5637,6 +5758,19 @@ impl<T> ThreadState<T> {
             ty,
             stat,
         )
+    }
+
+    /// Make `fd`, which this thread just opened, a random device
+    /// (`FileMetadata::classify_random_device`).
+    pub(crate) fn classify_random_device(&self, fd: RawFd) -> Result<(), Errno> {
+        self.metadata()
+            .classify_random_device(self.open_file_creator.unwrap_or(self.dettid), fd)
+    }
+
+    /// This table's count of random-device opens, for the exec exchange
+    /// (`ExecFdState::random_device_sequence`).
+    pub(crate) fn random_device_sequence_for_exec(&self) -> u64 {
+        self.metadata().next_random_device_sequence
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
