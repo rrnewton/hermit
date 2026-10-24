@@ -201,10 +201,15 @@ fn run_analyze(
         combined.contains("Stack trace for thread"),
         "{label}: hermit analyze did not print a guest stack trace\n{combined}"
     );
-    // --trial-timeout=auto: the runs after the target run are bounded.
+    // --trial-timeout=auto: the runs after the target run are bounded, at
+    // 60 s or 10 times the slowest endpoint run, whichever is longer.
+    let bound = combined
+        .split_once("Runs from here on are bounded at ")
+        .and_then(|(_, rest)| rest.split_once(" s of wall-clock time"))
+        .and_then(|(seconds, _)| seconds.parse::<u64>().ok());
     assert!(
-        combined.contains("Runs from here on are bounded at 60 s of wall-clock time"),
-        "{label}: no trial bound\n{combined}"
+        bound.is_some_and(|seconds| seconds >= 60),
+        "{label}: no trial bound of at least 60 s\n{combined}"
     );
     if !expected_output.is_empty() {
         assert!(
