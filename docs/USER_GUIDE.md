@@ -714,12 +714,27 @@ run is bounded: by default at max(60 s, 10 times the slowest endpoint run),
 which analyze prints (`--trial-timeout=SECONDS|auto|off`). With
 `--run1-preemptions` there is no target run to measure, so pass an explicit
 `--trial-timeout`; on a backend that does not enforce `--timeout`, bound the
-whole analysis from outside. A trial that reaches the
-bound counts as not reaching the target, and a baseline run that reaches it
-makes analyze search within the target schedule instead, as `--prefix-search`
-does. A trial that Hermit refuses when its guest reaches an operation Hermit
-does not support (exit 122) counts as not reaching the target too, with a
-warning; a refused target run still ends the analysis.
+whole analysis from outside. A trial that reaches the bound counts as not
+meeting the target, and a baseline run that reaches it makes analyze search
+within the target schedule instead, as `--prefix-search` does. A bound stops a
+trial at a time the host decides, so such a trial does not decide a
+`--prefix-search` boundary: when the search settles next to one, it runs that
+trial again with 4 times the bound (within the run arguments' own
+`--timeout`). If it then meets the target, the deciding event is an earlier
+one, and the search goes on below it. If it misses, the boundary stands on
+that finished trial. Once a confirmation finishes, whatever its outcome, every
+later run keeps the longer bound. If it is still stopped, or no longer bound
+can be given, the report calls that trial a hang, a third outcome rather than
+a run that misses (for example a deadlock while other threads keep polling),
+and notes that the boundary rests on a wall-clock bound. If the trial
+confirmed is the empty prefix's and it meets the target, the scheduler alone
+meets it, and analyze ends with an error that says so. A search whose baseline
+side never finishes thus runs one trial at 4 times the bound instead of
+rechecking it at the usual one, and one whose confirmation finishes runs the
+rest of its trials under the longer bound. A trial that Hermit refuses when
+its guest reaches an operation Hermit does not support (exit 122) counts as
+not meeting the target too, with a warning; a refused target run still ends
+the analysis.
 
 By default analyze bisects between the failing schedule and a passing one from
 another run. When the two runs differ in events only one of them executed (for

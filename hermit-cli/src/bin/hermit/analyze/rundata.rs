@@ -35,6 +35,7 @@ use tracing::metadata::LevelFilter;
 
 use crate::analyze::consts::*;
 use crate::analyze::types::AnalyzeOpts;
+use crate::analyze::types::CONFIRM_BOUND_FACTOR;
 use crate::analyze::types::ContinuationTimeslice;
 use crate::analyze::types::TRIAL_LOG_FACTOR;
 use crate::analyze::types::TRIAL_LOG_FLOOR;
@@ -97,14 +98,14 @@ impl TrialEnd {
             Ok(()) if matched() => Ok(TrialEnd::Met),
             Ok(()) => Ok(TrialEnd::Missed),
             Err(error) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
-                eprintln!(" => Timed out ({error}); counted as the baseline condition");
+                eprintln!(" => Timed out ({error}); counted as not meeting the target");
                 Ok(TrialEnd::Unfinished(Stop::Bound))
             }
             Err(error) if guest_reached_a_refusal(&error) => {
                 eprintln!(
                     " => {} Hermit refused this trial when the guest reached an operation it \
-                     does not support (exit 122; the reason is in {}); counted as the baseline \
-                     condition",
+                     does not support (exit 122; the reason is in {}); counted as not meeting \
+                     the target",
                     "WARNING:".yellow().bold(),
                     log.map_or("hermit's log above".to_owned(), |log| log
                         .display()
@@ -410,7 +411,7 @@ impl RunData {
         match self.trial_bound {
             Some(bound) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
                 error.context(format!(
-                    "{} reached hermit analyze's bound of {bound} s per run \
+                    "{} reached hermit analyze's bound of {bound} s for this run \
                      (--trial-timeout=SECONDS raises it, --trial-timeout=off lifts it)",
                     self.runname
                 ))
@@ -789,22 +790,73 @@ impl AnalyzeOpts {
     /// The wall-clock bound, in whole seconds, on a run with `trial`'s
     /// options (`--trial-timeout`): none where `--timeout` cannot be
     /// enforced, and with `auto` max(60 s, 10 times the slowest endpoint run
-    /// measured so far), none before one was.
+    /// measured so far), none before one was, times
+    /// [`AnalyzeOpts::trial_bound_factor`].
     pub fn trial_bound(&self, trial: &RunOpts) -> Option<NonZeroU64> {
+        self.trial_bound_times(trial, self.trial_bound_factor)
+    }
+
+    /// [`AnalyzeOpts::trial_bound`] with the bound multiplied by `factor`.
+    fn trial_bound_times(&self, trial: &RunOpts, factor: u32) -> Option<NonZeroU64> {
         if !trial.accepts_run_timeout() {
             return None;
         }
         match self.trial_timeout {
             TrialTimeout::Off => None,
-            TrialTimeout::Seconds(seconds) => Some(seconds),
+            TrialTimeout::Seconds(seconds) => {
+                NonZeroU64::new(seconds.get().saturating_mul(u64::from(factor)))
+            }
             TrialTimeout::Auto => {
                 let bound = self
                     .endpoints
                     .slowest?
                     .saturating_mul(TRIAL_TIMEOUT_FACTOR)
-                    .max(TRIAL_TIMEOUT_FLOOR);
+                    .max(TRIAL_TIMEOUT_FLOOR)
+                    .saturating_mul(factor);
                 NonZeroU64::new(bound.as_secs() + u64::from(bound.subsec_nanos() > 0))
             }
+        }
+    }
+
+    /// The wall-clock bound, in whole seconds, a `--prefix-search` trial gets
+    /// when it runs again to confirm the boundary: [`CONFIRM_BOUND_FACTOR`]
+    /// times `--trial-timeout`'s, within the run arguments' own `--timeout`.
+    /// None unless that is longer than the bound trials get now: none with
+    /// `--trial-timeout=off`, once the bound was raised, or where a shorter
+    /// `--timeout` in the run arguments applies.
+    pub fn confirmation_bound(&self) -> Option<u64> {
+        if self.trial_bound_factor != 1 {
+            return None;
+        }
+        let longer = self.effective_trial_bound_times(CONFIRM_BOUND_FACTOR)?;
+        self.effective_trial_bound_times(1)
+            .is_some_and(|now| longer > now)
+            .then_some(longer)
+    }
+
+    /// The run arguments' own `--timeout`, in whole seconds.
+    pub fn run_args_timeout(&self) -> Option<u64> {
+        RunData::get_raw_runopts(self)
+            .run_timeout()
+            .map(|own| own.as_secs())
+    }
+
+    /// The wall-clock bound, in whole seconds, a trial created now runs
+    /// under: [`AnalyzeOpts::trial_bound`], or the run arguments' own
+    /// `--timeout` where that is shorter.
+    pub fn effective_trial_bound(&self) -> Option<u64> {
+        self.effective_trial_bound_times(self.trial_bound_factor)
+    }
+
+    /// [`AnalyzeOpts::effective_trial_bound`] with `--trial-timeout`'s bound
+    /// multiplied by `factor`.
+    fn effective_trial_bound_times(&self, factor: u32) -> Option<u64> {
+        let trial = RunData::get_raw_runopts(self);
+        let own = trial.run_timeout().map(|own| own.as_secs());
+        let analyze = self.trial_bound_times(&trial, factor).map(NonZeroU64::get);
+        match (own, analyze) {
+            (Some(own), Some(analyze)) => Some(own.min(analyze)),
+            (own, analyze) => own.or(analyze),
         }
     }
 
@@ -2480,6 +2532,54 @@ mod tests {
         );
     }
 
+    /// A `--prefix-search` confirmation runs under 4 times `--trial-timeout`'s
+    /// bound, within the run arguments' own `--timeout`, and once the bound
+    /// is raised the runs created after that take it. `off`, a shorter
+    /// `--timeout` in the run arguments, or a bound raised already leaves
+    /// nothing longer to give.
+    #[test]
+    fn a_confirmation_lengthens_the_trial_bound() {
+        let options = |extra: &[&str], run_args: &[&str]| {
+            let mut argv = vec!["analyze"];
+            argv.extend(extra);
+            argv.push("--");
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let mut options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            options
+                .endpoints
+                .record(std::time::Duration::from_millis(10_400), None);
+            options
+        };
+        assert_eq!(options(&[], &[]).confirmation_bound(), Some(416));
+        assert_eq!(
+            options(&[], &["--timeout=120"]).confirmation_bound(),
+            Some(120)
+        );
+        assert_eq!(options(&[], &["--timeout=30"]).confirmation_bound(), None);
+        assert_eq!(
+            options(&["--trial-timeout=5"], &[]).confirmation_bound(),
+            Some(20)
+        );
+        assert_eq!(
+            options(&["--trial-timeout=off"], &[]).confirmation_bound(),
+            None
+        );
+        let mut raised = options(&[], &[]);
+        assert_eq!(raised.effective_trial_bound(), Some(104));
+        raised.trial_bound_factor = CONFIRM_BOUND_FACTOR;
+        assert_eq!(raised.confirmation_bound(), None);
+        assert_eq!(raised.effective_trial_bound(), Some(416));
+        let workspace = tempfile::tempdir().unwrap();
+        raised.tmp_dir = Some(workspace.path().to_path_buf());
+        let run = RunData::new_baseline(&raised, "prefix_round_002".to_owned()).unwrap();
+        assert_eq!(
+            run.runopts.run_timeout().map(|bound| bound.as_secs()),
+            Some(416)
+        );
+        assert_eq!(run.trial_bound, NonZeroU64::new(416));
+    }
+
     /// A run that the bound ended says which bound it was and how to change
     /// it; one that its own `--timeout` ended, or that failed otherwise, is
     /// left as it was.
@@ -2497,7 +2597,7 @@ mod tests {
         let message = format!("{timed_out:#}");
         assert!(
             message.starts_with(
-                "run2_baseline reached hermit analyze's bound of 60 s per run \
+                "run2_baseline reached hermit analyze's bound of 60 s for this run \
                  (--trial-timeout=SECONDS raises it, --trial-timeout=off lifts it)"
             ),
             "{message}"

@@ -236,16 +236,21 @@ pub struct AnalyzeOpts {
     /// number of seconds, or `off`.
     ///
     /// A replayed or spliced schedule can leave the guest spinning, or waiting for an event that
-    /// never comes. The endpoint runs are measured: the target run (or, with
-    /// `--run1-preemptions`, the first replay of its record) and the baseline run (from
-    /// `--run2-seed`, `--run2-preemptions`, or the run without chaos). With `auto`, every run
-    /// after the first measured one is bounded at max(60 s, 10 times the slowest endpoint run so
-    /// far), the baseline run included. A trial that reaches the bound did not reach the target:
-    /// it counts as the baseline condition, as a trial that a `--timeout` in the run arguments
-    /// ends does. A baseline run that reaches it gives no baseline, so analyze searches within
-    /// the target schedule instead (as `--prefix-search` does). A `--timeout` in the run
-    /// arguments still bounds every run, and wins where it is shorter. The bound needs a backend
-    /// on which `hermit run --timeout` is qualified; elsewhere `auto` gives none, and an
+    /// never comes. The endpoint runs are measured: the target run (or, with `--run1-preemptions`,
+    /// the first replay of its record) and the baseline run (from `--run2-seed`,
+    /// `--run2-preemptions`, or the run without chaos). With `auto`, every run after the first
+    /// measured one is bounded at max(60 s, 10 times the slowest endpoint run so far), the baseline
+    /// run included. A trial that reaches the bound counts as not meeting the target, as a trial
+    /// that a `--timeout` in the run arguments ends does. It does not decide a `--prefix-search`
+    /// boundary, though: when the search settles next to such a trial, it runs that trial again
+    /// with 4 times the bound (within the run arguments' own `--timeout`). If that confirmation
+    /// finishes, whatever its outcome, every later run keeps the longer bound, and if it met the
+    /// target the search goes on below it. If it is still stopped, or no longer bound can be given,
+    /// the report calls the trial a hang, a third outcome, and a bound this confirmation raised
+    /// goes back to the usual one. A baseline run that reaches it gives no baseline, so analyze
+    /// searches within the target schedule instead (as `--prefix-search` does). A `--timeout` in
+    /// the run arguments still bounds every run, and wins where it is shorter. The bound needs a
+    /// backend on which `hermit run --timeout` is qualified; elsewhere `auto` gives none, and an
     /// explicit number is refused.
     ///
     /// While trials are bounded, the log file a trial writes under `--verbose` or `--selfcheck`
@@ -303,6 +308,15 @@ pub struct AnalyzeOpts {
     /// measured before it.
     #[clap(skip)]
     pub endpoints: EndpointMeasurements,
+
+    /// How many times its usual `--trial-timeout` bound a run gets
+    /// ([`AnalyzeOpts::trial_bound`]): 1, or [`CONFIRM_BOUND_FACTOR`] from
+    /// the moment a `--prefix-search` confirmation raised it, unless that
+    /// confirmation was stopped again (`factor_after_confirmation` in phases.rs): it
+    /// stays raised after a confirmation that met or missed the target or
+    /// that Hermit refused.
+    #[clap(skip = 1u32)]
+    pub trial_bound_factor: u32,
 }
 
 /// `--continuation-timeslice`.
@@ -363,6 +377,9 @@ impl FromStr for TrialTimeout {
 pub const TRIAL_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
 /// How many times the slowest endpoint run `--trial-timeout=auto` gives a trial.
 pub const TRIAL_TIMEOUT_FACTOR: u32 = 10;
+/// How many times its usual `--trial-timeout` bound a `--prefix-search` trial
+/// gets when it runs again to confirm the boundary the search settled on.
+pub const CONFIRM_BOUND_FACTOR: u32 = 4;
 /// The least cap on a trial's log file.
 pub const TRIAL_LOG_FLOOR: u64 = 64 << 20;
 /// How many times the largest endpoint log a trial's log file may grow to.
