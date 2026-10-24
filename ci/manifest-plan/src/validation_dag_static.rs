@@ -2805,7 +2805,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // epoch read without copying the configuration, and its placeholder
     // gate): 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit", 2529),
+    // And scheduler::test::{a_run_of_expired_timed_waits_is_charged_one_turn_while_another_thread_waits,
+    // an_expired_timed_wait_is_one_that_ends_at_its_deadline}
+    // (short timed-wait pollers inflating virtual time): 2531.
+    ("test.detcore_unit", 2531),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4012,7 +4015,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (A5 step 3c slice 0c): 600, listed.
     // And liteinst_in_guest_programs::in_guest_unsequentialized_runs_refuse_a_caught_handler_by_name
     // (A5 step 3c slice 0g): 601, listed.
-    ("test.cli", 601),
+    // And short_timed_wait_pollers_do_not_inflate_a_cpu_bound_threads_time: 602.
+    // And a_chaos_recording_of_short_timed_waits_replays_its_schedule_without_desync: 603.
+    ("test.cli", 603),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4502,7 +4507,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unchanged at 520.
     // The in-guest unsequentialized-handler refusal test (slice 0g) starts the
     // in-guest runtime too and joins the hosted exclusions: unchanged at 520.
-    ("test.cli_on_host", 520),
+    // And short_timed_wait_pollers_do_not_inflate_a_cpu_bound_threads_time,
+    // which is not among them: 521.
+    // And a_chaos_recording_of_short_timed_waits_replays_its_schedule_without_desync,
+    // which is not among them either: 522.
+    ("test.cli_on_host", 522),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4925,7 +4934,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twelve A+ units: 2527, listed.
     // And the same three slice 7d determinize_stat_tests units: 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit_on_host", 2529),
+    // And the same two expired-timed-wait units: 2531.
+    ("test.detcore_unit_on_host", 2531),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

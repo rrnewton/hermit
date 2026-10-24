@@ -1243,6 +1243,18 @@ pub struct Scheduler {
     /// that switches threads (<https://github.com/rrnewton/hermit/issues/4139>).
     previous_turn_tid: Option<DetTid>,
 
+    /// Whether the last committed turn (as for `previous_turn_tid`, not a
+    /// host-timed polling retry) ended an expired timed wait
+    /// (`expired_wait_grant`), so that `bump_global_time` charges a run of
+    /// such turns once.
+    previous_turn_expired_wait: bool,
+
+    /// The thread whose grant, in the turn just committed, ended a timed wait
+    /// at its deadline: a `FutexWait` answered `TimeOut`, or a sleep
+    /// (`SleepUntil` with a deadline, not a yield) already due. Set by
+    /// `unblock_guest`, taken by the next `bump_global_time`.
+    expired_wait_grant: Option<DetTid>,
+
     /// INVARIANT: Thread IDs in `blocked` are absent from `run_queue`.
     pub blocked: BlockedPool,
 
@@ -4200,6 +4212,8 @@ impl Scheduler {
             bg_action_pool: Default::default(),
             committed_time: Default::default(),
             previous_turn_tid: None,
+            previous_turn_expired_wait: false,
+            expired_wait_grant: None,
             blocked: Default::default(),
             vfork_barriers: Default::default(),
             background_entry_barriers: Default::default(),
@@ -5043,6 +5057,43 @@ impl Scheduler {
         result
     }
 
+    /// Under `--replay-schedule-from`, wake the thread the trace switches to
+    /// now if it is still in a timed wait whose deadline has passed, so it is
+    /// runnable when the next turn is chosen.
+    ///
+    /// A scheduler pass wakes at most one due timed waiter
+    /// (`step2b_process_timed`), so how many due waiters are runnable when a
+    /// turn is chosen depends on how many passes ran since their deadlines
+    /// passed. The recording's passes include its chaos change points and
+    /// slice ends, which the replay does not repeat, so a timed waiter the
+    /// recording had woken in an extra pass could still be waiting when the
+    /// replay switched to it. The switch then fell through to another
+    /// runnable thread, a desync ("expected to be running thread 5, but
+    /// running 7"). This was rare while every turn charged half a millisecond
+    /// and deadlines passed several passes early. Since a run of expired
+    /// timed waits is charged one turn, deadlines pass as committed time
+    /// creeps forward between the turns of that run, often at the last turn
+    /// before the switch. Waking the target at its passed deadline is what the
+    /// next pass would do anyway, just ahead of the other due waiters, which
+    /// the following passes wake as before.
+    fn wake_due_replay_target(&mut self, target: DetTid) {
+        if self.run_queue.contains_tid(target) {
+            return;
+        }
+        let Some(deadline) = self.blocked.timed_waiters.thread_deadline(target) else {
+            return;
+        };
+        if deadline > self.committed_time || deadline.is_indefinite() {
+            return;
+        }
+        self.blocked.timed_waiters.remove(target);
+        trace!(
+            "[replay] dtid {} woken at its passed deadline {} (committed {}) for the trace's switch",
+            target, deadline, self.committed_time
+        );
+        self.wake_timed_event(deadline, target);
+    }
+
     /// Verify that the event we're replaying matches what just happened.  Set up the next
     /// (replayed) event to run.  Return true if the current thread will keep running and false if
     /// it needs to be descheduled.
@@ -5081,6 +5132,7 @@ impl Scheduler {
                 replayer::ReplayAction::ContextSwitch(is_now, new_tid, timeslice_remaining) => {
                     self.requeue_with_new_priority(mytid, REPLAY_DEFERRED_PRIORITY);
                     self.requeue_with_new_priority(new_tid, REPLAY_FOREGROUND_PRIORITY);
+                    self.wake_due_replay_target(new_tid);
                     if !self.run_queue.contains_tid(new_tid) {
                         // If it is not yet in next_turns, that is because it was JUST spawned and
                         // hasn't showed up yet, but it will by the next scheduler turn.
@@ -14550,6 +14602,18 @@ impl Scheduler {
                 .all(|id| matches!(id, ResourceID::InboundSignal(_)))
     }
 
+    /// A sleep (`SleepUntil` with a deadline: not a yield's epoch, nor a
+    /// pause's indefinite deadline) whose deadline `now` has reached.
+    fn is_due_sleep(rsrcs: &Resources, now: LogicalTime) -> bool {
+        rsrcs.resources.len() == 1
+            && rsrcs.resources.keys().all(|id| {
+                matches!(id, ResourceID::SleepUntil(deadline)
+                    if *deadline > LogicalTime::from_nanos(0)
+                        && !deadline.is_indefinite()
+                        && *deadline <= now)
+            })
+    }
+
     fn is_x_turn(rsrcs: &Resources, x: &ResourceID) -> bool {
         if rsrcs.resources.contains_key(x) {
             if rsrcs.resources.len() > 1 {
@@ -14607,6 +14671,50 @@ impl Scheduler {
                     && Self::is_inbound_signal_turn(resources)
             });
 
+        // A run of turns that each end an expired timed wait
+        // (`expired_wait_grant`: a futex wait answered `TimeOut`, or a sleep
+        // already due) is charged one scheduler turn, not one per turn, while
+        // another thread is queued to run. A timed wait shorter than one turn
+        // charge (`cv.wait_for(100us)` in a pool's idle loop, `usleep(100)`)
+        // otherwise never blocks: the charge of each turn carries the clock
+        // past the deadline the next waiter computed before it, so every wait
+        // ends at its grant, and a woken waiter goes to the head of its band
+        // (`wake_timed_event`). One futex poller then kept the CPU for its
+        // whole timeslice at a turn charge per iteration; under chaos, pollers
+        // that outranked another thread passed the CPU among themselves while
+        // it waited. Uncharged, the next wait sees only the time the waiters'
+        // own work took and blocks until its deadline, and the queued thread
+        // runs; that deadline then caps the queued thread's slice like any
+        // other (`deadline_remaining_from`). The first turn of a run, and
+        // every turn of a thread with nobody else queued, is charged as
+        // before, so a lone poller's time, and a wait of at least one turn
+        // charge beside other work, are unchanged; waiters that fall due
+        // together share one charge, and so do back-to-back waits whose
+        // deadline had already passed when they were made (a zero timeout).
+        // Time still advances by each waiter's own work, at least one syscall
+        // per turn, and by the empty-queue jump to the next deadline. Every
+        // input is a committed grant, the last non-polling committed turn, or
+        // the run queue as step 1 finds it, so the rule adds no host-timed
+        // input and inherits those that already reach the queue (a
+        // readmitted background call); a host-timed polling retry neither
+        // ends nor continues a run (`previous_turn_expired_wait`). Under
+        // `hermit record` and `hermit replay` (`recordreplay_modes`) every
+        // such turn keeps its charge, as signal deliveries do.
+        let expired_wait_grant = self.expired_wait_grant.take();
+        let expired_wait = !self.recordreplay_modes
+            && last_turn
+                .as_ref()
+                .is_ok_and(|resources| expired_wait_grant == Some(resources.tid));
+        let repeated_expired_wait = expired_wait
+            && self.previous_turn_expired_wait
+            && last_turn.as_ref().is_ok_and(|resources| {
+                // As `are_all_quiesced` does, not counting a thread whose old
+                // queue entry is pending removal.
+                self.run_queue.tids().any(|tid| {
+                    *tid != resources.tid && !self.pending_run_queue_removals.contains_key(tid)
+                })
+            });
+
         // At this moment, when threads are parked, we know that the global_time is
         // frozen and we can read it without any race.
         let snapshot: LogicalTime = {
@@ -14660,6 +14768,10 @@ impl Scheduler {
                 trace!(
                     "[scheduler] skipping scheduler time advance because just-finished turn delivered a signal to the thread already running"
                 );
+            } else if repeated_expired_wait {
+                trace!(
+                    "[scheduler] skipping scheduler time advance because just-finished turn ended an expired timed wait right after another"
+                );
             } else {
                 let newtime = match gtime.add_scheduler_time() {
                     Ok(newtime) => newtime,
@@ -14692,6 +14804,7 @@ impl Scheduler {
             && !last_turn_was_polling
         {
             self.previous_turn_tid = Some(resources.tid);
+            self.previous_turn_expired_wait = expired_wait;
         }
 
         match snapshot.cmp(&self.committed_time) {
@@ -14806,7 +14919,7 @@ impl Scheduler {
         }
         let fatal_alarm = self.in_guest_fatal_alarm_pending(dtid);
         let futex_timed_out = self.blocked.timed_out_futex_waiters.remove(&dtid);
-        let (guest_state_poll, fruitless, wants_alone) = match self
+        let (guest_state_poll, fruitless, wants_alone, sleep_due) = match self
             .next_turns
             .get(&dtid)
             .and_then(|turn| turn.req.try_read())
@@ -14815,9 +14928,14 @@ impl Scheduler {
                 Self::is_polling_turn(&rs) && rs.polls_guest_state_only,
                 Self::retries_its_call_without_progress(&rs),
                 rs.waits_until_nothing_else_can_run,
+                Self::is_due_sleep(&rs, self.committed_time),
             ),
-            _ => (false, false, false),
+            _ => (false, false, false, false),
         };
+        // Whether this grant ends a timed wait at its deadline
+        // (`expired_wait_grant`, read by `bump_global_time`).
+        self.expired_wait_grant =
+            ((futex_timed_out || sleep_due) && !signaled && !fatal_alarm).then_some(dtid);
         // The committed request, read before `clear_nextturn` empties it.
         let work_span_request = self
             .work_span
@@ -14910,12 +15028,17 @@ impl Scheduler {
     /// a request that is simply runnable or an entry kept past its time, and
     /// a thread pending removal or in a process a committed SIGKILL has
     /// doomed will never act on its deadline. A wait no longer than the time
-    /// the scheduler charges for a turn has therefore passed by the grant and
-    /// ends no slice: counting passed waits too would end the slice of every
-    /// thread granted while another thread's sleep is over, a contended
-    /// quantum this cap does not add (measured: 51% more virtual time for 8
-    /// threads sleeping 1 ms between bursts of work, against 11%). `None`
-    /// when nothing qualifies,
+    /// the scheduler charges for a turn has therefore usually passed by the
+    /// grant and ends no slice: counting passed waits too would end the slice
+    /// of every thread granted while another thread's sleep is over, a
+    /// contended quantum this cap does not add (measured: 51% more virtual
+    /// time for 8 threads sleeping 1 ms between bursts of work, against 11%).
+    /// The exception is the last wait of an uncharged run of expired waits
+    /// (`bump_global_time`): made after an uncharged turn, it is still ahead
+    /// and caps the next slice as a wait of one turn charge would. Like any
+    /// cap it ends the slice only at the thread's next check-in
+    /// (`cap_timeslice_at_deadline`), so a loop without syscalls still runs
+    /// to its PMU maximum. `None` when nothing qualifies,
     /// and always under record/replay, which records no hint (as it records
     /// no poll deadline, `note_poll_deadline`).
     ///
@@ -19823,6 +19946,212 @@ mod test {
             Duration::ZERO,
             "a retry between the same thread's turn and the delivery"
         );
+    }
+
+    /// A run of turns that each end an expired timed wait is charged one
+    /// scheduler turn while another thread is queued: the first of the run
+    /// is charged, the next is not, whether its thread is the same or
+    /// another. With nobody else queued (the waiter itself does not count),
+    /// under record/replay, and after any other committed turn, every such
+    /// turn is charged as before. A host-timed polling retry neither ends nor
+    /// continues a run, so the charge cannot depend on how many retries ran,
+    /// and neither does a skipped turn, which takes a pending mark with it.
+    #[test]
+    fn a_run_of_expired_timed_waits_is_charged_one_turn_while_another_thread_waits() {
+        let config = Config::default();
+        let first = DetTid::from_raw(13);
+        let second = DetTid::from_raw(14);
+        let worker = DetTid::from_raw(15);
+        // A committed turn of `tid`, and whether it ended an expired wait.
+        let wait = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::FutexWait, Permission::R);
+            (request, true)
+        };
+        let ordinary = |tid: DetTid| (Resources::new(tid), false);
+        let retry = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::InternalIOPolling, Permission::W);
+            (request, false)
+        };
+        // The advance of the last of `turns`, committed in order with
+        // `queued` in the run queue.
+        let advance = |record_replay: bool, queued: &[DetTid], turns: &[(Resources, bool)]| {
+            let mut sched = Scheduler::new(&config);
+            sched.recordreplay_modes = record_replay;
+            for tid in queued {
+                sched.priorities.insert(*tid, DEFAULT_PRIORITY);
+                sched.runqueue_push_back(*tid);
+            }
+            let time = Mutex::new(GlobalTime::new(&config));
+            let mut before = time.lock().unwrap().as_nanos();
+            for (turn, expired) in turns {
+                before = time.lock().unwrap().as_nanos();
+                sched.expired_wait_grant = expired.then_some(turn.tid);
+                sched.bump_global_time(&time, &Ok(turn.clone()));
+            }
+            time.lock().unwrap().as_nanos().duration_since(before)
+        };
+        let charge = advance(false, &[worker], &[ordinary(worker), ordinary(worker)]);
+        assert!(charge > Duration::ZERO, "an ordinary turn is charged");
+        assert_eq!(
+            advance(false, &[worker], &[ordinary(worker), wait(first)]),
+            charge,
+            "the first expired wait of a run"
+        );
+        assert_eq!(
+            advance(false, &[worker], &[wait(first), wait(second)]),
+            Duration::ZERO,
+            "another thread's expired wait right after it"
+        );
+        assert_eq!(
+            advance(false, &[worker], &[wait(first), wait(first), wait(first)]),
+            Duration::ZERO,
+            "the same thread's, again and again"
+        );
+        assert_eq!(
+            advance(false, &[], &[wait(first), wait(first)]),
+            charge,
+            "nobody else queued"
+        );
+        assert_eq!(
+            advance(false, &[first], &[wait(first), wait(first)]),
+            charge,
+            "only the waiter itself queued"
+        );
+        assert_eq!(
+            advance(true, &[worker], &[wait(first), wait(second)]),
+            charge,
+            "under record/replay"
+        );
+        assert_eq!(
+            advance(
+                false,
+                &[worker],
+                &[wait(first), ordinary(worker), wait(second)]
+            ),
+            charge,
+            "an ordinary turn ends the run"
+        );
+        assert_eq!(
+            advance(false, &[worker], &[wait(first), retry(first), wait(second)]),
+            Duration::ZERO,
+            "a retry does not end the run"
+        );
+        assert_eq!(
+            advance(
+                false,
+                &[worker],
+                &[ordinary(worker), retry(first), wait(second)]
+            ),
+            charge,
+            "nor start one"
+        );
+        assert_eq!(
+            advance(false, &[worker], &[wait(first), retry(first)]),
+            charge,
+            "and is charged itself"
+        );
+        // A skipped turn between two expired waits, and one that takes the
+        // mark a grant left for a turn that was not committed.
+        let skipped = |expired_before_skip: bool| {
+            let mut sched = Scheduler::new(&config);
+            sched.priorities.insert(worker, DEFAULT_PRIORITY);
+            sched.runqueue_push_back(worker);
+            let time = Mutex::new(GlobalTime::new(&config));
+            let (first_wait, _) = wait(first);
+            sched.expired_wait_grant = Some(first);
+            sched.bump_global_time(&time, &Ok(first_wait.clone()));
+            sched.expired_wait_grant = expired_before_skip.then_some(second);
+            sched.bump_global_time(&time, &Err(SkipTurn));
+            let (second_wait, _) = wait(second);
+            let before = time.lock().unwrap().as_nanos();
+            sched.expired_wait_grant = (!expired_before_skip).then_some(second);
+            sched.bump_global_time(&time, &Ok(second_wait));
+            time.lock().unwrap().as_nanos().duration_since(before)
+        };
+        assert_eq!(
+            skipped(false),
+            Duration::ZERO,
+            "a skipped turn does not end the run"
+        );
+        assert_eq!(
+            skipped(true),
+            charge,
+            "a skipped turn takes the mark with it"
+        );
+    }
+
+    /// An expired timed wait is one that ends at its deadline: a futex wait
+    /// answered `TimeOut`, or a sleep already due, including a zero-length one
+    /// (its deadline is the time it was made). A futex wait a wake ended, a
+    /// timeout whose grant delivers a signal, a yield's epoch sleep and a
+    /// pause's indefinite deadline are not.
+    #[test]
+    fn an_expired_timed_wait_is_one_that_ends_at_its_deadline() {
+        let tid = DetTid::from_raw(13);
+        let grant = |request: Resources, timed_out: bool| {
+            let mut sched = Scheduler::new(&Config::default());
+            sched.committed_time = LogicalTime::from_nanos(5_000_000);
+            register_known_thread(&mut sched, tid);
+            sched.runqueue_push_back(tid);
+            if timed_out {
+                assert!(sched.blocked.timed_out_futex_waiters.insert(tid));
+            }
+            let next = sched.next_turns.get(&tid).unwrap();
+            next.req.put(Ok(request.clone()));
+            let response = next.resp.clone();
+            assert_eq!(sched.run_queue.tentative_pop_next(), Some(tid));
+            assert!(sched.step4_resource_block(tid, &request, &response).is_ok());
+            assert!(sched.step5_guest_unblock(tid, &request, &response).is_ok());
+            sched.expired_wait_grant
+        };
+        let futex = || {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::FutexWait, Permission::R);
+            request
+        };
+        let sleep = |deadline: LogicalTime| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::SleepUntil(deadline), Permission::W);
+            request
+        };
+        assert_eq!(grant(futex(), true), Some(tid), "a futex timeout");
+        assert_eq!(grant(futex(), false), None, "one a wake ended");
+        assert_eq!(
+            grant(sleep(LogicalTime::from_nanos(4_000_000)), false),
+            Some(tid),
+            "a due sleep"
+        );
+        assert_eq!(
+            grant(sleep(LogicalTime::from_nanos(5_000_000)), false),
+            Some(tid),
+            "a zero-length sleep"
+        );
+        assert_eq!(
+            grant(sleep(LogicalTime::from_nanos(0)), false),
+            None,
+            "a yield"
+        );
+        let mut delivery = Resources::new(tid);
+        delivery.insert(
+            ResourceID::InboundSignal(SigWrapper(libc::SIGALRM)),
+            Permission::W,
+        );
+        assert_eq!(
+            grant(delivery, true),
+            None,
+            "a timeout whose grant delivers a signal"
+        );
+        let now = LogicalTime::from_nanos(5_000_000);
+        assert!(!Scheduler::is_due_sleep(
+            &sleep(LogicalTime::INDEFINITE),
+            now
+        ));
+        assert!(!Scheduler::is_due_sleep(
+            &sleep(LogicalTime::from_nanos(6_000_000)),
+            now
+        ));
     }
 
     /// https://github.com/rrnewton/hermit/issues/3517: a committed turn that
