@@ -1420,6 +1420,16 @@ pub struct RunOpts {
 
     /// Select guest networking. `local` creates an isolated loopback interface; `host` exposes the
     /// host network and compromises isolation and deterministic reproducibility.
+    ///
+    /// `local`, the default, gives each run its own network namespace, so a run's ports and
+    /// abstract unix socket names (`@name`) are its own. Under `host` the guest shares the host's:
+    /// every guest's first process is pid 3 and Hermit picks autobind names the same way in every
+    /// run, so two concurrent `host` runs whose guests bind the same abstract name, for instance
+    /// one built from the pid, collide and the second bind fails with EADDRINUSE. On the ptrace
+    /// backend Hermit prints a one-time NOTICE on stderr when a guest binds an abstract name under
+    /// `--network=host`, or fails to with EADDRINUSE. Use `host` only
+    /// for a guest that must reach the host's network, and run such guests one at a time when
+    /// they bind abstract names.
     #[clap(
         long,
         alias = "net",
@@ -6066,6 +6076,49 @@ fn gdbserver_respects_explicit_host_networking() {
     assert_eq!(opts.network, NetworkingMode::Host);
 }
 
+/// Detcore's notice for an abstract `AF_UNIX` bind is on only for a run that asked
+/// for `--network=host`, really shares the host's network namespace, has its own
+/// PID namespace, is not in a mode that needs host networking, and runs Detcore
+/// in Hermit's own process.
+#[test]
+fn abstract_bind_notice_is_on_only_for_an_explicit_host_network_run_on_ptrace() {
+    let resolved = |global: &[&str], args: &[&str]| {
+        let argv: Vec<&str> = std::iter::once("hermit")
+            .chain(global.iter().copied())
+            .chain(std::iter::once("run"))
+            .chain(args.iter().copied())
+            .chain(std::iter::once("fakeprog"))
+            .collect();
+        let mut opts = run_opts_for(&argv);
+        opts.validate_args_with_perf_support(true)
+            .unwrap_or_else(|error| panic!("{argv:?}: {error:#}"));
+        opts.det_opts.det_config.notice_host_network_abstract_binds
+    };
+    assert!(resolved(&[], &["--network=host"]));
+    assert!(!resolved(&[], &[]));
+    assert!(!resolved(&[], &["--network=local"]));
+    assert!(!resolved(&[], &["--analyze-networking"]));
+    // --analyze-networking isolates the run even under --network=host.
+    assert!(!resolved(&[], &["--network=host", "--analyze-networking"]));
+    // Host networking that another mode needs, or forces.
+    assert!(!resolved(&[], &["--no-namespace"]));
+    assert!(!resolved(&[], &["--gdbserver"]));
+    assert!(!resolved(&[], &["--gdbserver", "--network=host"]));
+    assert!(!resolved(&[], &["--strace-only"]));
+    assert!(!resolved(&[], &["--strace-only", "--network=host"]));
+    // A recording forces host networking but refuses abstract AF_UNIX
+    // addresses outright (and clap refuses it with --network=host).
+    let dir = tempfile::tempdir().unwrap();
+    let record = format!(
+        "--record-networking={}",
+        dir.path().join("net.trace").display()
+    );
+    assert!(!resolved(&[], &[&record]));
+    // Only the ptrace backend: KVM is not covered, and on the in-guest
+    // backends Detcore's stderr would be the guest's.
+    assert!(!resolved(&["--backend", "kvm"], &["--network=host"]));
+}
+
 /// `--analyze-networking` needs the isolated namespace, which `--gdbserver`
 /// no longer leaves, so the two combine.
 #[test]
@@ -8374,6 +8427,9 @@ impl RunOpts {
             );
         }
 
+        // What the command line asked for, before the modes below that force
+        // host networking.
+        let host_network_requested = self.network == NetworkingMode::Host;
         let config = &mut self.det_opts.det_config;
 
         // Every backend, DBT included, launches the guest through Reverie's
@@ -8760,6 +8816,21 @@ impl RunOpts {
         // documentation lists the routes that remain open. Replay applies the
         // same refusals in its private namespace.
         self.det_opts.det_config.network_trace = self.network_trace_config()?;
+        // Detcore's notice for an abstract AF_UNIX bind, on only where its
+        // advice holds and it reaches Hermit's stderr rather than the guest's:
+        // an explicit --network=host whose run really shares the host's
+        // namespace (--analyze-networking isolates it), in a PID namespace
+        // (every guest's first process is pid 3), not taken over by a mode
+        // that needs host networking (--gdbserver or --strace-only; a
+        // recording, which refuses abstract addresses outright, cannot be
+        // combined with --network=host), and with Detcore in Hermit's own
+        // process (the ptrace backend, e9patch preprocessing included).
+        self.det_opts.det_config.notice_host_network_abstract_binds = host_network_requested
+            && !self.network.uses_local_namespace(self.analyze_networking)
+            && !self.no_namespace
+            && !self.strace_only
+            && !self.det_opts.det_config.gdbserver
+            && matches!(backend, Backend::Ptrace | Backend::E9patch);
         if self.record_networking.is_some() {
             self.network = NetworkingMode::Host;
         }
