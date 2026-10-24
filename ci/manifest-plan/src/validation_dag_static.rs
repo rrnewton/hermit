@@ -1762,7 +1762,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Eight terminal-finalization custody and classification tests.
     // And container::tests::identity_hardening_freezes_the_dynamic_linker_cache
     // (the frozen /etc/ld.so.cache, Hermit c10c2882): 1096.
-    ("test.hermit_unit", 1096),
+    // And analyze's trial-input tests: phases::tests::{the_workspace_is_created_in_the_tmp_dir,
+    // a_same_thread_critical_pair_is_flagged_and_a_cross_thread_one_is_not},
+    // rundata::tests::{trials_bind_only_a_workspace_the_private_tmp_would_hide,
+    // every_trial_hands_the_guest_the_target_seed_inputs} and
+    // schedule_search::tests::{a_failing_schedule_with_extra_events_reduces_to_the_one_swap,
+    // replays_differing_only_by_branch_skid_are_one_interleaving}: 1102.
+    ("test.hermit_unit", 1102),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5261,7 +5267,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // The same eight finalization tests, with the existing selection unchanged.
     // And the frozen ld.so.cache container test (Hermit c10c2882): 1096.
-    ("test.hermit_unit_on_host", 1096),
+    // And the same six analyze trial-input tests: 1102.
+    ("test.hermit_unit_on_host", 1102),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
