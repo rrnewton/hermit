@@ -96,6 +96,9 @@ struct RawRecord {
     rewrite_exclusives: Option<super::RewriteExclusives>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     rewrite_exclusives_stripped_heuristic: bool,
+    // Carried by the `rcb_history` envelope around the record, never inside it.
+    #[serde(skip)]
+    identity: Option<super::HistoryIdentity>,
 }
 
 // The INFO comparison projection: RawRecord's exact serialization except the
@@ -158,6 +161,8 @@ struct InfoRecord {
     rewrite_exclusives: Option<super::RewriteExclusives>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     rewrite_exclusives_stripped_heuristic: bool,
+    #[serde(skip)]
+    identity: Option<super::HistoryIdentity>,
 }
 
 struct InfoLegacyFields<'a>(&'a PreemptionRecord);
@@ -991,6 +996,7 @@ mod tests {
             background_starts_unnoted: _,
             rewrite_exclusives: _,
             rewrite_exclusives_stripped_heuristic: _,
+            identity: _,
         } = record;
         // A stated overlay provenance round-trips byte for byte, as the
         // last field of the raw form.
