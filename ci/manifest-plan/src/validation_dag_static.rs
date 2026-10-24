@@ -1887,7 +1887,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And phases::tests::a_boundary_trial_still_stopped_is_reported_as_a_hang,
     // the_longest_finished_prefix_below_the_boundary_is_named and
     // a_confirmation_raises_the_bound_and_keeps_it_once_finished: 1222.
-    ("test.hermit_unit", 1222),
+    // And the guest-deadlock outcome's units:
+    // container::tests::a_container_child_exiting_guest_deadlock_is_a_guest_outcome,
+    // tests::guest_deadlock_uses_its_own_exit_and_marker,
+    // ptrace_completion::tests::a_guest_deadlock_completes_with_its_status_and_the_captured_output
+    // and error::tests::a_guest_deadlock_is_the_guests_outcome_only_once_the_run_finished:
+    // 1226, listed.
+    ("test.hermit_unit", 1226),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3107,7 +3113,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (a replay of a schedule's first events keeps their callback
     // checkpoints): 2789, listed.
     // And preemptions::tests::a_record_too_varied_to_renumber_keeps_its_priorities: 2790.
-    ("test.detcore_unit", 2790),
+    // And scheduler::test::terminal_verdicts_carry_the_kind_that_decides_the_status
+    // (the guest-deadlock outcome): 2791, listed.
+    ("test.detcore_unit", 2791),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4403,7 +4411,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 654 + 5 = 659, listed.
     // And +1 from 82cbd684: 660.
     // Train 6 recount (measured on 21f770f6 base): 666.
-    ("test.cli", 666),
+    // And a_guest_deadlock_is_the_guests_outcome_not_an_internal_failure,
+    // a_guest_deadlock_verifies_as_the_same_outcome_in_both_runs and
+    // a_recorded_guest_deadlock_replays_to_the_same_outcome (the guest-deadlock
+    // outcome, tests/c/condvar_join_deadlock.c): 669, listed.
+    ("test.cli", 669),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4946,7 +4958,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 5 = 578, listed.
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
-    ("test.cli_on_host", 585),
+    // And the same three guest-deadlock outcome tests: 588, listed.
+    ("test.cli_on_host", 588),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5419,7 +5432,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // And the same schedule-prefix unit: 2789, listed.
     // And the same normalize test: 2790.
-    ("test.detcore_unit_on_host", 2790),
+    // And the same guest-deadlock terminal-verdict unit: 2791, listed.
+    ("test.detcore_unit_on_host", 2791),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5801,7 +5815,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two --minimize tests: 1208.
     // And the same five boundary-confirmation tests: 1133.
     // And the same three prefix-hang tests: 1216.
-    ("test.hermit_unit_on_host", 1216),
+    // And the same four guest-deadlock outcome units: 1220, listed.
+    ("test.hermit_unit_on_host", 1220),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

@@ -235,6 +235,17 @@ mod tests {
             classify(exited(1), "HERMIT_INTERNAL_FAILURE class=cli-error\n").unwrap(),
             RunOutcome::Failed
         );
+        // A deadlock the scheduler proved is the guest's outcome, found by the
+        // schedule like any other failure, not one of Hermit's own.
+        assert_eq!(
+            classify(
+                exited(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+                "Deadlock detected: thread(s) waiting on futex, but no runnable threads left.\n\
+                 HERMIT_GUEST_DEADLOCK class=guest-deadlock\n"
+            )
+            .unwrap(),
+            RunOutcome::Failed
+        );
     }
 
     #[test]

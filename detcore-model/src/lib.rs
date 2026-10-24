@@ -59,6 +59,50 @@ const _: () = assert!(
     "a refusal exiting 0 would report success"
 );
 
+/// Exit status for a run whose GUEST DEADLOCKED: Detcore's scheduler found
+/// every remaining guest thread blocked on something no later turn can supply
+/// (its "Deadlock detected" report) and ended the run.
+///
+/// ⚠️ A GUEST OUTCOME, NOT A HERMIT FAILURE. Natively the program would hang
+/// forever; under Hermit's sequentialized virtual time "no thread can be woken
+/// now" is also "no thread can ever be woken", so the hang is detected and
+/// reported instead of reproduced. It is the virtual-time analogue of a
+/// `--timeout` firing on a hung guest (124), and like that bound it must not be
+/// reported as `HERMIT_INTERNAL_FAILURE_EXIT` (125, "file a bug against
+/// hermit"). Before this, the scheduler exited the container child 1 and the
+/// parent's classifier, whose catch-all means "the child died with a status it
+/// did not pick", turned the deadlock into `class=container-child-exit` and 125.
+///
+/// ⚠️ ONLY A GUEST DEADLOCK EXITS THIS. The scheduler's `HERMIT_DEADLOCK:`
+/// verdicts (an invariant of Hermit's own bookkeeping broke, or a backend never
+/// reported a death the kernel owed) still exit 1 and stay internal failures,
+/// and a happens-before refusal still exits [`HERMIT_POLICY_REFUSAL_EXIT`].
+///
+/// ⚠️ WHY 121. It extends the reserved band downwards by one (121 guest
+/// deadlock, 122 refusal, 123 log cap, 124 deadline, 125 hermit broke, 126/127
+/// exec-level), so the reserved codes stay contiguous and the guest range loses
+/// only its top value. It is not a signal status (`signal_from_exit_status` is
+/// `None`), so the classifier arms cannot both match. As with every other code,
+/// a guest may still exit 121 of its own accord: the stderr line
+/// `HERMIT_GUEST_DEADLOCK class=guest-deadlock` is the discriminator, present
+/// only when the scheduler declared the deadlock. See the allocation table
+/// above the constants in `hermit-cli/src/lib.rs`.
+///
+/// It lives here for the reason [`HERMIT_POLICY_REFUSAL_EXIT`] does: `detcore`
+/// emits it and `hermit-cli` recognises it.
+pub const HERMIT_GUEST_DEADLOCK_EXIT: i32 = 121;
+
+const _: () = assert!(
+    HERMIT_GUEST_DEADLOCK_EXIT == 121,
+    "121 extends the reserved band 122..=127 downwards and keeps it contiguous"
+);
+const _: () = assert!(
+    HERMIT_GUEST_DEADLOCK_EXIT != 0
+        && HERMIT_GUEST_DEADLOCK_EXIT != 1
+        && HERMIT_GUEST_DEADLOCK_EXIT != HERMIT_POLICY_REFUSAL_EXIT,
+    "a deadlock must not read as success, as the scheduler's old exit 1, or as a refusal"
+);
+
 /// The shell's base for "killed by signal N": a process killed by signal `N` is
 /// conventionally reported as `128 + N`.
 pub const SIGNAL_EXIT_BASE: i32 = 128;
@@ -148,6 +192,10 @@ const _: () = assert!(
 const _: () = assert!(
     signal_from_exit_status(HERMIT_POLICY_REFUSAL_EXIT).is_none(),
     "a policy refusal must not also parse as a signal death"
+);
+const _: () = assert!(
+    signal_from_exit_status(HERMIT_GUEST_DEADLOCK_EXIT).is_none(),
+    "a guest deadlock must not also parse as a signal death"
 );
 
 // ⚠️ PINNED AGAINST BOTH FAILURE DIRECTIONS. The first pin catches the band

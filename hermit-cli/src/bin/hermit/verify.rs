@@ -991,6 +991,11 @@ pub(crate) fn run_failure_of(error: &Error) -> Option<RunFailure> {
         .is_some()
     {
         Some(RunFailure::PolicyRefusal)
+    } else if error
+        .downcast_ref::<super::container::GuestDeadlock>()
+        .is_some()
+    {
+        Some(RunFailure::Deadlock)
     } else {
         None
     }
@@ -2724,6 +2729,7 @@ mod tests {
             0,
             101,
             detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+            detcore_model::HERMIT_GUEST_DEADLOCK_EXIT,
             hermit::HERMIT_DEADLINE_EXIT,
             hermit::HERMIT_LOG_CAP_EXIT,
             detcore_model::signal_exit_status(libc::SIGTERM),
@@ -2755,6 +2761,15 @@ mod tests {
                             .is_some()
                     );
                     assert_eq!(report, VerificationReport::no_result());
+                }
+                121 => {
+                    assert!(
+                        error
+                            .downcast_ref::<super::super::container::GuestDeadlock>()
+                            .is_some()
+                    );
+                    assert_eq!(report, VerificationReport::no_result());
+                    assert_eq!(super::super::failure_exit_code(&error), 121);
                 }
                 124 => {
                     assert!(
@@ -2809,6 +2824,10 @@ mod tests {
                 Error::msg("the guest program is statically linked")
                     .context(super::super::container::PolicyRefusal),
                 Some(RunFailure::PolicyRefusal),
+            ),
+            (
+                Error::new(super::super::container::GuestDeadlock),
+                Some(RunFailure::Deadlock),
             ),
             // Already published as its infrastructure error.
             (

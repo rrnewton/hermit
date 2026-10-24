@@ -188,6 +188,8 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
+pub use scheduler::GuestDeadlockUnwind;
+pub use scheduler::GuestDeadlockUnwindGuard;
 pub use scheduler::Priority;
 pub use scheduler::TerminalDeadlockHook;
 pub use scheduler::runqueue::DEFAULT_PRIORITY;
