@@ -4744,6 +4744,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             None
         };
         tool_global::mark_past_first_execve(guest, unprepared_exe).await;
+        // The files the kernel opened for this exec, the image and its
+        // program interpreter, join the run's host inputs (`host_inputs`).
+        if guest.config().record_host_inputs {
+            self.record_exec_host_inputs(guest).await;
+        }
         // The task's name for its rendered `/proc/<pid>/stat` where the tool
         // cannot read the kernel's (`procfs::task_stat`): the one the new
         // image's `AT_EXECFN` (`bprm->filename`) gives, under the leader's

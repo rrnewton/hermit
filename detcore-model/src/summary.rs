@@ -17,6 +17,8 @@ pub use reverie::DispatchStats;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::host_input::HostInputChange;
+use crate::host_input::HostInputSet;
 use crate::pid::DetTid;
 use crate::syscall_histogram::SyscallHistogramSummary;
 use crate::time::LogicalTime;
@@ -199,6 +201,21 @@ pub struct RunSummary {
     /// human-readable summary, whose INFO view is compared by `--verify`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub syscall_histogram: Option<SyscallHistogramSummary>,
+    /// The host files the guest opened, with the identity each path's first
+    /// open found and the set's digest (see [`crate::host_input`]). Two
+    /// separate runs whose digests differ read different host files, which
+    /// Hermit does not make deterministic. Absent when the run did not
+    /// record them. Not part of the human-readable summary, whose INFO view
+    /// `--verify` compares.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_inputs: Option<HostInputSet>,
+
+    /// The host files a schedule replay found changed since the recording it
+    /// replays, in the order the guest first opened them (see
+    /// [`crate::host_input::HostInputChange`]). Empty when nothing changed or
+    /// the run replayed nothing. Not part of the human-readable summary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_inputs_changed: Vec<HostInputChange>,
 }
 
 /// The full human-readable report, including recorded launch configuration.
@@ -262,6 +279,8 @@ impl RunSummary {
             preemption,
             dispatch_stats: _,
             syscall_histogram: _,
+            host_inputs: _,
+            host_inputs_changed: _,
         } = self;
         writeln!(f, "Final thread-tree was: {}", threads_descrip)?;
         writeln!(
