@@ -1357,7 +1357,7 @@ pub struct RunOpts {
     /// Mount a file or directory. This uses the same syntax as Docker's `--mount` option. The
     /// source must exist on the host. For simple bind mounts into guest `/tmp`, use `--bind`.
     #[clap(long, value_name = "path")]
-    mount: Vec<Mount>,
+    mount: Vec<MountArg>,
 
     /// Bind-mount a host file or directory into guest `/tmp`. Use `SOURCE` to preserve its path or
     /// `SOURCE:TARGET` to choose a target under `/tmp`; the source must already exist.
@@ -2015,6 +2015,35 @@ impl FromStr for SeedFrom {
     }
 }
 
+/// A `--mount`: the mount, and the spec it was parsed from, so that a
+/// rendered command line (`hermit analyze`'s reproducers) passes the same
+/// mount again. Reverie's `Mount` does not give its fields back, and some
+/// (its flags, data, pinned source) have no spec syntax.
+#[derive(Clone, Debug)]
+pub struct MountArg {
+    mount: Mount,
+    spec: String,
+}
+
+impl FromStr for MountArg {
+    type Err = <Mount as FromStr>::Err;
+
+    fn from_str(spec: &str) -> Result<Self, Self::Err> {
+        Ok(Self {
+            mount: spec.parse()?,
+            spec: spec.to_owned(),
+        })
+    }
+}
+
+impl std::ops::Deref for MountArg {
+    type Target = Mount;
+
+    fn deref(&self) -> &Mount {
+        &self.mount
+    }
+}
+
 /// Displays the `run` subcommand's own options, so that
 /// `hermit{global_backend_arg()} run{self}` is a runnable command. The backend is a
 /// global option and is therefore rendered by [`RunOpts::global_backend_arg`],
@@ -2171,12 +2200,7 @@ impl fmt::Display for RunOpts {
         }
 
         for mount in &self.mount {
-            let mut acc = Vec::new();
-            if let Some(s) = &mount.get_source() {
-                acc.push(format!("source={}", s.display()));
-            }
-            acc.push(format!("target={}", mount.get_target().display()));
-            write!(f, "--mount={}", shell_words::quote(&acc.join(",")),)?;
+            write!(f, " --mount={}", shell_words::quote(&mount.spec))?;
         }
         for bind in &self.bind {
             let src = bind.source.to_str().expect("valid unicode bind source");
@@ -3451,6 +3475,62 @@ fn source_less_mount_hides_program_from_resolution() {
     );
     let error = ro.resolve_guest_and_host_program().unwrap_err().to_string();
     assert!(error.contains("not visible through the configured guest mounts"));
+}
+
+/// The rendered options (what `hermit analyze` prints as a reproducer and
+/// writes to its `*.repro` files) are a shell command line that parses back
+/// to the same options: each `--mount` is its own word and keeps its whole
+/// spec, type and `readonly` included. Before, the first `--mount` was glued
+/// to the option before it, and every mount was shown as its source and
+/// target only, so a pasted reproducer lost the bind.
+#[test]
+fn rendered_options_parse_back_to_the_same_mounts() {
+    let bind = "type=bind,source=/etc/hostname,target=/etc/ld.so.cache,readonly";
+    let argv = [
+        "fakehermit",
+        "--save-config=/tmp/run one.config",
+        &format!("--mount={bind}"),
+        "--mount=type=tmpfs,target=/test",
+        "--bind=/tmp",
+        "--",
+        "/bin/echo",
+        "a b",
+    ];
+    // Options as `hermit run` and `hermit analyze` hold them, validated.
+    let validated = |argv: Vec<String>| {
+        let mut options = RunOpts::parse_from(argv);
+        options.validate_args_with_timer_support(Ok(())).unwrap();
+        options
+    };
+    let options = validated(argv.iter().map(|arg| arg.to_string()).collect());
+    let rendered = options.to_string();
+    assert!(
+        rendered.contains(&format!(
+            " --mount={} --mount={} ",
+            shell_words::quote(bind),
+            shell_words::quote("type=tmpfs,target=/test")
+        )),
+        "{rendered}"
+    );
+    let words = shell_words::split(&rendered).unwrap();
+    let reparsed = validated(
+        std::iter::once("fakehermit".to_owned())
+            .chain(words)
+            .collect(),
+    );
+    let mounts = |options: &RunOpts| -> Vec<Mount> {
+        options.mount.iter().map(|arg| arg.mount.clone()).collect()
+    };
+    assert_eq!(mounts(&reparsed), mounts(&options));
+    // The bind is still read-only: the source and target alone, the old
+    // rendering, parse to another mount.
+    let source_and_target: Mount = "source=/etc/hostname,target=/etc/ld.so.cache"
+        .parse()
+        .unwrap();
+    assert_ne!(mounts(&reparsed)[0], source_and_target);
+    assert_eq!(reparsed.save_config, options.save_config);
+    assert_eq!(reparsed.args, options.args);
+    assert_eq!(reparsed.to_string(), rendered);
 }
 
 #[test]
@@ -10149,7 +10229,7 @@ impl RunOpts {
     /// These options with the DBT adapter's own container inputs added after
     /// the caller's, only for this physical launch.
     #[cfg(feature = "dbt")]
-    pub(super) fn with_dbt_mounts(&self, binds: &[Bind], mounts: Vec<Mount>) -> Self {
+    pub(super) fn with_dbt_mounts(&self, binds: &[Bind], mounts: Vec<MountArg>) -> Self {
         let mut options = self.clone();
         options.backend_mounts.0 += mounts.len();
         options.backend_mounts.1 += binds.len();
@@ -10162,7 +10242,7 @@ impl RunOpts {
     /// them (shown in the guest's mount table): the DBT adapter's tmpfs at
     /// the test workdir, which the guest uses as its working directory.
     #[cfg(feature = "dbt")]
-    pub(super) fn with_guest_mount(&self, mount: Mount) -> Self {
+    pub(super) fn with_guest_mount(&self, mount: MountArg) -> Self {
         let mut options = self.clone();
         options.mount.push(mount);
         options
@@ -10174,6 +10254,7 @@ impl RunOpts {
     pub(super) fn mounts_tmpfs_at(&self, target: &Path) -> bool {
         self.mount
             .iter()
+            .map(|arg| &arg.mount)
             .any(|mount| mount.get_target() == target && mount.clone().fstype("tmpfs") == *mount)
     }
 
@@ -10257,7 +10338,7 @@ impl RunOpts {
             }
         };
 
-        for (index, mount) in self.mount.iter().enumerate() {
+        for (index, mount) in self.mount.iter().map(|arg| &arg.mount).enumerate() {
             let backend = index >= backend_mounts_from;
             let user_target = mount.get_target();
             identity_sources.discard_mounts_shadowed_by(&mut identity_mounts, user_target);
