@@ -18413,14 +18413,13 @@ mod test {
             .with_time(LogicalTime::from_nanos(10_000));
         let mut events = vec![prehook.clone()];
         if let Some(count) = branches {
-            let branch = SchedEvent::branches(next, count)
-                .with_time(LogicalTime::from_nanos(10_000) + LogicalTime::from_rcbs(count.into()));
-            let other = SchedEvent {
-                op: detcore_model::schedule::Op::OtherInstructions,
-                count: 1,
-                ..branch.clone()
-            };
-            events.extend([branch, other]);
+            // A timer preemption, as recordings write it: branches with no
+            // OtherInstructions after them, then the next thread's event.
+            events.push(
+                SchedEvent::branches(next, count).with_time(
+                    LogicalTime::from_nanos(10_000) + LogicalTime::from_rcbs(count.into()),
+                ),
+            );
         } else {
             events.push(SchedEvent::syscall(
                 next,
