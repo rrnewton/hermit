@@ -17,27 +17,33 @@ use std::process::Command;
 const IN_GUEST_SELECTED: &str =
     "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool";
 
-/// Runs `guest` under in-guest LiteInst (https://github.com/rrnewton/hermit/issues/3520)
-/// twice and returns its stdout. In-guest LiteInst refuses a maximum timeslice
+#[cfg(feature = "liteinst")]
+const IN_GUEST_BACKEND: &str = "liteinst";
+#[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+const IN_GUEST_BACKEND: &str = "in-guest-trap";
+#[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+const IN_GUEST_SELECTED: &str = "hermit: [in-guest-trap] selected: the guest preload is to host the Detcore Tool, \
+     with syscall site patching off (REVERIE_LITEINST_SITE_PATCHING=0)";
+
+/// Runs `guest` twice under the enabled in-guest backend and returns its stdout.
+/// The existing LiteInst and trap-only entrypoints use the same epoch, status,
+/// banner, nonempty-output and exact second-run parity assertions. It refuses a maximum timeslice
 /// until it can deliver Detcore's preemption timer, so these runs have none,
 /// and they do not pass `--verify` yet. The guest checks its own timestamps
 /// against logical time and fails if one escapes; the second run must print the
 /// same output. Both runs pin
 /// the same `--epoch`, as `--verify` pins one epoch for its two runs; without
 /// it each run starts its virtual clock at the host's current time.
-#[cfg(feature = "liteinst")]
-fn run_in_guest_liteinst_twice(guest: &Path, args: &[&str], label: &str) -> String {
+#[cfg(feature = "in-guest-trap")]
+fn run_in_guest_twice(guest: &Path, args: &[&str], label: &str) -> String {
     let run = || {
         let mut command = Command::new("timeout");
         command
             .args(["--kill-after", "5s", "90s"])
             .arg(hermit_test::hermit_binary())
-            .args([
-                "--log=info",
-                "--backend=liteinst",
-                "run",
-                "--epoch=2026-01-01T00:00:00Z",
-            ])
+            .arg("--log=info")
+            .arg(format!("--backend={IN_GUEST_BACKEND}"))
+            .args(["run", "--epoch=2026-01-01T00:00:00Z"])
             .args([
                 "--strict",
                 "--max-timeslice=disabled",
@@ -52,21 +58,24 @@ fn run_in_guest_liteinst_twice(guest: &Path, args: &[&str], label: &str) -> Stri
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             output.status.success(),
-            "liteinst/{label} failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            "{IN_GUEST_BACKEND}/{label} failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
             output.status
         );
         assert!(
             stderr.lines().any(|line| line == IN_GUEST_SELECTED),
-            "liteinst/{label} did not run under in-guest LiteInst\nstderr:\n{stderr}"
+            "{IN_GUEST_BACKEND}/{label} did not select its in-guest runtime\nstderr:\n{stderr}"
         );
         stdout
     };
     let first = run();
-    assert!(!first.is_empty(), "liteinst/{label} printed nothing");
+    assert!(
+        !first.is_empty(),
+        "{IN_GUEST_BACKEND}/{label} printed nothing"
+    );
     assert_eq!(
         run(),
         first,
-        "liteinst/{label} printed different output on its second run"
+        "{IN_GUEST_BACKEND}/{label} printed different output on its second run"
     );
     first
 }
@@ -233,6 +242,17 @@ fn socket_receive_timestamps_use_logical_time() {
 #[test]
 #[cfg(feature = "liteinst")]
 fn socket_receive_timestamps_use_logical_time_in_guest_liteinst() {
+    assert_socket_receive_timestamps_use_logical_time_in_guest();
+}
+
+#[test]
+#[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+fn socket_receive_timestamps_use_logical_time_in_guest_trap() {
+    assert_socket_receive_timestamps_use_logical_time_in_guest();
+}
+
+#[cfg(feature = "in-guest-trap")]
+fn assert_socket_receive_timestamps_use_logical_time_in_guest() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
@@ -260,6 +280,6 @@ fn socket_receive_timestamps_use_logical_time_in_guest_liteinst() {
             "{name} compilation failed: {}",
             String::from_utf8_lossy(&compile.stderr)
         );
-        assert_eq!(run_in_guest_liteinst_twice(&guest, &[], name), expected);
+        assert_eq!(run_in_guest_twice(&guest, &[], name), expected);
     }
 }

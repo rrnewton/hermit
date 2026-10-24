@@ -124,10 +124,11 @@ fn run() -> proof::Result<()> {
                 && package.crate_types == ["cdylib"],
             "fresh metadata selected a different Detcore runtime",
         )?;
-        let cargo_args = vec![
+        let mut cargo_args = vec![
             "build".into(),
             "--locked".into(),
             "--offline".into(),
+            "--no-default-features".into(),
             "--manifest-path".into(),
             manifest.to_string_lossy().into_owned(),
             "-p".into(),
@@ -139,6 +140,14 @@ fn run() -> proof::Result<()> {
             target.to_string_lossy().into_owned(),
             "--message-format=json-render-diagnostics".into(),
         ];
+        let features: Vec<String> = if cfg!(feature = "liteinst") {
+            vec!["liteinst".into()]
+        } else {
+            Vec::new()
+        };
+        if !features.is_empty() {
+            cargo_args.extend(["--features".into(), features.join(",")]);
+        }
         let cargo_version = runner.text("cargo", &["--version", "--verbose"], &root)?;
         let rustc_version = runner.text("rustc", &["--version", "--verbose"], &root)?;
         let output = runner.run("cargo", &cargo_args, &root)?;
@@ -147,7 +156,7 @@ fn run() -> proof::Result<()> {
         let artifact = proof::select_artifact(
             std::str::from_utf8(&output).map_err(|e| e.to_string())?,
             package,
-            &[],
+            &features,
             &expected_profile,
             &target,
         )?;
@@ -155,10 +164,20 @@ fn run() -> proof::Result<()> {
             artifact.reported_path == target.join("liteinst-runtime/libdetcore_liteinst.so"),
             "Cargo reported a different ordinary runtime output",
         )?;
+        let current_build_sources = if cfg!(feature = "liteinst") {
+            None
+        } else {
+            let build_command = runner
+                .commands
+                .last()
+                .ok_or("ordinary runtime build command was not retained")?;
+            Some(sources.with_current_build(build_command, &artifact.reported_path, &target)?)
+        };
+        let sources = current_build_sources.as_ref().unwrap_or(&sources);
         let qualification = proof::qualify_detcore_constructor_with_sources(
             &artifact.reported_path,
             &mut runner,
-            &sources,
+            sources,
         )?;
         qualifier_source.verify()?;
         profile_inputs.verify()?;

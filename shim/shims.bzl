@@ -235,6 +235,7 @@ def rust_library(
     test_deps = None,
     test_env = None,
     autocargo = None,
+    skip_autocargo_manifest = None,
     unittests = None,
     mapped_srcs = {},
     cpp_deps = None,
@@ -243,7 +244,9 @@ def rust_library(
     visibility = ["PUBLIC"],
     **kwargs,
 ):
-    _unused = (test_deps, test_env, named_deps, autocargo, unittests, visibility, cpp_deps, cxx_bridge, test_rustc_flags)  # @unused
+    # The public prelude generates no autocargo manifests; both controls are
+    # internal manifest metadata, with no effect on features or dependency edges.
+    _unused = (test_deps, test_env, named_deps, autocargo, skip_autocargo_manifest, unittests, visibility, cpp_deps, cxx_bridge, test_rustc_flags)  # @unused
     deps = _fix_deps(deps)
     mapped_srcs = _maybe_select_map(mapped_srcs, _fix_mapped_srcs)
 
