@@ -10516,7 +10516,19 @@ impl RunOpts {
         // this is in-process only; it reaches the ptrace backend directly and is not
         // carried through the DBT JSON config or `--save-config`.
         config.happens_before = self.resolved_happens_before.clone();
-        config.record_host_inputs = self.host_input_log.is_some();
+        // Host inputs are recorded for `--verify` (`host_input_log`), and for
+        // every run whose output a later run reproduces or is compared with:
+        // a recorded schedule keeps the run's host-input set, a schedule
+        // replay compares its opens against the recorded one, and a summary
+        // reports the set (`detcore_model::host_input::HostInputSet`). Not
+        // under DBT, whose runtime's configuration has no such field, so it
+        // would report an empty set that looks complete.
+        config.record_host_inputs = self.host_input_log.is_some()
+            || (self.runtime_backend() != Backend::Dbt
+                && (config.record_preemptions_to.is_some()
+                    || config.replay_preemptions_from.is_some()
+                    || config.replay_schedule_from.is_some()
+                    || self.summary_json.is_some()));
         config.host_input_log = self.host_input_log.clone();
         config.untraced_code_range = untraced_code_range(self.selected_backend());
         config.fatal_core_capture = self.fatal_core_capture();
