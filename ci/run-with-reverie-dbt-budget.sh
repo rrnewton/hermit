@@ -2647,7 +2647,7 @@ fi
 # reverie-dbt/vendor/dynamorio, and third-party/dynamorio. Existing budget
 # values and limits are unchanged. This is source-identity carry only;
 # it supplies no new calibration, build, runtime, or landing evidence.
-expected_pin=16a709ad377314a3c9966ad7047858c7651626f2
+expected_pin=33a8f64fb929f9a1e4168bbc63a8c2f21ab88a10
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
