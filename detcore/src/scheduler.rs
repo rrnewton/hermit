@@ -16,6 +16,9 @@ pub(crate) mod discarded_at_send;
 pub(crate) mod exec_teardown_tests;
 #[cfg(test)]
 mod gated_wait_tests;
+pub(crate) mod guest_mask_publication;
+#[cfg(test)]
+mod guest_mask_publication_tests;
 pub(crate) mod itimer_coalesce;
 pub(crate) mod parked;
 #[cfg(test)]
@@ -1829,6 +1832,19 @@ pub struct Scheduler {
     /// `SigBlk` may then be the in-guest runtime's mask; and those two readers
     /// take it too (`read_thread_blocked_mask_result`).
     saved_guest_sigmasks: BTreeMap<DetTid, u64>,
+
+    /// Under the in-guest delivery gate, the threads whose published guest
+    /// mask is unknown (IR-18, `guest_mask_publication::PublishedGuestMask`):
+    /// never also in `saved_guest_sigmasks`. Every scheduler-internal reader
+    /// takes such a thread as having published nothing; the `/proc` status
+    /// reader refuses by name. Empty with the gate off.
+    unknown_guest_sigmasks: BTreeSet<DetTid>,
+
+    /// Under the in-guest delivery gate, each thread's temporary-mask
+    /// publication in force (IR-23(a), `guest_mask_publication`): D37's held
+    /// masks, the committed-send window record, and what a withdrawal puts
+    /// back. Empty with the gate off.
+    temporary_mask_publications: BTreeMap<DetTid, guest_mask_publication::TemporaryMaskPublication>,
 
     /// Each thread's mask as Detcore's signal-state copy holds it, published
     /// by the thread before each request that can let another thread run
@@ -4332,6 +4348,8 @@ impl Scheduler {
             delivery_mask_override: None,
             signal_control_caller: None,
             saved_guest_sigmasks: Default::default(),
+            unknown_guest_sigmasks: Default::default(),
+            temporary_mask_publications: Default::default(),
             published_masks: Default::default(),
             published_dispositions: Default::default(),
             pending_real_time_expirations: Default::default(),
@@ -5286,6 +5304,8 @@ impl Scheduler {
         self.release_vfork_child(*dtid, false);
         self.vfork_registration_origins.remove(dtid);
         self.saved_guest_sigmasks.remove(dtid);
+        self.unknown_guest_sigmasks.remove(dtid);
+        self.temporary_mask_publications.remove(dtid);
         self.kernel_run_requests.remove(dtid);
         self.published_masks.remove(dtid);
         let retired = self
@@ -6836,7 +6856,10 @@ impl Scheduler {
 
     /// Record (`Some`) or clear (`None`) the mask Linux's `blocked` holds for
     /// `dettid` while its kernel `SigBlk` differs (`saved_guest_sigmasks`).
-    /// Returns false for a thread the scheduler no longer knows.
+    /// Returns false for a thread the scheduler no longer knows. Under the
+    /// in-guest delivery gate this new publication also ends an unknown mask
+    /// (IR-18) and supersedes a temporary-mask publication in force
+    /// (IR-23(a), `guest_mask_publication`); both are empty with the gate off.
     pub(crate) fn set_saved_guest_sigmask(&mut self, dettid: DetTid, mask: Option<u64>) -> bool {
         if !self.next_turns.contains_key(&dettid) {
             return false;
@@ -6845,6 +6868,8 @@ impl Scheduler {
             Some(mask) => self.saved_guest_sigmasks.insert(dettid, mask),
             None => self.saved_guest_sigmasks.remove(&dettid),
         };
+        self.unknown_guest_sigmasks.remove(&dettid);
+        self.forget_temporary_mask_publication(dettid);
         true
     }
 
@@ -10226,6 +10251,11 @@ impl Scheduler {
             if let Some(token) = token {
                 self.discard_note_fate(token, fate, record);
             }
+            self.note_committed_send_in_window(
+                dettid,
+                signal as libc::c_int,
+                matches!(queue, discarded_at_send::QueueId::Thread(_)),
+            );
             self.guest_send_landed = Some(true);
             if self.send_wakes(dettid) {
                 self.test_send_wakes.push(dettid);
@@ -10316,6 +10346,18 @@ impl Scheduler {
             && let Some(token) = token
         {
             self.discard_note_fate(token, fate, record);
+        }
+        // A5 step 3c.1e A: a successful send is committed here, before
+        // `note_group_send`'s and `send_wakes`'s early returns; while the
+        // target holds a temporary-mask publication it joins the committed-send
+        // window record, in the queue the send used. Nothing with the in-guest
+        // delivery gate off.
+        if result.is_ok() {
+            self.note_committed_send_in_window(
+                dettid,
+                signal as libc::c_int,
+                matches!(queue, discarded_at_send::QueueId::Thread(_)),
+            );
         }
         match result {
             Ok(()) if thread_of.is_none() => {
@@ -11759,6 +11801,15 @@ impl Scheduler {
     /// call published, its temporary one, as design 18.16 holds for a thread
     /// readmitted before its continuation turn; `thread_signal_mask` still
     /// reads it as unknown (`continuation_masks`).
+    ///
+    /// IR-18 (A5 step 3c.1e A): a rejoin that returned under the guest's own
+    /// mask (`ContinuationMask::Restored`: neither a temporary mask nor an
+    /// unknown one) but publishes none, on a backend that keeps no guest mask
+    /// apart, marks the mask unknown (`mark_guest_mask_unknown`) rather than
+    /// leaving the call's: that may be its temporary mask, which Linux took
+    /// down before the call returned (`restore_saved_sigmask_unless`). The
+    /// `/proc` status reader then refuses by name, and the scheduler's own
+    /// readers take nothing published.
     fn keep_mask_for_continuation(&mut self, dtid: DetTid) {
         let _ = self.blocked.out_of_scheduler_masks.remove(&dtid);
         let filed = self
@@ -11777,11 +11828,20 @@ impl Scheduler {
             self.blocked.continuation_masks.insert(dtid, mask);
         }
         if self.in_guest_signal_delivery
-            && let Some(published) = filed
-                .filter(Resources::is_rejoin)
-                .and_then(|req| req.guest_signal_mask)
+            && let Some(rejoin) = filed.filter(Resources::is_rejoin)
         {
-            self.saved_guest_sigmasks.insert(dtid, published);
+            match rejoin.guest_signal_mask {
+                Some(published) => {
+                    self.saved_guest_sigmasks.insert(dtid, published);
+                    self.unknown_guest_sigmasks.remove(&dtid);
+                }
+                None if !rejoin.blocked_signal_mask_unknown
+                    && rejoin.blocked_signal_mask.is_none() =>
+                {
+                    self.mark_guest_mask_unknown(dtid);
+                }
+                None => {}
+            }
         }
     }
 
