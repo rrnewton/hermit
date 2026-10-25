@@ -1379,6 +1379,42 @@ pub fn validate_expected_guest_exit(
     Ok(())
 }
 
+/// Check a declared guest exit that a result row, or a series row built from
+/// one, carries in `mode`. A replay cell inherits its verify recipe's
+/// declaration ([`cell_expected_guest_exit`]) and passes on it only through
+/// the verify cell's gate (a matched canonical replay whose guest and Hermit
+/// both end exactly that way), so a row may carry it in verify or replay mode.
+/// A recipe may still declare it only in verify mode
+/// ([`validate_expected_guest_exit`]).
+pub fn validate_result_expected_guest_exit(
+    id: &str,
+    mode: &str,
+    expected: Option<&ExpectedGuestExit>,
+) -> Result<(), String> {
+    let recipe_mode = if mode == "replay" { "verify" } else { mode };
+    validate_expected_guest_exit(id, recipe_mode, expected)
+}
+
+/// Whether `hermit_args`, an attempt's argv before the guest separator, is an
+/// invocation the runner writes for a cell whose declared nonzero exit it
+/// checks: a verify cell's comparison with `--verify-allow=failure`, or a
+/// replay cell's `record start`, whose comparison takes `--verify-allow=both`
+/// (`verified_invocation_argv`). A reader re-deciding a declared exit from a
+/// retained row requires one of these.
+pub fn invocation_admits_declared_guest_exit<S: AsRef<str>>(mode: &str, hermit_args: &[S]) -> bool {
+    let has = |flag: &str| hermit_args.iter().any(|arg| arg.as_ref() == flag);
+    match mode {
+        "verify" => has("--verify-allow=failure"),
+        "replay" => {
+            has("--verify-allow=both")
+                && hermit_args
+                    .windows(2)
+                    .any(|pair| pair[0].as_ref() == "record" && pair[1].as_ref() == "start")
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Assertions {
@@ -25020,6 +25056,48 @@ cp "{}" "$verdict"
             "exit 7",
         );
         assert_ne!(undeclared.outcome, "PASS", "{:?}", undeclared.reason);
+    }
+
+    /// A result row may carry a declared guest exit in verify or replay mode,
+    /// since a replay cell inherits its verify recipe's declaration, while a
+    /// recipe may declare one only in verify mode. A reader credits it only
+    /// from the invocation the runner writes for it: a verify comparison with
+    /// `--verify-allow=failure`, or a replay's `record start`, whose
+    /// comparison takes `--verify-allow=both`.
+    #[test]
+    fn a_replay_result_row_may_carry_its_inherited_declaration() {
+        let expected = expected_exit(Some(7), None);
+        for mode in ["verify", "replay"] {
+            validate_result_expected_guest_exit("row", mode, Some(&expected)).unwrap();
+        }
+        for mode in ["chaos", "naked"] {
+            assert!(
+                validate_result_expected_guest_exit("row", mode, Some(&expected)).is_err(),
+                "{mode}"
+            );
+        }
+        assert!(validate_expected_guest_exit("recipe", "replay", Some(&expected)).is_err());
+        let zero = expected_exit(Some(0), None);
+        assert!(validate_result_expected_guest_exit("row", "replay", Some(&zero)).is_err());
+        let verify = ["hermit", "run", "--verify-allow=failure"];
+        let replay = [
+            "hermit-verify-pair",
+            "hermit",
+            "log-diff",
+            "--verify-allow=both",
+            "hermit",
+            "record",
+            "start",
+        ];
+        assert!(invocation_admits_declared_guest_exit("verify", &verify));
+        assert!(invocation_admits_declared_guest_exit("replay", &replay));
+        assert!(!invocation_admits_declared_guest_exit("replay", &verify));
+        assert!(!invocation_admits_declared_guest_exit("verify", &replay));
+        assert!(!invocation_admits_declared_guest_exit(
+            "replay",
+            &["hermit", "log-diff", "--verify-allow=both", "hermit", "run"]
+        ));
+        assert!(!invocation_admits_declared_guest_exit("chaos", &replay));
     }
 
     fn replay_cell_with_verify(verify: ModeRecipe, replay: ModeRecipe) -> SelectedCell {
