@@ -1897,7 +1897,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // terminal_outcome_note::tests::a_virtual_timeout_noted_by_an_exiting_child_reaches_its_parent_once
     // and run::virtual_timeout_parses_round_trips_and_is_refused_without_the_scheduler:
     // 1234.
-    ("test.hermit_unit", 1234),
+    // And analyze's virtual-time trial bound:
+    // rundata::tests::{the_trial_virtual_bound_derives_from_the_longest_endpoint_run,
+    // the_wall_clock_bound_is_a_backstop_while_the_virtual_bound_applies,
+    // runs_take_the_virtual_bound_and_their_reproducer_carries_it,
+    // a_trial_its_virtual_bound_stopped_is_read_from_its_summary,
+    // an_inapplicable_trial_virtual_timeout_is_refused}
+    // and phases::tests::{a_trial_the_virtual_bound_stopped_is_not_confirmed,
+    // a_virtual_bound_boundary_is_reported_as_a_hang_without_a_longer_bound}:
+    // 1145.
+    ("test.hermit_unit", 1241),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5836,7 +5845,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three prefix-hang tests: 1221.
     // And the same four guest-deadlock outcome units: 1225, listed.
     // And the same three --virtual-timeout units: 1228.
-    ("test.hermit_unit_on_host", 1228),
+    // And the same seven virtual-time trial-bound tests: 1235.
+    ("test.hermit_unit_on_host", 1235),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

@@ -12960,6 +12960,28 @@ impl RunOpts {
         self.backend_enforces_timeout() && !self.uses_in_guest_liteinst()
     }
 
+    /// Why `hermit analyze` cannot bound this run with a `--virtual-timeout`
+    /// and read from its summary that the bound stopped it, if it cannot. Only
+    /// the ptrace runtime (also under the e9patch spelling) finishes a run its
+    /// virtual bound stopped as for a guest that exited and writes its
+    /// summary; KVM exits without one, and the other backends refuse the
+    /// bound. The bound measures virtual time, which `--no-virtualize-time`
+    /// turns off.
+    pub(crate) fn virtual_timeout_trial_refusal(&self) -> Option<String> {
+        let backend = self.runtime_backend();
+        if backend != Backend::Ptrace {
+            Some(format!(
+                "the trials run on the {} backend, and only on the ptrace backend does a run \
+                 that its virtual-time bound stopped write a summary that says so",
+                backend.as_str()
+            ))
+        } else if !self.det_opts.det_config.virtualize_time {
+            Some("the run arguments turn virtual time off (--no-virtualize-time)".to_owned())
+        } else {
+            None
+        }
+    }
+
     /// Bound the run at `seconds` of wall-clock time, or at its own
     /// `--timeout` where that is shorter: `hermit analyze`'s per-trial bound.
     pub(crate) fn bound_run_timeout(&mut self, seconds: NonZeroU64) {

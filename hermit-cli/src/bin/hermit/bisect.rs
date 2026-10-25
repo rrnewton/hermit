@@ -131,8 +131,9 @@ impl BisectOpts {
             inexact_branch_counter: self.inexact_branch_counter,
             branch_counter_warning: None,
             // Bisect runs no endpoint to measure: its replays are bounded by
-            // the run arguments' --timeout alone.
+            // the run arguments' --timeout and --virtual-timeout alone.
             trial_timeout: crate::analyze::TrialTimeout::Off,
+            trial_virtual_timeout: Some(crate::analyze::TrialVirtualTimeout::Off),
             endpoints: Default::default(),
             trial_bound_factor: 1,
         };
