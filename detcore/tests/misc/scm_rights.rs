@@ -220,6 +220,10 @@ fn received_pipe_end_shares_the_open_file() {
 
 /// Detcore keeps pipes nonblocking in the kernel. A blocking read through a
 /// received end must still wait for the writer rather than fail with EAGAIN.
+/// The writer is another process, not a thread: each guest descends, by
+/// fork, from the multithreaded test process, and a Rust thread started there
+/// can wait forever on a lock of the standard library's that another thread
+/// of the test process held at the fork. A forked writer takes no such lock.
 fn blocking_read_on_a_received_pipe_waits_for_the_writer() {
     let (read_end, write_end) = pipe();
     let (left, right) = socketpair(libc::SOCK_STREAM);
@@ -228,14 +232,26 @@ fn blocking_read_on_a_received_pipe_waits_for_the_writer() {
         panic!("expected one descriptor");
     };
 
-    let writer = std::thread::spawn(move || {
+    let writer = check(unsafe { libc::fork() }, "fork");
+    if writer == 0 {
+        // Only the parent reads.
+        unsafe {
+            libc::close(read_end);
+            libc::close(received);
+        }
         for _ in 0..3 {
-            std::thread::yield_now();
+            unsafe { libc::sched_yield() };
         }
         write_all(write_end, b"late");
-    });
+        unsafe { libc::_exit(0) };
+    }
+    // The writer holds the only write end: if it fails, the read ends at the
+    // end of file and the test fails, instead of waiting forever.
+    check(unsafe { libc::close(write_end) }, "close");
     assert_eq!(read_exact(received, 4), b"late");
-    writer.join().unwrap();
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(writer, &mut status, 0) }, writer);
+    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
     println!("blocking read on {received} returned the writer's bytes");
 }
 
