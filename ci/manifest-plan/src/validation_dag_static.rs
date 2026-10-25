@@ -1916,7 +1916,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // This is the prior middle's 1341 plus the inherited diagnostic and two callbacks.
     // Recount at 071e77ce66928fe71c2a596f23661e96ebd56770 retains all 1344
     // identities and adds five carried minimization/report tests: 1349.
-    ("test.hermit_unit", 1349),
+    // And analyze's workspace cleanup: workspace::tests::{a_workspace_is_removed_when_dropped,
+    // a_kept_workspace_stays, a_workspace_that_cannot_be_removed_is_named,
+    // an_uncreatable_tmp_dir_is_named} and stop::tests::{the_parent_is_the_field_after_the_state,
+    // the_first_stop_signal_is_the_one_reported,
+    // a_stop_signal_reaches_the_children_and_only_them,
+    // the_handler_stops_what_analyze_started_and_nothing_else}: 1357.
+    ("test.hermit_unit", 1357),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5992,7 +5998,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // all 1323 host identities: 1338, with the same six host exclusions.
     // The same five carried tests at 071e77ce66928fe71c2a596f23661e96ebd56770
     // retain all 1338 host identities: 1343, with the same six host exclusions.
-    ("test.hermit_unit_on_host", 1343),
+    // And the same eight workspace-cleanup tests: 1351.
+    ("test.hermit_unit_on_host", 1351),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
