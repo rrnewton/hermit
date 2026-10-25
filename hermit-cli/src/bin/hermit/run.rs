@@ -1764,6 +1764,11 @@ pub struct RunOpts {
     #[clap(skip)]
     e9patch_engagement: Option<BackendEngagement>,
 
+    /// What `--cpu-profile auto` resolved to and why, for the diagnostic
+    /// line `--log=info` and finer show.
+    #[clap(skip)]
+    auto_resolution: Option<String>,
+
     /// The root-image rewrite's sites in the dispatch record's terms; every
     /// count is unmeasured when the root executable was not an ELF image.
     #[clap(skip)]
@@ -6822,7 +6827,11 @@ impl RunOpts {
     fn admit_cpu_profile(&mut self) -> Result<(), Error> {
         self.resolve_auto_cpu_profile()?;
         let config = &self.det_opts.det_config;
-        if config.cpu_profile.is_default() {
+        // Still auto only where it could not resolve, which a later check or
+        // the launch refuses: nothing to admit.
+        if config.cpu_profile.is_default()
+            || config.cpu_profile == detcore_model::cpu_profile::CpuProfile::Auto
+        {
             return Ok(());
         }
         let backend = self.selected_backend();
@@ -6882,10 +6891,17 @@ impl RunOpts {
     /// (`hermit::cpu_profile_admission::resolve_auto`), before that profile
     /// is admitted like an explicit one. The configuration, and with it any
     /// recording and the second run of `--verify`, then holds only the named
-    /// profile. A program auto cannot read is refused by name.
+    /// profile. A program auto cannot read or resolve is refused by name at
+    /// the launch.
     fn resolve_auto_cpu_profile(&mut self) -> Result<(), Error> {
         use detcore_model::cpu_profile::CpuProfile;
         if self.det_opts.det_config.cpu_profile != CpuProfile::Auto {
+            return Ok(());
+        }
+        // A program that cannot run keeps its own fault (127 or 126), which
+        // `validate_program` reports in its place among the run's checks:
+        // auto stays unresolved, and nothing is admitted or launched for it.
+        if self.validate_program().is_err() {
             return Ok(());
         }
         let (program, _, rootfs) = self.guest_program_on_host()?;
@@ -6896,13 +6912,25 @@ impl RunOpts {
                 GuestPathMapping::Unchanged | GuestPathMapping::Hidden => path.to_path_buf(),
             },
         };
-        let (profile, why) = hermit::cpu_profile_admission::resolve_auto(&program, to_host)
-            .map_err(|why| {
-                Error::new(PolicyRefusal).context(format!("--cpu-profile auto refused: {why}"))
-            })?;
-        eprintln!("hermit: --cpu-profile auto resolved to {profile}: {why}");
+        // Where auto cannot resolve (an unreadable program, a level no
+        // profile presents), it stays auto: the run's own checks keep their
+        // place and their refusals, and the launch then refuses auto by name
+        // (`resolve_launch_auto`), before any guest runs. Never a guess.
+        let Ok((profile, why)) = hermit::cpu_profile_admission::resolve_auto(&program, to_host)
+        else {
+            return Ok(());
+        };
+        self.auto_resolution = Some(format!("--cpu-profile auto resolved to {profile}: {why}"));
         self.det_opts.det_config.cpu_profile = profile;
         Ok(())
+    }
+
+    /// Log what `--cpu-profile auto` resolved to, once tracing has started,
+    /// where the run's log goes (`--log=info` and finer).
+    fn log_auto_resolution(&self) {
+        if let Some(resolution) = &self.auto_resolution {
+            tracing::info!("{resolution}");
+        }
     }
 
     fn refuse_unqualified_liteinst_in_guest_options(&self) -> Result<(), Error> {
@@ -7603,6 +7631,7 @@ impl RunOpts {
                         .min(tracing::level_filters::LevelFilter::WARN),
                 );
                 let _tracing = warnings.init_tracing_for_backend(backend);
+                self.log_auto_resolution();
                 return invocation.run(
                     self.summary,
                     self.backend_engagement_json.as_deref(),
@@ -11171,13 +11200,15 @@ impl RunOpts {
             (self.namespace_only, "--namespace-only"),
             (self.verify, "--verify"),
             // Only `main` runs the host qualification the profile admits with.
+            // Not auto: each launch resolves that itself.
             (
-                !self.det_opts.det_config.cpu_profile.is_default(),
+                !self.det_opts.det_config.cpu_profile.is_default()
+                    && self.det_opts.det_config.cpu_profile
+                        != detcore_model::cpu_profile::CpuProfile::Auto,
                 match self.det_opts.det_config.cpu_profile {
                     detcore_model::cpu_profile::CpuProfile::HostNoRdrand => {
                         "--cpu-profile host-no-rdrand"
                     }
-                    detcore_model::cpu_profile::CpuProfile::Auto => "--cpu-profile auto",
                     _ => "--cpu-profile x86-64-v3",
                 },
             ),
@@ -11344,6 +11375,7 @@ impl RunOpts {
         identity_sources: Option<&IdentityGuard>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         let _guard = global.init_tracing_for_backend(self.runtime_backend());
+        self.log_auto_resolution();
         hermit::proc_mount::warn_if_readonly_proc();
 
         let backend = self.runtime_backend();

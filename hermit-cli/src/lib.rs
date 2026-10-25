@@ -4679,6 +4679,7 @@ async fn dispatch_backend(
     control: Option<std::rc::Rc<ptrace_completion::Control>>,
 ) -> Result<ExitStatus, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
+    crate::cpu_profile_admission::resolve_launch_auto(&command, &mut config)?;
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
     config.launch_image = launched_image(&command);
     if backend == Backend::Kvm {
@@ -5023,6 +5024,7 @@ async fn dispatch_output_backend(
     control: Option<std::rc::Rc<ptrace_completion::Control>>,
 ) -> Result<Output, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
+    crate::cpu_profile_admission::resolve_launch_auto(&command, &mut config)?;
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
     config.launch_image = launched_image(&command);
     if backend == Backend::Kvm {
