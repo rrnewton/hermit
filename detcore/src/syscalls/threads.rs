@@ -1264,6 +1264,15 @@ pub(crate) fn forget_thread_status(tid: Pid) {
     status_files::forget(tid);
 }
 
+/// Keep status files open from now on, in this process (`status_files`).
+/// Only a process that never shares a guest's descriptor table may call this:
+/// Hermit's own process, where Detcore traces the guest from outside. Detcore
+/// linked into a guest (the in-guest runtimes) never calls it, so it reads the
+/// path each time and no descriptor of its appears in the guest's table.
+pub(crate) fn keep_status_files_open() {
+    status_files::enable();
+}
+
 /// `/proc/<pid>/task/<tid>/status`, kept open per traced thread, so that a
 /// signal-state read is one pread(2) at offset 0 rather than an open(2),
 /// read(2) and close(2). A gated wait reads its thread's state at every turn,
@@ -1280,8 +1289,16 @@ pub(crate) fn forget_thread_status(tid: Pid) {
 /// exactly what reading the path did before this cache. At most `CAPACITY`
 /// files are kept, so a guest with many threads cannot exhaust Hermit's own
 /// descriptors; past that, reads open the path as before.
+///
+/// Files are kept only once `enable` has run in the process, which Hermit's
+/// own binary does at startup ([`keep_status_files_open`]). Where Detcore runs
+/// inside the guest (liteinst, in-guest-trap, DBT, SaBRe), a kept file would
+/// be a descriptor in the guest's own table, visible to it and inherited by its
+/// children; there nothing enables keeping, every read is the plain
+/// `read_to_string` of the path, and the map is never created (a `BTreeMap`,
+/// so no hasher state either).
 mod status_files {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
     use std::fs::File;
     use std::os::unix::fs::FileExt;
     use std::sync::Arc;
@@ -1295,9 +1312,39 @@ mod status_files {
     pub(super) const CAPACITY: usize = 256;
 
     /// The kept files, by (pid, tid).
-    type Kept = HashMap<(i32, i32), Arc<File>>;
+    type Kept = BTreeMap<(i32, i32), Arc<File>>;
 
-    static OPEN: LazyLock<Mutex<Kept>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+    static OPEN: LazyLock<Mutex<Kept>> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+    /// Whether this process keeps files (`enable`).
+    #[cfg(not(test))]
+    static KEEPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    #[cfg(test)]
+    thread_local! {
+        /// The switch for unit tests, per test thread, so that a test that
+        /// keeps no files runs beside one that keeps them.
+        static KEEPS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Keep files from now on (`keep_status_files_open`).
+    pub(super) fn enable() {
+        #[cfg(not(test))]
+        KEEPS.store(true, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
+        KEEPS_FOR_TEST.with(|keeps| keeps.set(true));
+    }
+
+    fn enabled() -> bool {
+        #[cfg(not(test))]
+        {
+            KEEPS.load(std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(test)]
+        {
+            KEEPS_FOR_TEST.with(|keeps| keeps.get())
+        }
+    }
 
     fn open() -> std::sync::MutexGuard<'static, Kept> {
         OPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1323,6 +1370,10 @@ mod status_files {
     /// Thread `tid`'s status file text. `ESRCH` when it cannot be read, as
     /// when the path could not be read before this cache.
     pub(super) fn read(pid: Pid, tid: Pid) -> Result<String, Errno> {
+        if !enabled() {
+            let path = format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw());
+            return std::fs::read_to_string(path).map_err(|_| Errno::ESRCH);
+        }
         let key = (pid.as_raw(), tid.as_raw());
         let kept = open().get(&key).cloned();
         if let Some(file) = kept {
@@ -1345,6 +1396,9 @@ mod status_files {
 
     /// Drop every kept file of thread `tid`.
     pub(super) fn forget(tid: Pid) {
+        if !enabled() {
+            return;
+        }
         open().retain(|&(_, kept_tid), _| kept_tid != tid.as_raw());
     }
 
@@ -6124,6 +6178,7 @@ mod tests {
     #[test]
     fn a_kept_status_file_reads_the_current_state_until_its_thread_is_forgotten() {
         std::thread::spawn(|| {
+            status_files::enable();
             let pid = Pid::from_raw(unsafe { libc::getpid() });
             let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
             let usr2 = crate::scheduler::kernel_signal_bit(libc::SIGUSR2);
@@ -6150,6 +6205,30 @@ mod tests {
         .unwrap();
     }
 
+    /// Until keeping is enabled, which only Hermit's own process does, a read
+    /// keeps no file: no descriptor of this process names the thread's status
+    /// file afterwards. Detcore linked into a guest is in this state, so its
+    /// reads leave nothing in the guest's descriptor table.
+    #[test]
+    #[allow(clippy::disallowed_methods)] // a host unit test lists its own descriptors
+    fn without_keeping_a_read_leaves_no_descriptor_open() {
+        std::thread::spawn(|| {
+            let pid = Pid::from_raw(unsafe { libc::getpid() });
+            let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+            assert!(read_kernel_signal_state(pid, tid).is_ok());
+            assert!(read_kernel_signal_state(pid, tid).is_ok());
+            assert!(status_files::kept_file(pid, tid).is_none());
+            let status = format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw());
+            for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+                let target = std::fs::read_link(entry.unwrap().path()).unwrap_or_default();
+                assert_ne!(target.to_str(), Some(status.as_str()));
+            }
+            forget_thread_status(tid);
+        })
+        .join()
+        .unwrap();
+    }
+
     /// A kept status file stays bound to the thread it was opened for: once
     /// that thread has exited, the kept file is unreadable (`ESRCH`), so a
     /// read never takes a later thread's state from it. The read then drops
@@ -6158,8 +6237,10 @@ mod tests {
     /// tests in this process start threads concurrently).
     #[test]
     fn a_kept_status_file_of_an_exited_thread_is_unreadable_and_dropped() {
+        status_files::enable();
         let pid = Pid::from_raw(unsafe { libc::getpid() });
         let (tid, kept) = std::thread::spawn(move || {
+            status_files::enable();
             let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
             assert!(read_kernel_signal_state(pid, tid).is_ok());
             let kept = status_files::kept_file(pid, tid).expect("the read keeps its file");

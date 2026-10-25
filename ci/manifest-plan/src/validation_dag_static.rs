@@ -2878,7 +2878,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And syscalls::threads::tests' two kept-status-file units (a kept
     // /proc status file reads the current state until its thread is
     // forgotten, and one of an exited thread is unreadable and dropped): 2578, listed.
-    ("test.detcore_unit", 2578),
+    // And without_keeping_a_read_leaves_no_descriptor_open (status files are
+    // kept only in Hermit's own process, never where Detcore runs in the
+    // guest): 2579, listed.
+    ("test.detcore_unit", 2579),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4108,7 +4111,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // putting its configuration in the DBT guest's environment: 608, listed.
     // And verify_print_verify_logs_echoes_a_refused_first_runs_log, added by
     // Hermit bbcd2f3e without a count: 609 (validate at 285a61ae saw 609).
-    ("test.cli", 609),
+    // And signal_state_reads_leave_no_status_descriptor_in_the_guest (no
+    // /proc status descriptor in an in-guest process or its fork child): 610.
+    ("test.cli", 610),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4606,7 +4611,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 527.
     // And the same uncounted verify-log echo test from bbcd2f3e, not excluded:
     // 528.
-    ("test.cli_on_host", 528),
+    // And signal_state_reads_leave_no_status_descriptor_in_the_guest (no
+    // /proc status descriptor in an in-guest process or its fork child): 529.
+    ("test.cli_on_host", 529),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5042,7 +5049,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And syscalls::threads::tests' two kept-status-file units (a kept
     // /proc status file reads the current state until its thread is
     // forgotten, and one of an exited thread is unreadable and dropped): 2578, listed.
-    ("test.detcore_unit_on_host", 2578),
+    // And without_keeping_a_read_leaves_no_descriptor_open (status files are
+    // kept only in Hermit's own process, never where Detcore runs in the
+    // guest): 2579, listed.
+    ("test.detcore_unit_on_host", 2579),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -2253,6 +2253,123 @@ fn a_refused_guest_signal_handler_is_announced_once_per_run() {
     eprintln!("{test} compared {backends:?}");
 }
 
+/// A guest that counts its descriptors naming a `/proc/<pid>/task/<tid>/status`
+/// file at the points where Detcore reads the thread's signal state from it
+/// (a masked `ppoll`, a signal left pending, a fork) and in the forked child.
+const STATUS_DESCRIPTOR_GUEST: &str = r#"
+#define _GNU_SOURCE
+#include <dirent.h>
+#include <poll.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+static void count(const char *when) {
+  DIR *dir = opendir("/proc/self/fd");
+  if (!dir) {
+    perror("opendir");
+    exit(2);
+  }
+  int found = 0;
+  struct dirent *entry;
+  while ((entry = readdir(dir)) != NULL) {
+    if (entry->d_name[0] == '.') continue;
+    char path[300];
+    char target[512];
+    snprintf(path, sizeof path, "/proc/self/fd/%s", entry->d_name);
+    ssize_t n = readlink(path, target, sizeof target - 1);
+    if (n <= 0) continue;
+    target[n] = '\0';
+    size_t length = strlen(target);
+    if (strncmp(target, "/proc/", 6) == 0 && length > 7 &&
+        strcmp(target + length - 7, "/status") == 0) {
+      found++;
+    }
+  }
+  closedir(dir);
+  printf("%s %d\n", when, found);
+  fflush(stdout);
+}
+
+int main(void) {
+  count("start");
+  sigset_t temporary;
+  sigemptyset(&temporary);
+  sigaddset(&temporary, SIGUSR2);
+  struct timespec zero = {0, 0};
+  ppoll(NULL, 0, &zero, &temporary);
+  count("after-ppoll");
+  sigset_t set;
+  sigemptyset(&set);
+  sigaddset(&set, SIGUSR2);
+  sigprocmask(SIG_BLOCK, &set, NULL);
+  kill(getpid(), SIGUSR2);
+  sigset_t pending;
+  sigpending(&pending);
+  count("after-pending");
+  pid_t child = fork();
+  if (child == 0) {
+    count("child");
+    _exit(0);
+  }
+  int status = 0;
+  waitpid(child, &status, 0);
+  count("end");
+  return 0;
+}
+"#;
+
+/// No signal-state read leaves a descriptor in the guest's own table. Detcore
+/// keeps each traced thread's `/proc` status file open only in Hermit's own
+/// process (`detcore::keep_host_status_files_open`); on the in-guest backends
+/// it runs inside the guest, where a kept file would be the guest's fd 5,
+/// inherited by its fork children (measured with the in-guest delivery gate
+/// forced on, 2026-10-25). The guest counts such descriptors in itself and in a
+/// forked child, on ptrace and on the in-guest backends.
+#[test]
+fn signal_state_reads_leave_no_status_descriptor_in_the_guest() {
+    let test = "signal_state_reads_leave_no_status_descriptor_in_the_guest";
+    let build_root = process_build_root("status-descriptors");
+    fs::create_dir_all(&build_root).expect("failed to create the guest directory");
+    let source = build_root.join("status_descriptors.c");
+    fs::write(&source, STATUS_DESCRIPTOR_GUEST).expect("failed to write the guest");
+    let guest = build_root.join("status_descriptors");
+    let compiled = Command::new("cc")
+        .args(["-O0", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&guest)
+        .output()
+        .expect("failed to compile the guest");
+    assert!(compiled.status.success(), "{compiled:?}");
+    let guest = guest.to_str().expect("guest path is UTF-8");
+    let mut backends = vec!["ptrace"];
+    if cfg!(feature = "liteinst") {
+        backends.extend(["liteinst", "in-guest-trap"]);
+    } else {
+        eprintln!("{test}: NOT COMPARED: liteinst and in-guest-trap are not in this build");
+    }
+    for backend in &backends {
+        let mut args = vec!["--backend", backend, "run"];
+        if *backend != "ptrace" {
+            args.push("--max-timeslice=disabled");
+        }
+        args.extend(["--", guest]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(
+            stdout(&output),
+            "start 0\nafter-ppoll 0\nafter-pending 0\nchild 0\nend 0\n",
+            "{backend}: {output:?}"
+        );
+    }
+    eprintln!("{test} compared {backends:?}");
+}
+
 static SESSION_CONTAINMENT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 fn session_containment_guest() -> &'static Path {

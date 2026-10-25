@@ -710,6 +710,10 @@ fn main() {
     // container inits -- three on `--verify`, which forks once per run. This
     // placement dominates every with_container and run_guarded_at site.
     detcore::util::init_shared_stderr_deadline_origin();
+    // This process traces guests from outside and never shares a guest's
+    // descriptor table, so Detcore may keep each traced thread's /proc status
+    // file open here. The in-guest runtimes never make this call.
+    detcore::keep_host_status_files_open();
     // Parse through `ArgMatches` so the run command can distinguish an
     // omitted epoch from an explicit CLI/environment value. `Config` keeps a
     // stable library default for wire fingerprints and unit fixtures; only an

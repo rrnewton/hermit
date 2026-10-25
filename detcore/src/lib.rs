@@ -99,6 +99,16 @@ mod test_pages;
 mod tool_global;
 #[cfg(feature = "physical-mm-test-support")]
 pub use tool_global::initial_mm_probe;
+
+/// Keep each traced thread's `/proc/<pid>/task/<tid>/status` open in this
+/// process and re-read it with pread(2), instead of opening it for every
+/// signal-state read. Call it only from a process that never shares a guest's
+/// descriptor table: Hermit's own binary, at startup. Detcore linked into a
+/// guest (the in-guest runtimes) must never call it, or the kept descriptors
+/// would be the guest's.
+pub fn keep_host_status_files_open() {
+    crate::syscalls::keep_status_files_open();
+}
 mod tool_local;
 pub mod util;
 mod wait_signal_end;
