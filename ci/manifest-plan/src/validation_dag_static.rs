@@ -2878,7 +2878,26 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And syscalls::threads::tests' two kept-status-file units (a kept
     // /proc status file reads the current state until its thread is
     // forgotten, and one of an exited thread is unreadable and dropped): 2578, listed.
-    ("test.detcore_unit", 2578),
+    // And A5 slice 3c.1e A's sixteen units: scheduler::guest_mask_publication_tests'
+    // four (a restored rejoin that publishes nothing leaves the mask unknown;
+    // a new task starts with its creator's published mask; a temporary-mask
+    // publication holds until a request or its withdrawal; the window records
+    // the scheduler's sends by queue), tool_global::tests::
+    // temporary_mask_publication_tests' three (a guest send committed during a
+    // publication joins the target's window; the status query's tri-state and
+    // held masks under the gate only; the coordinator seeds a new child),
+    // temporary_mask_turn_tests::publication_tests' seven (each masked site
+    // publishes once before the timerfd RPC; the entry's deadline; the entry
+    // removal before the RPC; held masks and R2 per queue; R2 keeps the entry
+    // instance before the yield; real-time instances refused from the
+    // committed record; a status read of an unknown mask refused),
+    // predicted_death_tests' and signal_announcement_tests' IR-15 units:
+    // 2594, listed.
+    // And its review round 1 units: guest_mask_publication_tests' and
+    // publication_tests' an_interrupted_end_keeps_the_temporary_mask_published
+    // and publication_tests' ir23c_the_staged_pselect6_writes_back_from_the_entry_deadline:
+    // 2597, listed.
+    ("test.detcore_unit", 2597),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5042,7 +5061,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And syscalls::threads::tests' two kept-status-file units (a kept
     // /proc status file reads the current state until its thread is
     // forgotten, and one of an exited thread is unreadable and dropped): 2578, listed.
-    ("test.detcore_unit_on_host", 2578),
+    // And the same sixteen A5 slice 3c.1e A units: 2594, listed.
+    // And the same three 3c.1e A review round 1 units: 2597, listed.
+    ("test.detcore_unit_on_host", 2597),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
