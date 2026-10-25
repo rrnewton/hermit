@@ -2875,7 +2875,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // units moved from syscalls::network_trace) and tool_local's
     // a_received_descriptor_is_recorded_as_the_in_guest_discovery_records_it:
     // 2576, listed.
-    ("test.detcore_unit", 2576),
+    // And syscalls::threads::tests' two kept-status-file units (a kept
+    // /proc status file reads the current state until its thread is
+    // forgotten, and one of an exited thread is unreadable and dropped): 2578, listed.
+    ("test.detcore_unit", 2578),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5036,7 +5039,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same four 3c.1d-ii review round 3 units: 2566, listed.
     // And the same one 3c.1d-ii review round 4 unit: 2567, listed.
     // And the same nine F0a units: 2576, listed.
-    ("test.detcore_unit_on_host", 2576),
+    // And syscalls::threads::tests' two kept-status-file units (a kept
+    // /proc status file reads the current state until its thread is
+    // forgotten, and one of an exited thread is unreadable and dropped): 2578, listed.
+    ("test.detcore_unit_on_host", 2578),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

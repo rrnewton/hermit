@@ -1254,9 +1254,124 @@ pub(crate) fn read_kernel_signal_state(pid: Pid, tid: Pid) -> Result<KernelSigna
         });
         return Err(Errno::ENOSYS);
     }
-    let path = format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw());
-    let status = std::fs::read_to_string(path).map_err(|_| Errno::ESRCH)?;
+    let status = status_files::read(pid, tid)?;
     KernelSignalState::parse(&status).ok_or(Errno::EIO)
+}
+
+/// Drop thread `tid`'s open status files (`status_files`). Called when the
+/// thread exits; a later read of a reused TID opens the file afresh.
+pub(crate) fn forget_thread_status(tid: Pid) {
+    status_files::forget(tid);
+}
+
+/// `/proc/<pid>/task/<tid>/status`, kept open per traced thread, so that a
+/// signal-state read is one pread(2) at offset 0 rather than an open(2),
+/// read(2) and close(2). A gated wait reads its thread's state at every turn,
+/// and every open(2) runs the host's file-open security hooks: measured on
+/// 2026-10-24, Hermit spent 20.7% of its samples opening this file and 18.5% in
+/// security_file_open alone, and on hosts where a BPF file-open hook takes its
+/// slow path (a mount walk and a contended map update) the same opens made the
+/// inherited-terminal poll tests of hermit-cli/tests/external_signal_interrupt.rs
+/// spend six times their ordinary system CPU.
+///
+/// An open procfs task file stays bound to the task it was opened for: after
+/// that thread exits it reads ESRCH, never a later task given the same TID. So
+/// a failed read drops the entry and opens the path once more, which reads
+/// exactly what reading the path did before this cache. At most `CAPACITY`
+/// files are kept, so a guest with many threads cannot exhaust Hermit's own
+/// descriptors; past that, reads open the path as before.
+mod status_files {
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::os::unix::fs::FileExt;
+    use std::sync::Arc;
+    use std::sync::LazyLock;
+    use std::sync::Mutex;
+
+    use reverie::Pid;
+    use reverie::syscalls::Errno;
+
+    /// The most status files kept open at once.
+    pub(super) const CAPACITY: usize = 256;
+
+    /// The kept files, by (pid, tid).
+    type Kept = HashMap<(i32, i32), Arc<File>>;
+
+    static OPEN: LazyLock<Mutex<Kept>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    fn open() -> std::sync::MutexGuard<'static, Kept> {
+        OPEN.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The whole file, read from offset 0. procfs regenerates a status file
+    /// for every read that starts at offset 0.
+    fn read_whole(file: &File) -> std::io::Result<String> {
+        let mut bytes = Vec::with_capacity(4096);
+        loop {
+            let filled = bytes.len();
+            bytes.resize(filled + 4096, 0);
+            let read = file.read_at(&mut bytes[filled..], filled as u64)?;
+            bytes.truncate(filled + read);
+            if read == 0 {
+                break;
+            }
+        }
+        String::from_utf8(bytes)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+    }
+
+    /// Thread `tid`'s status file text. `ESRCH` when it cannot be read, as
+    /// when the path could not be read before this cache.
+    pub(super) fn read(pid: Pid, tid: Pid) -> Result<String, Errno> {
+        let key = (pid.as_raw(), tid.as_raw());
+        let kept = open().get(&key).cloned();
+        if let Some(file) = kept {
+            if let Ok(text) = read_whole(&file)
+                && !text.is_empty()
+            {
+                return Ok(text);
+            }
+            open().remove(&key);
+        }
+        let path = format!("/proc/{}/task/{}/status", key.0, key.1);
+        let file = File::open(path).map_err(|_| Errno::ESRCH)?;
+        let text = read_whole(&file).map_err(|_| Errno::ESRCH)?;
+        let mut files = open();
+        if files.len() < CAPACITY {
+            files.insert(key, Arc::new(file));
+        }
+        Ok(text)
+    }
+
+    /// Drop every kept file of thread `tid`.
+    pub(super) fn forget(tid: Pid) {
+        open().retain(|&(_, kept_tid), _| kept_tid != tid.as_raw());
+    }
+
+    /// How many files are kept open now.
+    #[cfg(test)]
+    pub(super) fn kept() -> usize {
+        open().len()
+    }
+
+    /// Whether a file of thread `tid` of process `pid` is kept open.
+    #[cfg(test)]
+    pub(super) fn keeps(pid: Pid, tid: Pid) -> bool {
+        open().contains_key(&(pid.as_raw(), tid.as_raw()))
+    }
+
+    /// The kept file of thread `tid` of process `pid`, if one is kept, for a
+    /// test to read without the fallback to the path.
+    #[cfg(test)]
+    pub(super) fn kept_file(pid: Pid, tid: Pid) -> Option<Arc<File>> {
+        open().get(&(pid.as_raw(), tid.as_raw())).cloned()
+    }
+
+    /// `read_whole`, for tests.
+    #[cfg(test)]
+    pub(super) fn read_kept(file: &File) -> std::io::Result<String> {
+        read_whole(file)
+    }
 }
 
 /// Why a blocked wait ended the run instead of returning to the guest
@@ -6001,6 +6116,88 @@ mod tests {
         assert!(host_signal_state_reads_refused());
         assert_eq!(read_kernel_signal_state(pid, tid), Err(Errno::ENOSYS));
         assert_eq!(read_thread_signal_state(pid, tid), Err(Errno::ENOSYS));
+    }
+
+    /// A kept status file is read afresh each time: a signal blocked after
+    /// the first read shows in the second, which reuses the kept file, and the
+    /// thread's exit hook drops it (`forget_thread_status`).
+    #[test]
+    fn a_kept_status_file_reads_the_current_state_until_its_thread_is_forgotten() {
+        std::thread::spawn(|| {
+            let pid = Pid::from_raw(unsafe { libc::getpid() });
+            let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+            let usr2 = crate::scheduler::kernel_signal_bit(libc::SIGUSR2);
+            let before = read_kernel_signal_state(pid, tid).unwrap();
+            assert_eq!(before.blocked & usr2, 0);
+            assert!(status_files::keeps(pid, tid));
+            // SAFETY: changes only this spawned thread's own mask.
+            unsafe {
+                let mut set: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut set);
+                libc::sigaddset(&mut set, libc::SIGUSR2);
+                assert_eq!(
+                    libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut()),
+                    0
+                );
+            }
+            let after = read_kernel_signal_state(pid, tid).unwrap();
+            assert_eq!(after.blocked & usr2, usr2);
+            assert!(status_files::keeps(pid, tid));
+            forget_thread_status(tid);
+            assert!(!status_files::keeps(pid, tid));
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// A kept status file stays bound to the thread it was opened for: once
+    /// that thread has exited, the kept file is unreadable (`ESRCH`), so a
+    /// read never takes a later thread's state from it. The read then drops
+    /// the file and reads the path, as it did before files were kept: `ESRCH`
+    /// while the TID is free, or the state of a thread that reused it (other
+    /// tests in this process start threads concurrently).
+    #[test]
+    fn a_kept_status_file_of_an_exited_thread_is_unreadable_and_dropped() {
+        let pid = Pid::from_raw(unsafe { libc::getpid() });
+        let (tid, kept) = std::thread::spawn(move || {
+            let tid = Pid::from_raw(unsafe { libc::syscall(libc::SYS_gettid) } as i32);
+            assert!(read_kernel_signal_state(pid, tid).is_ok());
+            let kept = status_files::kept_file(pid, tid).expect("the read keeps its file");
+            (tid, kept)
+        })
+        .join()
+        .unwrap();
+        // join() returns before the kernel has finished tearing the thread
+        // down; until then the kept file still reads it (as its path would).
+        // Every read names that thread, and the file becomes unreadable.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let error = loop {
+            match status_files::read_kept(&kept) {
+                Ok(text) => {
+                    let own = format!("\nPid:\t{}\n", tid.as_raw());
+                    assert!(text.contains(&own), "{text}");
+                    assert!(std::time::Instant::now() < deadline, "{text}");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+        match read_kernel_signal_state(pid, tid) {
+            Err(errno) => {
+                assert_eq!(errno, Errno::ESRCH);
+                assert!(!status_files::keeps(pid, tid));
+            }
+            // A thread of another test took the TID: the read is the path's.
+            Ok(_) => {
+                // The kept file, if any, is the reopened one (the cache may be
+                // full of other tests' threads, which never run the exit hook).
+                if let Some(now) = status_files::kept_file(pid, tid) {
+                    assert!(!Arc::ptr_eq(&now, &kept));
+                }
+            }
+        }
+        assert!(status_files::kept() <= status_files::CAPACITY);
     }
     use crate::config::Config;
     use crate::tool_global::GlobalRequest;
