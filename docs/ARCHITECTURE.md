@@ -145,10 +145,11 @@ Detcore policy. The build-time `in-guest-trap` feature retains that base without
 `liteinst2`; the `liteinst` feature adds the patcher. Reverie retains LiteInst
 in its default build. Hermit selects the dependency features explicitly.
 At launch, Hermit binds `REVERIE_LITEINST_SITE_PATCHING=0` for in-guest-trap and
-refuses a run whose statistics show a patched site. LiteInst binds `1` when
-the caller leaves the selector unset, before the authenticated bootstrap is
-created, so an OFF runtime refuses instead of silently substituting traps.
-Explicit selectors, including `0`, retain their existing behavior. A patcher
+refuses a run whose statistics show a patched site. LiteInst preserves the
+selector's absence or explicit value. When the selector is unset, the
+authenticated tool-data record requires a runtime built with LiteInst, so an
+OFF runtime refuses instead of silently substituting traps. Explicit selectors,
+including `0`, retain their existing behavior. A patcher
 changes only how a syscall reaches the dispatcher, never what the dispatcher
 does with it, so by design liteinst should never pass a test that fails on
 in-guest-trap.
