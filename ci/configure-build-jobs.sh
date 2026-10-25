@@ -2683,8 +2683,23 @@ fi
 # Cargo.toml, Cargo.lock and rust-toolchain.toml, so the inventory, SDK and
 # native inputs, calibrated budget, job width and limits carry unchanged from
 # the 6f8fc22e entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 8b7ab5f3cbd2af2438d9c142aef486c5958ba05c ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 8b7ab5f3cbd2af2438d9c142aef486c5958ba05c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 5643be8b7ea2f54aab8f9a3c87a61a32885d9380 (2026-10-24): from
+# 8b7ab5f3cbd2af2438d9c142aef486c5958ba05c. Nine commits. Seven are on Reverie
+# main: 2857e9c4 and 75c612fa (doc citations, test-helper cfgs), 91433813,
+# 8dbf981d and f30fbbd7 (each backend states how its kernel spells the pidfd
+# self sentinels; under reverie-dbt/ they change only src/lib.rs and add
+# src/pidfd_self.rs, so the inventory is 1009), 7428d6aa (sanitizer kernel
+# coverage) and cf745200 (reverie-process program lookup). 102b3527 moves the
+# KVM backend's Linux emulation into the new crate reverie-linuxemu and the
+# KVM machine pieces into reverie-kvm-core; the root Cargo.toml only adds that
+# member and Cargo.lock only its package and the moved crates' dependencies.
+# 5643be8b refreshes four rows of reverie-liteinst-artifact's
+# reviewed native-source catalog. build.rs, vendor/dynamorio, native/,
+# third-party/ and rust-toolchain.toml are unchanged, so the SDK and native
+# inputs, calibrated budget, job width and limits carry unchanged from the
+# 8b7ab5f3 entry; the DBT Rust source change is not an SDK rebuild.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 5643be8b7ea2f54aab8f9a3c87a61a32885d9380 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 5643be8b7ea2f54aab8f9a3c87a61a32885d9380 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
