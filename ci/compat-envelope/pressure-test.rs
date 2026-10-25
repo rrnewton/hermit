@@ -82,12 +82,13 @@ use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::ObservedResult;
 use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
+use hermit_manifest_plan::runner::invocation_admits_declared_guest_exit;
 use hermit_manifest_plan::runner::retained_execution_path_error;
 use hermit_manifest_plan::runner::retained_verify_invocation_error;
 use hermit_manifest_plan::runner::retained_verify_pass_error;
 use hermit_manifest_plan::runner::run_epoch_from_env;
 use hermit_manifest_plan::runner::skid_overshoot_only_reports;
-use hermit_manifest_plan::runner::validate_expected_guest_exit;
+use hermit_manifest_plan::runner::validate_result_expected_guest_exit;
 use hermit_manifest_plan::stress_series::SeriesNoVerdictKind;
 use hermit_manifest_plan::stress_series::SeriesPressureAttempt;
 use hermit_manifest_plan::stress_series::SeriesPressureComparison;
@@ -7670,7 +7671,7 @@ fn matched_attempts_end_as_declared(row: &CellResult) -> bool {
         // Check the declaration before matching it, as the per-attempt check
         // does: a declaration the runner itself would refuse credits nothing,
         // and an out-of-range signal would overflow the match's `128 + signal`.
-        if validate_expected_guest_exit("result row", &row.mode, Some(declared)).is_err() {
+        if validate_result_expected_guest_exit("result row", &row.mode, Some(declared)).is_err() {
             return false;
         }
         let hermit_args = attempt
@@ -7681,10 +7682,7 @@ fn matched_attempts_end_as_declared(row: &CellResult) -> bool {
         let names_declaration = |code: Option<i32>, signal: Option<i32>| {
             code == declared.code && signal == declared.signal
         };
-        row.mode == "verify"
-            && hermit_args
-                .iter()
-                .any(|arg| arg == "--verify-allow=failure")
+        invocation_admits_declared_guest_exit(&row.mode, hermit_args)
             && declared.hermit_status_matches(attempt.status, attempt.signal)
             && names_declaration(report.guest_exit_code, report.guest_signal)
             && report.compared_outputs.as_ref().is_some_and(|outputs| {
@@ -22752,6 +22750,19 @@ mod pressure_sample_tests {
                 "{label}"
             );
         }
+        // A replay cell carries its verify recipe's declaration (the runner's
+        // cell_expected_guest_exit) and passes on it through the same exact
+        // match, so its matched exit 23 is retained as declared too
+        // (coordinator decision, 2026-10-25; until then this was refused).
+        let replay_23 = comparison_attempt("replay", 23);
+        let retained = retained_pressure_attempt("replay", Some(&code_23), &replay_23)
+            .unwrap_or_else(|error| panic!("a replay cell: {error}"));
+        assert_eq!(inner_pressure_category(&retained), None);
+        assert!(qualifying_subruns(
+            "replay",
+            Some(&code_23),
+            std::slice::from_ref(&replay_23)
+        ));
         let mut killed_137 = killed_139.clone();
         killed_137.status = Some(137);
         let mut blank_reason = code_23.clone();
@@ -22761,7 +22772,6 @@ mod pressure_sample_tests {
         let both = declare(Some(23), Some(23));
         let exits_22 = comparison_attempt("verify", 22);
         let exits_151 = comparison_attempt("verify", 151);
-        let replay_23 = comparison_attempt("replay", 23);
         let mut failed_23 = exits_23.clone();
         failed_23.outcome = "FAIL".into();
         for (label, mode, declared, attempt) in [
@@ -22794,7 +22804,6 @@ mod pressure_sample_tests {
             // A declaration the runner itself refuses accepts nothing more.
             ("a blank reason", "verify", Some(&blank_reason), &exits_23),
             ("both a code and a signal", "verify", Some(&both), &exits_23),
-            ("a replay cell", "replay", Some(&code_23), &replay_23),
             (
                 "an invocation that did not pass",
                 "verify",
@@ -22839,6 +22848,29 @@ mod pressure_sample_tests {
         ));
         row.attempts[0].argv.push("--verify-allow=failure".into());
         assert!(matched_attempts_end_as_declared(&row));
+        // A replay cell's row carries the declaration its verify recipe made
+        // (the runner's cell_expected_guest_exit) and is credited from the
+        // replay's own invocation, `record start` with the comparison's
+        // --verify-allow=both, and from no verify invocation.
+        let mut replay = row.clone();
+        replay.mode = "replay".into();
+        assert!(!matched_attempts_end_as_declared(&replay));
+        replay.attempts[0].argv = [
+            "hermit-verify-pair",
+            "hermit",
+            "log-diff",
+            "--verify-allow=both",
+            "hermit",
+            "record",
+            "start",
+            "--verify-strict",
+        ]
+        .map(String::from)
+        .to_vec();
+        assert!(matched_attempts_end_as_declared(&replay));
+        let mut verify_on_replay = replay.clone();
+        verify_on_replay.mode = "verify".into();
+        assert!(!matched_attempts_end_as_declared(&verify_on_replay));
         assert!(
             inner_pressure_history(std::slice::from_ref(&row))
                 .unwrap()

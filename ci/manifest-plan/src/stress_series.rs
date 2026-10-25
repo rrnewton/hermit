@@ -19,7 +19,7 @@ use crate::runner::ExpectedGuestExit;
 use crate::runner::FailureClass;
 use crate::runner::ObservedResult;
 use crate::runner::parse_expected_output_failure_reason;
-use crate::runner::validate_expected_guest_exit;
+use crate::runner::validate_result_expected_guest_exit;
 
 pub const STRESS_SERIES_SCHEMA_V1: &str = "stress-series/v1";
 pub const STRESS_SERIES_SCHEMA_V2: &str = "stress-series/v2";
@@ -572,7 +572,7 @@ impl SeriesPressureAttempt {
                         .status
                         .is_some_and(|status| mode == "chaos" || status == 0);
                 let declared_exit = declared.is_some_and(|declared| {
-                    validate_expected_guest_exit("declared_guest_exit", mode, Some(declared))
+                    validate_result_expected_guest_exit("declared_guest_exit", mode, Some(declared))
                         .is_ok()
                         && declared.hermit_status_matches(self.status, self.signal)
                 });
@@ -1191,7 +1191,7 @@ impl SeriesRow {
             signal: declared.signal,
             reason: declared.reason.clone(),
         };
-        validate_expected_guest_exit("declared_guest_exit", mode, Some(&expected))?;
+        validate_result_expected_guest_exit("declared_guest_exit", mode, Some(&expected))?;
         if !is_sha256(&declared.evidence_sha256) {
             return Err(format!(
                 "declared_guest_exit.evidence_sha256 must be lowercase 64-hex, got {:?}",
@@ -1776,7 +1776,7 @@ impl SeriesRow {
                                 signal: declared.signal,
                                 reason: declared.reason.clone(),
                             };
-                            validate_expected_guest_exit(
+                            validate_result_expected_guest_exit(
                                 "declared_guest_exit",
                                 mode,
                                 Some(&expected),
@@ -2102,6 +2102,17 @@ mod tests {
                 fixture.series.declared_guest_exit
             );
             decoded.validate_for_read().unwrap();
+            // A replay cell carries its verify recipe's declaration (the
+            // runner's cell_expected_guest_exit); no other mode does.
+            let mut replay = fixture.clone();
+            replay.series.cell = replay.series.cell.replace("/verify/", "/replay/");
+            assert!(replay.series.cell.contains("/replay/"), "{label}");
+            replay
+                .validate_for_write()
+                .unwrap_or_else(|error| panic!("{label} on replay: {error}"));
+            let mut chaos = fixture.clone();
+            chaos.series.cell = chaos.series.cell.replace("/verify/", "/chaos/");
+            assert!(chaos.validate_for_write().is_err(), "{label} on chaos");
         }
         // Rows without a declaration are unchanged on the wire.
         let plain = serde_json::to_string(&row(SeriesSchema::V3)).unwrap();
@@ -4297,8 +4308,15 @@ mod tests {
         undeclared.series.declared_guest_exit = None;
         let mut blank_reason = declared_pressure_row(Some(23), None, Some(23), None);
         declared(&mut blank_reason).reason = " ".into();
+        // A replay cell carries its verify recipe's declaration (the runner's
+        // cell_expected_guest_exit) and its matched exit 23 is admitted as
+        // declared, as on verify (coordinator decision, 2026-10-25; until then
+        // this was refused).
         let mut replay = declared_pressure_row(Some(23), None, Some(23), None);
         replay.series.cell = "fixture/test/replay/ptrace".into();
+        replay
+            .validate_for_write()
+            .unwrap_or_else(|error| panic!("a replay cell: {error}"));
         let mut failed = declared_pressure_row(Some(23), None, Some(23), None);
         let inner = &mut failed.series.pressure_evidence.as_mut().unwrap().attempts[0];
         inner.outcome = "FAIL".into();
@@ -4338,7 +4356,6 @@ mod tests {
                 "both a code and a signal",
                 declared_pressure_row(Some(23), Some(23), Some(23), None),
             ),
-            ("a replay cell", replay),
             ("an invocation that did not pass", failed),
         ] {
             let error = value.validate_for_read().unwrap_err();

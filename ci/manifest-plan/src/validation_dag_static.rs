@@ -1160,7 +1160,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // decoder) and tests::versioned_config_rejects_unknown_or_malformed_envelopes
     // (moved from hermit-run), when Hermit stopped putting its configuration in
     // the DBT guest's environment: 1844, listed.
-    ("test.regular_crates", 1844),
+    // And hermit-manifest-plan's
+    // runner::tests::a_replay_result_row_may_carry_its_inherited_declaration
+    // (a replay row carries its verify recipe's declared guest exit): 1845, listed.
+    ("test.regular_crates", 1845),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5592,7 +5595,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // The same 26 tests; all existing hosted exclusions remain unchanged.
     // And the same two detcore-dbt configuration tests: 1830, listed.
-    ("test.regular_crates_on_host", 1830),
+    // And the same inherited-declaration runner test: 1831, listed.
+    ("test.regular_crates_on_host", 1831),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
