@@ -2311,7 +2311,10 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
         // No backend installs a CPUID policy of its own any more, so the key
         // is always written false; see `from_legacy_backend_json`.
         ("cpuid_virtualized_by_backend", false),
-        ("backend_supports_madvise", backend.supports_madvise),
+        // Every backend now takes every madvise advice and refuses what it does
+        // not implement itself, so the key is always written true, its value on
+        // DBT, the form's only reader; see `from_legacy_backend_json`.
+        ("backend_supports_madvise", true),
         (
             "discover_live_file_metadata",
             backend.tool_shares_guest_descriptor_table,
@@ -2386,10 +2389,11 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 ///   address limit is each guest's own `Guest::user_address_limit` report);
 /// - every other key supplies the one capability of the same meaning.
 ///
-/// One input behaves differently since `supports_madv_dontneed` was deleted
-/// (every backend forwards `MADV_DONTNEED`): `backend_supports_madvise` false
-/// with `backend_is_kvm` false, a pair no writer produces, used to refuse that
-/// advice with ENOSYS and now forwards it.
+/// `backend_supports_madvise` supplies no capability any more: it said the
+/// tool could forward every madvise advice to the backend, which every backend
+/// now accepts, refusing an advice it does not implement itself. Since
+/// `supports_madv_dontneed` was deleted, `MADV_DONTNEED` had been forwarded
+/// whatever this key said.
 ///
 /// This inverts [`to_legacy_backend_json`] for every capability value the keys
 /// can express, which includes every backend's own constant except for
@@ -2414,6 +2418,11 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// so the legacy form keeps its bytes, and an input that
 /// says `true` fails the parse rather than being read as a policy no backend
 /// has.
+///
+/// `backend_supports_madvise` is written as true, its value on DBT, so the
+/// legacy form keeps its bytes. The reader still takes it as one of the fifteen
+/// keys, so it keeps its position in the array form, must be a boolean and may
+/// appear once, and ignores its value (KVM wrote false).
 ///
 /// `syscall_clobbers_virtualized_by_backend` supplies no capability either: it
 /// said the backend left the registers a `syscall` instruction clobbers as a
@@ -2588,6 +2597,12 @@ const fn legacy_backend_key_default_true() -> bool {
 struct LegacyBackendKeys {
     #[serde(default)]
     cpuid_virtualized_by_backend: bool,
+    // Supplies no capability; declared so that the key, like the others,
+    // fails the parse when it is given twice.
+    #[expect(
+        dead_code,
+        reason = "read only to refuse a repeated key; its value is ignored"
+    )]
     #[serde(default = "legacy_backend_key_default_true")]
     backend_supports_madvise: bool,
     #[serde(default)]
@@ -2655,7 +2670,6 @@ impl LegacyBackendKeys {
         backend.supports_parked_write_signal_interruption =
             self.backend_supports_parked_write_signal_interruption;
         backend.defers_vfork_child_registration = self.backend_defers_vfork_child_registration;
-        backend.supports_madvise = self.backend_supports_madvise;
         backend.provides_process_signal_control = self.backend_is_kvm;
         backend.emulates_child_waits = self.backend_is_kvm;
         // A legacy encoding predates this key. DBT, the form's only reader,
@@ -3759,18 +3773,9 @@ mod tests {
                     assert!(error.to_string().contains(key), "{error}");
                     continue;
                 }
-                "backend_supports_madvise" => expected.supports_madvise = false,
-                "discover_live_file_metadata" => {
-                    expected.tool_shares_guest_descriptor_table = true;
-                    expected.rediscovers_descriptors_after_exec = true;
-                    expected.loopback_pollers_yield_to_peers = true;
-                }
-                "detect_host_clock_futex_timeouts" => {
-                    expected.guest_clock_reads_bypass_backend = true
-                }
-                "syscall_clobbers_virtualized_by_backend" => {
-                    // It supplies no capability: either value reads back the
-                    // same configuration.
+                "syscall_clobbers_virtualized_by_backend" | "backend_supports_madvise" => {
+                    // Neither supplies a capability: either value reads back
+                    // the same configuration.
                     let mut flipped = ptrace.clone();
                     flipped.insert(key.to_owned(), serde_json::Value::Bool(!ptrace_value));
                     let decoded =
@@ -3778,6 +3783,14 @@ mod tests {
                             .unwrap();
                     assert_eq!(serde_json::to_string(&decoded).unwrap(), unflipped, "{key}");
                     continue;
+                }
+                "discover_live_file_metadata" => {
+                    expected.tool_shares_guest_descriptor_table = true;
+                    expected.rediscovers_descriptors_after_exec = true;
+                    expected.loopback_pollers_yield_to_peers = true;
+                }
+                "detect_host_clock_futex_timeouts" => {
+                    expected.guest_clock_reads_bypass_backend = true
                 }
                 "cancel_killed_thread_rpcs" => {
                     expected.needs_killed_thread_rpc_cancellation = true;
@@ -5178,7 +5191,7 @@ mod tests {
             r#""shared_dequeue_timers":null"#.to_owned(),
             r#""backend":null,"shared_dequeue_timers":null"#.to_owned(),
             format!(r#""backend":{kvm},"shared_dequeue_timers":true"#),
-            r#""backend":7,"backend":{"supports_madvise":false}"#.to_owned(),
+            r#""backend":7,"backend":{"tracks_process_children":false}"#.to_owned(),
             r#""shared_dequeue_timers":"yes","shared_dequeue_timers":true"#.to_owned(),
             r#""no_such_field":[1,{"x":null}]"#.to_owned(),
         ] {
@@ -5526,9 +5539,9 @@ mod tests {
             fields.len()
         );
         // The backend's values are part of the encoded default.
-        let flipped = config
-            .clone()
-            .with_backend(|backend| backend.supports_madvise = !backend.supports_madvise);
+        let flipped = config.clone().with_backend(|backend| {
+            backend.tracks_process_children = !backend.tracks_process_children
+        });
         assert_eq!(encode(&flipped).len(), encode(&config).len());
         assert_ne!(encode(&flipped), encode(&config));
     }

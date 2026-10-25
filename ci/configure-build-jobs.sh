@@ -2718,8 +2718,22 @@ fi
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory (1009), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the 943c0a9a entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ec5de39fb87701c1537ae5028249f070583eaa00 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ec5de39fb87701c1537ae5028249f070583eaa00 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO e5e0eff4e69b066932b431ce6f846ca1b437717c (2026-10-25): from
+# ec5de39fb87701c1537ae5028249f070583eaa00. One commit (capflags lane, slice 4): every
+# backend takes every madvise advice, KVM's LinuxEmu executor refuses the advice
+# it does not implement with a typed refusal, and the supports_madvise
+# capability is deleted. It changes reverie/src/capabilities.rs,
+# reverie/src/unsupported.rs, reverie-linuxemu/src/executor.rs and a comment in
+# reverie-kvm-core/src/provider_memory.rs. git diff is empty under reverie-dbt/
+# and third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml; both repository inputs to the DynamoRIO content key are
+# byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory (1009), SDK and native inputs, calibrated budget, job width
+# and limits carry unchanged from the ec5de39f entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != e5e0eff4e69b066932b431ce6f846ca1b437717c ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie e5e0eff4e69b066932b431ce6f846ca1b437717c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
