@@ -78,6 +78,8 @@ use crate::stress_series::HostCapabilityVerdict;
 #[cfg(test)]
 use crate::timeouts::COMPAT_REPLAY_FULL_2026_10_20_ENABLED_CELL_COUNT;
 #[cfg(test)]
+use crate::timeouts::DBT_2026_10_25_TIMEOUT_CALIBRATIONS;
+#[cfg(test)]
 use crate::timeouts::DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS;
 #[cfg(test)]
 use crate::timeouts::DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS;
@@ -15094,6 +15096,7 @@ fi
         let expected = EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)
+            .chain(&DBT_2026_10_25_TIMEOUT_CALIBRATIONS)
             .map(|calibration| {
                 (
                     (calibration.test, calibration.mode, calibration.backend),
