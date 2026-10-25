@@ -1262,7 +1262,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nextest list.
     // Full validate at 85b8cec25a executed 1973, all passed, against the
     // 1971 pin: 1971 + 2 = 1973, measured by that run.
-    ("test.regular_crates", 1973),
+    // And detcore-model's summary::tests::a_summary_of_a_run_the_timeout_stopped_is_marked_partial
+    // (https://github.com/rrnewton/hermit/pull/4685): 1973 + 1 = 1974.
+    ("test.regular_crates", 1974),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3254,7 +3256,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds 21
     // sync-edge and access-trace units: 3363 + 21 = 3384, measured by the
     // 216dbc929a full validate.
-    ("test.detcore_unit", 3386),
+    // And tool_global::tests'
+    // a_run_the_timeout_stopped_is_summarized_before_its_recording_is_flushed
+    // and scheduler::boundary_controller::tests'
+    // only_a_finished_runs_summary_requires_its_replay_to_have_ended
+    // (https://github.com/rrnewton/hermit/pull/4685): 3384 + 2 = 3386.
+    // Rebased onto main e8e0f9a1c: 3386 + 2 = 3388.
+    ("test.detcore_unit", 3388),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4628,7 +4636,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
     // Batch 1 adds one cli case: 787 + 1 = 788, from the batch1 validate
     // at 9baea420 carried through the split rebase.
-    ("test.cli", 789),
+    // And run_timeout_prints_a_partial_summary_naming_the_deadline
+    // (https://github.com/rrnewton/hermit/pull/4685): 787 + 1 = 788.
+    // Rebased onto main e8e0f9a1c: 789 + 1 = 790.
+    ("test.cli", 790),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5257,7 +5268,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 recount (measured by the 216dbc929a full validate, same
     // growth as test.cli): 699 + 7 = 706.
     // Batch 1 recount (same growth as test.cli): 706 + 1 = 707.
-    ("test.cli_on_host", 708),
+    // And the same partial-summary test, not excluded: 706 + 1 = 707.
+    // Rebased onto main e8e0f9a1c: 708 + 1 = 709.
+    ("test.cli_on_host", 709),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5267,7 +5280,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // exclusions are present exactly once: 1971 - 14 = 1957, by nextest list.
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a): 1957 + 2 = 1959 (1973 - 14).
-    ("test.regular_crates_on_host", 1959),
+    // And the same partial-summary detcore-model test, not excluded: 1959 + 1 = 1960.
+    ("test.regular_crates_on_host", 1960),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5810,7 +5824,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The pipe retry identity regression adds one unit: 3362 + 1 = 3363,
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
-    ("test.detcore_unit_on_host", 3386),
+    // And the same two partial-summary units: 3384 + 2 = 3386.
+    // Rebased onto main e8e0f9a1c: 3386 + 2 = 3388.
+    ("test.detcore_unit_on_host", 3388),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6467,7 +6483,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nextest list.
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a), none hosted-excluded: 1957 + 2 = 1959 (1973 - 14).
-    ("test.regular_crates_on_host", 1959),
+    // And the same partial-summary detcore-model test, not excluded: 1959 + 1 = 1960.
+    ("test.regular_crates_on_host", 1960),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
