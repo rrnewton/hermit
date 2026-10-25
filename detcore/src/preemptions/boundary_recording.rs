@@ -45,25 +45,33 @@ struct Envelope {
     slice_boundary_recording: BoundaryRecording,
 }
 
+/// Whether a record is in the slice-boundary format. The probe builds none of
+/// the record: it skips every value, so reading the format of a schedule of
+/// millions of events does not cost a JSON tree of it, several times the
+/// size of its text.
 #[derive(Deserialize)]
-struct MetadataProbe {
+struct FormatProbe {
     // A present null must not look like an absent protocol marker.
-    #[serde(default, deserialize_with = "present_boundary")]
-    slice_boundary_recording: Option<serde_json::Value>,
+    #[serde(default, deserialize_with = "marker_present")]
+    slice_boundary_recording: bool,
 }
 
-fn present_boundary<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<serde_json::Value>, D::Error> {
-    serde_json::Value::deserialize(deserializer).map(Some)
+fn marker_present<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    serde::de::IgnoredAny::deserialize(deserializer).map(|_| true)
+}
+
+impl FormatProbe {
+    fn is_boundary_recording(bytes: &[u8]) -> serde_json::Result<bool> {
+        serde_json::from_slice::<Self>(bytes).map(|probe| probe.slice_boundary_recording)
+    }
 }
 
 pub(super) fn read_settings<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     let bytes = std::fs::read(path)
         .map_err(|e| format!("cannot read preemption record {}: {}", path.display(), e))?;
-    let probe: MetadataProbe = serde_json::from_slice(&bytes)
+    let boundary = FormatProbe::is_boundary_recording(&bytes)
         .map_err(|e| format!("cannot parse preemption record {}: {}", path.display(), e))?;
-    if probe.slice_boundary_recording.is_none() {
+    if !boundary {
         // Each old metadata reader still deserializes only its own field,
         // from the original bytes, preserving its legacy acceptance contract.
         return serde_json::from_slice(&bytes)
@@ -148,11 +156,10 @@ impl Recording {
     /// Validate and parse either format without a malformed-new-to-legacy
     /// fallback.
     pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
-        let value: serde_json::Value = serde_json::from_slice(bytes)?;
         // Inspect only to dispatch. Deserialize the ORIGINAL bytes again so
-        // duplicate fields in the envelope are rejected, not overwritten by
-        // Value. A malformed new recording never falls back to legacy.
-        if value.get("slice_boundary_recording").is_some() {
+        // duplicate fields in the envelope are rejected. A malformed new
+        // recording never falls back to legacy.
+        if FormatProbe::is_boundary_recording(bytes)? {
             let envelope: Envelope = serde_json::from_slice(bytes)?;
             Ok(Self::Boundaries(envelope.slice_boundary_recording))
         } else {
@@ -391,6 +398,26 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    /// The format is the presence of the top-level marker, null included,
+    /// read without building any value.
+    #[test]
+    fn the_format_is_the_presence_of_the_top_level_marker() {
+        let probe = |text: &str| FormatProbe::is_boundary_recording(text.as_bytes()).unwrap();
+        assert!(!probe(r#"{"per_thread": {}, "global": []}"#));
+        assert!(probe(r#"{"slice_boundary_recording": {"preemptions": 1}}"#));
+        assert!(probe(r#"{"slice_boundary_recording": null}"#));
+        assert!(!probe(
+            r#"{"per_thread": {"3": {"slice_boundary_recording": 1}}, "global": []}"#
+        ));
+        assert!(
+            FormatProbe::is_boundary_recording(
+                br#"{"slice_boundary_recording": null, "slice_boundary_recording": null}"#
+            )
+            .is_err()
+        );
+        assert!(FormatProbe::is_boundary_recording(b"{\"global\": [").is_err());
     }
 
     #[test]
