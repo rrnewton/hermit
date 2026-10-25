@@ -46927,3 +46927,120 @@ fn a_run_without_namespaces_is_not_refused_where_user_namespaces_are_denied() {
     assert_success(&ran, &args);
     assert_eq!(stdout(&ran), "ran\n", "stderr:\n{}", stderr(&ran));
 }
+
+/// A recording whose thread stream cannot be written out in full when the
+/// thread exits is reported by record and refused by replay with the reason.
+/// The recorder used to drop its streams and ignore the error of their last
+/// write: record reported success and replay panicked on the cut stream.
+/// Here that write fails with EFBIG: `/bin/echo` is recorded once to learn
+/// the size of its root thread's event stream, then again under an
+/// `RLIMIT_FSIZE` one byte short of it, with SIGXFSZ ignored, so only the
+/// stream's last write crosses the limit, as one to a full disk would fail.
+#[test]
+fn a_recording_whose_stream_cannot_be_written_in_full_is_refused() {
+    use std::os::unix::process::CommandExt as _;
+
+    use hermit_record_format::event_stream::EventStreamId;
+    use hermit_record_format::event_stream::EventWriter;
+
+    let _lock = hermit_run_guard();
+    let record = |limit: Option<u64>| {
+        let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create the recording data dir");
+        let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+        let args = [
+            "record",
+            "start",
+            "--record-timeout",
+            "120",
+            &data_dir_arg,
+            "--",
+            "/bin/echo",
+            "stream",
+        ];
+        let mut command = hermit_command(&args);
+        if let Some(limit) = limit {
+            // SAFETY: setrlimit and signal are async-signal-safe.
+            unsafe {
+                command.pre_exec(move || {
+                    let rlimit = libc::rlimit {
+                        rlim_cur: limit,
+                        rlim_max: limit,
+                    };
+                    if libc::setrlimit(libc::RLIMIT_FSIZE, &rlimit) != 0
+                        || libc::signal(libc::SIGXFSZ, libc::SIG_IGN) == libc::SIG_ERR
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), "stream\n", "{args:?}");
+        let id = std::fs::read_dir(data_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .find(|name| !["last", "last-run", "tmp"].contains(&name.as_str()))
+            .expect("record start committed no recording");
+        (data_dir, data_dir_arg, id, output)
+    };
+
+    // The root stream's file name, from a fresh writer.
+    let scratch = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    drop(EventWriter::create(scratch.path(), &EventStreamId::root()).unwrap());
+    let root_stream = std::fs::read_dir(scratch.path().join("thread"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .find(|name| std::path::Path::new(name).extension().is_none())
+        .unwrap();
+
+    let (whole, _, whole_id, _) = record(None);
+    let whole = whole.path().join(&whole_id);
+    let size = std::fs::metadata(whole.join("thread").join(&root_stream))
+        .unwrap()
+        .len();
+    // Every other file the recording writes must stay under the limit.
+    let mut directories = vec![whole.clone()];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            let metadata = std::fs::metadata(&path).unwrap();
+            if metadata.is_dir() {
+                directories.push(path);
+            } else if path.file_name() != Some(root_stream.as_os_str()) {
+                assert!(
+                    metadata.len() < size - 1,
+                    "{path:?} is as large as the root stream"
+                );
+            }
+        }
+    }
+
+    let (_cut, cut_arg, cut_id, recorded) = record(Some(size - 1));
+    let reason = format!(
+        "the recording of thread stream {} could not be written in full",
+        EventStreamId::root()
+    );
+    let record_stderr = String::from_utf8_lossy(&recorded.stderr);
+    assert!(
+        record_stderr.contains(&format!(
+            "WARNING: replay will refuse this recording: {reason}"
+        )) && !record_stderr.contains("RECORDING COMPLETE"),
+        "record did not report the stream:\n{record_stderr}"
+    );
+    let args = ["replay", "--autopilot", &cut_arg, &cut_id];
+    let replay = hermit(&args);
+    assert!(
+        !replay.status.success(),
+        "{args:?} replayed a cut recording"
+    );
+    let stderr = String::from_utf8_lossy(&replay.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "This recording cannot be replayed faithfully: {reason}"
+        )) && stderr.contains("File too large"),
+        "{args:?}:\n{stderr}"
+    );
+}
