@@ -15,6 +15,8 @@
 //! random device and a rendered procfs file, which no descriptor of the
 //! receiving table names. Descriptors from another process in general are
 //! covered by `tests/c/scm_rights_received_descriptors.c`.
+//!
+//! Each run starts in a fresh PID namespace (`run_deterministically`).
 
 use std::io;
 use std::mem::size_of;
@@ -22,11 +24,11 @@ use std::mem::size_of_val;
 use std::ptr;
 
 use detcore::Config;
-use detcore::Detcore;
+use detcore_testutils::det_test_fn_with_config_repetitions;
 use libc::c_int;
 use reverie::ExitStatus;
 
-const RUNS: usize = 3;
+const RUNS: u64 = 3;
 
 /// `recvmsg` takes a different Detcore path with and without virtual time.
 fn configs() -> [(&'static str, Config); 2] {
@@ -51,30 +53,33 @@ fn configs() -> [(&'static str, Config); 2] {
     ]
 }
 
-/// Runs `guest` under each configuration and requires identical output.
+/// Runs `guest` `RUNS` times under each configuration and requires every
+/// run to exit 0 with the same stdout, stderr and schedule
+/// (`det_test_fn_with_config_repetitions`).
+///
+/// Each run starts in a fresh PID namespace, as a `hermit run` container
+/// does, so its guest's thread ids repeat. Detcore names some of an open
+/// file's state by a thread id: a random device's stream by the task that
+/// opened it or, for one it received, by the receiving table's owner
+/// (`RandomDeviceStream`). In the test process's own PID namespace those ids
+/// are host PIDs, new in every run, and a random device received from a child
+/// read different bytes each time.
 fn run_deterministically(guest: fn()) {
     for (name, config) in configs() {
-        let mut expected = None;
-        for run in 1..=RUNS {
-            let (output, _state) =
-                detcore_testutils::test_fn_with_config::<Detcore, _>(guest, config.clone(), true)
-                    .unwrap_or_else(|error| panic!("{name} run {run} failed: {error:#}"));
+        det_test_fn_with_config_repetitions(RUNS, true, guest, config, |output, _state| {
             assert_eq!(
                 output.status,
                 ExitStatus::Exited(0),
-                "{name} run {run} failed: {}",
+                "{name}: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
-            match &expected {
-                Some(expected) => {
-                    assert_eq!(
-                        &output.stdout, expected,
-                        "{name} output diverged on run {run}"
-                    )
-                }
-                None => expected = Some(output.stdout),
-            }
-        }
+            // Every guest prints what it found. An empty stdout would compare
+            // equal in every run, whatever the guest read.
+            assert!(
+                !output.stdout.is_empty(),
+                "{name}: the guest printed nothing"
+            );
+        });
     }
 }
 
