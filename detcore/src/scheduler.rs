@@ -2309,11 +2309,11 @@ pub struct Scheduler {
     /// maximum timeslice of virtual time, but at least
     /// `MIN_CHAOS_TURNS_PER_SLICE`; `None` when either is zero or unset.
     chaos_turns_per_slice: Option<u64>,
-    /// The thread whose grant this pass ended a timed wait at its deadline (a
-    /// due sleep or a futex timeout), taken by the next `bump_global_time`:
-    /// such a turn does not count toward the thread's chaos slice
+    /// The thread whose grant this pass ended a sleep at its deadline
+    /// (`ends_a_due_sleep`), taken by the next `bump_global_time`: such a turn
+    /// does not count toward the thread's chaos slice
     /// (`chaos_slice_spent_in_turns`).
-    chaos_timed_wait_grant: Option<DetTid>,
+    chaos_due_sleep_grant: Option<DetTid>,
     /// The threads that have had a grant, so that a thread that has not yet
     /// run can be told apart (`note_chaos_first_turn_waits`). An entry goes
     /// when its thread retires.
@@ -4275,8 +4275,8 @@ const MIN_CHAOS_TURNS_PER_SLICE: u64 = 400;
 /// `SleepUntil` with a real deadline, neither the zero of a yield epoch nor
 /// an indefinite one, that its caller did not ask to last no time (a
 /// zero-length sleep is a yield idiom: `Resources::zero_length_sleep`). Its
-/// grant ends a timed wait at its deadline
-/// (`Scheduler::chaos_timed_wait_grant`).
+/// grant does not count toward a chaos slice
+/// (`Scheduler::chaos_due_sleep_grant`).
 fn ends_a_due_sleep(request: &Resources, now: LogicalTime) -> bool {
     !request.zero_length_sleep
         && request.resources.len() == 1
@@ -4703,7 +4703,7 @@ impl Scheduler {
                         .filter(|charge| *charge > 0),
                 )
                 .map(|(slice, charge)| slice.div_ceil(charge).max(MIN_CHAOS_TURNS_PER_SLICE)),
-            chaos_timed_wait_grant: None,
+            chaos_due_sleep_grant: None,
             chaos_had_turn: Default::default(),
             chaos_first_turn_waits: Default::default(),
             fuzz_prng: Pcg64Mcg::seed_from_u64(cfg.fuzz_seed()),
@@ -15679,7 +15679,7 @@ impl Scheduler {
         };
         // Taken at every bump, a skipped one included, so it never outlives
         // the turn its grant began.
-        let timed_wait_grant = self.chaos_timed_wait_grant.take();
+        let due_sleep_grant = self.chaos_due_sleep_grant.take();
         // A host-timed retry is not a turn that both runs of --verify share:
         // letting it set the previous turn's thread would make whether the
         // next signal delivery is charged depend on how many retries ran.
@@ -15696,7 +15696,7 @@ impl Scheduler {
             self.previous_turn_expired_wait = expired_wait;
             if self.chaos_bounds_starvation
                 && !self.has_schedule_replay()
-                && timed_wait_grant != Some(resources.tid)
+                && due_sleep_grant != Some(resources.tid)
             {
                 *self.chaos_turns_in_slice.entry(resources.tid).or_insert(0) += 1;
             }
@@ -15895,8 +15895,7 @@ impl Scheduler {
         self.expired_wait_grant =
             ((futex_timed_out || sleep_due) && !signaled && !fatal_alarm).then_some(dtid);
         let guest_state_poll = polling_grant && guest_state_only;
-        self.chaos_timed_wait_grant =
-            ((futex_timed_out || chaos_sleep_due) && !signaled && !fatal_alarm).then_some(dtid);
+        self.chaos_due_sleep_grant = (chaos_sleep_due && !signaled && !fatal_alarm).then_some(dtid);
         if !polling_grant {
             self.note_chaos_first_turn_waits(dtid);
         }
@@ -16045,9 +16044,9 @@ impl Scheduler {
     /// the threads ahead of it do.
     ///
     /// This covers what `chaos_slice_spent_in_turns` leaves out: a thread
-    /// whose turns end timed waits at their deadlines, such as a loop of
-    /// sleeps shorter than a turn charge, which is always due and can hold a
-    /// worse band off the CPU for seconds. A newly created thread waited
+    /// whose turns end sleeps at their deadlines, such as a loop of sleeps
+    /// shorter than a turn charge, which is always due and can hold a worse
+    /// band off the CPU for seconds. A newly created thread waited
     /// 5 s for its first turn behind a 1 ms sleep loop, and a test's own 5 s
     /// watchdog fired. A thread that has run before is not bounded by this
     /// rule: the same holding is what reproduces a real use-after-free (main
@@ -16100,18 +16099,22 @@ impl Scheduler {
     /// its own-time slice could have lasted 20,000 to 40,000 syscalls (10 us
     /// for most, 5 us for a futex call or `sched_yield`).
     ///
-    /// A turn whose grant ended a timed wait at its deadline (a due sleep, or
-    /// a futex wait answered with a timeout: `chaos_timed_wait_grant`) does
-    /// not count. Such turns are paced by the thread's own deadlines, not
-    /// handed to it by another thread. A sleep shorter than a turn charge is
-    /// always due, so a loop of them holds a worse band off the CPU until its
-    /// own-time slice ends, and that holding is what reproduces a real
-    /// use-after-free: main held off for 3.8 s behind a 200 us sleep loop
-    /// while a pipeline restarts. Counting those turns cut the holding to
-    /// about 0.2 s and the repro from 4 of 12 seeds to 0. A thread that has
-    /// not yet run is still bounded (`chaos_first_turn_overdue`). A
-    /// zero-length sleep (`nanosleep` of zero, `poll` of nothing with a zero
-    /// timeout) is a yield idiom, not a timed wait, and counts.
+    /// A turn whose grant ended a sleep at its deadline (`ends_a_due_sleep`,
+    /// `chaos_due_sleep_grant`) does not count. A sleep is paced by its
+    /// thread's own deadline, not handed to it by another thread. A sleep
+    /// shorter than a turn charge is always due, so a loop of them holds a
+    /// worse band off the CPU until its own-time slice ends, and that holding
+    /// is what reproduces a real use-after-free: main held off for 3.8 s
+    /// behind a 200 us sleep loop while a pipeline restarts. Counting those
+    /// turns cut the holding to about 0.2 s and the repro from 4 of 12 seeds
+    /// to 0. A thread that has not yet run is still bounded
+    /// (`chaos_first_turn_overdue`). A zero-length sleep (`nanosleep` of
+    /// zero, `poll` of nothing with a zero timeout) is a yield idiom and
+    /// counts. So does a futex wait that timed out: its thread waits for
+    /// another thread, and a loop of them holding the CPU starves the thread
+    /// they wait for. Sixteen pollers on a 10 us `wait_for` held a
+    /// bundle-adjustment solver off for minutes when their timeouts did not
+    /// count.
     /// The count is of turns, not of virtual time, so it keeps counting
     /// across a sleep. The threshold uses the maximum timeslice, the bound
     /// on a slice, not the mean a chaos slice is drawn with
@@ -21339,8 +21342,8 @@ mod test {
     /// its last change point count toward its slice: once they have charged a
     /// maximum timeslice (400 turns of 0.5 ms against 200 ms), its next grant
     /// ends the slice (`chaos_slice_spent_in_turns`). A polling retry, a
-    /// skipped turn and a turn whose grant ended a timed wait at its deadline
-    /// do not count, a change point restarts the count, and nothing counts
+    /// skipped turn and a turn whose grant ended a sleep at its deadline do
+    /// not count, a change point restarts the count, and nothing counts
     /// without chaos or under `hermit record`/`hermit replay`.
     #[test]
     fn a_chaos_slice_is_spent_after_a_timeslice_of_turn_charges() {
@@ -21369,19 +21372,19 @@ mod test {
         retry.insert(ResourceID::InternalIOPolling, Permission::W);
         retry.poll_attempt = 1;
         sched.bump_global_time(&time, &Ok(retry));
-        sched.chaos_timed_wait_grant = Some(thread);
+        sched.chaos_due_sleep_grant = Some(thread);
         sched.bump_global_time(&time, &Err(SkipTurn));
         assert_eq!(
-            sched.chaos_timed_wait_grant, None,
+            sched.chaos_due_sleep_grant, None,
             "a skipped bump takes the note too"
         );
-        sched.chaos_timed_wait_grant = Some(thread);
+        sched.chaos_due_sleep_grant = Some(thread);
         commit(&mut sched, &time, 1);
         assert!(
             !sched.chaos_slice_spent_in_turns(thread),
-            "a polling retry, a skipped turn and a timed wait's end do not count"
+            "a polling retry, a skipped turn and a due sleep's end do not count"
         );
-        assert_eq!(sched.chaos_timed_wait_grant, None, "taken by the bump");
+        assert_eq!(sched.chaos_due_sleep_grant, None, "taken by the bump");
         commit(&mut sched, &time, 1);
         assert!(sched.chaos_slice_spent_in_turns(thread), "400 turns");
         assert_eq!(

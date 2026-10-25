@@ -4366,7 +4366,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And chaos_change_points_come_within_a_timeslice_of_turn_charges: 667.
     // And a_new_thread_behind_a_short_sleep_loop_gets_its_first_turn_within_a_second
     // and a_thread_that_has_run_still_waits_behind_a_short_sleep_loop: 669.
-    ("test.cli", 669),
+    // And a_worker_is_not_held_off_by_futex_waits_that_time_out: 670.
+    ("test.cli", 670),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4914,7 +4915,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_new_thread_behind_a_short_sleep_loop_gets_its_first_turn_within_a_second
     // and a_thread_that_has_run_still_waits_behind_a_short_sleep_loop,
     // which are not among them either: 588.
-    ("test.cli_on_host", 588),
+    // And a_worker_is_not_held_off_by_futex_waits_that_time_out, which is
+    // not among them either: 589.
+    ("test.cli_on_host", 589),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
