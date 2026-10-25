@@ -103,11 +103,11 @@ impl InventoryCounts {
 const REQUIRED_NEXTEST_POPULATIONS: &[(SuiteKey<'static>, InventoryCounts)] = &[
     (
         ("hermit-run", "lib", "hermit"),
-        InventoryCounts::new(475, 0, 0, 475),
+        InventoryCounts::new(476, 0, 0, 476),
     ),
     (
         ("hermit-run", "test", "cli"),
-        InventoryCounts::new(575, 6, 120, 701),
+        InventoryCounts::new(581, 6, 120, 707),
     ),
     (
         ("hermit-run", "test", "liteinst_allocator"),
