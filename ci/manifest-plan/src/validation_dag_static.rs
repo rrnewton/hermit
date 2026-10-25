@@ -1160,7 +1160,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // decoder) and tests::versioned_config_rejects_unknown_or_malformed_envelopes
     // (moved from hermit-run), when Hermit stopped putting its configuration in
     // the DBT guest's environment: 1844, listed.
-    ("test.regular_crates", 1844),
+    // Caller-owned DBT evidence validation (dh-pp7q9): two grammar units,
+    // measured with the existing selection and exclusions unchanged.
+    ("test.regular_crates", 1846),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1776,7 +1778,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // dbt_public_dispatch_refuses_strict_schedule_boundaries, which keeps the
     // refusal that serializing that environment variable used to make: 1091,
     // listed.
-    ("test.hermit_unit", 1091),
+    // Caller-owned DBT evidence validation (dh-pp7q9): one production-configuration refusal unit,
+    // measured with the existing selection and exclusions unchanged.
+    ("test.hermit_unit", 1092),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5311,7 +5315,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two --strace-only expansion tests: 1098.
     // Less the same eight dbt_detconfig_tests units: 1090. And the same
     // strict-schedule-boundaries refusal unit: 1091, listed.
-    ("test.hermit_unit_on_host", 1091),
+    // Caller-owned DBT evidence validation (dh-pp7q9): one production-configuration refusal unit,
+    // measured with the existing selection and exclusions unchanged.
+    ("test.hermit_unit_on_host", 1092),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5503,7 +5509,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // The same 26 tests; all existing hosted exclusions remain unchanged.
     // And the same two detcore-dbt configuration tests: 1830, listed.
-    ("test.regular_crates_on_host", 1830),
+    // Caller-owned DBT evidence validation (dh-pp7q9): two grammar units,
+    // measured with the existing selection and exclusions unchanged.
+    ("test.regular_crates_on_host", 1832),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

@@ -13,6 +13,7 @@
 
 #![deny(missing_docs)]
 
+mod evidence;
 #[cfg(test)]
 mod first_instruction_observer;
 mod ofd_channel;
@@ -48,6 +49,8 @@ use detcore::GlobalState;
 use detcore::UnsupportedSyscallError;
 use detcore::cancel_exec;
 use detcore::prepare_exec;
+pub use evidence::decode_evidence;
+pub use evidence::validate_evidence_record;
 use rand::RngExt as _;
 use reverie::Error;
 use reverie::ExitStatus;
