@@ -253,6 +253,13 @@ pub struct RunSummary {
     /// records or replays preemptions. Full report only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_exclusives_unavailable: Option<String>,
+
+    /// The run ended because its virtual clock passed `--virtual-timeout`,
+    /// whose bound in virtual nanoseconds this is: the scheduler granted no
+    /// turn past it. Its status is then 124, not one the guest exited with.
+    /// Absent for every other run and in older summaries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub virtual_timeout_ns: Option<u64>,
 }
 
 /// The store-exclusives a run's guest speculatively executed that failed,
@@ -376,6 +383,7 @@ impl RunSummary {
             store_exclusives,
             store_exclusives_unavailable,
             guest_deadlock,
+            virtual_timeout_ns,
         } = self;
         writeln!(f, "Final thread-tree was: {}", threads_descrip)?;
         writeln!(
@@ -390,6 +398,12 @@ impl RunSummary {
             writeln!(
                 f,
                 "Deadlock under Hermit's model: no remaining thread can be woken by anything Hermit models."
+            )?;
+        }
+        if let Some(bound) = virtual_timeout_ns {
+            writeln!(
+                f,
+                "The run's virtual clock passed --virtual-timeout={bound}: no scheduler turn was granted after it."
             )?;
         }
         if include_report_metadata {

@@ -199,14 +199,17 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
-pub use scheduler::GuestDeadlockUnwind;
-pub use scheduler::GuestDeadlockUnwindGuard;
 pub use scheduler::Priority;
 pub use scheduler::TerminalDeadlockHook;
+pub use scheduler::TerminalOutcome;
+pub use scheduler::TerminalOutcomeUnwind;
+pub use scheduler::TerminalOutcomeUnwindGuard;
+pub use scheduler::VirtualTimeoutExitHook;
 pub use scheduler::runqueue::DEFAULT_PRIORITY;
 pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
 pub use scheduler::set_terminal_deadlock_hook;
+pub use scheduler::set_virtual_timeout_exit_hook;
 pub use tool_global::BackendFailureCleanup;
 pub use tool_global::GlobalState;
 pub use tool_global::SyscallObservationGap;
@@ -2064,7 +2067,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         } = turn;
         // A delivery that ends the process is committed in this turn
         // (`Scheduler::commit_fatal_delivery`). Under `--pipe-wake-latency`
-        // the doom feeds the hand-off scan (`scheduler::pipe_wake`). Where the
+        // or `--virtual-timeout` the doom feeds the hand-off scan
+        // (`scheduler::pipe_wake`) and the bound (`thread_is_doomed`). Where the
         // kernel's signal state is the guest's own (ptrace), the process's
         // other threads also leave the scheduler now, as Linux kills them at
         // this delivery, instead of at their host-timed exit reports. That
@@ -2074,7 +2078,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // can change or cancel it at the resume.
         let may_retire_others = crate::syscalls::retires_others_at_fatal_delivery(&self.cfg);
         let retired_the_others = (may_retire_others
-            || self.cfg.pipe_wake_latency_in_effect().is_some())
+            || self.cfg.pipe_wake_latency_in_effect().is_some()
+            || self.cfg.virtual_timeout.is_some())
             && match crate::syscalls::fatal_default_delivery(guest, signal.raw(), may_retire_others)
             {
                 Some(retire_others) => {

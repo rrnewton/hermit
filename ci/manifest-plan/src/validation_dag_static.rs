@@ -1214,7 +1214,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hermit-detcore-tests --exclude hermit-run --exclude
     // hermetic_infra_hermit_flaky-tests` lists 1913, matching the full
     // validate at that tip (1913 executed, all passed).
-    ("test.regular_crates", 1913),
+    // And detcore-model's
+    // terminal_outcome_tests::terminal_outcomes_carry_their_status_and_class_line
+    // and config::tests::virtual_timeout_round_trips_but_never_enters_the_legacy_form
+    // (--virtual-timeout): 1915.
+    ("test.regular_crates", 1915),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1886,7 +1890,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // re-measured at this integration head.
     // PR 4836 adds run::detlog_anon_is_ptrace_only: 1242 + 1 = 1243, re-measured at this integration head.
     // PR 4619 adds seven hermit-run units: 1243 + 7 = 1250, re-measured at this integration head.
-    ("test.hermit_unit", 1250),
+    // 1095, listed. (--virtual-timeout renamed the last three to
+    // tests::terminal_outcomes_use_their_own_exit_and_marker,
+    // ptrace_completion::tests::a_terminal_outcome_completes_with_its_status_and_the_captured_output
+    // and error::tests::a_terminal_outcome_is_the_guests_only_once_the_run_finished.)
+    // And --virtual-timeout's
+    // container::tests::a_deadline_exit_is_a_virtual_timeout_only_with_its_note,
+    // terminal_outcome_note::tests::a_virtual_timeout_noted_by_an_exiting_child_reaches_its_parent_once
+    // and run::virtual_timeout_parses_round_trips_and_is_refused_without_the_scheduler:
+    // 1253.
+    ("test.hermit_unit", 1253),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3124,7 +3137,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4836 adds three detcore units: 2914 + 3 = 2917, re-measured at this integration head.
     // PR 4841 adds nine detcore units: 2917 + 9 = 2926, re-measured at this integration head.
     // PR 4619 adds three detcore units: 2926 + 3 = 2929, re-measured at this integration head.
-    ("test.detcore_unit", 2929),
+    // And scheduler::test::a_virtual_timeout_stops_the_run_at_the_first_commit_past_its_bound
+    // and scheduler::test::a_virtual_timeout_is_not_recorded_once_no_thread_can_be_granted_a_turn
+    // (--virtual-timeout): 2931.
+    ("test.detcore_unit", 2931),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4439,7 +4455,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4841 adds a_blocked_vectored_call_moves_bytes_through_the_memory_it_began_with: 705 + 1 = 706.
     // PR 4844 adds preadv2_and_pwritev2_at_the_current_offset_wait_as_readv_and_writev_do: 706 + 1 = 707.
     // PR 4619 adds seven cli cases: 707 + 7 = 714, re-measured at this integration head.
-    ("test.cli", 714),
+    // And a_virtual_timeout_stops_a_guest_that_never_ends,
+    // a_virtual_timeout_the_guest_never_reaches_changes_nothing and
+    // a_virtual_timeout_verifies_as_the_same_stop_in_both_runs
+    // (--virtual-timeout, tests/c/virtual_timeout_loop.c; the node skips
+    // run_kvm_virtual_timeout_is_reported_from_the_childs_note): 717.
+    ("test.cli", 717),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4995,7 +5016,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same PR 4841 cli case: 624 + 1 = 625.
     // The same PR 4844 cli case: 625 + 1 = 626.
     // The same seven PR 4619 cli cases: 626 + 7 = 633.
-    ("test.cli_on_host", 633),
+    // And the same three --virtual-timeout tests (this node skips the KVM
+    // one too): 636.
+    ("test.cli_on_host", 636),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5479,7 +5502,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same three PR 4836 units: 2914 + 3 = 2917.
     // The same nine PR 4841 units: 2917 + 9 = 2926.
     // The same three PR 4619 units: 2926 + 3 = 2929.
-    ("test.detcore_unit_on_host", 2929),
+    // And the same two --virtual-timeout scheduler units: 2931.
+    ("test.detcore_unit_on_host", 2931),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5860,7 +5884,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4826 rundata units: 1234 + 2 = 1236.
     // The same PR 4836 unit: 1236 + 1 = 1237.
     // The same seven PR 4619 units: 1237 + 7 = 1244.
-    ("test.hermit_unit_on_host", 1244),
+    // And the same three --virtual-timeout units: 1247.
+    ("test.hermit_unit_on_host", 1247),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6082,7 +6107,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Recount at 3bdd41fda38: the local selection lists 1913 and all
     // fourteen hosted exclusions are present exactly once, so the
     // hosted twin executes 1913 - 14 = 1899.
-    ("test.regular_crates_on_host", 1899),
+    // And the same two --virtual-timeout detcore-model tests: 1901.
+    ("test.regular_crates_on_host", 1901),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

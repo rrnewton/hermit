@@ -39,11 +39,14 @@ const SKID_OVERSHOOT_REFUSAL_PREFIX: &str =
 /// these says nothing certain about the guest. That includes a deadlock under
 /// Hermit's model: no wake Detcore models can reach the guest, which is a
 /// native hang only when that model is complete for the program.
+/// `--timeout`'s deadline is named by its class: `HERMIT_RUN_TIMEOUT
+/// class=virtual-timeout`, the same status for a `--virtual-timeout` bound, is
+/// a schedule that ran the guest past the bound, found like any other failure.
 const HERMIT_OUTCOMES: [(i32, &str); 6] = [
     (HERMIT_GUEST_DEADLOCK_EXIT, HERMIT_MODEL_DEADLOCK_LINE),
     (HERMIT_POLICY_REFUSAL_EXIT, "HERMIT_POLICY_REFUSAL "),
     (123, "HERMIT_LOG_CAP "),
-    (124, "HERMIT_RUN_TIMEOUT "),
+    (124, "HERMIT_RUN_TIMEOUT class=run-timeout"),
     (124, "HERMIT_RUN_TIMEOUT_FALLBACK"),
     (125, "HERMIT_INTERNAL_FAILURE "),
 ];
@@ -256,6 +259,18 @@ mod tests {
         );
         assert_eq!(
             classify(exited(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT), "").unwrap(),
+            RunOutcome::Failed
+        );
+        // So is a schedule that ran the guest past --virtual-timeout; the
+        // wall-clock --timeout stays Hermit's own outcome (below).
+        assert_eq!(
+            classify(
+                exited(124),
+                "Virtual timeout: at scheduler turn 15, the run's virtual clock is 4004335665 ns \
+                 past its start, beyond --virtual-timeout=3500000000; no further turn is \
+                 granted.\nHERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=3500000000\n"
+            )
+            .unwrap(),
             RunOutcome::Failed
         );
     }

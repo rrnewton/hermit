@@ -991,10 +991,15 @@ pub(crate) fn run_failure_of(error: &Error) -> Option<RunFailure> {
         .is_some()
     {
         Some(RunFailure::PolicyRefusal)
-    } else if error
-        .downcast_ref::<super::container::GuestDeadlock>()
-        .is_some()
-    {
+    } else if matches!(
+        error.downcast_ref::<super::container::SchedulerOutcome>(),
+        Some(super::container::SchedulerOutcome(
+            detcore::TerminalOutcome::GuestDeadlock
+        ))
+    ) {
+        // Not a virtual timeout: `--verify` with the bound is refused on
+        // every backend that cannot unwind the guest, and on ptrace a stopped
+        // run completes and is compared.
         Some(RunFailure::Deadlock)
     } else {
         None
@@ -2763,11 +2768,12 @@ mod tests {
                     assert_eq!(report, VerificationReport::no_result());
                 }
                 121 => {
-                    assert!(
-                        error
-                            .downcast_ref::<super::super::container::GuestDeadlock>()
-                            .is_some()
-                    );
+                    assert!(matches!(
+                        error.downcast_ref::<super::super::container::SchedulerOutcome>(),
+                        Some(super::super::container::SchedulerOutcome(
+                            detcore::TerminalOutcome::GuestDeadlock
+                        ))
+                    ));
                     assert_eq!(report, VerificationReport::no_result());
                     assert_eq!(super::super::failure_exit_code(&error), 121);
                 }
@@ -2826,8 +2832,16 @@ mod tests {
                 Some(RunFailure::PolicyRefusal),
             ),
             (
-                Error::new(super::super::container::GuestDeadlock),
+                Error::new(super::super::container::SchedulerOutcome(
+                    detcore::TerminalOutcome::GuestDeadlock,
+                )),
                 Some(RunFailure::Deadlock),
+            ),
+            (
+                Error::new(super::super::container::SchedulerOutcome(
+                    detcore::TerminalOutcome::VirtualTimeout { bound_ns: 1 },
+                )),
+                None,
             ),
             // Already published as its infrastructure error.
             (

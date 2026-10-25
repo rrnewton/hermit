@@ -645,7 +645,7 @@ impl Scheduler {
 
     /// Retire every thread still registered, in DetTid order, as a committed
     /// victim of a kill the scheduler does not send itself: the termination
-    /// that unwinds a deadlocked guest (`unwind_guest_deadlock`) kills every
+    /// that unwinds a deadlocked guest (`unwind_terminal_outcome`) kills every
     /// guest thread, and their deaths reach the scheduler as deregistrations
     /// in the order the host reports them. Retired here, each death is then
     /// only accounted ([`Self::route_sigkill_receipt`]), so the log the run
