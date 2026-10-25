@@ -329,6 +329,24 @@ pub const KVM_RATCHET_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [TimeoutCa
     configured_wall_seconds: 80,
 }];
 
+/// The DBT verify cell of the Python random example, from its 249 passing
+/// result rows in coordinator-launched full validations of 2026-10-11 to
+/// 2026-10-25 (row-level `cpu_usage_usec` and `duration_ms`), after the
+/// default CPU bound stopped the validation of f8adb23a at 22.0 CPU seconds.
+/// The configured CPU bound covers that stop (ceil(1.5 x 22.0) = 33).
+pub const DBT_2026_10_25_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [TimeoutCalibration {
+    test: "language-runtimes/example-python-random",
+    mode: "verify",
+    backend: "dbt",
+    samples: 249,
+    p90_cpu_usec: 17_274_987,
+    p90_wall_millis: 23_556,
+    required_cpu_seconds: 26,
+    required_wall_seconds: 95,
+    configured_cpu_seconds: 33,
+    configured_wall_seconds: 95,
+}];
+
 /// Per-cell nearest-rank p90 from ten schema-4 result rows, using row-level
 /// CPU microseconds and wall milliseconds, including reported preparation.
 /// See docs/LITEINST_QUALIFICATION_20260916.md for retained evidence and limits.
@@ -2068,6 +2086,7 @@ mod tests {
         for calibration in EXPLICIT_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)
+            .chain(&DBT_2026_10_25_TIMEOUT_CALIBRATIONS)
             .chain(&LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS)
             .chain(&LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS)
             .copied()

@@ -36312,7 +36312,7 @@
       "backend": "dbt",
       "category": "language-runtimes",
       "classification": "required",
-      "cpu_timeout_seconds": 22,
+      "cpu_timeout_seconds": 33,
       "lane": "portable",
       "mode": "verify",
       "requires": [
@@ -36323,7 +36323,7 @@
         "python3"
       ],
       "test": "language-runtimes/example-python-random",
-      "timeout_seconds": 57
+      "timeout_seconds": 95
     },
     {
       "backend": "dbt",

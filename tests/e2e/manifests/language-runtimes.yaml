@@ -219,6 +219,12 @@ test:
         backends_disabled:
           native: The existing python-random test owns the native-variation assertion
       verify:
+        timeout_seconds:
+          dbt: 95
+        cpu_timeout_seconds:
+          dbt: 33
+        slow_reason:
+          dbt: "DBT (DynamoRIO) costs this Python start far more than the other backends (about 1 second on each of them), and more again in coordinator-launched full validations on the development host (named in docs/TESTING_ENVIRONMENTS.md, Named measurement hosts), where the host's BPF file-open hook takes a slow path. Across its 249 passing coordinator runs from 2026-10-11 to 2026-10-25, nearest-rank p90 was 17.275 CPU and 23.556 wall seconds (max 21.308 CPU, 53.146 wall); ceil(1.5x CPU)=26 and ceil(4x wall)=95. The default 22-second CPU bound stopped the validation of f8adb23a at 22.0 CPU seconds, and the 57-second wall bound stopped two runs at about 57 seconds with 7 CPU seconds used. The CPU bound is 33, ceil(1.5 x 22.0), above the required 26; the wall bound is the required 95."
         ci:
           ptrace: true
           # DBT Python-random: 20/20 strict canonical pairs at c0216c84; unchanged example.
