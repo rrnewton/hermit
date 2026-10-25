@@ -797,34 +797,52 @@ async fn finalization_secondary_preserves_nested_cleanup_kind_and_stage() {
     assert!(diagnostic.contains("another output failure"));
 }
 
-/// A run torn down for a guest deadlock completes with the deadlock's status
-/// in place of a guest status it never had, keeping the output the guest
-/// wrote. It does only when the deadlock is the run's primary cause and the
-/// teardown recorded no failure of its own; an output run with no captured
-/// bytes has nothing honest to report and stays a failure too.
+/// A run torn down for a terminal outcome (a guest deadlock, a virtual
+/// timeout) completes with the outcome's status in place of a guest status it
+/// never had, keeping the output the guest wrote. It does only when the
+/// outcome is the run's primary cause and the teardown recorded no failure of
+/// its own; an output run with no captured bytes has nothing honest to report
+/// and stays a failure too.
 #[test]
-fn a_guest_deadlock_completes_with_its_status_and_the_captured_output() {
-    let deadlocked = || reverie::Error::Tool(Error::new(GuestDeadlocked::new(None)));
-    assert!(is_clean_guest_deadlock(&deadlocked(), 0));
-    assert!(
-        !is_clean_guest_deadlock(&deadlocked(), 1),
-        "a teardown failure"
-    );
-    assert!(!is_clean_guest_deadlock(
-        &reverie::Error::Tool(Error::msg("an earlier failure")),
-        0
-    ));
+fn a_terminal_outcome_completes_with_its_status_and_the_captured_output() {
+    use detcore::TerminalOutcome;
+    for (outcome, status) in [
+        (
+            TerminalOutcome::GuestDeadlock,
+            detcore_model::HERMIT_GUEST_DEADLOCK_EXIT,
+        ),
+        (
+            TerminalOutcome::VirtualTimeout { bound_ns: 7 },
+            crate::HERMIT_DEADLINE_EXIT,
+        ),
+    ] {
+        let ended = || reverie::Error::Tool(Error::new(SchedulerEndedRun::new(outcome, None)));
+        assert_eq!(clean_terminal_outcome(&ended(), 0), Some(outcome));
+        assert_eq!(
+            clean_terminal_outcome(&ended(), 1),
+            None,
+            "a teardown failure"
+        );
 
-    let deadlock = reverie::ExitStatus::Exited(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT);
+        let status = reverie::ExitStatus::Exited(status);
+        assert_eq!(
+            <reverie::ExitStatus as TerminalOutcomeResult>::terminal_outcome(outcome, None),
+            Some(status)
+        );
+        let output = <reverie::process::Output as TerminalOutcomeResult>::terminal_outcome(
+            outcome,
+            Some(&CapturedPrefix::default()),
+        )
+        .expect("captured bytes make an output");
+        assert_eq!(output.status, status);
+        assert!(output.stdout.is_empty() && output.stderr.is_empty());
+        assert!(
+            <reverie::process::Output as TerminalOutcomeResult>::terminal_outcome(outcome, None)
+                .is_none()
+        );
+    }
     assert_eq!(
-        <reverie::ExitStatus as GuestDeadlockResult>::guest_deadlock(None),
-        Some(deadlock)
+        clean_terminal_outcome(&reverie::Error::Tool(Error::msg("an earlier failure")), 0),
+        None
     );
-    let output = <reverie::process::Output as GuestDeadlockResult>::guest_deadlock(Some(
-        &CapturedPrefix::default(),
-    ))
-    .expect("captured bytes make an output");
-    assert_eq!(output.status, deadlock);
-    assert!(output.stdout.is_empty() && output.stderr.is_empty());
-    assert!(<reverie::process::Output as GuestDeadlockResult>::guest_deadlock(None).is_none());
 }

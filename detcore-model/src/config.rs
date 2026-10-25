@@ -1029,6 +1029,34 @@ pub struct Config {
     #[clap(long)]
     pub cap_preemption_charge: bool,
 
+    /// End the run in virtual time: once the run's virtual clock is more than this many virtual
+    /// nanoseconds past the run's start, Hermit grants no further scheduler turn and the run ends
+    /// with exit status 124 and the stderr line `HERMIT_RUN_TIMEOUT class=virtual-timeout
+    /// bound_ns=N`. The clock is Detcore's global virtual time since the run began, the same
+    /// virtual time `--summary` reports as elapsed (`virttime_elapsed` in `--summary-json`); it is
+    /// checked each time the scheduler commits it at the start of a turn, before the turn's thread
+    /// runs, and the check never moves it. A guest that has already exited, or whose remaining
+    /// processes a committed exit, kill, exec or fatal signal has marked doomed, is not stopped by
+    /// it, even if such a process then survives. Unlike `--timeout`, a
+    /// wall-clock bound in seconds that fires wherever the guest has got to when the host's clock
+    /// runs out (`class=run-timeout`), for a guest whose input all comes from inside the
+    /// container this bound fires at the same point of the same schedule on every host and in
+    /// every run, so the output written before it, `--summary` and a `--verify` comparison are
+    /// reproducible. A thread that polls something outside the container, such as a pipe a host
+    /// process feeds, advances virtual time with each retry, and the number of retries depends on
+    /// the host, so such a run can stop at another turn; `--verify --verify-strict` reports that
+    /// as a divergence. Virtual time does not pass while every thread is blocked in a call
+    /// outside the container, so bound such a wait with `--timeout`. On the ptrace backend the
+    /// run is then finished as for a guest that exited: its output is kept and `--summary` says
+    /// the bound fired. On the kvm backend the run exits 124 without a summary, and `--verify`
+    /// with the bound is refused there. Needs sequentialized threads and virtual time: refused
+    /// with `--no-sequentialize-threads`, `--namespace-only`, `--strace-only` or
+    /// `--no-virtualize-time`, and on the dbt, liteinst, in-guest-trap and sabre backends, where
+    /// it has not been qualified.
+    #[serde(default)]
+    #[clap(long, value_name = "virtual-nanoseconds")]
+    pub virtual_timeout: Option<NonZeroU64>,
+
     /// Shut down immediately upon SIGINT, rather than letting the guest handle it.
     #[clap(long)]
     pub sigint_instakill: bool,
@@ -1968,6 +1996,9 @@ impl fmt::Display for Config {
         if self.cap_preemption_charge {
             write!(f, " --cap-preemption-charge")?;
         }
+        if let Some(bound) = self.virtual_timeout {
+            write!(f, " --virtual-timeout={}", bound)?;
+        }
         if self.sigint_instakill {
             write!(f, " --sigint-instakill")?;
         }
@@ -2609,8 +2640,8 @@ impl Default for Config {
 /// [`Config::launch_image`], which came after it. So is [`Config::target_timeslice_syscalls_only`],
 /// added after this form froze; DBT runs without a PMU maximum, where the
 /// option has no effect. So are [`Config::futex_wake_yields`],
-/// [`Config::scheduler_turn_cost`] and [`Config::cap_preemption_charge`],
-/// also added after this form froze, which
+/// [`Config::scheduler_turn_cost`], [`Config::cap_preemption_charge`] and
+/// [`Config::virtual_timeout`], also added after this form froze, which
 /// `hermit run` refuses with the DBT backend, and [`Config::replaying`], set
 /// only by `hermit replay`, which runs only on the ptrace backend. So is
 /// [`Config::inherited_seccomp`], added after this form froze, which reads
@@ -3113,9 +3144,9 @@ mod legacy_backend_json {
     /// the behaviour every legacy reader already has.
     /// `in_guest_detlog_forward_policy` is unset for DBT (its runtime forwards
     /// no records on a socket), so it is never written and reads as unset.
-    /// `futex_wake_yields`, `pipe_wake_latency`, `scheduler_turn_cost` and
-    /// `cap_preemption_charge` came after the legacy form froze too, and
-    /// `hermit run` refuses them with the DBT backend.
+    /// `futex_wake_yields`, `pipe_wake_latency`, `scheduler_turn_cost`,
+    /// `cap_preemption_charge` and `virtual_timeout` came after the legacy form
+    /// froze too, and `hermit run` refuses them with the DBT backend.
     /// `replaying` is never written either: only `hermit replay` sets it, and
     /// replay runs only on the ptrace backend.
     /// `in_guest_site_patching_off` is false for DBT (it is set only for
@@ -3168,7 +3199,7 @@ mod legacy_backend_json {
     /// `eager_lone_preemptions` came after it too. DBT has no PMU timer, so
     /// the option has no effect there; it is never written and reads as
     /// false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 34] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 35] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3185,6 +3216,7 @@ mod legacy_backend_json {
         "replaying",
         "scheduler_turn_cost",
         "cap_preemption_charge",
+        "virtual_timeout",
         "inherited_seccomp",
         "cpu_profile",
         "cpu_profile_host",
@@ -3301,7 +3333,8 @@ mod legacy_backend_json {
     /// [`Config::target_timeslice_syscalls_only`],
     /// [`Config::futex_wake_yields`], [`Config::replaying`],
     /// [`Config::scheduler_turn_cost`], [`Config::cap_preemption_charge`],
-    /// [`Config::inherited_seccomp`] or [`Config::replay_edited_preemptions`] takes
+    /// [`Config::inherited_seccomp`], [`Config::replay_edited_preemptions`] or
+    /// [`Config::virtual_timeout`] takes
     /// an element. Each gets a
     /// placeholder; [`super::from_legacy_backend_json`] replaces the first.
     struct LegacyPositions<'f, 'l, A> {
@@ -3363,6 +3396,7 @@ mod legacy_backend_json {
                     "in_guest_detlog_forward_policy"
                     | "launch_image"
                     | "scheduler_turn_cost"
+                    | "virtual_timeout"
                     | "pipe_wake_latency"
                     | "expired_wait_charge"
                     | "container_mount_table"
@@ -3649,6 +3683,7 @@ mod legacy_backend_json {
                 | "replaying"
                 | "scheduler_turn_cost"
                 | "cap_preemption_charge"
+                | "virtual_timeout"
                 | "inherited_seccomp"
                 | "cpu_profile"
                 | "cpu_profile_host"
@@ -4386,6 +4421,7 @@ mod tests {
                 | "replaying"
                 | "scheduler_turn_cost"
                 | "cap_preemption_charge"
+                | "virtual_timeout"
                 | "inherited_seccomp"
                 | "cpu_profile"
                 | "cpu_profile_host"
@@ -4419,7 +4455,7 @@ mod tests {
         // `in_guest_reserved_signals`, `in_guest_refuses_host_timed_producers`,
         // `launch_image`, `target_timeslice_syscalls_only`, `futex_wake_yields`,
         // `pipe_wake_latency`, `expired_wait_charge`, `replaying`, `scheduler_turn_cost`,
-        // `cap_preemption_charge`, `inherited_seccomp`, `cpu_profile`,
+        // `cap_preemption_charge`, `virtual_timeout`, `inherited_seccomp`, `cpu_profile`,
         // `cpu_profile_host`, `cpu_profile_source`,
         // `signal_state_copy`, `container_mount_table`,
         // `mountinfo_mount_namespace`, `directory_placeholder`,
@@ -4429,9 +4465,12 @@ mod tests {
         // `notice_host_network_abstract_binds`, `eager_lone_preemptions` and
         // `strict_schedule_boundaries`
         // none: fourteen more keys and thirty-three fewer, so nineteen keys fewer
+        // `annotated_priority_replay`, `virtual_cpus`,
+        // `notice_host_network_abstract_binds` and `strict_schedule_boundaries`
+        // none: fourteen more keys and thirty-four fewer, so twenty keys fewer
         // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 19);
+        assert_eq!(fields.len(), keys.len() + 20);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -5038,6 +5077,49 @@ mod tests {
         assert!(
             !old.cap_preemption_charge,
             "a configuration from before the option reads as off"
+        );
+    }
+
+    /// `virtual_timeout` crosses Reverie RPC in the positional bincode form,
+    /// set or not, and is rendered into the reproduce command; it never enters
+    /// DBT's legacy form, whose runtime `hermit run` refuses it for.
+    #[test]
+    fn virtual_timeout_round_trips_but_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            virtual_timeout: NonZeroU64::new(3_500_000_000),
+            ..off.clone()
+        };
+        assert!(
+            on.to_string().contains(" --virtual-timeout=3500000000"),
+            "{on}"
+        );
+        assert!(!off.to_string().contains("--virtual-timeout"), "{off}");
+        for config in [&off, &on] {
+            let wire = bincode::serde::encode_to_vec(config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(decoded.virtual_timeout, config.virtual_timeout);
+        }
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("virtual_timeout"), "{json}");
+        assert_eq!(
+            from_legacy_backend_json(&json).unwrap().virtual_timeout,
+            None
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert_eq!(
+            from_legacy_backend_json(&array).unwrap().virtual_timeout,
+            None
         );
     }
 

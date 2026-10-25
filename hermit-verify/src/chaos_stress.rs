@@ -34,11 +34,14 @@ const SKID_OVERSHOOT_REFUSAL_PREFIX: &str =
 /// Hermit's own outcomes that no guest produced, each the exit status from the
 /// allocation table in hermit-cli/src/lib.rs with the stderr marker that tells
 /// it apart from a guest choosing the same status. A run that ends in one of
-/// these says nothing about the guest.
+/// these says nothing about the guest. `--timeout`'s deadline is named by its
+/// class: `HERMIT_RUN_TIMEOUT class=virtual-timeout`, the same status for a
+/// `--virtual-timeout` bound, is a schedule that ran the guest past the bound,
+/// found like any other failure, as a guest deadlock is.
 const HERMIT_OUTCOMES: [(i32, &str); 5] = [
     (HERMIT_POLICY_REFUSAL_EXIT, "HERMIT_POLICY_REFUSAL "),
     (123, "HERMIT_LOG_CAP "),
-    (124, "HERMIT_RUN_TIMEOUT "),
+    (124, "HERMIT_RUN_TIMEOUT class=run-timeout"),
     (124, "HERMIT_RUN_TIMEOUT_FALLBACK"),
     (125, "HERMIT_INTERNAL_FAILURE "),
 ];
@@ -242,6 +245,18 @@ mod tests {
                 exited(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
                 "Deadlock detected: thread(s) waiting on futex, but no runnable threads left.\n\
                  HERMIT_GUEST_DEADLOCK class=guest-deadlock\n"
+            )
+            .unwrap(),
+            RunOutcome::Failed
+        );
+        // So is a schedule that ran the guest past --virtual-timeout; the
+        // wall-clock --timeout stays Hermit's own outcome (below).
+        assert_eq!(
+            classify(
+                exited(124),
+                "Virtual timeout: at scheduler turn 15, the run's virtual clock is 4004335665 ns \
+                 past its start, beyond --virtual-timeout=3500000000; no further turn is \
+                 granted.\nHERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=3500000000\n"
             )
             .unwrap(),
             RunOutcome::Failed

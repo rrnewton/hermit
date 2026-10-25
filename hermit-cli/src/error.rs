@@ -63,12 +63,13 @@ pub enum FailureKind {
     /// Carried so the parent can record the verification run as failed by its
     /// backend instead of leaving the pending no-result stamp.
     BackendRunFailure,
-    /// The GUEST deadlocked ([`crate::GuestDeadlocked`]): a guest outcome, not
-    /// a failure. Carried for the reason `RunTimeout` is: the child reports it
-    /// through this channel, after the run was unwound and finished, rather
-    /// than through the `HERMIT_GUEST_DEADLOCK_EXIT` status it exits with when
-    /// its backend cannot unwind the guest.
-    GuestDeadlock,
+    /// The run ended with a scheduler terminal outcome ([`crate::SchedulerEndedRun`]):
+    /// the GUEST deadlocked, or its virtual clock passed `--virtual-timeout`.
+    /// A guest outcome, not a failure. Carried for the reason `RunTimeout` is:
+    /// the child reports it through this channel, after the run was unwound
+    /// and finished, rather than through the outcome's status, which it exits
+    /// with when its backend cannot unwind the guest.
+    TerminalOutcome(detcore::TerminalOutcome),
 }
 
 /// ⚠️ THE `kind` FIELD IS THE THIRD AND LAST OF ONE CHAIN OF FLATTENINGS.
@@ -178,11 +179,11 @@ fn is_policy_refusal(err: &Error) -> bool {
 /// cleanup observations are deliberately unreachable from this function.
 pub(crate) fn classify_ptrace_primary(error: &reverie::Error) -> FailureKind {
     match error {
-        // A guest deadlock completes as the guest's outcome only when its
-        // teardown was clean (`ptrace_completion::is_guest_deadlock`). Left as
-        // the primary of a failed run, the teardown failed or never
+        // A terminal outcome completes as the guest's outcome only when its
+        // teardown was clean (`ptrace_completion::clean_terminal_outcome`).
+        // Left as the primary of a failed run, the teardown failed or never
         // confirmed, which is Hermit's failure.
-        reverie::Error::Tool(inner) if inner.is::<crate::GuestDeadlocked>() => FailureKind::Error,
+        reverie::Error::Tool(inner) if inner.is::<crate::SchedulerEndedRun>() => FailureKind::Error,
         reverie::Error::Tool(inner) => classify_unwrapped(inner),
         _ => FailureKind::Error,
     }
@@ -239,8 +240,8 @@ fn classify_unwrapped(error: &Error) -> FailureKind {
         FailureKind::PolicyRefusal
     } else if error.downcast_ref::<crate::GuestTimedOut>().is_some() {
         FailureKind::RunTimeout
-    } else if error.downcast_ref::<crate::GuestDeadlocked>().is_some() {
-        FailureKind::GuestDeadlock
+    } else if let Some(ended) = error.downcast_ref::<crate::SchedulerEndedRun>() {
+        FailureKind::TerminalOutcome(ended.outcome)
     } else if error.downcast_ref::<crate::BackendRunFailure>().is_some() {
         FailureKind::BackendRunFailure
     } else {
@@ -369,8 +370,20 @@ mod tests {
                 FailureKind::BackendRunFailure,
             ),
             (
-                Error::new(crate::GuestDeadlocked::new(None)),
-                FailureKind::GuestDeadlock,
+                Error::new(crate::SchedulerEndedRun::new(
+                    detcore::TerminalOutcome::GuestDeadlock,
+                    None,
+                )),
+                FailureKind::TerminalOutcome(detcore::TerminalOutcome::GuestDeadlock),
+            ),
+            (
+                Error::new(crate::SchedulerEndedRun::new(
+                    detcore::TerminalOutcome::VirtualTimeout { bound_ns: 9 },
+                    None,
+                )),
+                FailureKind::TerminalOutcome(detcore::TerminalOutcome::VirtualTimeout {
+                    bound_ns: 9,
+                }),
             ),
             (
                 Error::new(crate::SkidOvershootError::new(2)),
@@ -516,16 +529,24 @@ mod tests {
         );
     }
 
-    /// A finished run's guest deadlock is the guest's outcome; one left as the
-    /// primary of a failed ptrace run (its teardown failed or never confirmed)
-    /// is Hermit's failure, so the unclean teardown is not reported as the
-    /// guest's.
+    /// A finished run's terminal outcome (a guest deadlock, a virtual
+    /// timeout) is the guest's outcome and crosses the container boundary
+    /// with its kind; one left as the primary of a failed ptrace run (its
+    /// teardown failed or never confirmed) is Hermit's failure, so the unclean
+    /// teardown is not reported as the guest's.
     #[test]
-    fn a_guest_deadlock_is_the_guests_outcome_only_once_the_run_finished() {
-        let finished = SerializableError::from(Error::new(crate::GuestDeadlocked::new(None)));
-        assert_eq!(finished.kind(), FailureKind::GuestDeadlock);
-        let primary = reverie::Error::Tool(Error::new(crate::GuestDeadlocked::new(None)));
-        assert_eq!(classify_ptrace_primary(&primary), FailureKind::Error);
+    fn a_terminal_outcome_is_the_guests_only_once_the_run_finished() {
+        for outcome in [
+            detcore::TerminalOutcome::GuestDeadlock,
+            detcore::TerminalOutcome::VirtualTimeout { bound_ns: 5 },
+        ] {
+            let finished =
+                SerializableError::from(Error::new(crate::SchedulerEndedRun::new(outcome, None)));
+            assert_eq!(finished.kind(), FailureKind::TerminalOutcome(outcome));
+            let primary =
+                reverie::Error::Tool(Error::new(crate::SchedulerEndedRun::new(outcome, None)));
+            assert_eq!(classify_ptrace_primary(&primary), FailureKind::Error);
+        }
     }
 
     /// An in-guest-trap refusal names that backend and keeps the same class.

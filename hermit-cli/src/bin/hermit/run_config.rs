@@ -1012,6 +1012,7 @@ mod tests {
         ),
         ("scheduler-turn-cost", &["--scheduler-turn-cost=10000"]),
         ("cap-preemption-charge", &["--cap-preemption-charge"]),
+        ("virtual-timeout", &["--virtual-timeout=1000"]),
         ("sigint-instakill", &["--sigint-instakill"]),
         ("warn-non-zero-binds", &["--warn-non-zero-binds"]),
         ("sched-heuristic", &["--sched-heuristic=random"]),

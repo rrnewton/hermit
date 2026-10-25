@@ -132,10 +132,15 @@ pub enum VerifyRunOutcome {
         /// the log (LiteInst, SaBRe); `None` on a backend that forwards none.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         forwarded_syscalls: Option<u64>,
-        /// The guest deadlocked (`hermit::GuestDeadlocked`); `status` is then
+        /// The guest deadlocked (`hermit::SchedulerEndedRun`); `status` is then
         /// `HERMIT_GUEST_DEADLOCK_EXIT`, which the guest never exited with.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         guest_deadlock: bool,
+        /// The run's virtual clock passed `--virtual-timeout`, this bound in
+        /// virtual nanoseconds (`hermit::SchedulerEndedRun`); `status` is then 124,
+        /// which the guest never exited with.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        virtual_timeout_ns: Option<u64>,
     },
     /// A typed failure of the run stopped it ([`RunFailure`]).
     RunFailed {

@@ -57,6 +57,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::vec::IntoIter;
 
+pub use detcore_model::TerminalOutcome;
 use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::Position;
 use detcore_model::happens_before::Strength;
@@ -1423,7 +1424,9 @@ pub struct Scheduler {
     /// (`scheduler::pipe_wake`).
     pipe_handoff_pending: BTreeMap<DetTid, Vec<DetTid>>,
     /// Processes a delivered signal with a fatal default action has doomed,
-    /// read only by the `--pipe-wake-latency` scan (`scheduler::pipe_wake`).
+    /// recorded under `--pipe-wake-latency` or `--virtual-timeout` and read
+    /// through [`Scheduler::thread_is_doomed`] by the pipe hand-off scan and
+    /// the virtual bound (`a_thread_can_still_be_granted`).
     fatal_signal_doomed: BTreeSet<DetPid>,
     /// Whether the `--pipe-wake-latency` hand-off has logged that it is inert.
     pipe_wake_inert_logged: bool,
@@ -1587,23 +1590,40 @@ pub struct Scheduler {
     terminal_deadlock: Option<String>,
 
     /// A scheduler turn refused because its configured charge would pass the
-    /// end of representable virtual time (`--scheduler-turn-cost`). Like
-    /// [`Scheduler::terminal_deadlock`], `bump_global_time` records it and
-    /// `sched_loop_inner` prints it and exits, because a panic in the
-    /// scheduler task would leave every guest parked. Both turn functions
-    /// return as soon as it is set, before any maintenance, selection, grant
-    /// or signal observation, so nothing new waits on a guest.
+    /// end of representable virtual time (`--scheduler-turn-cost`), or a
+    /// committed clock found behind the run's start while `--virtual-timeout`
+    /// measures it. Like [`Scheduler::terminal_deadlock`], `bump_global_time`
+    /// records it and `sched_loop_inner` prints it and exits, because a panic
+    /// in the scheduler task would leave every guest parked. Both turn
+    /// functions return as soon as it is set, before any selection, grant or
+    /// signal observation, so nothing new waits on a guest.
     terminal_clock_exhaustion: Option<String>,
+
+    /// `--virtual-timeout`, in virtual nanoseconds: the most the committed
+    /// global virtual time may pass the run's start before the run ends.
+    virtual_timeout: Option<u64>,
+
+    /// The rendered report of a pass of [`Scheduler::virtual_timeout`], once
+    /// `bump_global_time` committed a time beyond it
+    /// (`note_virtual_timeout`). The turn functions return as soon as it is
+    /// set, as for `terminal_clock_exhaustion`, so no turn is granted past
+    /// the bound; `sched_loop_inner` prints it and ends the run with
+    /// [`TerminalOutcome::VirtualTimeout`].
+    terminal_virtual_timeout: Option<String>,
+    /// Whether a commit past `--virtual-timeout` already recorded the
+    /// determinism loss of deciding after a SIGKILL whose victim could not be
+    /// named (`note_virtual_timeout`), so it is recorded once.
+    virtual_timeout_loss_noted: bool,
 
     /// What `terminal_deadlock` means, which decides the status the run ends
     /// with ([`TerminalKind`]). Set with the report it describes, so the first
     /// verdict keeps its kind.
     terminal_kind: TerminalKind,
 
-    /// The run ended with a guest deadlock that its backend unwound
-    /// (`unwind_guest_deadlock`): the teardown that follows is that outcome,
-    /// not a failure, and the run summary says so.
-    guest_deadlocked: bool,
+    /// The terminal outcome the run ended with, when its backend unwound the
+    /// guest for it (`unwind_terminal_outcome`): the teardown that follows is
+    /// that outcome, not a failure, and the run summary says so.
+    terminal_outcome: Option<TerminalOutcome>,
 
     /// The scheduler turn at which the shared logical-empty observation last
     /// logged "zero threads left anywhere, fizzling.", while that state lasts.
@@ -3461,19 +3481,24 @@ async fn sched_loop_inner(
         // is all the parent's classifier sees of it.
         let terminal = sched.lock().unwrap().take_terminal_verdict();
         if let Some((report, kind)) = terminal {
-            crate::host_timed_producers::emit_run_end_log();
-            eprintln!("{}", report);
-            // A backend that can unwind the parked guest ends the run itself,
-            // so the guest's output, the log and any recording are finished as
-            // for a run that exited. The scheduler grants nothing more; if
-            // another cause ended the run first, that cause's path finishes it.
-            if kind == TerminalKind::GuestDeadlock && unwind_guest_deadlock(&sched).is_some() {
+            if kind == TerminalKind::GuestDeadlock {
+                end_run_with_outcome(&sched, TerminalOutcome::GuestDeadlock, &report);
                 return;
             }
+            crate::host_timed_producers::emit_run_end_log();
+            eprintln!("{}", report);
             if kind != TerminalKind::Refusal {
                 report_terminal_deadlock_to_hook(&report);
             }
             std::process::exit(kind.exit_status());
+        }
+        // The run's virtual clock passed --virtual-timeout
+        // (`note_virtual_timeout`): reported and ended like a guest deadlock,
+        // so the report is the same in every run.
+        let virtual_timeout = sched.lock().unwrap().take_virtual_timeout();
+        if let Some((report, outcome)) = virtual_timeout {
+            end_run_with_outcome(&sched, outcome, &report);
+            return;
         }
         // Virtual time ran out under a configured --scheduler-turn-cost: end
         // the run the same way, rather than saturate the clock.
@@ -3887,9 +3912,10 @@ async fn do_ordinary_turn_blocking(
             let arc = global_time.clone();
 
             let next_outstanding = mg.step1_check_quiescence(&arc, last_turn);
-            // A refused charge ends the turn here, before any maintenance,
-            // selection or grant; `sched_loop_inner` then reports it and exits.
-            if mg.terminal_clock_exhaustion.is_some() {
+            // A refused charge, or a committed time past --virtual-timeout,
+            // ends the turn here, before any maintenance, selection or grant;
+            // `sched_loop_inner` then reports it and ends the run.
+            if mg.virtual_clock_ends_run() {
                 return Err(SkipTurn);
             }
             match next_outstanding {
@@ -3978,10 +4004,11 @@ pub async fn do_a_turn_blocking(
                     if !charged {
                         state.bump_global_time(&global_time, last_turn);
                         charged = true;
-                        // A refused charge ends the turn before maintenance,
+                        // A refused charge, or a committed time past
+                        // --virtual-timeout, ends the turn before maintenance,
                         // alarm selection, signal observations or grants can
-                        // start; `sched_loop_inner` reports it and exits.
-                        if state.terminal_clock_exhaustion.is_some() {
+                        // start; `sched_loop_inner` reports it and ends the run.
+                        if state.virtual_clock_ends_run() {
                             return Err(SkipTurn);
                         }
                     } else if refresh {
@@ -3990,7 +4017,9 @@ pub async fn do_a_turn_blocking(
                         // due check leaves the one-event budget available; an
                         // actual pop consumes it until this turn returns.
                         state.bump_global_time(&global_time, &Err(SkipTurn));
-                        if state.replay_waits_before_maintenance() {
+                        // A refreshed time can pass --virtual-timeout too.
+                        if state.virtual_clock_ends_run() || state.replay_waits_before_maintenance()
+                        {
                             return Err(SkipTurn);
                         }
                         if !timed_event_processed {
@@ -4245,7 +4274,7 @@ impl TerminalKind {
     pub(crate) fn exit_status(self) -> i32 {
         match self {
             Self::HermitStall => FATAL_EXIT_STATUS,
-            Self::GuestDeadlock => detcore_model::HERMIT_GUEST_DEADLOCK_EXIT,
+            Self::GuestDeadlock => TerminalOutcome::GuestDeadlock.exit_status(),
             Self::Refusal => detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
         }
     }
@@ -4281,66 +4310,116 @@ fn report_terminal_deadlock_to_hook(report: &str) {
 /// cannot account for, so it reports an internal failure.
 const FATAL_EXIT_STATUS: i32 = 1;
 
-/// How a run whose backend can unwind a deadlocked guest ends it, in place of
-/// the scheduler exiting the process: it asks the backend to tear the parked
-/// guest down and finish the run (the ptrace owner publishes a termination, as
-/// `--timeout` does), and returns whether that request became the run's cause.
-/// Called once, from the scheduler task with no scheduler lock held, after the
-/// report is printed; it must not block.
-pub type GuestDeadlockUnwind = Box<dyn FnOnce() -> bool>;
+/// How a run whose backend can unwind the parked guest ends it with a
+/// [`TerminalOutcome`], in place of the scheduler exiting the process: it asks
+/// the backend to tear the guest down and finish the run (the ptrace owner
+/// publishes a termination, as `--timeout` does), and returns whether that
+/// request became the run's cause. Called at most once, from the scheduler
+/// task with no scheduler lock held, after the outcome's report is printed; it
+/// must not block.
+pub type TerminalOutcomeUnwind = Box<dyn FnOnce(TerminalOutcome) -> bool>;
 
 thread_local! {
     /// The unwind of the run this thread drives. Per thread because a run's
     /// scheduler task runs on the thread that drives the run (ptrace's
     /// current-thread runtime on its tracer thread), and concurrent runs have
     /// threads of their own.
-    static GUEST_DEADLOCK_UNWIND: std::cell::RefCell<Option<GuestDeadlockUnwind>> =
+    static TERMINAL_OUTCOME_UNWIND: std::cell::RefCell<Option<TerminalOutcomeUnwind>> =
         const { std::cell::RefCell::new(None) };
 }
 
-/// Installs a run's [`GuestDeadlockUnwind`] on the calling thread while it
-/// lives. Without one a guest deadlock exits the process with
-/// `HERMIT_GUEST_DEADLOCK_EXIT`, which the parent recognises the same way.
-/// Whether the run's guest deadlocked is then [`GlobalState::guest_deadlocked`].
+/// Installs a run's [`TerminalOutcomeUnwind`] on the calling thread while it
+/// lives. Without one a terminal outcome exits the process with
+/// [`TerminalOutcome::exit_status`], which the parent recognises the same way.
+/// Whether, and with which outcome, the run ended is then
+/// [`GlobalState::terminal_outcome`].
 ///
-/// [`GlobalState::guest_deadlocked`]: crate::GlobalState::guest_deadlocked
+/// [`GlobalState::terminal_outcome`]: crate::GlobalState::terminal_outcome
 #[must_use = "the unwind is removed when the guard drops"]
-pub struct GuestDeadlockUnwindGuard(());
+pub struct TerminalOutcomeUnwindGuard(());
 
-impl GuestDeadlockUnwindGuard {
+impl TerminalOutcomeUnwindGuard {
     /// Install `unwind` for the run this thread drives, replacing any other.
-    pub fn install(unwind: GuestDeadlockUnwind) -> Self {
-        GUEST_DEADLOCK_UNWIND.with(|slot| *slot.borrow_mut() = Some(unwind));
+    pub fn install(unwind: TerminalOutcomeUnwind) -> Self {
+        TERMINAL_OUTCOME_UNWIND.with(|slot| *slot.borrow_mut() = Some(unwind));
         Self(())
     }
 }
 
-impl Drop for GuestDeadlockUnwindGuard {
+impl Drop for TerminalOutcomeUnwindGuard {
     fn drop(&mut self) {
-        GUEST_DEADLOCK_UNWIND.with(|slot| slot.borrow_mut().take());
+        TERMINAL_OUTCOME_UNWIND.with(|slot| slot.borrow_mut().take());
     }
 }
 
-/// Hand a guest deadlock to the unwind installed on this thread, if any:
+/// Hand a terminal outcome to the unwind installed on this thread, if any:
 /// `None` without one, else whether the unwind's request won. The run is
-/// marked deadlocked only when it did, so a run that ended for another cause
-/// first keeps that cause's outcome. Finding none, as a scheduler moved off
-/// the thread that drives its run would, falls back to exiting with
-/// `HERMIT_GUEST_DEADLOCK_EXIT`.
-fn unwind_guest_deadlock(sched: &Mutex<Scheduler>) -> Option<bool> {
-    let unwind = GUEST_DEADLOCK_UNWIND.with(|slot| slot.borrow_mut().take())?;
+/// marked with the outcome only when it did, so a run that ended for another
+/// cause first keeps that cause's outcome. Finding none, as a scheduler moved
+/// off the thread that drives its run would, falls back to exiting with the
+/// outcome's status.
+fn unwind_terminal_outcome(sched: &Mutex<Scheduler>, outcome: TerminalOutcome) -> Option<bool> {
+    let unwind = TERMINAL_OUTCOME_UNWIND.with(|slot| slot.borrow_mut().take())?;
     {
         let mut sched = sched.lock().unwrap();
         // Set before the request, whose teardown reports to the scheduler
         // synchronously (`report_backend_failure_location`).
-        sched.guest_deadlocked = true;
+        sched.terminal_outcome = Some(outcome);
         // The request kills every remaining guest thread, and their deaths
         // arrive in host order: retire them now, in DetTid order.
         sched.retire_threads_at_unwind();
     }
-    let won = unwind();
-    sched.lock().unwrap().guest_deadlocked = won;
+    let won = unwind(outcome);
+    sched.lock().unwrap().terminal_outcome = won.then_some(outcome);
     Some(won)
+}
+
+/// What a process does with a `--virtual-timeout` bound, in virtual
+/// nanoseconds, just before the scheduler exits it with 124 because no
+/// [`TerminalOutcomeUnwind`] took the outcome. The status is all that
+/// crosses the process boundary, and 124 is every deadline's status, so a
+/// parent that forked the process learns of the virtual timeout through this
+/// hook instead.
+pub type VirtualTimeoutExitHook = fn(u64);
+
+static VIRTUAL_TIMEOUT_EXIT_HOOK: Mutex<Option<VirtualTimeoutExitHook>> = Mutex::new(None);
+
+/// Install (or, with `None`, remove) the [`VirtualTimeoutExitHook`]. A process
+/// forked after this inherits it.
+pub fn set_virtual_timeout_exit_hook(hook: Option<VirtualTimeoutExitHook>) {
+    *VIRTUAL_TIMEOUT_EXIT_HOOK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = hook;
+}
+
+/// End the run with `outcome`: print its `report`, then hand it to the run's
+/// [`TerminalOutcomeUnwind`], so the guest's output, the log and any
+/// recording are finished as for a run that exited, or, without one, exit the
+/// process with the outcome's status. Returns only when an unwind took it; the
+/// scheduler grants nothing more, and if another cause ended the run first,
+/// that cause's path finishes it.
+///
+/// Printed with `eprintln!` rather than `tracing::error!`: the tracing writer
+/// prefixes a real wall-clock timestamp, and the report is required to be
+/// byte-identical across runs of the same program.
+fn end_run_with_outcome(sched: &Mutex<Scheduler>, outcome: TerminalOutcome, report: &str) {
+    crate::host_timed_producers::emit_run_end_log();
+    eprintln!("{}", report);
+    if unwind_terminal_outcome(sched, outcome).is_some() {
+        return;
+    }
+    match outcome {
+        TerminalOutcome::GuestDeadlock => report_terminal_deadlock_to_hook(report),
+        TerminalOutcome::VirtualTimeout { bound_ns } => {
+            let hook = *VIRTUAL_TIMEOUT_EXIT_HOOK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(hook) = hook {
+                hook(bound_ns);
+            }
+        }
+    }
+    std::process::exit(outcome.exit_status());
 }
 
 /// Until panics are escalated properly, this encapsulates a way to exit the hermit container
@@ -4675,8 +4754,11 @@ impl Scheduler {
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
             terminal_clock_exhaustion: None,
+            virtual_timeout: cfg.virtual_timeout.map(u64::from),
+            terminal_virtual_timeout: None,
+            virtual_timeout_loss_noted: false,
             terminal_kind: TerminalKind::default(),
-            guest_deadlocked: false,
+            terminal_outcome: None,
             empty_queue_kick_turn: None,
             backend_failure: None,
             backend_failure_sender: Some(backend_failure_sender),
@@ -5115,6 +5197,7 @@ impl Scheduler {
         // fatal signal doomed.
         self.namespace_zap_victims.remove(&dettid);
         self.signal_death_victims.remove(&dettid);
+        self.fatal_signal_doomed.remove(&dettid);
     }
 
     pub(crate) fn note_process_sigkill(
@@ -7095,13 +7178,14 @@ impl Scheduler {
         if self.run_queue.tentative_pop_in_progress() {
             self.run_queue.undo_tentative_pop();
         }
-        if self.guest_deadlocked {
-            // The backend tearing down the deadlocked guest it was handed
-            // (`GuestDeadlockUnwind`): the run's outcome, not a failure. Kept
-            // out of the INFO records `--verify` compares, which a host pid
-            // (`--no-namespace`) must not reach.
+        if let Some(outcome) = self.terminal_outcome {
+            // The backend tearing down the guest it was handed with a terminal
+            // outcome (`TerminalOutcomeUnwind`): the run's outcome, not a
+            // failure. Kept out of the INFO records `--verify` compares, which
+            // a host pid (`--no-namespace`) must not reach.
             tracing::debug!(
-                "unwinding the deadlocked guest: process {}, task {:?}, phase {}",
+                "unwinding the guest after {:?}: process {}, task {:?}, phase {}",
+                outcome,
                 event.pid,
                 event.tid,
                 event.phase
@@ -9256,7 +9340,7 @@ impl Scheduler {
     /// whose number can depend on host timing (a skipped pass, the KVM loop's
     /// refreshes), do not look again: an operation-count upgrade one of them
     /// runs is seen at the next committed time, in every run alike. A thread a
-    /// committed decision doomed (`poller_is_doomed`) may still be queued or
+    /// committed decision doomed (`thread_is_doomed`) may still be queued or
     /// not, at host-timed moments: its retry is not readied and it is not
     /// counted in the INFO line, and once a SIGKILL's victim could not be
     /// named no retry is readied at all, as for `ready_channel`.
@@ -9280,7 +9364,7 @@ impl Scheduler {
                 .run_queue
                 .upgrade_pollers()
                 .into_iter()
-                .filter(|tid| !self.unresolved_sigkill && !self.poller_is_doomed(*tid))
+                .filter(|tid| !self.unresolved_sigkill && !self.thread_is_doomed(*tid))
                 .count();
             let readied = if self.unresolved_sigkill {
                 0
@@ -9311,7 +9395,7 @@ impl Scheduler {
         let queued: Vec<DetTid> = self.run_queue.tids().copied().collect();
         let mut readied = 0;
         for tid in queued {
-            if self.poller_is_doomed(tid) {
+            if self.thread_is_doomed(tid) {
                 continue;
             }
             let Some(request) = self
@@ -10649,6 +10733,7 @@ impl Scheduler {
         self.work_span_forget_exit(parent, child);
         self.completed_physical_process_exits.remove(&child);
         self.sigkilled_processes.remove(&child);
+        self.fatal_signal_doomed.remove(&child);
         self.thread_tree.process_parent.remove(&child);
         self.thread_tree.process_wait.remove(&child);
         self.thread_tree.child_subreapers.remove(&child);
@@ -14005,7 +14090,7 @@ impl Scheduler {
     ///
     /// Records the report as [`TerminalKind::GuestDeadlock`] and returns
     /// [`SkipTurn`] rather than panicking. `sched_loop_inner` picks it up and
-    /// hands it to the backend's [`GuestDeadlockUnwind`], or exits the container
+    /// hands it to the backend's [`TerminalOutcomeUnwind`], or exits the container
     /// with `HERMIT_GUEST_DEADLOCK_EXIT` next to the two existing
     /// `--stop-after-*` fatal exits. A panic here would NOT end the
     /// run: the scheduler is a `tokio::spawn`ed task whose panic the harness
@@ -14098,9 +14183,102 @@ impl Scheduler {
         self.take_terminal_deadlock().map(|report| (report, kind))
     }
 
-    /// Whether the run ended with a guest deadlock its backend unwound.
-    pub(crate) fn guest_deadlocked(&self) -> bool {
-        self.guest_deadlocked
+    /// The terminal outcome the run ended with, when its backend unwound the
+    /// guest for it.
+    pub(crate) fn terminal_outcome(&self) -> Option<TerminalOutcome> {
+        self.terminal_outcome
+    }
+
+    /// Whether the virtual clock committed this turn ends the run: a charge
+    /// refused at the end of representable time (`terminal_clock_exhaustion`)
+    /// or a time past `--virtual-timeout` (`terminal_virtual_timeout`). The
+    /// turn functions return before anything else once it holds.
+    fn virtual_clock_ends_run(&self) -> bool {
+        self.terminal_clock_exhaustion.is_some() || self.terminal_virtual_timeout.is_some()
+    }
+
+    /// `--virtual-timeout`: once the committed global virtual time is more
+    /// than the bound past the run's start, and some thread could still be
+    /// granted a turn, record the report that ends the run. `elapsed` is
+    /// [`GlobalTime::elapsed_nanos`] at the snapshot that committed time was
+    /// taken from, the quantity a run summary reports as `virttime_elapsed`;
+    /// it is the only input the decision reads besides that thread set, and
+    /// it differs from the committed time every compared `COMMIT` record
+    /// carries by the run's constant start. Reading it neither moves nor
+    /// rounds the clock.
+    ///
+    /// A commit past the bound once no thread can be granted a turn (the last
+    /// one's exit was granted, or a committed decision doomed its process)
+    /// records nothing: the guest has ended, and the turn could grant nothing
+    /// to stop. A SIGKILL whose victim could not be named (a pidfd Detcore did
+    /// not record, `unresolved_sigkill`) leaves that victim counted until its
+    /// host-timed deregistration, so a decision taken after one is recorded as
+    /// a determinism loss. A clock behind its own start is a broken invariant,
+    /// the one the summary refuses too; it ends the run as Hermit's failure
+    /// rather than turn the bound off.
+    fn note_virtual_timeout(&mut self, elapsed: Option<LogicalTime>) {
+        let Some(bound_ns) = self.virtual_timeout else {
+            return;
+        };
+        let Some(elapsed) = elapsed else {
+            self.terminal_clock_exhaustion.get_or_insert_with(|| {
+                format!(
+                    "HERMIT_DEADLOCK: committed global virtual time {} is before the run's \
+                     start, so --virtual-timeout={} cannot be measured",
+                    self.committed_time, bound_ns
+                )
+            });
+            return;
+        };
+        let elapsed = elapsed.as_nanos();
+        if elapsed <= bound_ns || self.terminal_virtual_timeout.is_some() {
+            return;
+        }
+        if self.unresolved_sigkill && !self.virtual_timeout_loss_noted {
+            self.virtual_timeout_loss_noted = true;
+            self.note_determinism_loss(format!(
+                "--virtual-timeout={bound_ns} was decided at scheduler turn {} after a SIGKILL \
+                 whose victim could not be named, which counts as a thread a turn could be \
+                 granted to until its host-timed deregistration",
+                self.turn
+            ));
+        }
+        if self.a_thread_can_still_be_granted() {
+            self.terminal_virtual_timeout = Some(format!(
+                "Virtual timeout: at scheduler turn {}, the run's virtual clock is {} ns past \
+                 its start, beyond --virtual-timeout={}; no further turn is granted.",
+                self.turn, elapsed, bound_ns
+            ));
+        }
+    }
+
+    /// Whether some registered guest thread could still be granted a turn:
+    /// one whose own exit was not granted (`committed_exits`) and whose
+    /// process no committed turn marked doomed (`thread_is_doomed`: a granted
+    /// exit, a committed SIGKILL, an exec in flight or a delivered fatal
+    /// signal; or the exit grant of its PID namespace's init,
+    /// `namespace_zap_victims`). A doomed thread leaves the scheduler at a
+    /// host-timed moment, so whether it still has a `next_turns` entry must
+    /// not decide this. The marks err toward too much (a process-group SIGKILL
+    /// that fails keeps its members marked; a failed exec keeps its threads
+    /// marked), so a marked process that survives is not stopped by the bound,
+    /// the same way in every run.
+    fn a_thread_can_still_be_granted(&self) -> bool {
+        self.next_turns.keys().any(|tid| {
+            !self.committed_exits.contains(tid)
+                && !self.thread_is_doomed(*tid)
+                && !self
+                    .thread_tree
+                    .process_of(*tid)
+                    .is_some_and(|process| self.namespace_zap_victims.contains(&process))
+        })
+    }
+
+    /// Take a pending `--virtual-timeout` report with its outcome.
+    fn take_virtual_timeout(&mut self) -> Option<(String, TerminalOutcome)> {
+        let report = self.terminal_virtual_timeout.take()?;
+        let bound_ns = self.virtual_timeout?;
+        Some((report, TerminalOutcome::VirtualTimeout { bound_ns }))
     }
 
     /// Test seam: see [`SchedLoopPoint`].
@@ -15898,8 +16076,9 @@ impl Scheduler {
             });
 
         // At this moment, when threads are parked, we know that the global_time is
-        // frozen and we can read it without any race.
-        let snapshot: LogicalTime = {
+        // frozen and we can read it without any race. The time elapsed since
+        // the run's start is read in the same hold, for `--virtual-timeout`.
+        let (snapshot, elapsed): (LogicalTime, Option<LogicalTime>) = {
             let mut gtime = global_time.lock().unwrap();
 
             if self.run_queue.is_empty() && self.blocked.only_external_blocked() {
@@ -15978,7 +16157,7 @@ impl Scheduler {
                     );
                 }
             }
-            gtime.as_nanos()
+            (gtime.as_nanos(), gtime.elapsed_nanos())
         };
         // Taken at every bump, a skipped one included, so it never outlives
         // the turn its grant began.
@@ -16028,6 +16207,9 @@ impl Scheduler {
                 self.committed_time = snapshot;
             }
         }
+        // `committed_time` is now `snapshot`, whose distance from the run's
+        // start is `elapsed`.
+        self.note_virtual_timeout(elapsed);
         // O3: every turn of an observable process has quiesced, and no pop or
         // grant of the next pass has run yet.
         self.reconcile_inactive_alarms(self.committed_time);
@@ -17858,6 +18040,8 @@ impl Scheduler {
         for histogram in self.per_thread_syscall_histograms.values() {
             histogram.add_to(&mut syscall_histogram);
         }
+        let (guest_deadlock, virtual_timeout_ns) =
+            TerminalOutcome::to_fields(self.terminal_outcome);
 
         // After the record is flushed and each thread's DESYNC line is
         // logged above: the re-recorded history survives as evidence, and the
@@ -17896,7 +18080,8 @@ impl Scheduler {
                 // GlobalState keeps the host-input records.
                 host_inputs: None,
                 host_inputs_changed: Vec::new(),
-                guest_deadlock: self.guest_deadlocked,
+                guest_deadlock,
+                virtual_timeout_ns,
             },
             info_reprio_descrip,
         ))
@@ -34851,28 +35036,258 @@ mod test {
         );
 
         // Without an unwind on this thread the scheduler exits. With one it
-        // hands the deadlock over once, and the run reads as deadlocked only
-        // when the unwind's request became the run's cause.
+        // hands the outcome over once, and the run reads as having that
+        // outcome only when the unwind's request became the run's cause.
+        let deadlock = TerminalOutcome::GuestDeadlock;
         let sched = Mutex::new(Scheduler::new(&Config::default()));
-        assert_eq!(unwind_guest_deadlock(&sched), None);
+        assert_eq!(unwind_terminal_outcome(&sched, deadlock), None);
         for won in [true, false] {
             let calls = std::rc::Rc::new(std::cell::Cell::new(0));
             let counted = std::rc::Rc::clone(&calls);
-            let guard = GuestDeadlockUnwindGuard::install(Box::new(move || {
+            let guard = TerminalOutcomeUnwindGuard::install(Box::new(move |outcome| {
+                assert_eq!(outcome, deadlock);
                 counted.set(counted.get() + 1);
                 won
             }));
-            assert_eq!(unwind_guest_deadlock(&sched), Some(won));
-            assert_eq!(unwind_guest_deadlock(&sched), None, "called once");
+            assert_eq!(unwind_terminal_outcome(&sched, deadlock), Some(won));
+            assert_eq!(
+                unwind_terminal_outcome(&sched, deadlock),
+                None,
+                "called once"
+            );
             drop(guard);
             assert_eq!(calls.get(), 1);
-            assert_eq!(sched.lock().unwrap().guest_deadlocked(), won);
+            assert_eq!(
+                sched.lock().unwrap().terminal_outcome(),
+                won.then_some(deadlock)
+            );
         }
         // A removed unwind is not called.
-        drop(GuestDeadlockUnwindGuard::install(Box::new(|| {
+        drop(TerminalOutcomeUnwindGuard::install(Box::new(|_| {
             panic!("a removed unwind must not run")
         })));
-        assert_eq!(unwind_guest_deadlock(&sched), None);
+        assert_eq!(unwind_terminal_outcome(&sched, deadlock), None);
+    }
+
+    /// `--virtual-timeout` stops the run at the first commit of the global
+    /// clock that is more than the bound past the run's start, as a summary
+    /// measures elapsed time (`GlobalTime::elapsed_nanos`): a commit at
+    /// exactly the bound does not stop it, the next one past it does, and the
+    /// check leaves the committed time as it found it. Both turn functions
+    /// then end the turn (`virtual_clock_ends_run`), the report names the turn
+    /// and the elapsed time and nothing host-dependent, and the run ends with
+    /// the virtual-timeout outcome, handed to the run's unwind like a guest
+    /// deadlock. Without the option nothing is recorded, and a clock behind
+    /// the run's start ends the run as Hermit's failure instead of turning the
+    /// bound off.
+    #[test]
+    fn a_virtual_timeout_stops_the_run_at_the_first_commit_past_its_bound() {
+        let bound_ns = 3_000_000;
+        let config = Config {
+            virtual_timeout: std::num::NonZeroU64::new(bound_ns),
+            ..Config::default()
+        };
+        let time = Mutex::new(GlobalTime::new(&config));
+        let mut sched = Scheduler::new(&config);
+        // A live thread that a turn could still be granted to.
+        let thread = DetTid::from_raw(3);
+        sched.thread_tree.add_child(thread, thread, true);
+        register_known_thread(&mut sched, thread);
+        let advance_to = |sched: &mut Scheduler, elapsed: u64| {
+            let mut gtime = time.lock().unwrap();
+            let now = gtime.elapsed_nanos().unwrap().as_nanos();
+            gtime.add_extra_time(Duration::from_nanos(elapsed - now));
+            drop(gtime);
+            // A skipped turn charges nothing, so the clock is where the test
+            // put it.
+            sched.bump_global_time(&time, &Err(SkipTurn));
+        };
+        advance_to(&mut sched, bound_ns);
+        assert!(!sched.virtual_clock_ends_run(), "at the bound, not past it");
+        assert!(sched.take_virtual_timeout().is_none());
+
+        sched.turn = 41;
+        advance_to(&mut sched, bound_ns + 1);
+        let committed = sched.committed_time;
+        assert_eq!(committed, time.lock().unwrap().as_nanos(), "not moved");
+        assert!(sched.virtual_clock_ends_run());
+        // A later commit keeps the first report.
+        sched.turn = 42;
+        advance_to(&mut sched, bound_ns + 500);
+        let (report, outcome) = sched.take_virtual_timeout().expect("past the bound");
+        assert_eq!(
+            report,
+            "Virtual timeout: at scheduler turn 41, the run's virtual clock is 3000001 ns past \
+             its start, beyond --virtual-timeout=3000000; no further turn is granted."
+        );
+        assert_eq!(outcome, TerminalOutcome::VirtualTimeout { bound_ns });
+        assert!(!sched.virtual_clock_ends_run(), "taken");
+
+        let sched = Mutex::new(sched);
+        let guard = TerminalOutcomeUnwindGuard::install(Box::new(move |handed| {
+            assert_eq!(handed, outcome);
+            true
+        }));
+        assert_eq!(unwind_terminal_outcome(&sched, outcome), Some(true));
+        drop(guard);
+        let mut sched = sched.into_inner().unwrap();
+        assert_eq!(sched.terminal_outcome(), Some(outcome));
+        let (summary, _) = sched.generate_partial_run_summary_for_log(None).unwrap();
+        assert_eq!(summary.virtual_timeout_ns, Some(bound_ns));
+        assert!(!summary.guest_deadlock);
+
+        let mut unbounded = Scheduler::new(&Config::default());
+        let time = Mutex::new(GlobalTime::new(&Config::default()));
+        time.lock()
+            .unwrap()
+            .add_extra_time(Duration::from_secs(1_000_000));
+        unbounded.bump_global_time(&time, &Err(SkipTurn));
+        assert!(!unbounded.virtual_clock_ends_run());
+
+        let mut broken = Scheduler::new(&config);
+        broken.note_virtual_timeout(None);
+        assert!(broken.virtual_clock_ends_run());
+        assert!(broken.take_virtual_timeout().is_none());
+        let report = broken.terminal_clock_exhaustion.take().unwrap();
+        assert!(
+            report.starts_with("HERMIT_DEADLOCK: committed global virtual time"),
+            "{report}"
+        );
+    }
+
+    /// A commit past `--virtual-timeout` records nothing once no thread can be
+    /// granted a turn: after the last thread's death is recorded, after its
+    /// own exit was granted, or once a committed exit_group, fatal signal or
+    /// namespace end doomed its process, whether or not its host-timed
+    /// deregistration has arrived yet. The guest has then ended on its own,
+    /// and the last commit, which charges one more scheduler turn, must not
+    /// report it stopped by the bound. Each case has a baseline that fires
+    /// without the doom; a reused or reaped pid sheds it; and a decision
+    /// after a SIGKILL whose victim could not be named is a determinism loss.
+    #[test]
+    fn a_virtual_timeout_is_not_recorded_once_no_thread_can_be_granted_a_turn() {
+        let bound_ns = 1_000;
+        let config = Config {
+            virtual_timeout: std::num::NonZeroU64::new(bound_ns),
+            ..Config::default()
+        };
+        let leader = DetPid::from_raw(3);
+        let live = || {
+            let mut sched = Scheduler::new(&config);
+            sched.thread_tree.add_child(leader, leader, true);
+            register_known_thread(&mut sched, leader);
+            sched
+        };
+        let commit_past_the_bound = |sched: &mut Scheduler| {
+            let time = Mutex::new(GlobalTime::new(&config));
+            time.lock()
+                .unwrap()
+                .add_extra_time(Duration::from_nanos(bound_ns + 1));
+            sched.bump_global_time(&time, &Err(SkipTurn));
+            sched.virtual_clock_ends_run()
+        };
+        assert!(commit_past_the_bound(&mut live()), "a live thread");
+
+        let mut dead = live();
+        exit_process(&mut dead, leader);
+        assert!(!commit_past_the_bound(&mut dead), "the last thread's death");
+        let mut killed = live();
+        killed.logically_kill_thread(&leader, &leader, MmId::initial(leader));
+        assert!(!commit_past_the_bound(&mut killed), "a deregistration");
+        let mut exiting = live();
+        exiting.committed_exits.insert(leader);
+        assert!(!commit_past_the_bound(&mut exiting), "its own exit granted");
+        let mut doomed = live();
+        doomed.thread_tree.granted_exits.insert(leader);
+        assert!(!commit_past_the_bound(&mut doomed), "an exit_group granted");
+        assert!(doomed.take_virtual_timeout().is_none());
+
+        // A fatal signal delivered to one thread dooms its process, whose
+        // parked sibling stays registered until the host reports it gone.
+        // Without the leader, the sibling alone still lets the bound fire.
+        let sibling = DetTid::from_raw(4);
+        let two_threads = || {
+            let mut sched = live();
+            sched.thread_tree.add_child(leader, sibling, false);
+            register_known_thread(&mut sched, sibling);
+            sched
+        };
+        assert!(
+            commit_past_the_bound(&mut two_threads()),
+            "both threads live"
+        );
+        let mut sibling_only = two_threads();
+        sibling_only.committed_exits.insert(leader);
+        assert!(
+            commit_past_the_bound(&mut sibling_only),
+            "the sibling alone"
+        );
+        let mut signaled = two_threads();
+        signaled.record_committed_fatal_signal(leader);
+        assert!(!commit_past_the_bound(&mut signaled), "a fatal signal");
+
+        // The init of a PID namespace whose exit was granted takes its
+        // members with it at a host-chosen moment; the same member, not a
+        // victim, lets the bound fire.
+        let member = DetTid::from_raw(7);
+        let zapped = || {
+            let mut sched = ended_namespace_with_a_paused_member(member);
+            sched.virtual_timeout = Some(bound_ns);
+            sched
+        };
+        let mut spared = zapped();
+        spared.namespace_zap_victims.clear();
+        assert!(
+            commit_past_the_bound(&mut spared),
+            "the member, not a victim"
+        );
+        assert!(!commit_past_the_bound(&mut zapped()), "a namespace's end");
+
+        // A process reusing the pid of one a fatal signal doomed is a new
+        // process, as the clone path tells the scheduler.
+        let mut reused = live();
+        reused.record_committed_fatal_signal(leader);
+        reused.forget_committed_exit(leader);
+        assert!(commit_past_the_bound(&mut reused), "a reused pid");
+        let child = DetPid::from_raw(11);
+        let mut reaped = live();
+        reaped.thread_tree.add_child(leader, child, true);
+        reaped.record_committed_fatal_signal(child);
+        assert!(reaped.fatal_signal_doomed.contains(&child));
+        reaped.consume_child_wait(leader, child);
+        assert!(
+            !reaped.fatal_signal_doomed.contains(&child),
+            "a reaped child's doom"
+        );
+
+        // After a SIGKILL whose victim could not be named, the decision is
+        // recorded as a determinism loss, once.
+        let mut unnamed = live();
+        unnamed.record_unresolved_sigkill(None);
+        assert!(commit_past_the_bound(&mut unnamed), "an unnamed victim");
+        unnamed.terminal_virtual_timeout = None;
+        assert!(commit_past_the_bound(&mut unnamed), "decided again");
+        assert_eq!(unnamed.determinism_losses.len(), 1);
+        assert!(
+            unnamed.determinism_losses[0].contains("SIGKILL whose victim could not be named"),
+            "{:?}",
+            unnamed.determinism_losses
+        );
+        let mut named = live();
+        assert!(commit_past_the_bound(&mut named));
+        assert!(named.determinism_losses.is_empty());
+
+        // A live thread in another process still runs beside a doomed one,
+        // so the bound fires.
+        let other = DetPid::from_raw(9);
+        let mut beside = live();
+        beside.thread_tree.add_child(leader, other, true);
+        register_known_thread(&mut beside, other);
+        beside.record_committed_fatal_signal(leader);
+        assert!(
+            commit_past_the_bound(&mut beside),
+            "a live process beside a doomed one"
+        );
     }
 
     /// The unwind of a deadlocked guest kills every remaining thread, and the
@@ -34897,8 +35312,11 @@ mod test {
             Mutex::new(sched)
         };
         let unwound = |sched: &Mutex<Scheduler>| {
-            let guard = GuestDeadlockUnwindGuard::install(Box::new(|| true));
-            assert_eq!(unwind_guest_deadlock(sched), Some(true));
+            let guard = TerminalOutcomeUnwindGuard::install(Box::new(|_| true));
+            assert_eq!(
+                unwind_terminal_outcome(sched, TerminalOutcome::GuestDeadlock),
+                Some(true)
+            );
             drop(guard);
         };
 
