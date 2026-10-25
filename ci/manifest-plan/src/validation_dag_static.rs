@@ -1173,7 +1173,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // syscall_histogram::tests::the_pinned_table_names_every_countable_syscall_once
     // (the table a coverage report's never-exercised list comes from): 1857,
     // listed.
-    ("test.regular_crates", 1857),
+    // Caller-owned DBT evidence validation (dh-pp7q9): two grammar units,
+    // measured with the existing selection and exclusions unchanged.
+    ("test.regular_crates", 1859),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1800,7 +1802,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_adopted_ld_so_cache_role_becomes_the_runs_snapshot; and verify_inputs'
     // the_pair_program_follows_the_options_with_or_without_a_separator; and
     // a_misspelled_holder_option_is_refused_not_run: 1102, listed.
-    ("test.hermit_unit", 1102),
+    // Caller-owned DBT evidence validation (dh-pp7q9): one production-configuration refusal unit,
+    // measured with the existing selection and exclusions unchanged.
+    ("test.hermit_unit", 1103),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5480,7 +5484,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same three bisect search-input regressions: 1094, listed.
     // And the same HERMIT_CPU_PROFILE record_start test (848214c0): 1095, listed.
     // And the same seven ld.so.cache-sharing units: 1102, listed.
-    ("test.hermit_unit_on_host", 1102),
+    // Caller-owned DBT evidence validation (dh-pp7q9): one production-configuration refusal unit,
+    // measured with the existing selection and exclusions unchanged.
+    ("test.hermit_unit_on_host", 1103),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5677,7 +5683,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same eight syscall_histogram units: 1840, listed.
     // And the same two stress_series histogram row tests and the pinned-table
     // unit: 1843, listed.
-    ("test.regular_crates_on_host", 1843),
+    // Caller-owned DBT evidence validation (dh-pp7q9): two grammar units,
+    // measured with the existing selection and exclusions unchanged.
+    ("test.regular_crates_on_host", 1845),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

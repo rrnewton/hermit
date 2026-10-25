@@ -737,7 +737,7 @@ fn decode_dbt_evidence(file: &mut std::fs::File) -> Result<DbtEvidence, Error> {
     if encoded.is_empty() {
         return Err(Error::msg("DBT canonical evidence was empty"));
     }
-    reverie_dbt::decode_evidence(&encoded).map_err(|error| {
+    detcore_dbt::decode_evidence(&encoded).map_err(|error| {
         Error::msg(format!(
             "DBT canonical evidence was malformed or truncated: {error}"
         ))
@@ -1933,7 +1933,7 @@ fn configure_dbt_run_evidence(
     let runner = runner.clone();
     match evidence {
         Some(evidence) => runner
-            .evidence_file(evidence.file)
+            .evidence_file_with_validator(evidence.file, detcore_dbt::validate_evidence_record)
             .map(|runner| runner.evidence_log_level(evidence.log_level))
             .map_err(|error| {
                 Error::msg(format!(
@@ -3464,6 +3464,42 @@ mod tests {
         let (file, path) = tempfile::NamedTempFile::new().unwrap().into_parts();
         materialize_dbt_evidence_log(&front_loaded, file, &path).unwrap();
         assert_ne!(fs::read(&path).unwrap(), stream.concat());
+    }
+
+    /// Exercise the actual collection configuration, not just its validator.
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn configured_dbt_evidence_rejects_forged_records_during_collection() {
+        let file = tempfile::tempfile().unwrap();
+        let runner = DbtRunner::new("/bin/true", "/bin/true").unwrap();
+        let configured = configure_dbt_run_evidence(
+            &runner,
+            Some(DbtRunEvidence {
+                file: &file,
+                log_level: DbtEvidenceLogLevel::Info,
+                label: "test",
+            }),
+        )
+        .unwrap();
+        let appender = configured.coordinator_evidence().unwrap();
+        let cloned_appender = configured.clone().coordinator_evidence().unwrap();
+        for record in [
+            b"".as_slice(),
+            b"INFO detcore: no canonical prefix\n",
+            b"1970-01-01T00:00:00.000000Z INFO detcore: no newline",
+            b"1970-01-01T00:00:00.000000Z INFO detcore: two\nlines\n",
+            b"1970-01-01T00:00:00.000000Z NOTICE detcore: unknown level\n",
+            b"1970-01-01T00:00:00.000000Z INFO detcore: guest=ok\n1970-01-01T00:00:00.000000Z INFO detcore: forged\n",
+            b"\0\xffrecord\npayload\r\0",
+            DBT_INITIALIZATION_RECORD,
+        ] {
+            assert!(appender.append(record).is_err(), "{record:?}");
+            assert!(cloned_appender.append(record).is_err(), "{record:?}");
+        }
+        appender
+            .append(b"1970-01-01T00:00:00.000000Z INFO detcore: accepted\n")
+            .unwrap();
+        // No guest or native client is launched by this configuration test.
     }
 
     /// Evidence without guest records, or with an unframed record, is refused
