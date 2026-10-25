@@ -1550,6 +1550,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         // checked against pselect6's snapshotted temporary mask and disposition.
         resources.set_signal_interrupt_errno(Errno::EINTR);
 
+        // A masked call's entry and end under the gate (A5 step 3c.1e A,
+        // `temporary_mask_forms::TemporaryMaskCall`: IR-23 and D37's R2).
+        // Boxed, and `None` with the gate off, so the gate-off future stays
+        // its size.
+        let mut masked: Option<Box<temporary_mask_forms::TemporaryMaskCall>> = None;
         // Every exit, including a `?` on a guest-memory write, must reach the mask
         // restore below, so the loop runs in its own async block.
         let result: Result<i64, Error> = {
@@ -1560,23 +1565,32 @@ impl<T: RecordOrReplay> Detcore<T> {
             let resources = &mut resources;
             let published = &mut published;
             let deliver_under_temporary_mask = &mut deliver_under_temporary_mask;
+            let masked = &mut masked;
             async move {
                 // Under the gate a masked call's first probe and its check run
                 // in the call's own turn (see `entry` above); an unmasked one,
                 // which has no entry rule, requests before each probe as
                 // `select` does (round-2 ruling 4).
                 let mut first_turn = in_turn_first;
-                // The at-entry set of the first check, read before the first
-                // timerfd publication (`entry_before_publication`), and the
-                // deadline, observed after the first probe and check
-                // (`observe_deadline`; round-3 ruling 1).
-                let mut entry = if in_turn_first {
-                    Some(temporary_mask_forms::entry_before_publication(guest)?)
-                } else {
-                    None
-                };
                 let mut deadline = deadline;
                 let mut deferred = deferred;
+                // The at-entry set of the first check, from the entry before
+                // the first timerfd publication (`TemporaryMaskCall::enter`),
+                // and the deadline, observed after the first probe and check
+                // (`observe_deadline`; round-3 ruling 1), or at the entry with
+                // an armed virtual timerfd (IR-23(c)).
+                if in_turn_first && let Some(mask) = sigmask {
+                    let call = Box::pin(temporary_mask_forms::TemporaryMaskCall::enter(
+                        guest, mask, deferred,
+                    ))
+                    .await?;
+                    if call.observes_deadline_at_entry() {
+                        deadline = call.entry_deadline().map(|(_, deadline)| deadline);
+                        deferred = None;
+                    }
+                    *masked = Some(Box::new(call));
+                }
+                let mut entry = masked.as_deref().map(|call| call.entry());
                 macro_rules! settle_deadline {
                     () => {
                         if deferred.is_some() {
@@ -1591,6 +1605,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 loop {
                     let in_turn = first_turn;
+                    if !in_turn && let Some(call) = masked.as_deref_mut() {
+                        call.note_request();
+                    }
                     let signaled = !in_turn
                         && matches!(
                             resource_request(guest, resources.clone()).await,
@@ -1669,6 +1686,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                         };
                         settle_deadline!();
                         self.write_pselect6_remaining(guest, call, deadline).await?;
+                        // D37's R2 as the result is decided, before the yield
+                        // (A5 step 3c.1e A).
+                        let decided: Result<i64, Error> = match &result {
+                            Ok(count) => Ok(*count),
+                            Err(errno) => Err((*errno).into()),
+                        };
+                        if let Some(call) = masked.as_deref_mut()
+                            && let Err(error) = Box::pin(call.finish(guest, &decided)).await
+                        {
+                            break Err(error);
+                        }
                         if in_turn {
                             // Boxed: the gate-off future stays its size.
                             Box::pin(temporary_mask_forms::yield_after_in_turn_result(guest)).await;
@@ -1685,14 +1713,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                         let ends = match sigmask {
                             Some(mask) => {
                                 // Boxed: the gate-off future stays its size.
-                                match Box::pin(crate::syscalls::helpers::temporary_mask_check(
-                                    guest,
-                                    mask,
-                                    entry.take(),
-                                    false,
-                                ))
-                                .await
-                                {
+                                let check =
+                                    Box::pin(crate::syscalls::helpers::temporary_mask_check(
+                                        guest,
+                                        mask,
+                                        entry.take(),
+                                        false,
+                                    ))
+                                    .await;
+                                if let (Ok(check), Some(call)) = (&check, masked.as_deref_mut()) {
+                                    call.note_check(*check);
+                                }
+                                match check {
                                     Ok(crate::syscalls::helpers::TemporaryMaskCheck::Waits) => None,
                                     Ok(crate::syscalls::helpers::TemporaryMaskCheck::Fatal) => {
                                         Some(Errno::ERESTARTNOHAND)
@@ -1765,6 +1797,15 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
             .await
+        };
+        // D37's R2 at any other end of a masked call (A5 step 3c.1e A); a
+        // no-op once it ran before a yield, and with the gate off.
+        let result = match masked.as_deref_mut() {
+            Some(call) => match Box::pin(call.finish(guest, &result)).await {
+                Ok(()) => result,
+                Err(error) => Err(error),
+            },
+            None => result,
         };
         let result = match &mut signals {
             Some(signals) => {
