@@ -51,9 +51,9 @@ The source features `native-exec` and `mm-cancellation-test-support` enable
 relied on either feature to pull in the patcher must also select `liteinst`.
 `--backend=liteinst` refuses when that feature is absent; `--backend=in-guest-trap`
 uses the shared Tool/Detcore runtime with patching disabled. An enabled CLI
-requests patching explicitly when no selector was supplied, so an OFF runtime
-cannot silently substitute trap-only execution. An explicit selector `0` is
-still supported by the enabled CLI.
+preserves the selector's absence or explicit value. When it is unset, the
+authenticated tool-data record requires a LiteInst-capable runtime, so an OFF
+runtime refuses. An explicit selector `0` is still supported by the enabled CLI.
 
 The full/portable OFF validation cohort reuses one exclusively locked work
 directory for Cargo, installation and guest builds. Per-run logs and result
