@@ -3066,7 +3066,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
-    ("test.detcore_unit", 2817),
+    // And scheduler::test::{a_queued_sleep_is_a_timed_waiter_from_the_first_pass,
+    // a_queued_sleep_registers_whatever_the_priorities} and
+    // scheduler::parked_tests::the_controlled_loop_registers_a_queued_sleep
+    // (a queued sleep registers at the first quiescent pass): 2820, listed.
+    ("test.detcore_unit", 2820),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5378,7 +5382,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
-    ("test.detcore_unit_on_host", 2817),
+    // And the same three queued-sleep registration units: 2820, listed.
+    ("test.detcore_unit_on_host", 2820),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
