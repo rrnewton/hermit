@@ -8,6 +8,7 @@
 
 //! A mode for analyzing a hermit run.
 
+use std::num::NonZeroU32;
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -240,24 +241,58 @@ pub struct AnalyzeOpts {
     /// the first replay of its record) and the baseline run (from `--run2-seed`,
     /// `--run2-preemptions`, or the run without chaos). With `auto`, every run after the first
     /// measured one is bounded at max(60 s, 10 times the slowest endpoint run so far), the baseline
-    /// run included. A trial that reaches the bound counts as not meeting the target, as a trial
-    /// that a `--timeout` in the run arguments ends does. It does not decide a `--prefix-search`
-    /// boundary, though: when the search settles next to such a trial, it runs that trial again
-    /// with 4 times the bound (within the run arguments' own `--timeout`). If that confirmation
-    /// finishes, whatever its outcome, every later run keeps the longer bound, and if it met the
-    /// target the search goes on below it. If it is still stopped, or no longer bound can be given,
-    /// the report calls the trial a hang, a third outcome, and a bound this confirmation raised
-    /// goes back to the usual one. A baseline run that reaches it gives no baseline, so analyze
+    /// run included, and at 4 times that while `--trial-virtual-timeout` bounds the runs in virtual
+    /// time: this bound is then a backstop for a hang in which no virtual time passes (every thread
+    /// waiting on something outside the container). An explicit number of seconds is used as given.
+    /// A trial that reaches the bound counts as not meeting the target, as a trial that a
+    /// `--timeout` in the run arguments ends does. It does not decide a `--prefix-search` boundary,
+    /// though: when the search settles next to such a trial, it runs that trial again with 4 times
+    /// the bound (within the run arguments' own `--timeout`). If that confirmation finishes,
+    /// whatever its outcome, every later run keeps the longer bound, and if it met the target the
+    /// search goes on below it. If it is still stopped, or no longer bound can be given, the report
+    /// calls the trial a hang, a third outcome, and a bound this confirmation raised goes back to
+    /// the usual one. (A trial the virtual-time bound stops is not confirmed with a longer bound;
+    /// see `--trial-virtual-timeout`.) A baseline run that reaches it gives no baseline, so analyze
     /// searches within the target schedule instead (as `--prefix-search` does). A `--timeout` in
     /// the run arguments still bounds every run, and wins where it is shorter. The bound needs a
     /// backend on which `hermit run --timeout` is qualified; elsewhere `auto` gives none, and an
-    /// explicit number is refused.
+    /// explicit number is refused. `off` lifts the wall-clock bound only: the virtual-time bound,
+    /// where it applies, still does, without this backstop.
     ///
-    /// While trials are bounded, the log file a trial writes under `--verbose` or `--selfcheck`
-    /// is capped too, at max(64 MiB, 10 times the largest endpoint log) and within
+    /// While trials are bounded, the log file a trial writes under `--verbose` or `--selfcheck` is
+    /// capped too, at max(64 MiB, 10 times the largest endpoint log) and within
     /// HERMIT_LOG_MAX_BYTES (0 there lifts both caps); `off` lifts it as well.
     #[clap(long, value_name = "SECONDS|auto|off", default_value = "auto")]
     pub trial_timeout: TrialTimeout,
+
+    /// Virtual-time bound on each run after the target run, as a factor of the longest endpoint
+    /// run's virtual time: a positive whole number (10 when the option is not given), or `off`.
+    ///
+    /// Every run after the first measured endpoint run (the runs `--trial-timeout` describes) is
+    /// also bounded with `hermit run --virtual-timeout`, at max(60 s, FACTOR times the longest
+    /// endpoint run so far) of virtual time, read as the `virttime_elapsed` of each endpoint run's
+    /// summary. A trial that reaches it stops at the same scheduler turn on every host and in every
+    /// run, so whether a trial finishes does not depend on how fast or busy the host is. Analyze
+    /// reads from the trial's summary that the bound stopped it. Such a trial counts as not meeting
+    /// the target, as one the wall-clock bound stops does, and when a `--prefix-search` boundary
+    /// rests on it the report calls it a hang, a third outcome. Unlike a trial the wall-clock bound
+    /// stops, it is not confirmed with a longer bound: a rerun at the same bound stops at the same
+    /// turn. The 60 s floor covers virtual time that is not work: a timed wait that times out
+    /// advances the clock by its whole length in one turn, and a trial that continues at a coarser
+    /// timeslice than the endpoint runs lets a polling thread keep whole timeslices. A
+    /// `--virtual-timeout` in the run arguments still bounds every run, and wins where it is
+    /// shorter.
+    ///
+    /// While this bound applies, `--trial-timeout=auto` gives 4 times its usual wall-clock bound, a
+    /// backstop for a hang in which no virtual time passes, and `--trial-timeout=off` leaves the
+    /// virtual bound without a backstop. An explicit `--trial-timeout=SECONDS` is used as given:
+    /// where it is shorter than a trial takes to reach the virtual bound, host time decides whether
+    /// that trial finishes. The bound needs the ptrace backend, the only one that writes the
+    /// summary of a run its virtual bound stopped, and virtual time (no `--no-virtualize-time`);
+    /// elsewhere analyze gives none, and an explicit factor is refused. `off` bounds the runs in
+    /// wall-clock time alone, at `--trial-timeout`'s usual length.
+    #[clap(long, value_name = "FACTOR|off")]
+    pub trial_virtual_timeout: Option<TrialVirtualTimeout>,
 
     /// Specify that analyze itself should return a non-zero exit code on success.
     /// This is needed under esoteric invocation scenarios.
@@ -303,7 +338,8 @@ pub struct AnalyzeOpts {
     pub branch_counter_warning: Option<String>,
 
     /// What the endpoint runs measured so far; the trials' bounds derive
-    /// from it ([`AnalyzeOpts::trial_bound`]). Every `RunData` copies these
+    /// from it ([`AnalyzeOpts::trial_bound`],
+    /// [`AnalyzeOpts::trial_virtual_bound`]). Every `RunData` copies these
     /// options when it is created, so a run takes the bound of the endpoints
     /// measured before it.
     #[clap(skip)]
@@ -311,10 +347,11 @@ pub struct AnalyzeOpts {
 
     /// How many times its usual `--trial-timeout` bound a run gets
     /// ([`AnalyzeOpts::trial_bound`]): 1, or [`CONFIRM_BOUND_FACTOR`] from
-    /// the moment a `--prefix-search` confirmation raised it, unless that
-    /// confirmation was stopped again (`factor_after_confirmation` in phases.rs): it
-    /// stays raised after a confirmation that met or missed the target or
-    /// that Hermit refused.
+    /// the moment a `--prefix-search` confirmation raised it, unless the
+    /// wall-clock bound stopped that confirmation again
+    /// (`factor_after_confirmation` in phases.rs): it stays raised after a
+    /// confirmation that met or missed the target, that Hermit refused, or
+    /// that the virtual-time bound stopped.
     #[clap(skip = 1u32)]
     pub trial_bound_factor: u32,
 }
@@ -373,10 +410,43 @@ impl FromStr for TrialTimeout {
     }
 }
 
+/// `--trial-virtual-timeout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrialVirtualTimeout {
+    /// No virtual-time bound beyond the run arguments' own `--virtual-timeout`.
+    Off,
+    /// This many times the longest endpoint run's virtual time.
+    Factor(NonZeroU32),
+}
+
+impl FromStr for TrialVirtualTimeout {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "off" => Ok(TrialVirtualTimeout::Off),
+            _ => s
+                .parse()
+                .map(TrialVirtualTimeout::Factor)
+                .map_err(|_| format!("expected a positive whole factor or `off`, got {s:?}")),
+        }
+    }
+}
+
 /// The least wall-clock bound `--trial-timeout=auto` gives a trial.
 pub const TRIAL_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
 /// How many times the slowest endpoint run `--trial-timeout=auto` gives a trial.
 pub const TRIAL_TIMEOUT_FACTOR: u32 = 10;
+/// How many times longer `--trial-timeout=auto`'s wall-clock bound is while
+/// the virtual-time bound applies, where it is a backstop.
+pub const TRIAL_TIMEOUT_BACKSTOP_FACTOR: u32 = 4;
+/// How many times the longest endpoint run's virtual time a trial gets when
+/// `--trial-virtual-timeout` is not given.
+pub const TRIAL_VIRTUAL_TIMEOUT_FACTOR: NonZeroU32 = NonZeroU32::new(10).unwrap();
+/// Nanoseconds in a second, virtual or not.
+pub const NANOS_PER_SECOND: u64 = 1_000_000_000;
+/// The least virtual-time bound a trial gets, in virtual nanoseconds (60 s).
+pub const TRIAL_VIRTUAL_TIMEOUT_FLOOR: u64 = 60 * NANOS_PER_SECOND;
 /// How many times its usual `--trial-timeout` bound a `--prefix-search` trial
 /// gets when it runs again to confirm the boundary the search settled on.
 pub const CONFIRM_BOUND_FACTOR: u32 = 4;
@@ -385,12 +455,15 @@ pub const TRIAL_LOG_FLOOR: u64 = 64 << 20;
 /// How many times the largest endpoint log a trial's log file may grow to.
 pub const TRIAL_LOG_FACTOR: u64 = 10;
 
-/// The slowest wall-clock time and the largest log file of the endpoint runs
-/// measured so far.
+/// The slowest wall-clock time, the longest virtual time and the largest log
+/// file of the endpoint runs measured so far.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EndpointMeasurements {
     /// The slowest endpoint run, if one has been measured.
     pub slowest: Option<Duration>,
+    /// The longest endpoint run in virtual nanoseconds (its summary's
+    /// `virttime_elapsed`), if one wrote a summary.
+    pub longest_virtual: Option<u64>,
     /// The largest endpoint log file, if an endpoint run wrote one.
     pub largest_log: Option<u64>,
 }
@@ -406,6 +479,11 @@ impl EndpointMeasurements {
             self.slowest = Some(wall);
         }
         slowest
+    }
+
+    /// Record one endpoint run's virtual time, in virtual nanoseconds.
+    pub fn record_virtual(&mut self, elapsed: u64) {
+        self.longest_virtual = self.longest_virtual.max(Some(elapsed));
     }
 }
 

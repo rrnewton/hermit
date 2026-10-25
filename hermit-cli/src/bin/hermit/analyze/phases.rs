@@ -37,6 +37,7 @@ use crate::analyze::consts::*;
 use crate::analyze::rundata::RunData;
 use crate::analyze::rundata::Stop;
 use crate::analyze::rundata::TrialEnd;
+use crate::analyze::rundata::VirtualBoundStop;
 use crate::analyze::rundata::guest_reached_a_refusal;
 use crate::analyze::types::AnalyzeOpts;
 use crate::analyze::types::CONFIRM_BOUND_FACTOR;
@@ -210,10 +211,12 @@ fn confirmation_bound(
 }
 
 /// The bound factor after a confirmation that `raised` it ended `end`: a
-/// confirmation stopped again goes back to the usual bound, since the
-/// boundary rests on a bound either way and the shorter one costs less; one
-/// that finished keeps the longer bound, so the recheck and the stack-trace
-/// runs of that prefix can finish too.
+/// confirmation the wall-clock bound stopped again goes back to the usual
+/// bound, since the boundary rests on a bound either way and the shorter one
+/// costs less; one that finished keeps the longer bound, so the recheck and
+/// the stack-trace runs of that prefix can finish too. So does one the
+/// virtual-time bound stopped: those runs need as long to reach that same
+/// stop.
 fn factor_after_confirmation(factor: u32, raised: bool, end: TrialEnd) -> u32 {
     if raised && end == TrialEnd::Unfinished(Stop::Bound) {
         1
@@ -249,25 +252,65 @@ fn bound_remedy(own: Option<u64>, trial_timeout_off: bool, last: Option<u64>) ->
     }
 }
 
-/// What a search should say about its result when the last trial of the
-/// first `passing` events, the boundary's baseline side, did not finish:
-/// first within `bound` seconds of wall-clock time and then, when it ran
+/// [`bound_remedy`] for a trial a virtual-time bound of `bound` virtual
+/// nanoseconds stopped: the run arguments' own `--virtual-timeout` (`own`)
+/// where that is the bound, `--trial-virtual-timeout` where analyze's
+/// (`analyze`) is, and both where they are equal.
+fn virtual_bound_remedy(own: Option<u64>, analyze: Option<u64>, bound: u64) -> &'static str {
+    match (own == Some(bound), analyze == Some(bound)) {
+        (true, true) => {
+            "raise both the run arguments' --virtual-timeout and --trial-virtual-timeout"
+        }
+        (true, false) => "raise the run arguments' --virtual-timeout",
+        (false, _) => "raise --trial-virtual-timeout",
+    }
+}
+
+/// What a search should say about its result when the last trial of the first
+/// `passing` events, the boundary's baseline side, did not finish and ended
+/// `last` ([`Stop::Bound`] or [`Stop::VirtualBound`]). A trial the wall-clock
+/// bound stopped did not finish within `bound` seconds and then, when it ran
 /// again to confirm it, within `confirmed` seconds (`None`: no longer bound
-/// could be given). `below` is the longest shorter prefix the search
-/// replayed whose trial finished, and how it ended. It names only prefixes
-/// the search replayed: the search assumes the outcome changes once along
-/// the schedule, so it claims nothing about the prefixes in between.
-/// `remedy` is [`bound_remedy`]'s advice.
+/// could be given). One the virtual-time bound stopped is not confirmed with a
+/// longer bound, since a rerun at the same bound stops at the same scheduler
+/// turn, unless it was itself the confirmation, under `confirmed` seconds, of a
+/// trial the wall-clock bound stopped. `below` is the longest shorter prefix
+/// the search replayed whose trial finished, and how it ended. It names only
+/// prefixes the search replayed: the search assumes the outcome changes once
+/// along the schedule, so it claims nothing about the prefixes in between.
+/// `remedy` is [`bound_remedy`]'s or [`virtual_bound_remedy`]'s advice.
 fn unfinished_boundary_warning(
     passing: usize,
+    last: TrialEnd,
     bound: Option<u64>,
     confirmed: Option<u64>,
     below: Option<(usize, TrialEnd)>,
     remedy: &str,
 ) -> String {
-    let confirmation = match confirmed {
-        Some(longer) => format!(", nor within {longer} s when it ran again to confirm it"),
-        None => ", and no longer bound could be given to confirm it".to_owned(),
+    let wall = describe_trial_end(TrialEnd::Unfinished(Stop::Bound), bound);
+    let (stopped, rests_on) = match (last, confirmed) {
+        (TrialEnd::Unfinished(Stop::VirtualBound(_)), None) => (
+            describe_trial_end(last, None),
+            "a virtual-time bound, not on an outcome. That bound is the same on every host, and a \
+             rerun at the same bound stops at the same scheduler turn, so the trial was not \
+             confirmed with a longer bound",
+        ),
+        (TrialEnd::Unfinished(Stop::VirtualBound(nanos)), Some(longer)) => (
+            format!(
+                "{wall}, nor within {nanos} ns of virtual time when it ran again with a bound of \
+                 {longer} s to confirm it"
+            ),
+            "a virtual-time bound, not on an outcome. That bound is the same on every host, and a \
+             rerun at the same bound stops at the same scheduler turn",
+        ),
+        (_, Some(longer)) => (
+            format!("{wall}, nor within {longer} s when it ran again to confirm it"),
+            "a wall-clock bound, not on an outcome",
+        ),
+        (_, None) => (
+            format!("{wall}, and no longer bound could be given to confirm it"),
+            "a wall-clock bound, not on an outcome",
+        ),
     };
     let below = match below {
         Some((prefix, end)) => format!(
@@ -278,18 +321,17 @@ fn unfinished_boundary_warning(
         None => "No shorter prefix the search replayed finished.".to_owned(),
     };
     format!(
-        "replaying the first {passing} events and then scheduling without chaos \
-         {}{confirmation}: the guest hangs (for example in a deadlock while other threads keep \
-         polling), or needs longer still. A hang is a third outcome, not a run that misses the \
-         target, yet the search counted it as not meeting the target: this boundary rests on a \
-         wall-clock bound, not on an outcome. Given longer, that trial may meet the target, and \
-         an earlier event decide the outcome ({remedy}). {below}",
-        describe_trial_end(TrialEnd::Unfinished(Stop::Bound), bound)
+        "replaying the first {passing} events and then scheduling without chaos {stopped}: the \
+         guest hangs (for example in a deadlock while other threads keep polling), or needs \
+         longer still. A hang is a third outcome, not a run that misses the target, yet the \
+         search counted it as not meeting the target: this boundary rests on {rests_on}. Given \
+         longer, that trial may meet the target, and an earlier event decide the outcome \
+         ({remedy}). {below}"
     )
 }
 
 /// How a trial ended, for a message; `bound` is the wall-clock bound it ran
-/// under, in seconds.
+/// under, in seconds. A virtual-time bound is in the end itself.
 fn describe_trial_end(end: TrialEnd, bound: Option<u64>) -> String {
     match end {
         TrialEnd::Met => "met the target".to_owned(),
@@ -298,6 +340,9 @@ fn describe_trial_end(end: TrialEnd, bound: Option<u64>) -> String {
             Some(bound) => format!("did not finish within {bound} s"),
             None => "did not finish".to_owned(),
         },
+        TrialEnd::Unfinished(Stop::VirtualBound(nanos)) => {
+            format!("did not finish within {nanos} ns of virtual time")
+        }
         TrialEnd::Unfinished(Stop::Refusal) => "was refused by Hermit".to_owned(),
     }
 }
@@ -407,8 +452,9 @@ fn choose_continuation(
         .iter()
         .any(|(_, outcome)| *outcome == Continuation::ReplayUnfinished)
     {
-        "A replay that did not finish was ended by a bound (raise --trial-timeout) or refused \
-         by Hermit (its reason is in its log)."
+        "A replay that did not finish was ended by a bound (raise --trial-timeout, or \
+         --trial-virtual-timeout for a virtual-time bound) or refused by Hermit (its reason is \
+         in its log)."
     } else {
         "Schedule replay does not reproduce this run where replaying the whole target schedule \
          misses the target; check that the target run replays (--selfcheck)."
@@ -499,10 +545,15 @@ struct Boundary {
 /// when the search settles on one, `trial(k, Confirm)` runs it again with a
 /// longer bound. If it then meets the target, the boundary is below it, and
 /// the search goes on above the longest prefix that did not meet the target
-/// and was not stopped (or the empty prefix), every stopped trial in between
-/// open again. `Confirm` returns `None` when no longer bound can be given,
-/// and the boundary stays on the stopped trial. A search trial always
-/// returns `Some`.
+/// and was not stopped by the wall-clock bound (or the empty prefix), every
+/// such stopped trial in between open again. `Confirm` returns `None` when
+/// no longer bound can be given, and the boundary stays on the stopped
+/// trial. A search trial always returns `Some`.
+///
+/// A trial the virtual-time bound stopped is not confirmed with a longer
+/// bound, and bounds the search from below like a trial that missed: every
+/// run of it at the same bound stops at the same scheduler turn, on every
+/// host, so the boundary then rests on that bound.
 ///
 /// Confirming the boundary's trial is enough when a prefix that meets the
 /// target stays met when it grows: a stopped trial that steered the search
@@ -554,6 +605,37 @@ fn search_prefix_boundary(
                 });
             }
         }
+    }
+}
+
+/// What the final recheck of a `--prefix-search` boundary trial shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recheck {
+    /// Nothing to warn about: it ended as before, or missed the target in
+    /// another way (a refusal for a miss).
+    Repeated,
+    /// The wall-clock bound stopped it: the trial runs close to that bound.
+    CloseToTheBound,
+    /// Another outcome: whether it met the target changed, or a stop at the
+    /// virtual-time bound, which repeats like an outcome, did not repeat.
+    Other,
+}
+
+/// [`Recheck`] for a boundary trial that ended `first` and, run again,
+/// `again`.
+fn recheck(first: TrialEnd, again: TrialEnd) -> Recheck {
+    let virtual_stop = |end| matches!(end, TrialEnd::Unfinished(Stop::VirtualBound(_)));
+    if again == first {
+        Recheck::Repeated
+    } else if again == TrialEnd::Unfinished(Stop::Bound) {
+        Recheck::CloseToTheBound
+    } else if again.reached_target() != first.reached_target()
+        || virtual_stop(first)
+        || virtual_stop(again)
+    {
+        Recheck::Other
+    } else {
+        Recheck::Repeated
     }
 }
 
@@ -1068,6 +1150,7 @@ impl AnalyzeOpts {
             Ok(()) => true,
             Err(error)
                 if error.downcast_ref::<RunTimeoutMarker>().is_some()
+                    || error.downcast_ref::<VirtualBoundStop>().is_some()
                     || guest_reached_a_refusal(&error) =>
             {
                 eprintln!(
@@ -1309,9 +1392,11 @@ impl AnalyzeOpts {
         let failing = passing + 1;
         // On a host whose branch counter is not exact, two replays of one
         // prefix can differ, so the boundary is checked once more. A trial
-        // the bound stopped has no outcome to repeat, so such a baseline side
-        // is not run again, and a check the bound stops shows a trial close
-        // to the bound, not another outcome.
+        // the wall-clock bound stopped has no outcome to repeat, so such a
+        // baseline side is not run again, and a check that bound stops shows
+        // a trial close to the bound, not another outcome. A stop at the
+        // virtual-time bound repeats like an outcome, and is checked as one:
+        // a run of it that ends otherwise did not repeat.
         let mut rechecks = vec![(failing, TrialEnd::Met)];
         if passing_end != TrialEnd::Unfinished(Stop::Bound) {
             rechecks.insert(0, (passing, passing_end));
@@ -1320,20 +1405,21 @@ impl AnalyzeOpts {
         for (len, first) in rechecks {
             let first_bound = bound_of(len, continuation);
             let again = run_trial(len, continuation, TrialPurpose::Search)?.context(ended)?;
-            if again == first {
-                continue;
-            }
-            let what = format!(
-                "the prefix of {len} events {} and then {}",
-                describe_trial_end(first, first_bound),
-                describe_trial_end(again, bound_of(len, continuation))
-            );
-            if again == TrialEnd::Unfinished(Stop::Bound) {
-                unfinished_again.push(what);
-            } else if again.reached_target() != first.reached_target() {
-                changed.push(what);
-                // As before: one other outcome is enough to warn.
-                break;
+            let what = || {
+                format!(
+                    "the prefix of {len} events {} and then {}",
+                    describe_trial_end(first, first_bound),
+                    describe_trial_end(again, bound_of(len, continuation))
+                )
+            };
+            match recheck(first, again) {
+                Recheck::Repeated => {}
+                Recheck::CloseToTheBound => unfinished_again.push(what()),
+                Recheck::Other => {
+                    changed.push(what());
+                    // As before: one other outcome is enough to warn.
+                    break;
+                }
             }
         }
         if !changed.is_empty() {
@@ -1362,19 +1448,30 @@ impl AnalyzeOpts {
         if let Some(warning) = &refused {
             eprintln!(":: {} {warning}", "WARNING:".yellow().bold());
         }
-        let unfinished = (passing_end == TrialEnd::Unfinished(Stop::Bound)).then(|| {
+        let unfinished = matches!(
+            passing_end,
+            TrialEnd::Unfinished(Stop::Bound | Stop::VirtualBound(_))
+        )
+        .then(|| {
             let below = longest_finished_below(&ends.borrow(), continuation, passing);
             let confirmed = confirmations.borrow().get(&passing).copied();
             let (bound, longer) = match confirmed {
                 Some((earlier, longer)) => (earlier, Some(longer)),
                 None => (bound_of(passing, continuation), None),
             };
-            let remedy = bound_remedy(
-                self.run_args_timeout(),
-                self.trial_timeout == TrialTimeout::Off,
-                longer.or(bound),
-            );
-            unfinished_boundary_warning(passing, bound, longer, below, remedy)
+            let remedy = match passing_end {
+                TrialEnd::Unfinished(Stop::VirtualBound(nanos)) => virtual_bound_remedy(
+                    self.run_args_virtual_timeout(),
+                    self.current_trial_virtual_bound(),
+                    nanos,
+                ),
+                _ => bound_remedy(
+                    self.run_args_timeout(),
+                    self.trial_timeout == TrialTimeout::Off,
+                    longer.or(bound),
+                ),
+            };
+            unfinished_boundary_warning(passing, passing_end, bound, longer, below, remedy)
         });
         if let Some(warning) = &unfinished {
             eprintln!(":: {} {warning}", "WARNING:".yellow().bold());
@@ -2094,9 +2191,10 @@ impl AnalyzeOpts {
                 }
                 bail!(
                     "the baseline run ({from_where}) did not finish (a bound or a refusal \
-                     stopped it; see above). Pass a larger --trial-timeout, or another baseline; \
-                     without one, analyze bisects against the run without chaos, or searches \
-                     within the target schedule when that does not finish either."
+                     stopped it; see above). Pass a larger --trial-timeout or \
+                     --trial-virtual-timeout, or another baseline; without one, analyze bisects \
+                     against the run without chaos, or searches within the target schedule when \
+                     that does not finish either."
                 );
             }
             self.record_endpoint(&newrun);
@@ -2453,6 +2551,7 @@ impl AnalyzeOpts {
         self.refuse_outputs_trials_overwrite()?;
         self.refuse_unqualified_trial_timeout()?;
         self.refuse_unenforceable_trial_timeout()?;
+        self.refuse_inapplicable_trial_virtual_timeout()?;
         self.refuse_unsound_continuation_timeslice()?;
         self.install_trial_pmu_config()?;
         self.admit_branch_counter(&mut crate::tracing::write_stderr_diagnostic)?;
@@ -2570,7 +2669,8 @@ impl AnalyzeOpts {
                         || error.downcast_ref::<NothingToKnockOut>().is_some() =>
                 {
                     let hint = if error.downcast_ref::<BaselineUnfinished>().is_some() {
-                        "; a larger --trial-timeout may let the baseline finish"
+                        "; a larger --trial-timeout or --trial-virtual-timeout may let the \
+                         baseline finish"
                     } else {
                         ""
                     };
@@ -3080,6 +3180,7 @@ mod tests {
     fn a_boundary_trial_still_stopped_is_reported_as_a_hang() {
         let note = unfinished_boundary_warning(
             35_631,
+            TrialEnd::Unfinished(Stop::Bound),
             Some(60),
             Some(240),
             Some((9_000, TrialEnd::Missed)),
@@ -3097,6 +3198,7 @@ mod tests {
         }
         let unconfirmed = unfinished_boundary_warning(
             1,
+            TrialEnd::Unfinished(Stop::Bound),
             Some(120),
             None,
             None,
@@ -3112,6 +3214,177 @@ mod tests {
                 "no {expected:?} in {unconfirmed}"
             );
         }
+    }
+
+    /// A trial the virtual-time bound stopped is a hang the search does not
+    /// confirm with a longer bound, since every run of it at that bound
+    /// stops at the same scheduler turn. On the boundary's baseline side it
+    /// is the boundary, unconfirmed, the empty prefix's included. Below a
+    /// refuted wall-clock confirmation it still bounds the search from below,
+    /// as a trial that missed does. A confirmation it stopped keeps the
+    /// raised wall-clock bound, which the stack-trace runs of that prefix
+    /// need to reach the same stop. The final recheck runs it once more and
+    /// warns when that run ends otherwise.
+    #[test]
+    fn a_trial_the_virtual_bound_stopped_is_not_confirmed() {
+        let hang = TrialEnd::Unfinished(Stop::VirtualBound(60_000_000_000));
+        let found = search_prefix_boundary(100, TrialEnd::Missed, |prefix, purpose| {
+            assert_eq!(purpose, TrialPurpose::Search, "prefix {prefix}");
+            Ok(Some(if prefix > 40 {
+                TrialEnd::Met
+            } else if prefix == 40 {
+                hang
+            } else {
+                TrialEnd::Missed
+            }))
+        })
+        .unwrap();
+        assert_eq!(
+            found,
+            Boundary {
+                passing: 40,
+                passing_end: hang
+            }
+        );
+        let found = search_prefix_boundary(10, hang, |prefix, purpose| {
+            assert_eq!(purpose, TrialPurpose::Search, "prefix {prefix}");
+            Ok(Some(TrialEnd::Met))
+        })
+        .unwrap();
+        assert_eq!(
+            found,
+            Boundary {
+                passing: 0,
+                passing_end: hang
+            }
+        );
+
+        // Prefixes past 600 meet the target, but under the usual wall-clock
+        // bound only those past 900 finish; the prefix of 500 hangs.
+        let (mut longer, mut log) = (false, Vec::new());
+        let found = search_prefix_boundary(1000, TrialEnd::Missed, |prefix, purpose| {
+            log.push((prefix, purpose));
+            longer |= purpose == TrialPurpose::Confirm;
+            Ok(Some(if prefix > 600 && (prefix > 900 || longer) {
+                TrialEnd::Met
+            } else if prefix == 500 {
+                hang
+            } else if prefix > 600 {
+                TrialEnd::Unfinished(Stop::Bound)
+            } else {
+                TrialEnd::Missed
+            }))
+        })
+        .unwrap();
+        assert_eq!(
+            found,
+            Boundary {
+                passing: 600,
+                passing_end: TrialEnd::Missed
+            }
+        );
+        let confirmed = log
+            .iter()
+            .position(|&entry| entry == (900, TrialPurpose::Confirm))
+            .unwrap();
+        assert_eq!(log[confirmed + 1], (700, TrialPurpose::Search), "{log:?}");
+        assert_eq!(
+            log.iter()
+                .filter(|(_, purpose)| *purpose == TrialPurpose::Confirm)
+                .count(),
+            1,
+            "{log:?}"
+        );
+
+        assert_eq!(factor_after_confirmation(4, true, hang), 4);
+
+        // The final recheck runs such a trial again, and warns when that run
+        // does not stop at the same bound, as when the target's outcome
+        // changes; a trial the wall-clock bound stops again is close to it.
+        let bound = TrialEnd::Unfinished(Stop::Bound);
+        let refusal = TrialEnd::Unfinished(Stop::Refusal);
+        assert_eq!(recheck(hang, hang), Recheck::Repeated);
+        for again in [TrialEnd::Missed, TrialEnd::Met, refusal] {
+            assert_eq!(recheck(hang, again), Recheck::Other, "{again:?}");
+        }
+        assert_eq!(recheck(TrialEnd::Missed, hang), Recheck::Other);
+        assert_eq!(recheck(hang, bound), Recheck::CloseToTheBound);
+        assert_eq!(recheck(TrialEnd::Missed, refusal), Recheck::Repeated);
+        assert_eq!(recheck(TrialEnd::Met, TrialEnd::Missed), Recheck::Other);
+    }
+
+    /// When the boundary's baseline side stopped at the virtual-time bound, the
+    /// note calls it a hang, says the boundary rests on that bound, which is
+    /// the same on every host, and that the trial was not confirmed with a
+    /// longer bound because a rerun at the same bound stops at the same
+    /// scheduler turn; it never mentions a wall-clock bound or a confirmation
+    /// that was not run. When it was a confirmation of a trial the wall-clock
+    /// bound stopped that the virtual bound stopped, the note says both. The
+    /// advice names the flag that raises the bound that stopped it.
+    #[test]
+    fn a_virtual_bound_boundary_is_reported_as_a_hang_without_a_longer_bound() {
+        let hang = TrialEnd::Unfinished(Stop::VirtualBound(60_000_000_000));
+        assert_eq!(
+            describe_trial_end(hang, Some(240)),
+            "did not finish within 60000000000 ns of virtual time"
+        );
+        let note = unfinished_boundary_warning(
+            812,
+            hang,
+            Some(240),
+            None,
+            Some((700, TrialEnd::Missed)),
+            "raise --trial-virtual-timeout",
+        );
+        for expected in [
+            "replaying the first 812 events and then scheduling without chaos did not finish \
+             within 60000000000 ns of virtual time: the guest hangs",
+            "A hang is a third outcome, not a run that misses the target",
+            "this boundary rests on a virtual-time bound, not on an outcome. That bound is the \
+             same on every host, and a rerun at the same bound stops at the same scheduler turn, \
+             so the trial was not confirmed with a longer bound.",
+            "(raise --trial-virtual-timeout)",
+            "the prefix of 700 events, which missed the target.",
+        ] {
+            assert!(note.contains(expected), "no {expected:?} in {note}");
+        }
+        assert!(
+            !note.contains("wall-clock") && !note.contains("no longer bound"),
+            "{note}"
+        );
+        let confirmed = unfinished_boundary_warning(
+            812,
+            hang,
+            Some(240),
+            Some(960),
+            None,
+            "raise --trial-virtual-timeout",
+        );
+        for expected in [
+            "did not finish within 240 s, nor within 60000000000 ns of virtual time when it ran \
+             again with a bound of 960 s to confirm it",
+            "this boundary rests on a virtual-time bound, not on an outcome",
+        ] {
+            assert!(
+                confirmed.contains(expected),
+                "no {expected:?} in {confirmed}"
+            );
+        }
+        assert!(!confirmed.contains("was not confirmed"), "{confirmed}");
+
+        let own = "raise the run arguments' --virtual-timeout";
+        let trial = "raise --trial-virtual-timeout";
+        let floor = Some(60_000_000_000);
+        assert_eq!(virtual_bound_remedy(Some(5_000_000), floor, 5_000_000), own);
+        assert_eq!(
+            virtual_bound_remedy(Some(5_000_000), floor, 60_000_000_000),
+            trial
+        );
+        assert_eq!(virtual_bound_remedy(None, floor, 60_000_000_000), trial);
+        assert_eq!(
+            virtual_bound_remedy(floor, floor, 60_000_000_000),
+            "raise both the run arguments' --virtual-timeout and --trial-virtual-timeout"
+        );
     }
 
     /// The longest shorter prefix the hang note names finished: a stopped or
