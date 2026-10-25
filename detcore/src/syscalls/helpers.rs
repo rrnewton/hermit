@@ -4379,12 +4379,19 @@ impl IgnoredSignalShield {
     }
 }
 
+/// A shield is dropped with its mask still to put back only when the
+/// backend cancelled the handler around it, which it does when the thread
+/// dies during the wait or an injection (a sibling's `exit_group` or
+/// `execve`, a SIGKILL): the thread and its mask are gone, so there is
+/// nothing to put back.
 impl Drop for IgnoredSignalShield {
     fn drop(&mut self) {
-        debug_assert!(
-            self.guest_mask.is_none(),
-            "an ignored-signal shield was dropped without putting back the guest's mask"
-        );
+        if let Some(guest_mask) = self.guest_mask {
+            tracing::debug!(
+                "an ignored-signal shield ended with its handler, leaving the guest's mask \
+                 {guest_mask:#x} unrestored on a thread that is gone"
+            );
+        }
     }
 }
 
@@ -6050,6 +6057,17 @@ pub fn poll_nfds(nfds: libc::nfds_t) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The backend drops a handler when its thread dies during a wait, and
+    /// the shield with it: that must not panic, though the mask was never put
+    /// back (a debug assertion did, and ended the run).
+    #[test]
+    fn a_shield_dropped_with_its_handler_ends_quietly() {
+        drop(IgnoredSignalShield {
+            guest_mask: Some(0),
+        });
+        drop(IgnoredSignalShield::none());
+    }
 
     #[test]
     fn an_ignored_signal_shield_blocks_only_what_the_guest_ignores() {

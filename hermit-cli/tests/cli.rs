@@ -51442,6 +51442,102 @@ fn private_sigchld_epoll_and_other_wait_rows_under_record_and_replay() {
     record_private_sigchld_rows();
 }
 
+/// Linux discards a signal the process ignores when it is generated
+/// (`sig_ignored`, kernel/signal.c), so such a signal never ends an
+/// `epoll_wait` (`ep_poll` returns `EINTR` only for a pending signal,
+/// fs/eventpoll.c). Under ptrace the kernel queues it anyway, and a wait
+/// Detcore ran in the kernel (under record, and without sequentialized
+/// threads) returned `EINTR`. In the guest (`tests/c/epoll_ignored_signal.c`)
+/// each 100 ms wait is in turn an `epoll_wait`, an `epoll_pwait` and an
+/// `epoll_pwait2` without a mask: `chld` and `sigign` fork a child per wait
+/// (`SIGCHLD` ignored by default, or set to `SIG_IGN`), `storm` waits while a
+/// child sends 40 `SIGWINCH`, and in `alrm` a caught `SIGALRM` must still end
+/// each wait with `EINTR`. The guest blocks SIGUSR2 first; after the waits,
+/// and in the handler, its mask must be exactly that. Every mode must print
+/// native's line, except that under record the storm, whose sender sleeps on
+/// virtual time, may end before the waits do. `sigign` fails only under
+/// record: with SIGCHLD set to SIG_IGN the kernel sends nothing, and only the
+/// scheduler's own SIGCHLD reached the wait. In `exit` the process exits while
+/// a thread is inside an `epoll_wait` with no timeout: the thread dies during
+/// its wait, under the shield, which then has no mask to put back. It is not
+/// recorded: replay does not yet serve a call that was still in flight at exit
+/// (the thread's recorded events end before it).
+#[test]
+fn kernel_run_epoll_waits_are_not_ended_by_ignored_signals() {
+    let _lock = hermit_run_guard();
+    let guest = compiled_c_guest(&EPOLL_IGNORED_SIGNAL_GUEST, "epoll_ignored_signal");
+    let guest = guest.to_str().unwrap();
+    // As in run_strict_flag_is_accepted_and_runs, the strict leg disables the
+    // PMU timer and CPUID faulting so it runs where those are unavailable.
+    let strict = [
+        "--strict",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+    ];
+    for mode in ["chld", "storm", "sigign", "alrm", "exit"] {
+        let native = Command::new(guest)
+            .arg(mode)
+            .output()
+            .expect("failed to run the guest natively");
+        let expected = String::from_utf8_lossy(&native.stdout).into_owned();
+        let pinned = match mode {
+            "chld" => {
+                "chld: 5 timed out, 0 ready, 0 EINTR, 0 other; late data: 1; mask as before: \
+                 yes; 9 children\n"
+            }
+            "storm" => {
+                "storm: 3 timed out, 0 ready, 0 EINTR, 0 other; mask as before: yes; the storm was \
+                 still running when they returned: yes; 1 children\n"
+            }
+            "sigign" => {
+                "sigign: 5 timed out, 0 ready, 0 EINTR, 0 other; late data: 1; mask as before: \
+                 yes; 0 children\n"
+            }
+            "alrm" => {
+                "alrm: 0 timed out, 0 ready, 5 EINTR, 0 other, 5 alarms; mask as before in the \
+                 handler: yes, after: yes\n"
+            }
+            _ => "exit: a thread was still waiting\n",
+        };
+        assert_eq!(expected, pinned, "native {mode}");
+        for flags in [&strict[..], &[], &["--no-sequentialize-threads"]] {
+            let mut args = vec!["run", "--timeout", "120", "--base-env=minimal"];
+            args.extend_from_slice(flags);
+            args.extend(["--", guest, mode]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{args:?}");
+        }
+        if mode == "exit" {
+            continue;
+        }
+        let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create the recording data dir");
+        let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+        let args = [
+            "record",
+            "start",
+            "--verify",
+            "--verify-strict",
+            "--record-timeout",
+            "120",
+            &data_dir_arg,
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let recorded = stdout(&output);
+        if mode == "storm" {
+            let counts = "storm: 3 timed out, 0 ready, 0 EINTR, 0 other; mask as before: yes; ";
+            assert!(recorded.starts_with(counts), "{args:?}: {recorded}");
+        } else {
+            assert_eq!(recorded, expected, "{args:?}");
+        }
+    }
+}
+
 /// The single-threaded caught rows and the pending rows of
 /// `record_private_sigchld_rows`.
 #[test]
