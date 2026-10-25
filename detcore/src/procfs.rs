@@ -1503,6 +1503,16 @@ pub(crate) struct ProcfsSnapshotContext {
     /// holds them (`ignored_signals::hidden_from_status`). False keeps both
     /// fields as the kernel rendered them, as before.
     pub(crate) status_hides_ignored: bool,
+    /// For a status snapshot under the in-guest delivery gate (A5 step 3c.1e
+    /// A, D37's held masks): the ignored signals the thread keeps pending in
+    /// its private and its shared queue from a masked call's entry while that
+    /// call's temporary mask is published (`SigPnd_entry ∩ I ∩ own`,
+    /// `ShdPnd_entry ∩ I ∩ own`). Linux keeps them, though the temporary mask
+    /// does not block them, so each stays in its own queue's field
+    /// (`hidden_from_status` with the published mask and that queue's held
+    /// mask); one in the other queue, sent during the call, was discarded and
+    /// is hidden. `(0, 0)` with no publication in force, and with the gate off.
+    pub(crate) status_held_ignored: (u64, u64),
     /// For `/proc/locks`, which of the kernel's rows, in order, the guest
     /// owns (`locks::guest_lock_rows`); the others are dropped before the
     /// sanitizer numbers identities. Built by the caller, which asks
@@ -2435,6 +2445,7 @@ impl ProcfsFile {
             machine,
             published_sigblk,
             status_hides_ignored,
+            status_held_ignored,
             lock_rows_kept,
             task_stat,
         } = context;
@@ -2453,11 +2464,12 @@ impl ProcfsFile {
         }
         self.contents = Some(match &self.kind {
             ProcfsKind::Stat => sanitize_stat(&contents, Some((virtual_pid, virtual_ppid))),
-            ProcfsKind::Status => sanitize_status(
+            ProcfsKind::Status => sanitize_status_held(
                 &contents,
                 Some((virtual_pid, virtual_pid, virtual_ppid)),
                 published_sigblk,
                 status_hides_ignored,
+                status_held_ignored,
             ),
             ProcfsKind::ThreadStat => {
                 let (_, tid, ppid) = self
@@ -2469,11 +2481,12 @@ impl ProcfsFile {
                 let (tgid, tid, ppid) = self
                     .bound_thread_identity
                     .expect("thread-self status was not bound when opened");
-                sanitize_status(
+                sanitize_status_held(
                     &contents,
                     Some((tgid, tid, ppid)),
                     published_sigblk,
                     status_hides_ignored,
+                    status_held_ignored,
                 )
             }
             ProcfsKind::ProcessStat => {
@@ -2485,8 +2498,13 @@ impl ProcfsFile {
             }
             ProcfsKind::Statm => sanitize_statm(&contents),
             ProcfsKind::ProcessStatus => {
-                let sanitized =
-                    sanitize_status(&contents, None, published_sigblk, status_hides_ignored);
+                let sanitized = sanitize_status_held(
+                    &contents,
+                    None,
+                    published_sigblk,
+                    status_hides_ignored,
+                    status_held_ignored,
+                );
                 match &self.guest_numbers {
                     Some(numbers) => renumber_status(&sanitized, numbers),
                     None => sanitized,
@@ -3218,14 +3236,33 @@ fn sanitize_statm(contents: &[u8]) -> Vec<u8> {
     b"0 0 0 0 0 0 0\n".to_vec()
 }
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#553)
-// TODO-HUMAN-REVIEW(PR-723): Review /proc status identity field normalization.
+/// [`sanitize_status_held`] with no held masks, as every status was rendered
+/// before A5 step 3c.1e A.
+#[cfg(test)]
 fn sanitize_status(
     contents: &[u8],
     virtual_identity: Option<(i32, i32, i32)>,
     published_sigblk: Option<u64>,
     hides_ignored: bool,
+) -> Vec<u8> {
+    sanitize_status_held(
+        contents,
+        virtual_identity,
+        published_sigblk,
+        hides_ignored,
+        (0, 0),
+    )
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(#553)
+// TODO-HUMAN-REVIEW(PR-723): Review /proc status identity field normalization.
+fn sanitize_status_held(
+    contents: &[u8],
+    virtual_identity: Option<(i32, i32, i32)>,
+    published_sigblk: Option<u64>,
+    hides_ignored: bool,
+    held_ignored: (u64, u64),
 ) -> Vec<u8> {
     const STATE: &[u8] = b"State:";
     const TGID: &[u8] = b"Tgid:";
@@ -3306,8 +3343,20 @@ fn sanitize_status(
                 .ok()
                 .and_then(|value| u64::from_str_radix(value.trim(), 16).ok())
         {
+            // A5 step 3c.1e A: each queue keeps its own held instances (D37's
+            // held masks), never the other queue's.
+            let held = if label == SIGPND {
+                held_ignored.0
+            } else {
+                held_ignored.1
+            };
             let shown = pending
-                & !crate::ignored_signals::hidden_from_status(pending, ignored, caught, mask);
+                & !crate::ignored_signals::hidden_from_status(
+                    pending,
+                    ignored,
+                    caught,
+                    mask | held,
+                );
             normalized.extend_from_slice(label);
             normalized.extend_from_slice(format!("\t{shown:016x}").as_bytes());
         } else if body.starts_with(STATE) {

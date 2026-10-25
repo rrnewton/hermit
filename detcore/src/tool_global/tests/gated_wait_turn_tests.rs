@@ -267,6 +267,21 @@ struct TurnGuest {
     rsp: u64,
     /// The timeout pointer of each injected `pselect6` probe, in order.
     probe_timeouts: Vec<usize>,
+    /// What a withdrawal of a temporary-mask publication answers (A5 step
+    /// 3c.1e A): the committed-send window record.
+    send_window: crate::scheduler::guest_mask_publication::CommittedSendWindow,
+    /// What `GlobalRequest::InPidNamespaceInit` answers (IR-15).
+    pid_namespace_init: bool,
+    /// What `GlobalRequest::PublishedGuestSigmask` answers, under the gate.
+    status_mask: crate::scheduler::guest_mask_publication::StatusGuestMask,
+    /// Each injected `rt_tgsigqueueinfo` (signal, siginfo bytes), in order.
+    requeued: Vec<(i32, [u8; 128])>,
+    /// For each injected `rt_sigtimedwait`, how many RPCs of any kind had
+    /// been sent before it.
+    sigtimedwait_after_rpcs: Vec<usize>,
+    /// How many `rt_sigtimedwait` calls have been injected, shared with a
+    /// `/proc` script that answers by it.
+    dequeues: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl TurnGuest {
@@ -368,6 +383,22 @@ impl GlobalRPC<GlobalState> for TurnGuest {
                     Some(false),
                 )
             }
+            GlobalRequest::PublishTemporaryMask(control) => {
+                GlobalResponse::PublishTemporaryMask(match control {
+                    crate::scheduler::guest_mask_publication::TemporaryMaskControl::Publish {
+                        ..
+                    } => None,
+                    crate::scheduler::guest_mask_publication::TemporaryMaskControl::Withdraw {
+                        ..
+                    } => Some(self.send_window),
+                })
+            }
+            GlobalRequest::InPidNamespaceInit(_) => {
+                GlobalResponse::InPidNamespaceInit(self.pid_namespace_init)
+            }
+            GlobalRequest::PublishedGuestSigmask(_) => {
+                GlobalResponse::GuestSigmaskForStatus(self.status_mask)
+            }
             request => panic!("an unexpected RPC: {request:?}"),
         };
         (None, response)
@@ -432,7 +463,17 @@ impl Guest<Detcore> for TurnGuest {
             // for an invalid signal number.
             Syscall::Tgkill(send) => valid_signal_sent(send.sig()),
             Syscall::Tkill(send) => valid_signal_sent(send.sig()),
-            Syscall::RtTgsigqueueinfo(send) => valid_signal_sent(send.sig()),
+            Syscall::RtTgsigqueueinfo(send) => {
+                // Recorded where its siginfo is readable; the answer is the
+                // harness's as before.
+                if let Some(Ok(bytes)) = send
+                    .siginfo()
+                    .map(|info| LocalMemory::new().read_value::<_, [u8; 128]>(info.cast()))
+                {
+                    self.requeued.push((send.sig(), bytes));
+                }
+                valid_signal_sent(send.sig())
+            }
             Syscall::RtSigqueueinfo(send) => valid_signal_sent(send.sig()),
             // The kernel-access probe of an action (`read_kernel_sigaction`):
             // SIGKILL's action cannot change, so the kernel refuses it once it
@@ -474,6 +515,10 @@ impl Guest<Detcore> for TurnGuest {
                 self.sigtimedwait_sets.push(set);
                 let requests = self.requests().len();
                 self.sigtimedwait_after_requests.push(requests);
+                let rpcs = self.rpcs.lock().unwrap().len();
+                self.sigtimedwait_after_rpcs.push(rpcs);
+                self.dequeues
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 self.sigtimedwait_results
                     .pop_front()
                     .unwrap_or(Err(Errno::EAGAIN))
@@ -681,6 +726,12 @@ fn turn_guest(gate: bool, own_mask: Option<u64>) -> TurnGuest {
         handoffs: Default::default(),
         rsp: 0,
         probe_timeouts: Vec::new(),
+        send_window: Default::default(),
+        pid_namespace_init: false,
+        status_mask: Default::default(),
+        requeued: Vec::new(),
+        sigtimedwait_after_rpcs: Vec::new(),
+        dequeues: Default::default(),
     }
 }
 

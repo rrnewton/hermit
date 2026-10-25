@@ -3177,6 +3177,140 @@ where
     )))
 }
 
+/// Which of a thread's two queues [`remove_ignored_from_queue`] empties of a
+/// signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OneQueue {
+    /// The thread's private queue (`SigPnd`).
+    Private,
+    /// Its thread group's shared queue (`ShdPnd`).
+    Shared,
+}
+
+/// A5 step 3c.1e A, D37's R2 per queue: remove every pending instance of the
+/// ignored signal `signal` from `queue` only, leaving the other queue's
+/// instances as they are, in the thread's own turn. `rt_sigtimedwait`
+/// dequeues the private queue first (`dequeue_signal`, kernel/signal.c:
+/// 626-639 at v6.12), so:
+///
+/// - `Private`: one trusted zero-timeout `rt_sigtimedwait` per instance, for
+///   as long as the thread's `/proc` status shows `signal` in `SigPnd`.
+/// - `Shared`: the private instances are dequeued first, each with its
+///   siginfo, then the shared ones until `EAGAIN`, then the private ones are
+///   queued again, in their order, with their own siginfo, by
+///   `rt_tgsigqueueinfo` to the thread itself (`do_rt_tgsigqueueinfo` lets a
+///   thread queue any siginfo to itself, kernel/signal.c:4112-4114; the
+///   signal is blocked by the kernel's mask then, the guest's own mask, which
+///   blocks it since Linux kept it, or the in-guest runtime's, so it is
+///   queued and not discarded, `sig_ignored`, :104-120).
+///
+/// Nothing is injected when `signal` is not pending in `queue`. A failed
+/// injection, more instances than any queue holds, or no scratch stack is
+/// Hermit's own failure (`Error::Tool`), never an errno of the guest's call.
+pub(crate) async fn remove_ignored_from_queue<T, G>(
+    guest: &mut G,
+    signal: i32,
+    queue: OneQueue,
+) -> Result<(), Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let bit = crate::syscalls::kernel_sigset_bit(signal);
+    let failed = |what: &str| {
+        Error::Tool(anyhow::anyhow!(
+            "removing ignored signal {signal} from the {queue:?} queue: {what}"
+        ))
+    };
+    let state = read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+    let in_queue = match queue {
+        OneQueue::Private => state.thread_pending,
+        OneQueue::Shared => state.shared_pending,
+    };
+    if in_queue & bit == 0 {
+        return Ok(());
+    }
+    let mut stack = guest.stack().await;
+    let set_cell = stack.push(bit);
+    let timeout = stack.push(Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    });
+    // A siginfo cell, kept as bytes: `siginfo_t` holds raw pointers, so an
+    // address typed by it could not live across an await.
+    let info = stack.reserve::<[u8; 128]>();
+    let _stack_guard = stack
+        .commit()
+        .map_err(|errno| failed(&format!("no scratch stack ({errno})")))?;
+    // SAFETY: the kernel only reads the set; Reverie types it as mutable.
+    let set_cell = unsafe { set_cell.cast::<libc::sigset_t>().into_mut() };
+    let dequeue = move |with_info: bool| {
+        syscalls::RtSigtimedwait::new()
+            .with_set(Some(set_cell))
+            .with_info(with_info.then(|| info.cast()))
+            .with_timeout(Some(timeout))
+            .with_sigsetsize(KERNEL_SIGSET_SIZE)
+    };
+    // The private instances, dequeued one at a time while `SigPnd` shows
+    // them; their siginfo is kept to queue them again for `Shared`.
+    let mut kept: Vec<[u8; 128]> = Vec::new();
+    let mut removals = 0;
+    while read_thread_wait_signal_state(guest.pid(), guest.tid())?.thread_pending & bit != 0 {
+        removals += 1;
+        if removals > MAX_IGNORED_REMOVALS {
+            return Err(failed("too many instances"));
+        }
+        match guest.inject(dequeue(queue == OneQueue::Shared)).await {
+            Ok(_) => {
+                if queue == OneQueue::Shared {
+                    kept.push(guest.memory().read_value(info)?);
+                }
+            }
+            Err(errno) => return Err(failed(&format!("rt_sigtimedwait failed with {errno}"))),
+        }
+    }
+    if queue == OneQueue::Private {
+        tracing::info!(
+            "[dtid {}] under the in-guest delivery gate, removed ignored signal {} from the \
+             private queue, which Linux discarded at send (D37)",
+            guest.thread_state().dettid,
+            signal
+        );
+        return Ok(());
+    }
+    loop {
+        removals += 1;
+        if removals > MAX_IGNORED_REMOVALS {
+            return Err(failed("too many instances"));
+        }
+        match guest.inject(dequeue(false)).await {
+            Ok(_) => {}
+            Err(Errno::EAGAIN) => break,
+            Err(errno) => return Err(failed(&format!("rt_sigtimedwait failed with {errno}"))),
+        }
+    }
+    for siginfo in kept {
+        guest.memory().write_value(info, &siginfo)?;
+        let requeue = syscalls::RtTgsigqueueinfo::new()
+            .with_tgid(guest.pid().as_raw())
+            .with_tid(guest.tid().as_raw())
+            .with_sig(signal)
+            .with_siginfo(Some(info.cast()));
+        if let Err(errno) = guest.inject(requeue).await {
+            return Err(failed(&format!(
+                "queueing a kept private instance again failed with {errno}"
+            )));
+        }
+    }
+    tracing::info!(
+        "[dtid {}] under the in-guest delivery gate, removed ignored signal {} from the shared \
+         queue, which Linux discarded at send, keeping its private instances (D37)",
+        guest.thread_state().dettid,
+        signal
+    );
+    Ok(())
+}
+
 /// What a temporary-mask wait's check finds under the in-guest delivery gate
 /// ([`temporary_mask_check`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

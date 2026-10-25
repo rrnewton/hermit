@@ -336,6 +336,73 @@ pub(crate) fn unreadable_syscall_argument_refusal(
     )
 }
 
+/// The run-wide stopping refusal (A5 design D49) of a `/proc` status read
+/// under the in-guest delivery gate whose thread's guest mask the scheduler
+/// holds as unknown (A5 step 3c.1e A, IR-18): it was readmitted on a rejoin
+/// that returned under its own mask but published none, so neither the mask
+/// its call published (possibly a temporary one Linux has taken down) nor
+/// the kernel's `SigBlk` (the in-guest runtime's mask once it has one) is the
+/// guest's. Linux's answer is not known, so the run ends rather than show
+/// either. Defect-only once step 3c.1e B guarantees a published mask on every
+/// gated backend.
+pub(crate) fn guest_mask_unknown_refusal(reader: i32, thread: i32) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_GUEST_MASK_UNKNOWN): thread {reader} reads \
+         the /proc status of thread {thread}, whose signal mask Hermit does not know (it \
+         returned from a call outside the schedule under its own mask without publishing it), \
+         so SigBlk cannot be shown as Linux shows it (A5 step 3c.1e, IR-18, \
+         https://github.com/rrnewton/hermit/issues/4485)."
+    )
+}
+
+/// The run-wide stopping refusal (A5 design D49) of a masked wait's end under
+/// the in-guest delivery gate (A5 step 3c.1e A, D37's R2) where one ignored
+/// real-time signal `signal`, outside the call's temporary mask, has both an
+/// instance kept pending from the call's entry and one sent to the same
+/// `queue` while the temporary mask was published: Linux keeps the first and
+/// discarded the second at send (`sig_ignored`, kernel/signal.c:104-120 at
+/// v6.12), but the queue's pending bit cannot tell them apart, and a removal
+/// would dequeue the older one first. Fail closed.
+pub(crate) fn ignored_realtime_instances_refusal(caller: i32, signal: i32, queue: &str) -> String {
+    format!(
+        "hermit refused to continue the run (HERMIT_IGNORED_REALTIME_INSTANCES): a wait under a \
+         temporary signal mask in thread {caller} ends with ignored real-time signal {signal} \
+         ({}) pending in its {queue} queue both from before the call and from a send during \
+         it, which Linux keeps and discards respectively; Hermit cannot remove only the second \
+         (A5 step 3c.1e, D37, https://github.com/rrnewton/hermit/issues/4485).",
+        signal_name(signal),
+    )
+}
+
+/// The WARN of A5 step 3c.1e A, IR-15: a two-phase delivery's announcement
+/// of a default-action signal, or a predicted death, for a thread of a
+/// process that is the init of a PID namespace it created with
+/// `CLONE_NEWPID`. Linux marks such an init `SIGNAL_UNKILLABLE`
+/// (kernel/fork.c:2558-2560 at v6.12): a signal whose action is `SIG_DFL` is
+/// ignored when it is sent unless blocked (`sig_task_ignored`,
+/// kernel/signal.c:92-94, through `sig_ignored`, :104-120 and :111), and a
+/// blocked one is discarded at dequeue (`get_signal`, :2843-2845). SIGKILL
+/// and SIGSTOP are ignored the same way unless the send is forced
+/// (`!(force && sig_kernel_only(sig))`, :93), which it is from an ancestor
+/// PID namespace or the kernel (`send_signal_locked`, :1217-1224), a sender
+/// the hook does not see. No default-action delivery or death can be
+/// predicted for any of them; the hook is refused with `EPROTONOSUPPORT`.
+pub(crate) fn pid_namespace_init_prediction_refused_warning(
+    caller: i32,
+    hook: &str,
+    signal: i32,
+) -> String {
+    format!(
+        "hermit refused an in-guest delivery (HERMIT_PID_NAMESPACE_INIT_PREDICTION): {hook} for \
+         signal {signal} ({}), which takes its default action, in thread {caller}, whose \
+         process is the init of a PID namespace it created, where Linux ignores or discards \
+         a default-action signal (SIGNAL_UNKILLABLE), SIGKILL and SIGSTOP too unless sent \
+         from an ancestor PID namespace or the kernel; the hook returns \
+         EPROTONOSUPPORT (A5 step 3c.1e, IR-15, https://github.com/rrnewton/hermit/issues/4485).",
+        signal_name(signal),
+    )
+}
+
 /// The named refusal (A5 design D39) of a masked `pselect6` under the
 /// in-guest delivery gate that Detcore cannot serve on staged copies: more
 /// than 64 descriptors and a nonzero timeout with nothing ready (Detcore polls
