@@ -1230,6 +1230,26 @@ pub struct Config {
     #[serde(default)]
     #[clap(skip)]
     pub in_guest_signal_delivery: bool,
+
+    /// Whether `--replay-preemptions-from` names a record that carries
+    /// callback checkpoints, so priority-history replay ends each annotated
+    /// row at its recorded callback endpoint instead of at the first stop that
+    /// reaches the row's RCB count
+    /// (<https://github.com/rrnewton/hermit/issues/4082>).
+    ///
+    /// The host sets it, not a flag, from the validated record before the
+    /// scheduler or any Tool reads the configuration, and refuses a
+    /// configuration it does not qualify for such a record
+    /// (`preemption_admission::refuse_unqualified_annotated_replay`). Preparing
+    /// any run sets it from the record, so a caller's configuration cannot
+    /// carry it in; Detcore refuses a record whose checkpoints disagree with
+    /// it. A record so annotated was made with `--record-preemptions`, so the
+    /// replay observes schedule events as its recording did
+    /// (`observes_schedevents`). False, the default, changes nothing. Like
+    /// `in_guest_signal_delivery`, it has no legacy key.
+    #[serde(default)]
+    #[clap(skip)]
+    pub annotated_priority_replay: bool,
 }
 
 /// Where and how much [`Config::fatal_core_capture`] may write.
@@ -1531,6 +1551,42 @@ impl Config {
     /// This applies to both record and replay for scheduled events.
     pub fn should_trace_schedevent(&self) -> bool {
         self.record_preemptions || self.replay_schedule_from.is_some()
+    }
+
+    /// Whether this run produces and traces schedule events: the decision
+    /// `should_trace_schedevent` makes for recording and schedule replay, and
+    /// also replay of a callback-annotated priority history
+    /// (`annotated_priority_replay`). Such a record was made with
+    /// `--record-preemptions`, so its replay makes every decision this gates
+    /// as its recording did, whether or not it writes a record, and its
+    /// callback checkpoints compare against the progress those events count.
+    pub fn observes_schedevents(&self) -> bool {
+        self.should_trace_schedevent() || self.annotated_priority_replay
+    }
+
+    /// Why this effective configuration cannot replay a callback-annotated
+    /// priority history, or `None` when it can. Its row ends are actual
+    /// callback endpoints at exact RCB counts, guarded one RCB past each: that
+    /// needs the backend's own Detcore preemption timer events
+    /// (`delivers_preemption_timer_events`), sequentialized threads (the
+    /// scheduler that grants each history and acknowledges each row), an
+    /// active maximum timeslice, precise timers and RCB time. The answer
+    /// names the first unmet requirement. It reads capabilities, never a
+    /// backend's name, and never changes the configuration.
+    pub fn annotated_priority_replay_unqualified(&self) -> Option<&'static str> {
+        if !self.backend.delivers_preemption_timer_events {
+            Some("cannot deliver Detcore preemption timer events")
+        } else if !self.sequentialize_threads {
+            Some("does not sequentialize threads (--no-sequentialize-threads)")
+        } else if self.max_timeslice.is_none() {
+            Some("has its preemption timer disabled (--max-timeslice=disabled)")
+        } else if self.imprecise_timers {
+            Some("requests imprecise timers (--imprecise-timers)")
+        } else if self.no_rcb_time {
+            Some("requests logical time without RCBs (--no-rcb-time)")
+        } else {
+            None
+        }
     }
 
     /// Returns manual interuption points for a given thread
@@ -2832,7 +2888,11 @@ mod legacy_backend_json {
     /// as unset.
     /// `signal_at` came after the form froze; the scheduler acts on it, not
     /// the runtime, so it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 27] = [
+    /// `annotated_priority_replay` came after it too, and is false for every
+    /// backend that reads the legacy form: priority replay needs a preemption
+    /// timer, which none of them delivers, so it is never written and reads
+    /// as false.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 28] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -2860,6 +2920,7 @@ mod legacy_backend_json {
         "work_span_report",
         "signal_at",
         "in_guest_signal_delivery",
+        "annotated_priority_replay",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -2995,6 +3056,7 @@ mod legacy_backend_json {
                     | "in_guest_site_patching_off"
                     | "in_guest_refuses_host_timed_producers"
                     | "in_guest_signal_delivery"
+                    | "annotated_priority_replay"
                     | "target_timeslice_syscalls_only"
                     | "futex_wake_yields"
                     | "replaying"
@@ -3308,7 +3370,8 @@ mod legacy_backend_json {
                 | "signal_delivery_check_fatal"
                 | "work_span_report"
                 | "signal_at"
-                | "in_guest_signal_delivery" => Ok(()),
+                | "in_guest_signal_delivery"
+                | "annotated_priority_replay" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -4038,7 +4101,8 @@ mod tests {
                 | "signal_delivery_check_fatal"
                 | "work_span_report"
                 | "signal_at"
-                | "in_guest_signal_delivery" => {}
+                | "in_guest_signal_delivery"
+                | "annotated_priority_replay" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -4058,11 +4122,12 @@ mod tests {
         // `signal_state_copy`, `container_mount_table`,
         // `mountinfo_mount_namespace`, `directory_placeholder`,
         // `container_procfs`, `signal_delivery_check_fatal`,
-        // `work_span_report`, `signal_at` and `in_guest_signal_delivery` and
-        // `strict_schedule_boundaries` none: fourteen more keys and
-        // twenty-six fewer, so twelve keys fewer than fields.
+        // `work_span_report`, `signal_at`, `in_guest_signal_delivery`,
+        // `annotated_priority_replay` and `strict_schedule_boundaries` none:
+        // fourteen more keys and twenty-seven fewer, so thirteen keys fewer
+        // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 12);
+        assert_eq!(fields.len(), keys.len() + 13);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -4934,6 +4999,152 @@ mod tests {
             .expect("the field is serialized");
         let decoded: Config = serde_json::from_value(encoded).unwrap();
         assert!(!decoded.in_guest_signal_delivery);
+    }
+
+    /// `annotated_priority_replay` never enters the legacy form, and reads
+    /// back as false from both its object and array forms; it crosses
+    /// Reverie's positional bincode and JSON unchanged, and a JSON
+    /// configuration without the key reads as off.
+    #[test]
+    fn annotated_priority_replay_never_enters_the_legacy_form_and_round_trips() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            annotated_priority_replay: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("annotated_priority_replay"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .annotated_priority_replay
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .annotated_priority_replay
+        );
+        for annotated in [false, true] {
+            let config = Config {
+                annotated_priority_replay: annotated,
+                ..Config::default()
+            };
+            let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(decoded.annotated_priority_replay, annotated);
+            let json: Config =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            assert_eq!(json.annotated_priority_replay, annotated);
+        }
+        let mut encoded = serde_json::to_value(Config::default()).unwrap();
+        encoded
+            .as_object_mut()
+            .unwrap()
+            .remove("annotated_priority_replay")
+            .expect("the field is serialized");
+        let decoded: Config = serde_json::from_value(encoded).unwrap();
+        assert!(!decoded.annotated_priority_replay);
+    }
+
+    /// Schedule events are observed exactly where they are traced, and also
+    /// in replay of a callback-annotated priority history, whose recording
+    /// traced them, whether or not that replay records.
+    #[test]
+    fn annotated_priority_replay_observes_schedule_events() {
+        let plain = Config::default();
+        assert!(!plain.should_trace_schedevent() && !plain.observes_schedevents());
+        let recording = Config {
+            record_preemptions: true,
+            ..Config::default()
+        };
+        assert!(recording.should_trace_schedevent() && recording.observes_schedevents());
+        let replay = Config {
+            replay_preemptions_from: Some("history.json".into()),
+            ..Config::default()
+        };
+        assert!(!replay.observes_schedevents(), "an unannotated history");
+        let annotated = Config {
+            annotated_priority_replay: true,
+            ..replay
+        };
+        assert!(!annotated.should_trace_schedevent());
+        assert!(annotated.observes_schedevents());
+    }
+
+    /// An annotated priority history replays only on an effective
+    /// configuration with the backend's own preemption timer events,
+    /// sequentialized threads, an active maximum, precise timers and RCB time.
+    /// A configuration nobody prepared for a backend has no timer events and
+    /// is refused; each other unmet requirement is named in turn, and the
+    /// answer never changes the configuration.
+    #[test]
+    fn annotated_priority_replay_requires_a_qualified_effective_configuration() {
+        let unprepared = Config {
+            annotated_priority_replay: true,
+            replay_preemptions_from: Some("history.json".into()),
+            ..Config::default()
+        };
+        assert_eq!(
+            unprepared.annotated_priority_replay_unqualified(),
+            Some("cannot deliver Detcore preemption timer events")
+        );
+        let qualified = Config {
+            backend: BackendCapabilities::PTRACE,
+            sequentialize_threads: true,
+            max_timeslice: NonZeroU64::new(1_000_000),
+            imprecise_timers: false,
+            no_rcb_time: false,
+            ..unprepared.clone()
+        };
+        assert_eq!(qualified.annotated_priority_replay_unqualified(), None);
+        let before = serde_json::to_value(&qualified).unwrap();
+        for (config, setting) in [
+            (
+                Config {
+                    sequentialize_threads: false,
+                    ..qualified.clone()
+                },
+                "does not sequentialize threads (--no-sequentialize-threads)",
+            ),
+            (
+                Config {
+                    max_timeslice: None,
+                    ..qualified.clone()
+                },
+                "has its preemption timer disabled (--max-timeslice=disabled)",
+            ),
+            (
+                Config {
+                    imprecise_timers: true,
+                    ..qualified.clone()
+                },
+                "requests imprecise timers (--imprecise-timers)",
+            ),
+            (
+                Config {
+                    no_rcb_time: true,
+                    ..qualified.clone()
+                },
+                "requests logical time without RCBs (--no-rcb-time)",
+            ),
+        ] {
+            assert_eq!(
+                config.annotated_priority_replay_unqualified(),
+                Some(setting)
+            );
+        }
+        assert_eq!(serde_json::to_value(&qualified).unwrap(), before);
     }
 
     /// `--signal-at` takes `turn=N:SIGNAL` with SIGNAL a name or a number.

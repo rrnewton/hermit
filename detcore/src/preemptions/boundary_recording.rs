@@ -265,6 +265,15 @@ impl HistoryReader {
     ) -> Option<super::ThreadHistory> {
         self.0.metadata().per_thread.get(tid).cloned()
     }
+
+    /// The validated callback checkpoints of this history, per thread, in
+    /// row order (`PreemptionRecord::validate`).
+    pub(crate) fn callback_checkpoints(
+        &self,
+    ) -> &std::collections::BTreeMap<crate::types::DetTid, Vec<super::callback_history::Checkpoint>>
+    {
+        self.0.metadata().callback_checkpoints()
+    }
 }
 
 impl std::fmt::Display for HistoryReader {

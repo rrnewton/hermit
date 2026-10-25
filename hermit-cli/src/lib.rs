@@ -4873,6 +4873,7 @@ async fn dispatch_backend(
 ) -> Result<ExitStatus, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
+    crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;
     config.launch_image = launched_image(&command);
     if backend == Backend::Kvm {
         return Ok(run_kvm(
@@ -5222,6 +5223,7 @@ async fn dispatch_output_backend(
 ) -> Result<Output, Error> {
     // Every launch path, ptrace's included, reaches the guest through here.
     crate::cpu_profile_admission::refuse_unadmitted_launch(&config, backend == Backend::Ptrace)?;
+    crate::preemption_admission::refuse_unqualified_annotated_launch(&config)?;
     config.launch_image = launched_image(&command);
     if backend == Backend::Kvm {
         return run_kvm(
