@@ -929,7 +929,9 @@ hermit: NOTICE: the guest bound the abstract unix socket "@myapp:3" under --netw
 ```
 
 The bind itself is unchanged. Run such guests with `--network=local`, or one at
-a time when they need the host's network.
+a time when they need the host's network. `--strace-only` includes
+`--network=host`; to give such a run its own names, spell out its expansion
+with `--network=local` instead.
 
 `hermit run --gdbserver` serves the guest to one gdb client and waits for it
 before the guest runs. Attach from another terminal with

@@ -5885,11 +5885,11 @@ fn gdbserver_respects_explicit_host_networking() {
 /// `--analyze-networking` needs the isolated namespace, which `--gdbserver`
 /// no longer leaves, so the two combine.
 /// Detcore's notice for an abstract `AF_UNIX` bind is on only for a run that asked
-/// for `--network=host`, really shares the host's network namespace, has its own
-/// PID namespace, is not in a mode that needs host networking, and runs Detcore
-/// in Hermit's own process.
+/// for `--network=host` (given, or through `--strace-only`'s expansion), really
+/// shares the host's network namespace, has its own PID namespace, is not under
+/// `--gdbserver`, and runs Detcore in Hermit's own process.
 #[test]
-fn abstract_bind_notice_is_on_only_for_an_explicit_host_network_run_on_ptrace() {
+fn abstract_bind_notice_is_on_only_for_a_host_network_run_on_ptrace() {
     let resolved = |global: &[&str], args: &[&str]| {
         let argv: Vec<&str> = std::iter::once("hermit")
             .chain(global.iter().copied())
@@ -5912,8 +5912,23 @@ fn abstract_bind_notice_is_on_only_for_an_explicit_host_network_run_on_ptrace() 
     assert!(!resolved(&[], &["--no-namespace"]));
     assert!(!resolved(&[], &["--gdbserver"]));
     assert!(!resolved(&[], &["--gdbserver", "--network=host"]));
-    assert!(!resolved(&[], &["--strace-only"]));
-    assert!(!resolved(&[], &["--strace-only", "--network=host"]));
+    // --strace-only is shorthand for an expansion that includes
+    // --network=host, and resolves like it: the notice is on for both.
+    assert!(resolved(&[], &["--strace-only"]));
+    assert!(resolved(&[], &["--strace-only", "--network=host"]));
+    assert!(resolved(
+        &[],
+        &[
+            "--tmp=/tmp",
+            "--network=host",
+            "--no-virtualize-cpuid",
+            "--no-virtualize-time",
+            "--no-virtualize-metadata",
+            "--no-sequentialize-threads",
+            "--no-deterministic-io",
+            "--no-rcb-time",
+        ]
+    ));
     // A recording forces host networking but refuses abstract AF_UNIX
     // addresses outright (and clap refuses it with --network=host).
     let dir = tempfile::tempdir().unwrap();
@@ -8472,17 +8487,17 @@ impl RunOpts {
         self.det_opts.det_config.network_trace = self.network_trace_config()?;
         // Detcore's notice for an abstract AF_UNIX bind, on only where its
         // advice holds and it reaches Hermit's stderr rather than the guest's:
-        // an explicit --network=host whose run really shares the host's
-        // namespace (--analyze-networking isolates it), in a PID namespace
-        // (every guest's first process is pid 3), not taken over by a mode
-        // that needs host networking (--gdbserver or --strace-only; a
-        // recording, which refuses abstract addresses outright, cannot be
+        // --network=host, given or as part of --strace-only's documented
+        // expansion (lowered before this, so both spellings resolve alike),
+        // whose run really shares the host's namespace (--analyze-networking
+        // isolates it), in a PID namespace (every guest's first process is
+        // pid 3), not taken over by --gdbserver, which needs host networking
+        // (a recording, which refuses abstract addresses outright, cannot be
         // combined with --network=host), and with Detcore in Hermit's own
         // process (the ptrace backend, e9patch preprocessing included).
         self.det_opts.det_config.notice_host_network_abstract_binds = host_network_requested
             && !self.network.uses_local_namespace(self.analyze_networking)
             && !self.no_namespace
-            && !self.strace_only
             && !self.det_opts.det_config.gdbserver
             && matches!(backend, Backend::Ptrace | Backend::E9patch);
         if self.record_networking.is_some() {
