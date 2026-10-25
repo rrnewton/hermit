@@ -48,6 +48,7 @@
 //! as every Hermit integration test does.
 
 use std::os::unix::process::ExitStatusExt;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -243,11 +244,52 @@ fn run_replay_with(binary: &Path, scenario: Option<&str>, mode: Mode, hermit_arg
     // typed classifier judges the run hermit-verify reports as failed: its own
     // exit status and its own stderr. Only such a refusal is retried; the
     // retry is recorded, and credited a CPU budget, like hermit_output's.
-    let name = std::thread::current()
-        .name()
-        .unwrap_or("replay case")
-        .to_owned();
+    let thread = std::thread::current();
+    let name = thread.name().unwrap_or("replay case").to_owned();
+    // The verifier copies to fixed basenames. Keep each case and each typed
+    // skid retry separate when artifact retention is requested, and refuse
+    // to overwrite evidence from an earlier invocation of this test.
+    let artifact_directory = std::env::var_os("TEST_RESULT_ARTIFACTS_DIR").map(|root| {
+        assert!(
+            !root.is_empty(),
+            "TEST_RESULT_ARTIFACTS_DIR must not be empty"
+        );
+        let test_name = thread
+            .name()
+            .expect("artifact retention needs the test name");
+        assert!(
+            matches!(
+                Path::new(test_name).components().next(),
+                Some(Component::Normal(component)) if component == test_name
+            ),
+            "test name is not one normal path component: {test_name:?}"
+        );
+        let root = PathBuf::from(root).join("replay_modes");
+        std::fs::create_dir_all(&root).unwrap_or_else(|error| {
+            panic!("failed to create artifact root {}: {error}", root.display())
+        });
+        let directory = root.join(test_name);
+        std::fs::create_dir(&directory).unwrap_or_else(|error| {
+            panic!(
+                "failed to reserve case artifacts {}: {error}",
+                directory.display()
+            )
+        });
+        directory
+    });
+    let mut attempt = 0;
     let (_, _, output) = skid_overshoot::retry_typed_skid_refusal(&name, SKID_ATTEMPTS, || {
+        attempt += 1;
+        if let Some(directory) = &artifact_directory {
+            let directory = directory.join(format!("attempt-{attempt}"));
+            std::fs::create_dir(&directory).unwrap_or_else(|error| {
+                panic!(
+                    "failed to reserve attempt artifacts {}: {error}",
+                    directory.display()
+                )
+            });
+            command.env("TEST_RESULT_ARTIFACTS_DIR", directory);
+        }
         let output = command
             .output()
             .unwrap_or_else(|error| panic!("failed to start {rendered}: {error}"));
