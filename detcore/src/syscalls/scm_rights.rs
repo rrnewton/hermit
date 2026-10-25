@@ -54,17 +54,24 @@
 //! path. Under record and replay and without sequentialized threads no
 //! receive is recorded, logged at debug level only (`ReceiptMode`).
 //!
-//! Every received descriptor is a description of its own in Detcore's model,
-//! as in the in-guest discovery, even when it is an alias of a description
-//! the process already holds (it sent the descriptor to itself, say): Linux
-//! then shares the status flags, the directory position and lock ownership
-//! between the two, and Detcore's two models do not
-//! (<https://github.com/rrnewton/hermit/issues/4670>). Detcore cannot tell such
-//! an alias apart on every backend, and joining them only where it can would
-//! make the guest-visible result depend on the backend.
+//! A received descriptor can name an open file the receiving table already
+//! models: the process sent the descriptor to itself, or holds it under
+//! another number. Linux then shares one `struct file` between the two, with
+//! its status flags, directory position and lock ownership. Where the kernel
+//! answers `kcmp(KCMP_FILE)`, the record joins that open file as `dup` would
+//! ([`Detcore::join_received_alias`]), checked before the anonymous-inode
+//! refusal, so an eventfd the table models stays one. Elsewhere it is a
+//! description of its own in Detcore's model, as in the in-guest discovery,
+//! and Detcore's two models do not share that state
+//! (<https://github.com/rrnewton/hermit/issues/4670>). That makes the alias
+//! case depend on the backend: ptrace, the reference backend, answers as
+//! Linux does; KVM, whose executor does not answer `kcmp`, and the in-guest
+//! backends, which discover lazily, keep the separate model they had.
 
 use std::os::fd::RawFd;
 
+use nix::fcntl::OFlag;
+use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
@@ -490,6 +497,17 @@ impl ReceiveGeometry {
     }
 }
 
+/// What became of one received descriptor ([`Detcore::record_received_descriptor`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Receipt {
+    /// Recorded as an open file new to this table.
+    New,
+    /// Joined an open file this table already models, as an alias.
+    Joined,
+    /// Left out of the table.
+    Unrecorded,
+}
+
 /// How this run handles descriptors received over `SCM_RIGHTS`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReceiptMode {
@@ -555,13 +573,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Record in this thread's descriptor table each descriptor a receive
     /// installed (`delivered`), where this run records received descriptors
     /// and the receive completed in the caller's turn (`in_turn`,
-    /// [`Self::receipt_is_observable`]), and return those it recorded. The
-    /// guest's result is never changed. A descriptor left out of the table, as
-    /// every received descriptor was before, is named in a warning: for each
-    /// receive whose layout cannot be trusted, each receive on the background
-    /// path, each number that already has a record, each anonymous inode
-    /// other than an inotify instance, and each descriptor whose facts cannot
-    /// be taken. Under record and replay
+    /// [`Self::receipt_is_observable`]), and return those it recorded as open
+    /// files new to the table. One that joined an open file the table already
+    /// models is not returned: it brings the lock ledger no new identity, and
+    /// `refresh_description_locks` would mark that shared open file, the
+    /// original's too, as received. The guest's result is never changed. A
+    /// descriptor left out of the table, as every received descriptor was
+    /// before, is named in a warning: for each receive whose layout cannot be
+    /// trusted, each receive on the background path, each number that already
+    /// has a record, each anonymous inode other than an inotify instance, and
+    /// each descriptor whose facts cannot be taken. Under record and replay
     /// and without sequentialized threads none is recorded, logged at debug
     /// level only (a warning per call, or per tool process, would differ
     /// between runs that share a process). `cloexec` is whether the receive
@@ -619,8 +640,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 continue;
             }
             match self.record_received_descriptor(guest, fd).await {
-                Ok(true) => recorded.push(fd),
-                Ok(false) => {}
+                Ok(Receipt::New) => recorded.push(fd),
+                Ok(Receipt::Joined | Receipt::Unrecorded) => {}
                 Err(error) => {
                     // Open, but without its facts: listed, never modelled.
                     guest.thread_state().note_unmodelled_descriptor(fd, cloexec);
@@ -635,13 +656,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Record descriptor `fd`, which Linux has just installed through
-    /// `SCM_RIGHTS`, from the kernel's facts about it.
-    /// Whether it was recorded.
+    /// `SCM_RIGHTS`, from the kernel's facts about it, and say how.
     async fn record_received_descriptor<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
-    ) -> Result<bool, Error> {
+    ) -> Result<Receipt, Error> {
         // Linux gave the receiver free numbers. A record of one already
         // describes something Detcore does not know to be gone: kept as it is.
         if guest.thread_state().with_detfd(fd, |_| ()).is_ok() {
@@ -649,7 +669,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "[detcore] descriptor {fd}, received over SCM_RIGHTS, already has a record, \
                  which is kept"
             );
-            return Ok(false);
+            return Ok(Receipt::Unrecorded);
         }
         // Passive probes, retried when a signal stopped them before they ran.
         let descriptor_flags = guest
@@ -667,6 +687,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await? as i32;
         let stat = self.inject_fstat(guest, fd).await?;
+        if self
+            .join_received_alias(guest, fd, descriptor_flags, &stat)
+            .await?
+        {
+            return Ok(Receipt::Joined);
+        }
         // An anonymous inode (an eventfd, signalfd, timerfd, epoll set,
         // inotify instance, pidfd, userfaultfd, ...) has no file type, and
         // `fstat` cannot tell which it is. Recorded as an ordinary file, its
@@ -700,7 +726,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                      whose link cannot be read, so its kind is unknown: not recorded"
                 ),
             }
-            return Ok(false);
+            return Ok(Receipt::Unrecorded);
         }
         if may_be_placeholder(&stat)
             && placeholders_exist()
@@ -709,12 +735,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             self.adopt_received_placeholder(guest, fd, path, (stat.st_dev, stat.st_ino))
                 .await?;
-            return Ok(true);
+            return Ok(Receipt::New);
         }
-        // Every received descriptor is a description of its own in the model,
-        // even where it is an alias of one this process holds (see the
-        // module documentation), made exactly as the in-guest discovery
-        // makes it: a directory gets a sorted stream of its own.
+        // Any other received descriptor is a description of its own in the
+        // model (see the module documentation), made exactly as the in-guest
+        // discovery makes it: a directory gets a sorted stream of its own.
         guest.thread_state().add_discovered_fd(
             fd,
             descriptor_flags,
@@ -726,7 +751,87 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (`descriptor_directory`).
         self.recognize_received_placeholder(guest, fd, &stat, status_flags)
             .await;
-        Ok(true)
+        Ok(Receipt::New)
+    }
+
+    /// Join descriptor `fd`, which Linux has just installed through
+    /// `SCM_RIGHTS` and whose `fstat` is `stat`, to the open file it names
+    /// when this table already models that open file, as `dup` would, with
+    /// `FD_CLOEXEC` as `descriptor_flags` (`F_GETFD`) says. Whether it
+    /// joined one.
+    ///
+    /// Linux installs the sender's `struct file` (`receive_fd`), so the two
+    /// descriptors share its status flags, lock state, directory position and
+    /// scheduler resource: an `O_NONBLOCK` set through either shows through
+    /// both, and a blocking read through the received end of a pipe Detcore
+    /// keeps physically nonblocking still waits for the writer. Each
+    /// descriptor of the table on the same inode, or with none cached, is
+    /// compared with `kcmp(KCMP_FILE)`, in ascending order, through the
+    /// recording. `kcmp` names the receiving thread by its own id, not its
+    /// process's: Linux looks the descriptors up in the table of the task it
+    /// is given, which differs for a thread with a table of its own, and is
+    /// gone once a process's first thread has exited. Each candidate costs
+    /// one `kcmp`, an event under record; a table whose descriptors carry no
+    /// cached inode compares every descriptor. A `kcmp` the kernel does not
+    /// answer (`ENOSYS`, as from KVM's executor, or `EPERM`) ends the search,
+    /// and the descriptor is then a description of its own
+    /// (<https://github.com/rrnewton/hermit/issues/4670>).
+    async fn join_received_alias<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        descriptor_flags: i32,
+        stat: &libc::stat,
+    ) -> Result<bool, Error> {
+        // Linux's KCMP_FILE: compare the open files behind two descriptors.
+        const KCMP_FILE: i32 = 0;
+        let candidates: Vec<RawFd> = guest
+            .thread_state()
+            .fds_with_raw_inodes()
+            .into_iter()
+            .filter(|&(other, inode)| other != fd && inode.is_none_or(|inode| inode == stat.st_ino))
+            .map(|(other, _)| other)
+            .collect();
+        if candidates.is_empty() {
+            return Ok(false);
+        }
+        let tid = guest.inject(syscalls::Gettid::new()).await? as libc::pid_t;
+        for other in candidates {
+            let compared = self
+                .record_or_replay(
+                    guest,
+                    syscalls::Kcmp::new()
+                        .with_pid1(tid)
+                        .with_pid2(tid)
+                        .with_typ(KCMP_FILE)
+                        .with_idx1(fd as u64)
+                        .with_idx2(other as u64),
+                )
+                .await;
+            match compared {
+                Ok(0) => {
+                    let flags = if descriptor_flags & libc::FD_CLOEXEC != 0 {
+                        OFlag::O_CLOEXEC
+                    } else {
+                        OFlag::empty()
+                    };
+                    if let Some(open_file_id) = guest.thread_state_mut().dup_fd(other, fd, flags)? {
+                        self.release_port_for_open_file(guest, open_file_id).await;
+                    }
+                    return Ok(true);
+                }
+                Ok(_) => {}
+                Err(errno @ (Errno::ENOSYS | Errno::EPERM)) => {
+                    debug!(
+                        "[detcore] descriptor {fd}, received over SCM_RIGHTS, is not compared \
+                         with this table's: kcmp failed with {errno}"
+                    );
+                    return Ok(false);
+                }
+                Err(_) => {}
+            }
+        }
+        Ok(false)
     }
 
     /// What descriptor `fd` of the calling thread links to, read in the

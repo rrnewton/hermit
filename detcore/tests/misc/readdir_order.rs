@@ -447,13 +447,12 @@ fn drain_names(fd: i32) -> Vec<String> {
 }
 
 /// Send `fd` to this process over a Unix socket and return the descriptor
-/// that arrives. With sequentialized threads Detcore records it as a
-/// description of its own, which it does not join to `fd`'s, with a sorted
-/// stream and position of its own, as the in-guest backends discover one
-/// (`Detcore::record_received_descriptors`;
-/// https://github.com/rrnewton/hermit/issues/4670); without, it keeps no
-/// record of it, and `getdents` through it reads the kernel's buffers from
-/// the position it shares with `fd`. The tests that use it run both ways.
+/// that arrives. With sequentialized threads Detcore records it as an alias
+/// of `fd`'s open file while `fd` is open, sharing its sorted stream and
+/// position as Linux shares the kernel position
+/// (`Detcore::record_received_descriptors`); without, it keeps no record of
+/// it, and `getdents` through it reads the kernel's buffers from the
+/// position it shares with `fd`. The tests that use it run both ways.
 fn receive_descriptor(fd: i32) -> i32 {
     /// Room for one `SCM_RIGHTS` message, aligned as a `cmsghdr` must be.
     #[repr(C, align(8))]
@@ -748,13 +747,16 @@ fn rewind_after_host_order_sorts_again() {
     );
 }
 
-fn passed_on_descriptor_guest(root: &tempfile::TempDir) {
+/// `recorded`: whether Detcore records the received descriptor (with
+/// sequentialized threads), as an alias that shares the stream, or keeps no
+/// record of it (without), so that it reads the kernel's position.
+fn passed_on_descriptor_guest(root: &tempfile::TempDir, recorded: bool) {
     let mut expected = vec![".".to_owned(), "..".to_owned()];
     expected.extend(sorted_names());
 
     // Read part of the directory, then hand the open file to a received
-    // descriptor, which Detcore models with a stream of its own or does not
-    // track (see `receive_descriptor`). On Linux it reads the entries not yet
+    // descriptor, which Detcore records as an alias of the open file or does
+    // not track (see `receive_descriptor`). On Linux it reads the entries not yet
     // returned;
     // it may also repeat some here, because the host order differs, but it
     // must not miss any. The repeats are a known regression, not the spec:
@@ -781,15 +783,21 @@ fn passed_on_descriptor_guest(root: &tempfile::TempDir) {
         missing.first()
     );
 
-    // The stream itself continues where it stopped. This is NOT Linux
-    // behaviour: the two descriptors share one position, so after the
-    // passed-on descriptor read to the end, Linux returns nothing here. The
-    // stream does not see the alias's reads and returns those entries again,
-    // the second mechanism of https://github.com/rrnewton/hermit/issues/3722.
-    // Flip this assertion when that issue is fixed.
-    let mut names = first;
-    names.extend(drain_names(fd));
-    assert_eq!(names, expected);
+    // The two descriptors share one position, so after the passed-on
+    // descriptor read to the end, Linux returns nothing here. A recorded
+    // received descriptor shares the stream, so the same holds. An unrecorded
+    // one reads the kernel's position, which the stream does not see: the
+    // stream continues where it stopped and returns those entries again. That
+    // is NOT Linux behaviour, the second mechanism of
+    // https://github.com/rrnewton/hermit/issues/3722; flip that branch when
+    // the issue is fixed.
+    if recorded {
+        assert_eq!(drain_names(fd), Vec::<String>::new());
+    } else {
+        let mut names = first;
+        names.extend(drain_names(fd));
+        assert_eq!(names, expected);
+    }
 
     // At the end of the stream, the passed-on descriptor is at the end too.
     let mut buf = [0u8; 4096];
@@ -807,14 +815,22 @@ fn passed_on_descriptor_guest(root: &tempfile::TempDir) {
 /// tracked in https://github.com/rrnewton/hermit/issues/3722; see the guest.
 #[test]
 fn passed_on_descriptor_misses_no_entry() {
-    run_five_times_on(scrambled_directory, passed_on_descriptor_guest, true);
+    run_five_times_on(
+        scrambled_directory,
+        |root| passed_on_descriptor_guest(root, true),
+        true,
+    );
 }
 
 /// The same with unsequentialized threads, where Detcore keeps no record of
 /// the passed-on descriptor.
 #[test]
 fn unrecorded_passed_on_descriptor_misses_no_entry() {
-    run_five_times_on(scrambled_directory, passed_on_descriptor_guest, false);
+    run_five_times_on(
+        scrambled_directory,
+        |root| passed_on_descriptor_guest(root, false),
+        false,
+    );
 }
 
 fn partly_mapped_buffer_guest(root: &tempfile::TempDir) {
@@ -1038,11 +1054,11 @@ fn sorted(mut names: Vec<String>) -> Vec<String> {
     names
 }
 
-/// `recorded`: whether Detcore records the received descriptor (with
-/// sequentialized threads on ptrace and KVM) as a description of its own,
-/// with a sorted stream and position of its own, or keeps no record of it
-/// (without), so that it reads from the kernel's position, which it shares.
-fn alias_after_rewinds_guest(recorded: bool) {
+/// Detcore records the received descriptor (with sequentialized threads) as
+/// an alias of the open file, sharing its stream and position, or keeps no
+/// record of it (without), so that it reads from the kernel's position,
+/// which it shares. Either way it follows the rewinds as on Linux.
+fn alias_after_rewinds_guest() {
     let root = both_orders(300);
     let expected = listing_of(300);
 
@@ -1066,26 +1082,15 @@ fn alias_after_rewinds_guest(recorded: bool) {
         );
         assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_SET) }, 0);
         drop(dir);
-        if recorded {
-            // Linux shares one position: after the stream is rewound, the
-            // passed-on descriptor reads every entry again. A recorded
-            // received descriptor is a second model with a stream of its
-            // own, which its first drain left at the end, so it reads
-            // nothing: https://github.com/rrnewton/hermit/issues/4670. (Before
-            // Detcore recorded received descriptors this held as on Linux;
-            // the unrecorded variant below keeps that path.)
-            assert_eq!(
-                drain_names(received),
-                Vec::<String>::new(),
-                "{order}: after the second rewind"
-            );
-        } else {
-            assert_eq!(
-                sorted(drain_names(received)),
-                sorted(expected.clone()),
-                "{order}: after the second rewind"
-            );
-        }
+        // Linux shares one position: after the stream is rewound, the
+        // passed-on descriptor reads every entry again, though the
+        // descriptor it was sent from is closed. A recorded received
+        // descriptor is an alias of that open file and shares its stream.
+        assert_eq!(
+            sorted(drain_names(received)),
+            sorted(expected.clone()),
+            "{order}: after the second rewind"
+        );
         unsafe { libc::close(received) };
 
         // Seeking the stream back to where it already was, after the
@@ -1126,14 +1131,14 @@ fn alias_after_rewinds_guest(recorded: bool) {
 /// `assert_contains_rest`.
 #[test]
 fn passed_on_descriptor_follows_repeated_seeks() {
-    run_five_times_on(|| (), |()| alias_after_rewinds_guest(true), true);
+    run_five_times_on(|| (), |()| alias_after_rewinds_guest(), true);
 }
 
 /// The same with unsequentialized threads, where Detcore keeps no record of
 /// the passed-on descriptor, which then shares the kernel's position.
 #[test]
 fn unrecorded_passed_on_descriptor_follows_repeated_seeks() {
-    run_five_times_on(|| (), |()| alias_after_rewinds_guest(false), false);
+    run_five_times_on(|| (), |()| alias_after_rewinds_guest(), false);
 }
 
 /// A mapping of `pages` pages filled with 0xaa, of which the first `writable`
@@ -2351,7 +2356,7 @@ fn negative_count_untracked_guest() {
         File::create(root.path().join(name(index))).unwrap();
     }
 
-    // A received descriptor (recorded with a stream of its own, or
+    // A received descriptor (recorded as an alias of an open file, or
     // untracked), and one it
     // reads in host order because it was seeked to a host position before
     // its first read: a
@@ -2439,7 +2444,7 @@ fn negative_count_untracked_guest() {
     }
 
     // A descriptor Detcore tracks, rewound to 0 after it was read to the
-    // end, while a received descriptor (recorded with a stream of its own, or
+    // end, while a received descriptor (recorded as an alias, or
     // untracked),
     // for the same open file,
     // leaves the kernel's position at the end. Linux keeps one position for

@@ -3167,8 +3167,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And tight_stack_received_inotify's test that an inotify descriptor
     // received and read on a tight stack is recorded and renumbered: 164.
     // And scm_rights' seven tests of descriptors received over SCM_RIGHTS
-    // (recvmsg and recvmmsg, in-process and from a child, a random device, a
-    // rendered procfs file, MSG_CMSG_CLOEXEC): 171.
+    // (an alias's blocking state through recvmsg and recvmmsg, an eventfd
+    // alias's counter, an alias's own MSG_CMSG_CLOEXEC, a random device and a
+    // rendered procfs file from a child): 171.
     ("test.detcore_misc", 171),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.

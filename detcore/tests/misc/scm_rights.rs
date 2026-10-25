@@ -7,6 +7,14 @@
  */
 
 //! Descriptors received through `SCM_RIGHTS` control messages.
+//!
+//! Most tests send a descriptor the process keeps, so the received one names
+//! an open file the receiving table models and joins it as an alias
+//! (`Detcore::join_received_alias`): it keeps that file's blocking state and
+//! an eventfd's kind, and `MSG_CMSG_CLOEXEC` marks it alone. The others receive from a child a
+//! random device and a rendered procfs file, which no descriptor of the
+//! receiving table names. Descriptors from another process in general are
+//! covered by `tests/c/scm_rights_received_descriptors.c`.
 
 use std::io;
 use std::mem::size_of;
@@ -226,38 +234,6 @@ fn blocking_read_on_a_received_pipe_waits_for_the_writer() {
     println!("blocking read on {received} returned the writer's bytes");
 }
 
-/// Descriptors from another process are new to this table and work as the
-/// kernel describes them.
-fn descriptors_from_a_child_process_are_usable() {
-    let (left, right) = socketpair(libc::SOCK_STREAM);
-    let child = check(unsafe { libc::fork() }, "fork");
-    if child == 0 {
-        let memfd = check(
-            unsafe { libc::memfd_create(c"scm_rights".as_ptr(), 0) },
-            "memfd",
-        );
-        let (read_end, write_end) = pipe();
-        write_all(memfd, b"memfd contents");
-        write_all(write_end, b"pipe contents");
-        send_fds(left, &[memfd, read_end]);
-        unsafe { libc::_exit(0) };
-    }
-
-    let [memfd, read_end] = recv_fds(right, 0)[..] else {
-        panic!("expected two descriptors");
-    };
-    let mut contents = [0u8; 14];
-    let read = unsafe { libc::pread(memfd, contents.as_mut_ptr().cast(), contents.len(), 0) };
-    assert_eq!(read, 14, "pread: {}", io::Error::last_os_error());
-    assert_eq!(&contents, b"memfd contents");
-    assert_eq!(read_exact(read_end, 13), b"pipe contents");
-
-    let mut status = 0;
-    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
-    assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
-    println!("received {memfd} and {read_end} from the child");
-}
-
 /// A random device from another process is Detcore's random stream, as one
 /// this process opened is: the same bytes in every run.
 fn random_device_from_a_child_reads_the_deterministic_stream() {
@@ -369,6 +345,13 @@ fn recvmmsg_registers_every_message() {
     let [first, second] = received[..] else {
         panic!("expected one descriptor per message, got {received:?}");
     };
+    for fd in [first, second] {
+        assert_eq!(
+            fcntl(fd, libc::F_GETFL) & libc::O_NONBLOCK,
+            0,
+            "the sender's pipe ends are blocking"
+        );
+    }
     write_all(first, b"one");
     write_all(second, b"two");
     assert_eq!(read_exact(first_read, 3), b"one");
@@ -400,19 +383,59 @@ fn msg_cmsg_cloexec_marks_received_descriptors() {
     println!("{cloexec} is close-on-exec, {plain} is not");
 }
 
+fn eventfd(initial: u32, flags: c_int) -> c_int {
+    check(unsafe { libc::eventfd(initial, flags) }, "eventfd")
+}
+
+/// One `read` of an eventfd's eight bytes.
+fn read_exact_once(fd: c_int) -> [u8; 8] {
+    let mut bytes = [0u8; 8];
+    let read = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
+    assert_eq!(read, 8, "read from {fd}: {}", io::Error::last_os_error());
+    bytes
+}
+
+fn eventfd_write(fd: c_int, value: u64) {
+    write_all(fd, &value.to_ne_bytes());
+}
+
+/// An eventfd sent within the process is the sender's eventfd: a count
+/// written through either descriptor is read through the other, and an
+/// `EFD_SEMAPHORE` eventfd hands out one unit per read through both.
+fn received_eventfd_shares_the_counter() {
+    let (left, right) = socketpair(libc::SOCK_STREAM);
+    let original = eventfd(0, 0);
+    let semaphore = eventfd(2, libc::EFD_SEMAPHORE);
+    send_fds(left, &[original, semaphore]);
+    let [received, received_semaphore] = recv_fds(right, 0)[..] else {
+        panic!("expected two descriptors");
+    };
+    eventfd_write(received, 5);
+    let through_original = u64::from_ne_bytes(read_exact_once(original));
+    eventfd_write(original, 7);
+    let through_received = u64::from_ne_bytes(read_exact_once(received));
+    let units = [
+        u64::from_ne_bytes(read_exact_once(received_semaphore)),
+        u64::from_ne_bytes(read_exact_once(semaphore)),
+    ];
+    assert_eq!((through_original, through_received), (5, 7));
+    assert_eq!(units, [1, 1]);
+    println!("eventfd {received} shares {original}'s counter, semaphore units {units:?}");
+}
+
 #[test]
 fn scm_rights_pipe_end_shares_the_open_file() {
     run_deterministically(received_pipe_end_shares_the_open_file);
 }
 
 #[test]
-fn scm_rights_blocking_read_waits_for_the_writer() {
-    run_deterministically(blocking_read_on_a_received_pipe_waits_for_the_writer);
+fn scm_rights_eventfd_shares_the_counter() {
+    run_deterministically(received_eventfd_shares_the_counter);
 }
 
 #[test]
-fn scm_rights_from_a_child_process() {
-    run_deterministically(descriptors_from_a_child_process_are_usable);
+fn scm_rights_blocking_read_waits_for_the_writer() {
+    run_deterministically(blocking_read_on_a_received_pipe_waits_for_the_writer);
 }
 
 #[test]
