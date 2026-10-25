@@ -203,6 +203,11 @@ struct InodePool {
     /// Detcore keeps for the files it renders, by their inode number (see
     /// [`Self::rendered_file_state`]).
     rendered_file_states: HashMap<u64, crate::procfs::listing::RenderedFileState>,
+    /// The descriptor directories the run's guests opened, by registration
+    /// order: the `index`th is the one whose descriptor's kernel position is
+    /// `procfs::fd_directory::tag(index)` (see
+    /// [`Self::register_descriptor_directory`]).
+    descriptor_directories: Vec<crate::procfs::fd_directory::DescriptorDirectoryBinding>,
 }
 
 /// How a numbering request reached its file, which decides whether a retired
@@ -391,7 +396,38 @@ impl InodePool {
             incarnations: HashMap::new(),
             threads_counted: 0,
             rendered_file_states: HashMap::new(),
+            descriptor_directories: Vec::new(),
         }
+    }
+
+    /// Register a descriptor directory a guest opened, bound to `binding`,
+    /// and return the kernel position that tags its descriptor
+    /// (`procfs::fd_directory::tag`), or `None` once the tags are used up.
+    /// Every registration comes in its guest thread's turn, so the tags
+    /// follow the scheduler's order. Registrations are kept for the run: a
+    /// descriptor can carry its tag to another process or image (over
+    /// `SCM_RIGHTS`, or across an in-guest backend's `exec`) at any later
+    /// time, and one entry per open is bounded by the opens.
+    // TODO-HUMAN-REVIEW(#4604): Review the run-wide registry of descriptor
+    // directories, keyed by the kernel position of the descriptor on `/proc`
+    // that stands for each.
+    fn register_descriptor_directory(
+        &mut self,
+        binding: crate::procfs::fd_directory::DescriptorDirectoryBinding,
+    ) -> Option<u64> {
+        let tag = crate::procfs::fd_directory::tag(self.descriptor_directories.len())?;
+        self.descriptor_directories.push(binding);
+        Some(tag)
+    }
+
+    /// The descriptor directory a kernel position tags, if one was
+    /// registered with it.
+    fn descriptor_directory(
+        &self,
+        tag: u64,
+    ) -> Option<crate::procfs::fd_directory::DescriptorDirectoryBinding> {
+        let index = crate::procfs::fd_directory::tag_index(tag)?;
+        self.descriptor_directories.get(index).copied()
     }
 
     /// How many guest threads have been given task ID `tid` in this run (see
@@ -4500,6 +4536,19 @@ impl GlobalState {
                     .set_rss_limit(process, limit);
                 R::SetRssLimit(())
             }
+            GlobalRequest::RegisterDescriptorDirectory(binding) => {
+                let _sched = self.lock_rpc_scheduler(false).await;
+                R::RegisterDescriptorDirectory(
+                    self.inodes
+                        .lock()
+                        .unwrap()
+                        .register_descriptor_directory(binding),
+                )
+            }
+            GlobalRequest::DescriptorDirectory(tag) => {
+                let _sched = self.lock_rpc_scheduler(false).await;
+                R::DescriptorDirectory(self.inodes.lock().unwrap().descriptor_directory(tag))
+            }
             GlobalRequest::RenderedFileState(inode, change) => R::RenderedFileState(
                 self.inodes
                     .lock()
@@ -6952,6 +7001,12 @@ pub enum GlobalRequest {
     /// `Config::in_guest_signal_delivery` before a two-phase delivery's
     /// announcement and a predicted death. Appended last.
     InPidNamespaceInit(DetTid),
+    /// Register a descriptor directory a guest opened
+    /// (`InodePool::register_descriptor_directory`). Appended last.
+    RegisterDescriptorDirectory(crate::procfs::fd_directory::DescriptorDirectoryBinding),
+    /// The descriptor directory a kernel position tags
+    /// (`InodePool::descriptor_directory`). Appended last.
+    DescriptorDirectory(u64),
 }
 
 /// Responses from the global object
@@ -7232,6 +7287,11 @@ pub enum GlobalResponse {
     PublishTemporaryMask(Option<crate::scheduler::guest_mask_publication::CommittedSendWindow>),
     /// The answer to `GlobalRequest::InPidNamespaceInit`. Appended last.
     InPidNamespaceInit(bool),
+    /// The answer to `GlobalRequest::RegisterDescriptorDirectory`: the tag,
+    /// if one was left. Appended last.
+    RegisterDescriptorDirectory(Option<u64>),
+    /// The answer to `GlobalRequest::DescriptorDirectory`. Appended last.
+    DescriptorDirectory(Option<crate::procfs::fd_directory::DescriptorDirectoryBinding>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -10060,6 +10120,45 @@ where
             .await
             .1;
     assert_eq!(response, GlobalResponse::RecordExternalParent(()));
+}
+
+/// Register the descriptor directory bound to `binding` that the calling
+/// guest thread opened, and return the kernel position that tags its
+/// descriptor (`InodePool::register_descriptor_directory`).
+pub(crate) async fn register_descriptor_directory<G, T>(
+    guest: &mut G,
+    binding: crate::procfs::fd_directory::DescriptorDirectoryBinding,
+) -> Option<u64>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::RegisterDescriptorDirectory(binding))
+        .await
+        .1
+    {
+        GlobalResponse::RegisterDescriptorDirectory(tag) => tag,
+        _ => unreachable!(),
+    }
+}
+
+/// The descriptor directory the kernel position `tag` tags, if any
+/// (`InodePool::descriptor_directory`).
+pub(crate) async fn descriptor_directory<G, T>(
+    guest: &mut G,
+    tag: u64,
+) -> Option<crate::procfs::fd_directory::DescriptorDirectoryBinding>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::DescriptorDirectory(tag))
+        .await
+        .1
+    {
+        GlobalResponse::DescriptorDirectory(binding) => binding,
+        _ => unreachable!(),
+    }
 }
 
 /// Record `limit` as `process`'s virtual soft `RLIMIT_RSS`

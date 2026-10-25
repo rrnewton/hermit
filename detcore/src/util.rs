@@ -926,6 +926,33 @@ pub fn raw_read_listing(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     }
 }
 
+/// The descriptor numbers the `linux_dirent64` records in `records` name: each
+/// entry whose name is a decimal number (a descriptor directory's), in
+/// order, leaving out `.` and `..`.
+pub fn descriptor_names(records: &[u8]) -> Vec<i32> {
+    let mut numbers = Vec::new();
+    let mut at = 0;
+    while at + 19 <= records.len() {
+        let length = usize::from(u16::from_ne_bytes([records[at + 16], records[at + 17]]));
+        if length < 19 || at + length > records.len() {
+            break;
+        }
+        let name = &records[at + 19..at + length];
+        let name = &name[..name
+            .iter()
+            .position(|&byte| byte == 0)
+            .unwrap_or(name.len())];
+        if !name.is_empty()
+            && name.iter().all(u8::is_ascii_digit)
+            && let Some(number) = std::str::from_utf8(name).ok().and_then(|n| n.parse().ok())
+        {
+            numbers.push(number);
+        }
+        at += length;
+    }
+    numbers
+}
+
 /// `path` with every symbolic link followed and every `.` and `..` resolved,
 /// as glibc's `realpath` (`std::fs::canonicalize`) gives it: relative paths
 /// from the working directory, and the same errors for an empty path

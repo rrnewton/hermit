@@ -1532,7 +1532,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_path(path)
             .with_buf(Some(scratch))
             .with_buf_len(CAPACITY);
-        let length = usize::try_from(guest.inject(call).await.ok()?).ok()?;
+        // The guest's path, respelled for this injection where it leads below
+        // a descriptor directory, as the guest's own call is.
+        let length = usize::try_from(
+            Self::inject_translated(guest, Syscall::from(call))
+                .await
+                .ok()?,
+        )
+        .ok()?;
         let mut target = vec![0; length.min(CAPACITY)];
         let read = guest.memory().read_exact(scratch.cast(), &mut target);
         drop(guard);
@@ -1976,6 +1983,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Linux refuses a size that is not positive before it reads the path.
         readlink_size(call.bufsize())?;
         let path: PathBuf = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        if let Some(answer) = self
+            .answer_descriptor_directory_link(guest, &path, call.buf(), call.bufsize())
+            .await
+        {
+            return answer;
+        }
         if let Some(exe) = self
             .launched_exe(guest, (libc::AT_FDCWD, &path), false)
             .await
@@ -2101,6 +2114,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         // Linux refuses a size that is not positive before it reads the path.
         readlink_size(call.buf_len())?;
         let path: PathBuf = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
+        if path.is_absolute()
+            && let Some(answer) = self
+                .answer_descriptor_directory_link(guest, &path, call.buf(), call.buf_len())
+                .await
+        {
+            return answer;
+        }
         if let Some(exe) = self.launched_exe(guest, (call.dirfd(), &path), false).await {
             let saved = saved_exe_link_bytes(guest, call.buf(), call.buf_len());
             let result = self.record_or_replay(guest, call).await?;

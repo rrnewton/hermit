@@ -390,6 +390,13 @@ struct OpenFileDescription {
     /// name is below it (ENOTDIR), whatever its recorded `path` spells.
     #[serde(default)]
     procfs_link_itself: bool,
+    /// This open file is a task's descriptor directory, `/proc/<pid>/fd`,
+    /// which Detcore lists from its own table (`procfs::fd_directory`): the
+    /// task it is bound to, its position, and whether it was opened with
+    /// `O_PATH`. The kernel's descriptor is on `/proc` itself. Shared by
+    /// descriptor aliases and a fork's copies, as Linux shares the position.
+    #[serde(default)]
+    descriptor_directory: Option<DescriptorDirectoryState>,
     /// File status flags shared by dup and fork aliases.
     status_flags: i32,
     /// File path associated with fd.
@@ -620,6 +627,9 @@ impl std::fmt::Debug for OpenFileDescription {
         debug.field("inherited_external_read", &self.inherited_external_read);
         debug.field("pidfd_target", &self.pidfd_target);
         debug.field("procfs_reached", &self.procfs_reached);
+        if let Some(directory) = &self.descriptor_directory {
+            debug.field("descriptor_directory", directory);
+        }
         debug.field("status_flags", &self.status_flags);
         debug.field("path", &self.path);
         debug.field("inode", &self.inode);
@@ -655,6 +665,22 @@ impl std::fmt::Debug for OpenFileDescription {
         }
         debug.finish()
     }
+}
+
+/// What Detcore keeps of an open file that is a task's descriptor directory
+/// (`procfs::fd_directory`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct DescriptorDirectoryState {
+    /// The task the directory is bound to.
+    pub(crate) binding: crate::procfs::fd_directory::DescriptorDirectoryBinding,
+    /// The kernel position that tags the descriptor
+    /// (`procfs::fd_directory::tag`), if it has one.
+    pub(crate) tag: Option<u64>,
+    /// The guest's position in the directory, as Linux numbers it.
+    pub(crate) position: u64,
+    /// Opened with `O_PATH`: it lists nothing, and reads and seeks fail with
+    /// `EBADF`.
+    pub(crate) path_only: bool,
 }
 
 /// A timerfd's expirations counted on Detcore's virtual clock instead of the
@@ -860,6 +886,7 @@ impl DetFd {
                 pidfd_target: None,
                 procfs_reached: None,
                 procfs_link_itself: false,
+                descriptor_directory: None,
                 inherited_external_read: None,
                 status_flags: bits & !OFlag::O_CLOEXEC.bits(),
                 path: None,
@@ -1100,6 +1127,17 @@ impl DetFd {
     /// Whether this open file is a `/proc` selector link itself.
     pub(crate) fn procfs_link_itself(&self) -> bool {
         self.with_description(|d| d.procfs_link_itself)
+    }
+
+    /// The descriptor directory this open file is, if it is one
+    /// (`OpenFileDescription::descriptor_directory`).
+    pub(crate) fn descriptor_directory(&self) -> Option<DescriptorDirectoryState> {
+        self.with_description(|d| d.descriptor_directory)
+    }
+
+    /// Make this open file a descriptor directory, or change its state.
+    pub(crate) fn set_descriptor_directory(&self, state: DescriptorDirectoryState) {
+        self.with_description(|d| d.descriptor_directory = Some(state))
     }
 
     /// The task directory this open file is, if Detcore knows it

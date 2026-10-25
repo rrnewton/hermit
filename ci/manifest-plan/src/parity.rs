@@ -6221,7 +6221,9 @@ mod tests {
         // guest) adds one row per candidate backend: 2995.
         // c-programs/syscall-clobbers (the capability-flag lane's slice 3
         // guest) adds one row per candidate backend: 3000.
-        assert_eq!(parsed.cells.len(), 3000);
+        // c-programs/proc-fd-directory (package K slice F1's guest) adds one
+        // row per candidate backend: 3005.
+        assert_eq!(parsed.cells.len(), 3005);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448
