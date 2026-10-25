@@ -195,6 +195,7 @@ static TIMED_WAIT_POLLERS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SOCKET_READER_BESIDE_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HANDOFF_BESIDE_NEWCOMER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SLEEPER_BESIDE_NEWCOMER_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static POLLERS_BESIDE_WORKER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SCHEDULER_SIGNAL_WAITING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_WAITING_BESIDE_BACKGROUND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAIT_UNREADABLE_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -44938,6 +44939,50 @@ fn a_thread_that_has_run_still_waits_behind_a_short_sleep_loop() {
          priorities are now drawn differently, check that seed 4 still draws it behind the \
          loop (5.8 s late on main 288c4e60)"
     );
+}
+
+/// Four threads loop on a 10 us `pthread_cond_timedwait` that nobody signals,
+/// beside a compute-bound worker (tests/c/pollers_beside_worker.c). Each
+/// timed-out wait is a turn charged half a millisecond of virtual time for a
+/// few microseconds of the poller's own time. Unlike a due sleep's, those
+/// turns count toward the pollers' chaos slices: a futex wait that times out
+/// waits for another thread, and letting its loop hold the CPU starves that
+/// thread. When they did not count, as on main c7e03195, the worker was held
+/// off for 17-28 s at a time at `--chaos` seeds 1-6, and at two of them did
+/// not finish within 60 s. Here it is held off for at most 1.2 s at a time
+/// and finishes within 10 s of virtual time. Each seed must finish and keep
+/// the worker's longest gap under 5 s.
+#[test]
+fn a_worker_is_not_held_off_by_futex_waits_that_time_out() {
+    let _guard = hermit_run_guard();
+    let guest = futex_c_guest(&POLLERS_BESIDE_WORKER_GUEST, "pollers_beside_worker")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for seed in ["1", "2"] {
+        let output = hermit(&[
+            "run",
+            "--strict",
+            "--timeout",
+            "120",
+            "--chaos",
+            "--seed",
+            seed,
+            "--",
+            &guest,
+        ]);
+        let out = stdout(&output);
+        assert!(output.status.success(), "seed {seed}: {}", stderr(&output));
+        let gap_us: u64 = out
+            .split_whitespace()
+            .nth(6)
+            .and_then(|word| word.parse().ok())
+            .unwrap_or_else(|| panic!("seed {seed}: unexpected output {out:?}"));
+        assert!(
+            gap_us < 5_000_000,
+            "seed {seed}: the worker was held off for {gap_us} us beside the pollers"
+        );
+    }
 }
 
 /// Run tests/c/scheduler_signal_waiting.c under `run --strict` in each mode
