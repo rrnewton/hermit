@@ -4465,7 +4465,9 @@ impl ContainerInitStopSignalBridge {
     /// Call this in the thread that clones the container init, immediately
     /// before the clone. The query and the install are not one atomic step, so
     /// this relies on the requirement Container already places on its caller:
-    /// no other thread is running.
+    /// no other thread is running, or only one that takes no lock, allocates
+    /// nothing and leaves signal dispositions alone, as the memory budget's
+    /// watchdog of analyze and bisect does (`analyze/memory.rs`).
     pub(super) fn install() -> Result<Self, Error> {
         let handler: extern "C" fn(libc::c_int) = bridge_container_init_stop_signal;
         let mut guard = Self {

@@ -90,6 +90,7 @@ use std::os::fd::AsRawFd;
 use std::os::fd::BorrowedFd;
 use std::os::fd::FromRawFd;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
 
@@ -773,11 +774,40 @@ fn main() {
         .and_then(|()| global.open_log_file())
         .and_then(|()| command.main(&global));
 
-    let status = result.unwrap_or_else(|error| {
-        let status = ExitStatus::Exited(failure_exit_code(&error));
-        display_error(error);
-        status
-    });
+    match result {
+        Ok(status) => exit_with(status),
+        Err(error) => exit_with_error(error),
+    }
+}
+
+/// Report `error` as hermit's last word and exit with its status: from
+/// `main`, or from a thread that must end the process, such as the memory
+/// budget's watchdog of `hermit analyze`.
+fn exit_with_error(error: Error) -> ! {
+    claim_the_exit();
+    let status = ExitStatus::Exited(failure_exit_code(&error));
+    display_error(error);
+    finish_exit(status)
+}
+
+fn exit_with(status: ExitStatus) -> ! {
+    claim_the_exit();
+    finish_exit(status)
+}
+
+/// Only the first thread to end the process reports and chooses its status:
+/// when `main` returns while the memory watchdog refuses, the later of the
+/// two waits for the exit the first one makes.
+fn claim_the_exit() {
+    static EXITING: AtomicBool = AtomicBool::new(false);
+    if EXITING.swap(true, Ordering::SeqCst) {
+        loop {
+            std::thread::park();
+        }
+    }
+}
+
+fn finish_exit(status: ExitStatus) -> ! {
     // From here on a write may fail but must not replace `status`.
     block_write_signals_until_exit();
     // Guest output agreed by both `--verify` runs can still be buffered (no

@@ -24,6 +24,7 @@ use tracing::metadata::LevelFilter;
 
 use super::analyze::AnalyzeOpts;
 use super::analyze::ExitStatusConstraint;
+use super::analyze::MemoryBudget;
 use super::global_opts::GlobalOpts;
 
 /// Bisect two recorded schedules to identify the event ordering that causes a failure.
@@ -73,6 +74,12 @@ pub struct BisectOpts {
     #[clap(long, short)]
     verbose: bool,
 
+    /// The most memory bisect's own process may hold, as `hermit analyze
+    /// --max-memory` takes it: a size, `auto` (a quarter of the memory it may
+    /// use), or `off`.
+    #[clap(long, value_name = "SIZE|auto|off", default_value = "auto")]
+    max_memory: MemoryBudget,
+
     /// Arguments for the underlying `hermit run`, followed by the program and its arguments.
     #[clap(value_name = "RUN_ARGS", required = true)]
     run_args: Vec<String>,
@@ -85,6 +92,8 @@ pub struct BisectOpts {
 
 impl BisectOpts {
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        // Before the two schedules are read, the largest allocation.
+        let _watchdog = self.max_memory.enforce("hermit bisect")?;
         let (mut analyzer, good, bad) = self.prepare(global)?;
         analyzer.bisect_schedule_pair(good, bad)
     }
@@ -118,6 +127,7 @@ impl BisectOpts {
             jitter_dist: self.jitter_dist,
             execution_context: self.execution_context,
             tmp_dir: None,
+            max_memory: self.max_memory,
             success_exit_code: None,
             run_arg: Vec::new(),
             run_args: self.run_args.clone(),

@@ -4,7 +4,9 @@
 //! Initial workload/result draining is blocking. The two explicit settlement
 //! attempts below bound only finalization; configured CLI alarms/outer runners
 //! bound a stalled initial drain. The caller must satisfy Container's pre-thread
-//! and no-competing-reaper requirements.
+//! requirement (no other thread, or only one that takes no lock, allocates
+//! nothing and leaves signal dispositions alone; see
+//! `ContainerInitStopSignalBridge::install`) and its no-competing-reaper one.
 
 use std::any::Any;
 use std::cell::RefCell;
