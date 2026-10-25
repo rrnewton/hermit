@@ -3775,9 +3775,7 @@ async fn run_kvm(
     let envp = envp.iter().map(String::as_str).collect::<Vec<_>>();
 
     let setup_started = Instant::now();
-    // `prepare_backend_config` already copied `KvmBackend::capabilities()`,
-    // which reports the backend's own CPUID table and that, of the madvise
-    // advice with guest-visible semantics, it implements only MADV_DONTNEED.
+    // `prepare_backend_config` already copied `KvmBackend::capabilities()`.
     // KVM does not enter Hermit's UTS namespace, so Detcore must provide the
     // same synthetic identity that the namespace-backed ptrace path exposes.
     // TODO-HUMAN-REVIEW(PR-998): Review KVM UTS namespace parity.
@@ -8762,7 +8760,6 @@ mod tests {
             "supports_parked_write_signal_interruption":
                 matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Kvm),
             "defers_vfork_child_registration": kvm,
-            "supports_madvise": !kvm,
             "reports_child_exit_publication":
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "reports_kernel_child_exit_signals":
@@ -8987,7 +8984,10 @@ mod tests {
     /// the capability prctls reach the kernel on every backend, and so is the
     /// fifth, `syscall_clobbers_virtualized_by_backend`, now that Reverie's
     /// backend contract requires every backend to leave the syscall-clobbered
-    /// registers as a native return would (with the exceptions it names).
+    /// registers as a native return would (with the exceptions it names). The
+    /// second, `backend_supports_madvise`, is written true for every backend
+    /// now that every backend takes every madvise advice and refuses what it
+    /// does not implement itself.
     #[test]
     fn every_backend_encodes_its_current_legacy_projection() {
         for (backend, unsequenced, sequential) in [
@@ -8997,7 +8997,7 @@ mod tests {
             (Backend::InGuestTrap, "010001010000000", "010001010000000"),
             (Backend::Sabre, "011101110000000", "011101110000000"),
             (Backend::Dbt, "011001000100000", "011001000100000"),
-            (Backend::Kvm, "000001010010101", "000001010011101"),
+            (Backend::Kvm, "010001010010101", "010001010011101"),
         ] {
             for (sequentialize_threads, expected) in [(false, unsequenced), (true, sequential)] {
                 let config = prepare_backend_config(
