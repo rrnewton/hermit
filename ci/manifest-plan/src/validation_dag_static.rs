@@ -1978,7 +1978,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4609 (rebased onto post-split main) adds ten hermit-run units
     // (nine in app::analyze::phases, one in app::analyze::rundata):
     // 1239 + 10 = 1249, measured by nextest list.
-    ("test.hermit_unit", 1269),
+    // And analyze's workspace cleanup: workspace::tests::{a_workspace_is_removed_when_dropped,
+    // a_kept_workspace_stays, a_workspace_that_cannot_be_removed_is_named,
+    // an_uncreatable_tmp_dir_is_named} and stop::tests::{the_parent_is_the_field_after_the_state,
+    // the_first_stop_signal_is_the_one_reported,
+    // a_stop_signal_reaches_the_children_and_only_them,
+    // the_handler_stops_what_analyze_started_and_nothing_else}: 1277.
+    ("test.hermit_unit", 1277),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6284,7 +6290,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the hosted CPUID-faulting skip set): 1327 + 2 = 1329.
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
-    ("test.hermit_unit_on_host", 1263),
+    // And the same eight workspace-cleanup tests: 1271.
+    ("test.hermit_unit_on_host", 1271),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

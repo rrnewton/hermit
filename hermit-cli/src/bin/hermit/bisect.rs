@@ -129,6 +129,9 @@ impl BisectOpts {
             execution_context: self.execution_context,
             tmp_dir: None,
             max_memory: self.max_memory,
+            // Bisect keeps its workspace whatever this says
+            // (`bisect_schedule_pair`).
+            keep_tmp: false,
             success_exit_code: None,
             run_arg: Vec::new(),
             run_args: self.run_args.clone(),
