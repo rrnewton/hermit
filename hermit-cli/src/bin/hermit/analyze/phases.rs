@@ -50,6 +50,13 @@ use crate::app::schedule_search::INEXACT_COUNTER_BRANCH_JITTER;
 use crate::app::schedule_search::NoSingleSwap;
 use crate::app::schedule_search::TrialOutcome;
 use crate::app::schedule_search::search_for_critical_schedule;
+use crate::app::analyze::types::ContinuationTimeslice;
+use crate::app::analyze::stop;
+use crate::app::analyze::stop::StopSignals;
+use crate::app::analyze::stop::Stopped;
+use crate::app::analyze::workspace::Retention;
+use crate::app::analyze::workspace::Workspace;
+use crate::app::analyze::workspace::note;
 
 /// Compare only preemptions, not recorded schedules.
 fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
@@ -1586,28 +1593,47 @@ impl AnalyzeOpts {
         strs.join(", ")
     }
 
-    /// Mutates AnalyzeOpts in order to initialize some fields.
-    fn phase0_initialize(&mut self) -> anyhow::Result<()> {
-        let mut builder = tempfile::Builder::new();
-        builder.prefix("hermit_analyze");
-        let dir = match &self.tmp_dir {
-            Some(parent) => {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("cannot create --tmp-dir {}", parent.display()))?;
-                builder.tempdir_in(parent)?
+    /// Create the workspace in `--tmp-dir` and make it `tmp_dir`, where every
+    /// run puts its files. The returned guard removes or keeps it, as
+    /// `retention` says, when it is dropped.
+    fn phase0_initialize(&mut self, retention: Retention) -> anyhow::Result<Workspace> {
+        let workspace = Workspace::create(self.tmp_dir.as_deref(), retention)?;
+        // Trials name the workspace by its canonical path, so that a relative
+        // --tmp-dir, or one through a symlink, names the same directory inside
+        // their container, where only a workspace under host /tmp is bound.
+        let tmpdir_path = std::fs::canonicalize(workspace.path()).with_context(|| {
+            format!(
+                "cannot resolve the workspace {}",
+                workspace.path().display()
+            )
+        })?;
+        eprintln!(
+            ":: Temp workspace: {}{}",
+            tmpdir_path.display(),
+            match retention {
+                Retention::Remove => " (removed when analyze exits; --keep-tmp keeps it)",
+                Retention::Keep { .. } => "",
             }
-            None => builder.tempdir()?,
-        };
-        // For now always keep the temporary results. Trials name the workspace
-        // by its canonical path, so that a relative --tmp-dir, or one through
-        // a symlink, names the same directory inside their container, where
-        // only a workspace under host /tmp is bound.
-        let kept = dir.keep();
-        let tmpdir_path = std::fs::canonicalize(&kept)
-            .with_context(|| format!("cannot resolve the workspace {}", kept.display()))?;
-        eprintln!(":: Temp workspace: {}", tmpdir_path.display());
+        );
         self.tmp_dir = Some(tmpdir_path);
-        Ok(())
+        Ok(workspace)
+    }
+
+    /// What becomes of analyze's workspace: kept with `--keep-tmp`, and with
+    /// `--verbose`, whose per-run logs are in it for the user to read;
+    /// removed otherwise.
+    fn workspace_retention(&self) -> Retention {
+        if self.keep_tmp {
+            Retention::Keep {
+                because: Some("--keep-tmp"),
+            }
+        } else if self.verbose {
+            Retention::Keep {
+                because: Some("--verbose"),
+            }
+        } else {
+            Retention::Remove
+        }
     }
 
     /// Create our workspace and verify the input run matches the criteria, or find one that does.
@@ -1949,7 +1975,8 @@ impl AnalyzeOpts {
         good: Vec<SchedEvent>,
         bad: Vec<SchedEvent>,
     ) -> anyhow::Result<ExitStatus> {
-        self.phase0_initialize()?;
+        // Bisect keeps its workspace, and says where when it exits.
+        let _workspace = self.phase0_initialize(Retention::Keep { because: None })?;
         eprintln!(
             ":: Beginning schedule bisection using good/bad endpoints ({} / {} events)",
             good.len(),
@@ -2273,8 +2300,30 @@ impl AnalyzeOpts {
     pub fn main(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
         self.prepare(global)?;
         let _watchdog = self.max_memory.enforce("hermit analyze")?;
+        // From here SIGTERM, SIGINT and SIGHUP end the run in progress and
+        // the analysis, which then removes what it created like any other
+        // ending, and the process dies of the signal (`raise_or_exit`).
+        let stop_signals = StopSignals::install()?;
+        let workspace = self.phase0_initialize(self.workspace_retention())?;
+        let result = self.analyze(global);
+        drop(workspace);
+        // Restored before the last check, so a signal from here on has its
+        // default action rather than being recorded too late to act on.
+        drop(stop_signals);
+        let Err(Stopped(signal)) = stop::check() else {
+            return result;
+        };
+        match result {
+            Err(error) if error.downcast_ref::<Stopped>().is_none() => note(&format!(
+                ":: hermit analyze stopped on {signal}, after this error: {error:#}"
+            )),
+            _ => note(&format!(":: hermit analyze stopped on {signal}.")),
+        }
+        Ok(ExitStatus::Signaled(signal, false))
+    }
 
-        self.phase0_initialize()?; // Need this early to set tmp_dir.
+    /// The analysis, in the workspace phase 0 created.
+    fn analyze(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
         {
             let dummy = RunData::new_baseline(self, "dummy".to_string())?;
             if !dummy.runopts.det_opts.det_config.chaos {
@@ -3618,7 +3667,7 @@ mod tests {
         let tmp_dir = format!("--tmp-dir={}", parent.path().display());
         let mut options =
             AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
-        options.phase0_initialize().unwrap();
+        let _workspace = options.phase0_initialize(Retention::Remove).unwrap();
         let branches = |tid: i32, count: u32| {
             serde_json::json!({
                 "dettid": tid, "op": "Branch", "count": count,
@@ -3748,23 +3797,53 @@ mod tests {
     }
 
     /// `--tmp-dir` names the directory the workspace is created in, and is
-    /// created if it is missing.
+    /// created if it is missing. The workspace goes when analyze is done
+    /// with it, unless `--keep-tmp` or `--verbose` keeps it (not
+    /// `--selfcheck`, though it writes run logs there too); the `--tmp-dir`
+    /// stays.
     #[test]
     fn the_workspace_is_created_in_the_tmp_dir() {
-        let parent = tempfile::tempdir().unwrap();
-        let requested = parent.path().join("not-yet-created");
-        let tmp_dir = format!("--tmp-dir={}", requested.display());
-        let mut options =
-            AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
-        options.phase0_initialize().unwrap();
-        let workspace = options.get_tmp().unwrap();
-        assert_eq!(
-            workspace.parent(),
-            Some(std::fs::canonicalize(&requested).unwrap().as_path())
-        );
-        assert!(workspace.is_dir(), "{}", workspace.display());
+        for (option, kept) in [
+            (None, false),
+            (Some("--keep-tmp"), true),
+            (Some("--verbose"), true),
+            (Some("--selfcheck"), false),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let requested = parent.path().join("not-yet-created");
+            let tmp_dir = format!("--tmp-dir={}", requested.display());
+            let mut argv = vec!["analyze", tmp_dir.as_str(), "--", "/bin/true"];
+            argv.splice(1..1, option);
+            let mut options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            let retention = options.workspace_retention();
+            assert_eq!(
+                retention,
+                if kept {
+                    Retention::Keep { because: option }
+                } else {
+                    Retention::Remove
+                },
+                "{option:?}"
+            );
+            let guard = options.phase0_initialize(retention).unwrap();
+            let workspace = options.get_tmp().unwrap().to_path_buf();
+            assert_eq!(
+                workspace.parent(),
+                Some(std::fs::canonicalize(&requested).unwrap().as_path())
+            );
+            assert!(workspace.is_dir(), "{}", workspace.display());
+            drop(guard);
+            assert_eq!(
+                workspace.exists(),
+                kept,
+                "{option:?}: {}",
+                workspace.display()
+            );
+            assert!(requested.is_dir(), "{}", requested.display());
+        }
 
         // Through a symlink, the workspace is named by its canonical path.
+        let parent = tempfile::tempdir().unwrap();
         let real = parent.path().join("real");
         std::fs::create_dir(&real).unwrap();
         let link = parent.path().join("link");
@@ -3772,7 +3851,7 @@ mod tests {
         let tmp_dir = format!("--tmp-dir={}", link.display());
         let mut options =
             AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
-        options.phase0_initialize().unwrap();
+        let _guard = options.phase0_initialize(Retention::Remove).unwrap();
         let workspace = options.get_tmp().unwrap();
         assert_eq!(
             workspace.parent(),

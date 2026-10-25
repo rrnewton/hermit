@@ -214,6 +214,9 @@ pub struct AnalyzeOpts {
     pub analyze_seed: Option<u64>,
 
     /// Print quite a bit of extra information so that you can see exactly what is happening.
+    ///
+    /// Each run then writes its log into the workspace (see --tmp-dir), and analyze keeps the
+    /// workspace when it exits, as --keep-tmp does, so that the logs can be read.
     #[clap(long, short)]
     pub verbose: bool,
 
@@ -229,7 +232,9 @@ pub struct AnalyzeOpts {
     /// Directory under which the analysis creates its workspace of temporary artifacts
     /// (schedules, logs, reports of every run), created if missing.
     ///
-    /// By default the workspace is a directory in `/tmp`
+    /// By default the workspace is created in the system's temporary directory: $TMPDIR, or
+    /// /tmp when TMPDIR is unset. Analyze removes the workspace when it exits, unless
+    /// --keep-tmp or --verbose; this directory itself stays.
     #[clap(long, value_name = "PATH")]
     pub tmp_dir: Option<PathBuf>,
 
@@ -263,6 +268,25 @@ pub struct AnalyzeOpts {
     /// letting it grow until the kernel kills it.
     #[clap(long, value_name = "SIZE|auto|off", default_value = "auto")]
     pub max_memory: super::MemoryBudget,
+
+    /// Keep the workspace (see --tmp-dir) when analyze exits.
+    ///
+    /// The workspace holds every run's schedules, logs, output and reproducer command, and the
+    /// paths analyze prints name it. By default analyze removes it when it exits: after its
+    /// report, after an error, and when SIGTERM, SIGINT or SIGHUP stops it. A stop signal ends
+    /// the run in progress and starts no other; analyze then removes the workspace and dies of
+    /// that signal (a shell reports 128 plus its number, 143 for SIGTERM). --verbose keeps the
+    /// workspace too. The report file (--report-file) is never removed.
+    ///
+    /// Analyze cannot clean up after SIGKILL, nor after a stop signal it does not handle: one it
+    /// inherits as ignored stays ignored, and an analyze that is PID 1 of its PID namespace
+    /// (`docker run IMAGE hermit analyze ...` without --init) leaves the stop signals at their
+    /// default actions, which Linux discards for a namespace's init. Neither does it handle
+    /// them, so that they kill it at once as before, when /proc is not its own PID namespace's
+    /// (analyze started by another process inside `unshare -pf` without --mount-proc) or
+    /// when it inherited more than 64 children.
+    #[clap(long)]
+    pub keep_tmp: bool,
 
     /// Specify that analyze itself should return a non-zero exit code on success.
     /// This is needed under esoteric invocation scenarios.
