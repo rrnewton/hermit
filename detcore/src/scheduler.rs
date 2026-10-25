@@ -1257,6 +1257,19 @@ pub struct Scheduler {
     /// such turns once.
     previous_turn_expired_wait: bool,
 
+    /// Whether a run of consecutive turns that end expired timed waits is
+    /// charged one scheduler turn (`bump_global_time`), as
+    /// `--expired-wait-charge` says (`Config::expired_wait_runs_charged_once`):
+    /// by default on outside race search and off under `--chaos` or a
+    /// heuristic that does not select by priority, where each expired wait
+    /// keeps its turn charge: the time those charges add stretches short
+    /// waits, and real sleep-ordered races in timing-sensitive tests
+    /// reproduced under chaos only with it (measured in rrnewton/hermit#4632).
+    /// A replay that leaves the option unset takes the value its record
+    /// states (`PreemptionRecord::expired_wait_runs_charged_once`), and a
+    /// recording stores it, so both charge alike.
+    expired_wait_runs_charged_once: bool,
+
     /// The thread whose grant, in the turn just committed, ended a timed wait
     /// at its deadline: a `FutexWait` answered `TimeOut`, or a sleep
     /// (`SleepUntil` with a deadline, not a yield) already due. Set by
@@ -4218,6 +4231,26 @@ impl Scheduler {
                 },
             ),
         };
+        // A replay that leaves `--expired-wait-charge` unset charges runs of
+        // expired timed waits as its record says (a record that does not say,
+        // older or written by an `each` run, by default race search, charged
+        // every wait); any
+        // other run as `Config::expired_wait_runs_charged_once` says. `hermit
+        // run` has refused an explicit value that disagrees with the record.
+        let replayed_record = cfg
+            .replay_schedule_from
+            .as_ref()
+            .or(cfg.replay_preemptions_from.as_ref());
+        let expired_wait_runs_charged_once = match replayed_record {
+            Some(path) if cfg.expired_wait_charge.is_none() && !cfg.recordreplay_modes => {
+                crate::preemptions::read_recorded_expired_wait_runs_charged_once(path)
+                    // A file that cannot be read fails the replay's own
+                    // loader: the schedule's just above, the preemptions'
+                    // in `tool_global` right after this.
+                    .unwrap_or(false)
+            }
+            _ => cfg.expired_wait_runs_charged_once(),
+        };
         // The strict verifier explicitly selects the complete protocol. Ordinary
         // producers and the recovery/editor path keep the legacy representation.
         let boundaries = cfg.strict_schedule_boundaries;
@@ -4226,7 +4259,8 @@ impl Scheduler {
                 .with_epoch(cfg.epoch)
                 .with_pipe_wake_latency(cfg.pipe_wake_latency_in_effect())
                 .with_signal_state_copy(cfg.signal_state_copy)
-                .with_rng_seed(cfg.rng_seed());
+                .with_rng_seed(cfg.rng_seed())
+                .with_expired_wait_runs_charged_once(expired_wait_runs_charged_once);
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -4285,6 +4319,7 @@ impl Scheduler {
             committed_time: Default::default(),
             previous_turn_tid: None,
             previous_turn_expired_wait: false,
+            expired_wait_runs_charged_once,
             expired_wait_grant: None,
             blocked: Default::default(),
             vfork_barriers: Default::default(),
@@ -5149,13 +5184,13 @@ impl Scheduler {
     /// recording had woken in an extra pass could still be waiting when the
     /// replay switched to it. The switch then fell through to another
     /// runnable thread, a desync ("expected to be running thread 5, but
-    /// running 7"). This was rare while every turn charged half a millisecond
-    /// and deadlines passed several passes early. Since a run of expired
-    /// timed waits is charged one turn, deadlines pass as committed time
-    /// creeps forward between the turns of that run, often at the last turn
-    /// before the switch. Waking the target at its passed deadline is what the
-    /// next pass would do anyway, just ahead of the other due waiters, which
-    /// the following passes wake as before.
+    /// running 7"). This is rare while every turn charges half a millisecond
+    /// and deadlines pass several passes early. Where a run of expired timed
+    /// waits is charged one turn (`expired_wait_runs_charged_once`), deadlines
+    /// pass as committed time creeps forward between the turns of that run,
+    /// often at the last turn before the switch. Waking the target at its
+    /// passed deadline is what the next pass would do anyway, just ahead of
+    /// the other due waiters, which the following passes wake as before.
     fn wake_due_replay_target(&mut self, target: DetTid) {
         if self.run_queue.contains_tid(target) {
             return;
@@ -14935,38 +14970,37 @@ impl Scheduler {
                     && Self::is_inbound_signal_turn(resources)
             });
 
-        // A run of turns that each end an expired timed wait
-        // (`expired_wait_grant`: a futex wait answered `TimeOut`, or a sleep
-        // already due) is charged one scheduler turn, not one per turn, while
-        // another thread is queued to run. A timed wait shorter than one turn
-        // charge (`cv.wait_for(100us)` in a pool's idle loop, `usleep(100)`)
-        // otherwise never blocks: the charge of each turn carries the clock
-        // past the deadline the next waiter computed before it, so every wait
+        // A run of turns that each end an expired timed wait (`expired_wait_grant`: a
+        // futex wait answered `TimeOut`, or a sleep already due) is charged one
+        // scheduler turn, not one per turn, while another thread is queued to run. A
+        // timed wait shorter than one turn charge (`cv.wait_for(100us)` in a pool's idle
+        // loop, `usleep(100)`) otherwise never blocks: the charge of each turn carries
+        // the clock past the deadline the next waiter computed before it, so every wait
         // ends at its grant, and a woken waiter goes to the head of its band
-        // (`wake_timed_event`). One futex poller then kept the CPU for its
-        // whole timeslice at a turn charge per iteration; under chaos, pollers
-        // that outranked another thread passed the CPU among themselves while
-        // it waited. Uncharged, the next wait sees only the time the waiters'
-        // own work took and blocks until its deadline, and the queued thread
-        // runs; that deadline then caps the queued thread's slice like any
-        // other (`deadline_remaining_from`). The first turn of a run, and
-        // every turn of a thread with nobody else queued, is charged as
-        // before, so a lone poller's time, and a wait of at least one turn
-        // charge beside other work, are unchanged; waiters that fall due
-        // together share one charge, and so do back-to-back waits whose
-        // deadline had already passed when they were made (a zero timeout).
-        // Time still advances by each waiter's own work, at least one syscall
-        // per turn, and by the empty-queue jump to the next deadline. Every
-        // input is a committed grant, the previous turn as above, or
-        // the run queue as step 1 finds it, so the rule adds no host-timed
-        // input and inherits those that already reach the queue (a
-        // readmitted background call); a host-timed polling retry neither
-        // ends nor continues a run (`previous_turn_expired_wait`), nor does a
-        // schedule replay's switch turn, which its recording lacks. Under
-        // `hermit record` and `hermit replay` (`recordreplay_modes`) every
-        // such turn keeps its charge, as signal deliveries do.
+        // (`wake_timed_event`). One futex poller then kept the CPU for its whole
+        // timeslice at a turn charge per iteration. Uncharged, the next wait sees only
+        // the time the waiters' own work took and blocks until its deadline, and the
+        // queued thread runs; that deadline then caps the queued thread's slice like any
+        // other (`deadline_remaining_from`). The first turn of a run, and every turn of
+        // a thread with nobody else queued, is charged as before, so a lone poller's
+        // time, and a wait of at least one turn charge beside other work, are unchanged;
+        // waiters that fall due together share one charge, and so do back-to-back waits
+        // whose deadline had already passed when they were made (a zero timeout). Time
+        // still advances by each waiter's own work, at least one syscall per turn, and
+        // by the empty-queue jump to the next deadline. Every input is a committed
+        // grant, the previous turn as above, or the run queue as step 1 finds it, so the
+        // rule adds no host-timed input and inherits those that already reach the queue
+        // (a readmitted background call); a host-timed polling retry neither ends nor
+        // continues a run (`previous_turn_expired_wait`), nor does a schedule replay's
+        // switch turn, which its recording lacks. Under race search (`--chaos`, a random
+        // heuristic) every such turn keeps its charge by default, as under `hermit
+        // record` and `hermit replay` (`recordreplay_modes`): the time each charge adds
+        // stretches short waits, which real races depend on. `--expired-wait-charge`
+        // sets the rule, and a replay follows its record
+        // (`expired_wait_runs_charged_once`).
         let expired_wait_grant = self.expired_wait_grant.take();
         let expired_wait = !self.recordreplay_modes
+            && self.expired_wait_runs_charged_once
             && last_turn
                 .as_ref()
                 .is_ok_and(|resources| expired_wait_grant == Some(resources.tid));
@@ -20455,13 +20489,145 @@ mod test {
         );
     }
 
+    /// Under a schedule replay, the thread the trace switches to is woken at
+    /// the switch if it is still in a timed wait whose deadline has passed: a
+    /// pass wakes one due waiter, and the replay runs fewer passes than its
+    /// recording did. A waiter whose deadline is ahead, and a thread already
+    /// queued, are left alone.
+    #[test]
+    fn a_replays_switch_target_wakes_at_its_passed_deadline() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        scheduler.committed_time = at(10_000);
+        let due = DetTid::from_raw(3);
+        let ahead = DetTid::from_raw(5);
+        let queued = DetTid::from_raw(7);
+        for (tid, deadline) in [(due, at(9_000)), (ahead, at(20_000)), (queued, at(8_000))] {
+            queue_request(&mut scheduler, tid, sleep_request(tid, deadline));
+            scheduler.priorities.insert(tid, DEFAULT_PRIORITY);
+            if tid != queued {
+                assert!(scheduler.run_queue.remove_tid(tid));
+                scheduler.blocked.timed_waiters.insert(deadline, tid);
+            }
+        }
+        for tid in [due, ahead, queued] {
+            scheduler.wake_due_replay_target(tid);
+        }
+        assert!(scheduler.run_queue.contains_tid(due));
+        assert_eq!(scheduler.blocked.timed_waiters.thread_deadline(due), None);
+        assert!(!scheduler.run_queue.contains_tid(ahead));
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(ahead),
+            Some(at(20_000))
+        );
+        assert!(scheduler.run_queue.contains_tid(queued));
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(queued),
+            None
+        );
+    }
+
+    /// A replay that leaves `--expired-wait-charge` unset charges runs of
+    /// expired timed waits as its record says, whatever its own options: a
+    /// record of a plain run (which stores the rule) makes even a `--chaos`
+    /// replay charge a run once, and a record that does not say (a chaos
+    /// recording, or one older than the rule) makes even a plain replay
+    /// charge every wait. An explicit value decides; a run that replays
+    /// nothing takes the default from `--chaos` and the heuristic; a
+    /// recording stores the rule.
+    #[test]
+    fn a_replay_charges_expired_waits_as_its_record_says() {
+        let dir = tempfile::tempdir().unwrap();
+        for (recorded_once, chaos) in [(true, true), (false, false), (true, false), (false, true)] {
+            let path = dir
+                .path()
+                .join(format!("record-{recorded_once}-{chaos}.json"));
+            let record = crate::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+                .with_expired_wait_runs_charged_once(recorded_once);
+            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+            for schedule in [true, false] {
+                let config = Config {
+                    chaos,
+                    replay_schedule_from: schedule.then(|| path.clone()),
+                    replay_preemptions_from: (!schedule).then(|| path.clone()),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    Scheduler::new(&config).expired_wait_runs_charged_once,
+                    recorded_once,
+                    "recorded {recorded_once}, --chaos {chaos}, schedule replay {schedule}"
+                );
+            }
+        }
+        // An explicit `--expired-wait-charge` decides, record or not (`hermit
+        // run` refuses one that disagrees with the record before this).
+        let path = dir.path().join("record-true-true.json");
+        use crate::config::ExpiredWaitCharge;
+        for (charge, once) in [
+            (ExpiredWaitCharge::Once, true),
+            (ExpiredWaitCharge::Each, false),
+        ] {
+            for replay in [None, Some(path.clone())] {
+                let config = Config {
+                    chaos: true,
+                    expired_wait_charge: Some(charge),
+                    replay_schedule_from: replay.clone(),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    Scheduler::new(&config).expired_wait_runs_charged_once,
+                    once,
+                    "{charge:?}, replaying {replay:?}"
+                );
+            }
+        }
+        // A replay that also records stores the rule it replayed under.
+        let replaying_recorder = Config {
+            chaos: true,
+            replay_schedule_from: Some(path.clone()),
+            record_preemptions: true,
+            ..Default::default()
+        };
+        let scheduler = Scheduler::new(&replaying_recorder);
+        assert!(scheduler.expired_wait_runs_charged_once);
+        assert!(
+            scheduler
+                .preemption_writer
+                .unwrap()
+                .into_string()
+                .contains("\"expired_wait_runs_charged_once\":true")
+        );
+        // A heuristic that does not select by priority is race search too.
+        let random = Config {
+            sched_heuristic: crate::config::SchedHeuristic::Random,
+            ..Default::default()
+        };
+        assert!(!Scheduler::new(&random).expired_wait_runs_charged_once);
+        for chaos in [false, true] {
+            let config = Config {
+                chaos,
+                record_preemptions: true,
+                ..Default::default()
+            };
+            let scheduler = Scheduler::new(&config);
+            assert_eq!(scheduler.expired_wait_runs_charged_once, !chaos);
+            let written = scheduler.preemption_writer.unwrap().into_string();
+            assert_eq!(
+                written.contains("\"expired_wait_runs_charged_once\":true"),
+                !chaos,
+                "{written}"
+            );
+        }
+    }
+
     /// A run of turns that each end an expired timed wait is charged one
     /// scheduler turn while another thread is queued: the first of the run
     /// is charged, the next is not, whether its thread is the same or
     /// another. With nobody else queued (the waiter itself does not count),
-    /// under record/replay, and after any other committed turn, every such
-    /// turn is charged as before. A host-timed polling retry neither ends nor
-    /// continues a run, so the charge cannot depend on how many retries ran,
+    /// under record/replay, under `--chaos`, and after any other committed
+    /// turn, every such turn is charged as before. A host-timed polling retry
+    /// neither ends nor continues a run, so the charge cannot depend on how
+    /// many retries ran,
     /// and neither does a skipped turn, which takes a pending mark with it,
     /// nor a schedule replay's own switch turn, which its recording lacks.
     #[test]
@@ -20488,15 +20654,18 @@ mod test {
             (request, false)
         };
         // The advance of the last of `turns`, committed in order with
-        // `queued` in the run queue.
-        let advance = |record_replay: bool, queued: &[DetTid], turns: &[(Resources, bool)]| {
-            let mut sched = Scheduler::new(&config);
+        // `queued` in the run queue, by a scheduler for `config`.
+        let advance_under = |config: &Config,
+                             record_replay: bool,
+                             queued: &[DetTid],
+                             turns: &[(Resources, bool)]| {
+            let mut sched = Scheduler::new(config);
             sched.recordreplay_modes = record_replay;
             for tid in queued {
                 sched.priorities.insert(*tid, DEFAULT_PRIORITY);
                 sched.runqueue_push_back(*tid);
             }
-            let time = Mutex::new(GlobalTime::new(&config));
+            let time = Mutex::new(GlobalTime::new(config));
             let mut before = time.lock().unwrap().as_nanos();
             for (turn, expired) in turns {
                 before = time.lock().unwrap().as_nanos();
@@ -20504,6 +20673,9 @@ mod test {
                 sched.bump_global_time(&time, &Ok(turn.clone()));
             }
             time.lock().unwrap().as_nanos().duration_since(before)
+        };
+        let advance = |record_replay: bool, queued: &[DetTid], turns: &[(Resources, bool)]| {
+            advance_under(&config, record_replay, queued, turns)
         };
         let charge = advance(false, &[worker], &[ordinary(worker), ordinary(worker)]);
         assert!(charge > Duration::ZERO, "an ordinary turn is charged");
@@ -20601,6 +20773,21 @@ mod test {
             skipped(true),
             charge,
             "a skipped turn takes the mark with it"
+        );
+        // Under --chaos every expired wait keeps its turn charge.
+        let chaos = Config {
+            chaos: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            advance_under(&chaos, false, &[worker], &[wait(first), wait(second)]),
+            charge,
+            "under --chaos"
+        );
+        assert_eq!(
+            advance_under(&chaos, false, &[worker], &[wait(first), wait(first)]),
+            charge,
+            "the same thread's, under --chaos"
         );
     }
 

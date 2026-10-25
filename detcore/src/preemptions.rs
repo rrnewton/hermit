@@ -80,6 +80,18 @@ pub struct PreemptionRecord {
     /// synthesized in memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rng_seed: Option<u64>,
+    /// Whether the run that produced this record charged a run of
+    /// consecutive expired timed waits one scheduler turn
+    /// (`Scheduler::expired_wait_runs_charged_once`): a run under
+    /// `--expired-wait-charge=once`, by default one outside race search.
+    /// `false`, which writes the record exactly as before the field existed
+    /// and is what a record without it means, is the rule of every run
+    /// before it and of `each` runs: each expired wait is charged. A replay
+    /// that leaves `--expired-wait-charge` unset charges as its record says,
+    /// so that a chaos recording replayed without `--chaos` (or a plain one
+    /// replayed with it) keeps its recorded virtual times.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    expired_wait_runs_charged_once: bool,
 }
 
 impl std::fmt::Display for PreemptionRecord {
@@ -100,7 +112,22 @@ impl PreemptionRecord {
             signal_state_copy: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
+            expired_wait_runs_charged_once: false,
         }
+    }
+
+    /// Whether the run this record came from charged a run of expired timed
+    /// waits one turn (`false` for each wait charged, and for records that
+    /// do not say).
+    pub fn expired_wait_runs_charged_once(&self) -> bool {
+        self.expired_wait_runs_charged_once
+    }
+
+    /// The same record, stating how the run it came from charged runs of
+    /// expired timed waits.
+    pub fn with_expired_wait_runs_charged_once(mut self, once: bool) -> Self {
+        self.expired_wait_runs_charged_once = once;
+        self
     }
 
     /// The same record, stating the `--pipe-wake-latency` of the trials it
@@ -205,6 +232,7 @@ impl PreemptionRecord {
             signal_state_copy: self.signal_state_copy,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: self.rng_seed,
+            expired_wait_runs_charged_once: self.expired_wait_runs_charged_once,
         }
     }
 
@@ -266,6 +294,7 @@ impl PreemptionRecord {
             signal_state_copy: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
+            expired_wait_runs_charged_once: false,
         }
     }
 
@@ -773,6 +802,46 @@ mod tests {
                 "{recorded:?} replayed with {replay:?}"
             );
         }
+    }
+
+    /// How a run charged runs of expired timed waits rides in a preemption
+    /// record only when it charged them once (`--expired-wait-charge=once`,
+    /// by default outside race search), so an `each` record is written
+    /// exactly as before; a record that does not say means every expired
+    /// wait was charged.
+    #[test]
+    fn the_expired_wait_charge_rule_round_trips() {
+        let unsaid = PreemptionRecord::from_sched_events(Vec::new());
+        assert!(!unsaid.expired_wait_runs_charged_once());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        for once in [false, true] {
+            let written = PreemptionWriter::new(None)
+                .with_expired_wait_runs_charged_once(once)
+                .into_string();
+            assert_eq!(
+                written.contains("expired_wait_runs_charged_once"),
+                once,
+                "{written}"
+            );
+            let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+            assert_eq!(back.expired_wait_runs_charged_once(), once);
+            assert_eq!(
+                back.clone_preemptions_only()
+                    .expired_wait_runs_charged_once(),
+                once
+            );
+            std::fs::write(&path, &written).unwrap();
+            assert_eq!(
+                read_recorded_expired_wait_runs_charged_once(&path),
+                Ok(once)
+            );
+        }
+        std::fs::write(&path, serde_json::to_string(&unsaid).unwrap()).unwrap();
+        assert_eq!(
+            read_recorded_expired_wait_runs_charged_once(&path),
+            Ok(false)
+        );
     }
 
     /// The signal-state copy setting rides in a preemption record as the
@@ -1313,6 +1382,14 @@ impl PreemptionWriter {
         self
     }
 
+    /// Store whether the run charged a run of expired timed waits one turn
+    /// (`Scheduler::expired_wait_runs_charged_once`; `false` leaves the record
+    /// as it was before the field existed).
+    pub fn with_expired_wait_runs_charged_once(mut self, once: bool) -> Self {
+        self.inner.expired_wait_runs_charged_once = once;
+        self
+    }
+
     /// Does the record have zero entries?
     pub fn is_empty(&self) -> bool {
         self.inner.per_thread.is_empty()
@@ -1667,6 +1744,63 @@ pub fn annotated_replay_mode_refusal(cfg: &crate::Config) -> Option<String> {
             "HERMIT_CALLBACK_CHECKPOINT_UNQUALIFIED_MODE: the run was prepared to replay a \
              callback-annotated priority history, but its configuration {setting}; no thread \
              has started"
+        )
+    })
+}
+
+/// Read only whether the run that wrote a preemption record file charged a
+/// run of expired timed waits one turn, as [`read_recorded_epoch`] reads the
+/// epoch. `Ok(false)` for a record that does not say: one written before the
+/// field existed, or by a run under the `each` rule (by default race search),
+/// both of which charged every wait.
+pub fn read_recorded_expired_wait_runs_charged_once(path: &Path) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct ChargeOnly {
+        #[serde(default)]
+        expired_wait_runs_charged_once: bool,
+    }
+    Ok(boundary_recording::read_settings::<ChargeOnly>(path)?.expired_wait_runs_charged_once)
+}
+
+/// The refusal of a replay whose explicit `--expired-wait-charge` differs from
+/// the rule a record states (`recorded_once`, as
+/// [`read_recorded_expired_wait_runs_charged_once`] reads it), naming the
+/// record by `source` (an option and a path), or `None` when they agree or the
+/// replay leaves the option unset, and so takes the record's rule. For a
+/// search (`hermit analyze`, `hermit bisect`), which runs every trial under
+/// one rule, the remedy names the recordings instead.
+pub fn expired_wait_charge_mismatch(
+    source: &str,
+    recorded_once: bool,
+    replay: Option<detcore_model::config::ExpiredWaitCharge>,
+    search: bool,
+) -> Option<String> {
+    let replay = replay?;
+    let recorded = detcore_model::config::ExpiredWaitCharge::from_charged_once(recorded_once);
+    (recorded != replay).then(|| {
+        let remedy = if search {
+            format!(
+                "A search replays every trial under one rule, its target's unless its run \
+                 arguments give one. Re-record this one under that rule \
+                 (`hermit run --expired-wait-charge={} --record-preemptions-to=...`), or, if \
+                 it is the target, pass --expired-wait-charge={} in the run arguments.",
+                replay.as_str(),
+                recorded.as_str()
+            )
+        } else {
+            format!(
+                "Replay with --expired-wait-charge={}, or leave the option out to take the \
+                 record's.",
+                recorded.as_str()
+            )
+        };
+        format!(
+            "{source} was recorded with --expired-wait-charge={} and would be replayed with \
+             --expired-wait-charge={}. The rule decides how much virtual time expired timed \
+             waits cost, and so which thread runs next, so the replay cannot reproduce the run. \
+             {remedy}",
+            recorded.as_str(),
+            replay.as_str(),
         )
     })
 }

@@ -1190,7 +1190,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's
     // syscall_histogram::tests::the_finished_form_keeps_only_nonzero_slots_and_sums_back_exactly
     // (finished threads keep sparse histograms): 1867, listed.
-    ("test.regular_crates", 1880),
+    // And hermit-verify's schedule_trace::tests::
+    // interpolate_refuses_schedules_recorded_under_different_expired_wait_charges
+    // and detcore-model's config::tests::
+    // the_expired_wait_charge_is_printed_when_set_and_never_enters_the_legacy_form: 1882.
+    ("test.regular_crates", 1882),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1841,7 +1845,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1121, listed (1114 on main plus seven).
     // And the fourteen pinned_cpu::tests units, which choose the CPU a run is
     // pinned to (https://github.com/rrnewton/hermit/issues/4824): 1135, listed.
-    ("test.hermit_unit", 1160),
+    // And run::replay_refuses_another_expired_wait_charge,
+    // analyze::phases::tests::analyze_runs_every_trial_under_the_targets_expired_wait_charge
+    // and bisect::tests::bisect_replays_under_the_bad_schedules_expired_wait_charge: 1163.
+    ("test.hermit_unit", 1163),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3047,7 +3054,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler::test::{a_run_of_expired_timed_waits_is_charged_one_turn_while_another_thread_waits,
     // an_expired_timed_wait_is_one_that_ends_at_its_deadline}
     // (short timed-wait pollers inflating virtual time): 2697.
-    ("test.detcore_unit", 2697),
+    // And scheduler::test::a_replay_charges_expired_waits_as_its_record_says,
+    // preemptions::tests::the_expired_wait_charge_rule_round_trips (race search
+    // keeps each expired wait's charge; replays follow the record) and
+    // scheduler::test::a_replays_switch_target_wakes_at_its_passed_deadline: 2700.
+    ("test.detcore_unit", 2700),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5323,7 +5334,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same nine units for a read that faults: 2691, listed.
     // And the same protection-key subscription unit: 2692, listed.
     // And the same two expired-timed-wait units: 2697.
-    ("test.detcore_unit_on_host", 2697),
+    // And the same three charge-rule and switch-target units: 2700.
+    ("test.detcore_unit_on_host", 2700),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5691,7 +5703,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.hermit_unit runs all seven: 1115, listed
     // (1114 on main plus one).
     // And the same fourteen pinned_cpu::tests units: 1129, listed.
-    ("test.hermit_unit_on_host", 1154),
+    // And the same three --expired-wait-charge units: 1157.
+    ("test.hermit_unit_on_host", 1157),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5896,7 +5909,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same native-client publication regression is included on the host.
     // And the same detcore-dbt fingerprint test: 1852, listed.
     // And the same finished-thread sparse histogram unit: 1853, listed.
-    ("test.regular_crates_on_host", 1866),
+    // And the same expired-wait-charge interpolation and config tests: 1868.
+    ("test.regular_crates_on_host", 1868),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

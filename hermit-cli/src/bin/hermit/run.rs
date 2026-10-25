@@ -4095,6 +4095,51 @@ fn the_retired_signal_state_check_variable_is_refused() {
     }
 }
 
+/// A replay under an explicit `--expired-wait-charge` other than the rule its
+/// record states is refused, under both replay flags; a record without the
+/// field charged each wait; a replay that leaves the option unset is never
+/// refused (it takes the record's rule).
+#[test]
+fn replay_refuses_another_expired_wait_charge() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = |name: &str, once: bool| {
+        let path = dir.path().join(name);
+        let record = detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+            .with_expired_wait_runs_charged_once(once);
+        std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+        path
+    };
+    let each = record("each.json", false);
+    let once = record("once.json", true);
+    for flag in ["--replay-schedule-from", "--replay-preemptions-from"] {
+        for (path, charge, refused) in [
+            (&each, None, false),
+            (&each, Some("each"), false),
+            (&each, Some("once"), true),
+            (&once, None, false),
+            (&once, Some("once"), false),
+            (&once, Some("each"), true),
+        ] {
+            let replay = format!("{flag}={}", path.display());
+            let mut argv = vec!["fakehermit".to_owned(), replay];
+            if let Some(charge) = charge {
+                argv.push(format!("--expired-wait-charge={charge}"));
+            }
+            argv.push("fakeprog".to_owned());
+            let ro = RunOpts::parse_from(&argv);
+            let result = ro.refuse_replay_under_another_expired_wait_charge();
+            assert_eq!(result.is_err(), refused, "{argv:?}: {result:?}");
+            if let Err(error) = result {
+                let error = format!("{error:#}");
+                assert!(
+                    error.contains(flag) && error.contains("cannot reproduce the run"),
+                    "{error}"
+                );
+            }
+        }
+    }
+}
+
 /// A replay of a record made under another `--pipe-wake-latency` is refused,
 /// in both directions and for a different latency, under both replay flags;
 /// `0` is not off; a record without the field is off
@@ -6801,6 +6846,37 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Refuse to replay a preemption or schedule record under an explicit
+    /// `--expired-wait-charge` other than the rule the record states. A replay
+    /// that leaves the option unset takes the record's rule (a record without
+    /// the field charged every wait), so it is never refused. As for the
+    /// epoch, the record is read before anything is launched.
+    fn refuse_replay_under_another_expired_wait_charge(&self) -> Result<(), Error> {
+        if self.namespace_only || self.det_opts.det_config.expired_wait_charge.is_none() {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        for (option, path) in [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            let recorded = detcore::preemptions::read_recorded_expired_wait_runs_charged_once(path)
+                .map_err(Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::expired_wait_charge_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                config.expired_wait_charge,
+                false,
+            ) {
+                return Err(Error::new(PolicyRefusal).context(refusal));
+            }
+        }
+        Ok(())
+    }
+
     /// Refuses a replay of a recorded schedule under the other signal-state
     /// copy setting (`--no-signal-state-copy`), as
     /// `refuse_replay_under_another_pipe_wake_latency` refuses another
@@ -7646,6 +7722,7 @@ impl RunOpts {
                 drawn
             );
         }
+        self.refuse_replay_under_another_expired_wait_charge()?;
         if !self.namespace_only
             && (self.verify_verbose
                 || global

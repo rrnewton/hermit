@@ -25,6 +25,7 @@ use detcore::preemptions::PreemptionReader;
 use detcore::preemptions::PreemptionRecord;
 use detcore::preemptions::strip_times_from_events_file;
 use detcore::types::SchedEvent;
+use detcore_model::config::ExpiredWaitCharge;
 use hermit::process::Bind;
 use reverie::process::Output;
 use tracing::metadata::LevelFilter;
@@ -756,14 +757,60 @@ impl AnalyzeOpts {
             .signal_state_copy
     }
 
-    /// `record` stamped with the trials' `--pipe-wake-latency` and
-    /// signal-state copy setting, as every record analyze writes must be: a
-    /// record that omitted either would be accepted when replayed under
-    /// another value (<https://github.com/rrnewton/hermit/issues/4380>).
+    /// The trials' `--expired-wait-charge`, from their run arguments, where
+    /// [`Self::adopt_expired_wait_charge`] puts it; `each` before then, the
+    /// rule of the `--chaos` runs analyze makes.
+    pub fn trial_expired_wait_charge(&self) -> ExpiredWaitCharge {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .expired_wait_charge
+            .unwrap_or(ExpiredWaitCharge::Each)
+    }
+
+    /// Run every trial under one `--expired-wait-charge`: the run arguments'
+    /// own, or else the rule of the `target` recording (`--run1-preemptions`
+    /// for analyze, `--bad` for bisect), or else `each`, the rule of the
+    /// `--chaos` target run analyze makes. A search mixes the target's
+    /// schedule with a baseline's recorded without `--chaos`, so the two must
+    /// not charge expired waits differently, and a failure is searched under
+    /// the rule that found it. The value is added to the run arguments, as
+    /// [`Self::adopt_recorded_epoch`] adds the epoch, so trial commands and
+    /// reproducers carry it; recordings under another rule are then refused
+    /// ([`Self::refuse_recordings_under_another_pipe_wake_latency`]).
+    pub fn adopt_expired_wait_charge(&mut self, target: Option<&Path>) -> anyhow::Result<()> {
+        if RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .expired_wait_charge
+            .is_some()
+        {
+            return Ok(());
+        }
+        let once = match target {
+            Some(path) => detcore::preemptions::read_recorded_expired_wait_runs_charged_once(path)
+                .map_err(anyhow::Error::msg)?,
+            None => false,
+        };
+        self.run_arg.push(format!(
+            "--expired-wait-charge={}",
+            ExpiredWaitCharge::from_charged_once(once).as_str()
+        ));
+        Ok(())
+    }
+
+    /// `record` stamped with the trials' `--pipe-wake-latency`, signal-state
+    /// copy setting and `--expired-wait-charge`, as every record analyze
+    /// writes must be: a record that omitted one would be accepted when
+    /// replayed under another value
+    /// (<https://github.com/rrnewton/hermit/issues/4380>).
     pub fn stamp_trial_record(&self, record: PreemptionRecord) -> PreemptionRecord {
         record
             .with_pipe_wake_latency(self.trial_pipe_wake_latency())
             .with_signal_state_copy(Some(self.trial_signal_state_copy()))
+            .with_expired_wait_runs_charged_once(
+                self.trial_expired_wait_charge() == ExpiredWaitCharge::Once,
+            )
     }
 
     /// Write the schedule `events` for a trial to replay, stamped
@@ -784,7 +831,9 @@ impl AnalyzeOpts {
     /// A record without the field was made with the option off. The same
     /// recordings are checked for the signal-state copy setting
     /// (`--no-signal-state-copy`), which a record without that field does not
-    /// state, so it is accepted under either.
+    /// state, so it is accepted under either, and for the trials'
+    /// `--expired-wait-charge` ([`Self::adopt_expired_wait_charge`]), which a
+    /// record without that field states as `each`.
     pub fn refuse_recordings_under_another_pipe_wake_latency(
         &self,
         recordings: &[(&str, &Path)],
@@ -821,6 +870,16 @@ impl AnalyzeOpts {
                 &format!("{option} {}", path.display()),
                 recorded,
                 config.signal_state_copy,
+            ) {
+                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+            }
+            let recorded = detcore::preemptions::read_recorded_expired_wait_runs_charged_once(path)
+                .map_err(anyhow::Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::expired_wait_charge_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                Some(self.trial_expired_wait_charge()),
+                true,
             ) {
                 return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
             }

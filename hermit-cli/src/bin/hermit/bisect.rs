@@ -143,6 +143,8 @@ impl BisectOpts {
         // Each trial's schedule is written anew without an epoch, so the
         // trials replay from the one the two schedules were recorded under.
         analyzer.adopt_recorded_epoch(&[("--good", &self.good), ("--bad", &self.bad)])?;
+        // Every replay charges expired timed waits as the failing schedule did.
+        analyzer.adopt_expired_wait_charge(Some(&self.bad))?;
         analyzer.refuse_recordings_under_another_pipe_wake_latency(&[
             ("--good", &self.good),
             ("--bad", &self.bad),
@@ -340,6 +342,12 @@ mod tests {
                 "signal_state_copy",
                 serde_json::json!(false),
                 "--no-signal-state-copy",
+                true,
+            ),
+            (
+                "expired_wait_runs_charged_once",
+                serde_json::json!(true),
+                "--expired-wait-charge",
                 true,
             ),
         ] {
@@ -658,7 +666,8 @@ mod tests {
 
         // The default epoch, for schedules that carry none.
         let trials = prepared_trials(dir, None, None, &[]).unwrap();
-        assert!(trials.run_arg.is_empty(), "{:?}", trials.run_arg);
+        // No `--epoch` is added; `--expired-wait-charge` always is.
+        assert_eq!(trials.run_arg, ["--expired-wait-charge=each"]);
         assert_eq!(trials.trial_epoch_for_test(), "2026-01-01T00:00:00+00:00");
 
         // The recorded epoch, from either schedule or both.
@@ -678,7 +687,8 @@ mod tests {
         // An explicit epoch equal to the recorded one adds no second --epoch.
         let trials =
             prepared_trials(dir, Some(RECORDED), Some(RECORDED), &["--epoch", RECORDED]).unwrap();
-        assert!(trials.run_arg.is_empty(), "{:?}", trials.run_arg);
+        // No `--epoch` is added; `--expired-wait-charge` always is.
+        assert_eq!(trials.run_arg, ["--expired-wait-charge=each"]);
         assert_eq!(trials.trial_epoch_for_test(), RECORDED_RFC3339);
 
         // An explicit epoch that differs is refused, naming the remedy.
@@ -711,6 +721,65 @@ mod tests {
             message.contains(RECORDED_RFC3339) && message.contains("2026-01-01T00:00:00+00:00"),
             "{error:#}"
         );
+    }
+
+    /// Bisect replays every trial under the `--expired-wait-charge` of the
+    /// `--bad` schedule (unless its run arguments give one), and refuses a
+    /// `--good` schedule recorded under the other rule.
+    #[test]
+    fn bisect_replays_under_the_bad_schedules_expired_wait_charge() {
+        use detcore_model::config::ExpiredWaitCharge;
+        let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-resources");
+        let dir = tempfile::tempdir().unwrap();
+        let write = |fixture: &str, name: &str, once: bool| {
+            let source = resources.join(format!("flaky_cas_sequence_schedules-{fixture}.json"));
+            let mut record: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(source).unwrap()).unwrap();
+            if once {
+                record["expired_wait_runs_charged_once"] = serde_json::Value::from(true);
+            }
+            let path = dir.path().join(name);
+            fs::write(&path, record.to_string()).unwrap();
+            path
+        };
+        let prepare = |good: &Path, bad: &Path, run_args: &[&str]| {
+            let good = format!("--good={}", good.display());
+            let bad = format!("--bad={}", bad.display());
+            let mut argv = vec!["hermit", "bisect", good.as_str(), bad.as_str(), "--"];
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Bisect(options) = args.command else {
+                panic!("{argv:?} is not bisect")
+            };
+            options
+                .prepare(&args.global)
+                .map(|(analyzer, _, _)| analyzer.trial_expired_wait_charge())
+        };
+        let good_each = write("passing", "good-each.json", false);
+        let bad_each = write("failing", "bad-each.json", false);
+        let good_once = write("passing", "good-once.json", true);
+        let bad_once = write("failing", "bad-once.json", true);
+        assert_eq!(
+            prepare(&good_each, &bad_each, &[]).unwrap(),
+            ExpiredWaitCharge::Each
+        );
+        assert_eq!(
+            prepare(&good_once, &bad_once, &[]).unwrap(),
+            ExpiredWaitCharge::Once
+        );
+        for (good, bad, run_args) in [
+            (&good_each, &bad_once, vec![]),
+            (&good_once, &bad_each, vec![]),
+            (&good_each, &bad_each, vec!["--expired-wait-charge=once"]),
+        ] {
+            let error = prepare(good, bad, &run_args).unwrap_err();
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+            assert!(
+                format!("{error:#}").contains("--expired-wait-charge"),
+                "{error:#}"
+            );
+        }
     }
 
     /// Bisect refuses, before any trial, a `--good` or `--bad` schedule, or a

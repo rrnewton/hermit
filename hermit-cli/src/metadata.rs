@@ -1237,6 +1237,8 @@ fn record_or_replay_config_with_timer_support(
         // the option existed, and record mode's own scheduling, have no
         // hand-off (https://github.com/rrnewton/hermit/issues/4380).
         pipe_wake_latency: None,
+        // Record and replay charge every expired timed wait, whatever the value.
+        expired_wait_charge: None,
         // A `hermit run` option; record and replay do not gather it.
         work_span_report: None,
         scheduler_turn_cost: default_config.scheduler_turn_cost,
