@@ -63,37 +63,49 @@ checker is read-only and does not build, load, inspect, or silently repair an
 image. Both `-h` and `--help` describe this interface; its unit tests run with
 `rust-script --test ci/hermetic/check-image-provenance.rs`.
 
-The current 29a8 pin supersedes d4e5, whose root had no `curl` executable, so
-`test.record_replay` skipped
-`network_trace::curl_recording_replays_offline_with_identical_logs`, the only
-pinned-root test that runs curl
-(https://github.com/rrnewton/hermit/issues/3786). The replacement adds
-`curl.bin` to `guestTools` and `/usr/bin/curl` to `guest-paths.txt`. Two builds
-from commit `b8981f6ac8da871ab68b4cb75a9736dd810b0af0` used independent source
-snapshots, physical Nix stores that did not exist before the build, and Podman
-stores; both produced archive
-`7aeffce338a79d601c7352c80acd1ceca67547efcc02fd44e169ac465be6cd39`
-and loaded the same 29a8 image. d4e5 itself replaced d809, whose root lacked
-liblzma, which libunwind's static pkg-config closure names after Reverie
-https://github.com/rrnewton/reverie/pull/942; d809
-(https://github.com/rrnewton/hermit/pull/3171) replaced c607
-(https://github.com/rrnewton/hermit/pull/3172), an image built from a reused,
-mixed Nix store.
+The current a2828a pin supersedes 29a8 and provides the configured genuine GNU
+native fixtures. The flake's `NIX_NO_SELF_RPATH=1` prevents stdenv from adding
+an empty RUNPATH to the native `nice` and `echo` fixtures; the strict
+no-DT_RPATH/DT_RUNPATH build guard is unchanged. No GNU or Hermit runtime test
+pass is claimed by this image receipt.
 
-This proves same-host reproducibility for the recorded method only; it makes no
-cross-host reproducibility claim. Each build ran as a systemd user service
-bounded to 2 CPUs (`CPUQuota=200%`), 8 GiB of memory with no swap and 2400
-seconds of wall time, running `nix --store <build-root>/nix-root build .#image`
-without network access: the new store could substitute only from the build
-host's default store, only signed or content-addressed paths, and every
-unsigned path was rebuilt. The Nix build sandbox's `/bin/sh` was a static
-busybox recorded in the receipt. The receipt records the build-time Nix
-version; its evidence limitations name what it does not preserve: the service
-environment's values, the build logs and path-info records, and the superseded
-d4e5 archive bytes. `build-image.sh` remains useful for a local one-off build,
-but one such build is not sufficient evidence for another reviewed repin. A
-future repin must replace the digest and provenance together with two new
-agreeing isolated builds.
+Two independent builds from commit
+`58fee8a4b37470f0995ff57e7f8092a43295b1f7` used fresh physical source and Nix
+store roots. Each protected source tar contains only the signed `ci/hermetic`
+subtree (20 members, 296960 bytes), not the whole repository. Both produced
+archive `b56dfc1b525cde2e3218c15b3968e06204c1dff8709e80a2815188d2e85e3638`
+and their separate private Podman stores expose identical manifest, config,
+layer descriptors and the a2828a reference. Four actual native registered NAR
+hash/size pairs agree between the private Nix stores; registration metadata
+is retained separately and is not asserted identical.
+
+Each producer used an authenticated systemd user scope bounded to 2 CPUs
+(`CPUQuota=200%`), 8 GiB with no swap and 2400 seconds, with fresh user, network
+and mount namespaces and a static BusyBox sandbox shell. The literal Nix
+image selector was `path:.#image`, with both `--store` and `--eval-store` bound
+to that producer's private root. Network access, daemon/service fallback and
+unsigned substitution were forbidden; Nix could accept only signed or
+content-addressed paths from the host local store. An independent image build
+does not imply that each accepted substituted input was rebuilt.
+
+This establishes same-host agreement for the recorded method, not cross-host
+reproducibility or independent cryptographic/NAR-payload verification. The
+six receipt limitations disclose the subtree source scope, privately retained
+raw evidence, last-observed resource counters and sampling gaps, historical
+superseded archive, four-file live equivalence and incomplete A load runtime
+closure. A's current loaded file-data custody was admitted separately; the
+checker does not require a timely A load runtime close. Earlier failed
+attempts remain failed. Pinning this receipt does not load, tag or adopt an
+image in the default Podman store, or establish a whole-OFF/runtime pass.
+
+Historically, 29a8 superseded d4e5 to restore the `curl` executable for
+`network_trace::curl_recording_replays_offline_with_identical_logs`
+(https://github.com/rrnewton/hermit/issues/3786); its archive was
+`7aeffce338a79d601c7352c80acd1ceca67547efcc02fd44e169ac465be6cd39`. The older
+d4e5/liblzma repair followed https://github.com/rrnewton/reverie/pull/942.
+`build-image.sh` remains useful for a one-off local build, but a future reviewed
+repin must replace the digest and provenance together with two new agreeing
+isolated builds.
 
 `setup.pinned_root_fetch` fetches Cargo dependencies; it does not prepare the OCI
 image. Prepare that image explicitly with `build-image.sh` when needed. Each
