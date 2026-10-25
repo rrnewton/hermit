@@ -146,8 +146,14 @@ impl BisectOpts {
             ("--good", &self.good),
             ("--bad", &self.bad),
         ])?;
-        let good = good.into_global();
-        let bad = bad.into_global();
+        let mut good = good.into_global();
+        let mut bad = bad.into_global();
+        // Analyze's trial outputs omit optional event timestamps. Put these
+        // admitted search inputs in that same representation: bisection edits
+        // event order, not the original recordings' virtual-time trajectories.
+        for event in good.iter_mut().chain(&mut bad) {
+            event.end_time = None;
+        }
         if good == bad {
             bail!("the --good and --bad schedules contain identical event traces");
         }
@@ -175,8 +181,187 @@ fn read_schedule(path: &Path, label: &str) -> anyhow::Result<PreemptionRecord> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
+    use detcore::types::DetTid;
+    use detcore::types::LogicalTime;
+    use detcore::types::Op;
+    use detcore::types::SyscallPhase;
+    use reverie::syscalls::Sysno;
+
     use super::*;
     use crate::container::PolicyRefusal;
+
+    fn search_record(events: Vec<SchedEvent>) -> serde_json::Value {
+        let record = PreemptionRecord::from_sched_events(events)
+            .with_pipe_wake_latency(Some(3_000_000))
+            .with_signal_state_copy(Some(true));
+        let mut record = serde_json::to_value(record).unwrap();
+        record["epoch"] = serde_json::json!(RECORDED);
+        record
+    }
+
+    /// Exercise production admission and conversion without launching a trial;
+    /// both successful preparation and refusal must leave the inputs intact.
+    fn prepare_search_records(
+        good: &serde_json::Value,
+        bad: &serde_json::Value,
+    ) -> Result<(AnalyzeOpts, Vec<SchedEvent>, Vec<SchedEvent>), Error> {
+        let dir = tempfile::tempdir().unwrap();
+        let good_path = dir.path().join("good.json");
+        let bad_path = dir.path().join("bad.json");
+        let good_bytes = serde_json::to_vec(good).unwrap();
+        let bad_bytes = serde_json::to_vec(bad).unwrap();
+        fs::write(&good_path, &good_bytes).unwrap();
+        fs::write(&bad_path, &bad_bytes).unwrap();
+        let args = crate::Args::try_parse_from([
+            "hermit".to_owned(),
+            "bisect".to_owned(),
+            format!("--good={}", good_path.display()),
+            format!("--bad={}", bad_path.display()),
+            "--".to_owned(),
+            format!("--epoch={RECORDED}"),
+            "--pipe-wake-latency=3000000".to_owned(),
+            "/bin/true".to_owned(),
+        ])
+        .unwrap();
+        let crate::Subcommand::Bisect(options) = args.command else {
+            panic!("expected bisect")
+        };
+        let result = options.prepare(&args.global);
+        assert_eq!(fs::read(good_path).unwrap(), good_bytes);
+        assert_eq!(fs::read(bad_path).unwrap(), bad_bytes);
+        result
+    }
+
+    #[test]
+    fn bisect_search_removes_only_event_times_from_both_inputs() {
+        let first = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook)
+            .with_start_rip(NonZeroUsize::new(0x1000).unwrap())
+            .with_end_rip(NonZeroUsize::new(0x1002).unwrap());
+        let second = SchedEvent::branches(DetTid::from_raw(5), 4);
+        let good = vec![first, second];
+        let mut timed_good = good.clone();
+        timed_good[0].end_time = Some(LogicalTime::from_nanos(10));
+        let trials_dir = tempfile::tempdir().unwrap();
+
+        // Every distinction other than optional timestamps still reaches the
+        // search, including the order and a genuinely unmatched event.
+        for field in [
+            "order",
+            "thread",
+            "op",
+            "phase",
+            "count",
+            "start_rip",
+            "end_rip",
+            "extra",
+        ] {
+            let mut bad = good.clone();
+            match field {
+                "order" => bad.reverse(),
+                "thread" => bad[0].dettid = DetTid::from_raw(7),
+                "op" => bad[0].op = Op::Syscall(Sysno::read, SyscallPhase::Prehook),
+                "phase" => bad[0].op = Op::Syscall(Sysno::write, SyscallPhase::Posthook),
+                "count" => bad[1].count += 1,
+                "start_rip" => bad[0].start_rip = NonZeroUsize::new(0x2000),
+                "end_rip" => bad[0].end_rip = NonZeroUsize::new(0x2002),
+                "extra" => bad.push(SchedEvent::branches(DetTid::from_raw(7), 1)),
+                _ => unreachable!(),
+            }
+            let timed_bad = bad
+                .iter()
+                .cloned()
+                .map(|event| event.with_time(LogicalTime::from_nanos(20)))
+                .collect();
+            let (mut trials, prepared_good, prepared_bad) = prepare_search_records(
+                &search_record(timed_good.clone()),
+                &search_record(timed_bad),
+            )
+            .unwrap();
+            assert_eq!(prepared_good, good, "{field}: good input");
+            assert_eq!(prepared_bad, bad, "{field}: bad input");
+            assert_ne!(prepared_good, prepared_bad, "{field}");
+            trials.tmp_dir = Some(trials_dir.path().to_path_buf());
+            assert_eq!(trials.trial_epoch_for_test(), RECORDED_RFC3339);
+            assert_eq!(trials.trial_pipe_wake_latency(), Some(3_000_000));
+            assert!(trials.trial_signal_state_copy());
+        }
+    }
+
+    #[test]
+    fn bisect_refuses_endpoints_differing_only_in_event_times() {
+        let event = SchedEvent::branches(DetTid::from_raw(3), 4);
+        for (good_time, bad_time) in [(Some(10), Some(20)), (Some(10), None), (None, Some(20))] {
+            let mut good = event.clone();
+            let mut bad = event.clone();
+            good.end_time = good_time.map(LogicalTime::from_nanos);
+            bad.end_time = bad_time.map(LogicalTime::from_nanos);
+            // Ordinary event equality still distinguishes the original times.
+            assert_ne!(good, bad);
+            let error =
+                prepare_search_records(&search_record(vec![good]), &search_record(vec![bad]))
+                    .unwrap_err();
+            assert!(
+                error.to_string().contains("identical event traces"),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn bisect_admits_raw_records_before_projecting_search_times() {
+        let event = SchedEvent::branches(DetTid::from_raw(3), 4);
+        let good = search_record(vec![event.clone().with_time(LogicalTime::from_nanos(10))]);
+        let bad = search_record(vec![event.with_time(LogicalTime::from_nanos(20))]);
+        // These would become identical search vectors. The raw-record refusal
+        // must win first, for either endpoint, and retain its original cause.
+        for (field, value, cause, policy) in [
+            (
+                "per_thread",
+                serde_json::json!({"3": {"final_prio": 0, "prio_changes": []}}),
+                "final priority for thread 3 invalid: 0",
+                false,
+            ),
+            (
+                "epoch",
+                serde_json::json!("2026-01-01T00:00:00Z"),
+                "epoch",
+                true,
+            ),
+            (
+                "pipe_wake_latency",
+                serde_json::json!(0),
+                "--pipe-wake-latency=0",
+                true,
+            ),
+            (
+                "signal_state_copy",
+                serde_json::json!(false),
+                "--no-signal-state-copy",
+                true,
+            ),
+        ] {
+            for change_good in [true, false] {
+                let mut good = good.clone();
+                let mut bad = bad.clone();
+                let changed = if change_good { &mut good } else { &mut bad };
+                changed[field] = value.clone();
+                let error = prepare_search_records(&good, &bad).unwrap_err();
+                let message = format!("{error:#}");
+                assert!(message.contains(cause), "{field}: {message}");
+                assert!(
+                    !message.contains("identical event traces"),
+                    "{field}: {message}"
+                );
+                assert_eq!(
+                    error.downcast_ref::<PolicyRefusal>().is_some(),
+                    policy,
+                    "{message}"
+                );
+            }
+        }
+    }
 
     /// Through `main`: bisect refuses `--strict` in its run arguments on an
     /// inexact retired-branch counter before it reads either schedule

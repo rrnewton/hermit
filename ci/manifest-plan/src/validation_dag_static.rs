@@ -1776,7 +1776,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // dbt_public_dispatch_refuses_strict_schedule_boundaries, which keeps the
     // refusal that serializing that environment variable used to make: 1091,
     // listed.
-    ("test.hermit_unit", 1091),
+    // Three bisect search-input projection and admission regressions: 1094, listed.
+    ("test.hermit_unit", 1094),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5382,7 +5383,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two --strace-only expansion tests: 1098.
     // Less the same eight dbt_detconfig_tests units: 1090. And the same
     // strict-schedule-boundaries refusal unit: 1091, listed.
-    ("test.hermit_unit_on_host", 1091),
+    // The same three bisect search-input regressions: 1094, listed.
+    ("test.hermit_unit_on_host", 1094),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
