@@ -132,6 +132,7 @@ use hermit::canonical_verdict::VerificationReport;
 static DBT_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_EXECVEAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PREEMPTION_CHARGE_REPLAY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_PID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_PRLIMIT_SELF_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -16698,6 +16699,63 @@ fn chaos_spinner_wait_ms(backend: &[&str]) -> u64 {
 fn chaos_bounds_how_long_a_spinner_keeps_a_new_thread_waiting() {
     let waited = chaos_spinner_wait_ms(&[]);
     assert!(waited <= 4, "the new thread waited {waited} ms");
+}
+
+/// A schedule replay of a `--cap-preemption-charge` chaos recording keeps the
+/// recording's clock. Two threads make short syscalls under a logical 20 us
+/// `--target-timeslice` (no PMU needed), so nearly every turn ends an expired
+/// slice and is charged at most the slice; the replay's own switch turns
+/// (`TraceReplay`) are granted to threads stopped at a request they have not
+/// been granted yet. Counted as a thread's previous turn, a switch turn
+/// restarted its measure and the replayed preemption was charged 1 ns where
+/// the recording charged the slice, so the replay printed other times while
+/// following the schedule without a desync. The schedule is followed with no
+/// desync and every printed time equals the recording's, at seeds 1 and 2.
+#[test]
+fn a_capped_chaos_recording_replays_its_schedule_with_the_recordings_clock() {
+    let guest = futex_c_guest(&PREEMPTION_CHARGE_REPLAY_GUEST, "preemption_charge_replay")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let slices = [
+        "--max-timeslice=disabled",
+        "--target-timeslice=20000",
+        "--cap-preemption-charge",
+    ];
+    let guest_args = [guest.as_str(), "300", "2"];
+    for seed in ["1", "2"] {
+        let schedule = directory.path().join(format!("schedule-{seed}.json"));
+        let record = format!("--record-preemptions-to={}", schedule.display());
+        let mut args = vec!["run", "--strict", "--chaos", "--seed", seed, &record];
+        args.extend_from_slice(&slices);
+        args.push("--");
+        args.extend_from_slice(&guest_args);
+        let recorded = hermit(&args);
+        assert!(recorded.status.success(), "{args:?}: {}", stderr(&recorded));
+
+        let replay = format!("--replay-schedule-from={}", schedule.display());
+        let mut args = vec!["--log=info", "run", "--strict", &replay];
+        args.extend_from_slice(&slices);
+        args.push("--");
+        args.extend_from_slice(&guest_args);
+        let replayed = hermit(&args);
+        let log = stderr(&replayed);
+        assert!(replayed.status.success(), "{args:?}: {log}");
+        assert!(
+            log.contains("(0 desynced)") && !log.contains("in a desynced state"),
+            "seed {seed}: the replay left its recorded schedule:\n{}",
+            log.lines()
+                .filter(|line| line.contains("desync") || line.contains("expected to be running"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert_eq!(
+            stdout(&replayed),
+            stdout(&recorded),
+            "seed {seed}: the replay's clock differs from the recording's"
+        );
+    }
 }
 
 /// The bounded priority is the one recorded, so a preemption replay of the
