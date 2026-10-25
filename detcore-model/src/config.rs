@@ -785,11 +785,13 @@ pub struct Config {
     /// scheduler seed, the thread, and the number of the thread's earlier spread waits.
     /// Recorded schedules store the value and the seed, and a replay under others is refused.
     /// Not spread: poll, epoll and select timeouts, signal timers, and waits with no finite
-    /// future deadline. Needs `--chaos`, or a replay of a schedule recorded with it, threads
+    /// future deadline. Needs `--chaos`, or a replay of preemptions recorded with it, threads
     /// sequentialized by Detcore's scheduler, and the ptrace backend (or e9patch preprocessing,
     /// which runs on it); must be finite and above 1. Unset (the default), nothing changes.
     /// `hermit analyze` refuses it: its bisect and minimize replays mix schedules found
-    /// under different seeds.
+    /// under different seeds. `--replay-schedule-from` refuses it too: it evaluates a sleep
+    /// when its schedule next runs the thread, later than the recording did, and would draw
+    /// the wake time from another clock; replay with `--replay-preemptions-from` and `--chaos`.
     #[serde(default)]
     #[clap(long, value_name = "factor")]
     pub chaos_timed_wait_spread: Option<f64>,

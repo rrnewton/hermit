@@ -537,8 +537,10 @@ progress. When the factor is below one, the clock
 first jumps to the wait's deadline, as if the other threads had been
 descheduled, so the waiter still observes its full duration; above one, the
 wait oversleeps. Poll, epoll and select timeouts and signal timers are not
-spread. A recorded schedule stores the spread and seed, and a replay under
-others is refused; `hermit analyze` does not support the option yet.
+spread. A recording stores the spread and seed, and a replay under others is
+refused. Replay such a recording with `--replay-preemptions-from`, `--chaos`
+and the recorded spread and seed; `--replay-schedule-from` and `hermit
+analyze` do not support the option yet.
 
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with
