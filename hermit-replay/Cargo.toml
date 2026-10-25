@@ -12,8 +12,8 @@ hermit-record-format = { version = "0.5.1", path = "../hermit-record-format" }
 anyhow = "1.0.103"
 detcore = { package = "hermit-detcore", version = "0.5.1", path = "../detcore" }
 libc = "0.2.186"
-reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "943c0a9ac4b04ef41621a51497357081be551abe" }
-reverie-ptrace = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "943c0a9ac4b04ef41621a51497357081be551abe" }
+reverie = { package = "reverie-core", version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "ec5de39fb87701c1537ae5028249f070583eaa00" }
+reverie-ptrace = { version = "0.5.1", git = "https://github.com/rrnewton/reverie.git", rev = "ec5de39fb87701c1537ae5028249f070583eaa00" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 tempfile = "3.27.0"
 tokio = { version = "1.52.4", features = ["full", "test-util", "tracing"] }

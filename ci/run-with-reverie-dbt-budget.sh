@@ -2628,7 +2628,21 @@ fi
 # width and limits carry unchanged from the 8b7ab5f3 entry; only the source
 # inventory count moves, by the one added Rust file named above. The client.c
 # change still requires a fresh client build and Hermit validation.
-expected_pin=943c0a9ac4b04ef41621a51497357081be551abe
+# CARRY TO ec5de39fb87701c1537ae5028249f070583eaa00 (2026-10-25): from
+# 943c0a9ac4b04ef41621a51497357081be551abe. Two commits. abe07924 moves the KVM
+# backend's Linux emulation into the new crate reverie-linuxemu and the KVM
+# machine pieces into reverie-kvm-core (a pure code move); the root Cargo.toml
+# only adds that workspace member and the root Cargo.lock only its package and
+# the moved crates' dependencies. ec5de39f (liteinst lane) refreshes the root
+# Cargo.toml row of reverie-liteinst-artifact's reviewed native-source catalog.
+# git diff is empty under reverie-dbt/ and third-party/ and for
+# rust-toolchain.toml; both repository inputs to the DynamoRIO content key are
+# byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory (1009), SDK and native inputs, calibrated budget, job width
+# and limits carry unchanged from the 943c0a9a entry.
+expected_pin=ec5de39fb87701c1537ae5028249f070583eaa00
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
