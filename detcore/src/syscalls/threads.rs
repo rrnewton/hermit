@@ -744,6 +744,49 @@ fn signal_default_action_ends_the_process(signal: SigWrapper) -> bool {
     )
 }
 
+/// Whether a run may retire a process's other threads in the turn that
+/// delivers a signal ending the process (`Scheduler::commit_fatal_delivery`):
+/// its threads are serialized, the kernel's signal state is the guest's own,
+/// from which the delivering thread reads that the kernel carries the default
+/// action out, and no gdbserver is attached, whose client decides the signal
+/// when it resumes the thread.
+pub(crate) fn retires_others_at_fatal_delivery(cfg: &Config) -> bool {
+    cfg.sequentialize_threads && cfg.backend.kernel_signal_state_is_guests && !cfg.gdbserver
+}
+
+/// Whether delivering `signal` to the calling thread now ends its process,
+/// by an action left at a default that terminates or dumps core: `None` when
+/// it does not, else whether the kernel's signal state also shows that
+/// resuming the thread with `signal` carries the action out
+/// ([`KernelSignalState::delivery_carries_out_a_fatal_default`]), asked only
+/// when `may_retire_others`. Detcore's copy of the dispositions answers the
+/// first question without a read for most deliveries (a handled or ignored
+/// signal); the kernel's state is read at most once.
+pub(crate) fn fatal_default_delivery<G, T>(
+    guest: &G,
+    signal: i32,
+    may_retire_others: bool,
+) -> Option<bool>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let copied = super::signal_shadow::copied_dispositions_for(guest, signal)
+        .map(|copied| default_action_ends_process(copied.ignored, copied.caught, signal));
+    if copied == Some(false) {
+        return None;
+    }
+    let kernel = (copied.is_none() || may_retire_others)
+        .then(|| read_thread_signal_state(guest.pid(), guest.tid()).ok())
+        .flatten();
+    let ends = copied
+        .unwrap_or_else(|| kernel.is_some_and(|state| state.default_action_ends_process(signal)));
+    ends.then(|| {
+        may_retire_others
+            && kernel.is_some_and(|state| state.delivery_carries_out_a_fatal_default(signal))
+    })
+}
+
 fn signal_has_uncatchable_default_disposition(signal: SigWrapper) -> bool {
     matches!(signal.raw(), libc::SIGKILL | libc::SIGSTOP)
 }
@@ -1064,6 +1107,14 @@ impl KernelSignalState {
     /// stops or continues. `SIGKILL` always does.
     pub(crate) fn default_action_ends_process(&self, signal: i32) -> bool {
         default_action_ends_process(self.ignored, self.caught, signal)
+    }
+
+    /// Whether resuming the thread from a delivery stop with `signal` makes
+    /// the kernel carry out its default action and end the process: the
+    /// thread does not block `signal`, which `ptrace_signal` would requeue,
+    /// and [`Self::default_action_ends_process`].
+    pub(crate) fn delivery_carries_out_a_fatal_default(&self, signal: i32) -> bool {
+        self.blocked & kernel_sigset_bit(signal) == 0 && self.default_action_ends_process(signal)
     }
 
     /// The job-control stop signals `SIGTSTP`, `SIGTTIN`, and `SIGTTOU` whose
@@ -7418,6 +7469,78 @@ mod tests {
             assert!(!signal_default_disposition_does_not_interrupt_child_wait(
                 SigWrapper(signal)
             ));
+        }
+    }
+
+    /// Only a serialized run on a backend whose kernel signal state is the
+    /// guest's own, with no gdbserver attached, retires threads at a fatal
+    /// delivery.
+    #[test]
+    fn only_serialized_ptrace_runs_without_a_gdbserver_retire_at_a_fatal_delivery() {
+        let ptrace = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| *backend = reverie::BackendCapabilities::PTRACE);
+        assert!(retires_others_at_fatal_delivery(&ptrace));
+        for (case, cfg) in [
+            (
+                "gdbserver",
+                Config {
+                    gdbserver: true,
+                    ..ptrace.clone()
+                },
+            ),
+            (
+                "unserialized",
+                Config {
+                    sequentialize_threads: false,
+                    ..ptrace.clone()
+                },
+            ),
+            (
+                "DBT",
+                ptrace
+                    .clone()
+                    .with_backend(|backend| *backend = reverie::BackendCapabilities::DBT),
+            ),
+        ] {
+            assert!(!retires_others_at_fatal_delivery(&cfg), "{case}");
+        }
+    }
+
+    /// A delivery stop's signal ends the process only when it is unblocked
+    /// and left at a default that terminates or dumps core.
+    #[test]
+    fn only_an_unblocked_default_fatal_delivery_ends_the_process() {
+        let abrt = kernel_sigset_bit(libc::SIGABRT);
+        let default = KernelSignalState::default();
+        assert!(default.delivery_carries_out_a_fatal_default(libc::SIGABRT));
+        assert!(default.delivery_carries_out_a_fatal_default(libc::SIGSEGV));
+        for signal in [libc::SIGCHLD, libc::SIGWINCH, libc::SIGTSTP, libc::SIGCONT] {
+            assert!(
+                !default.delivery_carries_out_a_fatal_default(signal),
+                "{signal}"
+            );
+        }
+        for state in [
+            KernelSignalState {
+                blocked: abrt,
+                ..Default::default()
+            },
+            KernelSignalState {
+                caught: abrt,
+                ..Default::default()
+            },
+            KernelSignalState {
+                ignored: abrt,
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                !state.delivery_carries_out_a_fatal_default(libc::SIGABRT),
+                "{state:?}"
+            );
         }
     }
 

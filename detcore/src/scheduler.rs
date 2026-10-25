@@ -5113,16 +5113,17 @@ impl Scheduler {
     /// `de_thread` kills the other threads instead (`do_group_exit` and
     /// `zap_threads` defer to `group_exec_task`).
     ///
-    /// The process is recorded doomed (`record_committed_fatal_signal`), and
-    /// on a backend that retires a kill's victims at the kill turn (ptrace)
-    /// its other threads are retired here, as committed victims
-    /// (`retire_fatal_delivery_victims`). Before, each left at its own
+    /// The process is recorded doomed (`record_committed_fatal_signal`). When
+    /// `retire_others` (the caller read that the kernel carries the default
+    /// action out when it resumes `sender`), on a backend that retires a
+    /// kill's victims at the kill turn (ptrace), its other threads are
+    /// retired here, as committed victims (`retire_fatal_delivery_victims`). Before, each left at its own
     /// host-timed exit report, and a report that came after the sender's let
     /// the empty run queue read as a deadlock of the threads still parked in
     /// futex waits. Returns whether any thread was retired: the sender then
     /// files nothing more, since turn selection now waits for the victims'
     /// deaths, which only its delivery causes.
-    pub(crate) fn commit_fatal_delivery(&mut self, sender: DetTid) -> bool {
+    pub(crate) fn commit_fatal_delivery(&mut self, sender: DetTid, retire_others: bool) -> bool {
         let Some(process) = self.registered_process(sender) else {
             return false;
         };
@@ -5132,6 +5133,9 @@ impl Scheduler {
             return false;
         }
         self.record_committed_fatal_signal(process);
+        if !retire_others {
+            return false;
+        }
         if !self.holds_serial_grant(sender) {
             tracing::warn!(
                 "[scheduler] dettid {sender} reported a fatal delivery without holding the serial grant; its process's other threads stay"
@@ -35840,7 +35844,7 @@ mod test {
         assert!(report.contains("waiting on futex"), "{report}");
 
         let (mut scheduler, mm) = fatal_delivery_scheduler(&config);
-        assert!(scheduler.commit_fatal_delivery(sender));
+        assert!(scheduler.commit_fatal_delivery(sender, true));
         assert_eq!(
             scheduler.next_turns.keys().copied().collect::<Vec<_>>(),
             [sender]
@@ -35894,7 +35898,7 @@ mod test {
             "the stale edge this test is about must exist"
         );
 
-        assert!(scheduler.commit_fatal_delivery(sender));
+        assert!(scheduler.commit_fatal_delivery(sender, true));
         for tid in [leader, parked] {
             assert!(scheduler.is_unaccounted_sigkill_victim(tid), "{tid}");
         }
@@ -35908,9 +35912,11 @@ mod test {
 
     /// Nothing is retired where Linux does not end the group at the delivery
     /// (a PID namespace's init, `SIGNAL_UNKILLABLE`; an exec in flight, whose
-    /// `de_thread` kills the others), on a backend that does not retire a
-    /// kill's victims at the kill turn (DBT ends the group with its own
-    /// `Exit` grant), for a sender that does not hold the turn, or, under
+    /// `de_thread` kills the others), where the caller could not establish
+    /// that the kernel carries the default action out at the resume (a
+    /// blocked signal, an attached gdbserver), on a backend that does not
+    /// retire a kill's victims at the kill turn (DBT ends the group with its
+    /// own `Exit` grant), for a sender that does not hold the turn, or, under
     /// record, beside a thread with a background operation in flight, whose
     /// recorded result's rejoin must still be consumed.
     #[test]
@@ -35923,11 +35929,12 @@ mod test {
             *backend = reverie::BackendCapabilities::DBT;
         });
         type Setup = fn(&mut Scheduler);
-        let cases: [(&str, &Config, Setup, bool); 5] = [
+        let cases: [(&str, &Config, Setup, bool, bool); 6] = [
             (
                 "namespace init",
                 &plain,
                 |s| s.thread_tree.mark_pid_namespace_init(DetPid::from_raw(3)),
+                true,
                 false,
             ),
             (
@@ -35945,10 +35952,18 @@ mod test {
                         },
                     );
                 },
+                true,
                 false,
             ),
-            ("DBT", &dbt, |_| {}, true),
-            ("turn not held", &plain, |s| s.parked.running = None, true),
+            ("kernel does not carry it out", &plain, |_| {}, false, true),
+            ("DBT", &dbt, |_| {}, true, true),
+            (
+                "turn not held",
+                &plain,
+                |s| s.parked.running = None,
+                true,
+                true,
+            ),
             (
                 "background operation under record",
                 &plain,
@@ -35960,12 +35975,13 @@ mod test {
                         .insert(parked, crate::resources::ExternalOpId::new(parked, 1));
                 },
                 true,
+                true,
             ),
         ];
-        for (case, config, setup, doomed) in cases {
+        for (case, config, setup, retire, doomed) in cases {
             let (mut scheduler, _) = fatal_delivery_scheduler(config);
             setup(&mut scheduler);
-            assert!(!scheduler.commit_fatal_delivery(sender), "{case}");
+            assert!(!scheduler.commit_fatal_delivery(sender, retire), "{case}");
             assert_eq!(scheduler.next_turns.len(), 3, "{case}");
             assert!(!scheduler.is_unaccounted_sigkill_victim(parked), "{case}");
             assert!(!scheduler.sigkill_fence_holds(), "{case}");

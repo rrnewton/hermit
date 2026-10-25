@@ -82,6 +82,7 @@ pub(crate) use threads::KernelSignalState;
 /// One of a thread's two queues of pending signals.
 pub(crate) use threads::SignalQueue;
 pub(crate) use threads::default_action_ends_process;
+pub(crate) use threads::fatal_default_delivery;
 pub(crate) use threads::forget_thread_status;
 pub(crate) use threads::host_signal_state_reads_refused;
 pub(crate) use threads::ignored_at_generation;
@@ -91,6 +92,7 @@ pub(crate) use threads::read_kernel_signal_state;
 pub(crate) use threads::read_thread_signal_state;
 pub(crate) use threads::real_uid;
 pub(crate) use threads::refuse_host_signal_state_reads;
+pub(crate) use threads::retires_others_at_fatal_delivery;
 #[cfg(test)]
 pub(crate) use threads::signal_state_read_seam;
 pub(crate) use threads::thread_is_gone;

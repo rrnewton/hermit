@@ -2006,25 +2006,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             boundary_token,
         } = turn;
         // A delivery that ends the process is committed in this turn
-        // (`Scheduler::commit_fatal_delivery`). Where the kernel's signal
-        // state is the guest's own (ptrace), the dispositions read here are
-        // the ones the kernel acts on, and the process's other threads leave
-        // the scheduler now, as Linux kills them at this delivery, instead of
-        // at their host-timed exit reports. Under `--pipe-wake-latency` the
-        // doom also feeds the hand-off scan (`scheduler::pipe_wake`).
-        let commits_fatal_delivery = self.cfg.pipe_wake_latency_in_effect().is_some()
-            || (self.cfg.sequentialize_threads && self.cfg.backend.kernel_signal_state_is_guests);
-        let retired_the_others = commits_fatal_delivery
-            && match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal.raw()) {
-                Some(copied) => crate::syscalls::default_action_ends_process(
-                    copied.ignored,
-                    copied.caught,
-                    signal.raw(),
-                ),
-                None => crate::syscalls::read_thread_signal_state(guest.pid(), guest.tid())
-                    .is_ok_and(|state| state.default_action_ends_process(signal.raw())),
-            }
-            && tool_global::commit_fatal_delivery(guest).await;
+        // (`Scheduler::commit_fatal_delivery`). Under `--pipe-wake-latency`
+        // the doom feeds the hand-off scan (`scheduler::pipe_wake`). Where the
+        // kernel's signal state is the guest's own (ptrace), the process's
+        // other threads also leave the scheduler now, as Linux kills them at
+        // this delivery, instead of at their host-timed exit reports. That
+        // needs the kernel to carry out the default action when it resumes
+        // this thread, as its signal state says now: the signal is unblocked
+        // (`ptrace_signal` requeues a blocked one) and no gdbserver client
+        // can change or cancel it at the resume.
+        let may_retire_others = crate::syscalls::retires_others_at_fatal_delivery(&self.cfg);
+        let retired_the_others = (may_retire_others
+            || self.cfg.pipe_wake_latency_in_effect().is_some())
+            && match crate::syscalls::fatal_default_delivery(guest, signal.raw(), may_retire_others)
+            {
+                Some(retire_others) => {
+                    tool_global::commit_fatal_delivery(guest, retire_others).await
+                }
+                None => false,
+            };
         // A timer entry's siginfo, with its overrun counted now that the
         // delivery's turn is granted, where the handler's time begins.
         if timer_entry {
