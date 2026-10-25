@@ -766,6 +766,15 @@ pub struct Resources {
     /// because `Resources` crosses positional RPCs.
     #[serde(default)]
     pub(crate) slice_expired: bool,
+    /// Set on a sleep its caller asked to last no time (`nanosleep` of zero,
+    /// `poll` with no descriptors and a zero timeout): a yield idiom whose
+    /// deadline is the moment it was asked, not a wait for time to pass
+    /// (`scheduler::ends_a_due_sleep`). `false` for every other request,
+    /// including an absolute sleep whose deadline has already passed.
+    /// Appended last and `#[serde(default)]`: `Resources` travels in bincode
+    /// RPCs, which decode by position.
+    #[serde(default)]
+    pub(crate) zero_length_sleep: bool,
 }
 
 impl fmt::Debug for Resources {
@@ -796,6 +805,9 @@ impl fmt::Debug for Resources {
         }
         if self.waits_until_nothing_else_can_run {
             debug.field("waits_until_nothing_else_can_run", &true);
+        }
+        if self.zero_length_sleep {
+            debug.field("zero_length_sleep", &true);
         }
         if self.previous_attempt_made_progress {
             debug.field("previous_attempt_made_progress", &true);
@@ -882,6 +894,7 @@ impl Resources {
             callback_checkpoint: None,
             priority_row: None,
             slice_expired: false,
+            zero_length_sleep: false,
         }
     }
 
@@ -936,6 +949,8 @@ impl Resources {
         self.replay_served_from_log |= other.replay_served_from_log;
         self.polls_guest_state_only |= other.polls_guest_state_only;
         self.waits_until_nothing_else_can_run |= other.waits_until_nothing_else_can_run;
+        // A combined operation is a zero-length sleep only if both parts are.
+        self.zero_length_sleep &= other.zero_length_sleep;
         self.previous_attempt_made_progress |= other.previous_attempt_made_progress;
         self.upgraded_from_attempt = self.upgraded_from_attempt.max(other.upgraded_from_attempt);
         // A merged request waits for the earlier of two deadlines.

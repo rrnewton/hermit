@@ -6116,6 +6116,7 @@ impl<T> ThreadState<T> {
             callback_checkpoint: None,
             priority_row: None,
             slice_expired: false,
+            zero_length_sleep: false,
         }
     }
 

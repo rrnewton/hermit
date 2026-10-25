@@ -5805,6 +5805,7 @@ impl GlobalState {
                     callback_checkpoint: None,
                     priority_row: None,
                     slice_expired: false,
+                    zero_length_sleep: false,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {
