@@ -89,6 +89,7 @@ use crate::procfs_inode;
 use crate::procfs_inode::ProcfsName;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ChaosEpochTransition;
+use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -3037,7 +3038,7 @@ impl GlobalState {
         // accounting so logical teardown cannot linearize between the two.
         let mut tombstoned_deregistration = None;
         {
-            let sched = self.lock_rpc_scheduler(consuming_cleanup).await;
+            let mut sched = self.lock_rpc_scheduler(consuming_cleanup).await;
             if exec_reconnect.is_none()
                 && !is_exec_caller_after_local_mm_swap
                 && !sched.rpc_incarnation_matches(dtid, request_mm)
@@ -3058,6 +3059,13 @@ impl GlobalState {
                     "deregistration must belong to its sender"
                 );
                 assert_eq!(owner.mm, request_mm, "deregistration must retain its MmId");
+                // A vfork child torn down before its registration completed
+                // (it died before its first stop, or its registration was
+                // refused) never registers; the barrier of the vfork that
+                // created it must not wait for it.
+                if let Some(origin) = owner.vfork_origin {
+                    sched.record_unregistered_vfork_child_exit(origin, owner.dettid);
+                }
                 // DBT can reject StartNewThread before parent registration.
                 // Its tombstone still needs the existing final accounting path.
                 if !sched.thread_was_registered(dtid) && !sched.thread_is_logically_killed(dtid) {
@@ -5569,6 +5577,7 @@ impl GlobalState {
             detpid,
             mm,
             thread_start_entered: _,
+            vfork_origin: _,
             timeslice_stats,
             syscall_count,
             chaos_epochs,
@@ -6186,6 +6195,9 @@ pub struct ThreadDeregistration {
     /// Carried by the consuming ThreadState owner, independently of detpid's
     /// delayed initialization and the parent's scheduler registration RPC.
     pub(crate) thread_start_entered: bool,
+    /// The parent's `BlockingVfork` operation if a `CLONE_VFORK` call created
+    /// this thread, carried from the owner's `ThreadState::vfork_origin`.
+    pub(crate) vfork_origin: Option<ExternalOpId>,
     pub(crate) timeslice_stats: TimesliceStats,
     pub(crate) syscall_count: u64,
     pub(crate) chaos_epochs: Vec<ChaosEpochTransition>,
@@ -11864,6 +11876,7 @@ mod tests {
                     detpid: process,
                     mm,
                     thread_start_entered: true,
+                    vfork_origin: None,
                     timeslice_stats: TimesliceStats::default(),
                     syscall_count: 0,
                     chaos_epochs: Vec::new(),
@@ -14366,6 +14379,7 @@ mod tests {
                     detpid: target,
                     mm: MmId::initial(victim),
                     thread_start_entered: true,
+                    vfork_origin: None,
                     timeslice_stats: TimesliceStats {
                         count: 1,
                         sum_ns: 10,
@@ -14490,6 +14504,7 @@ mod tests {
                             detpid: victim,
                             mm: MmId::initial(victim),
                             thread_start_entered: true,
+                            vfork_origin: None,
                             timeslice_stats: TimesliceStats {
                                 count: 1,
                                 sum_ns: 10,
@@ -16177,6 +16192,7 @@ mod tests {
                 reverie::Tid::from_raw(leader.as_raw()),
                 ThreadDeregistration {
                     thread_start_entered: true,
+                    vfork_origin: None,
                     dettid: leader,
                     detpid,
                     mm: MmId::initial(detpid),
@@ -16335,6 +16351,7 @@ mod tests {
                     old_mm,
                     GlobalRequest::DeregisterThread(ThreadDeregistration {
                         thread_start_entered: true,
+                        vfork_origin: None,
                         dettid: leader,
                         detpid,
                         mm: old_mm,
@@ -17743,6 +17760,7 @@ mod tests {
                 reverie::Tid::from_raw(leader.as_raw()),
                 ThreadDeregistration {
                     thread_start_entered: true,
+                    vfork_origin: None,
                     dettid: leader,
                     detpid,
                     mm: MmId::initial(detpid),
@@ -17769,6 +17787,7 @@ mod tests {
                 reverie::Tid::from_raw(leader.as_raw()),
                 ThreadDeregistration {
                     thread_start_entered: true,
+                    vfork_origin: None,
                     dettid: leader,
                     detpid,
                     mm: MmId::initial(detpid).for_exec(detpid),
@@ -18083,6 +18102,7 @@ mod tests {
                     MmId::initial(dettid),
                     GlobalRequest::DeregisterThread(ThreadDeregistration {
                         thread_start_entered: true,
+                        vfork_origin: None,
                         dettid,
                         detpid,
                         mm: MmId::initial(detpid),
@@ -18117,6 +18137,7 @@ mod tests {
                     MmId::initial(dettid),
                     GlobalRequest::DeregisterThread(ThreadDeregistration {
                         thread_start_entered: true,
+                        vfork_origin: None,
                         dettid,
                         detpid,
                         mm: MmId::initial(detpid),

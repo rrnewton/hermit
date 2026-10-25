@@ -8612,7 +8612,6 @@ mod tests {
         assert!(sabre.tracks_process_children);
         assert!(!sabre.runs_exit_robust_list);
         assert!(!sabre.requires_thread_directed_process_signals);
-        assert!(!sabre.defers_vfork_child_registration);
         let ptrace = prepare_backend_config(config, Backend::Ptrace).backend;
         assert!(!ptrace.tool_shares_guest_descriptor_table);
         assert!(!ptrace.rediscovers_descriptors_after_exec);
@@ -8623,7 +8622,6 @@ mod tests {
         assert!(ptrace.tracks_process_children);
         assert!(ptrace.runs_exit_robust_list);
         assert!(!ptrace.requires_thread_directed_process_signals);
-        assert!(!ptrace.defers_vfork_child_registration);
     }
 
     #[test]
@@ -8677,7 +8675,6 @@ mod tests {
         assert!(kvm.backend.tracks_process_children);
         assert!(!kvm.backend.runs_exit_robust_list);
         assert!(!kvm.backend.requires_thread_directed_process_signals);
-        assert!(kvm.backend.defers_vfork_child_registration);
 
         // A controlled run needs both the backend's process-signal control and
         // sequentialized threads; neither alone admits one.
@@ -8759,7 +8756,6 @@ mod tests {
             "requires_thread_directed_process_signals": dbt,
             "supports_parked_write_signal_interruption":
                 matches!(backend, Backend::Ptrace | Backend::E9patch | Backend::Kvm),
-            "defers_vfork_child_registration": kvm,
             "reports_child_exit_publication":
                 matches!(backend, Backend::Ptrace | Backend::E9patch),
             "reports_kernel_child_exit_signals":
@@ -8987,7 +8983,9 @@ mod tests {
     /// registers as a native return would (with the exceptions it names). The
     /// second, `backend_supports_madvise`, is written true for every backend
     /// now that every backend takes every madvise advice and refuses what it
-    /// does not implement itself.
+    /// does not implement itself, and the fifteenth,
+    /// `backend_defers_vfork_child_registration`, false for every backend now
+    /// that Detcore waits for a vfork child however late it registers.
     #[test]
     fn every_backend_encodes_its_current_legacy_projection() {
         for (backend, unsequenced, sequential) in [
@@ -8997,7 +8995,7 @@ mod tests {
             (Backend::InGuestTrap, "010001010000000", "010001010000000"),
             (Backend::Sabre, "011101110000000", "011101110000000"),
             (Backend::Dbt, "011001000100000", "011001000100000"),
-            (Backend::Kvm, "010001010010101", "010001010011101"),
+            (Backend::Kvm, "010001010010100", "010001010011100"),
         ] {
             for (sequentialize_threads, expected) in [(false, unsequenced), (true, sequential)] {
                 let config = prepare_backend_config(
@@ -9033,7 +9031,6 @@ mod tests {
         assert!(!config.backend.tracks_process_children);
         assert!(!config.backend.runs_exit_robust_list);
         assert!(config.backend.requires_thread_directed_process_signals);
-        assert!(!config.backend.defers_vfork_child_registration);
     }
 
     #[test]

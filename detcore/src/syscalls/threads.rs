@@ -2028,9 +2028,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        let blocking_child_op_id = ExternalOpId::new(parent_dettid, ts.stats.syscall_count);
         if is_vfork {
             ts.pending_vfork = Some(PendingVfork {
                 parent_dettid,
+                op: blocking_child_op_id,
                 parent_detpid: ts.detpid.expect("detpid unset"),
                 child_tid_addr: ctid,
                 flags,
@@ -2057,8 +2059,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         super::signal_shadow::before_clone(guest, flags.bits()).await;
 
         trace!("[detcore, dtid {}] parent invoking clone.", parent_dettid);
-        let blocking_child_op_id =
-            ExternalOpId::new(parent_dettid, guest.thread_state().stats.syscall_count);
 
         // A CLONE_VFORK parent cannot resume until the child execs or exits.
         // Relinquish the parent's scheduler turn before entering that
@@ -2088,10 +2088,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut resources = Resources::new(parent_dettid);
             if maybe_res.is_err() {
                 // TODO-HUMAN-REVIEW(PR-1152): Review failed deferred-vfork cancellation.
-                // A deferred-spawn backend cannot infer failure from the absence of a registered
-                // child: a successful child also registers after this continuation. Report the
-                // known injected-syscall outcome explicitly so the scheduler can cancel the
-                // barrier and re-admit this parent before we propagate the original error below.
+                // The scheduler cannot infer failure from the absence of a registered child: a
+                // successful child may also register after this continuation. Report the known
+                // injected-syscall outcome explicitly so the scheduler can cancel the barrier and
+                // re-admit this parent before we propagate the original error below.
                 resources.insert(
                     ResourceID::VforkFailed(blocking_child_op_id),
                     Permission::RW,

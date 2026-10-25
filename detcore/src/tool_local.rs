@@ -51,6 +51,7 @@ use crate::record_or_replay::NoopTool;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::ChaosEpochTransition;
 use crate::resources::Device;
+use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
@@ -3727,6 +3728,9 @@ impl ThreadStats {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingVfork {
     pub parent_dettid: DetTid,
+    /// The parent's `BlockingVfork` operation, which identifies this vfork's
+    /// scheduler barrier.
+    pub op: ExternalOpId,
     pub parent_detpid: DetPid,
     pub child_tid_addr: usize,
     pub flags: CloneFlags,
@@ -4030,6 +4034,13 @@ pub struct ThreadState<T> {
     /// Whether the backend entered the thread-start callback. Construction
     /// alone does not imply that this thread was admitted to the scheduler.
     pub(crate) thread_start_entered: bool,
+
+    /// The parent's `BlockingVfork` operation, if a `CLONE_VFORK` call
+    /// created this thread. A vfork child that is torn down before its
+    /// scheduler registration completes reports it in its deregistration, so
+    /// the barrier of exactly that vfork ends
+    /// ([`crate::scheduler::Scheduler::record_unregistered_vfork_child_exit`]).
+    pub(crate) vfork_origin: Option<ExternalOpId>,
 
     /// Host thread ID supplied by a backend whose scheduler identity is
     /// virtual. `None` keeps the existing direct-ID behavior for other
@@ -5136,6 +5147,7 @@ impl<T> ThreadState<T> {
             dettid: pid,
             detpid: None, // Initialized later.
             thread_start_entered: false,
+            vfork_origin: None, // The root thread.
             physical_tid: None,
             signal_task_identity: None,
             open_file_creator: None,
@@ -8128,6 +8140,7 @@ mod native_exec_cut_tests {
                 5 => {
                     thread.pending_vfork = Some(PendingVfork {
                         parent_dettid: binding.dettid,
+                        op: ExternalOpId::new(binding.dettid, 0),
                         parent_detpid: binding.detpid,
                         child_tid_addr: 0,
                         flags: CloneFlags::CLONE_VFORK,
