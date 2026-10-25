@@ -42551,33 +42551,35 @@ fn timed_wait_pollers_run(
 /// calls getppid every 1000 iterations, the pollers' pending deadline now
 /// caps main's slices at one turn charge, the cost the deadline cap allows
 /// (about 3x, as for a sleeper of one turn charge), where main took 35x.
-/// Chaos runs of both kinds of poller also verify at bitwise parity.
+/// Runs of both kinds of poller also verify at bitwise parity. Under
+/// `--chaos` every expired wait keeps its charge by default
+/// (`--expired-wait-charge`), as before, so these runs are plain; with
+/// `--expired-wait-charge=once` a chaos run of six `condwait` pollers is as
+/// fast.
 #[test]
 fn short_timed_wait_pollers_do_not_inflate_a_cpu_bound_threads_time() {
     let (alone, _) = timed_wait_pollers_run(&[], "condwait", "0", "0");
-    let chaos_1 = &["--chaos", "--seed", "1"][..];
-    let chaos_2 = &["--chaos", "--seed", "2"][..];
-    for (mode, pollers) in [
-        ("sleep", "1"),
-        ("condwait", "1"),
-        ("sleep", "6"),
-        ("condwait", "6"),
+    let chaos_once = &["--chaos", "--seed", "1", "--expired-wait-charge=once"][..];
+    for (mode, pollers, hermit_args) in [
+        ("sleep", "1", &[][..]),
+        ("condwait", "1", &[][..]),
+        ("sleep", "6", &[][..]),
+        ("condwait", "6", &[][..]),
+        ("condwait", "6", chaos_once),
     ] {
-        for hermit_args in [&[][..], chaos_1, chaos_2] {
-            let (work, total) = timed_wait_pollers_run(hermit_args, mode, pollers, "0");
-            assert!(
-                total < 2 * alone,
-                "{mode} x{pollers} {hermit_args:?}: 100 us pollers made {alone} us of work take \
-                 {total} us (work {work} us)"
-            );
-        }
+        let (work, total) = timed_wait_pollers_run(hermit_args, mode, pollers, "0");
+        assert!(
+            total < 2 * alone,
+            "{mode} x{pollers} {hermit_args:?}: 100 us pollers made {alone} us of work take \
+             {total} us (work {work} us)"
+        );
     }
     let (alone, _) = timed_wait_pollers_run(&[], "condwait", "0", "1000");
-    for (mode, hermit_args) in [("condwait", &[][..]), ("sleep", chaos_1)] {
-        let (work, total) = timed_wait_pollers_run(hermit_args, mode, "1", "1000");
+    for mode in ["condwait", "sleep"] {
+        let (work, total) = timed_wait_pollers_run(&[], mode, "1", "1000");
         assert!(
             total < 5 * alone,
-            "{mode} {hermit_args:?}: a 100 us poller made {alone} us of work with syscalls \
+            "{mode}: a 100 us poller made {alone} us of work with syscalls \
              take {total} us (work {work} us)"
         );
     }
@@ -42585,13 +42587,12 @@ fn short_timed_wait_pollers_do_not_inflate_a_cpu_bound_threads_time() {
         let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
         let verdict = directory.path().join("verify.json");
         let verdict_arg = verdict.to_str().unwrap().to_owned();
-        let mut args = chaos_1.to_vec();
-        args.extend_from_slice(&[
+        let args = [
             "--verify",
             "--verify-strict",
             "--verify-json",
             verdict_arg.as_str(),
-        ]);
+        ];
         timed_wait_pollers_run(&args, mode, "6", "0");
         let report: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(&verdict).expect("failed to read the verify verdict"),
@@ -42602,47 +42603,73 @@ fn short_timed_wait_pollers_do_not_inflate_a_cpu_bound_threads_time() {
     }
 }
 
-/// A chaos run of six pollers in 100 us `pthread_cond_timedwait` loops beside
-/// a CPU-bound thread (tests/c/timed_wait_pollers.c), recorded with
-/// `--record-preemptions-to`, replays under `--replay-schedule-from` without
-/// a desync at seeds 1 and 2. Since a run of expired timed waits is charged
-/// one turn, the pollers' deadlines pass as committed time creeps forward
-/// within such a run. A scheduler pass wakes one due timed waiter, and the
-/// recording's passes include chaos change points the replay does not
-/// repeat, so the poller the trace switched to could still be waiting: the
-/// replay ran another thread and desynced twice at both seeds ("expected to
-/// be running thread 5, but running 7"). The switch now wakes its target at
-/// its passed deadline (`wake_due_replay_target`).
+/// A schedule replay that leaves `--expired-wait-charge` unset charges runs
+/// of expired timed waits as its recording did
+/// (`PreemptionRecord::expired_wait_runs_charged_once`), whatever its own
+/// options, and follows the recording without a desync and with its poll
+/// counts (tests/c/timed_wait_pollers.c), replayed without `--chaos`:
+/// - chaos recordings under `--expired-wait-charge=once` of six pollers in
+///   100 us `pthread_cond_timedwait` loops beside a CPU-bound thread, whose
+///   runs of expired waits were charged once. A scheduler pass wakes one due
+///   timed waiter, and the recording's passes include chaos change points
+///   the replay does not repeat, so the poller the trace switched to could
+///   still be waiting: the replay ran another thread and desynced twice at
+///   both seeds ("expected to be running thread 5, but running 7"). The
+///   switch now wakes its target at its passed deadline
+///   (`wake_due_replay_target`).
+/// - chaos recordings under the default rule of six sleepers in 1 ms loops,
+///   whose waits fall due together and were each charged. With the replay's
+///   own default rule (once, without `--chaos`) they leave the schedule.
 #[test]
-fn a_chaos_recording_of_short_timed_waits_replays_its_schedule_without_desync() {
+fn a_schedule_replay_charges_expired_waits_as_its_recording_did() {
     let guest = futex_c_guest(&TIMED_WAIT_POLLERS_GUEST, "timed_wait_pollers")
         .to_str()
         .unwrap()
         .to_owned();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    for seed in ["1", "2"] {
-        let schedule = directory.path().join(format!("schedule-{seed}.json"));
-        let record = format!("--record-preemptions-to={}", schedule.display());
-        let guest_args = [guest.as_str(), "condwait", "6", "100", "2000000"];
-        let mut args = vec!["run", "--strict", "--chaos", "--seed", seed, &record, "--"];
-        args.extend_from_slice(&guest_args);
-        let recorded = hermit(&args);
-        assert!(recorded.status.success(), "{args:?}: {}", stderr(&recorded));
+    for (rule, mode, wait_us) in [("once", "condwait", "100"), ("each", "sleep", "1000")] {
+        for seed in ["1", "2"] {
+            let name = format!("{rule}-{seed}");
+            let schedule = directory.path().join(format!("schedule-{name}.json"));
+            let record = format!("--record-preemptions-to={}", schedule.display());
+            // The `each` leg records under the default rule.
+            let guest_args = [guest.as_str(), mode, "6", wait_us, "2000000"];
+            let mut args = vec!["run", "--strict", "--chaos", "--seed", seed, &record];
+            if rule == "once" {
+                args.push("--expired-wait-charge=once");
+            }
+            args.push("--");
+            args.extend_from_slice(&guest_args);
+            let recorded = hermit(&args);
+            assert!(recorded.status.success(), "{args:?}: {}", stderr(&recorded));
 
-        let replay = format!("--replay-schedule-from={}", schedule.display());
-        let mut args = vec!["--log=info", "run", "--strict", &replay, "--"];
-        args.extend_from_slice(&guest_args);
-        let replayed = hermit(&args);
-        let log = stderr(&replayed);
-        assert!(replayed.status.success(), "{args:?}: {log}");
-        assert!(
-            log.contains("(0 desynced)") && !log.contains("in a desynced state"),
-            "seed {seed}: the replay left its recorded schedule:\n{}",
-            log.lines()
-                .filter(|line| line.contains("desync") || line.contains("expected to be running"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+            let replay = format!("--replay-schedule-from={}", schedule.display());
+            let mut args = vec!["--log=info", "run", "--strict", &replay, "--"];
+            args.extend_from_slice(&guest_args);
+            let replayed = hermit(&args);
+            let log = stderr(&replayed);
+            assert!(replayed.status.success(), "{args:?}: {log}");
+            assert!(
+                log.contains("(0 desynced)") && !log.contains("in a desynced state"),
+                "{name}: the replay left its recorded schedule:\n{}",
+                log.lines()
+                    .filter(
+                        |line| line.contains("desync") || line.contains("expected to be running")
+                    )
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            // The poll count; the virtual times can differ by the constant
+            // 500 us of a schedule replay's first switch turn.
+            let polls = |output: &Output| {
+                stdout(output)
+                    .split_whitespace()
+                    .find(|field| field.starts_with("polls="))
+                    .map(str::to_owned)
+            };
+            assert!(polls(&recorded).is_some(), "{name}: {}", stdout(&recorded));
+            assert_eq!(polls(&replayed), polls(&recorded), "{name}");
+        }
     }
 }
 
