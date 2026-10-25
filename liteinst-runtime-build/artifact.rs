@@ -727,6 +727,41 @@ pub(crate) mod native {
             .run(program, &args, cwd)
             .unwrap_or_else(|e| panic!("native producer command failed: {e}"))
     }
+    /// The pinned Nix compiler's ld wrapper reads this target-suffixed
+    /// documented switch before adding RUNPATH for its -L directories. Keep
+    /// it local to this bounded child; other compilers ignore the variable.
+    fn retain_native_link(runner: &mut qualifier::Runner, cc: &str, args: Vec<String>, cwd: &Path) {
+        let mut scoped = vec![
+            "NIX_DONT_SET_RPATH_x86_64_unknown_linux_gnu=1".to_owned(),
+            cc.to_owned(),
+        ];
+        scoped.extend(args);
+        retain(runner, "env", scoped, cwd);
+    }
+
+    // Refuse the same five dynamic tags as native_exec_artifacts before
+    // publishing any newly compiled runner/runtime bytes. Never edit an ELF
+    // to remove a forbidden tag after compilation.
+    fn require_no_loader_overrides(path: &Path) {
+        use goblin::elf::dynamic;
+        let bytes = fs::read(path).expect("read produced native role");
+        let elf = Elf::parse(&bytes).expect("parse produced native role");
+        if let Some(table) = &elf.dynamic {
+            assert!(
+                table.dyns.iter().all(|d| !matches!(
+                    d.d_tag,
+                    dynamic::DT_RPATH
+                        | dynamic::DT_RUNPATH
+                        | dynamic::DT_TEXTREL
+                        | dynamic::DT_AUDIT
+                        | dynamic::DT_DEPAUDIT
+                )),
+                "produced native role requests unsupported loader search or text writes: {}",
+                path.display()
+            );
+        }
+    }
+
     fn gate_digest(path: &Path) -> [u8; 32] {
         let bytes = fs::read(path).expect("read current native bootstrap");
         let elf = Elf::parse(&bytes).expect("parse current native bootstrap");
@@ -1057,10 +1092,13 @@ pub(crate) mod native {
             "-Wl,--no-as-needed".into(),
             "-ldetcore_liteinst".into(),
             "-Wl,--as-needed".into(),
+            "-lm".into(),
             "-o".into(),
             text(&runner_file),
         ]);
-        retain(&mut runner, &cc, args, &native_sources);
+        retain_native_link(&mut runner, &cc, args, &native_sources);
+        require_no_loader_overrides(&runner_file);
+        require_no_loader_overrides(&runtime);
         for source in &source_files {
             source.verify().unwrap();
         }
