@@ -13,6 +13,38 @@ pub type Error = anyhow::Error;
 
 pub use anyhow::Context;
 
+/// The first loss already recorded before a strict trap postcondition failed.
+/// This same-image metadata keeps the original refusal and its display intact.
+#[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct VerificationDeterminismLoss {
+    reason: String,
+    message: String,
+}
+
+#[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+impl VerificationDeterminismLoss {
+    pub fn attach(error: Error, reason: String) -> Error {
+        let message = error.to_string();
+        error.context(Self { reason, message })
+    }
+
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
+#[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+impl std::fmt::Display for VerificationDeterminismLoss {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+#[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+impl std::error::Error for VerificationDeterminismLoss {}
+
 /// A serializable error. This is useful for sending an error to the parent
 /// process. This works by converting an error into a string via its `Display`
 /// implementation. Although we lose type information in the process of
@@ -102,6 +134,9 @@ pub struct SerializableError {
     /// An unresolved owner is separate from the primary failure class. This
     /// same-image container field is not a cross-version wire compatibility promise.
     cleanup_stage: Option<crate::HermitCleanupStage>,
+    /// A prior loss is separate from this error's fail-closed policy class.
+    #[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+    verification_loss: Option<String>,
 }
 
 impl SerializableError {
@@ -190,6 +225,22 @@ fn finalization_primary(error: &Error) -> Option<&Error> {
         })
 }
 
+#[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+fn verification_loss_from_primary(error: &Error) -> Option<String> {
+    if let Some(primary) = finalization_primary(error) {
+        return verification_loss_from_primary(primary);
+    }
+    if let Some(loss) = error.downcast_ref::<VerificationDeterminismLoss>() {
+        return Some(loss.reason.clone());
+    }
+    error
+        .chain()
+        .find_map(|cause| match cause.downcast_ref::<reverie::Error>() {
+            Some(reverie::Error::Tool(inner)) => verification_loss_from_primary(inner),
+            _ => None,
+        })
+}
+
 fn classify_preserving_cleanup(error: &Error) -> (FailureKind, Option<crate::HermitCleanupStage>) {
     if let Some(primary) = finalization_primary(error) {
         classify_preserving_cleanup(primary)
@@ -242,17 +293,23 @@ impl From<Error> for SerializableError {
         // would mean matching on English, which is the thing `kind` exists to
         // avoid.
         let (kind, cleanup_stage) = classify_preserving_cleanup(&err);
+        #[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+        let verification_loss = verification_loss_from_primary(&err);
         Self {
             error,
             context,
             kind,
             cleanup_stage,
+            #[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+            verification_loss,
         }
     }
 }
 
 impl From<SerializableError> for Error {
     fn from(mut err: SerializableError) -> Self {
+        #[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+        let verification_loss = err.verification_loss.take();
         if let Some(root_cause) = err.context.pop() {
             let mut error = Self::msg(root_cause);
 
@@ -260,8 +317,22 @@ impl From<SerializableError> for Error {
                 error = error.context(context);
             }
 
+            #[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+            if let Some(reason) = verification_loss {
+                return error.context(VerificationDeterminismLoss {
+                    reason,
+                    message: err.error,
+                });
+            }
             error.context(err.error)
         } else {
+            #[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+            if let Some(reason) = verification_loss {
+                return Self::new(VerificationDeterminismLoss {
+                    reason,
+                    message: err.error,
+                });
+            }
             Self::msg(err.error)
         }
     }
@@ -395,6 +466,114 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+    fn prior_verification_loss_survives_the_same_image_error_boundary() {
+        let reason = "process 7 exited without deregistering";
+        for finalized in [false, true] {
+            for tool_wrapper in [false, true] {
+                let error = VerificationDeterminismLoss::attach(
+                    Error::new(crate::LiteinstInGuestRefusal::for_backend(
+                        crate::Backend::InGuestTrap,
+                        "no guest process reported LiteInst statistics",
+                    )),
+                    reason.to_owned(),
+                );
+                let error = if finalized {
+                    detcore::combine_finalization::<()>(
+                        Err(error),
+                        Err(Error::msg("secondary recording cleanup failed")),
+                    )
+                    .unwrap_err()
+                } else {
+                    error
+                };
+                let error = if tool_wrapper {
+                    Error::new(reverie::Error::Tool(error))
+                } else {
+                    error
+                };
+                let messages = error.chain().map(ToString::to_string).collect::<Vec<_>>();
+                let serialized = SerializableError::from(error);
+                // The existing classifier explicitly unwraps a finalization
+                // primary. A direct Tool wrapper otherwise hides this type.
+                let kind = if tool_wrapper && !finalized {
+                    FailureKind::Error
+                } else {
+                    FailureKind::PolicyRefusal
+                };
+                assert_eq!(serialized.kind(), kind);
+                assert_eq!(serialized.verification_loss.as_deref(), Some(reason));
+                let bytes =
+                    bincode::serde::encode_to_vec(&serialized, bincode::config::legacy()).unwrap();
+                let (decoded, used): (SerializableError, usize) =
+                    bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+                assert_eq!(used, bytes.len());
+                assert_eq!(decoded, serialized);
+                let restored = Error::from(decoded);
+                assert_eq!(
+                    restored
+                        .downcast_ref::<VerificationDeterminismLoss>()
+                        .unwrap()
+                        .reason(),
+                    reason,
+                );
+                assert_eq!(
+                    restored
+                        .chain()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>(),
+                    messages,
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+    fn a_refusal_without_prior_loss_does_not_acquire_verification_metadata() {
+        let ordinary_refusal = Error::new(crate::LiteinstInGuestRefusal::for_backend(
+            crate::Backend::InGuestTrap,
+            "no guest process reported LiteInst statistics; determinism loss recorded in prose",
+        ));
+        let secondary_loss = detcore::combine_finalization::<()>(
+            Err(Error::msg("ordinary primary failure")),
+            Err(VerificationDeterminismLoss::attach(
+                Error::msg("secondary failure"),
+                "a loss only in secondary cleanup".to_owned(),
+            )),
+        )
+        .unwrap_err();
+        for (error, kind) in [
+            (ordinary_refusal, FailureKind::PolicyRefusal),
+            (secondary_loss, FailureKind::Error),
+        ] {
+            let messages = error.chain().map(ToString::to_string).collect::<Vec<_>>();
+            let serialized = SerializableError::from(error);
+            assert_eq!(serialized.kind(), kind);
+            assert_eq!(serialized.verification_loss, None);
+            let bytes =
+                bincode::serde::encode_to_vec(&serialized, bincode::config::legacy()).unwrap();
+            let (decoded, used): (SerializableError, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+            assert_eq!(used, bytes.len());
+            assert_eq!(decoded, serialized);
+            let restored = Error::from(decoded);
+            assert!(
+                restored
+                    .downcast_ref::<VerificationDeterminismLoss>()
+                    .is_none()
+            );
+            assert_eq!(
+                restored
+                    .chain()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                messages,
+            );
+        }
+    }
+
+    #[test]
     fn into_serializable_error() {
         let error = Error::msg("root cause")
             .context("a")
@@ -408,6 +587,8 @@ mod tests {
                 context: vec!["b".into(), "a".into(), "root cause".into(),],
                 kind: FailureKind::Error,
                 cleanup_stage: None,
+                #[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+                verification_loss: None,
             }
         );
     }
@@ -419,6 +600,8 @@ mod tests {
             context: vec!["b".into(), "a".into(), "root cause".into()],
             kind: FailureKind::Error,
             cleanup_stage: None,
+            #[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+            verification_loss: None,
         });
 
         assert_eq!(

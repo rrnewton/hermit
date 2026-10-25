@@ -438,6 +438,9 @@ pub use error::Context;
 pub use error::Error;
 pub use error::FailureKind;
 pub use error::SerializableError;
+#[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+#[doc(hidden)]
+pub use error::VerificationDeterminismLoss;
 use goblin::elf::Elf;
 use goblin::elf::header;
 use goblin::elf::section_header;
@@ -1921,10 +1924,18 @@ fn in_guest_trap_patching_evidence(
 fn refuse_in_guest_trap_patching(backend: Backend, evidence: Option<String>) -> Result<(), Error> {
     match evidence {
         Some(reason) => {
+            // This postcondition also sets the latch. Preserve only a loss
+            // that preceded it, so a missing measurement alone stays a refusal.
+            #[cfg(not(feature = "liteinst"))]
+            let prior_loss = detcore::detlog::determinism_loss();
             detcore::detlog::record_determinism_loss(&reason);
-            Err(Error::new(LiteinstInGuestRefusal::for_backend(
-                backend, reason,
-            )))
+            let refusal = Error::new(LiteinstInGuestRefusal::for_backend(backend, reason));
+            #[cfg(not(feature = "liteinst"))]
+            let refusal = match prior_loss {
+                Some(reason) => VerificationDeterminismLoss::attach(refusal, reason),
+                None => refusal,
+            };
+            Err(refusal)
         }
         None => Ok(()),
     }

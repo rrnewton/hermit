@@ -111,6 +111,48 @@
         configureFlags = previous.configureFlags
           ++ [ "--enable-install-program=arch,kill,uptime" ];
       });
+      # Separate source-built GNU nice/echo inputs for strict native controls.
+      # Existing /bin providers remain the original guestTools outputs. The
+      # wrapper switch prevents RUNPATH during linking; the final check refuses
+      # any forbidden dynamic tag. No cached ELF is rewritten to remove one.
+      nativeExecCoreutils = (pkgs.coreutils-full.override {
+        minimal = true;
+        singleBinary = false;
+        gmpSupport = false;
+        aclSupport = false;
+        attrSupport = false;
+        withOpenssl = false;
+      }).overrideAttrs (previous: {
+        pname = "hermit-native-exec-coreutils";
+        env = (previous.env or {}) // {
+          NIX_DONT_SET_RPATH_x86_64_unknown_linux_gnu = "1";
+        };
+        postFixup = (previous.postFixup or "") + ''
+          for program in nice echo; do
+            dynamic="$TMPDIR/hermit-native-$program.dynamic"
+            if ! ${pkgs.binutils}/bin/readelf --wide --dynamic "$out/bin/$program" > "$dynamic"; then
+              echo "native fixture is not a readable ELF: $program" >&2
+              exit 1
+            fi
+            if ${pkgs.gnugrep}/bin/grep -Eq '\((RPATH|RUNPATH|TEXTREL|AUDIT|DEPAUDIT)\)' "$dynamic"; then
+              echo "native fixture has forbidden dynamic tags: $program" >&2
+              exit 1
+            else
+              status=$?
+              if [ "$status" -ne 1 ]; then exit "$status"; fi
+            fi
+          done
+        '';
+      });
+      nativeExecTestInputs = pkgs.writeTextDir
+        "libexec/hermit-native-exec-fixtures/inputs.json"
+        (builtins.toJSON {
+          version = 1;
+          nice = "${nativeExecCoreutils}/bin/nice";
+          echo = "${nativeExecCoreutils}/bin/echo";
+          library_directories = [ "${pkgs.glibc}/lib" ];
+        });
+
       requiredGuestPaths = pkgs.lib.filter (path: path != "")
         (pkgs.lib.splitString "\n" (builtins.readFile ./guest-paths.txt));
 
@@ -192,6 +234,7 @@
           # cannot be checked for reproducibility.
           created = "1970-01-01T00:00:01Z";
           contents = guestTools ++ buildTools ++ testTools ++ [
+            nativeExecTestInputs
             pkgs.dockerTools.binSh
             pkgs.dockerTools.usrBinEnv
             pkgs.dockerTools.caCertificates
@@ -228,6 +271,7 @@
               "PATH=/bin:/usr/bin"
               "HERMIT_RUST_SCRIPT_VERSION=${rustScriptVersion}"
               "HERMIT_CARGO_NEXTEST_VERSION=${cargoNextestVersion}"
+              "HERMIT_NATIVE_EXEC_TEST_INPUTS=${nativeExecTestInputs}/libexec/hermit-native-exec-fixtures/inputs.json"
               "PKG_CONFIG_PATH=${pkgs.lib.makeSearchPathOutput "dev" "lib/pkgconfig" nativeLibs}"
               "CPATH=${pkgs.lib.makeSearchPathOutput "dev" "include" nativeLibs}"
               "LIBRARY_PATH=${pkgs.lib.makeLibraryPath nativeLibs}"

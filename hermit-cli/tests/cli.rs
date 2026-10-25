@@ -16883,6 +16883,7 @@ fn max_log_bytes_exits_promptly_with_a_vmm_guest_and_stderr_a_full_pipe() {
 /// validation node stages e9patch, so the test names `/bin/false` for each:
 /// had hermit run either, the run would fail rather than reach the cap.
 #[test]
+#[cfg(feature = "e9patch")]
 fn max_log_bytes_exits_promptly_with_e9patch_on_a_script_and_stderr_a_full_pipe() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let script = noisy_guest_script(directory.path(), "noisy.sh");
@@ -16900,6 +16901,62 @@ fn max_log_bytes_exits_promptly_with_e9patch_on_a_script_and_stderr_a_full_pipe(
             .env(hermit::e9patch::E9TOOL_ENV, "/bin/false")
             .env(hermit::e9patch::E9PATCH_BACKEND_ENV, "/bin/false");
     });
+}
+
+/// An absent optional backend is a named availability failure, not a log-cap
+/// positive. Keep the enabled e9patch script/cap test above unchanged.
+#[test]
+#[cfg(not(feature = "e9patch"))]
+fn e9patch_disabled_build_refuses_before_running_a_guest() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let marker = directory.path().join("guest-ran");
+    assert!(
+        !marker.try_exists().expect("fresh guest marker path"),
+        "guest marker already exists: {}",
+        marker.display()
+    );
+    let bind = format!("{}:/tmp/e9patch-disabled-build", directory.path().display());
+    let output = hermit_test::hermit_output(
+        "hermit run",
+        hermit_command(&[
+            "--backend=e9patch",
+            "run",
+            "--bind",
+            &bind,
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf ran > \"$1\"",
+            "e9patch-disabled-build",
+            "/tmp/e9patch-disabled-build/guest-ran",
+        ])
+        .current_dir(directory.path())
+        .stdin(Stdio::null()),
+    );
+    assert!(
+        !marker
+            .try_exists()
+            .expect("guest marker visibility after refusal"),
+        "the e9patch guest ran before the missing-feature refusal and wrote {}",
+        marker.display()
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_INTERNAL_FAILURE_EXIT),
+        "{output:?}"
+    );
+    let error = stderr(&output);
+    assert!(
+        error.contains("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=e9patch"),
+        "{error}"
+    );
+    assert!(
+        error.contains("the `e9patch` feature is not enabled in this build"),
+        "{error}"
+    );
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(!error.contains("HERMIT_LOG_CAP"), "{error}");
 }
 
 /// A `--happens-before` spec with one anchor at a function the guest does not
@@ -31455,21 +31512,25 @@ fn run_kvm_timerfd_virtual_masked_waits_is_refused_by_name() {
 // For the same reason epollet reports its three timers in another order
 // (0 1 2, as ptrace without a timer does, against 1 2 0 with one).
 #[test]
+#[cfg(feature = "dbt")]
 fn run_dbt_timerfd_virtual_catchup() {
     timerfd_virtual_time::verify("dbt", "catchup", timerfd_virtual_time::CATCHUP);
 }
 
 #[test]
+#[cfg(feature = "dbt")]
 fn run_dbt_timerfd_virtual_nonblock() {
     timerfd_virtual_time::verify("dbt", "nonblock", timerfd_virtual_time::NONBLOCK);
 }
 
 #[test]
+#[cfg(feature = "dbt")]
 fn run_dbt_timerfd_virtual_zero_timeout() {
     timerfd_virtual_time::verify("dbt", "zero-timeout", timerfd_virtual_time::ZERO_TIMEOUT);
 }
 
 #[test]
+#[cfg(feature = "dbt")]
 fn run_dbt_timerfd_virtual_masked_ppoll_expired() {
     timerfd_virtual_time::verify(
         "dbt",
@@ -31481,16 +31542,19 @@ fn run_dbt_timerfd_virtual_masked_ppoll_expired() {
 /// The forked child and its parent share one timer: the model was promoted
 /// before the native fork.
 #[test]
+#[cfg(feature = "dbt")]
 fn run_dbt_timerfd_virtual_dup_fork() {
     timerfd_virtual_time::verify("dbt", "dup-fork", timerfd_virtual_time::DUP_FORK);
 }
 
 #[test]
+#[cfg(feature = "dbt")]
 fn run_dbt_timerfd_virtual_readv() {
     timerfd_virtual_time::verify("dbt", "readv", timerfd_virtual_time::READV);
 }
 
 #[test]
+#[cfg(feature = "dbt")]
 fn run_dbt_timerfd_virtual_sigchld_storm() {
     timerfd_virtual_time::verify("dbt", "sigchld-storm", timerfd_virtual_time::SIGCHLD_STORM);
 }
@@ -31498,6 +31562,7 @@ fn run_dbt_timerfd_virtual_sigchld_storm() {
 /// As on KVM, a masked wait that may wait would wait in the host: refused by
 /// name.
 #[test]
+#[cfg(feature = "dbt")]
 fn run_dbt_timerfd_virtual_masked_waits_is_refused_by_name() {
     timerfd_virtual_time::refused(
         "dbt",
@@ -31517,16 +31582,19 @@ fn run_dbt_timerfd_virtual_masked_waits_is_refused_by_name() {
 // configuration's order. exec is refused by LiteInst itself (the in-guest
 // backend does not forward execve yet).
 #[test]
+#[cfg(feature = "liteinst")]
 fn run_liteinst_timerfd_virtual_catchup() {
     timerfd_virtual_time::verify("liteinst", "catchup", timerfd_virtual_time::CATCHUP);
 }
 
 #[test]
+#[cfg(feature = "liteinst")]
 fn run_liteinst_timerfd_virtual_nonblock() {
     timerfd_virtual_time::verify("liteinst", "nonblock", timerfd_virtual_time::NONBLOCK);
 }
 
 #[test]
+#[cfg(feature = "liteinst")]
 fn run_liteinst_timerfd_virtual_zero_timeout() {
     timerfd_virtual_time::verify(
         "liteinst",
@@ -31536,6 +31604,7 @@ fn run_liteinst_timerfd_virtual_zero_timeout() {
 }
 
 #[test]
+#[cfg(feature = "liteinst")]
 fn run_liteinst_timerfd_virtual_masked_ppoll_expired() {
     timerfd_virtual_time::verify(
         "liteinst",
@@ -31547,16 +31616,19 @@ fn run_liteinst_timerfd_virtual_masked_ppoll_expired() {
 /// One timer shared by a parent and its forked child: both reach the one
 /// model the parent promoted before the fork.
 #[test]
+#[cfg(feature = "liteinst")]
 fn run_liteinst_timerfd_virtual_dup_fork() {
     timerfd_virtual_time::verify("liteinst", "dup-fork", timerfd_virtual_time::DUP_FORK);
 }
 
 #[test]
+#[cfg(feature = "liteinst")]
 fn run_liteinst_timerfd_virtual_readv() {
     timerfd_virtual_time::verify("liteinst", "readv", timerfd_virtual_time::READV);
 }
 
 #[test]
+#[cfg(feature = "liteinst")]
 fn run_liteinst_timerfd_virtual_sigchld_storm() {
     timerfd_virtual_time::verify(
         "liteinst",
@@ -31568,6 +31640,7 @@ fn run_liteinst_timerfd_virtual_sigchld_storm() {
 /// As on KVM and DBT, a masked wait that may wait would wait in the host:
 /// refused by name.
 #[test]
+#[cfg(feature = "liteinst")]
 fn run_liteinst_timerfd_virtual_masked_waits_is_refused_by_name() {
     timerfd_virtual_time::refused(
         "liteinst",
@@ -31579,8 +31652,87 @@ fn run_liteinst_timerfd_virtual_masked_waits_is_refused_by_name() {
 
 /// A timerfd passed over `SCM_RIGHTS` is refused by name, as on ptrace.
 #[test]
+#[cfg(feature = "liteinst")]
 fn run_liteinst_timerfd_virtual_scm_rights_is_refused_by_name() {
     timerfd_virtual_time::refused("liteinst", "scm-rights", None, "a message passes timerfd");
+}
+
+// Exercise each shared timerfd mode on the trap runtime in both builds.
+// Backend-specific positives above keep their original identities and oracles.
+#[test]
+#[cfg(feature = "in-guest-trap")]
+fn run_in_guest_trap_timerfd_virtual_catchup() {
+    timerfd_virtual_time::verify("in-guest-trap", "catchup", timerfd_virtual_time::CATCHUP);
+}
+
+#[test]
+#[cfg(feature = "in-guest-trap")]
+fn run_in_guest_trap_timerfd_virtual_nonblock() {
+    timerfd_virtual_time::verify("in-guest-trap", "nonblock", timerfd_virtual_time::NONBLOCK);
+}
+
+#[test]
+#[cfg(feature = "in-guest-trap")]
+fn run_in_guest_trap_timerfd_virtual_zero_timeout() {
+    timerfd_virtual_time::verify(
+        "in-guest-trap",
+        "zero-timeout",
+        timerfd_virtual_time::ZERO_TIMEOUT,
+    );
+}
+
+#[test]
+#[cfg(feature = "in-guest-trap")]
+fn run_in_guest_trap_timerfd_virtual_masked_ppoll_expired() {
+    timerfd_virtual_time::verify(
+        "in-guest-trap",
+        "masked-ppoll-expired",
+        timerfd_virtual_time::MASKED_PPOLL_EXPIRED,
+    );
+}
+
+#[test]
+#[cfg(feature = "in-guest-trap")]
+fn run_in_guest_trap_timerfd_virtual_dup_fork() {
+    timerfd_virtual_time::verify("in-guest-trap", "dup-fork", timerfd_virtual_time::DUP_FORK);
+}
+
+#[test]
+#[cfg(feature = "in-guest-trap")]
+fn run_in_guest_trap_timerfd_virtual_readv() {
+    timerfd_virtual_time::verify("in-guest-trap", "readv", timerfd_virtual_time::READV);
+}
+
+#[test]
+#[cfg(feature = "in-guest-trap")]
+fn run_in_guest_trap_timerfd_virtual_sigchld_storm() {
+    timerfd_virtual_time::verify(
+        "in-guest-trap",
+        "sigchld-storm",
+        timerfd_virtual_time::SIGCHLD_STORM,
+    );
+}
+
+#[test]
+#[cfg(feature = "in-guest-trap")]
+fn run_in_guest_trap_timerfd_virtual_masked_waits_is_refused_by_name() {
+    timerfd_virtual_time::refused(
+        "in-guest-trap",
+        "masked-waits",
+        None,
+        "epoll_pwait with a signal mask would wait in the host",
+    );
+}
+
+#[test]
+#[cfg(feature = "in-guest-trap")]
+fn run_in_guest_trap_timerfd_virtual_scm_rights_is_refused_by_name() {
+    timerfd_virtual_time::refused(
+        "in-guest-trap",
+        "scm-rights",
+        None,
+        "a message passes timerfd",
+    );
 }
 
 /// A timerfd the host never makes readable ends the run on a named refusal,

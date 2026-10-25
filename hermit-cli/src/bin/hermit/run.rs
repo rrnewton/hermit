@@ -861,6 +861,28 @@ impl std::fmt::Display for DeterminismLossRecorded {
 
 impl std::error::Error for DeterminismLossRecorded {}
 
+/// Give a prior loss its usual verification run name without discarding the
+/// strict refusal, policy class, or cleanup context that crossed the boundary.
+#[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+fn name_recorded_verification_loss(error: Error, run: VerificationRun, single_run: bool) -> Error {
+    let Some(loss) = error.downcast_ref::<hermit::VerificationDeterminismLoss>() else {
+        return error;
+    };
+    let reason = loss.reason().to_owned();
+    let run = if single_run {
+        "run"
+    } else {
+        match run {
+            VerificationRun::Run1 => "run 1",
+            VerificationRun::Run2 => "run 2",
+        }
+    };
+    error.context(DeterminismLossRecorded {
+        run: run.to_owned(),
+        reason,
+    })
+}
+
 impl RunLatches {
     /// Refuses to compare `run` when either latch is set.
     pub(super) fn refuse_comparison(&self, run: &str) -> Result<(), Error> {
@@ -9985,23 +10007,29 @@ impl RunOpts {
                 ""
             },
         );
-        self.launch_in_container(
-            (Some(log_file), network_trace, forwarded_detlogs),
-            &resources,
-            None,
-            move |(log, _, forwarded), identity, native| {
-                options.run_verify_in_container(log, forwarded, &global, identity, native)
-            },
-        )
-        .map(
-            |((output, skid_overshoots, latches), _guards)| VerificationRunOutput {
-                output,
-                skid_overshoots,
-                latches,
-                #[cfg(feature = "dbt")]
-                dbt: None,
-            },
-        )
+        let result = self
+            .launch_in_container(
+                (Some(log_file), network_trace, forwarded_detlogs),
+                &resources,
+                None,
+                move |(log, _, forwarded), identity, native| {
+                    options.run_verify_in_container(log, forwarded, &global, identity, native)
+                },
+            )
+            .map(
+                |((output, skid_overshoots, latches), _guards)| VerificationRunOutput {
+                    output,
+                    skid_overshoots,
+                    latches,
+                    #[cfg(feature = "dbt")]
+                    dbt: None,
+                },
+            );
+        #[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+        let result = result.map_err(|error| {
+            name_recorded_verification_loss(error, _run, self.verify_run.is_some())
+        });
+        result
     }
 
     fn merge_from_env_settings(&self, command: &mut Command) -> anyhow::Result<()> {
@@ -11989,6 +12017,81 @@ mod tests {
         assert!(
             refusal.contains("log sink failure: injected write failure"),
             "{refusal}"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+    fn a_prior_loss_on_a_failed_verification_keeps_its_run_name_and_refusal() {
+        for (run, single_run, label) in [
+            (VerificationRun::Run1, false, "run 1"),
+            (VerificationRun::Run2, false, "run 2"),
+            (VerificationRun::Run1, true, "run"),
+        ] {
+            let reason = "process 7 exited without deregistering";
+            let error = hermit::VerificationDeterminismLoss::attach(
+                Error::new(hermit::LiteinstInGuestRefusal::for_backend(
+                    Backend::InGuestTrap,
+                    "no guest process reported LiteInst statistics",
+                )),
+                reason.to_owned(),
+            );
+            let serialized = hermit::SerializableError::from(error);
+            assert_eq!(serialized.kind(), hermit::FailureKind::PolicyRefusal);
+            let bytes =
+                bincode::serde::encode_to_vec(&serialized, bincode::config::legacy()).unwrap();
+            let (decoded, used): (hermit::SerializableError, usize) =
+                bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+            assert_eq!(used, bytes.len());
+            let error = super::super::container::classify_container_result::<()>(Ok(Err(decoded)))
+                .unwrap_err();
+            let error = name_recorded_verification_loss(error, run, single_run);
+            let loss = error.downcast_ref::<DeterminismLossRecorded>().unwrap();
+            assert_eq!(loss.run, label);
+            assert_eq!(loss.reason, reason);
+            assert_eq!(
+                error.to_string(),
+                format!("{label}: determinism loss recorded: {reason}"),
+            );
+            assert!(
+                error
+                    .downcast_ref::<super::super::container::PolicyRefusal>()
+                    .is_some()
+            );
+            assert!(format!("{error:#}").contains("no guest process reported LiteInst statistics"));
+            assert_eq!(
+                super::super::verify::run_failure_of(&error),
+                Some(hermit::canonical_verdict::RunFailure::DeterminismLoss),
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+    fn a_failed_verification_without_prior_loss_stays_a_policy_refusal() {
+        let original = Error::new(hermit::LiteinstInGuestRefusal::for_backend(
+            Backend::InGuestTrap,
+            "no guest process reported LiteInst statistics",
+        ));
+        let serialized = hermit::SerializableError::from(original);
+        let bytes = bincode::serde::encode_to_vec(&serialized, bincode::config::legacy()).unwrap();
+        let (decoded, used): (hermit::SerializableError, usize) =
+            bincode::serde::decode_from_slice(&bytes, bincode::config::legacy()).unwrap();
+        assert_eq!(used, bytes.len());
+        let error =
+            super::super::container::classify_container_result::<()>(Ok(Err(decoded))).unwrap_err();
+        let message = format!("{error:#}");
+        let error = name_recorded_verification_loss(error, VerificationRun::Run1, false);
+        assert!(error.downcast_ref::<DeterminismLossRecorded>().is_none());
+        assert!(
+            error
+                .downcast_ref::<super::super::container::PolicyRefusal>()
+                .is_some()
+        );
+        assert_eq!(format!("{error:#}"), message);
+        assert_eq!(
+            super::super::verify::run_failure_of(&error),
+            Some(hermit::canonical_verdict::RunFailure::PolicyRefusal),
         );
     }
 

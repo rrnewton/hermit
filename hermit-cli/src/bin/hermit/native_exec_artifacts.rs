@@ -1072,16 +1072,12 @@ mod tests {
 
         // Capture genuine ELF and its complete real loader dependency graph.
         // This qualifies catalog-name mechanics, not a native launch.
-        let program = std::fs::read("/bin/echo").unwrap();
+        let fixture = super::super::native_exec_run::native_test_inputs().unwrap();
+        let program = std::fs::read(&fixture.echo).unwrap();
         let elf = Elf::parse(&program).unwrap();
         let interpreter = elf.interpreter.unwrap().to_owned();
-        let directories = [
-            Path::new(&interpreter).parent().unwrap().to_path_buf(),
-            PathBuf::from("/lib64"),
-            PathBuf::from("/usr/lib64"),
-            PathBuf::from("/lib/x86_64-linux-gnu"),
-            PathBuf::from("/usr/lib/x86_64-linux-gnu"),
-        ];
+        let mut directories = vec![Path::new(&interpreter).parent().unwrap().to_path_buf()];
+        directories.extend(fixture.library_directories);
         let locate = |name: &str| {
             directories
                 .iter()

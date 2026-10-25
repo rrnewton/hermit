@@ -560,7 +560,6 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.cli",
     "test.liteinst_allocator",
     "test.liteinst_stacks",
-    "test.in_guest_trap_no_liteinst",
     "test.isolated_dbt_workdir",
     "test.inherited_terminal_read",
     "test.isolation_matrix_ptrace_runtime",

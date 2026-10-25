@@ -522,13 +522,35 @@ const LITEINST_RUNTIME_REFUSAL_EXIT: i32 = 127;
 
 #[test]
 fn liteinst_runtime_refuses_another_trees_fingerprint_before_connecting() {
-    let runtime = hermit_binary()
-        .parent()
-        .expect("the Cargo-built Hermit has a profile directory")
-        .join("libdetcore_liteinst.so");
+    let runtime = if std::env::var_os(hermit::LITEINST_TOOL_RUNTIME_ENV).is_some()
+        || std::env::var_os(hermit_resources::INSTALL_DIR_ENV).is_some()
+    {
+        // Explicit selections are authoritative, including invalid or incomplete
+        // ones: the public resolver must reject them without a dev fallback.
+        hermit::liteinst_tool_runtime_library_path()
+            .expect("the explicitly selected in-guest runtime must be finalized and valid")
+    } else {
+        // This process is the integration-test binary in profile/deps, not
+        // Hermit. Resolve implicit paths relative to the actual Hermit binary.
+        let profile = hermit_binary()
+            .parent()
+            .expect("the Cargo-built Hermit has a profile directory");
+        let colocated_resources = profile.join("rsrcs");
+        let packaged_resources = profile
+            .parent()
+            .expect("the Cargo profile has a target directory")
+            .join("install_pkg/rsrcs");
+        if colocated_resources.is_dir() {
+            colocated_resources.join("libdetcore_liteinst.so")
+        } else if packaged_resources.is_dir() {
+            packaged_resources.join("libdetcore_liteinst.so")
+        } else {
+            profile.join("libdetcore_liteinst.so")
+        }
+    };
     assert!(
         runtime.is_file(),
-        "{} is missing; build it with `cargo build -p detcore-liteinst` in this profile",
+        "{} is missing from the selected finalized Hermit runtime",
         runtime.display()
     );
     let run = |fingerprint: &str| {
@@ -2712,7 +2734,12 @@ fn in_guest_trap_verifies_a_program_with_no_site_patched() {
         stderr.lines().any(|line| line == IN_GUEST_TRAP_SELECTED),
         "{stderr}"
     );
-    assert!(!stderr.contains(IN_GUEST_SELECTED), "{stderr}");
+    assert!(
+        !stderr.contains(
+            "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool"
+        ),
+        "{stderr}"
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         stdout
