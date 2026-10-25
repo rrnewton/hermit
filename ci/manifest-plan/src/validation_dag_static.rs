@@ -3157,7 +3157,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // negative_count_on_unrecorded_received_descriptors): 163.
     // And tight_stack_received_inotify's test that an inotify descriptor
     // received and read on a tight stack is recorded and renumbered: 164.
-    ("test.detcore_misc", 164),
+    // And kernel_run_poll_waits_time_out_through_ignored_signals: 165.
+    ("test.detcore_misc", 165),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -4339,7 +4340,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And in_guest_runtime_survives_a_guest_dup2_onto_each_of_its_descriptors
     // (https://github.com/rrnewton/hermit/issues/4689): 645.
     // And kernel_run_epoll_waits_are_not_ended_by_ignored_signals: 655.
-    ("test.cli", 655),
+    // And kernel_run_poll_waits_are_not_ended_by_ignored_signals: 656.
+    ("test.cli", 656),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4872,7 +4874,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same in-guest dup2-onto-runtime-descriptors test, not excluded:
     // 564.
     // And kernel_run_epoll_waits_are_not_ended_by_ignored_signals: 574.
-    ("test.cli_on_host", 574),
+    // And kernel_run_poll_waits_are_not_ended_by_ignored_signals: 575.
+    ("test.cli_on_host", 575),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4946,7 +4949,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two A+ tests: 159.
     // And the same four F0a readdir_order variants: 163.
     // And the same tight-stack received-inotify test: 164.
-    ("test.detcore_misc_on_host", 164),
+    // And kernel_run_poll_waits_time_out_through_ignored_signals: 165.
+    ("test.detcore_misc_on_host", 165),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).

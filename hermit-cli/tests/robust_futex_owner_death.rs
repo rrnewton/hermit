@@ -1595,11 +1595,12 @@ fn ptrace_records_a_self_aliased_word_woken_once_and_refuses_older_recordings() 
     // 0x185 random devices are classified by device number,
     // 0x186 projects coherent NUMA rows with authenticated private ownership,
     // 0x187 chaos recordings store their schedule,
-    // and 0x188 shields kernel-run epoll waits from ignored signals),
+    // 0x188 shields kernel-run epoll waits from ignored signals,
+    // and 0x189 shields kernel-run poll-family waits from them too),
     // and a recording from before the change, 0x14f, is still refused by
     // the exact-match gate.
     assert_eq!(
-        metadata["version"], 0x188,
+        metadata["version"], 0x189,
         "RECORD_VERSION moved; point this test at the current version and the one before"
     );
     metadata["version"] = serde_json::json!(0x14f);

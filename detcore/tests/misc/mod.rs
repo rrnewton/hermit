@@ -14,6 +14,7 @@
 )]
 
 mod cpuinfo_sessions;
+mod ignored_signal_waits;
 mod inode_reuse;
 mod notification_fds;
 mod proc_stat_lifecycle;

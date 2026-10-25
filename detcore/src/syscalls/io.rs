@@ -360,7 +360,8 @@ where
 /// the call then keeps the guest's wrapper and the kernel fails it with EFAULT
 /// in Linux's order (Claude review of
 /// https://github.com/rrnewton/hermit/pull/4166). `None` too when the call
-/// has no mask, its wrapper cannot be read, or the size is not the kernel's.
+/// has no mask, its wrapper cannot be read as the kernel copies it
+/// (`read_pselect6_argument`), or the size is not the kernel's.
 ///
 /// The read is the call's first injection: a signal that stops it restarts
 /// the call (`restart_if_first_probe_not_run`), the only error returned.
@@ -375,10 +376,7 @@ where
     let Some(wrapper) = call.sigmask() else {
         return Ok(None);
     };
-    let Ok(argument) = guest
-        .memory()
-        .read_value::<_, Pselect6SigmaskArg>(wrapper.cast())
-    else {
+    let Some(argument) = read_pselect6_argument(guest, wrapper) else {
         return Ok(None);
     };
     if argument.sigsetsize != KERNEL_SIGSET_SIZE {
@@ -396,6 +394,56 @@ where
     };
     super::signal_shadow::note_wait_mask(guest, mask);
     Ok(Some(mask))
+}
+
+/// Whether a pselect6 names no mask: it passes no `{ sigmask, sigsetsize }`
+/// argument, or one whose mask pointer is NULL, as glibc's `pselect` passes
+/// it. Linux then leaves the thread's mask in place without reading the size
+/// (`set_user_sigmask`). The argument is read whole, once, with the guest's
+/// own access (`read_pselect6_argument`), so one the kernel would fail to copy
+/// counts as naming a mask: the call keeps it, and its EFAULT.
+fn pselect6_names_no_mask<G, T>(guest: &mut G, call: syscalls::Pselect6) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let Some(wrapper) = call.sigmask() else {
+        return true;
+    };
+    read_pselect6_argument(guest, wrapper).is_some_and(|argument| argument.sigmask == 0)
+}
+
+/// pselect6's `{ sigmask, sigsetsize }` argument at `wrapper`, read as Linux
+/// copies it (`get_sigset_argpack`): whole, in one read that honours the
+/// guest's page protections, or `None` where the kernel's copy would fault,
+/// or where the tracer cannot read it although the kernel can (a write-only
+/// page on x86). Either way the call keeps the guest's argument. A tracer read
+/// retried word by word reaches a `PROT_NONE` tail on ptrace
+/// (`PTRACE_PEEKDATA`), which the kernel's copy does not.
+fn read_pselect6_argument<G, T>(
+    guest: &mut G,
+    wrapper: Addr<'_, libc::sigset_t>,
+) -> Option<Pselect6SigmaskArg>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let mut bytes = [0u8; std::mem::size_of::<Pselect6SigmaskArg>()];
+    guest
+        .memory()
+        .read_exact_with_user_access(wrapper.cast::<u8>(), &mut bytes)
+        .ok()?;
+    let word = |at: usize| {
+        usize::from_ne_bytes(
+            bytes[at..at + std::mem::size_of::<usize>()]
+                .try_into()
+                .expect("a word"),
+        )
+    };
+    Some(Pselect6SigmaskArg {
+        sigmask: word(0),
+        sigsetsize: word(std::mem::size_of::<usize>()),
+    })
 }
 
 /// The temporary mask a replayed zero-timeout pselect6 sleeps under, read
@@ -1025,7 +1073,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
             Ok(self.record_or_replay(guest, call).await?)
         } else {
-            self.record_or_replay_blocking(guest, call).await
+            self.record_or_replay_shielded_wait(guest, call).await
         }
     }
 
@@ -1198,6 +1246,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                         self.record_or_replay_pselect6_under_a_private_mask(guest, call, mask)
                             .await?
                     }
+                    // A wrapper that names no mask leaves the thread's own
+                    // mask in place, which the scheduler reads and the shield
+                    // covers. The kernel is handed no wrapper, which Linux
+                    // takes alike, so a sibling cannot write a mask into the
+                    // guest's before the kernel reads it.
+                    None if pselect6_names_no_mask(guest, call) => {
+                        self.record_or_replay_shielded_wait(
+                            guest,
+                            Syscall::Pselect6(call.with_sigmask(None)),
+                        )
+                        .await
+                    }
                     None => {
                         self.record_or_replay_blocking_with_unknown_mask(
                             guest,
@@ -1215,7 +1275,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .await
                     .map_err(Into::into)
             } else {
-                self.record_or_replay_blocking(guest, Syscall::Pselect6(call))
+                self.record_or_replay_shielded_wait(guest, Syscall::Pselect6(call))
                     .await
             };
             if let Some(mask) = temporary_mask
@@ -1226,7 +1286,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             return result;
         }
         if !self.cfg.sequentialize_threads {
-            return Ok(guest.inject(call).await?);
+            // A call with a mask waits under it; one that names none is
+            // shielded as select is, and the kernel is handed no wrapper (as
+            // under record), since a sibling runs concurrently here.
+            if !pselect6_names_no_mask(guest, call) {
+                return Ok(guest.inject(call).await?);
+            }
+            let may_wait = !call.timeout().is_some_and(|timeout| {
+                guest
+                    .memory()
+                    .read_value(timeout)
+                    .is_ok_and(|timeout: Timespec| timeout.tv_sec == 0 && timeout.tv_nsec == 0)
+            });
+            return self
+                .inject_shielded_wait(guest, call.with_sigmask(None), may_wait)
+                .await;
         }
         // Under the in-guest delivery gate (A5 step 3c.1d) the forms follow
         // design D39 and D50, and no probe carries the guest's temporary mask
@@ -1338,6 +1412,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 _ => None,
             };
             let Some(mask) = snapshot else {
+                if sigmask_argument.is_none_or(|argument| argument.sigmask == 0) {
+                    // No mask, read in this turn: hand the kernel no wrapper,
+                    // as record does.
+                    return self
+                        .record_or_replay_shielded_wait(
+                            guest,
+                            Syscall::Pselect6(call.with_sigmask(None)),
+                        )
+                        .await;
+                }
                 return self
                     .record_or_replay_blocking_with_mask(guest, Syscall::Pselect6(call), None)
                     .await;
@@ -1942,7 +2026,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
         if !self.cfg.sequentialize_threads {
-            return Ok(guest.inject(call).await?);
+            // A zero timeout is not shielded, as it is not under record: a
+            // pending signal ends such a call with ERESTARTNOHAND and Linux
+            // runs it again in place, which the guest does not see, and every
+            // probe would pay for two mask changes. A timeout the tracer
+            // cannot read is shielded.
+            let may_wait = !call.timeout().is_some_and(|timeout| {
+                guest
+                    .memory()
+                    .read_value(timeout)
+                    .is_ok_and(|timeout: libc::timeval| timeout.tv_sec == 0 && timeout.tv_usec == 0)
+            });
+            return self.inject_shielded_wait(guest, call, may_wait).await;
         }
 
         if call.nfds() < 0 {
@@ -1968,7 +2063,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // over-reading the guest bitmap (Linux clamps raw fd-set copies to max_fds).
         if call.nfds() > PSELECT6_INTERNAL_MAX_NFDS {
             return self
-                .record_or_replay_blocking(guest, Syscall::Select(call))
+                .record_or_replay_shielded_wait(guest, Syscall::Select(call))
                 .await;
         }
 
@@ -2397,18 +2492,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             // recording without the kernel ever doing so; recording and replay
             // must schedule the call alike. The result has no `?`: an
             // interruption must reach the replay delivery below.
-            let result: Result<i64, Error> =
-                if self.cfg.recordreplay_modes && temporary_mask.is_some() {
-                    self.record_or_replay_blocking_with_unknown_mask(guest, Syscall::Ppoll(call))
-                        .await
-                } else {
-                    self.record_or_replay_blocking_with_mask(
-                        guest,
-                        Syscall::Ppoll(call),
-                        blocked_signal_mask,
-                    )
+            let result: Result<i64, Error> = if temporary_mask.is_none() {
+                // No mask: the call waits under the thread's own.
+                self.record_or_replay_shielded_wait(guest, Syscall::Ppoll(call))
                     .await
-                };
+            } else if self.cfg.recordreplay_modes {
+                self.record_or_replay_blocking_with_unknown_mask(guest, Syscall::Ppoll(call))
+                    .await
+            } else {
+                self.record_or_replay_blocking_with_mask(
+                    guest,
+                    Syscall::Ppoll(call),
+                    blocked_signal_mask,
+                )
+                .await
+            };
             if let Some(staged) = staged {
                 staged.release(guest);
             }
@@ -2791,12 +2889,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             let request = Self::sleep_request(guest, time_delta).await;
             resource_request(guest, request).await;
             Ok(0)
-        } else {
+        } else if call.timeout() == 0 {
+            // Not shielded, as no zero-timeout probe is: a signal pending at
+            // its entry still ends it with a restart code.
             print_poll(&call);
             let result = self
                 .record_or_replay_blocking(guest, Syscall::Poll(call))
                 .await;
             kernel_poll_result(&call, result)
+        } else {
+            print_poll(&call);
+            self.record_or_replay_shielded_wait(guest, Syscall::Poll(call))
+                .await
         }
     }
 
@@ -2924,7 +3028,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
             Ok(self.record_or_replay(guest, call).await?)
         } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
-            self.record_or_replay_epoll_wait_blocking(guest, Syscall::EpollPwait(call))
+            self.record_or_replay_shielded_wait(guest, Syscall::EpollPwait(call))
                 .await
         } else {
             self.handle_internal_epoll_pwait(guest, call).await
@@ -3199,7 +3303,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     self.record_or_replay_masked_epoll_pwait2(guest, args, !observed)
                         .await
                 } else {
-                    self.record_or_replay_epoll_wait_blocking(guest, call).await
+                    self.record_or_replay_shielded_wait(guest, call).await
                 };
             }
         } else if self.cfg.sequentialize_threads
@@ -3241,18 +3345,39 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
-    /// `record_or_replay_blocking` for an `epoll_wait`, or an `epoll_pwait` or
-    /// `epoll_pwait2` without a mask, that waits in the kernel, with the
-    /// signals the guest ignores blocked for the wait (`IgnoredSignalShield`):
-    /// Linux discards them at generation, so they never end the wait with
-    /// `EINTR`, but ptrace queues them.
-    async fn record_or_replay_epoll_wait_blocking<G: Guest<Self>>(
+    /// `record_or_replay_blocking` for a wait in the kernel under the thread's
+    /// own mask, with the signals the guest ignores blocked for the wait
+    /// (`IgnoredSignalShield`): an `epoll_wait`, or an `epoll_pwait` or
+    /// `epoll_pwait2` without a mask, or a `poll`, `select`, or `ppoll` or
+    /// `pselect6` naming no mask. Linux discards those signals at generation,
+    /// so they never end the wait, but ptrace queues them.
+    async fn record_or_replay_shielded_wait<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
         let shield = crate::syscalls::helpers::IgnoredSignalShield::raise(guest).await?;
         let result = self.record_or_replay_blocking(guest, call).await;
+        shield.lower(guest).await?;
+        result
+    }
+
+    /// `guest.inject(call)` for a `select`, or a `pselect6` handed no mask,
+    /// that waits in the kernel without sequentialized threads, with the
+    /// signals the guest ignores blocked for the wait when it `may_wait`
+    /// (`IgnoredSignalShield`).
+    async fn inject_shielded_wait<G: Guest<Self>, S: SyscallInfo>(
+        &self,
+        guest: &mut G,
+        call: S,
+        may_wait: bool,
+    ) -> Result<i64, Error> {
+        let shield = if may_wait {
+            crate::syscalls::helpers::IgnoredSignalShield::raise(guest).await?
+        } else {
+            crate::syscalls::helpers::IgnoredSignalShield::none()
+        };
+        let result = guest.inject(call).await.map_err(Error::from);
         shield.lower(guest).await?;
         result
     }
@@ -3454,7 +3579,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, Resources::new(guest.thread_state().dettid)).await;
             Ok(self.record_or_replay(guest, call).await?)
         } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
-            self.record_or_replay_epoll_wait_blocking(guest, Syscall::EpollWait(call))
+            self.record_or_replay_shielded_wait(guest, Syscall::EpollWait(call))
                 .await
         } else {
             self.handle_internal_epoll_wait(guest, call).await
