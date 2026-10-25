@@ -12,7 +12,9 @@ mod consts;
 mod minimize;
 mod phases;
 mod rundata;
+mod stop;
 mod types;
+mod workspace;
 
 pub use types::AnalyzeOpts;
 pub use types::ContinuationTimeslice;
