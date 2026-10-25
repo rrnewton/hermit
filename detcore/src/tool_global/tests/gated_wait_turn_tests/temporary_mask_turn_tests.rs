@@ -2061,9 +2061,10 @@ fn arm_virtual_timerfd(guest: &mut TurnGuest) {
 /// The clock is observed after the first check, so the hand-off comes after
 /// it (the staged path observes it only for a write-back and makes no
 /// hand-off before its refusal). With an armed virtual timerfd the first
-/// observation is the timerfd publication before the first probe: the
-/// at-entry set is read before it (`entry_before_publication`), so the same
-/// answers hold. Mutations "the clock observed before the first probe"
+/// observation is the deadline's at the entry, after the temporary mask's
+/// publication and before the timerfd publication (A5 step 3c.1e A,
+/// IR-23(c)): the at-entry set is read before both
+/// (`TemporaryMaskCall::enter`), so the same answers hold. Mutations "the clock observed before the first probe"
 /// (every form but the timerfd rows: (a) epoll returns EINTR, (b) removes)
 /// and "the at-entry set taken as everything pending" (the timerfd rows).
 #[tokio::test]
@@ -2310,3 +2311,5 @@ async fn a_removal_with_no_scratch_stack_is_hermit_s_own_failure() {
     );
     assert!(guest.sigtimedwait_sets.is_empty(), "nothing injected");
 }
+
+mod publication_tests;

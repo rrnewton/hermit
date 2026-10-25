@@ -1412,6 +1412,22 @@ fn fdinfo_refusal(call: &str, fd: RawFd, step: &str, errno: Errno) -> String {
     )
 }
 
+/// What a status snapshot reports for the signal mask and D37's held masks
+/// of the thread it describes (`status_published_sigblk`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StatusMaskFacts {
+    /// The `SigBlk` reported in place of the kernel's, or `None` to keep the
+    /// kernel's.
+    pub(crate) sigblk: Option<u64>,
+    /// Under the in-guest delivery gate, while the thread holds a
+    /// temporary-mask publication (A5 step 3c.1e A, IR-23(a)), the ignored
+    /// signals it keeps pending from its masked call's entry in its private
+    /// and shared queues (D37's held masks), which the status shows although
+    /// the published temporary mask does not block them; zero otherwise.
+    pub(crate) held_private: u64,
+    pub(crate) held_shared: u64,
+}
+
 /// The `SigBlk` a status snapshot reports for the thread it describes
 /// (`mask_thread`, from `ProcfsFile::status_mask_thread`) in place of the
 /// kernel's, or `None` to keep the kernel's: the guest mask that thread
@@ -1424,20 +1440,56 @@ fn fdinfo_refusal(call: &str, fd: RawFd, step: &str, errno: Errno) -> String {
 /// kernel's may be the in-guest runtime's (A5 step 3c.1b). With nothing
 /// published for the thread the scheduler answers `None`, and the kernel's
 /// `SigBlk` is reported, as before.
+///
+/// Under the gate (A5 step 3c.1e A) the answer is tri-state (IR-18) and
+/// carries D37's held masks of a temporary-mask publication in force
+/// (`Scheduler::status_guest_mask`). A mask the scheduler holds as unknown is
+/// shown neither as the call's earlier mask nor as the kernel's `SigBlk`
+/// (the in-guest runtime's mask once it has one): the read is refused by name
+/// through the run-wide stopping refusal HERMIT_GUEST_MASK_UNKNOWN (D49),
+/// never an errno to the reader; were the run to go on, Hermit's own failure
+/// (`Error::Tool`) ends the read. `reader` is the reading thread.
 pub(crate) async fn status_published_sigblk<G, T>(
     guest: &mut G,
     mask_thread: Option<i32>,
-) -> Option<u64>
+) -> Result<StatusMaskFacts, Error>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    match mask_thread {
-        Some(thread) if crate::syscalls::helpers::publishes_guest_masks(guest.config()) => {
-            crate::tool_global::published_guest_sigmask(guest, DetTid::from_raw(thread)).await
-        }
-        _ => None,
+    use crate::scheduler::guest_mask_publication::PublishedGuestMask;
+    let Some(thread) = mask_thread else {
+        return Ok(StatusMaskFacts::default());
+    };
+    if !crate::syscalls::helpers::publishes_guest_masks(guest.config()) {
+        return Ok(StatusMaskFacts::default());
     }
+    if !guest.config().in_guest_signal_delivery {
+        return Ok(StatusMaskFacts {
+            sigblk: crate::tool_global::published_guest_sigmask(guest, DetTid::from_raw(thread))
+                .await,
+            ..Default::default()
+        });
+    }
+    let status = crate::tool_global::status_guest_mask(guest, DetTid::from_raw(thread)).await;
+    let sigblk = match status.mask {
+        Some(PublishedGuestMask::Known(mask)) => Some(mask),
+        None => None,
+        Some(PublishedGuestMask::Unknown) => {
+            let reason = crate::refused_signal_controls::guest_mask_unknown_refusal(
+                guest.thread_state().dettid.as_raw(),
+                thread,
+            );
+            tracing::error!("{}", reason);
+            crate::tool_global::stopping_refusal(guest, reason.clone()).await;
+            return Err(Error::Tool(anyhow::anyhow!(reason)));
+        }
+    };
+    Ok(StatusMaskFacts {
+        sigblk,
+        held_private: status.held_private,
+        held_shared: status.held_shared,
+    })
 }
 
 #[cfg(test)]
@@ -6622,7 +6674,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mask_thread = guest.thread_state().with_detfd(call.fd(), |detfd| {
             detfd.procfs_status_mask_thread(&contents)
         })?;
-        let published_sigblk = status_published_sigblk(guest, mask_thread).await;
+        let mask_facts = status_published_sigblk(guest, mask_thread).await?;
         // A process's `stat` or `comm` Detcore opened renders its task's
         // record in the process table as of this read (`procfs::task_stat`).
         let task_stat = self
@@ -6644,11 +6696,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     random_uuid,
                     virtual_cpuinfo: virtual_cpuinfo.clone(),
                     machine: machine.clone(),
-                    published_sigblk,
+                    published_sigblk: mask_facts.sigblk,
                     // A5 step 3c.1d, design D37: the pending ignored signals
                     // the guest's mask lets in are left out, under the gate
-                    // only.
+                    // only; those a temporary-mask publication keeps from its
+                    // call's entry stay, each queue by its own held mask (A5
+                    // step 3c.1e A).
                     status_hides_ignored: guest.config().in_guest_signal_delivery,
+                    status_held_ignored: (mask_facts.held_private, mask_facts.held_shared),
                     lock_rows_kept: lock_rows_kept.clone(),
                     task_stat,
                 },

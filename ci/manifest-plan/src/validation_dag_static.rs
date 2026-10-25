@@ -2896,7 +2896,37 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And without_keeping_a_read_leaves_no_descriptor_open (status files are
     // kept only in Hermit's own process, never where Detcore runs in the
     // guest): 2579, listed.
-    ("test.detcore_unit", 2579),
+    // And A5 slice 3c.1e A's sixteen units: scheduler::guest_mask_publication_tests'
+    // four (a restored rejoin that publishes nothing leaves the mask unknown;
+    // a new task starts with its creator's published mask; a temporary-mask
+    // publication holds until a request or its withdrawal; the window records
+    // the scheduler's sends by queue), tool_global::tests::
+    // temporary_mask_publication_tests' three (a guest send committed during a
+    // publication joins the target's window; the status query's tri-state and
+    // held masks under the gate only; the coordinator seeds a new child),
+    // temporary_mask_turn_tests::publication_tests' seven (each masked site
+    // publishes once before the timerfd RPC; the entry's deadline; the entry
+    // removal before the RPC; held masks and R2 per queue; R2 keeps the entry
+    // instance before the yield; real-time instances refused from the
+    // committed record; a status read of an unknown mask refused),
+    // predicted_death_tests' and signal_announcement_tests' IR-15 units:
+    // 2595, listed.
+    // And its review round 1 units: guest_mask_publication_tests' and
+    // publication_tests' an_interrupted_end_keeps_the_temporary_mask_published
+    // and publication_tests' ir23c_the_staged_pselect6_writes_back_from_the_entry_deadline:
+    // 2598, listed.
+    // And its review round 2 units: guest_mask_publication_tests'
+    // a_new_task_never_starts_with_its_creators_temporary_mask,
+    // temporary_mask_publication_tests'
+    // a_child_forked_after_a_parked_masked_call_starts_with_the_own_mask and
+    // publication_tests' a_parked_masked_wait_puts_the_own_mask_back_unless_interrupted:
+    // 2601, listed.
+    // And its review round 3 units: temporary_mask_publication_tests'
+    // a_clone_publishes_the_creators_current_mask_before_its_child_is_seeded
+    // and guest_mask_publication_tests'
+    // rejoins_and_withdrawals_decide_the_mark_a_child_is_seeded_from: 2603,
+    // listed.
+    ("test.detcore_unit", 2603),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5070,7 +5100,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And without_keeping_a_read_leaves_no_descriptor_open (status files are
     // kept only in Hermit's own process, never where Detcore runs in the
     // guest): 2579, listed.
-    ("test.detcore_unit_on_host", 2579),
+    // And the same sixteen A5 slice 3c.1e A units: 2595, listed.
+    // And the same three 3c.1e A review round 1 units: 2598, listed.
+    // And the same three 3c.1e A review round 2 units: 2601, listed.
+    // And the same two 3c.1e A review round 3 units: 2603, listed.
+    ("test.detcore_unit_on_host", 2603),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
