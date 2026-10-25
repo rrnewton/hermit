@@ -1249,13 +1249,15 @@ pub struct Scheduler {
     /// The logical, global time consumed by actions that have been committed already.
     pub committed_time: LogicalTime,
 
-    /// The thread of the last committed turn, so that `bump_global_time` can
-    /// tell a signal delivery to the thread that was already running from one
-    /// that switches threads (<https://github.com/rrnewton/hermit/issues/4139>).
+    /// The thread of the last committed turn, not counting host-timed polling
+    /// retries or a schedule replay's own switch turns, so that
+    /// `bump_global_time` can tell a signal delivery to the thread that was
+    /// already running from one that switches threads
+    /// (<https://github.com/rrnewton/hermit/issues/4139>).
     previous_turn_tid: Option<DetTid>,
 
     /// Whether the last committed turn (as for `previous_turn_tid`, not a
-    /// host-timed polling retry) ended an expired timed wait
+    /// host-timed polling retry or a replay's switch turn) ended an expired timed wait
     /// (`expired_wait_grant`), so that `bump_global_time` charges a run of
     /// such turns once.
     previous_turn_expired_wait: bool,
@@ -15004,7 +15006,8 @@ impl Scheduler {
         // ran nothing but its handler
         // (https://github.com/rrnewton/hermit/issues/4139). The previous turn
         // is the last committed one other than a host-timed polling retry
-        // (`last_turn_was_polling`); skipped turns do not count. So the rule
+        // (`last_turn_was_polling`) or a schedule replay's own switch turn
+        // (`is_internal_turn`); skipped turns do not count. So the rule
         // also frees the signal wake of a thread asleep in pause, nanosleep or
         // a futex wait when that thread had the previous turn. Both inputs are
         // committed turns that both runs of --verify share, so they decide
@@ -15039,11 +15042,12 @@ impl Scheduler {
         // deadline had already passed when they were made (a zero timeout).
         // Time still advances by each waiter's own work, at least one syscall
         // per turn, and by the empty-queue jump to the next deadline. Every
-        // input is a committed grant, the last non-polling committed turn, or
+        // input is a committed grant, the previous turn as above, or
         // the run queue as step 1 finds it, so the rule adds no host-timed
         // input and inherits those that already reach the queue (a
         // readmitted background call); a host-timed polling retry neither
-        // ends nor continues a run (`previous_turn_expired_wait`). Under
+        // ends nor continues a run (`previous_turn_expired_wait`), nor does a
+        // schedule replay's switch turn, which its recording lacks. Under
         // `hermit record` and `hermit replay` (`recordreplay_modes`) every
         // such turn keeps its charge, as signal deliveries do.
         let expired_wait_grant = self.expired_wait_grant.take();
@@ -15146,8 +15150,14 @@ impl Scheduler {
         // A host-timed retry is not a turn that both runs of --verify share:
         // letting it set the previous turn's thread would make whether the
         // next signal delivery is charged depend on how many retries ran.
+        // Nor is a schedule replay's own switch turn (`TraceReplay`, an
+        // internal turn): the recording has none, so letting it set the
+        // previous turn would end a run of expired waits, or make a signal
+        // delivery look like one to the running thread, where the recording
+        // decided otherwise, and charge the replay differently.
         if let Ok(resources) = last_turn
             && !last_turn_was_polling
+            && !Self::is_internal_turn(resources)
         {
             self.previous_turn_tid = Some(resources.tid);
             self.previous_turn_expired_wait = expired_wait;
@@ -20438,6 +20448,11 @@ mod test {
             request.insert(ResourceID::InternalIOPolling, Permission::W);
             request
         };
+        let switch = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::TraceReplay, Permission::RW);
+            request
+        };
         // The advance of the last of `turns`, committed in order.
         let advance = |record_replay: bool, turns: &[Resources]| {
             let mut sched = Scheduler::new(&config);
@@ -20472,6 +20487,22 @@ mod test {
             advance(false, &[Resources::new(other), delivery(running)]),
             charge,
             "a delivery that switches threads"
+        );
+        assert_eq!(
+            advance(
+                false,
+                &[Resources::new(other), switch(running), delivery(running)]
+            ),
+            charge,
+            "a schedule replay's switch turn is not the previous turn"
+        );
+        assert_eq!(
+            advance(
+                false,
+                &[Resources::new(running), switch(running), delivery(running)]
+            ),
+            Duration::ZERO,
+            "nor does it hide the running thread's own previous turn"
         );
         assert_eq!(
             advance(true, &[Resources::new(running), delivery(running)]),
@@ -20515,7 +20546,8 @@ mod test {
     /// under record/replay, and after any other committed turn, every such
     /// turn is charged as before. A host-timed polling retry neither ends nor
     /// continues a run, so the charge cannot depend on how many retries ran,
-    /// and neither does a skipped turn, which takes a pending mark with it.
+    /// and neither does a skipped turn, which takes a pending mark with it,
+    /// nor a schedule replay's own switch turn, which its recording lacks.
     #[test]
     fn a_run_of_expired_timed_waits_is_charged_one_turn_while_another_thread_waits() {
         let config = Config::default();
@@ -20532,6 +20564,11 @@ mod test {
         let retry = |tid: DetTid| {
             let mut request = Resources::new(tid);
             request.insert(ResourceID::InternalIOPolling, Permission::W);
+            (request, false)
+        };
+        let switch = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::TraceReplay, Permission::RW);
             (request, false)
         };
         // The advance of the last of `turns`, committed in order with
@@ -20597,6 +20634,15 @@ mod test {
             advance(false, &[worker], &[wait(first), retry(first), wait(second)]),
             Duration::ZERO,
             "a retry does not end the run"
+        );
+        assert_eq!(
+            advance(
+                false,
+                &[worker],
+                &[wait(first), switch(second), wait(second)]
+            ),
+            Duration::ZERO,
+            "nor does a schedule replay's switch turn, which the recording lacks"
         );
         assert_eq!(
             advance(
