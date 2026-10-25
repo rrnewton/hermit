@@ -1963,6 +1963,12 @@
       "why": "tests/c/rcx_canonicalization.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/rdtsc_spin_deadline.c",
+      "runner": "hermit-cli/tests/cli.rs::a_schedule_replay_reads_a_trapped_rdtsc_before_switching_away",
+      "why": "tests/c/rdtsc_spin_deadline.c is owned by hermit-cli/tests/cli.rs: two threads spin on the TSC to a deadline and print their read counts; the CLI test records it under --chaos --target-timeslice so that a recorded slice ends at a trapped rdtsc, replays the schedule, and requires zero desynced events and the recording's output, which a generic manifest cell cannot express."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/readdir_entries.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

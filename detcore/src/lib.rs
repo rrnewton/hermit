@@ -3723,6 +3723,24 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 dettid,
                 guest.thread_state().thread_logical_time
             );
+            // The guest TSC must name the same instant as `clock_gettime`. Both
+            // now read the coordinator's clock through the shared per-process
+            // floor, so a guest comparing the two -- a clocksource watchdog, a
+            // delay loop calibrated against a device timer, a second vCPU
+            // reading the TSC -- sees one time base instead of two.
+            //
+            // The `add_rdtsc()` charge above is folded into global time by the
+            // same RPC that reads it back (`send_and_update_time` updates the
+            // coordinator before dispatching the request), so consecutive reads
+            // from one thread still advance.
+            //
+            // Read it before the event is traced. Under `--replay-schedule-from`
+            // tracing the event is where the replayer hands the CPU to the next
+            // recorded thread when this read was the last event of a slice, so
+            // reading after it would see the time those threads ran. The
+            // recording read the clock here, before its slice ended in the post
+            // hook, and so does the replay now.
+            let tsc = guest_clock_time(guest).await;
             if self.cfg.observes_schedevents() {
                 let ev = with_guest_time(
                     guest,
@@ -3737,17 +3755,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 );
                 trace_schedevent(guest, ev, true).await;
             }
-            // The guest TSC must name the same instant as `clock_gettime`. Both
-            // now read the coordinator's clock through the shared per-process
-            // floor, so a guest comparing the two -- a clocksource watchdog, a
-            // delay loop calibrated against a device timer, a second vCPU
-            // reading the TSC -- sees one time base instead of two.
-            //
-            // The `add_rdtsc()` charge above is folded into global time by the
-            // same RPC that reads it back (`send_and_update_time` updates the
-            // coordinator before dispatching the request), so consecutive reads
-            // from one thread still advance.
-            let tsc = guest_clock_time(guest).await;
             Ok(RdtscResult {
                 // We treat virtual cycles as equivalent to virtual nanoseconds.
                 tsc: tsc.as_nanos(),

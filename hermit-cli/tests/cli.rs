@@ -22551,6 +22551,83 @@ fn a_replay_stuck_off_its_schedule_stops_under_replay_exhausted_panic() {
     assert_eq!(stdout(&replay), "", "the guest ran on past the release");
 }
 
+/// A schedule replay hands the CPU to the next recorded thread when it traces
+/// the event that ended a slice. A trapped `rdtsc` that ends a slice (an
+/// expired `--target-timeslice`, checked at the trap) used to read the guest
+/// TSC only after that hand-off, so the replayed guest saw the time the other
+/// threads ran meanwhile and left its spin loop at another iteration than
+/// the recording did: every seed below desynced. The TSC is now read before
+/// the event is traced, where the recording read it.
+///
+/// Every slice ends at a check-in, a trapped `rdtsc` or a syscall, where the
+/// expired `--target-timeslice` is found: the PMU timer is armed only at the
+/// default 200 ms maximum, which this guest never reaches, so the schedule
+/// does not depend on where a timer interrupt lands.
+#[test]
+fn a_schedule_replay_reads_a_trapped_rdtsc_before_switching_away() {
+    static GUEST: OnceLock<PathBuf> = OnceLock::new();
+    let guest = futex_c_guest(&GUEST, "rdtsc_spin_deadline")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for seed in ["1", "2", "3", "4"] {
+        let schedule = directory.path().join(format!("schedule-{seed}.json"));
+        let record = format!("--record-preemptions-to={}", schedule.display());
+        let recorded = hermit(&[
+            "run",
+            "--strict",
+            "--chaos",
+            "--seed",
+            seed,
+            "--target-timeslice=20000",
+            &record,
+            "--",
+            &guest,
+        ]);
+        assert!(
+            recorded.status.success(),
+            "seed {seed}: {}",
+            stderr(&recorded)
+        );
+        // The case under test: a recorded slice ended at a trapped rdtsc and
+        // another thread ran next.
+        let recording: serde_json::Value =
+            serde_json::from_slice(&fs::read(&schedule).unwrap()).unwrap();
+        let events = recording["global"].as_array().unwrap();
+        assert!(
+            events
+                .windows(2)
+                .any(|pair| pair[0]["op"] == "Rdtsc" && pair[0]["dettid"] != pair[1]["dettid"]),
+            "seed {seed}: no recorded slice ended at an rdtsc"
+        );
+
+        let summary = directory.path().join(format!("summary-{seed}.json"));
+        let replay = format!("--replay-schedule-from={}", schedule.display());
+        let summary_flag = format!("--summary-json={}", summary.display());
+        let replayed = hermit(&["run", "--strict", &replay, &summary_flag, "--", &guest]);
+        assert!(
+            replayed.status.success(),
+            "seed {seed}: {}",
+            stderr(&replayed)
+        );
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(&summary).unwrap()).unwrap();
+        assert_eq!(
+            summary["schedevent_desynced"], 0,
+            "seed {seed}: the replay left its recorded schedule: {summary}"
+        );
+        // And it followed the whole recording: past its end a replay runs on
+        // unguided and counts no desyncs.
+        assert_eq!(
+            summary["schedevent_replayed"],
+            events.len(),
+            "seed {seed}: the replay did not follow the whole recording: {summary}"
+        );
+        assert_eq!(stdout(&replayed), stdout(&recorded), "seed {seed}");
+    }
+}
+
 /// A gate on a vfork child before its exec can never open: while the child
 /// runs, no other thread can (https://github.com/rrnewton/hermit/issues/3930).
 /// The child of `posix_spawn` calls dup2 before execve; a spec holding it there

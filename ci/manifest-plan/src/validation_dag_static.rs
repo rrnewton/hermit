@@ -4360,7 +4360,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 654 + 5 = 659, listed.
     // And +1 from 82cbd684: 660.
     // Train 6 recount (measured on 21f770f6 base): 666.
-    ("test.cli", 666),
+    // And a_schedule_replay_reads_a_trapped_rdtsc_before_switching_away: 667.
+    ("test.cli", 667),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4903,7 +4904,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 5 = 578, listed.
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
-    ("test.cli_on_host", 585),
+    // And a_schedule_replay_reads_a_trapped_rdtsc_before_switching_away, which
+    // is not among them: 586.
+    ("test.cli_on_host", 586),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
