@@ -2598,6 +2598,7 @@ fn signal_state_reads_leave_no_status_descriptor_in_the_guest() {
 
 static SESSION_CONTAINMENT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHOSEN_GUEST_IDS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static EXIT_WITH_WAITER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 fn session_containment_guest() -> &'static Path {
     SESSION_CONTAINMENT_GUEST.get_or_init(|| {
@@ -55978,4 +55979,270 @@ fn run_refuses_incomplete_replay_before_guest_execution() {
             );
         }
     }
+}
+
+/// A process exits while one of its threads is still blocked in a call
+/// (`tests/c/exit_with_waiter.c`): main's exit_group ends the thread inside
+/// the call, which never returns. The recorder writes a call's events when it
+/// returns, so the recording holds nothing for that call. Replay ended with a
+/// panic when the thread's event stream ran out ("Replay event stream ended
+/// unexpectedly") for a poll, ppoll, select, pselect6, epoll_wait or
+/// epoll_pwait; it now leaves the thread blocked until the replayed exit, as
+/// the recording did. Each mode must print native's line under
+/// `record start --verify --verify-strict`, with bitwise parity. It is also
+/// recorded under `HERMIT_RACE_PROBE=bg_pre_call=0-10`, whose delay before a
+/// background call lets main's exit end the thread before the recorder sees
+/// the call at all, so the recording ends even before the call's syscall
+/// record (seeds 1 and 2 do that for the poll family on the hosts measured).
+#[test]
+fn a_recording_that_ends_inside_a_blocked_call_replays() {
+    let _lock = hermit_run_guard();
+    let guest = compiled_c_guest(&EXIT_WITH_WAITER_GUEST, "exit_with_waiter");
+    let guest = guest.to_str().unwrap();
+    for mode in [
+        "poll",
+        "ppoll",
+        "select",
+        "pselect",
+        "epoll",
+        "epoll_pwait",
+        "recv",
+        "read",
+        "accept",
+    ] {
+        let native = Command::new(guest)
+            .arg(mode)
+            .output()
+            .expect("failed to run the guest natively");
+        let expected = format!("{mode}: exiting with a thread still waiting\n");
+        assert_eq!(
+            String::from_utf8_lossy(&native.stdout),
+            expected,
+            "native {mode}"
+        );
+        for seed in [None, Some("1"), Some("2")] {
+            let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+                .expect("failed to create the recording data dir");
+            let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+            let args = [
+                "record",
+                "start",
+                "--verify",
+                "--verify-strict",
+                "--record-timeout",
+                "120",
+                &data_dir_arg,
+                "--",
+                guest,
+                mode,
+            ];
+            // A replay that waits forever for the call ends here rather than
+            // hanging the test (record start has no replay timeout).
+            let mut command = Command::new("timeout");
+            command
+                .args(["--kill-after", "10s", "300s"])
+                .arg(env!("CARGO_BIN_EXE_hermit"));
+            append_hermit_args(&mut command, &args);
+            if let Some(seed) = seed {
+                command
+                    .env("HERMIT_RACE_PROBE", "bg_pre_call=0-10")
+                    .env("HERMIT_RACE_PROBE_SEED", seed);
+            }
+            let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+            assert_ne!(
+                output.status.code(),
+                Some(124),
+                "{args:?} probe seed {seed:?}: replay hung"
+            );
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{args:?} probe seed {seed:?}");
+        }
+    }
+}
+
+/// A recording cut short somewhere other than inside a thread's last
+/// background call is refused at once, never parked. The root thread's event
+/// stream of an `exit_with_waiter` recording is cut at an event boundary two
+/// events before its end, so its syscall stream goes on past the cut, and the
+/// thread holds its turn there: `replay --autopilot` must fail with the event
+/// stream error rather than wait (a parked turn holder would stop the replay).
+#[test]
+fn a_recording_cut_between_calls_is_refused_rather_than_parked() {
+    use hermit_record_format::event_stream::EventReader;
+    use hermit_record_format::event_stream::EventStreamId;
+    use hermit_record_format::event_stream::EventWriter;
+
+    let _lock = hermit_run_guard();
+    let guest = compiled_c_guest(&EXIT_WITH_WAITER_GUEST, "exit_with_waiter");
+    let guest = guest.to_str().unwrap();
+    let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the recording data dir");
+    let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+    let args = [
+        "record",
+        "start",
+        "--record-timeout",
+        "120",
+        &data_dir_arg,
+        "--",
+        guest,
+        "poll",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let id = std::fs::read_dir(data_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .find(|name| !["last", "last-run", "tmp"].contains(&name.as_str()))
+        .expect("record start wrote no recording");
+    let recording = data_dir.path().join(&id);
+
+    // The root stream's file name and header length, from a fresh writer.
+    let root = EventStreamId::root();
+    let scratch = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    drop(EventWriter::create(scratch.path(), &root).unwrap());
+    let fresh = std::fs::read_dir(scratch.path().join("thread"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_none())
+        .unwrap();
+    let mut boundary = std::fs::metadata(&fresh).unwrap().len();
+    let mut boundaries = vec![boundary];
+    let mut reader = EventReader::open(&recording, &root).unwrap();
+    while let Some(event) = reader.next_event_or_end().unwrap() {
+        boundary += bincode::serde::encode_to_vec(&event, bincode::config::legacy())
+            .unwrap()
+            .len() as u64;
+        boundaries.push(boundary);
+    }
+    let events = recording.join("thread").join(fresh.file_name().unwrap());
+    assert_eq!(std::fs::metadata(&events).unwrap().len(), boundary);
+    assert!(boundaries.len() > 3, "too few root events: {boundaries:?}");
+    let cut = boundaries[boundaries.len() - 3];
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&events)
+        .unwrap()
+        .set_len(cut)
+        .unwrap();
+
+    let args = ["replay", "--autopilot", &data_dir_arg, &id];
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", "10s", "120s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"));
+    append_hermit_args(&mut command, &args);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(output.status.code(), Some(124), "{args:?} hung:\n{stderr}");
+    assert!(
+        !output.status.success(),
+        "{args:?} replayed a cut recording"
+    );
+    // Refused by the replay tool's own check, before the scheduler is asked.
+    assert!(
+        stderr.contains("Replay event stream ended unexpectedly")
+            && stderr.contains("syscall stream ended: false"),
+        "{args:?}:\n{stderr}"
+    );
+}
+
+/// A recording whose only thread was killed from outside the guest, inside a
+/// call it ran in its own turn, is refused at once rather than parked: a
+/// parked turn holder would stop the replay for good. `exit_with_waiter busy`
+/// rewrites a file in a loop of logged calls; the test kills the guest with
+/// SIGKILL from outside while `record start` records it, which still commits
+/// the recording, and `replay --autopilot` must then fail with the event
+/// stream error.
+#[test]
+fn a_recording_killed_from_outside_is_refused_rather_than_parked() {
+    let _lock = hermit_run_guard();
+    let guest = compiled_c_guest(&EXIT_WITH_WAITER_GUEST, "exit_with_waiter");
+    let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the recording data dir");
+    let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+    let busy_file = data_dir.path().join("busy.bin");
+    let args = [
+        "record",
+        "start",
+        "--record-timeout",
+        "120",
+        &data_dir_arg,
+        "--",
+        guest.to_str().unwrap(),
+        "busy",
+        busy_file.to_str().unwrap(),
+    ];
+    let mut record = hermit_command(&args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("failed to start record");
+    // The guest's host pid: the process named after the guest whose
+    // ancestors include the recorder.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let parent_of = |pid: u32| -> Option<(String, u32)> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let open = stat.find('(')?;
+        let close = stat.rfind(')')?;
+        let comm = stat[open + 1..close].to_owned();
+        let ppid = stat[close + 2..].split(' ').nth(1)?.parse().ok()?;
+        Some((comm, ppid))
+    };
+    let guest_pid = loop {
+        if std::time::Instant::now() >= deadline {
+            let _ = record.kill();
+            let _ = record.wait();
+            panic!("the guest never started rewriting its file");
+        }
+        if std::fs::metadata(&busy_file).is_ok_and(|meta| meta.len() > 0) {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let found = std::fs::read_dir("/proc").unwrap().find_map(|entry| {
+                let pid: u32 = entry.ok()?.file_name().to_str()?.parse().ok()?;
+                let (comm, mut ancestor) = parent_of(pid)?;
+                if comm != "exit_with_waite" {
+                    return None;
+                }
+                while ancestor > 1 {
+                    if ancestor == record.id() {
+                        return Some(pid);
+                    }
+                    ancestor = parent_of(ancestor)?.1;
+                }
+                None
+            });
+            if let Some(pid) = found {
+                break pid;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let killed = unsafe { libc::kill(guest_pid as libc::pid_t, libc::SIGKILL) };
+    assert_eq!(killed, 0, "failed to kill the guest");
+    let _ = record.wait();
+    let id = std::fs::read_dir(data_dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .find(|name| !["last", "last-run", "tmp", "busy.bin"].contains(&name.as_str()))
+        .expect("record start committed no recording");
+
+    let args = ["replay", "--autopilot", &data_dir_arg, &id];
+    let mut command = Command::new("timeout");
+    command
+        .args(["--kill-after", "10s", "120s"])
+        .arg(env!("CARGO_BIN_EXE_hermit"));
+    append_hermit_args(&mut command, &args);
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_ne!(output.status.code(), Some(124), "{args:?} hung:\n{stderr}");
+    assert!(
+        !output.status.success(),
+        "{args:?} replayed a killed recording"
+    );
+    // Refused by the scheduler: the thread held its turn.
+    assert!(
+        stderr.contains("Replay event stream ended unexpectedly")
+            && stderr.contains("holds its turn"),
+        "{args:?}:\n{stderr}"
+    );
 }

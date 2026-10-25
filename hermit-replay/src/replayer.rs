@@ -405,6 +405,11 @@ pub struct ReplayerThreadState {
     stream_id: EventStreamId,
     child_stream_ids: ChildEventStreamIds,
     bootstrapped: bool,
+    /// `EventReader::events_read` when the current syscall began: a recording
+    /// that ends partway through a call's events was not cut short by the
+    /// thread's death (`park_unreturned_call`).
+    #[serde(default)]
+    call_events_start: u64,
     /// The root guest's captured output endpoints (`ReplayOutputs`), which
     /// every thread inherits from the thread that created it.
     #[serde(skip)]
@@ -470,6 +475,78 @@ impl Default for ReplayerThreadState {
     }
 }
 
+/// Parks a thread whose recording ends inside its current call. A recorder
+/// writes a call's syscall record when the call starts and all its events
+/// when it returns, so a thread whose streams both end there, before any of
+/// the call's events, never returned from the call: it was still blocked in
+/// it, or had not yet reached the recorder, when the process exited or
+/// another thread's `execve` ended it.
+///
+/// Replay leaves the thread blocked in the kernel the same way, in an
+/// injected `pause`, until the replayed exit ends the thread and the backend
+/// drops this handler with it. Detcore's scheduler must accept first
+/// (`replay_call_never_returns`): only a background call can be parked, since
+/// a thread holding its turn would stop the replay, and a call the rejoin log
+/// readmits returned in the recording. A thread the scheduler has already
+/// removed is waited out instead: an exit is ending it. Any other ending of the recording, and
+/// a signal that reaches the parked thread (none ended the call in the
+/// recording), stops the replay as a divergence.
+pub(crate) async fn park_unreturned_call<G: Guest<Replayer>>(
+    guest: &mut G,
+    expecting: &str,
+) -> reverie::Never {
+    let thread = guest.tid();
+    let state = guest.thread_state_mut();
+    let count = state.count;
+    let partway = state.events_read != state.call_events_start;
+    match (state.syscalls_exhausted(), state.events_exhausted()) {
+        (Ok(true), Ok(true)) if !partway => {}
+        (Ok(syscalls_end), Ok(events_end)) => panic!(
+            "Replay event stream ended unexpectedly on thread {thread}: no {expecting} after \
+             syscall event {count}, and the recording was not cut short inside this call \
+             (syscall stream ended: {syscalls_end}, event stream ended: {events_end}, events \
+             of this call already read: {partway})"
+        ),
+        (Err(error), _) | (_, Err(error)) => panic!(
+            "Replay could not read the recording of thread {thread} after syscall event \
+             {count}: {error}"
+        ),
+    }
+    let verdict = detcore::replay_call_never_returns_reply(
+        guest
+            .send_rpc(detcore::replay_call_never_returns_request())
+            .await,
+    );
+    match verdict {
+        Ok(detcore::UnreturnedCall::Park) => {}
+        Ok(detcore::UnreturnedCall::Gone) => {
+            // An exit is already ending the thread; the backend drops this
+            // handler when it observes the thread's exit.
+            tracing::debug!(
+                "[tid {thread}] the recording ends inside a call of a thread already gone"
+            );
+            std::future::pending::<()>().await;
+            unreachable!("a pending future never completes");
+        }
+        Err(reason) => panic!(
+            "Replay event stream ended unexpectedly on thread {thread}: no {expecting} after \
+             syscall event {count}, and the thread cannot be parked: {reason}"
+        ),
+    }
+    tracing::debug!(
+        "[tid {thread}] the recording ends at {expecting} after syscall event {count}: the \
+         call never returned, so the thread stays blocked until the process exits"
+    );
+    let interrupted = guest
+        .inject_restartable(reverie::syscalls::Pause::new())
+        .await;
+    panic!(
+        "Replay diverged on thread {thread}: its recording ends inside a call after syscall \
+         event {count}, which no signal ended in the recording, but its parked pause returned \
+         {interrupted:?}"
+    )
+}
+
 /// A Reverie tool that replays syscalls. Note that only syscalls that cannot be
 /// made deterministic are forwarded to this tool.
 #[derive(Serialize, Deserialize)]
@@ -526,6 +603,7 @@ impl Tool for Replayer {
             child_stream_ids: ChildEventStreamIds::default(),
             interrupted_poll: None,
             bootstrapped: parent.is_some_and(|(_, state)| state.bootstrapped),
+            call_events_start: 0,
             outputs: match parent {
                 None => self.outputs.clone(),
                 Some((_, state)) => state.outputs.clone(),
@@ -543,7 +621,11 @@ impl Tool for Replayer {
         guest: &mut G,
         syscall: Syscall,
     ) -> Result<i64, Error> {
-        self.expect_syscall(guest, syscall);
+        let state = guest.thread_state_mut();
+        state.call_events_start = state.events_read;
+        if !self.expect_syscall(guest, syscall) {
+            match park_unreturned_call(guest, "syscall record").await {}
+        }
 
         // As the recorder does: the kernel's restart of a poll a signal ended
         // there is served from the poll's recorded outputs.
@@ -822,6 +904,8 @@ impl Tool for Replayer {
         guest: &mut G,
         _request: Rdtsc,
     ) -> Result<RdtscResult, Errno> {
+        let state = guest.thread_state_mut();
+        state.call_events_start = state.events_read;
         next_event!(guest, Rdtsc)
     }
 }
@@ -2457,22 +2541,25 @@ impl Replayer {
     }
 
     // Check if we received the expected syscall or not.
-    fn expect_syscall<G: Guest<Self>>(&self, guest: &mut G, syscall: Syscall) {
+    ///
+    /// Returns false when the thread's syscall stream ends cleanly here: the
+    /// thread died in this call before the recorder saw it, so the caller parks
+    /// it (`park_unreturned_call`).
+    fn expect_syscall<G: Guest<Self>>(&self, guest: &mut G, syscall: Syscall) -> bool {
         let thread = guest.tid();
         let next_count = guest.thread_state().count + 1;
-        let debug_event = guest
-            .thread_state_mut()
-            .next_debug_event()
-            .unwrap_or_else(|source| {
-                panic!(
-                    "Replay syscall stream ended unexpectedly for recording {} on thread {} at event {} while the guest executed {:?}: {}",
-                    self.data.display(),
-                    thread,
-                    next_count,
-                    syscall,
-                    source,
-                )
-            });
+        let debug_event = match guest.thread_state_mut().next_debug_event_or_end() {
+            Ok(Some(debug_event)) => debug_event,
+            Ok(None) => return false,
+            Err(source) => panic!(
+                "Replay syscall stream ended unexpectedly for recording {} on thread {} at event {} while the guest executed {:?}: {}",
+                self.data.display(),
+                thread,
+                next_count,
+                syscall,
+                source,
+            ),
+        };
 
         let actual_event = DebugEvent::new(syscall, &guest.memory());
         let exec_syscall = matches!(syscall, Syscall::Execve(_) | Syscall::Execveat(_));
@@ -2485,13 +2572,13 @@ impl Replayer {
         if normalize_unused_args(debug_event.syscall()) == normalize_unused_args(syscall)
             && debug_event.exec_request_matches(&actual_event)
         {
-            return;
+            return true;
         }
 
         if guest.is_root_thread() && !guest.thread_state().bootstrapped && exec_syscall {
             // The controller-visible replay bootstrap pathname is deliberately
             // substituted before injection and therefore differs here.
-            return;
+            return true;
         }
 
         let error = DesyncError {

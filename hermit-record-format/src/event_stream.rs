@@ -9,6 +9,7 @@
 use std::fmt;
 use std::fs;
 use std::io;
+use std::io::BufRead as _;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
@@ -385,6 +386,10 @@ pub struct EventReader {
 
     // The number of events read so far. Useful for debugging purposes.
     pub count: u64,
+
+    /// The number of events (not syscall records) read so far.
+    #[serde(default)]
+    pub events_read: u64,
 }
 
 fn default_reader() -> io::BufReader<fs::File> {
@@ -405,13 +410,60 @@ impl EventReader {
             reader,
             debug_events,
             count: 0,
+            events_read: 0,
         })
     }
 
     /// Reads the next event from the stream. Returns an error if there are no
     /// more events to consume.
     pub fn next_event(&mut self) -> Result<Event, bincode::error::DecodeError> {
-        bincode::serde::decode_from_std_read(&mut self.reader, bincode::config::legacy())
+        let event =
+            bincode::serde::decode_from_std_read(&mut self.reader, bincode::config::legacy())?;
+        self.events_read += 1;
+        Ok(event)
+    }
+
+    /// Reads the next event from the stream, or `None` when the stream ends
+    /// cleanly, at an event boundary. A recorder writes a call's events when
+    /// the call returns, so a stream that ends there was cut short by the
+    /// thread's death inside its last call. A stream that ends inside an event
+    /// is an error, as with `next_event`.
+    pub fn next_event_or_end(&mut self) -> Result<Option<Event>, bincode::error::DecodeError> {
+        match self.reader.fill_buf() {
+            Ok([]) => Ok(None),
+            Ok(_) => self.next_event().map(Some),
+            Err(inner) => Err(bincode::error::DecodeError::Io {
+                inner,
+                additional: 0,
+            }),
+        }
+    }
+
+    /// Whether every recorded syscall in the syscall stream has been read: the
+    /// call being replayed was this thread's last.
+    pub fn syscalls_exhausted(&mut self) -> io::Result<bool> {
+        Ok(self.debug_events.fill_buf()?.is_empty())
+    }
+
+    /// Whether every recorded event has been read.
+    pub fn events_exhausted(&mut self) -> io::Result<bool> {
+        Ok(self.reader.fill_buf()?.is_empty())
+    }
+
+    /// Reads the next syscall from the syscall stream, or `None` when the stream
+    /// ends cleanly, at a record boundary: the thread died in a call before the
+    /// recorder saw it. A stream that ends inside a record is an error.
+    pub fn next_debug_event_or_end(
+        &mut self,
+    ) -> Result<Option<DebugEvent>, bincode::error::DecodeError> {
+        match self.debug_events.fill_buf() {
+            Ok([]) => Ok(None),
+            Ok(_) => self.next_debug_event().map(Some),
+            Err(inner) => Err(bincode::error::DecodeError::Io {
+                inner,
+                additional: 0,
+            }),
+        }
     }
 
     /// Reads the next syscall from the syscall stream.
@@ -620,6 +672,70 @@ mod tests {
             .unwrap();
         let error = writer.finish().unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::ENOSPC), "{error}");
+    }
+
+    /// A stream that ends at an event boundary ends cleanly (`None`), as one
+    /// whose thread died inside its last call does; one that ends inside an
+    /// event is an error. The syscall stream says when the last call was read,
+    /// and ends cleanly too for a thread that died before the recorder saw its
+    /// call.
+    #[test]
+    fn a_stream_cut_at_an_event_boundary_ends_cleanly() {
+        use std::io::Write as _;
+
+        use super::DebugEvent;
+        use super::EventReader;
+        use super::EventWriter;
+        use crate::event::Event;
+        use crate::event::SyscallEvent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let id = EventStreamId::root();
+        {
+            let mut writer = EventWriter::create(dir.path(), &id).unwrap();
+            writer
+                .push_debug_event(DebugEvent::for_test(Sysno::read, "read"))
+                .unwrap();
+            writer
+                .push_event(Event {
+                    event: Ok(SyscallEvent::Return(3)),
+                })
+                .unwrap();
+            // The last call, which never returned: its syscall, no event.
+            writer
+                .push_debug_event(DebugEvent::for_test(Sysno::poll, "poll"))
+                .unwrap();
+        }
+        let mut reader = EventReader::open(dir.path(), &id).unwrap();
+        assert!(reader.next_debug_event_or_end().unwrap().is_some());
+        assert!(!reader.syscalls_exhausted().unwrap());
+        assert!(!reader.events_exhausted().unwrap());
+        assert!(matches!(
+            reader.next_event_or_end().unwrap(),
+            Some(Event {
+                event: Ok(SyscallEvent::Return(3))
+            })
+        ));
+        assert!(reader.events_exhausted().unwrap());
+        assert_eq!(reader.events_read, 1);
+        assert!(reader.next_debug_event_or_end().unwrap().is_some());
+        assert!(reader.syscalls_exhausted().unwrap());
+        assert!(reader.next_event_or_end().unwrap().is_none());
+        // A thread that died in a call before the recorder saw it.
+        assert!(reader.next_debug_event_or_end().unwrap().is_none());
+        assert_eq!(reader.count, 2);
+
+        // Two bytes of a further event: cut inside it.
+        let path = dir.path().join("thread").join(id.file_name());
+        fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(&[0, 0])
+            .unwrap();
+        let mut reader = EventReader::open(dir.path(), &id).unwrap();
+        assert!(reader.next_event_or_end().unwrap().is_some());
+        assert!(reader.next_event_or_end().is_err());
     }
 
     #[test]
