@@ -48478,7 +48478,11 @@ fn private_sigchld_epoll_and_other_wait_rows_under_record_and_replay() {
 /// native's line, except that under record the storm, whose sender sleeps on
 /// virtual time, may end before the waits do. `sigign` fails only under
 /// record: with SIGCHLD set to SIG_IGN the kernel sends nothing, and only the
-/// scheduler's own SIGCHLD reached the wait.
+/// scheduler's own SIGCHLD reached the wait. In `exit` the process exits while
+/// a thread is inside an `epoll_wait` with no timeout: the thread dies during
+/// its wait, under the shield, which then has no mask to put back. It is not
+/// recorded: replay does not yet serve a call that was still in flight at exit
+/// (the thread's recorded events end before it).
 #[test]
 fn kernel_run_epoll_waits_are_not_ended_by_ignored_signals() {
     let _lock = hermit_run_guard();
@@ -48491,7 +48495,7 @@ fn kernel_run_epoll_waits_are_not_ended_by_ignored_signals() {
         "--max-timeslice=disabled",
         "--no-virtualize-cpuid",
     ];
-    for mode in ["chld", "storm", "sigign", "alrm"] {
+    for mode in ["chld", "storm", "sigign", "alrm", "exit"] {
         let native = Command::new(guest)
             .arg(mode)
             .output()
@@ -48510,10 +48514,11 @@ fn kernel_run_epoll_waits_are_not_ended_by_ignored_signals() {
                 "sigign: 5 timed out, 0 ready, 0 EINTR, 0 other; late data: 1; mask as before: \
                  yes; 0 children\n"
             }
-            _ => {
+            "alrm" => {
                 "alrm: 0 timed out, 0 ready, 5 EINTR, 0 other, 5 alarms; mask as before in the \
                  handler: yes, after: yes\n"
             }
+            _ => "exit: a thread was still waiting\n",
         };
         assert_eq!(expected, pinned, "native {mode}");
         for flags in [&strict[..], &[], &["--no-sequentialize-threads"]] {
@@ -48523,6 +48528,9 @@ fn kernel_run_epoll_waits_are_not_ended_by_ignored_signals() {
             let output = hermit(&args);
             assert_success(&output, &args);
             assert_eq!(stdout(&output), expected, "{args:?}");
+        }
+        if mode == "exit" {
+            continue;
         }
         let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
             .expect("failed to create the recording data dir");

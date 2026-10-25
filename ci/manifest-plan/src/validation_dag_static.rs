@@ -3054,7 +3054,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // determinize_stat_nlink_pin_edges (directory st_nlink pinned to 1):
     // 2736 + 2 = 2738, listed.
     // And an_ignored_signal_shield_blocks_only_what_the_guest_ignores: 2739.
-    ("test.detcore_unit", 2739),
+    // And a_shield_dropped_with_its_handler_ends_quietly: 2740.
+    ("test.detcore_unit", 2740),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5338,7 +5339,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same P2b deletion of the anchor device unit: 2694, listed.
     // And the same two directory st_nlink units: 2738, listed.
     // And an_ignored_signal_shield_blocks_only_what_the_guest_ignores: 2739.
-    ("test.detcore_unit_on_host", 2739),
+    // And a_shield_dropped_with_its_handler_ends_quietly: 2740.
+    ("test.detcore_unit_on_host", 2740),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

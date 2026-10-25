@@ -17,11 +17,14 @@
 // the kernel.
 // "alrm": a 30 ms ITIMER_REAL with a SIGALRM handler interrupts each of five
 // 100 ms epoll_waits: EINTR.
+// "exit": a thread waits with no timeout while main returns, so the process
+// exits with the thread inside its wait.
 //
 // Every mode blocks SIGUSR2 first, and reports whether the thread's mask is
 // still exactly that after the waits (and, in "alrm", inside the handler).
 #define _GNU_SOURCE
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -163,6 +166,29 @@ static int storm_mode(int epfd) {
   return 0;
 }
 
+static int exit_epfd;
+
+static void *wait_forever(void *arg) {
+  (void)arg;
+  struct epoll_event ev;
+  epoll_wait(exit_epfd, &ev, 1, -1);
+  return NULL;
+}
+
+static int exit_mode(int epfd) {
+  exit_epfd = epfd;
+  pthread_t waiter;
+  if (pthread_create(&waiter, NULL, wait_forever, NULL) != 0) {
+    perror("pthread_create");
+    return 2;
+  }
+  struct timespec delay = {0, 50 * 1000 * 1000};
+  syscall(SYS_nanosleep, &delay, NULL);
+  printf("exit: a thread was still waiting\n");
+  fflush(stdout);
+  return 0;
+}
+
 static int alarm_mode(int epfd) {
   struct sigaction sa;
   memset(&sa, 0, sizeof sa);
@@ -205,6 +231,9 @@ int main(int argc, char **argv) {
   }
   if (strcmp(mode, "alrm") == 0) {
     return alarm_mode(epfd);
+  }
+  if (strcmp(mode, "exit") == 0) {
+    return exit_mode(epfd);
   }
   if (strcmp(mode, "sigign") == 0) {
     signal(SIGCHLD, SIG_IGN);
