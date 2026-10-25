@@ -57,6 +57,33 @@ fn yellow_msg(msg: &str) {
     eprintln!(":: {}", msg.yellow().bold());
 }
 
+/// What stack1 and stack2 of a `--prefix-search` report are, given the
+/// thread the target schedule runs at the deciding event (`chosen`) and the
+/// one the scheduler runs there without that event (`instead`, `None` when
+/// the run without it ended first). Two threads are a pair whose order
+/// decides the outcome. One thread is not a pair at all: the scheduler runs
+/// it there either way, so the report says so instead of calling the thread
+/// a race with itself.
+fn stack_pair_sentences(
+    chosen: detcore::types::DetTid,
+    instead: Option<detcore::types::DetTid>,
+) -> String {
+    if instead == Some(chosen) {
+        format!(
+            "stack1 and stack2 both belong to thread {chosen}: the scheduler runs it at that \
+             point with or without the event, so they are not two threads racing.\nWhat the \
+             event can change is how thread {chosen} runs from there, not which thread runs: look \
+             at what it does before another thread runs, and at that thread.\n"
+        )
+    } else {
+        "stack1 is the thread the target schedule runs at that point; stack2 is the thread that \
+         runs there instead when the scheduler continues without chaos.\nThe outcome depends on \
+         which of the two runs first: add synchronization that makes the order irrelevant, or \
+         that enforces the passing order.\n"
+            .to_owned()
+    }
+}
+
 /// The result of `--prefix-search`: replaying the first `decision` events of
 /// `schedule` and then scheduling without chaos misses the target, while
 /// replaying event `decision` too meets it.
@@ -220,7 +247,11 @@ impl AnalyzeOpts {
     /// then let the scheduler go on without chaos. The trial's record keeps
     /// the callback checkpoints within the prefix
     /// ([`PreemptionRecord::schedule_prefix`]), so its slices end where the
-    /// recording's did.
+    /// recording's did, all but the one running at the prefix's end: where
+    /// that slice ends decides what runs next, which is event `len`'s
+    /// decision. A trial that replayed it would already make that decision,
+    /// and the search would name the event before it, with the thread that
+    /// ran up to it on both sides of the pair.
     fn prefix_trial(
         &self,
         runname: &str,
@@ -411,12 +442,10 @@ impl AnalyzeOpts {
             schedule.schedevents()[decision],
             self.display_criteria()
         );
-        header.push_str(
-            "stack1 is the thread the target schedule runs at that point; stack2 is the thread \
-             that runs there instead when the scheduler continues without chaos.\nThe outcome \
-             depends on which of the two runs first: add synchronization that makes the order \
-             irrelevant, or that enforces the passing order.\n",
-        );
+        header.push_str(&stack_pair_sentences(
+            schedule.schedevents()[decision].dettid,
+            continued.get(decision).map(|event| event.dettid),
+        ));
         let context = Self::generate_context(
             schedule.schedevents(),
             decision.max(1),
@@ -1440,9 +1469,10 @@ mod tests {
     }
 
     /// A `--prefix-search` trial replays the target record's first events
-    /// together with the callback checkpoints those events reach, so its
-    /// slices end where the recording's did; a checkpoint past the prefix is
-    /// dropped.
+    /// together with the callback checkpoints of the slices those events
+    /// end, so its slices end where the recording's did; a checkpoint past
+    /// the prefix is dropped, and so is the one at its end while an event
+    /// follows: that slice end is the next event's decision.
     #[test]
     fn a_prefix_trial_keeps_the_target_checkpoints_within_its_prefix() {
         let parent = tempfile::tempdir().unwrap();
@@ -1450,9 +1480,9 @@ mod tests {
         let mut options =
             AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
         options.phase0_initialize().unwrap();
-        let branches = |count: u32| {
+        let branches = |tid: i32, count: u32| {
             serde_json::json!({
-                "dettid": 3, "op": "Branch", "count": count,
+                "dettid": tid, "op": "Branch", "count": count,
                 "start_rip": null, "end_rip": null, "end_time": null
             })
         };
@@ -1466,31 +1496,71 @@ mod tests {
             })
         };
         let target: PreemptionRecord = serde_json::from_value(serde_json::json!({
-            "per_thread": {"3": {
-                "final_prio": 1000,
-                "prio_changes": [[100, 1000], [200, 1000]],
-                "preemption_rcbs": [10, 15]
-            }},
-            "global": [branches(10), branches(5)],
-            "callback_checkpoints": {"3": [checkpoint(0, 10, 100), checkpoint(1, 15, 200)]}
+            "per_thread": {
+                "3": {
+                    "final_prio": 1000,
+                    "prio_changes": [[100, 1000], [300, 1000]],
+                    "preemption_rcbs": [10, 15]
+                },
+                "5": {"final_prio": 1000, "prio_changes": [[200, 1000]], "preemption_rcbs": [4]}
+            },
+            "global": [branches(3, 10), branches(5, 4), branches(3, 5)],
+            "callback_checkpoints": {
+                "3": [checkpoint(0, 10, 100), checkpoint(1, 15, 300)],
+                "5": [checkpoint(0, 4, 200)]
+            }
         }))
         .unwrap();
         target.validate().unwrap();
-        for (len, kept) in [(0, 0), (1, 1), (2, 2)] {
+        for (len, kept) in [(0, 0), (1, 0), (2, 1), (3, 3)] {
             let mut run = options.prefix_trial("prefix_round", &target, len).unwrap();
             let written: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(run.sched_path_in()).unwrap())
                     .unwrap();
             assert_eq!(written["global"].as_array().unwrap().len(), len);
-            let points = written["callback_checkpoints"]["3"]
-                .as_array()
-                .map_or(0, |points| points.len());
+            let points: usize = ["3", "5"]
+                .iter()
+                .map(|tid| {
+                    written["callback_checkpoints"][tid]
+                        .as_array()
+                        .map_or(0, |points| points.len())
+                })
+                .sum();
             assert_eq!(points, kept, "prefix of {len}: {written}");
             PreemptionReader::new(run.sched_path_in())
                 .load_all()
                 .validate()
                 .unwrap();
         }
+    }
+
+    /// The sentences a `--prefix-search` report gives its stacks present two
+    /// threads at the deciding event as the pair whose order decides the
+    /// outcome, and one thread, which the scheduler runs there without the
+    /// event too, as that one thread: never as a race with itself.
+    #[test]
+    fn a_prefix_report_says_when_both_stacks_are_one_thread() {
+        let (reader, binder) = (
+            detcore::types::DetTid::from_raw(7),
+            detcore::types::DetTid::from_raw(9),
+        );
+        let pair = stack_pair_sentences(binder, Some(reader));
+        assert!(
+            pair.contains("stack2 is the thread that runs there instead"),
+            "{pair}"
+        );
+        assert!(pair.contains("which of the two runs first"), "{pair}");
+
+        let one = stack_pair_sentences(reader, Some(reader));
+        assert!(one.contains("both belong to thread 7"), "{one}");
+        assert!(one.contains("not two threads racing"), "{one}");
+        for race in ["runs there instead", "which of the two runs first"] {
+            assert!(!one.contains(race), "{race:?} in\n{one}");
+        }
+
+        // A run without the event that ended before it keeps the usual
+        // sentences: its stack2 is empty, and a warning says why.
+        assert_eq!(stack_pair_sentences(reader, None), pair);
     }
 
     /// `--tmp-dir` names the directory the workspace is created in, and is
