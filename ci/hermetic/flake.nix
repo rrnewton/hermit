@@ -126,6 +126,7 @@
         pname = "hermit-native-exec-coreutils";
         env = (previous.env or {}) // {
           NIX_DONT_SET_RPATH_x86_64_unknown_linux_gnu = "1";
+          NIX_NO_SELF_RPATH = "1";
         };
         postFixup = (previous.postFixup or "") + ''
           for program in nice echo; do
