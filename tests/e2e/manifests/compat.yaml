@@ -1474,6 +1474,9 @@ corpus:
     # cells run): 10 of 10 with four runs at once. mountpoint joined once
     # Detcore rendered /proc/<pid>/mountinfo from the container mount table
     # (K3a of https://github.com/rrnewton/hermit/issues/4213): 10 of 10.
+    # kill, lsirq, lsmod and sysctl-random-uuid joined after running clean,
+    # 3 of 3, on each of the five nightly pressure sweeps from 2026-10-21 to
+    # 2026-10-25 (Hermit 9b30cb9a to 7903351d).
     - backend: kvm
       rows:
         [
@@ -1486,8 +1489,8 @@ corpus:
           expr, factor, fallocate, fgrep, file, find, findmnt, flex,
           fmt, fold, free, "g++", gcc, gcov, getconf, getopt, git, gprof, grep,
           groups, gzip, gzip-roundtrip, head, hexdump, hostname, iconv, id,
-          install, ionice, iostat, ip, join, jq, ld, ln, logger, logname, ls,
-          lscpu, lua, lua-direct, m4, make, md5sum, mkdir, mkfifo, mktemp,
+          install, ionice, iostat, ip, join, jq, kill, ld, ln, logger, logname, ls,
+          lscpu, lsirq, lsmod, lua, lua-direct, m4, make, md5sum, mkdir, mkfifo, mktemp,
           mountpoint, mpstat-softirqs, msgfmt, msgunfmt, mv, namei, netlink-route,
           netlink-sock-diag, nice, nl, nm, node, nohup, nproc, numactl-hardware,
           numastat, numfmt, objcopy, objdump, od, openssl, paste, patch,
@@ -1496,7 +1499,7 @@ corpus:
           realpath, rev, rm, rmdir, ruby, sar-resource-tables, sed, seq,
           setfacl, setfattr, sha1sum, sha224sum, sha256sum, sha384sum,
           sha512sum, shell-build, shred, shuf, size, sleep, sort, split,
-          sqlite3, ss, stat, stdbuf, strings, strip, sum, sync, tac, tar,
+          sqlite3, ss, stat, stdbuf, strings, strip, sum, sync, sysctl-random-uuid, tac, tar,
           tar-roundtrip, taskset, tcl, tee, test, time, timeout, top, touch, tr,
           "true", truncate, tsort, tty, uname, unexpand, uniq, uptime, users,
           uuidgen, vmstat, wc, wc-lines, wget-localhost, whoami, xmllint, xxd,
@@ -1597,19 +1600,7 @@ corpus:
         4 runs; ptrace passes 3 of 3
       rows:
         [
-          iostat, mpstat-softirqs
-        ]
-    - backend: ptrace
-      result: crash-error
-      evidence: https://github.com/rrnewton/hermit/issues/3789
-      reason: >-
-        Detcore panics with "signal_guest: thread should be parked in the
-        scheduler" while timeout waits in rt_sigsuspend for its child (1 of
-        1 in the validation of 57883eff8); locally 1 of 40 runs diverged at
-        the same rt_sigsuspend
-      rows:
-        [
-          timeout
+          iostat
         ]
   # The rr run type (scripts/validate.rs --rr-compat-only): every program
   # the rr lane listed as passing record/replay (its 139

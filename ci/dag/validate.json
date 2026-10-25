@@ -11194,6 +11194,20 @@
           "category": "c-programs",
           "test": "c-programs/userfaultfd-self-service",
           "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/userfaultfd-self-service",
+          "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/userfaultfd-self-service",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -13846,6 +13860,13 @@
           "category": "compat",
           "test": "compat/kill",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/kill",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -14014,6 +14035,13 @@
           "category": "compat",
           "test": "compat/lsirq",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/lsirq",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -14036,6 +14064,13 @@
           "test": "compat/lsmod",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/lsmod",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -16024,6 +16059,13 @@
           "test": "compat/sysctl-random-uuid",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sysctl-random-uuid",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -18854,6 +18896,13 @@
           "category": "compat",
           "test": "compat/kill",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/kill",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -18988,6 +19037,13 @@
           "test": "compat/lsirq",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/lsirq",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -19002,6 +19058,13 @@
           "test": "compat/lsmod",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/lsmod",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -20640,6 +20703,13 @@
           "test": "compat/sysctl-random-uuid",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sysctl-random-uuid",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -23291,6 +23361,13 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/mpstat-softirqs",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/node",
           "mode": "verify",
           "backend": "ptrace"
@@ -23483,6 +23560,13 @@
           "test": "compat/test",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/timeout",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "lane": "portable",
@@ -62380,6 +62464,20 @@
           "category": "c-programs",
           "test": "c-programs/userfaultfd-self-service",
           "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/userfaultfd-self-service",
+          "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/userfaultfd-self-service",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -65015,6 +65113,13 @@
           "category": "compat",
           "test": "compat/kill",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/kill",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -65183,6 +65288,13 @@
           "category": "compat",
           "test": "compat/lsirq",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/lsirq",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
@@ -65205,6 +65317,13 @@
           "test": "compat/lsmod",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/lsmod",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -67193,6 +67312,13 @@
           "test": "compat/sysctl-random-uuid",
           "mode": "verify",
           "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sysctl-random-uuid",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
