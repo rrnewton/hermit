@@ -3040,6 +3040,12 @@ pub enum ObservedResult {
     Oom,
     SandboxDenied,
     InfrastructureError,
+    /// A chaos cell whose every attempt matched, failed by its own population
+    /// floor (`assert.min_distinct`, `min_passes`, `min_failures` or
+    /// `min_normalized_entropy`): the schedules no longer expose what the cell
+    /// exists to observe. No attempt crashed, so it is not a crash-error, and
+    /// none diverged, so it is not a determinism failure.
+    ChaosFloorFailure,
 }
 
 impl ObservedResult {
@@ -3052,6 +3058,7 @@ impl ObservedResult {
             "crash-error" => Ok(Self::CrashError),
             "timeout" => Ok(Self::Timeout),
             "oom" => Ok(Self::Oom),
+            "chaos-floor-failure" => Ok(Self::ChaosFloorFailure),
             "sandbox-denied" => Err(
                 "pressure summary contains a sandbox-denied operation; refusing to store it as product behavior"
                     .into(),
@@ -3075,6 +3082,7 @@ impl ObservedResult {
             Self::Oom => "oom",
             Self::SandboxDenied => "sandbox-denied",
             Self::InfrastructureError => "infrastructure-error",
+            Self::ChaosFloorFailure => "chaos-floor-failure",
         }
     }
 
@@ -3091,7 +3099,8 @@ impl ObservedResult {
             Self::DeterminismFailure
             | Self::ParityFailure
             | Self::ReplayFailure
-            | Self::CrashError => Some(FailureClass::ProductFailure),
+            | Self::CrashError
+            | Self::ChaosFloorFailure => Some(FailureClass::ProductFailure),
             Self::Timeout | Self::Oom => Some(FailureClass::NoResult),
             Self::SandboxDenied | Self::InfrastructureError => {
                 Some(FailureClass::UnderstoodInfrastructureFailure)
@@ -8334,6 +8343,29 @@ fn observed_result(
     typed
 }
 
+/// A chaos cell that its population floor failed while every attempt matched
+/// is [`ObservedResult::ChaosFloorFailure`], not the crash-error
+/// [`observed_result`] would infer from the FAIL alone, which no attempt
+/// supports (the stress series refused such rows: "framework result has no
+/// supporting canonical typed attempt"). Any other result is kept: a
+/// divergence, a timeout, a crash an attempt does support, or a framework
+/// failure.
+fn chaos_floor_result(
+    result: Option<ObservedResult>,
+    floor_failed: bool,
+    attempts: &[AttemptResult],
+) -> Option<ObservedResult> {
+    let every_attempt_matched = !attempts.is_empty()
+        && attempts
+            .iter()
+            .all(|attempt| verification_verdict(attempt) == Some(Verdict::Matched));
+    if floor_failed && every_attempt_matched && result == Some(ObservedResult::CrashError) {
+        Some(ObservedResult::ChaosFloorFailure)
+    } else {
+        result
+    }
+}
+
 fn observed_result_from_typed_evidence(
     mode: &str,
     outcome: &str,
@@ -8897,6 +8929,7 @@ fn run_cell_inner(
         outcome = "FAIL".into();
         reason = Some(format!("custom observed {distinct} distinct outcomes"));
     }
+    let mut chaos_floor_failed = false;
     if cell.id.mode == "chaos" {
         let assert = mode.assert.as_ref().cloned().unwrap_or_default();
         let (pass_count, failure_count, timed_out_count) = chaos_population_counts(attempts);
@@ -8935,6 +8968,7 @@ fn run_cell_inner(
                 .min_normalized_entropy
                 .is_some_and(|minimum| normalized_entropy < minimum)
         {
+            chaos_floor_failed = outcome != "ERROR";
             apply_failed_chaos_assertion(
                 &mut outcome,
                 &mut reason,
@@ -8985,7 +9019,11 @@ fn run_cell_inner(
         error_kind = Some("infrastructure".into());
         reason = Some("Hermit binary changed while the cell was executing".into());
     }
-    let result = observed_result(&cell.id.mode, &outcome, attempts, error_kind.as_deref());
+    let result = chaos_floor_result(
+        observed_result(&cell.id.mode, &outcome, attempts, error_kind.as_deref()),
+        chaos_floor_failed,
+        attempts,
+    );
     let failure_class = failure_class(&outcome, result, error_kind.as_deref());
     let cpu_usage_usec = attempts
         .iter()
@@ -20762,6 +20800,54 @@ backends_disabled:
         sandbox_denied
             .require_current_classification()
             .expect("typed sandbox denial is a current non-product result");
+    }
+
+    /// A chaos cell its population floor failed while every attempt matched
+    /// is a chaos-floor failure: a product failure no attempt contradicts,
+    /// where the FAIL alone would have been inferred a crash-error that no
+    /// attempt supports. A divergence, an attempt that did not match, or a
+    /// FAIL the floor did not cause keeps its own result.
+    #[test]
+    fn a_chaos_floor_failure_over_matched_attempts_is_named_not_a_crash() {
+        let mut matched = attempt_with_sabre_evidence("");
+        matched.verification_report =
+            Some(serde_json::to_string(&canonical_verification_report()).unwrap());
+        let attempts = vec![matched.clone(), matched.clone()];
+        let inferred = observed_result("chaos", "FAIL", &attempts, None);
+        assert_eq!(inferred, Some(ObservedResult::CrashError));
+        assert_eq!(
+            chaos_floor_result(inferred, true, &attempts),
+            Some(ObservedResult::ChaosFloorFailure)
+        );
+        assert_eq!(
+            ObservedResult::ChaosFloorFailure.failure_class(),
+            Some(FailureClass::ProductFailure)
+        );
+        // Not caused by the floor: unchanged.
+        assert_eq!(chaos_floor_result(inferred, false, &attempts), inferred);
+        // An attempt without a matched report: the crash stands.
+        let mut unmatched = matched.clone();
+        unmatched.verification_report = None;
+        let mixed = vec![matched.clone(), unmatched];
+        assert_eq!(
+            chaos_floor_result(inferred, true, &mixed),
+            Some(ObservedResult::CrashError)
+        );
+        // A divergence keeps its own result.
+        let mut report = canonical_verification_report();
+        report.verified = false;
+        report.bitwise_parity = false;
+        report.verdict = Verdict::Diverged;
+        let mut diverged = matched.clone();
+        diverged.verification_report = Some(serde_json::to_string(&report).unwrap());
+        let with_divergence = vec![matched, diverged];
+        let divergence = observed_result("chaos", "FAIL", &with_divergence, None);
+        assert_eq!(divergence, Some(ObservedResult::DeterminismFailure));
+        assert_eq!(
+            chaos_floor_result(divergence, true, &with_divergence),
+            Some(ObservedResult::DeterminismFailure)
+        );
+        assert_eq!(chaos_floor_result(None, true, &attempts), None);
     }
 
     #[test]
