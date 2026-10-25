@@ -14,6 +14,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
+mod cmake_source;
+
 const DYNAMORIO_FILES: &[&str] = &[
     "bin64/drrun",
     "lib64/release/libdynamorio.so",
@@ -252,11 +254,13 @@ fn build_dbt_client(
     dynamorio_cmake: &Path,
 ) {
     let source = reverie_dbt::native_client_source_dir().join("client.c");
-    let build = build_root.join("dbt-client");
+    let (cmake_source, build) =
+        cmake_source::source_and_build_dir(&manifest_dir.join("native-client"), build_root)
+            .expect("failed to resolve the native-client CMake source");
     run(
         Command::new("cmake")
             .arg("-S")
-            .arg(manifest_dir.join("native-client"))
+            .arg(&cmake_source)
             .arg("-B")
             .arg(&build)
             .arg("-DCMAKE_BUILD_TYPE=Release")
@@ -368,6 +372,7 @@ fn build_liteinst_runtime(
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=cmake_source.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-env-changed=HERMIT_INSTALL_FORCE_RESTAGE");
     println!("cargo:rerun-if-changed=../scripts/stage-liteinst-runtime.sh");
