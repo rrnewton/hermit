@@ -4558,6 +4558,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // N3 adds twelve cli cases, measured at its base (763 + 12 = 775 in
     // its tight loop): 764 + 12 = 776.
     ("test.cli", 776),
+    // And sixteen tests of the declared-ISA refusal and --cpu-profile auto
+    // (https://github.com/rrnewton/hermit/issues/4695), none matching a
+    // --skip: 627, listed.
+    ("test.cli", 627),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5177,6 +5181,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
     // The same four typedlog units: 1947 + 4 = 1951 (carried).
     ("test.regular_crates_on_host", 1951),
+    // And the sixteen declared-ISA and --cpu-profile auto tests, none
+    // excluded: 546, by selection.
+    ("test.cli_on_host", 546),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
