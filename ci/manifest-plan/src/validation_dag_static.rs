@@ -3071,7 +3071,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_fatal_delivery_does_not_take_a_reused_thread_id_from_another_process,
     // a_fatal_delivery_retires_nothing_where_it_cannot_commit_the_group_end):
     // 2814, listed.
-    ("test.detcore_unit", 2814),
+    // And syscalls::threads' only_an_unblocked_default_fatal_delivery_ends_the_process
+    // and only_serialized_ptrace_runs_without_a_gdbserver_retire_at_a_fatal_delivery,
+    // and tool_global::tests::fatal_delivery_tests'
+    // a_retired_siblings_late_request_stays_unanswered: 2817, listed.
+    ("test.detcore_unit", 2817),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5387,7 +5391,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
     // And the same three fatal-delivery retirement units: 2814, listed.
-    ("test.detcore_unit_on_host", 2814),
+    // And the same three fatal-delivery predicate and late-request units:
+    // 2817, listed.
+    ("test.detcore_unit_on_host", 2817),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

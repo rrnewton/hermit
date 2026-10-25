@@ -21,9 +21,14 @@
  *   term    raise(3) of SIGTERM: a terminating default action.
  *   segv    a store through a null pointer: a SIGSEGV Linux forces.
  *
- * With a second argument, `forked`, a child process does all of this and the
- * process Hermit starts reports how the child ended and exits 0, so that
- * `--verify` can compare two runs of it.
+ * A second argument changes the shape:
+ *
+ *   forked    a child process does all of this, and the process Hermit
+ *             starts reports how the child ended and exits 0, so that
+ *             `--verify` can compare two runs of it.
+ *   sleeping  once counted, each waiter sleeps in a loop of 1 ms nanosleeps
+ *             instead of waiting on the condition variable, so the threads
+ *             the delivery ends are in timed waits.
  *
  * Every line printed is fixed.
  */
@@ -47,12 +52,19 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t never = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t counted = PTHREAD_COND_INITIALIZER;
 static int waiting;
+static int sleeping;
 
 static void* waiter(void* unused) {
   (void)unused;
   pthread_mutex_lock(&lock);
   waiting++;
   pthread_cond_signal(&counted);
+  if (sleeping) {
+    pthread_mutex_unlock(&lock);
+    for (;;) {
+      usleep(1000);
+    }
+  }
   for (;;) {
     pthread_cond_wait(&never, &lock);
   }
@@ -97,7 +109,7 @@ static int run_threads(const char* mode) {
 }
 
 static int usage(const char* program) {
-  fprintf(stderr, "usage: %s abort|term|segv [forked]\n", program);
+  fprintf(stderr, "usage: %s abort|term|segv [forked|sleeping]\n", program);
   return 64;
 }
 
@@ -111,6 +123,10 @@ int main(int argc, char** argv) {
     return usage(argv[0]);
   }
   if (argc == 2) {
+    return run_threads(mode);
+  }
+  if (strcmp(argv[2], "sleeping") == 0) {
+    sleeping = 1;
     return run_threads(mode);
   }
   if (strcmp(argv[2], "forked") != 0) {

@@ -4279,10 +4279,10 @@ impl GlobalState {
             GlobalRequest::HandOffTurn => {
                 R::HandOffTurn(self.lock_rpc_scheduler(false).await.hand_off_turn(dtid))
             }
-            GlobalRequest::CommitFatalDelivery => R::CommitFatalDelivery(
+            GlobalRequest::CommitFatalDelivery(retire_others) => R::CommitFatalDelivery(
                 self.lock_rpc_scheduler(false)
                     .await
-                    .commit_fatal_delivery(dtid),
+                    .commit_fatal_delivery(dtid, retire_others),
             ),
             GlobalRequest::TouchFile(ino) => R::TouchFile(self.recv_touch_file(from, ino).await),
             GlobalRequest::SetFileMtime(ino, mtime) => {
@@ -6999,8 +6999,10 @@ pub enum GlobalRequest {
     /// (`Scheduler::hand_off_turn`).
     HandOffTurn,
     /// The calling thread is delivering a signal whose default action ends
-    /// its process (`Scheduler::commit_fatal_delivery`).
-    CommitFatalDelivery,
+    /// its process (`Scheduler::commit_fatal_delivery`), and whether the
+    /// kernel carries that action out when it resumes the thread, so the
+    /// process's other threads may be retired now.
+    CommitFatalDelivery(bool),
 
     /// Bump mtime
     TouchFile(RawInode),
@@ -9621,15 +9623,16 @@ where
 }
 
 /// Commit that the calling thread is delivering a signal whose default action
-/// ends its process (`Scheduler::commit_fatal_delivery`). Returns whether the
-/// process's other threads were retired.
-pub async fn commit_fatal_delivery<G, T>(guest: &mut G) -> bool
+/// ends its process (`Scheduler::commit_fatal_delivery`), retiring the
+/// process's other threads when `retire_others`. Returns whether any was
+/// retired.
+pub async fn commit_fatal_delivery<G, T>(guest: &mut G, retire_others: bool) -> bool
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
     matches!(
-        send_and_update_time(guest, GlobalRequest::CommitFatalDelivery)
+        send_and_update_time(guest, GlobalRequest::CommitFatalDelivery(retire_others))
             .await
             .1,
         GlobalResponse::CommitFatalDelivery(true)
@@ -12184,6 +12187,7 @@ mod tests {
     mod comm_alias_open_tests;
     mod exec_identity_tests;
     mod exec_teardown_tests;
+    mod fatal_delivery_tests;
     mod gated_wait_turn_tests;
     mod guest_mask_publication_tests;
     mod sigkill_deregistration_tests;

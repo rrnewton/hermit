@@ -36372,15 +36372,16 @@ fn a_guest_or_child_killed_by_a_realtime_signal_reports_it() {
 /// signal's default action (`tests/c/fatal_signal_futex_waiters.c`): abort(3),
 /// raise(3) of SIGTERM, and a forced SIGSEGV. Linux kills the whole thread
 /// group at that delivery, so Hermit ends with the guest's signal and the
-/// guest's output: under `run`, under a chaos `run` recording its schedule,
-/// whose replay follows it with no desynchronized event, and, for abort(3),
-/// under `record start`, whose recording replays to the same end. Before, the
-/// parked threads left the scheduler only at their own host-timed exit
-/// reports, and one that came after the delivering thread's made the empty run
-/// queue read as a deadlock: Hermit exited 125 (`container-child-exit`) and
-/// wrote no schedule. The same end in a forked child, which its parent
-/// reports, verifies at bitwise parity; before, the parked threads' removals
-/// interleaved with the parent's turns at host-chosen points.
+/// guest's output: under a chaos `run` recording its schedule, whose replay
+/// follows it with no desynchronized event, and, for abort(3), under `record
+/// start`, whose recording replays to the same end. Before, the parked
+/// threads left the scheduler only at their own host-timed exit reports, and
+/// one that came after the delivering thread's made the empty run queue read
+/// as a deadlock: Hermit exited 125 (`container-child-exit`) and wrote no
+/// schedule. The run verifies at bitwise parity, with the other threads in
+/// futex waits and, `sleeping`, in timed sleeps, and so does the same end in
+/// a forked child, which its parent reports; before, the threads' removals
+/// interleaved with the turns that followed at host-chosen points.
 #[test]
 fn a_default_fatal_signal_ends_a_process_whose_other_threads_wait_on_a_futex() {
     use std::os::unix::process::ExitStatusExt;
@@ -36406,8 +36407,37 @@ fn a_default_fatal_signal_ends_a_process_whose_other_threads_wait_on_a_futex() {
         let record = format!("--record-preemptions-to={schedule}");
         let replay = format!("--replay-schedule-from={schedule}");
         let summary_json = format!("--summary-json={summary}");
+        let printed = format!("3 waiters blocked, ending by {mode}\n");
+        for shape in ["", "sleeping"] {
+            let report = path(&format!("verify{shape}.json"));
+            let mut args = vec![
+                "run",
+                "--strict",
+                "--verify",
+                "--verify-strict",
+                "--verify-allow=failure",
+                "--verify-json",
+                &report,
+                "--",
+                guest,
+                mode,
+            ];
+            args.extend((!shape.is_empty()).then_some(shape));
+            let output = hermit(&args);
+            let log = stderr(&output);
+            assert_eq!(
+                output.status.signal(),
+                Some(signal),
+                "hermit {args:?} ended with {}:\n{log}",
+                output.status
+            );
+            assert_eq!(stdout(&output), printed, "hermit {args:?}:\n{log}");
+            assert_bitwise_parity(&report, &format!("{mode} {shape}"));
+            let report: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
+            assert_eq!(report["guest_signal"], signal, "{mode} {shape}: {report}");
+        }
         let mut runs = vec![
-            vec!["run", "--strict", "--", guest, mode],
             vec![
                 "run", "--strict", "--chaos", "--seed=5", &record, "--", guest, mode,
             ],
@@ -36425,7 +36455,6 @@ fn a_default_fatal_signal_ends_a_process_whose_other_threads_wait_on_a_futex() {
             ]);
             runs.push(vec!["replay", "--autopilot", "--data-dir", &data]);
         }
-        let printed = format!("3 waiters blocked, ending by {mode}\n");
         for args in &runs {
             let output = hermit(args);
             let log = stderr(&output);
@@ -36445,7 +36474,7 @@ fn a_default_fatal_signal_ends_a_process_whose_other_threads_wait_on_a_futex() {
             serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
         assert_eq!(summary["schedevent_desynced"], 0, "{mode}: {summary}");
 
-        let report = path("verify.json");
+        let report = path("verify-forked.json");
         let args = [
             "run",
             "--strict",
@@ -36464,16 +36493,22 @@ fn a_default_fatal_signal_ends_a_process_whose_other_threads_wait_on_a_futex() {
             stdout(&output),
             format!("{printed}child ended by signal {signal}\n")
         );
-        let report: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&report).unwrap()).unwrap();
-        let compared = &report["compared_log_messages"];
-        assert_eq!(report["bitwise_parity"], true, "{mode}: {report}");
-        assert!(
-            compared["left"].as_u64().is_some_and(|left| left > 0)
-                && compared["left"] == compared["right"],
-            "{mode}: {report}"
-        );
+        assert_bitwise_parity(&report, &format!("{mode} forked"));
     }
+}
+
+/// The `--verify-json` report at `path` says bitwise parity, with the same
+/// nonzero number of INFO records compared on each side.
+fn assert_bitwise_parity(path: &str, case: &str) {
+    let report: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    let compared = &report["compared_log_messages"];
+    assert_eq!(report["bitwise_parity"], true, "{case}: {report}");
+    assert!(
+        compared["left"].as_u64().is_some_and(|left| left > 0)
+            && compared["left"] == compared["right"],
+        "{case}: {report}"
+    );
 }
 
 /// The KVM twin of

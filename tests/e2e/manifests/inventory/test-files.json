@@ -526,7 +526,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/fatal_signal_futex_waiters.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/fatal_signal_futex_waiters.c is owned by hermit-cli/tests/cli.rs: a_default_fatal_signal_ends_a_process_whose_other_threads_wait_on_a_futex compiles this guest, whose last thread ends the process by abort(3), raise(SIGTERM) or a null store while every other thread is parked in a futex wait, and requires Hermit to end with that signal and the guest's output under run, a chaos run recording its schedule and that schedule's replay, and record start and its replay, and a forked copy to verify at bitwise parity; it stays a fixture because a generic manifest cannot require a signal exit status, a schedule replay with no desynchronized event, and a recording replay in one case."
+      "why": "tests/c/fatal_signal_futex_waiters.c is owned by hermit-cli/tests/cli.rs: a_default_fatal_signal_ends_a_process_whose_other_threads_wait_on_a_futex compiles this guest, whose last thread ends the process by abort(3), raise(SIGTERM) or a null store while every other thread is parked in a futex wait, and requires Hermit to end with that signal and the guest's output under a chaos run recording its schedule and that schedule's replay, and record start and its replay, and the run to verify at bitwise parity with the other threads in futex waits or (sleeping) in timed sleeps, as does a forked copy; it stays a fixture because a generic manifest cannot require a signal exit status, a schedule replay with no desynchronized event, and a recording replay in one case."
     },
     {
       "disposition": "integration-fixture",
