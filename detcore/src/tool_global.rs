@@ -6195,6 +6195,7 @@ impl GlobalState {
                     reads_signalfd: false,
                     read_fd: None,
                     polls_guest_state_only: false,
+                    polls_a_named_fifo: false,
                     relies_on_guest_held_marks: false,
                     passes_descriptors_out: false,
                     waits_until_nothing_else_can_run: false,

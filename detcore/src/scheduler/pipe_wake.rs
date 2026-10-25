@@ -50,6 +50,7 @@ impl Scheduler {
     /// or a delivered fatal signal. Such a thread may leave the scheduler at a
     /// host-timed moment, so neither the scan below nor `--virtual-timeout`
     /// (`a_thread_can_still_be_granted`) may depend on whether it already has.
+    /// A thread of no known process counts as doomed.
     pub(super) fn thread_is_doomed(&self, tid: DetTid) -> bool {
         let Some(process) = self.thread_tree.thread_to_leader.get(&tid).copied() else {
             return true;
