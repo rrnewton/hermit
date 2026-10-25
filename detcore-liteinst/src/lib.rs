@@ -152,6 +152,9 @@ unsafe extern "C" fn detcore_liteinst_initialize_body() {
                 .unwrap_or_else(|error| {
                     fail(&format!("the launch bootstrap is unreadable: {error}"))
                 });
+            launch
+                .validate_runtime_features(cfg!(feature = "liteinst"))
+                .unwrap_or_else(|error| fail(&error));
             // SAFETY: as below.
             unsafe {
                 initialize_detcore(InitializationInputs {

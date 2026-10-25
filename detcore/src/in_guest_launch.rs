@@ -21,10 +21,13 @@ const MAGIC: &[u8] = b"HERMIT-LITEINST-LAUNCH-V1\0";
 const FORWARD: &str = "forward";
 const POLICY: &str = "policy";
 const FINGERPRINT: &str = "fingerprint";
+const REQUIRE_LITEINST: &str = "require-liteinst";
 
 /// Hermit's launch settings for one in-guest LiteInst run.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InGuestLaunch {
+    /// Require the absent-selector LiteInst default, without sealing a guest environment value.
+    pub require_liteinst: bool,
     /// The DETLOG forwarding socket, as
     /// [`crate::detlog::tool_output_env_value`] writes it.
     pub forward_request: Option<String>,
@@ -52,7 +55,21 @@ impl InGuestLaunch {
                 bytes.push(0);
             }
         }
+        if self.require_liteinst {
+            bytes.extend_from_slice(b"require-liteinst=1\0");
+        }
         bytes
+    }
+
+    /// Refuse an incompatible runtime before installing the Tool.
+    pub fn validate_runtime_features(&self, liteinst_available: bool) -> Result<(), String> {
+        if self.require_liteinst && !liteinst_available {
+            return Err(
+                "built without LiteInst; enable the `liteinst` Cargo feature to use site patching"
+                    .to_owned(),
+            );
+        }
+        Ok(())
     }
 
     /// Reads [`Self::encode`]'s bytes. Refuses another record, an unknown or
@@ -75,6 +92,13 @@ impl InGuestLaunch {
             let (name, value) = entry
                 .split_once('=')
                 .ok_or_else(|| format!("launch setting {entry:?} is not name=value"))?;
+            if name == REQUIRE_LITEINST {
+                if value != "1" || launch.require_liteinst {
+                    return Err("unreadable or repeated LiteInst runtime requirement".to_owned());
+                }
+                launch.require_liteinst = true;
+                continue;
+            }
             let slot = match name {
                 FORWARD => &mut launch.forward_request,
                 POLICY => &mut launch.forward_policy,
@@ -98,6 +122,7 @@ mod tests {
         for launch in [
             InGuestLaunch::default(),
             InGuestLaunch {
+                require_liteinst: true,
                 forward_request: Some("7:12345:67890".to_owned()),
                 forward_policy: Some("info,detcore::random=warn".to_owned()),
                 coordinator_fingerprint: Some("9349c85b2c48fc92".to_owned()),
@@ -119,8 +144,44 @@ mod tests {
         unknown.extend_from_slice(b"colour=blue\0");
         let mut unterminated = MAGIC.to_vec();
         unterminated.extend_from_slice(b"policy=a");
-        for bytes in [&b"REVERIE-LI-V1"[..], &repeated, &unknown, &unterminated] {
+        let mut invalid_requirement = MAGIC.to_vec();
+        invalid_requirement.extend_from_slice(b"require-liteinst=0\0");
+        let mut repeated_requirement = MAGIC.to_vec();
+        repeated_requirement.extend_from_slice(b"require-liteinst=1\0require-liteinst=1\0");
+        for bytes in [
+            &b"REVERIE-LI-V1"[..],
+            &repeated,
+            &unknown,
+            &unterminated,
+            &invalid_requirement,
+            &repeated_requirement,
+        ] {
             assert!(InGuestLaunch::decode(bytes).is_err(), "{bytes:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod runtime_feature_requirement_tests {
+    use super::InGuestLaunch;
+
+    #[test]
+    fn liteinst_intent_refuses_a_trap_only_runtime_independently_of_environment() {
+        let required = InGuestLaunch {
+            require_liteinst: true,
+            ..Default::default()
+        };
+        assert!(required.validate_runtime_features(false).is_err());
+        assert!(required.validate_runtime_features(true).is_ok());
+        assert!(
+            InGuestLaunch::default()
+                .validate_runtime_features(false)
+                .is_ok()
+        );
+        assert!(
+            InGuestLaunch::default()
+                .validate_runtime_features(true)
+                .is_ok()
+        );
     }
 }
