@@ -587,11 +587,14 @@ fn remaining_sleep_duration(target: LogicalTime, now: LogicalTime) -> Duration {
 
 impl<T: RecordOrReplay> Detcore<T> {
     /// Convenience function for constructing a sleep request with a nanosecond offset from "now".
+    /// A zero offset marks the request a zero-length sleep (`Resources::zero_length_sleep`).
     pub async fn sleep_request<G: Guest<Self>>(guest: &mut G, ns_delta: Duration) -> Resources {
         let base_time = thread_observe_time(guest).await;
         let target_time = base_time + ns_delta;
         let resource = ResourceID::SleepUntil(target_time);
-        guest.thread_state().mk_request(resource, Permission::W)
+        let mut request = guest.thread_state().mk_request(resource, Permission::W);
+        request.zero_length_sleep = ns_delta.is_zero();
+        request
     }
 
     /// Convenience function for constructing a sleep request with a absolute nanosecond value from the realtime clock.
