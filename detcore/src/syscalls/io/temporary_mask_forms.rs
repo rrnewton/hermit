@@ -314,32 +314,425 @@ where
     Some((started_at, started_at + timeout))
 }
 
-/// Round-3 ruling 1: the at-entry set of a wait's first check
-/// (`temporary_mask_check`'s `entry`). The one RPC a wait must make before its
-/// first probe is the publication of expired virtual timerfds, which a probe
-/// must see as Linux's first pass does; it observes the clock only while the
-/// process holds an armed virtual timerfd. Then the signals pending before
-/// it are read first (one `/proc` read, no RPC), so a signal committed during
-/// a hand-off that publication allows is decided under the temporary mask,
-/// as one sent during the call. Otherwise everything pending at the first
-/// check was pending at entry (`!0`). The clock observation that RPC makes
-/// grants no turn, but a sibling in a background call can run concurrently;
-/// for what another thread may do during it, three named residuals of the
-/// armed-timerfd case are carried to step 3c.1e (review round 4): the
-/// temporary mask is not yet published, so a cross-process `/proc` reader
-/// sees the previous mask; this set holds signal numbers, not instances, so
-/// an ignored signal pending at entry and sent again then, under a temporary
-/// mask that blocks it, is removed whole; and a deadline observed later
-/// reads any time that thread added.
-pub(super) fn entry_before_publication<T, G>(guest: &G) -> Result<KernelSigset, Error>
-where
-    T: RecordOrReplay,
-    G: Guest<Detcore<T>>,
-{
-    if !crate::syscalls::timerfd::holds_armed_virtual_timerfd(guest) {
-        return Ok(!0);
+/// A5 step 3c.1e A (IR-23, D37's R2 with private and shared held masks;
+/// plan-3c1e-r4 section 1 A, carrying revision 3 section 1 A and revision 2
+/// section 1 A): a masked wait's entry and end under the in-guest delivery
+/// gate, at each of the five sites that publish expired virtual timerfds
+/// before a first probe (`gated_staged_pselect6`, `gated_masked_ppoll`,
+/// `gated_zero_timeout_epoll`, `gated_masked_epoll`, and the internal
+/// `pselect6` path, `handle_internal_pselect6`).
+///
+/// [`Self::enter`]: with no armed virtual timerfd no RPC comes between the
+/// entry and the first check, and nothing changes from step 3c.1d (the first
+/// check's at-entry set is everything, `!0`). With one, the publication of
+/// expired timerfds observes the clock (an RPC) before the first probe, so,
+/// in the call's own turn and before that RPC:
+///
+/// - the thread's `/proc` status is read once (no RPC);
+/// - (b) the ignored instances the guest's own mask leaves unblocked, `I ∖
+///   own`, are removed: Linux discarded each when it was sent (`sig_ignored`,
+///   kernel/signal.c:104-120), so an instance sent again during the RPC under
+///   the temporary mask is never mistaken for one kept from entry;
+/// - the entry snapshot is kept per queue (`SigPnd`, `ShdPnd`), less what was
+///   removed, with D37's held masks `held_private = SigPnd_entry ∩ I ∩ own`
+///   and `held_shared = ShdPnd_entry ∩ I ∩ own`;
+/// - (a) the temporary mask is published with the held masks
+///   (`GlobalRequest::PublishTemporaryMask`, non-yielding), so another
+///   process's `/proc` status read during the RPC shows `SigBlk` as Linux
+///   does (`set_user_sigmask` installs it for the call, kernel/signal.c:3169)
+///   and each queue's pending field hides exactly the ignored arrivals Linux
+///   discarded (`procfs::sanitize_status_held`);
+/// - (c) the deadline is observed next, ahead of the timerfd publication, so
+///   it is the one Linux takes at the entry (`poll_select_set_timeout`,
+///   fs/select.c:752 and :1113 at v6.12; `ep_timeout_to_timespec` from
+///   `epoll_pwait`, fs/eventpoll.c:1909-1927 and :2506-2508), whatever a
+///   concurrently running sibling adds to global time during that
+///   publication ([`Self::entry_deadline`]); the observation grants no turn
+///   and moves no time. Without an armed timerfd it stays after the first
+///   probe and check (round-3 ruling 1), so an ordinary timed masked wait
+///   gains no RPC.
+///
+/// The pair is filed once per call: later iterations of a parked wait run
+/// under the requests that publish the temporary mask. At the zero-timeout
+/// masked `epoll_pwait` the probe runs without the mask (IR-9), and the
+/// temporary mask is published all the same, as Linux has it installed for
+/// the call.
+///
+/// [`Self::finish`], D37's R2, as the call's result is decided (before the
+/// one yielding empty request after a first-probe result,
+/// [`yield_after_in_turn_result`]), at the end of every masked wait that
+/// published its temporary mask, parked or not: the ignored arrivals since
+/// the publication outside the temporary mask, which Linux discarded at
+/// send, are removed per queue; entry instances are kept (IR-7 row (A)). A
+/// publication still in force (no request filed since) is withdrawn, which
+/// answers the committed-send window record; on an interrupted end
+/// (`-ERESTARTNOHAND`, `-EINTR`) the temporary mask stays published until
+/// the thread's next request, as Linux does not restore the own mask at the
+/// return (`restore_saved_sigmask_unless`, fs/select.c:301,
+/// fs/eventpoll.c:2495 and :2547 at v6.12) and the delivery keeps the
+/// temporary mask in `blocked`, with the handler's `sa_mask` and the signal,
+/// until `rt_sigreturn` (`signal_delivered`, kernel/signal.c:2951-2954); one ignored real-time number
+/// with an entry instance and a send to the same queue in the window is the
+/// named stopping refusal HERMIT_IGNORED_REALTIME_INSTANCES, decided from
+/// that committed record, never from bits.
+#[derive(Debug)]
+pub(super) struct TemporaryMaskCall {
+    /// The temporary mask, as Linux installs it.
+    mask: KernelSigset,
+    /// The entry snapshot `(SigPnd, ShdPnd)` less the entry removal, with an
+    /// armed virtual timerfd only.
+    snapshot: Option<(KernelSigset, KernelSigset)>,
+    /// The wait's start and deadline, observed at the entry with an armed
+    /// virtual timerfd only (IR-23(c)).
+    deadline: Option<(LogicalTime, LogicalTime)>,
+    /// The pair's publication is in force: filed, and no request since.
+    pair_in_force: bool,
+    /// The temporary mask has been published, by the pair or a request.
+    published: bool,
+    /// A check completed its removals, and no request has been filed since:
+    /// every ignored instance outside the temporary mask is gone.
+    settled: bool,
+    /// A check completed its removals at some point: every ignored instance
+    /// outside the temporary mask still pending was sent since, under it.
+    checked: bool,
+    /// The call filed a request that published its temporary mask (a park),
+    /// so that mask stays published past the call unless the end puts the
+    /// guest's own mask back ([`Self::finish`]).
+    parked: bool,
+    /// [`Self::finish`] ran.
+    finished: bool,
+}
+
+impl TemporaryMaskCall {
+    /// The entry of a masked wait whose temporary mask is `mask`, in the
+    /// call's own turn (see the type's documentation). `timeout` is the
+    /// wait's timeout where a deadline is kept for it (`None` for a zero
+    /// timeout or none): with an armed virtual timerfd it is observed here,
+    /// after the publication and before the timerfd publication (IR-23(c),
+    /// [`Self::entry_deadline`]).
+    pub(super) async fn enter<T, G>(
+        guest: &mut G,
+        mask: KernelSigset,
+        timeout: Option<Duration>,
+    ) -> Result<Self, Error>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        let mut call = Self {
+            mask,
+            snapshot: None,
+            deadline: None,
+            pair_in_force: false,
+            published: false,
+            settled: false,
+            checked: false,
+            parked: false,
+            finished: false,
+        };
+        if !crate::syscalls::timerfd::holds_armed_virtual_timerfd(guest) {
+            return Ok(call);
+        }
+        let state =
+            crate::syscalls::threads::read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+        let reserved = guest.config().in_guest_reserved_signals;
+        let own = crate::syscalls::helpers::gated_own_mask(guest, state.blocked);
+        let ignored = crate::ignored_signals::pending_ignored(&state, reserved);
+        let discarded = ignored & !own;
+        crate::syscalls::helpers::remove_ignored_signals(guest, discarded).await?;
+        let private = state.thread_pending & !discarded;
+        let shared = state.shared_pending & !discarded;
+        call.snapshot = Some((private, shared));
+        let dettid = guest.thread_state().dettid;
+        crate::tool_global::publish_temporary_mask(
+            guest,
+            crate::scheduler::guest_mask_publication::TemporaryMaskControl::Publish {
+                thread: dettid,
+                mask,
+                held_private: private & ignored & own,
+                held_shared: shared & ignored & own,
+            },
+        )
+        .await;
+        call.pair_in_force = true;
+        call.published = true;
+        // IR-23(c): the deadline now, ahead of the timerfd publication's RPC,
+        // and after the temporary mask's publication, so that no RPC comes
+        // before that publication (IR-23(a)) and a signal committed during
+        // the observation, which grants no turn, would be one sent during the
+        // call.
+        call.deadline = observe_deadline(guest, timeout).await;
+        Ok(call)
     }
-    Ok(crate::syscalls::threads::read_thread_wait_signal_state(guest.pid(), guest.tid())?.pending)
+
+    /// The first check's at-entry set (`temporary_mask_check`'s `entry`): the
+    /// entry snapshot, both queues, or everything (`!0`) when nothing could
+    /// arrive between the entry and that check.
+    pub(super) fn entry(&self) -> KernelSigset {
+        self.snapshot
+            .map_or(!0, |(private, shared)| private | shared)
+    }
+
+    /// Whether the entry made the publication RPC, so the deadline was
+    /// observed there (IR-23(c)).
+    pub(super) fn observes_deadline_at_entry(&self) -> bool {
+        self.snapshot.is_some()
+    }
+
+    /// The start and deadline observed at the entry (IR-23(c)): `Some` only
+    /// with an armed virtual timerfd and a timeout; otherwise the caller
+    /// observes them after the first probe and check (round-3 ruling 1).
+    pub(super) fn entry_deadline(&self) -> Option<(LogicalTime, LogicalTime)> {
+        self.deadline
+    }
+
+    /// The call files a request that publishes its temporary mask (a park).
+    pub(super) fn note_request(&mut self) {
+        self.pair_in_force = false;
+        self.published = true;
+        self.settled = false;
+        self.parked = true;
+    }
+
+    /// A check completed its removals (`TemporaryMaskCheck::Waits` or
+    /// `EpollInterrupted`): every ignored instance outside the temporary mask
+    /// pending then was removed.
+    pub(super) fn note_check(&mut self, check: TemporaryMaskCheck) {
+        if matches!(
+            check,
+            TemporaryMaskCheck::Waits | TemporaryMaskCheck::EpollInterrupted
+        ) {
+            self.settled = true;
+            self.checked = true;
+        }
+    }
+
+    /// D37's R2 as the call's result is decided (see the type's
+    /// documentation), `result` the call's. Runs once; nothing for a call
+    /// that never published its temporary mask, or whose last check settled
+    /// everything with no request since. A publication still in force is
+    /// withdrawn; on an interrupted end (`-ERESTARTNOHAND`, `-EINTR`) the
+    /// temporary mask stays published until the thread's next request, as
+    /// Linux does not restore the own mask at the return
+    /// (`restore_saved_sigmask_unless`, fs/select.c:301, fs/eventpoll.c:2495
+    /// and :2547 at v6.12) and the delivery keeps the temporary mask in
+    /// `blocked`, with the handler's `sa_mask` and the signal, until
+    /// `rt_sigreturn` (`signal_delivered`, kernel/signal.c:2951-2954). A call that parked (its requests published the temporary
+    /// mask) and ends otherwise puts the guest's own mask back
+    /// ([`Self::put_back_own_mask`]), as Linux restores it before such a
+    /// call returns; otherwise the temporary mask would stay published until
+    /// the thread's next request, and a `fork` then would seed the child with
+    /// it, where Linux's child copies the own mask (`arch_dup_task_struct`,
+    /// kernel/fork.c:1086 at v6.12). The refusal's error is returned in place
+    /// of the call's result.
+    pub(super) async fn finish<T, G>(
+        &mut self,
+        guest: &mut G,
+        result: &Result<i64, Error>,
+    ) -> Result<(), Error>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        if self.finished {
+            return Ok(());
+        }
+        self.finished = true;
+        if !self.published {
+            return Ok(());
+        }
+        let removed = self.remove_arrivals(guest, result).await;
+        if self.parked && !interrupted(result) {
+            Self::put_back_own_mask(guest).await;
+        }
+        removed
+    }
+
+    /// The guest's own mask published again for the thread
+    /// (`GlobalRequest::SetSavedGuestSigmask`) at the end of a masked call
+    /// that parked and was not interrupted: the mask a request without a
+    /// temporary mask publishes (`tool_global::publish_request_guest_mask`),
+    /// or nothing on a backend that keeps no guest mask apart, as on every
+    /// backend before step 3c.1e B, so readers take the kernel's `SigBlk`,
+    /// which is then the own mask.
+    async fn put_back_own_mask<T, G>(guest: &mut G)
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        let own = crate::tool_global::publish_request_guest_mask(
+            guest,
+            &Resources::new(guest.thread_state().dettid),
+        );
+        crate::tool_global::set_saved_guest_sigmask(guest, own).await;
+    }
+
+    /// [`Self::finish`]'s withdrawal of a publication in force and D37's R2.
+    async fn remove_arrivals<T, G>(
+        &mut self,
+        guest: &mut G,
+        result: &Result<i64, Error>,
+    ) -> Result<(), Error>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        let dettid = guest.thread_state().dettid;
+        let window = if self.pair_in_force {
+            self.pair_in_force = false;
+            crate::tool_global::publish_temporary_mask(
+                guest,
+                crate::scheduler::guest_mask_publication::TemporaryMaskControl::Withdraw {
+                    thread: dettid,
+                    keep_published: interrupted(result),
+                },
+            )
+            .await
+            .unwrap_or_default()
+        } else {
+            Default::default()
+        };
+        if self.settled {
+            return Ok(());
+        }
+        let state =
+            crate::syscalls::threads::read_thread_wait_signal_state(guest.pid(), guest.tid())?;
+        let reserved = guest.config().in_guest_reserved_signals;
+        let outside = crate::ignored_signals::pending_ignored(&state, reserved) & !self.mask;
+        if outside == 0 {
+            return Ok(());
+        }
+        let (snap_private, snap_shared) = match self.snapshot {
+            // After a completed check every instance outside the temporary
+            // mask is one sent since, under it.
+            Some(snapshot) if !self.checked => snapshot,
+            _ => (0, 0),
+        };
+        let removal = r2_removal(
+            outside,
+            state.thread_pending,
+            state.shared_pending,
+            (snap_private, snap_shared),
+            window,
+        );
+        if let Some((signal, queue)) = removal.refused {
+            let reason = crate::refused_signal_controls::ignored_realtime_instances_refusal(
+                dettid.as_raw(),
+                signal,
+                queue,
+            );
+            tracing::error!("{}", reason);
+            crate::tool_global::stopping_refusal(guest, reason).await;
+            return Err(Errno::ENOSYS.into());
+        }
+        crate::syscalls::helpers::remove_ignored_signals(guest, removal.everywhere).await?;
+        for signal in signals_in(removal.private_only) {
+            crate::syscalls::helpers::remove_ignored_from_queue(
+                guest,
+                signal,
+                crate::syscalls::helpers::OneQueue::Private,
+            )
+            .await?;
+        }
+        for signal in signals_in(removal.shared_only) {
+            crate::syscalls::helpers::remove_ignored_from_queue(
+                guest,
+                signal,
+                crate::syscalls::helpers::OneQueue::Shared,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+/// What `Detcore::staged_pselect6_body` takes of a gated staged `pselect6`
+/// once its sets are read: the call, its temporary mask and timeout, the sets
+/// as read (`readfds`, `writefds`, `exceptfds`), and their length in bytes.
+#[derive(Clone, Copy)]
+struct StagedPselect6<'a> {
+    call: syscalls::Pselect6,
+    mask: KernelSigset,
+    timeout: Option<Duration>,
+    originals: &'a [Option<Vec<u8>>; 3],
+    len: usize,
+}
+
+/// Whether a masked wait's `result` is an interrupted end, on which Linux
+/// does not restore the own mask at the return, and the delivery keeps the
+/// temporary mask in `blocked` until `rt_sigreturn`:
+/// `-ERESTARTNOHAND` (`pselect6`, `ppoll`) or `-EINTR` (the `epoll` forms,
+/// and the refused caught end).
+fn interrupted(result: &Result<i64, Error>) -> bool {
+    matches!(
+        result,
+        Err(Error::Errno(Errno::ERESTARTNOHAND | Errno::EINTR))
+    )
+}
+
+/// The signal numbers in `set`, lowest first.
+fn signals_in(set: KernelSigset) -> impl Iterator<Item = i32> {
+    (1..=64).filter(move |signal| set & (1_u64 << (signal - 1)) != 0)
+}
+
+/// What D37's R2 removes at a masked wait's end ([`r2_removal`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct R2Removal {
+    /// Signals whose every pending instance goes (no entry instance of it is
+    /// kept in either queue).
+    pub(super) everywhere: KernelSigset,
+    /// Signals to remove from the private queue only (an entry instance is
+    /// kept in the shared queue).
+    pub(super) private_only: KernelSigset,
+    /// Signals to remove from the shared queue only (an entry instance is
+    /// kept in the private queue).
+    pub(super) shared_only: KernelSigset,
+    /// The first ignored real-time signal, and its queue, with both an entry
+    /// instance kept and a send committed to that queue in the window: not
+    /// representable by bits (HERMIT_IGNORED_REALTIME_INSTANCES).
+    pub(super) refused: Option<(i32, &'static str)>,
+}
+
+/// D37's R2 as a pure function: `outside`, the pending ignored signals
+/// outside the temporary mask (both queues); `private` and `shared`, the
+/// queues' pending sets now; `snapshot`, the entry instances still held per
+/// queue (`(0, 0)` once a check has removed every instance outside the
+/// temporary mask); `window`, the committed sends to the thread while its
+/// pair publication was in force. Per queue, an arrival is a signal pending
+/// there now that the entry snapshot of that queue lacks
+/// (`SigPnd_now ∖ SigPnd_snapshot`, and the same for the shared queue):
+/// Linux discarded it at send. An entry instance is kept (IR-7 row (A)).
+/// A standard signal can have only one instance per queue (`legacy_queue`,
+/// kernel/signal.c:1094 at v6.12, physically as in Linux), so an arrival in
+/// a queue that holds an entry instance of it is impossible; a real-time one
+/// can, which only the committed window record shows, and it is refused.
+pub(super) fn r2_removal(
+    outside: KernelSigset,
+    private: KernelSigset,
+    shared: KernelSigset,
+    snapshot: (KernelSigset, KernelSigset),
+    window: crate::scheduler::guest_mask_publication::CommittedSendWindow,
+) -> R2Removal {
+    let (snap_private, snap_shared) = snapshot;
+    let held_private = outside & private & snap_private;
+    let held_shared = outside & shared & snap_shared;
+    let arrived_private = outside & private & !snap_private;
+    let arrived_shared = outside & shared & !snap_shared;
+    let realtime = crate::syscalls::helpers::REAL_TIME_SIGNALS;
+    let refused = [
+        (held_private & window.sent_private & realtime, "private"),
+        (held_shared & window.sent_shared & realtime, "shared"),
+    ]
+    .into_iter()
+    .find(|(set, _)| *set != 0)
+    .map(|(set, queue)| (set.trailing_zeros() as i32 + 1, queue));
+    let held = held_private | held_shared;
+    R2Removal {
+        everywhere: (arrived_private | arrived_shared) & !held,
+        private_only: arrived_private & held_shared,
+        shared_only: arrived_shared & held_private,
+        refused,
+    }
 }
 
 /// What a check found, as the call's error, or `None` when the wait goes on.
@@ -489,9 +882,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// copy, the call is refused by name with `ENOSYS` once the sets have
     /// been read (D54), so their EFAULT comes first; an EBADF, which only a
     /// probe finds, is not reported then. No RPC runs before the probe and the
-    /// check but the timerfd publication, whose hand-off the at-entry set
-    /// covers ([`entry_before_publication`]); the clock is observed only for
-    /// the time left that a return writes back (round-3 ruling 1). A count or
+    /// check but the timerfd publication, before which the call publishes its
+    /// temporary mask and keeps its entry snapshot ([`TemporaryMaskCall`]);
+    /// the clock is observed only for
+    /// the time left that a return writes back (round-3 ruling 1), at the
+    /// entry with an armed virtual timerfd (IR-23(c),
+    /// `TemporaryMaskCall::entry_deadline`). A count or
     /// an error that a nonzero timeout's probe finds is returned after one
     /// yielding empty request ([`yield_after_in_turn_result`], round-3 ruling
     /// 2).
@@ -502,7 +898,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         mask: KernelSigset,
         timeout: Option<Duration>,
     ) -> Result<i64, Error> {
-        let zero = timeout == Some(Duration::ZERO);
         let refuse = |guest: &G, why: &str| {
             tracing::warn!(
                 "{}",
@@ -527,7 +922,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let originals = match read_gated_fd_sets(guest, "pselect6", call, len).await {
             Ok((readfds, writefds, exceptfds)) => [readfds, writefds, exceptfds],
             Err(error) => {
-                self.write_staged_pselect6_remaining(guest, call, timeout)
+                self.write_staged_pselect6_remaining(guest, call, timeout, None)
                     .await?;
                 return Err(error);
             }
@@ -539,7 +934,60 @@ impl<T: RecordOrReplay> Detcore<T> {
                  would find, is not reported)",
             );
         }
-        let entry = entry_before_publication(guest)?;
+        // IR-23: the entry, before the expired-timerfd publication's RPC
+        // (`TemporaryMaskCall::enter`); D37's R2 as the result is decided
+        // (`TemporaryMaskCall::finish`), before the yield after a first-probe
+        // result.
+        let mut masked =
+            TemporaryMaskCall::enter(guest, mask, timeout.filter(|timeout| !timeout.is_zero()))
+                .await?;
+        let staged = StagedPselect6 {
+            call,
+            mask,
+            timeout,
+            originals: &originals,
+            len,
+        };
+        let outcome = self.staged_pselect6_body(guest, staged, &mut masked).await;
+        let (result, yields) = outcome.unwrap_or_else(|error| (Err(error), false));
+        masked.finish(guest, &result).await?;
+        if yields {
+            yield_after_in_turn_result(guest).await;
+        }
+        result
+    }
+
+    /// [`Self::gated_staged_pselect6`] from the timerfd publication on: the
+    /// call's result, and whether one yielding empty request follows it (a
+    /// result the first probe of a nonzero timeout found). The outer `Err` is
+    /// a failure before the result was decided.
+    async fn staged_pselect6_body<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        staged: StagedPselect6<'_>,
+        masked: &mut TemporaryMaskCall,
+    ) -> Result<(Result<i64, Error>, bool), Error> {
+        let StagedPselect6 {
+            call,
+            mask,
+            timeout,
+            originals,
+            len,
+        } = staged;
+        let zero = timeout == Some(Duration::ZERO);
+        let refuse = |guest: &G, why: &str| {
+            tracing::warn!(
+                "{}",
+                crate::refused_signal_controls::masked_pselect6_nfds_refused_warning(
+                    guest.thread_state().dettid.as_raw(),
+                    call.nfds(),
+                    why,
+                )
+            );
+            Ok((Err(Errno::ENOSYS.into()), false))
+        };
+        let entry = masked.entry();
+        let entry_deadline = masked.entry_deadline();
         // A virtual timerfd among the sets is readable exactly when its
         // deadline has passed (`crate::syscalls::timerfd`).
         crate::syscalls::timerfd::publish_expired(guest).await;
@@ -602,28 +1050,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             match result {
                 Ok(0) => {}
                 Err(errno) if crate::wait_signal_end::is_restart_code(errno) => {
-                    put_back(guest, &empty(&originals))?;
+                    put_back(guest, &empty(originals))?;
                 }
                 ready_or_error => {
-                    self.write_staged_pselect6_remaining(guest, call, timeout)
+                    self.write_staged_pselect6_remaining(guest, call, timeout, entry_deadline)
                         .await?;
-                    if !zero {
-                        yield_after_in_turn_result(guest).await;
-                    }
-                    return ready_or_error.map_err(Into::into);
+                    return Ok((ready_or_error.map_err(Into::into), !zero));
                 }
             }
             let check = temporary_mask_check(guest, mask, Some(entry), false).await?;
+            masked.note_check(check);
             if let Some(errno) = check_result(check, Errno::ERESTARTNOHAND) {
-                put_back(guest, &originals)?;
-                self.write_staged_pselect6_remaining(guest, call, timeout)
+                put_back(guest, originals)?;
+                self.write_staged_pselect6_remaining(guest, call, timeout, entry_deadline)
                     .await?;
-                return Err(errno.into());
+                return Ok((Err(errno.into()), false));
             }
             if zero {
-                return Ok(0);
+                return Ok((Ok(0), false));
             }
-            put_back(guest, &originals)?;
+            put_back(guest, originals)?;
             return refuse(guest, "a nonzero timeout and nothing ready");
         }
         // On copies: the probe polls staged copies of the sets, and Detcore
@@ -672,13 +1118,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(0) => {}
             Ok(count) => {
                 let copied = copy_back(guest);
-                self.write_staged_pselect6_remaining(guest, call, timeout)
+                self.write_staged_pselect6_remaining(guest, call, timeout, entry_deadline)
                     .await?;
-                if !zero {
-                    yield_after_in_turn_result(guest).await;
-                }
-                copied?;
-                return Ok(count);
+                return Ok((copied.map(|()| count), !zero));
             }
             Err(errno) if crate::wait_signal_end::is_restart_code(errno) => {
                 let empty = Some(vec![0; len]);
@@ -687,44 +1129,50 @@ impl<T: RecordOrReplay> Detcore<T> {
                 write_pselect6_fd_set(guest, probe.exceptfds(), &empty)?;
             }
             Err(errno) => {
-                self.write_staged_pselect6_remaining(guest, call, timeout)
+                self.write_staged_pselect6_remaining(guest, call, timeout, entry_deadline)
                     .await?;
-                if !zero {
-                    yield_after_in_turn_result(guest).await;
-                }
-                return Err(errno.into());
+                return Ok((Err(errno.into()), !zero));
             }
         }
         let check = temporary_mask_check(guest, mask, Some(entry), false).await?;
+        masked.note_check(check);
         if let Some(errno) = check_result(check, Errno::ERESTARTNOHAND) {
-            self.write_staged_pselect6_remaining(guest, call, timeout)
+            self.write_staged_pselect6_remaining(guest, call, timeout, entry_deadline)
                 .await?;
-            return Err(errno.into());
+            return Ok((Err(errno.into()), false));
         }
         if zero {
             copy_back(guest)?;
-            return Ok(0);
+            return Ok((Ok(0), false));
         }
         drop(_guard);
         refuse(guest, "a nonzero timeout and nothing ready")
     }
 
-    /// The time left a staged `pselect6` writes back as it returns, measured
-    /// from a deadline observed then ([`observe_deadline`]): Linux writes it
-    /// for any result of a nonzero timeout (`poll_select_finish`,
-    /// fs/select.c:295-301 at v6.12), and none for a zero one.
+    /// The time left a staged `pselect6` writes back as it returns: Linux
+    /// writes it for any result of a nonzero timeout (`poll_select_finish`,
+    /// fs/select.c:295-301 at v6.12), and none for a zero one. It is measured
+    /// from the deadline observed at the entry where there is one (`entry`,
+    /// with an armed virtual timerfd: `TemporaryMaskCall::entry_deadline`,
+    /// IR-23(c)), and otherwise from a deadline observed then
+    /// ([`observe_deadline`]), no RPC coming between the entry and the
+    /// return that could add time.
     async fn write_staged_pselect6_remaining<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Pselect6,
         timeout: Option<Duration>,
+        entry: Option<(LogicalTime, LogicalTime)>,
     ) -> Result<(), Error> {
         if timeout == Some(Duration::ZERO) {
             return Ok(());
         }
-        let deadline = observe_deadline(guest, timeout)
-            .await
-            .map(|(_, deadline)| deadline);
+        let deadline = match entry {
+            Some((_, deadline)) => Some(deadline),
+            None => observe_deadline(guest, timeout)
+                .await
+                .map(|(_, deadline)| deadline),
+        };
         self.write_pselect6_remaining(guest, call, deadline).await
     }
 
@@ -786,8 +1234,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mask = read_temporary_mask(guest, "ppoll", mask_address, true).await?;
         let zero = timeout == Some(Duration::ZERO);
         // The clock is observed only after the first probe and its check
-        // (`observe_deadline`, round-3 ruling 1).
-        let mut timing: Option<(LogicalTime, LogicalTime)> = None;
+        // (`observe_deadline`, round-3 ruling 1), or at the entry with an armed
+        // virtual timerfd (IR-23(c), `TemporaryMaskCall::entry_deadline`).
+        let mut timing: Option<(LogicalTime, LogicalTime)>;
         let live: Vec<std::ops::Range<usize>> = ppoll_fds_range(call).into_iter().collect();
         let Some(staged) = stage_private_cells(guest, PrivateCells::ZeroTimeout, &live).await?
         else {
@@ -844,7 +1293,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.fyi("ppoll");
         rsrc.set_signal_interrupt_errno(Errno::EINTR);
         rsrc.blocked_signal_mask = Some(mask);
-        let mut entry = Some(entry_before_publication(guest)?);
+        // IR-23: the entry, before the expired-timerfd publication's RPC,
+        // which observes the deadline first with an armed virtual timerfd
+        // (IR-23(c)); D37's R2 as the result is decided.
+        let mut masked = TemporaryMaskCall::enter(guest, mask, timeout.filter(|_| !zero)).await?;
+        timing = masked.entry_deadline();
+        let mut entry = Some(masked.entry());
         let mut first = true;
         // Whether the time left was written before the ruling-5 yield.
         let mut written = false;
@@ -852,6 +1306,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // The first probe and check run in the call's own turn.
             let in_turn = first;
             if !in_turn {
+                masked.note_request();
                 resource_request(guest, rsrc.clone()).await;
             }
             first = false;
@@ -868,18 +1323,29 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // The time left is written before the yield (round-3
                         // ruling 6).
                         if let (Some(timeout_address), Some(timeout)) = (call.timeout(), timeout) {
-                            let started_at = thread_observe_time(guest).await;
+                            let started_at = match timing {
+                                Some((started_at, _)) => started_at,
+                                None => thread_observe_time(guest).await,
+                            };
                             self.write_ppoll_remaining(guest, timeout_address, timeout, started_at)
                                 .await?;
                             written = true;
                         }
+                        // D37's R2 before the yield, whose request publishes
+                        // the guest's own mask.
+                        let result = ready_or_error.map_err(Error::from);
+                        if let Err(error) = masked.finish(guest, &result).await {
+                            break Err(error);
+                        }
                         yield_after_in_turn_result(guest).await;
+                        break result;
                     }
                     break ready_or_error.map_err(Into::into);
                 }
             }
             match temporary_mask_check(guest, mask, entry.take(), false).await {
                 Ok(check) => {
+                    masked.note_check(check);
                     if let Some(errno) = check_result(check, Errno::ERESTARTNOHAND) {
                         break Err(errno.into());
                     }
@@ -889,7 +1355,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if zero {
                 break Ok(0);
             }
-            if in_turn {
+            if in_turn && !masked.observes_deadline_at_entry() {
                 timing = observe_deadline(guest, timeout).await;
                 rsrc.poll_deadline = crate::syscalls::timerfd::poll_deadline_with(
                     guest,
@@ -906,6 +1372,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             record_retry_event(guest, probe).await;
         };
         staged.release(guest);
+        let finished = masked.finish(guest, &result).await;
+        let result = match finished {
+            Ok(()) => result,
+            Err(error) => Err(error),
+        };
         if let (Some(timeout_address), Some(timeout), false, false) =
             (call.timeout(), timeout, zero, written)
         {
@@ -939,7 +1410,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mask = read_temporary_mask(guest, "epoll_pwait", address, true).await?;
         let probe = call.with_sigmask(None).with_timeout(0);
         if call.timeout() == 0 {
-            return self.gated_zero_timeout_epoll(guest, probe).await;
+            return self.gated_zero_timeout_epoll(guest, probe, mask).await;
         }
         // A negative timeout waits forever (`ep_poll`'s `timeout` NULL).
         let timeout = u64::try_from(call.timeout())
@@ -957,17 +1428,31 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// same: `ep_poll` returns ready events, and with a zero timeout 0 before
     /// it tests `signal_pending` (fs/eventpoll.c:2010-2011 at v6.12), and the
     /// thread's own mask goes back since the result is not `-EINTR` (:2495),
-    /// so the temporary mask never decides anything, and nothing is removed:
-    /// a ready or zero return keeps every pending signal (IR-7 row (A)).
+    /// so the temporary mask never decides anything, and nothing pending from
+    /// entry is removed: a ready or zero return keeps every pending signal
+    /// (IR-7 row (A)). With an armed virtual timerfd the temporary mask `mask`
+    /// is published for the publication's RPC, as Linux has it installed for
+    /// the call although the probe runs without it (IR-9), and an ignored
+    /// signal sent then outside it, which Linux discarded at send, is removed
+    /// as the result is decided (`TemporaryMaskCall`, A5 step 3c.1e A); the
+    /// empty request comes before the call's entry, under the guest's own
+    /// mask.
     async fn gated_zero_timeout_epoll<G: Guest<Self>>(
         &self,
         guest: &mut G,
         probe: syscalls::EpollPwait,
+        mask: KernelSigset,
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         resource_request(guest, Resources::new(dettid)).await; // empty request
+        let mut masked = TemporaryMaskCall::enter(guest, mask, None).await?;
         crate::syscalls::timerfd::publish_expired(guest).await;
-        Ok(self.record_or_replay(guest, probe).await?)
+        let result = self
+            .record_or_replay(guest, probe)
+            .await
+            .map_err(Error::from);
+        masked.finish(guest, &result).await?;
+        result
     }
 
     /// A masked `epoll_pwait2` under the gate (D39): D41's check, the timeout
@@ -1005,7 +1490,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_sigmask(None)
             .with_sigsetsize(args.arg5);
         if timeout == Some(Duration::ZERO) {
-            return self.gated_zero_timeout_epoll(guest, probe).await;
+            return self.gated_zero_timeout_epoll(guest, probe, mask).await;
         }
         self.gated_masked_epoll(guest, probe, mask, timeout, "epoll_pwait2")
             .await
@@ -1039,9 +1524,38 @@ impl<T: RecordOrReplay> Detcore<T> {
         timeout: Option<Duration>,
         fyi: &'static str,
     ) -> Result<i64, Error> {
-        let mut entry = Some(entry_before_publication(guest)?);
+        // IR-23: the entry, before the expired-timerfd publication's RPC,
+        // which observes the deadline first with an armed virtual timerfd
+        // (IR-23(c)); D37's R2 as the result is decided.
+        let mut masked = TemporaryMaskCall::enter(guest, mask, timeout).await?;
+        let (result, yields) = self
+            .masked_epoll_loop(guest, probe, mask, timeout, fyi, &mut masked)
+            .await
+            .unwrap_or_else(|error| (Err(error), false));
+        masked.finish(guest, &result).await?;
+        if yields {
+            yield_after_in_turn_result(guest).await;
+        }
+        result
+    }
+
+    /// [`Self::gated_masked_epoll`]'s probes, checks and park: the call's
+    /// result, and whether one yielding empty request follows it (events or
+    /// an error the first, in-turn probe found). The outer `Err` is a failure
+    /// before the result was decided.
+    async fn masked_epoll_loop<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        probe: syscalls::EpollPwait,
+        mask: KernelSigset,
+        timeout: Option<Duration>,
+        fyi: &'static str,
+        masked: &mut TemporaryMaskCall,
+    ) -> Result<(Result<i64, Error>, bool), Error> {
+        let mut entry = Some(masked.entry());
         let mut first = true;
-        let mut deadline: Option<LogicalTime> = None;
+        let mut deadline: Option<LogicalTime> =
+            masked.entry_deadline().map(|(_, deadline)| deadline);
         let mut rsrc = Resources::new(guest.thread_state().dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi(fyi);
@@ -1051,6 +1565,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // The first probe and check run in the call's own turn.
             let in_turn = first;
             if !in_turn {
+                masked.note_request();
                 resource_request(guest, rsrc.clone()).await;
             }
             first = false;
@@ -1059,16 +1574,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 crate::syscalls::timerfd::poll_deadline_with(guest, deadline, next_timerfd);
             let result = guest.inject_with_retry(probe).await;
             if !probe.syscall_would_have_blocked(result) {
-                if in_turn {
-                    yield_after_in_turn_result(guest).await;
-                }
-                return result.map_err(Into::into);
+                return Ok((result.map_err(Into::into), in_turn));
             }
             let check = temporary_mask_check(guest, mask, entry.take(), true).await?;
+            masked.note_check(check);
             if let Some(errno) = check_result(check, Errno::EINTR) {
-                return Err(errno.into());
+                return Ok((Err(errno.into()), false));
             }
-            if in_turn {
+            if in_turn && !masked.observes_deadline_at_entry() {
                 deadline = observe_deadline(guest, timeout)
                     .await
                     .map(|(_, deadline)| deadline);
@@ -1079,7 +1592,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if let Some(deadline) = deadline
                 && thread_observe_time(guest).await >= deadline
             {
-                return Ok(0);
+                return Ok((Ok(0), false));
             }
             record_retry_event(guest, probe).await;
         }

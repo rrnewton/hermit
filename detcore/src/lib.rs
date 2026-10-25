@@ -499,6 +499,24 @@ pub fn two_phase_refusal(cfg: &Config) -> Option<&'static str> {
     None
 }
 
+/// A5 step 3c.1e A, IR-15: whether delivering `signal` takes its default
+/// action (neither a handler nor `SIG_IGN`), as Detcore's copy of the
+/// dispositions holds them or else as the kernel reports them. A thread whose
+/// state cannot be read counts as taking the default action, so the IR-15
+/// guard fails closed.
+fn delivery_takes_default_action<G, T>(guest: &G, signal: i32) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let bit = crate::syscalls::kernel_sigset_bit(signal);
+    match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal) {
+        Some(copied) => (copied.caught | copied.ignored) & bit == 0,
+        None => crate::syscalls::read_kernel_signal_state(guest.pid(), guest.tid())
+            .map_or(true, |state| (state.caught | state.ignored) & bit == 0),
+    }
+}
+
 /// Whether delivering `signal` now runs a handler the guest installed, as
 /// Detcore's copy of the dispositions holds them or else as the kernel
 /// reports them (`ThreadState::delivered_since_request`). A thread whose state
@@ -590,6 +608,51 @@ pub fn observes_sigreturns(cfg: &Config) -> bool {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// A5 step 3c.1e A, IR-15 (Detcore's half): whether the calling thread's
+    /// process is the init of a PID namespace it created with `CLONE_NEWPID`
+    /// (`Scheduler`'s `pid_namespace_inits`, through
+    /// `GlobalRequest::InPidNamespaceInit`), in which case `hook` for
+    /// `signal`, a delivery that takes its default action, is refused with a
+    /// named WARN. Linux marks such an init `SIGNAL_UNKILLABLE`
+    /// (kernel/fork.c:2558-2560 at v6.12): a signal whose action is
+    /// `SIG_DFL` is ignored when it is sent, unless blocked
+    /// (`sig_task_ignored`, kernel/signal.c:92-94, reached through
+    /// `sig_ignored`, :104-120, which keeps a blocked one, :111), and a
+    /// blocked one is queued and then discarded at dequeue (`get_signal`,
+    /// :2843-2845). SIGKILL and SIGSTOP are ignored the same way unless the
+    /// send is forced (`!(force && sig_kernel_only(sig))`, :93): forced when
+    /// it comes from an ancestor PID namespace or from the kernel
+    /// (`send_signal_locked`, :1217-1224), so whether one reaches the init
+    /// depends on its sender, which the hook does not see. No default-action
+    /// delivery or death can be predicted for any of them, SIGKILL and
+    /// SIGSTOP included. A caught signal is delivered to an init as to any
+    /// process.
+    /// `unshare(CLONE_NEWPID)`, the other way a process becomes an init
+    /// (kernel/fork.c:2558-2560 for its next child), is refused with `EPERM`
+    /// on every backend (`is_mount_ns_admin_refused_syscall`), so only
+    /// `clone(CLONE_NEWPID)` children are inits. Called only under the
+    /// in-guest delivery gate.
+    async fn pid_namespace_init_refused<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        hook: &str,
+        signal: i32,
+    ) -> bool {
+        let dettid = guest.thread_state().dettid;
+        if !tool_global::in_pid_namespace_init(guest, dettid).await {
+            return false;
+        }
+        warn!(
+            "{}",
+            crate::refused_signal_controls::pid_namespace_init_prediction_refused_warning(
+                dettid.as_raw(),
+                hook,
+                signal,
+            )
+        );
+        true
+    }
+
     /// Whether `signal`, passed on to a guest thread without a report, could
     /// have entered a handler the thread's signal-state copy never saw: where
     /// the copy is kept against the kernel's own state, for any signal but
@@ -3469,6 +3532,25 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             );
             return Err(Errno::EPROTONOSUPPORT);
         }
+        // A5 step 3c.1e A, IR-15: under the in-guest delivery gate, no
+        // default-action delivery is predicted for a process that is the init
+        // of a PID namespace it created (`SIGNAL_UNKILLABLE`: such a signal is
+        // ignored at send unless blocked, kernel/signal.c:92-94 via :104-120,
+        // and a blocked one is discarded at dequeue, :2843-2845 at v6.12;
+        // SIGKILL and SIGSTOP too, unless the send is forced, from an
+        // ancestor PID namespace or the kernel, `force && sig_kernel_only`,
+        // :93 and :1217-1224, which the hook cannot tell); a caught signal is
+        // announced as for any process
+        // (`pid_namespace_init_refused`). Refused before any turn, by name;
+        // nothing is asked with the gate off.
+        if self.cfg.in_guest_signal_delivery
+            && delivery_takes_default_action(guest, signal)
+            && self
+                .pid_namespace_init_refused(guest, "announce_signal_event", signal)
+                .await
+        {
+            return Err(Errno::EPROTONOSUPPORT);
+        }
         let stop = self.inbound_stop(guest);
         let turn = self
             .inbound_turn(guest, SigWrapper(signal), stop, TurnScope::Announcement)
@@ -3619,6 +3701,22 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 "[dtid {dettid}] refusing a predicted death ({status:?}): this run does not \
                  take in-guest signal delivery"
             );
+            return Err(Errno::EPROTONOSUPPORT);
+        }
+        // A5 step 3c.1e A, IR-15: a predicted death is a default action, and
+        // a PID namespace's init is not killed by one (`SIGNAL_UNKILLABLE`:
+        // ignored at send unless blocked, kernel/signal.c:92-94 via :104-120,
+        // a blocked one discarded at dequeue, :2843-2845 at v6.12), so no
+        // death is predicted for it: refused before the turn is held.
+        let signal = match status {
+            ExitStatus::Signaled(signal, _) => signal as i32,
+            ExitStatus::SignaledRaw(signal, _) => signal,
+            ExitStatus::Exited(_) => unreachable!("checked above"),
+        };
+        if self
+            .pid_namespace_init_refused(guest, "exit_for_predicted_death", signal)
+            .await
+        {
             return Err(Errno::EPROTONOSUPPORT);
         }
         if !tool_global::hold_turn_for_group_exit(guest, dettid).await {

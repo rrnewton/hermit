@@ -3760,11 +3760,33 @@ impl GlobalState {
             GlobalRequest::DeregisterThread(deregistration) => {
                 R::DeregisterThread(self.recv_deregister_thread(from, deregistration).await)
             }
-            GlobalRequest::PublishedGuestSigmask(thread) => R::PublishedGuestSigmask(
+            GlobalRequest::PublishedGuestSigmask(thread) => {
+                let scheduler = self.lock_rpc_scheduler(false).await;
+                // Under the in-guest delivery gate the status reader gets the
+                // tri-state and D37's held masks (A5 step 3c.1e A); with it
+                // off, the answer is the one it always was.
+                if self.cfg.in_guest_signal_delivery {
+                    R::GuestSigmaskForStatus(scheduler.status_guest_mask(thread))
+                } else {
+                    R::PublishedGuestSigmask(scheduler.published_guest_sigmask(thread))
+                }
+            }
+            GlobalRequest::PublishTemporaryMask(control) => R::PublishTemporaryMask(
                 self.lock_rpc_scheduler(false)
                     .await
-                    .published_guest_sigmask(thread),
+                    .temporary_mask_control(dtid, control),
             ),
+            GlobalRequest::InPidNamespaceInit(thread) => {
+                let scheduler = self.lock_rpc_scheduler(false).await;
+                R::InPidNamespaceInit(
+                    scheduler
+                        .thread_tree
+                        .process_of(thread)
+                        .is_some_and(|process| {
+                            scheduler.thread_tree.is_pid_namespace_init(process)
+                        }),
+                )
+            }
             GlobalRequest::SetSavedGuestSigmask(mask) => {
                 let updated = self
                     .lock_rpc_scheduler(false)
@@ -4025,6 +4047,17 @@ impl GlobalState {
             ) => {
                 let (fence, valve) = {
                     let mut scheduler = self.lock_rpc_scheduler(false).await;
+                    // A5 step 3c.1e A: this handler is the commit point of a
+                    // guest's cross-task send (it runs only after the injected
+                    // send succeeded); while the target holds a temporary-mask
+                    // publication, the send joins its committed-send window
+                    // record, thread-directed in the private queue. Nothing
+                    // with the in-guest delivery gate off.
+                    scheduler.note_committed_send_in_window(
+                        dettid,
+                        signal,
+                        scope == SignalScope::Thread,
+                    );
                     scheduler.notify_signal_pending(dettid, SigWrapper(signal));
                     let dbt = self.cfg.backend.requires_thread_directed_process_signals;
                     // kill, rt_sigqueueinfo and a pidfd without
@@ -5032,6 +5065,13 @@ impl GlobalState {
                     resp: Ivar::new(),
                     protocol: Default::default(),
                 });
+            // Under the in-guest delivery gate, a new task starts with the
+            // guest mask its creator published, as Linux's child starts with
+            // its creator's `blocked` (A5 step 3c.1e A, fork-child seeding);
+            // a no-op with the gate off, and for the root thread.
+            if flags.is_some() {
+                sched.seed_child_guest_sigmask(parent_dettid, child_dettid);
+            }
 
             {
                 let is_group_leader = if let Some(f) = flags {
@@ -6899,6 +6939,19 @@ pub enum GlobalRequest {
     /// Record a process's virtual soft `RLIMIT_RSS` after a `setrlimit` or
     /// `prlimit64` changed it (`Scheduler::set_rss_limit`). Appended last.
     SetRssLimit(DetPid, u64),
+    /// A5 step 3c.1e A, IR-23(a): the sender's masked wait publishes its
+    /// temporary mask with D37's held masks before its first expired-timerfd
+    /// publication, or withdraws that publication as a call that filed no
+    /// later request returns (`Scheduler::temporary_mask_control`). Answered
+    /// in the sender's own turn with no scheduling decision; filed only under
+    /// `Config::in_guest_signal_delivery`. Appended last.
+    PublishTemporaryMask(crate::scheduler::guest_mask_publication::TemporaryMaskControl),
+    /// A5 step 3c.1e A, IR-15: whether this thread's process is the init of a
+    /// PID namespace it created with `CLONE_NEWPID`
+    /// (`ThreadTree::is_pid_namespace_init`), asked under
+    /// `Config::in_guest_signal_delivery` before a two-phase delivery's
+    /// announcement and a predicted death. Appended last.
+    InPidNamespaceInit(DetTid),
 }
 
 /// Responses from the global object
@@ -7165,6 +7218,20 @@ pub enum GlobalResponse {
     RecordExternalParent(()),
     /// Appended last.
     SetRssLimit(()),
+    /// The answer to `GlobalRequest::PublishedGuestSigmask` under
+    /// `Config::in_guest_signal_delivery` (A5 step 3c.1e A): the published
+    /// mask, tri-state (IR-18), and D37's held masks of a temporary-mask
+    /// publication in force (`Scheduler::status_guest_mask`). With the gate
+    /// off the query is answered with `PublishedGuestSigmask`, as before.
+    /// Appended last.
+    GuestSigmaskForStatus(crate::scheduler::guest_mask_publication::StatusGuestMask),
+    /// The answer to `GlobalRequest::PublishTemporaryMask`: for a withdrawal
+    /// of a publication in force, the sends committed to the thread while it
+    /// was (the committed-send window record); `None` otherwise. Appended
+    /// last.
+    PublishTemporaryMask(Option<crate::scheduler::guest_mask_publication::CommittedSendWindow>),
+    /// The answer to `GlobalRequest::InPidNamespaceInit`. Appended last.
+    InPidNamespaceInit(bool),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -7636,6 +7703,72 @@ where
         GlobalResponse::PublishedGuestSigmask(mask) => mask,
         GlobalResponse::ThreadExited => None,
         other => panic!("unexpected response to PublishedGuestSigmask: {other:?}"),
+    }
+}
+
+/// A5 step 3c.1e A: what the `/proc` status reader needs of `thread` under
+/// the in-guest delivery gate (`Scheduler::status_guest_mask`): its published
+/// mask, tri-state (IR-18), and D37's held masks of a temporary-mask
+/// publication in force. Asked through the same query as
+/// [`published_guest_sigmask`], which the coordinator answers with the
+/// appended `GuestSigmaskForStatus` under the gate.
+pub(crate) async fn status_guest_mask<G, T>(
+    guest: &mut G,
+    thread: DetTid,
+) -> crate::scheduler::guest_mask_publication::StatusGuestMask
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    use crate::scheduler::guest_mask_publication::PublishedGuestMask;
+    use crate::scheduler::guest_mask_publication::StatusGuestMask;
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::PublishedGuestSigmask(thread)).await;
+    match response {
+        GlobalResponse::GuestSigmaskForStatus(status) => status,
+        GlobalResponse::PublishedGuestSigmask(mask) => StatusGuestMask {
+            mask: mask.map(PublishedGuestMask::Known),
+            ..Default::default()
+        },
+        GlobalResponse::ThreadExited => StatusGuestMask::default(),
+        other => panic!("unexpected response to PublishedGuestSigmask: {other:?}"),
+    }
+}
+
+/// A5 step 3c.1e A, IR-23(a): file `control`, the sender's temporary-mask
+/// publication or its withdrawal (`GlobalRequest::PublishTemporaryMask`),
+/// answered in its own turn with no scheduling decision. A withdrawal of a
+/// publication in force answers the committed-send window record.
+pub(crate) async fn publish_temporary_mask<G, T>(
+    guest: &mut G,
+    control: crate::scheduler::guest_mask_publication::TemporaryMaskControl,
+) -> Option<crate::scheduler::guest_mask_publication::CommittedSendWindow>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::PublishTemporaryMask(control)).await;
+    match response {
+        GlobalResponse::PublishTemporaryMask(window) => window,
+        GlobalResponse::ThreadExited => None,
+        other => panic!("unexpected response to PublishTemporaryMask: {other:?}"),
+    }
+}
+
+/// A5 step 3c.1e A, IR-15: whether `thread`'s process is the init of a PID
+/// namespace it created with `CLONE_NEWPID` (`GlobalRequest::InPidNamespaceInit`).
+pub(crate) async fn in_pid_namespace_init<G, T>(guest: &mut G, thread: DetTid) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::InPidNamespaceInit(thread)).await;
+    match response {
+        GlobalResponse::InPidNamespaceInit(init) => init,
+        GlobalResponse::ThreadExited => false,
+        other => panic!("unexpected response to InPidNamespaceInit: {other:?}"),
     }
 }
 
@@ -8369,6 +8502,26 @@ where
     };
 
     let detpid = guest.thread_state().detpid.expect("detpid unset");
+
+    // Under the in-guest delivery gate (A5 step 3c.1e A), the creator
+    // publishes its current guest mask before the child is registered and
+    // seeded from it (`Scheduler::seed_child_guest_sigmask`), as Linux's
+    // child starts with its creator's `blocked` at the clone
+    // (`arch_dup_task_struct`, kernel/fork.c:1086-1091 at v6.12). An ordinary
+    // clone files no request, so without this a mask changed since the
+    // creator's last request (an `rt_sigprocmask` just before the `fork`)
+    // would seed the child with the older one. The mask is the one a request
+    // without a temporary mask publishes (`publish_request_guest_mask`: the
+    // backend's record of the guest's mask, with phase 1's virtual SIGALRM
+    // bit; a clone never runs inside a masked call), nothing on a backend
+    // that keeps no guest mask apart, so readers take the kernel's `SigBlk`.
+    // Non-yielding; nothing is sent with the gate off. A vfork's own request
+    // already publishes the mask before its child registers.
+    if flags.is_some() && guest.config().in_guest_signal_delivery {
+        let current =
+            publish_request_guest_mask(guest, &Resources::new(guest.thread_state().dettid));
+        set_saved_guest_sigmask(guest, current).await;
+    }
 
     let resp = send_and_update_time(
         guest,
@@ -11233,6 +11386,7 @@ mod tests {
     mod gated_wait_turn_tests;
     mod guest_mask_publication_tests;
     mod stopping_refusal_tests;
+    mod temporary_mask_publication_tests;
     mod timerless_clock_tests;
     use std::collections::BTreeSet;
     use std::os::fd::AsRawFd;
