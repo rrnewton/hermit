@@ -1178,6 +1178,13 @@ impl DbtVerification {
         verify_json: Option<&Path>,
     ) -> Result<super::run::VerificationRunOutput, Error> {
         let invocation = &self.invocation;
+        // Both physical runs bind the one /etc/ld.so.cache snapshot `verify`
+        // took before building this adapter
+        // (https://github.com/rrnewton/hermit/issues/4693).
+        anyhow::ensure!(
+            invocation.execution.options.has_ld_so_cache_snapshot(),
+            "DBT verification run has no shared /etc/ld.so.cache snapshot"
+        );
         let stats = invocation.execution.stats_capture()?;
         let runner = invocation
             .execution

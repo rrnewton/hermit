@@ -330,8 +330,12 @@ pub struct VerifyInputsOpts {
     #[clap(long, conflicts_with = "inputs", value_name = "DECLARATION")]
     native_exec_declaration: Option<PathBuf>,
 
-    /// The pair program and its arguments.
-    #[clap(last = true, required = true)]
+    /// The pair program and its arguments, after the options; a `--` before
+    /// it is accepted and not needed. Without one, the first `--` of the whole
+    /// command line stays the one inside the pair program (the run's guest
+    /// separator), which is where readers of a recorded command line look for
+    /// the end of Hermit's options.
+    #[clap(trailing_var_arg = true, required = true)]
     program: Vec<String>,
 }
 
@@ -450,12 +454,15 @@ fn place(
 /// The pair's frozen stdin: the bytes the existing stdin snapshot owner would
 /// replay (`hermit::reserve_output_stdin_snapshot`), sealed, so neither run can
 /// see the caller change them. A terminal or an absent stdin is `/dev/null`,
-/// as there.
+/// as there, and so is the null device itself: it holds no bytes to freeze,
+/// and an empty sealed file in its place would change what each guest finds
+/// at its standard input (a regular file, not the character device a run
+/// without the holder gives it).
 fn freeze_stdin(stdin: Option<File>) -> Result<OwnedFd> {
     let Some(mut stdin) = stdin.filter(|file| {
         // SAFETY: isatty only queries the descriptor.
         let terminal = unsafe { libc::isatty(file.as_raw_fd()) } == 1;
-        !terminal
+        !terminal && !is_null_device(file)
     }) else {
         return Ok(File::open("/dev/null")?.into());
     };
@@ -464,6 +471,16 @@ fn freeze_stdin(stdin: Option<File>) -> Result<OwnedFd> {
     }
     let (fd, _, _) = seal_into_memfd(c"hermit-shared-stdin", &mut stdin)?;
     Ok(fd)
+}
+
+/// Whether `file` is the null device (character device 1:3, Linux
+/// Documentation/admin-guide/devices.txt).
+fn is_null_device(file: &File) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().is_ok_and(|metadata| {
+        metadata.file_type().is_char_device() && metadata.rdev() == libc::makedev(1, 3)
+    })
 }
 
 /// The inputs a run adopted from `--native-exec-shared-inputs`, checked
@@ -480,6 +497,60 @@ impl AdoptedInputs {
     #[allow(dead_code)] // The native-exec consumer is the first caller.
     pub(crate) fn into_inputs<T: SharedInputs>(self) -> Result<T> {
         T::adopt(&self.producer, self.objects)
+    }
+
+    /// The set `hermit verify-inputs --input ROLE:PATH...` would hand a run,
+    /// sealed here in-process, for tests of what a run does with it.
+    #[cfg(test)]
+    pub(crate) fn sealed_for_test(inputs: &[(String, PathBuf)]) -> Result<Self> {
+        let (producer, objects) = SealedFiles::seal(inputs)?.export()?;
+        Ok(Self {
+            producer,
+            manifest: File::open("/dev/null")?.into(),
+            objects,
+        })
+    }
+
+    /// Whether the holder sealed an object for `role`.
+    pub(crate) fn has_role(&self, role: &str) -> bool {
+        self.objects.iter().any(|(meta, _)| meta.role == role)
+    }
+
+    /// The bytes of the one object the holder sealed (`hermit verify-inputs
+    /// --input ROLE:PATH`) for `role`, or `None` when the set has none. That
+    /// object must come from [`SealedFiles`] and record `path`, so a role
+    /// cannot stand for a different file.
+    pub(crate) fn read_role(&self, role: &str, path: &std::path::Path) -> Result<Option<Vec<u8>>> {
+        let mut found = self.objects.iter().filter(|(meta, _)| meta.role == role);
+        let Some((meta, fd)) = found.next() else {
+            return Ok(None);
+        };
+        ensure!(
+            found.next().is_none(),
+            "the shared inputs seal the role {role:?} more than once"
+        );
+        ensure!(
+            self.producer == SealedFiles::PRODUCER,
+            "the shared input {role:?} comes from {:?}, not {:?}",
+            self.producer,
+            SealedFiles::PRODUCER
+        );
+        ensure!(
+            meta.path.as_deref() == Some(path),
+            "the shared input {role:?} records {:?}, not {}",
+            meta.path,
+            path.display()
+        );
+        // A fresh open description: its own offset, from the start.
+        let mut bytes = Vec::new();
+        File::open(format!("/proc/self/fd/{}", fd.as_raw_fd()))?.read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 == meta.size,
+            "the shared input {role:?} read {} bytes, not its sealed {}",
+            bytes.len(),
+            meta.size
+        );
+        Ok(Some(bytes))
     }
 }
 
@@ -563,6 +634,10 @@ static ENTRY_ADOPTION: std::sync::Mutex<Option<(RawFd, Result<AdoptedInputs>)>> 
 /// The descriptor a raw command line passes as `--native-exec-shared-inputs`
 /// before its first `--`, which ends Hermit's own options. Only the two exact
 /// spellings clap accepts count; anything else is left to clap to refuse.
+///
+/// The holder (`hermit verify-inputs`) takes no such flag, and its pair
+/// program follows its options without a `--`: the scan stops at that
+/// subcommand, so the flag of a run inside the program is not the holder's.
 fn shared_inputs_fd_in(argv: &[std::ffi::OsString]) -> Option<String> {
     const FLAG: &[u8] = b"--native-exec-shared-inputs";
     // Other operands (including the declaration path) are opaque Unix bytes.
@@ -570,7 +645,7 @@ fn shared_inputs_fd_in(argv: &[std::ffi::OsString]) -> Option<String> {
     let mut words = argv.iter().skip(1).map(|word| word.as_bytes());
     while let Some(word) = words.next() {
         match word {
-            b"--" => return None,
+            b"--" | b"verify-inputs" => return None,
             word if word == FLAG => {
                 return words
                     .next()
@@ -659,6 +734,108 @@ mod tests {
         assert!(file.write_all(b"x").is_err());
     }
 
+    // The run side of /etc/ld.so.cache sharing
+    // (https://github.com/rrnewton/hermit/issues/4693): the one object sealed
+    // for a role, from the plain-files producer, at the path the caller names.
+    #[test]
+    fn a_role_reads_its_one_sealed_object_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ld.so.cache");
+        std::fs::write(&path, b"sealed cache").unwrap();
+        let adopted = |producer: &str| {
+            let (_, objects) = SealedFiles::seal(&[("ld-so-cache".into(), path.clone())])
+                .unwrap()
+                .export()
+                .unwrap();
+            AdoptedInputs {
+                producer: producer.into(),
+                manifest: File::open("/dev/null").unwrap().into(),
+                objects,
+            }
+        };
+        let inputs = adopted(SealedFiles::PRODUCER);
+        std::fs::write(&path, b"replaced on the host").unwrap();
+        assert_eq!(
+            inputs.read_role("ld-so-cache", &path).unwrap().as_deref(),
+            Some(&b"sealed cache"[..])
+        );
+        assert_eq!(inputs.read_role("absent", &path).unwrap(), None);
+        let elsewhere = dir.path().join("other");
+        assert!(inputs.read_role("ld-so-cache", &elsewhere).is_err());
+        assert!(
+            adopted("another-producer")
+                .read_role("ld-so-cache", &path)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_null_device_stays_the_null_device_and_a_file_is_frozen() {
+        use std::os::unix::fs::FileTypeExt;
+        let null = File::from(freeze_stdin(Some(File::open("/dev/null").unwrap())).unwrap());
+        assert!(is_null_device(&null));
+        assert!(null.metadata().unwrap().file_type().is_char_device());
+
+        let mut input = tempfile::tempfile().unwrap();
+        input.write_all(b"guest input").unwrap();
+        let frozen = freeze_stdin(Some(input)).unwrap();
+        assert_eq!(
+            seals_of(frozen.as_raw_fd()).unwrap() & REQUIRED_SEALS,
+            REQUIRED_SEALS
+        );
+        let mut bytes = Vec::new();
+        File::open(format!("/proc/self/fd/{}", frozen.as_raw_fd()))
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"guest input");
+    }
+
+    // The pair program follows the holder's options with or without a `--`,
+    // and every word of it -- its own `--` (the run's guest separator)
+    // included -- reaches the program unchanged.
+    #[test]
+    fn a_misspelled_holder_option_is_refused_not_run() {
+        let error = VerifyInputsOpts::try_parse_from([
+            "verify-inputs",
+            "--manifest-fd",
+            "9",
+            "--inptu",
+            "r:/p",
+            "bash",
+        ])
+        .expect_err("clap refuses an unknown option before the program");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn the_pair_program_follows_the_options_with_or_without_a_separator() {
+        let program = [
+            "bash",
+            "-c",
+            "script",
+            "name",
+            "--log",
+            "--",
+            "/bin/true",
+            "--x",
+        ];
+        let parse = |words: &[&str]| {
+            VerifyInputsOpts::try_parse_from(
+                ["verify-inputs", "--manifest-fd", "9", "--input", "r:/p"]
+                    .iter()
+                    .chain(words),
+            )
+            .unwrap()
+        };
+        for words in [&program[..], &[&["--"][..], &program[..]].concat()[..]] {
+            let opts = parse(words);
+            assert_eq!(opts.program, program, "{words:?}");
+            assert_eq!(opts.manifest_fd, 9);
+            assert_eq!(opts.inputs, ["r:/p"]);
+        }
+    }
+
     #[test]
     fn the_entry_scan_finds_the_flag_only_among_hermits_own_options() {
         let scan = |words: &[&str]| {
@@ -686,6 +863,23 @@ mod tests {
             None
         );
         assert_eq!(scan(&["run", "--", "true"]), None);
+        // The holder's pair program is not Hermit's options.
+        assert_eq!(
+            scan(&[
+                "verify-inputs",
+                "--manifest-fd",
+                "9",
+                "bash",
+                "-c",
+                "x",
+                "hermit",
+                "run",
+                "--native-exec-shared-inputs=9",
+                "--",
+                "true",
+            ]),
+            None
+        );
     }
 
     #[test]

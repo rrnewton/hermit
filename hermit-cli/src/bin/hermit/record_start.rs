@@ -491,7 +491,7 @@ impl StartOpts {
     ) -> Result<(Container, IdentityGuard), Error> {
         let mut container = namespace_container(true);
         network.configure(&mut container, false);
-        let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts()?;
+        let (mut identity_mounts, mut identity_guard) = identity_hardening_mounts(None)?;
         for mount in &self.mount {
             let user_target = mount.get_target();
             identity_guard.discard_mounts_shadowed_by(&mut identity_mounts, user_target);

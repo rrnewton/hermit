@@ -1080,6 +1080,11 @@ fn started_by_a_dap_supervisor(owner: &OsStr) -> bool {
     same_executable && holds_the_socket
 }
 
+/// The role `hermit verify-inputs --input ROLE:PATH` seals the host's
+/// dynamic-linker cache under for a `--verify-run` pair, and its path.
+pub(crate) const LD_SO_CACHE_ROLE: &str = "ld-so-cache";
+pub(crate) const LD_SO_CACHE_PATH: &str = "/etc/ld.so.cache";
+
 /// Command-line options for the "run" subcommand.
 #[derive(Debug, Parser, Clone)]
 #[clap(group(clap::ArgGroup::new("verification").args(["verify", "verify_run"])))]
@@ -1630,6 +1635,14 @@ pub struct RunOpts {
     /// run ends.
     #[clap(skip)]
     shared_inputs: Option<std::sync::Arc<super::verify_inputs::AdoptedInputs>>,
+
+    /// The guest's `/etc/ld.so.cache`, when one snapshot serves both runs of a
+    /// verification: taken once by `run --verify`, or the object the holder
+    /// sealed as [`LD_SO_CACHE_ROLE`] for `--verify-run`. `None` reads the
+    /// host's cache at container setup
+    /// (https://github.com/rrnewton/hermit/issues/4693).
+    #[clap(skip)]
+    ld_so_cache_snapshot: Option<super::container::LdSoCacheSnapshot>,
 
     /// Print a summary of the process tree's execution to stderr before exiting.
     #[clap(long, short = 'u')]
@@ -3032,6 +3045,92 @@ fn every_backend_keeps_io_buffer_checking_on_by_default() {
             );
         }
     }
+}
+
+// Both runs of an in-process `--verify` bind the snapshot their owner took,
+// and a run refuses to set up its container without it
+// (https://github.com/rrnewton/hermit/issues/4693).
+#[test]
+fn verification_runs_bind_one_shared_ld_so_cache_snapshot() {
+    let tmpfs = tempfile::tempdir().unwrap();
+    let mut ro = run_opts_for(&["hermit", "run", "/bin/true"]);
+    assert!(
+        ro.mounts(tmpfs.path()).is_ok(),
+        "a plain run reads the host's cache"
+    );
+    ro.fatal_core_run_label = Some("run2");
+    let refused = ro
+        .mounts(tmpfs.path())
+        .err()
+        .expect("run 2 without the snapshot");
+    assert!(
+        refused
+            .to_string()
+            .contains("verification run run2 has no shared /etc/ld.so.cache snapshot"),
+        "{refused:#}"
+    );
+    let shared = ro.with_verification_ld_so_cache().unwrap();
+    assert_eq!(
+        shared.ld_so_cache_snapshot,
+        Some(super::container::LdSoCacheSnapshot::of_host().unwrap())
+    );
+    assert!(shared.mounts(tmpfs.path()).is_ok());
+    // An existing snapshot (one the holder sealed) is kept, not re-read.
+    let sealed = super::container::LdSoCacheSnapshot::from_bytes(b"sealed".to_vec());
+    ro.ld_so_cache_snapshot = Some(sealed.clone());
+    assert_eq!(
+        ro.with_verification_ld_so_cache()
+            .unwrap()
+            .ld_so_cache_snapshot,
+        Some(sealed)
+    );
+}
+
+// `--verify-run` under the holder takes the sealed /etc/ld.so.cache as its
+// snapshot, and only that role at that path.
+#[test]
+fn an_adopted_ld_so_cache_role_becomes_the_runs_snapshot() {
+    let mut ro = run_opts_for(&["hermit", "run", "/bin/true"]);
+    let dir = tempfile::tempdir().unwrap();
+    let other = dir.path().join("other");
+    fs::write(&other, b"not the cache").unwrap();
+    let unrelated =
+        super::verify_inputs::AdoptedInputs::sealed_for_test(&[("data".into(), other.clone())])
+            .unwrap();
+    ro.adopt_shared_ld_so_cache(&unrelated).unwrap();
+    assert_eq!(ro.ld_so_cache_snapshot, None);
+    let misplaced =
+        super::verify_inputs::AdoptedInputs::sealed_for_test(&[(LD_SO_CACHE_ROLE.into(), other)])
+            .unwrap();
+    assert!(ro.adopt_shared_ld_so_cache(&misplaced).is_err());
+    let Ok(host) = fs::read(LD_SO_CACHE_PATH) else {
+        return;
+    };
+    let sealed = super::verify_inputs::AdoptedInputs::sealed_for_test(&[(
+        LD_SO_CACHE_ROLE.into(),
+        PathBuf::from(LD_SO_CACHE_PATH),
+    )])
+    .unwrap();
+    // A run that holds the sealed role but did not adopt it is refused.
+    let tmpfs = tempfile::tempdir().unwrap();
+    ro.shared_inputs = Some(std::sync::Arc::new(sealed));
+    let refused = ro
+        .mounts(tmpfs.path())
+        .err()
+        .expect("an unadopted sealed cache");
+    assert!(
+        refused
+            .to_string()
+            .contains("the shared inputs seal /etc/ld.so.cache, but this run did not adopt it"),
+        "{refused:#}"
+    );
+    let adopted = std::sync::Arc::clone(ro.shared_inputs.as_ref().unwrap());
+    ro.adopt_shared_ld_so_cache(&adopted).unwrap();
+    assert_eq!(
+        ro.ld_so_cache_snapshot,
+        Some(super::container::LdSoCacheSnapshot::from_bytes(host))
+    );
+    assert!(ro.mounts(tmpfs.path()).is_ok());
 }
 
 #[test]
@@ -7231,6 +7330,7 @@ impl RunOpts {
         );
         if let Some(fd) = self.native_exec_shared_inputs {
             let adopted = super::verify_inputs::take_adopted(fd)?;
+            self.adopt_shared_ld_so_cache(&adopted)?;
             #[cfg(feature = "native-exec")]
             if self.native_exec_inputs.is_some() {
                 self.native_exec_capture = Some(std::sync::Arc::new(
@@ -9487,6 +9587,19 @@ impl RunOpts {
         if let Some(path) = &self.verify_json {
             write_pending_verification_json(path)?;
         }
+        // One /etc/ld.so.cache snapshot for both runs, taken before anything
+        // copies these options -- the DBT adapter keeps its own copy and runs
+        // both executions from it (https://github.com/rrnewton/hermit/issues/4693).
+        self.with_verification_ld_so_cache()?
+            .verify_sharing_ld_so_cache(global, _dbt_stdin)
+    }
+
+    /// [`Self::verify`] once these options carry the snapshot both runs bind.
+    fn verify_sharing_ld_so_cache(
+        &self,
+        global: &GlobalOpts,
+        _dbt_stdin: Option<fs::File>,
+    ) -> Result<ExitStatus, Error> {
         #[cfg(feature = "dbt")]
         let mut dbt = if self.selected_backend() == Backend::Dbt {
             Some(self.dbt_invocation()?.verification(_dbt_stdin)?)
@@ -9560,9 +9673,18 @@ impl RunOpts {
         let summary2_path = records_run_metadata
             .then(|| self.summary_json.as_deref().or(summary1_path.as_deref()))
             .flatten();
+        // Both runs bind one snapshot of the host's /etc/ld.so.cache: the
+        // package manager can replace it between them, and the two loaders'
+        // `fstat` of it would then differ (https://github.com/rrnewton/hermit/issues/4693).
+        let ld_so_cache = self
+            .with_verification_ld_so_cache()?
+            .ld_so_cache_snapshot
+            .expect("with_verification_ld_so_cache always sets the snapshot");
         let mut run1_options = self.clone();
         run1_options.summary_json = summary1_path.clone();
+        run1_options.ld_so_cache_snapshot = Some(ld_so_cache.clone());
         let mut run2_options = self.clone();
+        run2_options.ld_so_cache_snapshot = Some(ld_so_cache);
         run2_options.summary_json = summary2_path.map(Path::to_owned);
 
         // Each run records the host files its guest opens, so that a
@@ -10028,12 +10150,66 @@ impl RunOpts {
         !self.no_namespace
     }
 
+    /// Take the `/etc/ld.so.cache` role the `hermit verify-inputs` holder
+    /// sealed, if it sealed one, as this run's snapshot: both runs of the pair
+    /// then bind the same bytes whatever the host's package manager does
+    /// between them (https://github.com/rrnewton/hermit/issues/4693).
+    fn adopt_shared_ld_so_cache(
+        &mut self,
+        adopted: &super::verify_inputs::AdoptedInputs,
+    ) -> Result<(), Error> {
+        if let Some(bytes) = adopted.read_role(LD_SO_CACHE_ROLE, Path::new(LD_SO_CACHE_PATH))? {
+            self.ld_so_cache_snapshot =
+                Some(super::container::LdSoCacheSnapshot::from_bytes(bytes));
+        }
+        Ok(())
+    }
+
+    /// Whether these options carry the `/etc/ld.so.cache` snapshot both runs
+    /// of a verification bind.
+    #[cfg(feature = "dbt")]
+    pub(super) fn has_ld_so_cache_snapshot(&self) -> bool {
+        self.ld_so_cache_snapshot.is_some()
+    }
+
+    /// These options with the `/etc/ld.so.cache` snapshot both runs of an
+    /// in-process verification bind: the one already taken, else the host's
+    /// cache now.
+    fn with_verification_ld_so_cache(&self) -> Result<Self, Error> {
+        let mut shared = self.clone();
+        if shared.ld_so_cache_snapshot.is_none() {
+            shared.ld_so_cache_snapshot = Some(super::container::LdSoCacheSnapshot::of_host()?);
+        }
+        Ok(shared)
+    }
+
     /// Returns the mounts to be used with the container, in the order they are
     /// installed: the identity-hardening mounts, the caller's `--mount`s and
     /// `--bind`s (a backend adapter's own last, marked as a backend's), the
     /// e9patch overlay (a backend's own), and the private `/tmp`.
     fn mounts(&self, tmpfs: &Path) -> Result<PreparedMounts, Error> {
-        let (mut identity_mounts, identity_sources) = identity_hardening_mounts()?;
+        // Each run of an in-process `--verify` must bind the one snapshot its
+        // owner took for both; reading the host here would let a cache
+        // replaced between the runs reach only one of them
+        // (https://github.com/rrnewton/hermit/issues/4693).
+        anyhow::ensure!(
+            !matches!(self.fatal_core_run_label, Some("run1" | "run2"))
+                || self.ld_so_cache_snapshot.is_some(),
+            "verification run {} has no shared /etc/ld.so.cache snapshot",
+            self.fatal_core_run_label.unwrap_or_default()
+        );
+        // And a `--verify-run` whose holder sealed the cache binds that copy,
+        // never the host's (`adopt_shared_ld_so_cache`).
+        anyhow::ensure!(
+            self.ld_so_cache_snapshot.is_some()
+                || !self
+                    .shared_inputs
+                    .as_ref()
+                    .is_some_and(|inputs| inputs.has_role(LD_SO_CACHE_ROLE)),
+            "the shared inputs seal /etc/ld.so.cache, but this run did not adopt it"
+        );
+        let (mut identity_mounts, identity_sources) =
+            identity_hardening_mounts(self.ld_so_cache_snapshot.as_ref())?;
         let mut identity_sources = identity_sources;
         let mut explicit_tmp_mount = false;
         let mut user_mounts = Vec::with_capacity(self.mount.len() + self.bind.len());

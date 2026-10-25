@@ -4602,6 +4602,11 @@ import json,pathlib,sys
 root=pathlib.Path(__file__).parent
 full=sys.argv[1:]
 a=full
+# `hermit verify-inputs --OPTION VALUE... PAIR`: the holder seals, then execs the pair.
+if a and a[0]=='verify-inputs':
+ import os;i=1
+ while a[i].startswith('--'):i+=2
+ os.execvp(a[i],a[i:])
 if '--help' in a:
  print('--verify-strict');sys.exit(0)
 if 'run' in a:a=a[a.index('run'):]
@@ -4992,6 +4997,11 @@ rundir.mkdir()
 import json,os,pathlib,sys
 root=pathlib.Path(__file__).parent
 a=sys.argv[1:]
+# `hermit verify-inputs --OPTION VALUE... PAIR`: the holder seals, then execs the pair.
+if a and a[0]=='verify-inputs':
+ import os;i=1
+ while a[i].startswith('--'):i+=2
+ os.execvp(a[i],a[i:])
 if '--help' in a:
  print('--verify-strict');sys.exit(0)
 evidence=os.environ.get('HERMIT_SABRE_PATH_EVIDENCE')
@@ -7166,6 +7176,11 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
 import sys
 full=sys.argv[1:]
 a=full
+# `hermit verify-inputs --OPTION VALUE... PAIR`: the holder seals, then execs the pair.
+if a and a[0]=='verify-inputs':
+ import os;i=1
+ while a[i].startswith('--'):i+=2
+ os.execvp(a[i],a[i:])
 if '--help' in a:
  print('--verify-strict');sys.exit(0)
 if 'run' in a:a=a[a.index('run'):]

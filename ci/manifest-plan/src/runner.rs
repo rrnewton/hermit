@@ -3639,6 +3639,11 @@ pub struct RunContext {
     pub timeout_multipliers: TimeoutMultipliers,
     pub scheduled_worker_capacity: ScheduledWorkerCapacity,
     pub isolated_workdir: Option<PathBuf>,
+    /// Whether verify and chaos attempts run their two executions under
+    /// `hermit verify-inputs`, sharing one sealed copy of the host's
+    /// `/etc/ld.so.cache` ([`shared_inputs_argv`]). Decided once per run:
+    /// true where the host has the cache.
+    pub shares_ld_so_cache: bool,
 }
 
 /// The epoch a cell gets when `HERMIT_EPOCH` is unset, re-exported for the
@@ -3832,6 +3837,7 @@ impl RunContext {
             timeout_multipliers: timeout_multipliers_from_env()?,
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir,
+            shares_ld_so_cache: Path::new(LD_SO_CACHE_PATH).exists(),
         })
     }
 
@@ -4810,8 +4816,18 @@ fn verify_attempt_invocation_error<'a>(
     comparator: Comparator,
 ) -> Result<Option<&'a str>, String> {
     // The paired program ([`VERIFY_PAIR_SCRIPT`]): the comparison, then the
-    // run command.
-    let paired = &attempt.argv;
+    // run command -- under `hermit verify-inputs` when the attempt shares the
+    // host's dynamic-linker cache ([`shared_inputs_argv`]), and alone in rows
+    // recorded before that or on a host without one.
+    let shared = attempt
+        .argv
+        .get(1..=SHARED_INPUTS_PREFIX.len())
+        .is_some_and(|words| words.iter().map(String::as_str).eq(SHARED_INPUTS_PREFIX));
+    let paired = if shared {
+        &attempt.argv[1 + SHARED_INPUTS_PREFIX.len()..]
+    } else {
+        &attempt.argv[..]
+    };
     let program = ["bash", "-c", VERIFY_PAIR_SCRIPT, VERIFY_PAIR_NAME];
     if paired
         .get(..program.len())
@@ -4829,6 +4845,9 @@ fn verify_attempt_invocation_error<'a>(
         .map(|offset| offset + 1)
         .ok_or("has no run command after its comparison")?;
     let (comparison, argv) = commands.split_at(run_start);
+    if shared && attempt.argv.first() != argv.first() {
+        return Err("seals its shared inputs with a Hermit other than the run's".into());
+    }
     let head = ["--log", "info", "--backend", backend, "run"];
     if argv
         .get(1..=head.len())
@@ -4890,6 +4909,13 @@ fn verify_attempt_invocation_error<'a>(
         return Err(format!(
             "lacks `--verify-run {VERIFY_RUN_DIR_PLACEHOLDER}` where the executor writes it"
         ));
+    }
+    if tokens.flag(SHARED_INPUTS_FLAG) != shared {
+        return Err(if shared {
+            format!("seals shared inputs but its run lacks `{SHARED_INPUTS_FLAG}`")
+        } else {
+            format!("carries `{SHARED_INPUTS_FLAG}` without the `hermit verify-inputs` holder")
+        });
     }
     paired_comparison_error(comparison, &argv[0], expects_exit)
         .map_err(|error| format!("compares with a command that {error}"))?;
@@ -5717,6 +5743,52 @@ pub const VERIFY_RUN_DIR_PLACEHOLDER: &str = "@VERIFY_RUN_DIR@";
 /// <run1>` in the replay's.
 const VERIFY_REPLAY_OF_PLACEHOLDER: &str = "@VERIFY_REPLAY_OF@";
 
+/// The descriptor `hermit verify-inputs` places a verified attempt's
+/// shared-input manifest at: above 2 and outside the native adapter's
+/// reserved 198-204.
+const SHARED_INPUTS_FD: &str = "9";
+
+/// The run option that adopts that manifest, the same word in both runs, so
+/// the two guests still see one Hermit command line.
+const SHARED_INPUTS_FLAG: &str = "--native-exec-shared-inputs=9";
+
+/// The host's dynamic-linker cache, as the holder seals it: Hermit binds the
+/// copy the run adopts under this role in place of reading the host's file
+/// at each run's setup.
+const LD_SO_CACHE_PATH: &str = "/etc/ld.so.cache";
+const LD_SO_CACHE_INPUT: &str = "ld-so-cache:/etc/ld.so.cache";
+
+/// The words before a paired program that [`shared_inputs_argv`] puts there,
+/// after the Hermit binary.
+///
+/// No `--` ends the holder's options: the program follows them directly, so
+/// the first `--` of the recorded command line is still the run's guest
+/// separator, where its readers ([`ParityGuestInputs`](crate::parity), the
+/// SaBRe selection, the scorecard) find the end of Hermit's options.
+const SHARED_INPUTS_PREFIX: [&str; 5] = [
+    "verify-inputs",
+    "--manifest-fd",
+    SHARED_INPUTS_FD,
+    "--input",
+    LD_SO_CACHE_INPUT,
+];
+
+/// `paired` run under `hermit verify-inputs`, which seals the host's
+/// `/etc/ld.so.cache` once for the attempt and hands both runs that one copy.
+///
+/// A host package manager replaces the cache many times an hour. Each run
+/// used to freeze its own copy when its container was set up, so a
+/// replacement between the two runs gave them different caches: the
+/// loader's `fstat` of it differed, and the comparison reported a
+/// divergence that no host-input check could name
+/// (https://github.com/rrnewton/hermit/issues/4693).
+fn shared_inputs_argv(hermit: &str, paired: Vec<String>) -> Vec<String> {
+    let mut argv = vec![hermit.to_owned()];
+    argv.extend(SHARED_INPUTS_PREFIX.map(String::from));
+    argv.extend(paired);
+    argv
+}
+
 /// The `--verify-run` directories of a paired attempt, below its
 /// `verify-runs/<attempt>` directory.
 fn verify_run_directories(verify_runs: &Path) -> [PathBuf; 2] {
@@ -5804,6 +5876,10 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
         }
         VerifiedInvocation::Verify => None,
     };
+    // A `record start` takes no shared inputs, and a host without a cache has
+    // none to seal.
+    let shares_ld_so_cache =
+        !matches!(invocation, VerifiedInvocation::Replay { .. }) && context.shares_ld_so_cache;
     match invocation {
         VerifiedInvocation::Replay {
             record_timeout_seconds,
@@ -5818,11 +5894,12 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
         }
         VerifiedInvocation::Verify => {
             argv.extend(["--verify-run".into(), VERIFY_RUN_DIR_PLACEHOLDER.into()]);
+            argv.extend(shares_ld_so_cache.then(|| SHARED_INPUTS_FLAG.to_owned()));
         }
         VerifiedInvocation::Chaos { seed } => {
+            argv.extend(["--verify-run".into(), VERIFY_RUN_DIR_PLACEHOLDER.into()]);
+            argv.extend(shares_ld_so_cache.then(|| SHARED_INPUTS_FLAG.to_owned()));
             argv.extend([
-                "--verify-run".into(),
-                VERIFY_RUN_DIR_PLACEHOLDER.into(),
                 "--chaos".into(),
                 "--sched-heuristic=random".into(),
                 format!("--seed={seed}"),
@@ -5830,7 +5907,7 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
         }
     }
     let mut comparison = vec![
-        hermit,
+        hermit.clone(),
         "log-diff".into(),
         "--verify-json".into(),
         verdict.to_string_lossy().into_owned(),
@@ -5867,7 +5944,12 @@ fn verified_invocation_argv(args: VerifiedInvocationArgs<'_>) -> Vec<String> {
     }
     argv.push("--".into());
     argv.extend(guest_argv.iter().cloned());
-    paired_verification_argv(comparison, argv)
+    let paired = paired_verification_argv(comparison, argv);
+    if shares_ld_so_cache {
+        shared_inputs_argv(&hermit, paired)
+    } else {
+        paired
+    }
 }
 
 /// The argv of `VERIFY_PAIR_SCRIPT` comparing two executions of the `run`
@@ -12286,6 +12368,7 @@ corpus:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         build_spec(
@@ -12655,6 +12738,7 @@ esac
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: Some(PathBuf::from("/test")),
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let spec_on = |cell: &SelectedCell| {
@@ -13364,6 +13448,7 @@ esac
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         }
     }
@@ -14476,6 +14561,7 @@ fi
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         assert_eq!(
@@ -18534,6 +18620,7 @@ int main(int argc, char **argv) {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
 
@@ -18612,6 +18699,7 @@ int main(int argc, char **argv) {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let result = host_inapplicable_result(
@@ -18740,6 +18828,7 @@ int main(int argc, char **argv) {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let path = root.join("results.jsonl");
@@ -19020,6 +19109,7 @@ backends_disabled:
                 timeout_multipliers: TimeoutMultipliers::default(),
                 scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
                 isolated_workdir: None,
+                shares_ld_so_cache: false,
                 exact_branch_counter: None,
             };
             let spec = build_spec(
@@ -19099,6 +19189,7 @@ backends_disabled:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let spec = build_spec(
@@ -19160,6 +19251,7 @@ backends_disabled:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(7),
             isolated_workdir: Some(PathBuf::from("/test")),
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let spec = build_spec(
@@ -19577,6 +19669,7 @@ backends_disabled:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let spec = build_spec(
@@ -19939,6 +20032,7 @@ backends_disabled:
             timeout_multipliers: crate::timeouts::timeout_multipliers_from_env().unwrap(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let manifests = ManifestSet::load(&root).unwrap();
@@ -20073,6 +20167,7 @@ backends_disabled:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(7),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let spec = build_spec(
@@ -21959,6 +22054,49 @@ exit "$(cat "$PWD/exit-status")"
         );
         assert!(has(&kept, "--verify-log-dir"));
         accepted_skid("a row whose verify logs were kept", &kept, 2);
+        // The pair under `hermit verify-inputs`, sharing one sealed copy of
+        // the host's /etc/ld.so.cache (https://github.com/rrnewton/hermit/issues/4693).
+        let shared = rendered(
+            &base,
+            &context(&|context| context.shares_ld_so_cache = true),
+            &|_| {},
+        );
+        assert_eq!(
+            shared.argv[1..=SHARED_INPUTS_PREFIX.len()],
+            SHARED_INPUTS_PREFIX.map(String::from),
+            "{:?}",
+            shared.argv
+        );
+        assert_eq!(
+            shared.argv[0],
+            shared.argv[at(&shared.argv, "log-diff") - 1]
+        );
+        assert_eq!(
+            shared.argv[at(&shared.argv, VERIFY_RUN_DIR_PLACEHOLDER) + 1],
+            SHARED_INPUTS_FLAG
+        );
+        accepted_skid("a row whose pair shares the host's ld.so.cache", &shared, 2);
+        refused(
+            "a shared-input holder whose run does not adopt the inputs",
+            &with_argv(&shared, |argv| {
+                let index = at(argv, SHARED_INPUTS_FLAG);
+                argv.remove(index);
+            }),
+            "lacks `--native-exec-shared-inputs=9`",
+        );
+        refused(
+            "a run that adopts shared inputs no holder sealed",
+            &with_argv(&base, |argv| {
+                let index = at(argv, VERIFY_RUN_DIR_PLACEHOLDER) + 1;
+                argv.insert(index, SHARED_INPUTS_FLAG.to_owned());
+            }),
+            "without the `hermit verify-inputs` holder",
+        );
+        refused(
+            "a holder that is not the run's Hermit",
+            &with_argv(&shared, |argv| argv[0] = "/elsewhere/hermit".to_owned()),
+            "seals its shared inputs with a Hermit other than the run's",
+        );
         let test = cell_recorded_by(&base).id.test;
         let parity = rendered(
             &base,
@@ -25062,6 +25200,64 @@ cp "{}" "$verdict"
         assert_eq!(spec.argv.last().map(String::as_str), Some("/bin/true"));
     }
 
+    /// Where the host has /etc/ld.so.cache, verify and chaos pairs run under
+    /// `hermit verify-inputs` and both runs adopt its one sealed copy; a
+    /// replay pair, whose first command is `record start`, does not
+    /// (https://github.com/rrnewton/hermit/issues/4693).
+    #[test]
+    fn verify_and_chaos_pairs_share_the_hosts_ld_so_cache_and_replay_pairs_do_not() {
+        let mut context = run_context(Path::new("/repo"));
+        context.shares_ld_so_cache = true;
+        let spec_of = |context: &RunContext, cell: &SelectedCell| {
+            build_spec(
+                context,
+                cell,
+                PathBuf::from("/repo/results/shared-cell"),
+                vec!["/bin/true".into()],
+                "1",
+                (cell.id.mode == "chaos").then_some(7),
+                15,
+            )
+            .unwrap()
+        };
+        let hermit = context.hermit_bin.to_string_lossy().into_owned();
+        for mode in ["verify", "chaos"] {
+            let spec = spec_of(&context, &ptrace_cell(mode));
+            assert_eq!(spec.argv[0], hermit, "{mode}: {:?}", spec.argv);
+            assert_eq!(
+                spec.argv[1..=SHARED_INPUTS_PREFIX.len()],
+                SHARED_INPUTS_PREFIX.map(String::from),
+                "{mode}: {:?}",
+                spec.argv
+            );
+            assert_eq!(
+                spec.argv[1 + SHARED_INPUTS_PREFIX.len()..][..3],
+                ["bash", "-c", VERIFY_PAIR_SCRIPT],
+                "{mode}"
+            );
+            assert!(
+                spec.argv.windows(3).any(|window| window
+                    == [
+                        "--verify-run",
+                        VERIFY_RUN_DIR_PLACEHOLDER,
+                        SHARED_INPUTS_FLAG
+                    ]),
+                "{mode}: {:?}",
+                spec.argv
+            );
+        }
+        let base = ptrace_cell("verify").test.modes["verify"].clone();
+        let replay = spec_of(&context, &replay_cell_with_verify(base.clone(), base));
+        assert_eq!(replay.argv[..3], ["bash", "-c", VERIFY_PAIR_SCRIPT]);
+        assert!(!replay.argv.iter().any(|arg| arg == SHARED_INPUTS_FLAG));
+
+        // Without the cache nothing changes.
+        context.shares_ld_so_cache = false;
+        let plain = spec_of(&context, &ptrace_cell("verify"));
+        assert_eq!(plain.argv[..3], ["bash", "-c", VERIFY_PAIR_SCRIPT]);
+        assert!(!plain.argv.iter().any(|arg| arg == SHARED_INPUTS_FLAG));
+    }
+
     /// A canonical matched report whose two runs printed `first` and
     /// `second` on stdout.
     fn stdout_report(first: &str, second: &str) -> VerificationReport {
@@ -26319,6 +26515,7 @@ cp "{}" "$verdict"
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let error = run_preparation(
@@ -26380,6 +26577,7 @@ cp "{}" "$verdict"
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
         let test = recipe(true);
@@ -26567,6 +26765,7 @@ cp "{}" "$verdict"
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            shares_ld_so_cache: false,
             exact_branch_counter: None,
         };
 

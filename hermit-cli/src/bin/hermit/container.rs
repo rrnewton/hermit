@@ -1101,10 +1101,20 @@ fn frozen_group_file() -> Result<tempfile::NamedTempFile, Error> {
 /// full validation. A copy taken when the container is set up, bound
 /// read-only over the path, keeps the cache one unchanging file for the
 /// guest's whole run, as the frozen `/etc/group` keeps group resolution.
-fn frozen_ld_so_cache() -> Result<Option<tempfile::NamedTempFile>, Error> {
-    let contents = match fs::read(LD_SO_CACHE) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        read => read.context("Failed to read the host dynamic-linker cache")?,
+///
+/// Both runs of one verification must see the same bytes too, so a caller
+/// that runs both passes the one [`LdSoCacheSnapshot`] it took for them
+/// (https://github.com/rrnewton/hermit/issues/4693); without one the host's
+/// cache is read now.
+fn frozen_ld_so_cache(
+    snapshot: Option<&LdSoCacheSnapshot>,
+) -> Result<Option<tempfile::NamedTempFile>, Error> {
+    let snapshot = match snapshot {
+        Some(snapshot) => snapshot.clone(),
+        None => LdSoCacheSnapshot::of_host()?,
+    };
+    let Some(contents) = snapshot.0 else {
+        return Ok(None);
     };
     let mut cache = tempfile::NamedTempFile::new()
         .context("Failed to create the frozen dynamic-linker cache for the guest")?;
@@ -1118,6 +1128,35 @@ fn frozen_ld_so_cache() -> Result<Option<tempfile::NamedTempFile>, Error> {
     Ok(Some(cache))
 }
 
+/// The bytes of the host's `/etc/ld.so.cache` at one moment, or `None` when
+/// the host has none: what [`frozen_ld_so_cache`] gives the guest.
+///
+/// A package manager replaces the host's cache many times an hour. Two runs of
+/// one verification that each read it can see different caches -- the
+/// loader's `fstat` of it then differs, and the comparison reports a
+/// divergence no host-input check names
+/// (https://github.com/rrnewton/hermit/issues/4693) -- so the caller of both
+/// runs takes one snapshot and gives it to each.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct LdSoCacheSnapshot(Option<std::sync::Arc<Vec<u8>>>);
+
+impl LdSoCacheSnapshot {
+    /// The host's cache now.
+    pub(super) fn of_host() -> Result<Self, Error> {
+        match fs::read(LD_SO_CACHE) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self(None)),
+            read => Ok(Self(Some(std::sync::Arc::new(
+                read.context("Failed to read the host dynamic-linker cache")?,
+            )))),
+        }
+    }
+
+    /// A cache another process already sealed (`hermit verify-inputs`).
+    pub(super) fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(Some(std::sync::Arc::new(bytes)))
+    }
+}
+
 /// Deterministic identity-resolution mounts shared by `run`, `record`, and
 /// `replay`: a frozen `/etc/group`, a frozen `/etc/ld.so.cache`
 /// ([`frozen_ld_so_cache`]) and an empty directory over the host nscd
@@ -1125,7 +1164,12 @@ fn frozen_ld_so_cache() -> Result<Option<tempfile::NamedTempFile>, Error> {
 /// state (the nscd cache and the systemd-userdb socket), so record/replay
 /// reproduce the same group/user resolution that `run` mode already enforces.
 /// Returns the mounts plus a guard that must outlive container setup.
-pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard), Error> {
+///
+/// `ld_so_cache`: the snapshot both runs of a verification share, or `None`
+/// to take the host's cache now.
+pub(super) fn identity_hardening_mounts(
+    ld_so_cache: Option<&LdSoCacheSnapshot>,
+) -> Result<(Vec<Mount>, IdentityGuard), Error> {
     let group_file = frozen_group_file()?;
     let mut mountinfo_roots = vec![MountInfoRootSource::new(
         group_file.path(),
@@ -1133,7 +1177,7 @@ pub(super) fn identity_hardening_mounts() -> Result<(Vec<Mount>, IdentityGuard),
         DETERMINISTIC_GROUP_ROOT,
     )?];
     let mut mounts = vec![Mount::bind(group_file.path(), GROUP_FILE).readonly()];
-    let ld_so_cache = frozen_ld_so_cache()?;
+    let ld_so_cache = frozen_ld_so_cache(ld_so_cache)?;
     if let Some(cache) = &ld_so_cache {
         mountinfo_roots.push(MountInfoRootSource::new(
             cache.path(),
@@ -3970,7 +4014,7 @@ pub(super) mod declared_inputs {
 /// held until after `Container::run` returns.
 pub(super) fn deterministic_container() -> Result<(Container, IdentityGuard), Error> {
     let mut container = default_container(true);
-    let (mounts, identity_guard) = identity_hardening_mounts()?;
+    let (mounts, identity_guard) = identity_hardening_mounts(None)?;
     container.mounts(mounts);
     Ok((container, identity_guard))
 }
@@ -5916,8 +5960,8 @@ mod tests {
     // `run` mode regardless of whether the host `/etc/group` lists 65534.
     #[test]
     fn identity_hardening_freezes_group_with_overflow_entry() {
-        let (mounts, guard) =
-            identity_hardening_mounts().expect("identity hardening mounts should be constructible");
+        let (mounts, guard) = identity_hardening_mounts(None)
+            .expect("identity hardening mounts should be constructible");
         assert!(
             !mounts.is_empty(),
             "expected at least the frozen /etc/group mount"
@@ -5945,8 +5989,8 @@ mod tests {
     // a trailing separator, which mount refuses with ENOTDIR).
     #[test]
     fn identity_hardening_freezes_the_dynamic_linker_cache() {
-        let (mounts, guard) =
-            identity_hardening_mounts().expect("identity hardening mounts should be constructible");
+        let (mounts, guard) = identity_hardening_mounts(None)
+            .expect("identity hardening mounts should be constructible");
         let Ok(host) = fs::read(LD_SO_CACHE) else {
             assert!(guard._ld_so_cache.is_none());
             return;
@@ -5969,6 +6013,38 @@ mod tests {
             root.target == Path::new(LD_SO_CACHE)
                 && root.deterministic_root.as_deref() == Some(DETERMINISTIC_LD_SO_CACHE_ROOT)
         }));
+    }
+
+    // Both runs of a verification take the guest's cache from the one
+    // snapshot their caller took, never from the host at each run's setup
+    // (https://github.com/rrnewton/hermit/issues/4693).
+    #[test]
+    fn identity_hardening_binds_the_given_dynamic_linker_cache_snapshot() {
+        let snapshot = LdSoCacheSnapshot::from_bytes(b"not the host's cache".to_vec());
+        let (mounts, guard) = identity_hardening_mounts(Some(&snapshot))
+            .expect("identity hardening mounts should be constructible");
+        let cache = guard
+            ._ld_so_cache
+            .as_ref()
+            .expect("a snapshot with bytes gets a frozen copy");
+        assert_eq!(fs::read(cache.path()).unwrap(), b"not the host's cache");
+        assert_eq!(
+            mounts
+                .iter()
+                .filter(|mount| mount.get_target() == Path::new(LD_SO_CACHE))
+                .count(),
+            1,
+            "{mounts:?}"
+        );
+        let (mounts, guard) = identity_hardening_mounts(Some(&LdSoCacheSnapshot(None)))
+            .expect("identity hardening mounts should be constructible");
+        assert!(guard._ld_so_cache.is_none());
+        assert!(
+            mounts
+                .iter()
+                .all(|mount| mount.get_target() != Path::new(LD_SO_CACHE)),
+            "a snapshot of a host without a cache binds none: {mounts:?}"
+        );
     }
 
     #[test]

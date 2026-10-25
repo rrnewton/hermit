@@ -1163,7 +1163,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's
     // hermit_cpu_profile_supplies_the_profile_only_when_the_flag_is_absent
     // (848214c0, HERMIT_CPU_PROFILE): 1845, listed.
-    ("test.regular_crates", 1845),
+    // And runner::tests::verify_and_chaos_pairs_share_the_hosts_ld_so_cache_and_replay_pairs_do_not
+    // (https://github.com/rrnewton/hermit/issues/4693): 1846, listed.
+    ("test.regular_crates", 1846),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1782,7 +1784,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Three bisect search-input projection and admission regressions: 1094, listed.
     // And record_start's record_start_takes_hermit_cpu_profile_when_the_flag_is_absent
     // (848214c0, HERMIT_CPU_PROFILE): 1095, listed.
-    ("test.hermit_unit", 1095),
+    // And seven ld.so.cache-sharing units (https://github.com/rrnewton/hermit/issues/4693):
+    // container's identity_hardening_binds_the_given_dynamic_linker_cache_snapshot,
+    // verify_inputs' a_role_reads_its_one_sealed_object_and_nothing_else and
+    // the_null_device_stays_the_null_device_and_a_file_is_frozen; run's
+    // verification_runs_bind_one_shared_ld_so_cache_snapshot and
+    // an_adopted_ld_so_cache_role_becomes_the_runs_snapshot; and verify_inputs'
+    // the_pair_program_follows_the_options_with_or_without_a_separator; and
+    // a_misspelled_holder_option_is_refused_not_run: 1102, listed.
+    ("test.hermit_unit", 1102),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4118,7 +4128,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Hermit bbcd2f3e without a count: 609 (validate at 285a61ae saw 609).
     // And signal_state_reads_leave_no_status_descriptor_in_the_guest (no
     // /proc status descriptor in an in-guest process or its fork child): 610.
-    ("test.cli", 610),
+    // And verify_inputs::a_verify_run_binds_the_ld_so_cache_its_holder_sealed
+    // (https://github.com/rrnewton/hermit/issues/4693): 611.
+    ("test.cli", 611),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4618,7 +4630,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 528.
     // And signal_state_reads_leave_no_status_descriptor_in_the_guest (no
     // /proc status descriptor in an in-guest process or its fork child): 529.
-    ("test.cli_on_host", 529),
+    // And the same ld.so.cache holder test, not excluded: 530.
+    ("test.cli_on_host", 530),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5406,7 +5419,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // strict-schedule-boundaries refusal unit: 1091, listed.
     // The same three bisect search-input regressions: 1094, listed.
     // And the same HERMIT_CPU_PROFILE record_start test (848214c0): 1095, listed.
-    ("test.hermit_unit_on_host", 1095),
+    // And the same seven ld.so.cache-sharing units: 1102, listed.
+    ("test.hermit_unit_on_host", 1102),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5599,7 +5613,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same 26 tests; all existing hosted exclusions remain unchanged.
     // And the same two detcore-dbt configuration tests: 1830, listed.
     // And the same HERMIT_CPU_PROFILE detcore-model test (848214c0): 1831, listed.
-    ("test.regular_crates_on_host", 1831),
+    // And the same ld.so.cache-sharing runner test: 1832, listed.
+    ("test.regular_crates_on_host", 1832),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
