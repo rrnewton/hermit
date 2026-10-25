@@ -2361,10 +2361,11 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
         // the kernel on every backend. Always false; see
         // `from_legacy_backend_json`.
         ("backend_virtualizes_capability_prctls", false),
-        (
-            "backend_defers_vfork_child_registration",
-            backend.defers_vfork_child_registration,
-        ),
+        // A vfork child may register before or after the parent's call returns
+        // on every backend now, and Detcore waits for it either way, so the key
+        // is always written false, its value on DBT, the form's only reader;
+        // see `from_legacy_backend_json`.
+        ("backend_defers_vfork_child_registration", false),
     ]
 }
 
@@ -2418,6 +2419,14 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// so the legacy form keeps its bytes, and an input that
 /// says `true` fails the parse rather than being read as a policy no backend
 /// has.
+///
+/// `backend_defers_vfork_child_registration` supplies no capability either: it
+/// said the backend registered a vfork child only after the parent's call
+/// returned, which Reverie's backend contract now allows of every backend. It
+/// is written as false, its value on DBT, so the legacy form keeps its bytes.
+/// The reader still takes it as one of the fifteen keys, so it keeps its
+/// position in the array form, must be a boolean and may appear once, and
+/// ignores its value (KVM wrote true).
 ///
 /// `backend_supports_madvise` is written as true, its value on DBT, so the
 /// legacy form keeps its bytes. The reader still takes it as one of the fifteen
@@ -2638,6 +2647,12 @@ struct LegacyBackendKeys {
     backend_supports_parked_write_signal_interruption: bool,
     #[serde(default)]
     backend_virtualizes_capability_prctls: bool,
+    // Supplies no capability; declared so that the key, like the others,
+    // fails the parse when it is given twice.
+    #[expect(
+        dead_code,
+        reason = "read only to refuse a repeated key; its value is ignored"
+    )]
     #[serde(default)]
     backend_defers_vfork_child_registration: bool,
 }
@@ -2669,7 +2684,6 @@ impl LegacyBackendKeys {
             self.backend_requires_thread_directed_process_signals;
         backend.supports_parked_write_signal_interruption =
             self.backend_supports_parked_write_signal_interruption;
-        backend.defers_vfork_child_registration = self.backend_defers_vfork_child_registration;
         backend.provides_process_signal_control = self.backend_is_kvm;
         backend.emulates_child_waits = self.backend_is_kvm;
         // A legacy encoding predates this key. DBT, the form's only reader,
@@ -3367,7 +3381,6 @@ mod tests {
         assert!(config.backend.runs_exit_robust_list);
         assert!(!config.backend.requires_thread_directed_process_signals);
         assert!(config.backend.supports_parked_write_signal_interruption);
-        assert!(!config.backend.defers_vfork_child_registration);
         assert!(!config.sequentialize_threads);
         assert!(
             legacy_backend_keys(&config).contains(&("kvm_shared_dequeue_timers", false)),
@@ -3773,9 +3786,11 @@ mod tests {
                     assert!(error.to_string().contains(key), "{error}");
                     continue;
                 }
-                "syscall_clobbers_virtualized_by_backend" | "backend_supports_madvise" => {
-                    // Neither supplies a capability: either value reads back
-                    // the same configuration.
+                "syscall_clobbers_virtualized_by_backend"
+                | "backend_supports_madvise"
+                | "backend_defers_vfork_child_registration" => {
+                    // None supplies a capability: either value reads back the
+                    // same configuration.
                     let mut flipped = ptrace.clone();
                     flipped.insert(key.to_owned(), serde_json::Value::Bool(!ptrace_value));
                     let decoded =
@@ -3835,9 +3850,6 @@ mod tests {
                         .unwrap_err();
                     assert!(error.to_string().contains(key), "{error}");
                     continue;
-                }
-                "backend_defers_vfork_child_registration" => {
-                    expected.defers_vfork_child_registration = true
                 }
                 other => panic!("no expectation for legacy key {other}"),
             }

@@ -3977,6 +3977,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     callback_history: Default::default(),
                     detpid: None, // Initialized later.
                     thread_start_entered: false,
+                    vfork_origin: if clone_flags.contains(CloneFlags::CLONE_VFORK) {
+                        pts.1.pending_vfork.as_ref().map(|pending| pending.op)
+                    } else {
+                        None
+                    },
                     physical_tid: None,
                     signal_task_identity: None,
                     open_file_creator: None,
@@ -6247,6 +6252,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             detpid,
             mm: mm_id,
             thread_start_entered: thread_state.thread_start_entered,
+            vfork_origin: thread_state.vfork_origin,
             timeslice_stats: thread_state.stats.timeslice_stats,
             syscall_count: thread_state.stats.syscall_count,
             chaos_epochs: pending_chaos_epochs,

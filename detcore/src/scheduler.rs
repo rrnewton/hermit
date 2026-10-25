@@ -1263,6 +1263,15 @@ pub struct Scheduler {
     /// against this record instead of the barrier. A new vfork by the same
     /// TID clears a stale record ([`Scheduler::begin_vfork_barrier`]).
     dead_vfork_parents: BTreeSet<DetTid>,
+    /// Vfork parents whose child was torn down before its registration
+    /// completed (it died before its first stop, or its registration was
+    /// refused), so it will never register. The barrier ends at the parent's
+    /// continuation, a point that does not depend on when the host reported
+    /// the teardown ([`Scheduler::record_unregistered_vfork_child_exit`]).
+    unregistered_vfork_child_exits: BTreeSet<DetTid>,
+    /// The `BlockingVfork` operation that began each vfork barrier, which a
+    /// child's teardown must name to end that barrier and no other.
+    vfork_barrier_ops: BTreeMap<DetTid, ExternalOpId>,
     /// Vfork parents that died while their registered child was still known
     /// to the scheduler. Their barrier is kept until the child's next release
     /// edge, which happens at a deterministic point: its `Exit` grant, its
@@ -4241,6 +4250,8 @@ impl Scheduler {
             background_entry_valve: Duration::from_secs(30),
             vfork_registration_origins: Default::default(),
             dead_vfork_parents: Default::default(),
+            unregistered_vfork_child_exits: Default::default(),
+            vfork_barrier_ops: Default::default(),
             dead_parent_vfork_barriers: Default::default(),
             released_vfork_barriers: Default::default(),
             vfork_rejoin_edges: Default::default(),
@@ -6192,6 +6203,8 @@ impl Scheduler {
         self.dead_parent_vfork_barriers.remove(&parent);
         self.released_vfork_barriers.remove(&parent);
         self.vfork_rejoin_edges.remove(&parent);
+        self.unregistered_vfork_child_exits.remove(&parent);
+        self.vfork_barrier_ops.remove(&parent);
     }
 
     /// `parent` is being logically killed. With no child registered yet, its
@@ -6255,6 +6268,10 @@ impl Scheduler {
             .retain(|parent| self.vfork_barriers.contains_key(parent));
         self.vfork_rejoin_edges
             .retain(|parent| self.vfork_barriers.contains_key(parent));
+        self.unregistered_vfork_child_exits
+            .retain(|parent| self.vfork_barriers.contains_key(parent));
+        self.vfork_barrier_ops
+            .retain(|parent, _| self.vfork_barriers.contains_key(parent));
     }
 
     #[cfg(test)]
@@ -8315,16 +8332,18 @@ impl Scheduler {
 
     /// Keep scheduling inside an active vfork until the parent can continue.
     /// Before child registration no guest may run; afterward step 3 selects the
-    /// child first (see [`Self::step3_peek`]). A failed clone reaches the parent
-    /// continuation without a child.
+    /// child first (see [`Self::step3_peek`]). A failed clone posts
+    /// `VforkFailed` instead of the parent's continuation and has no child.
     ///
-    /// On the ptrace backend the kernel keeps the vfork parent blocked inside the injected
-    /// `clone(2)` until the child execs or exits, so a registered child (barrier `Some`) is always
-    /// present by the time the parent posts its continuation; an unfulfilled barrier (`None`) at
-    /// that point therefore means the clone failed and the barrier must be dropped. On a backend
-    /// that defers the child spawn (see `defers_vfork_child_registration`, e.g. KVM) the
-    /// child registers only *after* the parent posts its continuation, so an unfulfilled barrier at
-    /// parent continuation means the child is still on its way and the barrier must be kept.
+    /// The child of a successful clone may register before or after the parent posts its
+    /// continuation (Reverie's backend contract, "When a `vfork` child registers": on ptrace the
+    /// kernel keeps the parent inside the injected `clone(2)` until the child execs or exits, so
+    /// the child has registered first; KVM starts the child only after the parent's call has
+    /// returned). So an unfulfilled barrier (`None`) at the parent's continuation means the child
+    /// is still on its way, and the barrier is kept until the child registers. A barrier
+    /// ends without a registered child only at `VforkFailed`, at the parent's exit, or at
+    /// the continuation once the child was torn down before registering
+    /// ([`Self::record_unregistered_vfork_child_exit`]).
     ///
     /// Two states make every pass skip its turn until a backend event arrives:
     /// a `Pending` barrier waits for its child's registration, and a
@@ -8342,7 +8361,6 @@ impl Scheduler {
     fn step2a_wait_for_vfork_barrier(&mut self) -> Result<(), SkipTurn> {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-1152): Review deferred vfork child registration.
-        let defers_registration = self.backend.defers_vfork_child_registration;
         let completed_parents: Vec<_> = self
             .vfork_barriers
             .iter()
@@ -8364,13 +8382,13 @@ impl Scheduler {
                             matches!(resource, ResourceID::BlockedExternalContinue(_))
                         });
                         // A failed injected clone is an explicit deterministic outcome: no child
-                        // can ever register, so cancel the barrier on every backend. Successful
-                        // deferred spawns retain the ordinary continuation and keep waiting.
-                        // At parent continuation, drop a fulfilled barrier as normal cleanup. An
-                        // unfulfilled barrier is a failed clone only when the backend kept the
-                        // parent blocked until the child registered; when the backend defers child
-                        // registration the child is still coming, so keep waiting.
-                        vfork_failed || (at_continue && (child_registered || !defers_registration))
+                        // can ever register, so cancel the barrier. At the parent's continuation,
+                        // drop a fulfilled barrier as normal cleanup; an unfulfilled one waits for
+                        // its child unless the child was torn down before it could register.
+                        vfork_failed
+                            || (at_continue
+                                && (child_registered
+                                    || self.unregistered_vfork_child_exits.contains(parent)))
                     }
                     _ => false,
                 };
@@ -13850,6 +13868,7 @@ impl Scheduler {
                 debug_assert!(rid.is_kernel_run_blocking());
                 if matches!(rid, ResourceID::BlockingVfork(_)) {
                     self.begin_vfork_barrier(dettid);
+                    self.vfork_barrier_ops.insert(dettid, *op_id);
                     if let Some(origin) = self.next_turns[&dettid].protocol.origin {
                         self.vfork_registration_origins.insert(dettid, origin.mm);
                     }
@@ -14321,6 +14340,30 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    /// `child`, created by the vfork whose `BlockingVfork` operation is
+    /// `origin`, is being torn down without having registered, so it never
+    /// will: record it, and that barrier ends at the parent's continuation
+    /// (`step2a`). Only the barrier `origin` began, while it is still pending
+    /// (its child has not registered, which would have fulfilled it), is
+    /// affected; a teardown naming an earlier vfork of the same parent, or
+    /// arriving after the child registered, changes nothing. Whether a thread
+    /// with `child`'s TID registered in an earlier lifetime does not matter.
+    /// The caller has authenticated `child` as the deregistration's sender.
+    pub(crate) fn record_unregistered_vfork_child_exit(
+        &mut self,
+        origin: ExternalOpId,
+        child: DetTid,
+    ) {
+        let parent = origin.tid;
+        if parent == child
+            || self.vfork_barrier_ops.get(&parent) != Some(&origin)
+            || self.vfork_barriers.get(&parent) != Some(&None)
+        {
+            return;
+        }
+        self.unregistered_vfork_child_exits.insert(parent);
     }
 
     // TODO-HUMAN-REVIEW(PR-868): Review the vfork registration scheduler barrier.
@@ -20445,12 +20488,14 @@ mod test {
     }
 
     /// A failed clone has no child and no release edge: the barrier ends at
-    /// the continuation and the parent keeps the background readmission.
+    /// its `VforkFailed` and the parent keeps the background readmission.
     #[test]
     fn a_failed_vfork_keeps_the_background_readmission() {
         let (mut scheduler, op_id, parent, _) = backgrounded_vfork_pair();
         scheduler.vfork_barriers.insert(parent, None);
-        post_vfork_continuation(&mut scheduler, op_id);
+        let mut failure = Resources::new(parent);
+        failure.insert(ResourceID::VforkFailed(op_id), Permission::RW);
+        scheduler.next_turns[&parent].req.put(Ok(failure));
         assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
         assert!(scheduler.vfork_barriers.is_empty());
         assert!(scheduler.blocked.external_io_blockers.contains_key(&parent));
@@ -20458,15 +20503,12 @@ mod test {
     }
 
     /// A continuation that comes before the child's release edge (a backend
-    /// deferring the child's registration posts it before the child runs)
-    /// ends the barrier as before but readmits nothing: the parent cannot
-    /// resume ahead of the child it is waiting for.
+    /// that registers the child after the parent's call returns posts it
+    /// before the child runs) ends the barrier as before but readmits nothing:
+    /// the parent cannot resume ahead of the child it is waiting for.
     #[test]
     fn a_continuation_before_the_release_edge_keeps_the_background_readmission() {
-        let config = Config::default().with_backend(|backend| {
-            backend.defers_vfork_child_registration = true;
-        });
-        let mut scheduler = Scheduler::new(&config);
+        let mut scheduler = Scheduler::new(&Config::default());
         let parent = DetTid::from_raw(3);
         let child = DetTid::from_raw(5);
         let op_id = ExternalOpId::new(parent, 7);
@@ -21006,6 +21048,122 @@ mod test {
         ));
     }
 
+    /// A parent at its continuation whose child never registers, and was
+    /// never reported torn down, still waits: the barrier stays through the
+    /// valve and the run is refused by name, rather than the continuation
+    /// being read as a failed clone.
+    #[test]
+    fn a_continuation_without_a_child_past_its_valve_refuses_the_run_and_stays() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let parent = DetTid::from_raw(3);
+        let op_id = ExternalOpId::new(parent, 7);
+        let mut continuation = Resources::new(parent);
+        continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+        scheduler.vfork_barriers.insert(parent, None);
+        scheduler.next_turns.insert(
+            parent,
+            ThreadNextTurn {
+                dettid: parent,
+                child_tid_addr: 0,
+                req: Ivar::full(Ok(continuation)),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        assert!(scheduler.vfork_barrier_refusal.is_none());
+
+        expire_vfork_barrier_valve(&mut scheduler);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&None));
+        let refusal = scheduler
+            .vfork_barrier_refusal
+            .take()
+            .expect("an expired wait records a typed refusal");
+        assert_eq!(
+            refusal.waits,
+            vec![VforkBarrierWait {
+                parent,
+                child: None,
+                state: VforkBarrierState::Pending,
+            }]
+        );
+    }
+
+    /// A vfork child torn down before its registration completed (it died
+    /// before its first stop, or its registration was refused) ends its
+    /// parent's barrier at the parent's continuation, whichever of the two
+    /// events arrives first. A teardown that names another vfork operation of
+    /// the same parent (an earlier child's late teardown), or that arrives
+    /// for a parent without a pending barrier, changes nothing.
+    #[test]
+    fn a_vfork_child_torn_down_before_registering_ends_the_barrier_at_continuation() {
+        let parent = DetTid::from_raw(3);
+        let child = DetTid::from_raw(5);
+        let op_id = ExternalOpId::new(parent, 7);
+        let earlier_op = ExternalOpId::new(parent, 4);
+        let continuation = || {
+            let mut continuation = Resources::new(parent);
+            continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+            continuation
+        };
+        let pending = |req: Ivar<Result<Resources, ThreadExited>>| {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.vfork_barriers.insert(parent, None);
+            scheduler.vfork_barrier_ops.insert(parent, op_id);
+            scheduler.next_turns.insert(
+                parent,
+                ThreadNextTurn {
+                    dettid: parent,
+                    child_tid_addr: 0,
+                    req,
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+            scheduler
+        };
+
+        // Continuation first, then the teardown.
+        let mut scheduler = pending(Ivar::full(Ok(continuation())));
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        // An earlier vfork's child, torn down late, is not this barrier's.
+        scheduler.record_unregistered_vfork_child_exit(earlier_op, DetTid::from_raw(9));
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&None));
+        scheduler.record_unregistered_vfork_child_exit(op_id, child);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+        assert!(scheduler.unregistered_vfork_child_exits.is_empty());
+        assert!(scheduler.vfork_barrier_ops.is_empty());
+
+        // Teardown first: the barrier still waits for the continuation.
+        let mut scheduler = pending(Ivar::new());
+        scheduler.record_unregistered_vfork_child_exit(op_id, child);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
+        assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&None));
+        scheduler.next_turns[&parent].req.put(Ok(continuation()));
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+
+        // No pending barrier (the child registered): nothing is recorded.
+        let mut scheduler = pending(Ivar::new());
+        scheduler.complete_vfork_registration(parent, child);
+        scheduler.record_unregistered_vfork_child_exit(op_id, child);
+        assert!(scheduler.unregistered_vfork_child_exits.is_empty());
+
+        // The child's TID belonged to a thread that registered and exited in
+        // an earlier lifetime: the teardown of this never-registered child
+        // still ends the barrier.
+        let mut scheduler = pending(Ivar::full(Ok(continuation())));
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, child, true);
+        assert!(scheduler.thread_was_registered(child));
+        scheduler.record_unregistered_vfork_child_exit(op_id, child);
+        assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
+        assert!(scheduler.vfork_barriers.is_empty());
+    }
+
     /// A released barrier whose parent never posts its continuation, and is
     /// never retired, is refused by name once the valve expires, and the
     /// barrier stays released.
@@ -21115,13 +21273,15 @@ mod test {
         assert!(scheduler.step2a_wait_for_vfork_barrier().is_ok());
     }
 
+    /// A failed clone's `VforkFailed` ends a barrier whose child never
+    /// registered.
     #[test]
     fn vfork_registration_barrier_releases_failed_clone() {
         let mut scheduler = Scheduler::new(&Config::default());
         let parent = DetTid::from_raw(3);
         let op_id = ExternalOpId::new(parent, 7);
-        let mut continuation = Resources::new(parent);
-        continuation.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+        let mut failure = Resources::new(parent);
+        failure.insert(ResourceID::VforkFailed(op_id), Permission::RW);
 
         scheduler.vfork_barriers.insert(parent, None);
         scheduler.next_turns.insert(
@@ -21129,7 +21289,7 @@ mod test {
             ThreadNextTurn {
                 dettid: parent,
                 child_tid_addr: 0,
-                req: Ivar::full(Ok(continuation)),
+                req: Ivar::full(Ok(failure)),
                 resp: Ivar::new(),
                 protocol: Default::default(),
             },
@@ -21143,13 +21303,11 @@ mod test {
     // TODO-HUMAN-REVIEW(PR-1152): Review deferred vfork child registration.
     #[test]
     fn vfork_registration_barrier_waits_for_deferred_child_at_continuation() {
-        // On a backend that defers the child spawn (e.g. KVM), the parent posts its continuation
-        // BEFORE the child registers. An unfulfilled barrier at continuation must be kept, not
-        // torn down as a failed clone; otherwise the late child panics on registration.
-        let config = Config::default().with_backend(|backend| {
-            backend.defers_vfork_child_registration = true;
-        });
-        let mut scheduler = Scheduler::new(&config);
+        // A backend may start the child only after the parent's call returns (KVM does), so the
+        // parent posts its continuation BEFORE the child registers. An unfulfilled barrier at
+        // continuation must be kept, not torn down as a failed clone; otherwise the late child
+        // panics on registration.
+        let mut scheduler = Scheduler::new(&Config::default());
         let parent = DetTid::from_raw(3);
         let child = DetTid::from_raw(5);
         let op_id = ExternalOpId::new(parent, 7);
@@ -21169,7 +21327,7 @@ mod test {
         );
 
         // Parent is at its continuation but the child has not registered: keep waiting, keep the
-        // barrier (the failed-clone teardown must NOT fire on a deferring backend).
+        // barrier (only `VforkFailed` means the clone failed).
         assert!(scheduler.step2a_wait_for_vfork_barrier().is_err());
         assert_eq!(scheduler.vfork_barriers.get(&parent), Some(&None));
 
@@ -21182,10 +21340,7 @@ mod test {
     // TODO-HUMAN-REVIEW(PR-1152): Review failed deferred-vfork cancellation.
     #[test]
     fn vfork_registration_barrier_releases_deferred_failed_clone() {
-        let config = Config::default().with_backend(|backend| {
-            backend.defers_vfork_child_registration = true;
-        });
-        let mut scheduler = Scheduler::new(&config);
+        let mut scheduler = Scheduler::new(&Config::default());
         let parent = DetTid::from_raw(3);
         let op_id = ExternalOpId::new(parent, 7);
         let mut failure = Resources::new(parent);

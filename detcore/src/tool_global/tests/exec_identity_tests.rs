@@ -434,6 +434,7 @@ fn deregistration(thread: &ThreadState<()>) -> ThreadDeregistration {
         detpid: thread.detpid.unwrap(),
         mm: thread.mm_id,
         thread_start_entered: thread.thread_start_entered,
+        vfork_origin: None,
         timeslice_stats: thread.stats.timeslice_stats,
         syscall_count: thread.stats.syscall_count,
         chaos_epochs: Vec::new(),
