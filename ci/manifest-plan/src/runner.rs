@@ -3641,7 +3641,7 @@ pub struct RunContext {
     pub isolated_workdir: Option<PathBuf>,
     /// Whether verify and chaos attempts run their two executions under
     /// `hermit verify-inputs`, sharing one sealed copy of the host's
-    /// `/etc/ld.so.cache` ([`shared_inputs_argv`]). Decided once per run:
+    /// `/etc/ld.so.cache` (`shared_inputs_argv`). Decided once per run:
     /// true where the host has the cache.
     pub shares_ld_so_cache: bool,
 }
