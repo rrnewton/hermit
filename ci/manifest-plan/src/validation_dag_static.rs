@@ -4136,10 +4136,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // /proc status descriptor in an in-guest process or its fork child): 610.
     // And verify_inputs::a_verify_run_binds_the_ld_so_cache_its_holder_sealed
     // (https://github.com/rrnewton/hermit/issues/4693): 611.
-    // And fifteen tests of the declared-ISA refusal and --cpu-profile auto
+    // And sixteen tests of the declared-ISA refusal and --cpu-profile auto
     // (https://github.com/rrnewton/hermit/issues/4695), none matching a
-    // --skip: 626, listed.
-    ("test.cli", 626),
+    // --skip: 627, listed.
+    ("test.cli", 627),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4640,9 +4640,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And signal_state_reads_leave_no_status_descriptor_in_the_guest (no
     // /proc status descriptor in an in-guest process or its fork child): 529.
     // And the same ld.so.cache holder test, not excluded: 530.
-    // And the fifteen declared-ISA and --cpu-profile auto tests, none
-    // excluded: 545, by selection.
-    ("test.cli_on_host", 545),
+    // And the sixteen declared-ISA and --cpu-profile auto tests, none
+    // excluded: 546, by selection.
+    ("test.cli_on_host", 546),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
