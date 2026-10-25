@@ -1918,7 +1918,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // phases::tests::the_baseline_knock_out_removes_a_real_intervention_until_none_is_left: 1305.
     // And --minimize's baseline search and minimization: phases::tests::the_baseline_search_knocks_out_the_replayed_record_until_a_replay_misses and
     // minimize::tests::a_failed_cut_of_a_threads_last_interventions_is_tested_again: 1307.
-    ("test.hermit_unit", 1307),
+    // And analyze's workspace cleanup: workspace::tests::{a_workspace_is_removed_when_dropped,
+    // a_kept_workspace_stays, a_workspace_that_cannot_be_removed_is_named,
+    // an_uncreatable_tmp_dir_is_named} and stop::tests::{the_parent_is_the_field_after_the_state,
+    // the_first_stop_signal_is_the_one_reported,
+    // a_stop_signal_reaches_the_children_and_only_them,
+    // the_handler_stops_what_analyze_started_and_nothing_else}: 1315.
+    ("test.hermit_unit", 1315),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5988,7 +5994,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same slice-end test: 1294.
     // And the same two minimize tests: 1299.
     // And the same two --minimize tests: 1301.
-    ("test.hermit_unit_on_host", 1301),
+    // And the same eight workspace-cleanup tests: 1309.
+    ("test.hermit_unit_on_host", 1309),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
