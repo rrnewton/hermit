@@ -303,6 +303,9 @@ where
             )
         }
     };
+    // A virtual-timeout note an earlier child left is not this child's
+    // (`classify_container_result`).
+    super::terminal_outcome_note::clear();
     // The container init inherits this at clone, and it covers the setup Reverie
     // runs before the factory above can arm the init's own handlers.
     let stop_signal_bridge = super::container::ContainerInitStopSignalBridge::install()?;

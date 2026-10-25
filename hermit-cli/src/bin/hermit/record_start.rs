@@ -623,7 +623,7 @@ impl StartOpts {
             let resources = format!("recording {} and identity mounts", data.path().display());
             let options = self.clone();
             let global = global.clone();
-            let ((exit_status, guest_deadlock), (data, _identity)) = super::owned_container::run(
+            let ((exit_status, outcome), (data, _identity)) = super::owned_container::run(
                 &mut container,
                 (data, identity_guard),
                 resources,
@@ -640,7 +640,7 @@ impl StartOpts {
                     let command = options.guest_command()?;
                     let mountinfo = identity.mount_provenance()?;
                     // A deadlocked guest's recording is finished and kept.
-                    hermit::GuestDeadlocked::status_of(match record_timeout {
+                    hermit::SchedulerEndedRun::status_of(match record_timeout {
                         Some(timeout) => with_recording_deadline(timeout, || {
                             hermit::record_to_with_mountinfo(
                                 command,
@@ -690,8 +690,8 @@ impl StartOpts {
                 );
             }
 
-            if guest_deadlock {
-                return Err(Error::new(crate::container::GuestDeadlock));
+            if let Some(outcome) = outcome {
+                return Err(Error::new(crate::container::SchedulerOutcome(outcome)));
             }
             Ok(recording.exit_status)
         }
@@ -746,7 +746,7 @@ impl StartOpts {
                     identity.record_plan()?;
                     let command = options.guest_command()?;
                     let mountinfo = identity.mount_provenance()?;
-                    hermit::GuestDeadlocked::output_of(match record_timeout {
+                    hermit::SchedulerEndedRun::output_of(match record_timeout {
                         Some(timeout) => with_recording_deadline(timeout, || {
                             hermit::record_with_output_with_mountinfo(
                                 command,
@@ -764,7 +764,7 @@ impl StartOpts {
                     })
                 },
             )?;
-        let (recording, recording_deadlocked) = recording;
+        let (recording, recording_outcome) = recording;
         eprintln!(":: {}", "Replaying...".yellow().bold());
         let (mut replay_container, replay_identity) = self.configured_container(self.network())?;
         let mounts = self.mount.clone();
@@ -778,13 +778,13 @@ impl StartOpts {
             None,
             move |(data, _, _, _)| {
                 let _guard = replay_global.init_tracing();
-                hermit::GuestDeadlocked::output_of(hermit::replay_with_output_and_mounts(
+                hermit::SchedulerEndedRun::output_of(hermit::replay_with_output_and_mounts(
                     data.path(),
                     &mounts,
                 ))
             },
         )?;
-        let (replay, replay_deadlocked) = replay;
+        let (replay, replay_outcome) = replay;
 
         let status = conclude_record_replay(
             [&recording, &replay],
@@ -793,7 +793,7 @@ impl StartOpts {
             self.verify_json.as_deref(),
             false,
         )?;
-        deadlocked_pair_outcome(status, recording_deadlocked, replay_deadlocked)
+        ended_pair_outcome(status, recording_outcome, replay_outcome)
     }
 
     fn verification_strictness(&self) -> LogCompareStrictness {
@@ -842,20 +842,24 @@ impl StartOpts {
             }
         };
         let (outcome, result) = match result {
-            Ok((output, guest_deadlock)) => {
+            Ok((output, outcome)) => {
                 writer.write(verify_run::STDOUT, &output.stdout)?;
                 writer.write(verify_run::STDERR, &output.stderr)?;
+                let (guest_deadlock, virtual_timeout_ns) =
+                    detcore::TerminalOutcome::to_fields(outcome);
                 (
                     verify_run::VerifyRunOutcome::Completed {
                         status: verify_run::recorded_status(output.status),
                         skid_overshoots: 0,
                         forwarded_syscalls: None,
                         guest_deadlock,
+                        virtual_timeout_ns,
                     },
-                    if guest_deadlock {
-                        Err(Error::new(crate::container::GuestDeadlock))
-                    } else {
-                        Ok(output.status)
+                    match outcome {
+                        Some(outcome) => {
+                            Err(Error::new(crate::container::SchedulerOutcome(outcome)))
+                        }
+                        None => Ok(output.status),
                     },
                 )
             }
@@ -885,12 +889,12 @@ impl StartOpts {
     }
 
     /// Record the guest into `data`, as `record_verify` records it, with
-    /// whether the guest deadlocked.
+    /// the terminal outcome it ended with, if any.
     fn record_into(
         &self,
         data: &Path,
         global: &GlobalOpts,
-    ) -> Result<(reverie::process::Output, bool), Error> {
+    ) -> Result<(reverie::process::Output, Option<detcore::TerminalOutcome>), Error> {
         fs::create_dir(data).with_context(|| format!("creating {}", data.display()))?;
         let (mut container, identity_guard) = self.recording_container(global)?;
         eprintln!(":: {}", "Recording...".yellow().bold());
@@ -915,7 +919,7 @@ impl StartOpts {
                 identity.record_plan()?;
                 let command = options.guest_command()?;
                 let mountinfo = identity.mount_provenance()?;
-                hermit::GuestDeadlocked::output_of(match record_timeout {
+                hermit::SchedulerEndedRun::output_of(match record_timeout {
                     Some(timeout) => with_recording_deadline(timeout, || {
                         hermit::record_with_output_with_mountinfo(
                             command,
@@ -937,12 +941,12 @@ impl StartOpts {
     }
 
     /// Replay the recording in `data`, as `record_verify` replays it, with
-    /// whether the guest deadlocked.
+    /// the terminal outcome it ended with, if any.
     fn replay_from(
         &self,
         data: &Path,
         global: &GlobalOpts,
-    ) -> Result<(reverie::process::Output, bool), Error> {
+    ) -> Result<(reverie::process::Output, Option<detcore::TerminalOutcome>), Error> {
         eprintln!(":: {}", "Replaying...".yellow().bold());
         let (mut container, identity) = self.configured_container(self.network())?;
         let mounts = self.mount.clone();
@@ -958,7 +962,7 @@ impl StartOpts {
             None,
             move |_| {
                 let _guard = replay_global.init_tracing();
-                hermit::GuestDeadlocked::output_of(hermit::replay_with_output_and_mounts(
+                hermit::SchedulerEndedRun::output_of(hermit::replay_with_output_and_mounts(
                     &data, &mounts,
                 ))
             },
@@ -993,7 +997,7 @@ impl StartOpts {
                 identity.record_plan()?;
                 let command = options.guest_command()?;
                 let mountinfo = identity.mount_provenance()?;
-                hermit::GuestDeadlocked::status_of(match record_timeout {
+                hermit::SchedulerEndedRun::status_of(match record_timeout {
                     Some(timeout) => with_recording_deadline(timeout, || {
                         hermit::record_to_with_mountinfo(
                             command,
@@ -1246,18 +1250,18 @@ fn replay_hint_commands(id: &str, data_dir: Option<&Path>) -> [(&'static str, St
 }
 
 /// The outcome of a recording and its replay that the comparison matched: the
-/// recording's status, which is the deadlock's when both runs deadlocked, then
-/// reported as the guest's outcome.
-pub(crate) fn deadlocked_pair_outcome(
+/// recording's status, which is the terminal outcome's when both runs ended
+/// with the same one, then reported as the guest's outcome.
+pub(crate) fn ended_pair_outcome(
     status: ExitStatus,
-    recording_deadlocked: bool,
-    replay_deadlocked: bool,
+    recording: Option<detcore::TerminalOutcome>,
+    replay: Option<detcore::TerminalOutcome>,
 ) -> Result<ExitStatus, Error> {
-    if recording_deadlocked
-        && replay_deadlocked
-        && status.code() == Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT)
+    if let Some(outcome) = recording
+        && recording == replay
+        && status.code() == Some(outcome.exit_status())
     {
-        return Err(Error::new(crate::container::GuestDeadlock));
+        return Err(Error::new(crate::container::SchedulerOutcome(outcome)));
     }
     Ok(status)
 }

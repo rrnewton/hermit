@@ -77,6 +77,7 @@ mod run_config;
 mod run_timeout;
 mod schedule_search;
 mod strace;
+mod terminal_outcome_note;
 #[cfg(test)]
 mod test_isolation;
 mod tracing;
@@ -185,10 +186,10 @@ use self::analyze::AnalyzeOpts;
 use self::bisect::BisectOpts;
 use self::container::ContainerChildExit;
 use self::container::ContainerChildPanic;
-use self::container::GuestDeadlock;
 use self::container::LogCapExceeded;
 use self::container::PolicyRefusal;
 use self::container::RunTimeoutMarker;
+use self::container::SchedulerOutcome;
 use self::container::SignalDeath;
 use self::global_opts::GlobalOpts;
 use self::host_capabilities::HostCapabilitiesOpts;
@@ -849,12 +850,18 @@ fn block_write_signals_until_exit() {
     }
 }
 
-/// A guest deadlock reported across the container boundary
-/// ([`GuestDeadlock`]) or returned by a run in this process
-/// ([`hermit::GuestDeadlocked`]).
-fn is_guest_deadlock(error: &Error) -> bool {
-    error.downcast_ref::<GuestDeadlock>().is_some()
-        || error.downcast_ref::<hermit::GuestDeadlocked>().is_some()
+/// The scheduler terminal outcome (a guest deadlock, a virtual timeout) a run
+/// ended with, reported across the container boundary ([`SchedulerOutcome`]) or
+/// returned by a run in this process ([`hermit::SchedulerEndedRun`]).
+fn terminal_outcome_of(error: &Error) -> Option<detcore::TerminalOutcome> {
+    error
+        .downcast_ref::<SchedulerOutcome>()
+        .map(|SchedulerOutcome(outcome)| *outcome)
+        .or_else(|| {
+            error
+                .downcast_ref::<hermit::SchedulerEndedRun>()
+                .map(|ended| ended.outcome)
+        })
 }
 
 /// Machine-readable classification of a hermit-internal failure, on stderr.
@@ -934,11 +941,12 @@ fn failure_exit_code(error: &Error) -> i32 {
     if error.downcast_ref::<LogCapExceeded>().is_some() {
         return hermit::HERMIT_LOG_CAP_EXIT;
     }
-    // A guest deadlock is the guest's outcome: the scheduler proved the hang
-    // the program would sit in forever natively, the virtual-time analogue of
-    // the deadline above.
-    if is_guest_deadlock(error) {
-        return detcore_model::HERMIT_GUEST_DEADLOCK_EXIT;
+    // A scheduler terminal outcome is the guest's: a guest deadlock (the
+    // scheduler proved the hang the program would sit in forever natively,
+    // the virtual-time analogue of the deadline above) or a virtual timeout
+    // (that deadline in virtual time, 124 like it).
+    if let Some(outcome) = terminal_outcome_of(error) {
+        return outcome.exit_status();
     }
     match error.downcast_ref::<GuestProgramFault>() {
         Some(fault) => fault.exit_code(),
@@ -982,11 +990,12 @@ fn classify_failure(error: &Error) -> String {
     if error.downcast_ref::<LogCapExceeded>().is_some() {
         return "HERMIT_LOG_CAP class=log-cap".to_string();
     }
-    // NOT HERMIT_INTERNAL_FAILURE: the guest deadlocked and hermit reported
-    // it. The scheduler's report naming every blocked thread is above this
-    // line; this one is what a caller keys on to tell 121 from a guest's own.
-    if is_guest_deadlock(error) {
-        return "HERMIT_GUEST_DEADLOCK class=guest-deadlock".to_string();
+    // NOT HERMIT_INTERNAL_FAILURE: the guest deadlocked, or its virtual clock
+    // passed --virtual-timeout, and hermit reported it. The scheduler's report
+    // is above this line; this one is what a caller keys on to tell 121 from a
+    // guest's own, and a virtual timeout's 124 from --timeout's.
+    if let Some(outcome) = terminal_outcome_of(error) {
+        return outcome.class_line();
     }
     // ONE discriminant, read once, covering all three flattenings.
     if let Some(ContainerChildExit(status)) = error.downcast_ref::<ContainerChildExit>() {
@@ -1106,7 +1115,7 @@ mod tests {
     use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
 
     use super::Args;
-    use super::GuestDeadlock;
+    use super::SchedulerOutcome;
     use super::Subcommand;
     use super::args_from_matches_with_clock;
     use super::classify_failure;
@@ -1889,25 +1898,42 @@ mod tests {
         );
     }
 
-    /// A guest deadlock has its own exit status and class line, and neither is
-    /// an internal failure's: the line a caller keys on, and 121 rather than
-    /// 125.
+    /// Each scheduler terminal outcome has its own exit status and class line,
+    /// and neither is an internal failure's: a guest deadlock exits 121 with
+    /// `class=guest-deadlock`, as it always did; a virtual timeout exits 124
+    /// with `class=virtual-timeout` and its bound, which `--timeout`'s 124
+    /// (`class=run-timeout`) never prints. Each is read from the parent-side
+    /// type and from the library's.
     #[test]
-    fn guest_deadlock_uses_its_own_exit_and_marker() {
-        for error in [
-            Error::new(GuestDeadlock),
-            Error::new(hermit::GuestDeadlocked::new(None)),
+    fn terminal_outcomes_use_their_own_exit_and_marker() {
+        let timeout = detcore::TerminalOutcome::VirtualTimeout { bound_ns: 250 };
+        for (outcome, code, class) in [
+            (
+                detcore::TerminalOutcome::GuestDeadlock,
+                detcore_model::HERMIT_GUEST_DEADLOCK_EXIT,
+                "HERMIT_GUEST_DEADLOCK class=guest-deadlock",
+            ),
+            (
+                timeout,
+                hermit::HERMIT_DEADLINE_EXIT,
+                "HERMIT_RUN_TIMEOUT class=virtual-timeout bound_ns=250",
+            ),
         ] {
-            assert_eq!(
-                failure_exit_code(&error),
-                detcore_model::HERMIT_GUEST_DEADLOCK_EXIT
-            );
-            assert_ne!(failure_exit_code(&error), HERMIT_INTERNAL_FAILURE_EXIT);
-            assert_eq!(
-                classify_failure(&error),
-                "HERMIT_GUEST_DEADLOCK class=guest-deadlock"
-            );
+            for error in [
+                Error::new(SchedulerOutcome(outcome)),
+                Error::new(hermit::SchedulerEndedRun::new(outcome, None)),
+            ] {
+                assert_eq!(failure_exit_code(&error), code);
+                assert_ne!(failure_exit_code(&error), HERMIT_INTERNAL_FAILURE_EXIT);
+                assert_eq!(classify_failure(&error), class);
+            }
         }
+        let wall = Error::new(super::container::RunTimeoutMarker);
+        assert_eq!(failure_exit_code(&wall), hermit::HERMIT_DEADLINE_EXIT);
+        assert_eq!(
+            classify_failure(&wall),
+            "HERMIT_RUN_TIMEOUT class=run-timeout"
+        );
     }
 
     #[test]

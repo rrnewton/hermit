@@ -188,14 +188,17 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
-pub use scheduler::GuestDeadlockUnwind;
-pub use scheduler::GuestDeadlockUnwindGuard;
 pub use scheduler::Priority;
 pub use scheduler::TerminalDeadlockHook;
+pub use scheduler::TerminalOutcome;
+pub use scheduler::TerminalOutcomeUnwind;
+pub use scheduler::TerminalOutcomeUnwindGuard;
+pub use scheduler::VirtualTimeoutExitHook;
 pub use scheduler::runqueue::DEFAULT_PRIORITY;
 pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
 pub use scheduler::set_terminal_deadlock_hook;
+pub use scheduler::set_virtual_timeout_exit_hook;
 pub use tool_global::BackendFailureCleanup;
 pub use tool_global::GlobalState;
 pub use tool_global::SyscallObservationGap;
@@ -1766,10 +1769,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             mycount,
             boundary_token,
         } = turn;
-        // Under `--pipe-wake-latency`, a delivery that ends the process
-        // dooms its threads at this committed turn, before their
-        // host-timed removal (`scheduler::pipe_wake`).
-        if self.cfg.pipe_wake_latency_in_effect().is_some()
+        // Under `--pipe-wake-latency` or `--virtual-timeout`, a delivery
+        // that ends the process dooms its threads at this committed turn,
+        // before their host-timed removal (`Scheduler::thread_is_doomed`).
+        if (self.cfg.pipe_wake_latency_in_effect().is_some() || self.cfg.virtual_timeout.is_some())
             && match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal.raw()) {
                 Some(copied) => crate::syscalls::default_action_ends_process(
                     copied.ignored,

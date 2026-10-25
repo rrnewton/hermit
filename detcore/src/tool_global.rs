@@ -2156,11 +2156,11 @@ impl GlobalState {
         }
     }
 
-    /// Whether this run ended with a guest deadlock that its backend unwound
-    /// (`GuestDeadlockUnwindGuard`): the status the run completed with is
-    /// then `HERMIT_GUEST_DEADLOCK_EXIT`, not one the guest exited with.
-    pub fn guest_deadlocked(&self) -> bool {
-        self.sched.lock().unwrap().guest_deadlocked()
+    /// The terminal outcome this run ended with, when its backend unwound the
+    /// guest for it (`TerminalOutcomeUnwindGuard`): the status the run
+    /// completed with is then the outcome's, not one the guest exited with.
+    pub fn terminal_outcome(&self) -> Option<crate::TerminalOutcome> {
+        self.sched.lock().unwrap().terminal_outcome()
     }
 
     /// Consume failed-run state after the scheduler has naturally finished.

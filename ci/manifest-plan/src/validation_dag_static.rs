@@ -1195,7 +1195,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // capability_clear_image_readiness_preserves_legacy_conditions: 1883, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1894.
     // Train 6 recount (measured on 21f770f6 base): 1899.
-    ("test.regular_crates", 1899),
+    // And detcore-model's
+    // terminal_outcome_tests::terminal_outcomes_carry_their_status_and_class_line
+    // and config::tests::virtual_timeout_round_trips_but_never_enters_the_legacy_form
+    // (--virtual-timeout): 1901.
+    ("test.regular_crates", 1901),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1893,7 +1897,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // ptrace_completion::tests::a_guest_deadlock_completes_with_its_status_and_the_captured_output
     // and error::tests::a_guest_deadlock_is_the_guests_outcome_only_once_the_run_finished:
     // 1226, listed.
-    ("test.hermit_unit", 1226),
+    // 1095, listed. (--virtual-timeout renamed the last three to
+    // tests::terminal_outcomes_use_their_own_exit_and_marker,
+    // ptrace_completion::tests::a_terminal_outcome_completes_with_its_status_and_the_captured_output
+    // and error::tests::a_terminal_outcome_is_the_guests_only_once_the_run_finished.)
+    // And --virtual-timeout's
+    // container::tests::a_deadline_exit_is_a_virtual_timeout_only_with_its_note,
+    // terminal_outcome_note::tests::a_virtual_timeout_noted_by_an_exiting_child_reaches_its_parent_once
+    // and run::virtual_timeout_parses_round_trips_and_is_refused_without_the_scheduler:
+    // 1229.
+    ("test.hermit_unit", 1229),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3118,7 +3131,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And scheduler::test::
     // a_deadlock_unwind_retires_the_remaining_threads_in_tid_order:
     // 2792, listed.
-    ("test.detcore_unit", 2792),
+    // And scheduler::test::a_virtual_timeout_stops_the_run_at_the_first_commit_past_its_bound
+    // and scheduler::test::a_virtual_timeout_is_not_recorded_once_no_thread_can_be_granted_a_turn
+    // (--virtual-timeout): 2794.
+    ("test.detcore_unit", 2794),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4420,7 +4436,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // outcome, tests/c/condvar_join_deadlock.c): 669, listed.
     // And a_guest_deadlock_that_kills_several_threads_verifies_at_parity: 670,
     // listed.
-    ("test.cli", 670),
+    // And a_virtual_timeout_stops_a_guest_that_never_ends,
+    // a_virtual_timeout_the_guest_never_reaches_changes_nothing and
+    // a_virtual_timeout_verifies_as_the_same_stop_in_both_runs
+    // (--virtual-timeout, tests/c/virtual_timeout_loop.c; the node skips
+    // run_kvm_virtual_timeout_is_reported_from_the_childs_note): 673.
+    ("test.cli", 673),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4965,7 +4986,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 585.
     // And the same three guest-deadlock outcome tests: 588, listed.
     // And the same several-thread guest-deadlock parity test: 589, listed.
-    ("test.cli_on_host", 589),
+    // And the same three --virtual-timeout tests (this node skips the KVM
+    // one too): 592.
+    ("test.cli_on_host", 592),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5440,7 +5463,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same normalize test: 2790.
     // And the same guest-deadlock terminal-verdict unit: 2791, listed.
     // And the same unwind retirement unit: 2792, listed.
-    ("test.detcore_unit_on_host", 2792),
+    // And the same two --virtual-timeout scheduler units: 2794.
+    ("test.detcore_unit_on_host", 2794),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5823,7 +5847,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five boundary-confirmation tests: 1133.
     // And the same three prefix-hang tests: 1216.
     // And the same four guest-deadlock outcome units: 1220, listed.
-    ("test.hermit_unit_on_host", 1220),
+    // And the same three --virtual-timeout units: 1223.
+    ("test.hermit_unit_on_host", 1223),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6033,7 +6058,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hosted exclusions unchanged: 1869, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1880.
     // Train 6 recount (measured on 21f770f6 base): 1885.
-    ("test.regular_crates_on_host", 1885),
+    // And the same two --virtual-timeout detcore-model tests: 1887.
+    ("test.regular_crates_on_host", 1887),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
