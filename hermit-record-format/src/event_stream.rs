@@ -494,6 +494,58 @@ impl EventWriter {
         )
         .map(|_| ())
     }
+
+    /// Writes out what both streams still buffer and closes their files,
+    /// reporting the first error. Dropping the writer instead would flush and
+    /// close them too, but would ignore every error, so a stream cut short by a
+    /// full disk (ENOSPC), a file-size limit or an I/O error at its last write,
+    /// or by an error close(2) reports for writes it could not complete, went
+    /// unnoticed until replay failed on it.
+    pub fn finish(self) -> io::Result<()> {
+        let Self {
+            writer,
+            debug_events,
+        } = self;
+        let events = finish_file(writer);
+        let debug_events = finish_file(debug_events);
+        events.and(debug_events)
+    }
+
+    /// An event writer over `events` and `debug_events`, with no stream
+    /// header. Test support only, for the tests here and in the recorder.
+    #[doc(hidden)]
+    pub fn for_test(events: fs::File, debug_events: fs::File) -> Self {
+        Self {
+            writer: io::BufWriter::new(events),
+            debug_events: io::BufWriter::new(debug_events),
+        }
+    }
+}
+
+/// Flushes `writer` and closes its file, reporting an error from either. A
+/// failed flush leaves the rest unwritten: the writer is taken apart rather
+/// than dropped, since its drop would write the rest again and could leave a
+/// complete file behind a reported error.
+fn finish_file(writer: io::BufWriter<fs::File>) -> io::Result<()> {
+    use std::os::fd::IntoRawFd as _;
+    let file = match writer.into_inner() {
+        Ok(file) => file,
+        Err(error) => {
+            let (error, writer) = error.into_parts();
+            let (_file, _unwritten) = writer.into_parts();
+            return Err(error);
+        }
+    };
+    let fd = file.into_raw_fd();
+    // SAFETY: `fd` came from `into_raw_fd`, so it is open and nothing else
+    // owns it. Linux releases the descriptor before it flushes the file, so it
+    // is released even when close fails, and an EINTR must not be retried
+    // (`file_close_fd` before `filp_flush` in fs/open.c).
+    if unsafe { libc::close(fd) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 impl Default for EventWriter {
@@ -518,6 +570,56 @@ mod tests {
 
     fn raw(sysno: Sysno, args: SyscallArgs) -> Syscall {
         Syscall::from_raw(sysno, args)
+    }
+
+    /// `finish` writes out what a stream buffers and reports an error
+    /// writing it, which dropping the writer would ignore: here `/dev/full`,
+    /// whose every write fails with ENOSPC, as a full disk's would.
+    #[test]
+    fn finishing_a_stream_reports_the_error_of_its_last_write() {
+        use super::DebugEvent;
+        use super::EventReader;
+        use super::EventWriter;
+        use crate::event::Event;
+        use crate::event::SyscallEvent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let id = EventStreamId::root();
+        let mut writer = EventWriter::create(dir.path(), &id).unwrap();
+        writer
+            .push_debug_event(DebugEvent::for_test(Sysno::read, "read"))
+            .unwrap();
+        writer
+            .push_event(Event {
+                event: Ok(SyscallEvent::Return(3)),
+            })
+            .unwrap();
+        // Buffered so far: the files hold nothing yet.
+        let path = dir.path().join("thread").join(id.file_name());
+        assert_eq!(fs::metadata(&path).unwrap().len(), 0);
+        writer.finish().unwrap();
+        let mut reader = EventReader::open(dir.path(), &id).unwrap();
+        assert!(matches!(
+            reader.next_event().unwrap(),
+            Event {
+                event: Ok(SyscallEvent::Return(3))
+            }
+        ));
+
+        let full = || {
+            fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap()
+        };
+        let mut writer = EventWriter::for_test(full(), full());
+        writer
+            .push_event(Event {
+                event: Ok(SyscallEvent::Return(3)),
+            })
+            .unwrap();
+        let error = writer.finish().unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC), "{error}");
     }
 
     #[test]

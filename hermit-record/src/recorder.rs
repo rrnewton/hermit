@@ -28,6 +28,8 @@ use std::sync::Mutex;
 
 use reverie::Errno;
 use reverie::Error;
+use reverie::ExitStatus;
+use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
@@ -197,6 +199,20 @@ impl ContainerOutputs {
 impl RecorderThreadState {
     fn push_event(&mut self, event: Event) -> Result<(), bincode::error::EncodeError> {
         self.events.push_event(event)
+    }
+
+    /// Writes out and closes the thread's streams as the thread exits
+    /// (`EventWriter::finish`), or says why its recording is incomplete. The
+    /// recorder then marks the recording as one replay refuses
+    /// (`detcore::detlog::record_replay_refusal`, kept in its metadata), rather
+    /// than let replay fail later on the cut stream, far from the cause.
+    fn finish(self) -> Result<(), String> {
+        let stream_id = self.stream_id;
+        self.events.finish().map_err(|error| {
+            format!(
+                "the recording of thread stream {stream_id} could not be written in full: {error}"
+            )
+        })
     }
 
     fn push_debug_event(&mut self, event: DebugEvent) -> Result<(), bincode::error::EncodeError> {
@@ -509,6 +525,20 @@ impl Tool for Recorder {
 
     fn subscriptions(_config: &<Self::GlobalState as GlobalTool>::Config) -> Subscription {
         hermit_record_format::subscriptions::record_and_replay()
+    }
+
+    async fn on_exit_thread<G: GlobalRPC<Self::GlobalState>>(
+        &self,
+        tid: Tid,
+        _global_state: &G,
+        thread_state: Self::ThreadState,
+        _exit_status: ExitStatus,
+    ) -> Result<(), Error> {
+        if let Err(reason) = thread_state.finish() {
+            tracing::error!("[tid {tid}] {reason}");
+            detcore::detlog::record_replay_refusal(&reason);
+        }
+        Ok(())
     }
 
     async fn handle_syscall_event<G: Guest<Self>>(
@@ -1567,6 +1597,74 @@ mod mkdir_probe_tests {
         assert_eq!(
             require_mkdir_probe_closed(Err(Errno::EINTR)),
             Err(Errno::EINTR)
+        );
+    }
+}
+
+#[cfg(test)]
+mod finish_tests {
+    use super::*;
+
+    /// A handle that sends nothing: exiting a thread needs no RPC.
+    struct NoRpc(detcore::Config);
+
+    #[reverie::tool]
+    impl GlobalRPC<detcore::GlobalState> for NoRpc {
+        async fn send_rpc(
+            &self,
+            _message: <detcore::GlobalState as GlobalTool>::Request,
+        ) -> <detcore::GlobalState as GlobalTool>::Response {
+            unreachable!("a thread's exit sends no RPC")
+        }
+
+        fn config(&self) -> &detcore::Config {
+            &self.0
+        }
+    }
+
+    /// A thread whose streams cannot be written out in full when it exits
+    /// leaves its recording marked as one replay must refuse, with the reason.
+    /// Its writer is on `/dev/full`, whose every write fails with ENOSPC, as a
+    /// full disk's would at the stream's last write.
+    #[test]
+    fn a_thread_stream_that_cannot_be_written_in_full_refuses_replay() {
+        let full = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open("/dev/full")
+                .unwrap()
+        };
+        let mut state = RecorderThreadState {
+            events: EventWriter::for_test(full(), full()),
+            stream_id: EventStreamId::root().child(3),
+            child_stream_ids: ChildEventStreamIds::default(),
+            pending_exec: None,
+            bootstrapped: true,
+            outputs: ContainerOutputs::default(),
+            output_descriptions: Default::default(),
+        };
+        state
+            .push_event(Event {
+                event: Ok(SyscallEvent::Return(0)),
+            })
+            .unwrap();
+        assert_eq!(detcore::detlog::replay_refusal(), None);
+        let recorder = Recorder::default();
+        let rpc = NoRpc(detcore::Config::default());
+        let exit = recorder.on_exit_thread(Tid::from_raw(7), &rpc, state, ExitStatus::Exited(0));
+        let mut exit = std::pin::pin!(exit);
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        let std::task::Poll::Ready(result) = exit.as_mut().poll(&mut context) else {
+            panic!("exiting a thread waited");
+        };
+        result.unwrap();
+        let refusal = detcore::detlog::replay_refusal().expect("no replay refusal recorded");
+        let stream = EventStreamId::root().child(3);
+        assert!(
+            refusal.contains(&format!(
+                "thread stream {stream} could not be written in full"
+            )) && refusal.contains("No space left on device"),
+            "{refusal}"
         );
     }
 }
