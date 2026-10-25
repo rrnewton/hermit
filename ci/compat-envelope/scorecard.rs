@@ -198,6 +198,14 @@ Commands:
       supplied no rows: reading nothing is what an unpopulated series looks
       like, not a finding that a cell has no evidence. An unreachable root is
       refused outright rather than read as empty.
+  project-observations-snapshot --snapshot FILE --snapshot-sha256 HEX \
+      --refreshed-at STAMP
+      The same projection as project-observations, reading one immutable
+      scorecard-series-snapshot/v1 file instead of a series worktree. The
+      ledger publisher uses it once retention has moved original series files
+      to its archive: the snapshot then carries the authenticated rows while
+      its source commit and tree stay the real published ones. The file must
+      match the digest and name the hermit_test_ledger repository.
   project-and-observe-results --snapshot FILE --snapshot-sha256 HEX \
       --results DIR --expected-head SHA --refreshed-at STAMP
       In one locked transaction, project one immutable canonical series
@@ -3708,6 +3716,53 @@ where
     Ok((summaries, retained))
 }
 
+#[derive(Debug)]
+struct ProjectObservationsSnapshotArgs {
+    snapshot: PathBuf,
+    snapshot_sha256: String,
+    refreshed_at: String,
+}
+
+fn parse_project_observations_snapshot_args<I>(
+    mut args: I,
+) -> Result<ProjectObservationsSnapshotArgs, String>
+where
+    I: Iterator<Item = String>,
+{
+    let mut snapshot = None;
+    let mut snapshot_sha256 = None;
+    let mut refreshed_at = None;
+    while let Some(arg) = args.next() {
+        let slot = match arg.as_str() {
+            "--snapshot" => &mut snapshot,
+            "--snapshot-sha256" => &mut snapshot_sha256,
+            "--refreshed-at" => &mut refreshed_at,
+            _ => {
+                return Err(format!(
+                    "unknown project-observations-snapshot option `{arg}`\n\n{USAGE}"
+                ));
+            }
+        };
+        if slot.is_some() {
+            return Err(format!(
+                "project-observations-snapshot accepts {arg} only once"
+            ));
+        }
+        *slot = Some(
+            args.next()
+                .ok_or_else(|| format!("project-observations-snapshot {arg} requires a value"))?,
+        );
+    }
+    let required = |value: Option<String>, option: &str| {
+        value.ok_or_else(|| format!("project-observations-snapshot requires {option}\n\n{USAGE}"))
+    };
+    Ok(ProjectObservationsSnapshotArgs {
+        snapshot: PathBuf::from(required(snapshot, "--snapshot FILE")?),
+        snapshot_sha256: required(snapshot_sha256, "--snapshot-sha256 HEX")?,
+        refreshed_at: required(refreshed_at, "--refreshed-at STAMP")?,
+    })
+}
+
 fn set_project_and_observe_arg(
     slot: &mut Option<String>,
     option: &str,
@@ -3830,6 +3885,7 @@ fn run() -> Result<(), String> {
             | "import-results"
             | "update-observations"
             | "project-observations"
+            | "project-observations-snapshot"
             | "project-and-observe-results"
             | "export-legacy"
     ) && env::var_os("DEV_HERMIT_TEST_LEDGER_PUBLISH_LOCK_FD").is_none()
@@ -3931,6 +3987,15 @@ fn run() -> Result<(), String> {
                 // produce the same file. A refresh timestamp the tool invents is
                 // a diff on every run that says nothing changed.
                 &refreshed_at.ok_or("project-observations requires --refreshed-at STAMP")?,
+            )?;
+        }
+        "project-observations-snapshot" => {
+            let options = parse_project_observations_snapshot_args(args)?;
+            project_observations_snapshot(
+                &root,
+                &options.snapshot,
+                &options.snapshot_sha256,
+                &options.refreshed_at,
             )?;
         }
         "project-and-observe-results" => {
@@ -11403,7 +11468,6 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
     let derived = check_tracked(root)?;
     let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
     reconcile_history_catalogue(root, &mut tracked)?;
-    let before = tracked.clone();
 
     // Resolve and verify the source once, then parse only the captured commit
     // bytes. A later worktree mutation cannot change the rows while leaving the
@@ -11416,25 +11480,150 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
         );
     }
     let rows = read_series_rows(&snapshot)?;
-    let attempts = validate_attempt_bindings(&tracked, Some(&rows))?;
-    let representation = direct_representation(&tracked, &rows, &attempts)?;
-    remove_replaceable_projected_observations(&mut tracked, &rows, Some(&snapshot.source))?;
+    project_observation_rows(
+        root,
+        &derived,
+        tracked,
+        &rows,
+        &ObservationRowSource {
+            source: &snapshot.source,
+            repository: snapshot.source_repository.as_deref(),
+            commit: &snapshot.source_commit,
+            tree: &snapshot.source_tree,
+        },
+        refreshed_at,
+        || Ok(()),
+    )
+}
+
+/// The same projection as `project_observations`, from one held
+/// scorecard-series-snapshot/v1 file rather than a series worktree.
+///
+/// The ledger publisher needs this once retention has moved original series
+/// files out of the published tree: the snapshot then holds the authenticated
+/// union of active and archived rows, and still names the real published
+/// commit and `series` tree. A series worktree cannot express that, because its
+/// committed-file guard requires every row to be in a committed shard. The
+/// snapshot must hold published rows only (no local sources), exactly the
+/// population `project_observations` reads; it is rechecked against its
+/// digest and identity immediately before the write.
+fn project_observations_snapshot(
+    root: &Path,
+    snapshot_path: &Path,
+    snapshot_sha256: &str,
+    refreshed_at: &str,
+) -> Result<(), String> {
+    project_observations_snapshot_with(
+        root,
+        snapshot_path,
+        snapshot_sha256,
+        refreshed_at,
+        || Ok(()),
+    )
+}
+
+/// `project_observations_snapshot` with a hook that runs after every guard and
+/// immediately before the held snapshot's final recheck; tests use it to
+/// change the file while it is held.
+fn project_observations_snapshot_with<BeforeVerify>(
+    root: &Path,
+    snapshot_path: &Path,
+    snapshot_sha256: &str,
+    refreshed_at: &str,
+    before_verify: BeforeVerify,
+) -> Result<(), String>
+where
+    BeforeVerify: FnOnce() -> Result<(), String>,
+{
+    if refreshed_at.trim().is_empty() {
+        return Err("--refreshed-at requires a nonempty deterministic stamp".into());
+    }
+    let _lock = acquire_history_write_lock(root)?;
+    // Validate and hold the caller's operand before unrelated catalogue work,
+    // as project-and-observe-results does.
+    let snapshot = HeldScorecardSeriesSnapshot::open(snapshot_path, snapshot_sha256)?;
+    let source = &snapshot.snapshot.source;
+    if source.repository.as_deref() != Some(TEST_LEDGER_REPOSITORY) {
+        return Err(
+            "new observation projections must read the existing hermit_test_ledger repository"
+                .into(),
+        );
+    }
+    if !source.local_sources.is_empty() || source.published_rows != snapshot.snapshot.rows_read {
+        return Err(format!(
+            "scorecard snapshot {} holds unpublished local rows; an observation projection \
+             reads published rows only",
+            snapshot_path.display()
+        ));
+    }
+    let derived = check_tracked(root)?;
+    let mut tracked = load_existing(root)?.ok_or("tracked cell file does not exist")?;
+    reconcile_history_catalogue(root, &mut tracked)?;
+    project_observation_rows(
+        root,
+        &derived,
+        tracked,
+        &snapshot.rows,
+        &ObservationRowSource {
+            source: &source.path,
+            repository: source.repository.as_deref(),
+            commit: &source.commit,
+            tree: &source.tree,
+        },
+        refreshed_at,
+        || {
+            before_verify()?;
+            snapshot.verify()
+        },
+    )
+}
+
+/// The identity a projection records for the rows it read.
+struct ObservationRowSource<'a> {
+    source: &'a str,
+    repository: Option<&'a str>,
+    commit: &'a str,
+    tree: &'a str,
+}
+
+/// Project canonical series rows onto the reconciled history and write it.
+///
+/// Both projection commands share this body, so the same rows and source
+/// identity produce the same files whichever way they were read.
+/// `verify_source` runs after every guard and immediately before the write.
+fn project_observation_rows<VerifySource>(
+    root: &Path,
+    derived: &Derived,
+    mut tracked: TrackedCells,
+    rows: &[SeriesRow],
+    row_source: &ObservationRowSource<'_>,
+    refreshed_at: &str,
+    verify_source: VerifySource,
+) -> Result<(), String>
+where
+    VerifySource: FnOnce() -> Result<(), String>,
+{
+    let before = tracked.clone();
+    let source = row_source.source.to_string();
+    let attempts = validate_attempt_bindings(&tracked, Some(rows))?;
+    let representation = direct_representation(&tracked, rows, &attempts)?;
+    remove_replaceable_projected_observations(&mut tracked, rows, Some(&source))?;
     let unrepresented = rows
         .iter()
         .filter(|row| !representation.represented_event_ids.contains(&row.event_id))
         .collect::<Vec<&SeriesRow>>();
     let mut projection =
-        apply_series_rows_in_place(root, &mut tracked, &unrepresented, Some(&snapshot.source))?;
+        apply_series_rows_in_place(root, &mut tracked, &unrepresented, Some(&source))?;
     projection.represented_rows += representation.represented_event_ids.len();
     let skipped = &projection.skipped;
 
     let rows_read = rows.len() as u64;
     tracked.schema = SCHEMA;
     tracked.projection = Some(ObservationProjection {
-        source: snapshot.source.clone(),
-        source_repository: snapshot.source_repository.clone(),
-        source_commit: Some(snapshot.source_commit.clone()),
-        source_tree: Some(snapshot.source_tree.clone()),
+        source: source.clone(),
+        source_repository: row_source.repository.map(str::to_string),
+        source_commit: Some(row_source.commit.to_string()),
+        source_tree: Some(row_source.tree.to_string()),
         refreshed_at: refreshed_at.to_string(),
         rows_read,
         pre_series_corpus: rows.is_empty() || representation.has_unrepresented_direct_evidence,
@@ -11448,7 +11637,8 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
     // hit the disk is a projection someone has to notice and revert.
     enforce_projection_preserves_evidence(&before, &tracked, rows_read)?;
     enforce_writer_boundary(&before, &tracked, Writer::Observations)?;
-    write_observation_files(root, &derived, &tracked)?;
+    verify_source()?;
+    write_observation_files(root, derived, &tracked)?;
 
     println!(
         "compatibility scorecard: projected {} cell(s) from {} evidence row(s), including {} \
@@ -11458,9 +11648,9 @@ fn project_observations(root: &Path, series_root: &Path, refreshed_at: &str) -> 
         projection.rows,
         projection.no_verdict_rows,
         projection.runs,
-        snapshot.source,
-        snapshot.source_commit,
-        snapshot.source_tree
+        source,
+        row_source.commit,
+        row_source.tree
     );
     println!(
         "  {} row(s) were already represented by one exact recorded run/attempt; \
@@ -33752,6 +33942,238 @@ mod post_verdict_transaction_tests {
         assert_eq!(bindings.len(), 1);
         assert_eq!(bindings[0].run_id, "direct-current-run");
         preserve_attempt_bindings(&successor, &current).unwrap();
+    }
+
+    /// One series row for the snapshot projection tests: real cell, tree and
+    /// depth of the fixture's measured source, distinct event and run ids.
+    fn snapshot_projection_row(
+        fixture: &Fixture,
+        event_id: &str,
+        run_id: &str,
+        emitted_at: &str,
+    ) -> SeriesRow {
+        let measured = fixture.options.results_head.clone().unwrap();
+        let row = SeriesRow {
+            source: String::new(),
+            schema: SeriesSchema::V3,
+            event_id: event_id.into(),
+            event_type: "series.observation".into(),
+            emitted_at: emitted_at.into(),
+            team: "hermit".into(),
+            host: "fixture-host".into(),
+            producer: SeriesProducer::Validate,
+            run_id: run_id.into(),
+            series: SeriesPayload {
+                cell: series_cell_key(&fixture.id),
+                tree: measured.clone(),
+                detcore_tree: Some(git(
+                    &fixture.root,
+                    &["rev-parse", &format!("{measured}:detcore")],
+                )),
+                outcome: SeriesOutcome::Passed,
+                result: Some(ObservedResult::Pass),
+                failure_class: None,
+                no_verdict_evidence: None,
+                pressure_evidence: None,
+                declared_guest_exit: None,
+                comparison: None,
+                run_index: 1,
+                attempt: Some(1),
+                num_runs: 1,
+                last_run_index: None,
+                main_ancestry: Some(true),
+                runtime: None,
+                source_tree_dirty: false,
+                depth: source_depths(&fixture.root, &measured).unwrap(),
+                coordinates: None,
+                first_divergent_messages: None,
+                machine_shortname: Some("fixture-host".into()),
+                kernel_version: Some("fixture-kernel".into()),
+                host_capabilities: Some(BTreeMap::from([
+                    (
+                        HostCapability::CpuidFaulting,
+                        HostCapabilityVerdict {
+                            present: true,
+                            evidence: "fixture cpuid probe".into(),
+                        },
+                    ),
+                    (
+                        HostCapability::Kvm,
+                        HostCapabilityVerdict {
+                            present: false,
+                            evidence: "fixture kvm probe".into(),
+                        },
+                    ),
+                ])),
+                strictness: None,
+                divergence: None,
+            },
+        };
+        row.validate_for_read().unwrap();
+        row
+    }
+
+    /// Ledger retention moves original series files to an archive, so the
+    /// publisher hands the authenticated rows over as a snapshot instead of a
+    /// series worktree. Reading the same rows at the same source commit and
+    /// tree must write byte-identical history either way.
+    #[test]
+    fn snapshot_projection_writes_what_the_series_worktree_projection_writes() {
+        let _fixture_lock = history_fixture_lock();
+        let fixture = Fixture::new();
+        fixture.publish().unwrap();
+        // Two rows whose emitted_at order is the reverse of their event_id
+        // order: the worktree reader and the snapshot list them differently.
+        let rows = [
+            snapshot_projection_row(
+                &fixture,
+                "fixture-snapshot-projection-a",
+                "snapshot-projection-run-a",
+                "2026-09-13T18:31:00Z",
+            ),
+            snapshot_projection_row(
+                &fixture,
+                "fixture-snapshot-projection-b",
+                "snapshot-projection-run-b",
+                "2026-09-13T18:30:00Z",
+            ),
+        ];
+        let shard = fixture.ledger.join("series/hermit/fixture/2026-09.jsonl");
+        fs::create_dir_all(shard.parent().unwrap()).unwrap();
+        let mut lines = Vec::new();
+        for row in &rows {
+            lines.extend(serde_json::to_vec(row).unwrap());
+            lines.push(b'\n');
+        }
+        fs::write(&shard, &lines).unwrap();
+        git(&fixture.ledger, &["add", "series", "scorecard"]);
+        let ledger_commit = commit(&fixture.ledger, "snapshot projection fixture");
+        let series_tree = git(&fixture.ledger, &["rev-parse", "HEAD:series"]);
+        let published = read_history_files(&fixture.root).unwrap();
+
+        project_observations(&fixture.root, &fixture.ledger.join("series"), "nightly").unwrap();
+        let from_worktree = read_history_files(&fixture.root).unwrap();
+        assert!(from_worktree != published);
+        let projection = fixture.cells().projection.unwrap();
+        assert_eq!(projection.rows_read, 2);
+        assert_eq!(
+            projection.source_commit.as_deref(),
+            Some(ledger_commit.as_str())
+        );
+        assert_eq!(
+            projection.source_tree.as_deref(),
+            Some(series_tree.as_str())
+        );
+        git(&fixture.ledger, &["checkout", "--quiet", "--", "scorecard"]);
+        assert!(read_history_files(&fixture.root).unwrap() == published);
+
+        // The archived form, committed: the ledger's HEAD no longer holds the
+        // shard, so neither its worktree nor HEAD:series has these rows. The
+        // snapshot names the earlier commit and tree that did, as the
+        // publisher's authenticated archive view does.
+        git(&fixture.ledger, &["rm", "--quiet", "-r", "series"]);
+        fs::create_dir_all(fixture.ledger.join("series")).unwrap();
+        fs::write(fixture.ledger.join("series/ARCHIVE.json"), b"{}\n").unwrap();
+        git(&fixture.ledger, &["add", "series"]);
+        commit(&fixture.ledger, "archive the series fixture");
+        let mut sorted = rows.to_vec();
+        sorted.sort_by(|left, right| {
+            (&left.emitted_at, &left.event_id).cmp(&(&right.emitted_at, &right.event_id))
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let value =
+            scorecard_snapshot_fixture_value(&ledger_commit, &series_tree, &sorted).unwrap();
+        let snapshot = directory.path().join("snapshot.json");
+        let snapshot_sha256 = write_scorecard_snapshot_fixture(&snapshot, &value).unwrap();
+        let write_variant = |name: &str, value: &JsonValue| {
+            let path = directory.path().join(name);
+            let sha256 = write_scorecard_snapshot_fixture(&path, value).unwrap();
+            (path, sha256)
+        };
+
+        // Refusals leave both history files byte-identical.
+        let error =
+            project_observations_snapshot(&fixture.root, &snapshot, &"0".repeat(64), "nightly")
+                .unwrap_err();
+        assert!(error.contains("digest mismatch"), "{error}");
+        let error = project_observations_snapshot(&fixture.root, &snapshot, &snapshot_sha256, " ")
+            .unwrap_err();
+        assert!(error.contains("--refreshed-at"), "{error}");
+        let mut no_repository = value.clone();
+        no_repository["source"]["repository"] = JsonValue::Null;
+        let (path, sha256) = write_variant("no-repository.json", &no_repository);
+        let error =
+            project_observations_snapshot(&fixture.root, &path, &sha256, "nightly").unwrap_err();
+        assert!(error.contains("hermit_test_ledger repository"), "{error}");
+        let mut unpublished = value.clone();
+        unpublished["source"]["published_rows"] = 1.into();
+        let (path, sha256) = write_variant("unpublished.json", &unpublished);
+        let error =
+            project_observations_snapshot(&fixture.root, &path, &sha256, "nightly").unwrap_err();
+        assert!(error.contains("published rows only"), "{error}");
+        // A local source with every row counted as published still names
+        // rows that are not in the ledger; the reader itself admits it.
+        let mut local = value.clone();
+        local["source"]["local_sources"] = serde_json::json!([{
+            "kind": "live", "path": "local.jsonl", "device": 1, "inode": 2,
+            "rows": 0, "size": 0, "sha256": "e".repeat(64),
+        }]);
+        let (path, sha256) = write_variant("local.json", &local);
+        HeldScorecardSeriesSnapshot::open(&path, &sha256).unwrap();
+        let error =
+            project_observations_snapshot(&fixture.root, &path, &sha256, "nightly").unwrap_err();
+        assert!(error.contains("published rows only"), "{error}");
+        // A snapshot changed after it was opened and checked is refused by
+        // the recheck immediately before the write.
+        let error = project_observations_snapshot_with(
+            &fixture.root,
+            &snapshot,
+            &snapshot_sha256,
+            "nightly",
+            || {
+                let mut changed = fs::read(&snapshot).unwrap();
+                changed.push(b'\n');
+                fs::write(&snapshot, &changed).map_err(|error| error.to_string())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("changed"), "{error}");
+        assert!(read_history_files(&fixture.root).unwrap() == published);
+
+        let snapshot_sha256 = write_scorecard_snapshot_fixture(&snapshot, &value).unwrap();
+        project_observations_snapshot(&fixture.root, &snapshot, &snapshot_sha256, "nightly")
+            .unwrap();
+        assert!(read_history_files(&fixture.root).unwrap() == from_worktree);
+    }
+
+    #[test]
+    fn snapshot_projection_arguments_are_exact() {
+        let parse = |args: &[&str]| {
+            parse_project_observations_snapshot_args(args.iter().map(|arg| arg.to_string()))
+        };
+        let parsed = parse(&[
+            "--snapshot",
+            "s.json",
+            "--snapshot-sha256",
+            "abc",
+            "--refreshed-at",
+            "stamp",
+        ])
+        .unwrap();
+        assert_eq!(parsed.snapshot, PathBuf::from("s.json"));
+        assert_eq!(parsed.snapshot_sha256, "abc");
+        assert_eq!(parsed.refreshed_at, "stamp");
+        let error = parse(&["--snapshot", "a", "--snapshot", "b"]).unwrap_err();
+        assert!(error.contains("only once"), "{error}");
+        let error = parse(&["--snapshot", "a", "--refreshed-at"]).unwrap_err();
+        assert!(error.contains("requires a value"), "{error}");
+        let error = parse(&["--series-root", "series"]).unwrap_err();
+        assert!(
+            error.contains("unknown project-observations-snapshot option"),
+            "{error}"
+        );
+        let error = parse(&["--snapshot", "a", "--refreshed-at", "stamp"]).unwrap_err();
+        assert!(error.contains("--snapshot-sha256 HEX"), "{error}");
     }
 
     #[test]
