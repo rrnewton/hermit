@@ -37428,7 +37428,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x18b, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x18c, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];
@@ -51464,6 +51464,51 @@ fn private_sigchld_epoll_and_other_wait_rows_under_record_and_replay() {
 /// (the thread's recorded events end before it).
 #[test]
 fn kernel_run_epoll_waits_are_not_ended_by_ignored_signals() {
+    check_kernel_run_waits_are_not_ended_by_ignored_signals(&[], &[None]);
+}
+
+/// As `kernel_run_epoll_waits_are_not_ended_by_ignored_signals`, with the
+/// poll family: each wait is in turn a `poll`, a `ppoll`, a `select`, a
+/// `pselect6` without a mask argument and one with an argument that names no
+/// mask (as glibc's `pselect` passes it). Linux ends these with a restart code
+/// only for a pending signal (`do_poll`, `core_sys_select`, fs/select.c), so
+/// an ignored one never ends them. Under ptrace it did. A `poll` then
+/// restarts through `restart_syscall`, which Detcore refuses, so under record
+/// and without sequentialized threads `chld` and `storm` ended with a policy
+/// refusal, and under record `sigign` too. The other calls' timeouts sit on a
+/// read-only page, where Linux cannot write back the time left, so such a call
+/// returned EINTR instead of running again. The `select`, and the late wait
+/// (a `pselect6`), watch fd 100, more descriptors than Hermit emulates, so
+/// they wait in the kernel under `--strict` and plain runs too (where, as
+/// under record, only the storm's counts are compared). The late wait's one
+/// second is then host time in those runs, against the writer child's 60 ms
+/// of virtual time. The storm's sender exits right
+/// after its last signal, so its SIGCHLD reaches the first wait with the
+/// storm's last SIGWINCH under record. Two more recordings of the storm start
+/// each backgrounded call up to 10 ms late, with two seeds
+/// (docs/RACE_PROBES.md), so signals reach the wait while it would restart.
+#[test]
+fn kernel_run_poll_waits_are_not_ended_by_ignored_signals() {
+    check_kernel_run_waits_are_not_ended_by_ignored_signals(
+        &["poll"],
+        &[None, Some("7"), Some("8")],
+    );
+}
+
+/// The start of the storm's line in
+/// `check_kernel_run_waits_are_not_ended_by_ignored_signals`: all that a run
+/// whose sender sleeps on virtual time while the waits run in the kernel can
+/// be held to.
+const STORM_COUNTS: &str = "storm: 3 timed out, 0 ready, 0 EINTR, 0 other; mask as before: yes; ";
+
+/// Runs `tests/c/epoll_ignored_signal.c` with `family` after each mode
+/// (`kernel_run_epoll_waits_are_not_ended_by_ignored_signals`), and records
+/// the storm once for each entry of `storm_probes`: under the race probe with
+/// that seed for a `Some`.
+fn check_kernel_run_waits_are_not_ended_by_ignored_signals(
+    family: &[&str],
+    storm_probes: &[Option<&str>],
+) {
     let _lock = hermit_run_guard();
     let guest = compiled_c_guest(&EPOLL_IGNORED_SIGNAL_GUEST, "epoll_ignored_signal");
     let guest = guest.to_str().unwrap();
@@ -51477,6 +51522,7 @@ fn kernel_run_epoll_waits_are_not_ended_by_ignored_signals() {
     for mode in ["chld", "storm", "sigign", "alrm", "exit"] {
         let native = Command::new(guest)
             .arg(mode)
+            .args(family)
             .output()
             .expect("failed to run the guest natively");
         let expected = String::from_utf8_lossy(&native.stdout).into_owned();
@@ -51499,41 +51545,67 @@ fn kernel_run_epoll_waits_are_not_ended_by_ignored_signals() {
             }
             _ => "exit: a thread was still waiting\n",
         };
-        assert_eq!(expected, pinned, "native {mode}");
+        assert_eq!(expected, pinned, "native {mode} {family:?}");
         for flags in [&strict[..], &[], &["--no-sequentialize-threads"]] {
             let mut args = vec!["run", "--timeout", "120", "--base-env=minimal"];
             args.extend_from_slice(flags);
             args.extend(["--", guest, mode]);
+            args.extend_from_slice(family);
             let output = hermit(&args);
             assert_success(&output, &args);
-            assert_eq!(stdout(&output), expected, "{args:?}");
+            let printed = stdout(&output);
+            if mode == "storm" && !family.is_empty() && flags != ["--no-sequentialize-threads"] {
+                // The poll family's select waits in the kernel even in a
+                // sequentialized run, while the sender sleeps on virtual
+                // time, so the storm may end before the waits do, as under
+                // record.
+                assert!(printed.starts_with(STORM_COUNTS), "{args:?}: {printed}");
+            } else {
+                assert_eq!(printed, expected, "{args:?}");
+            }
         }
         if mode == "exit" {
             continue;
         }
-        let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-            .expect("failed to create the recording data dir");
-        let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
-        let args = [
-            "record",
-            "start",
-            "--verify",
-            "--verify-strict",
-            "--record-timeout",
-            "120",
-            &data_dir_arg,
-            "--",
-            guest,
-            mode,
-        ];
-        let output = hermit(&args);
-        assert_success(&output, &args);
-        let recorded = stdout(&output);
-        if mode == "storm" {
-            let counts = "storm: 3 timed out, 0 ready, 0 EINTR, 0 other; mask as before: yes; ";
-            assert!(recorded.starts_with(counts), "{args:?}: {recorded}");
+        let probes: &[Option<&str>] = if mode == "storm" {
+            storm_probes
         } else {
-            assert_eq!(recorded, expected, "{args:?}");
+            &[None]
+        };
+        for &probe in probes {
+            let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+                .expect("failed to create the recording data dir");
+            let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+            let mut args = vec![
+                "record",
+                "start",
+                "--verify",
+                "--verify-strict",
+                "--record-timeout",
+                "120",
+                &data_dir_arg,
+                "--",
+                guest,
+                mode,
+            ];
+            args.extend_from_slice(family);
+            let mut command = hermit_command(&args);
+            if let Some(seed) = probe {
+                command
+                    .env("HERMIT_RACE_PROBE", "bg_pre_call=0-10")
+                    .env("HERMIT_RACE_PROBE_SEED", seed);
+            }
+            let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+            assert_success(&output, &args);
+            let recorded = stdout(&output);
+            if mode == "storm" {
+                assert!(
+                    recorded.starts_with(STORM_COUNTS),
+                    "{args:?} (probe seed: {probe:?}): {recorded}"
+                );
+            } else {
+                assert_eq!(recorded, expected, "{args:?}");
+            }
         }
     }
 }

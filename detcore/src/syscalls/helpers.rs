@@ -4296,12 +4296,17 @@ where
 }
 
 /// The signals the guest ignores, blocked for one wait that Detcore runs in the
-/// kernel and that a signal ends with `EINTR` rather than a restart code: the
-/// `epoll_wait` family (`ep_poll`). Linux discards a signal the process ignores
-/// when it is generated (`sig_ignored`), so it never ends such a wait, but it
-/// queues one for a traced thread, and the wait then returned `EINTR` to the
-/// guest. Blocked for the wait, such a signal stays pending without ending it;
-/// once the guest's mask is back it is delivered and ignored, as it was before.
+/// kernel under the thread's own mask: the `epoll_wait` family (`ep_poll`), and
+/// `poll`, `select`, and `ppoll` and `pselect6` naming no mask (`do_sys_poll`,
+/// `core_sys_select`). Linux discards a signal the process ignores when it is
+/// generated (`sig_ignored`), so it never ends such a wait, but it queues one
+/// for a traced thread. An epoll wait then returned `EINTR` to the guest. A
+/// poll-family wait ended with a restart code instead: a `poll` restarts
+/// through `restart_syscall`, which Detcore refuses, and a `select`,
+/// `pselect6` or `ppoll` runs again in place, or returns `EINTR` when Linux
+/// cannot write back its time left (`poll_select_finish`). Blocked for the
+/// wait, such a signal stays pending without ending it; once the guest's mask
+/// is back it is delivered and ignored, as it was before.
 /// The mask changes through the backend (`Guest::set_blocked_signals`, on
 /// ptrace `PTRACE_SETSIGMASK`), so no syscall the guest or the recorder sees is
 /// added. Replay, which serves the wait from the recording, raises the same
@@ -4315,7 +4320,8 @@ pub(crate) struct IgnoredSignalShield {
 }
 
 impl IgnoredSignalShield {
-    /// No shield: the wait cannot block, or runs under its own temporary mask.
+    /// No shield: the wait cannot block, or runs under its own temporary mask
+    /// (or one the tracer cannot read).
     pub(crate) fn none() -> Self {
         Self { guest_mask: None }
     }
@@ -4382,8 +4388,8 @@ impl IgnoredSignalShield {
 /// A shield is dropped with its mask still to put back only when the
 /// backend cancelled the handler around it, which it does when the thread
 /// dies during the wait or an injection (a sibling's `exit_group` or
-/// `execve`, a SIGKILL): the thread and its mask are gone, so there is
-/// nothing to put back.
+/// `execve`, a SIGKILL), or when a backend error is ending the run: either
+/// way the mask no longer matters, so there is nothing to put back.
 impl Drop for IgnoredSignalShield {
     fn drop(&mut self) {
         if let Some(guest_mask) = self.guest_mask {

@@ -862,7 +862,13 @@ impl RecordVersion {
 // scheduler reads that mask when it commits the wait, so an older recording,
 // made under the guest's own mask, could choose another SIGCHLD taker or
 // readmission point in replay; it is refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18b);
+// 0x18b -> 0x18c (0x18c reserved for the 4681 change by coord3): a `poll`,
+// `select`, or `ppoll` or `pselect6` naming no mask, that Detcore runs in
+// the kernel, now waits with the signals the guest ignores blocked, in
+// record and in replay, so such a signal no longer ends it with a restart
+// code. An older recording holds the restarts and was made under the
+// guest's own mask; it is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18c);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -887,7 +893,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18b);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x18b;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x18c;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
