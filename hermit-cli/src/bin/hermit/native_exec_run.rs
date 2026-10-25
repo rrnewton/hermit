@@ -769,9 +769,14 @@ mod tests {
             !cwd.starts_with("/tmp"),
             "physical native Capture requires a caller-owned uncovered cwd"
         );
+        let test_output = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("target/ci/native-exec-tests");
+        std::fs::create_dir_all(&test_output).unwrap();
         let staging = tempfile::Builder::new()
             .prefix(".bootstrap-rpc-test-")
-            .tempdir_in(&cwd)
+            .tempdir_in(&test_output)
             .unwrap();
         let native_inputs = super::native_test_inputs().unwrap();
         let declaration = staging.path().join("inputs.json");

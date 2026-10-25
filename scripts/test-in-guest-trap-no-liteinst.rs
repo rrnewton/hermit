@@ -2537,6 +2537,7 @@ fn run_host_locked(
         "--format",
         "json",
     ]);
+    command.arg("--repo-root").arg(root);
     let plan = runner.checked("host-manifest-plan", &mut command)?;
     let plan = read_json(&plan, clock)?;
     let host_ids = check_partition_plan(
@@ -2554,6 +2555,7 @@ fn run_host_locked(
         "--jobs",
         &workers,
     ]);
+    command.arg("--repo-root").arg(root);
     runner.checked("host-build-manifest-programs", &mut command)?;
     let host_report_path = generation.join("e2e-results-host.json");
     let mut command = runner.command(&harness);
@@ -2572,6 +2574,7 @@ fn run_host_locked(
         ])
         .arg(generation.join("cells-host.jsonl"))
         .env("DAGRUN_TEST_COUNTS_PATH", &host_report_path);
+    command.arg("--repo-root").arg(root);
     let (host_status, _) = runner.run("host-manifest-run", &mut command)?;
     let pinned_report = read_report(&raw["manifest_report"])?;
     let host_report = read_report(&host_report_path)?;
