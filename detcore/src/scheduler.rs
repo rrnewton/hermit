@@ -1207,6 +1207,15 @@ impl BackgroundReadSignals {
 /// interval would have upgraded anyway.
 const MIN_POLL_UPGRADE_PERIOD_NS: u64 = 200_000_000;
 
+/// How the run a summary describes ended (`Scheduler::summarize_run`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunEnd {
+    /// The guest exited, or the scheduler ended the run.
+    Finished,
+    /// `--timeout`, the run's wall-clock deadline, stopped it first.
+    Stopped,
+}
+
 /// The state for the deterministic scheduler.
 #[derive(Debug)]
 pub struct Scheduler {
@@ -17140,7 +17149,29 @@ impl Scheduler {
         &mut self,
         preemptions_to: Option<&PathBuf>,
     ) -> anyhow::Result<(RunSummary, Option<String>)> {
-        if let Some(replayer) = &self.boundary_replayer {
+        self.summarize_run(preemptions_to, RunEnd::Finished)
+    }
+
+    /// [`Self::generate_partial_run_summary_for_log`] for a run `--timeout`
+    /// stopped before the guest exited, summarized as it stands. Its replay
+    /// need not have reached the recording's end, and a recording bound for a
+    /// file is described but left in place, for the failed run's own flush
+    /// (`GlobalState::clean_up_after_run_timeout`).
+    pub(crate) fn generate_stopped_run_summary_for_log(
+        &mut self,
+        preemptions_to: Option<&PathBuf>,
+    ) -> anyhow::Result<(RunSummary, Option<String>)> {
+        self.summarize_run(preemptions_to, RunEnd::Stopped)
+    }
+
+    fn summarize_run(
+        &mut self,
+        preemptions_to: Option<&PathBuf>,
+        end: RunEnd,
+    ) -> anyhow::Result<(RunSummary, Option<String>)> {
+        if end == RunEnd::Finished
+            && let Some(replayer) = &self.boundary_replayer
+        {
             replayer.finish().map_err(crate::TerminalReplayRefusal)?;
         }
         let schedevent_replayed = if let Some(replayer) = &self.boundary_replayer {
@@ -17223,16 +17254,19 @@ impl Scheduler {
 
         // Legacy EOF policy does not make an unconsumed suffix fatal. Name
         // incomplete callback metadata separately; do not invent guest events.
-        for (tid, points) in &self.callback_checkpoints {
-            if !points.is_empty() {
-                let message = format!(
-                    "DESYNC incomplete callback history for {tid}: {} unconsumed checkpoints",
-                    points.len()
-                );
-                tracing::warn!("{}", message);
-                desync_descrip
-                    .get_or_insert_with(String::new)
-                    .push_str(&format!("{message}\n"));
+        // A stopped run's replay is unfinished by definition.
+        if end == RunEnd::Finished {
+            for (tid, points) in &self.callback_checkpoints {
+                if !points.is_empty() {
+                    let message = format!(
+                        "DESYNC incomplete callback history for {tid}: {} unconsumed checkpoints",
+                        points.len()
+                    );
+                    tracing::warn!("{}", message);
+                    desync_descrip
+                        .get_or_insert_with(String::new)
+                        .push_str(&format!("{message}\n"));
+                }
             }
         }
         for message in &self.callback_checkpoint_desyncs {
@@ -17241,8 +17275,16 @@ impl Scheduler {
                 .push_str(&format!("{message}\n"));
         }
 
-        let (reprio_descrip, info_reprio_descrip) = if let Some(pw) = self.preemption_writer.take()
+        let (reprio_descrip, info_reprio_descrip) = if end == RunEnd::Stopped
+            && let (Some(pw), Some(path)) = (&self.preemption_writer, preemptions_to)
         {
+            let info_description = format!(
+                "Record of {} preemption and reprioritization events:\n",
+                pw.len()
+            );
+            let description = format!("{info_description}  (Writing to file {path:?})\n");
+            (Some(description), Some(info_description))
+        } else if let Some(pw) = self.preemption_writer.take() {
             let mut buf = String::new();
             writeln!(
                 buf,
@@ -17330,6 +17372,8 @@ impl Scheduler {
                 // GlobalState keeps the host-input records.
                 host_inputs: None,
                 host_inputs_changed: Vec::new(),
+                // GlobalState marks a run its deadline stopped.
+                run_timeout_secs: None,
             },
             info_reprio_descrip,
         ))
