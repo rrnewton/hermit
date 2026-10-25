@@ -1763,7 +1763,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Eight terminal-finalization custody and classification tests.
     // And container::tests::identity_hardening_freezes_the_dynamic_linker_cache
     // (the frozen /etc/ld.so.cache, Hermit c10c2882): 1096.
-    ("test.hermit_unit", 1096),
+    // Current source adds liteinst_binds_its_unset_default_but_preserves_explicit_selectors (361f352): 1097.
+    ("test.hermit_unit", 1097),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2806,7 +2807,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // epoch read without copying the configuration, and its placeholder
     // gate): 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit", 2529),
+    // The sealed LiteInst default-capability requirement adds one in_guest_launch model unit: 2530.
+    ("test.detcore_unit", 2530),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4025,7 +4027,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nested-refusal sub-check split out of
     // a_namespace_only_guests_kill_0_never_reaches_hermits_group
     // (https://github.com/rrnewton/hermit/issues/4065), unchanged: 606, listed.
-    ("test.cli", 606),
+    // Nine run_in_guest_trap_timerfd_virtual_* cases plus verify_print_verify_logs_echoes_a_refused_first_runs_log: 616.
+    ("test.cli", 616),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4519,7 +4522,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // removals), none excluded: 524.
     // And a_nested_namespace_only_run_is_refused_without_its_kill_filter, split
     // out unchanged and not excluded: 525.
-    ("test.cli_on_host", 525),
+    // The host filters exclude none of those ten CLI identities; preserve every existing exclusion: 535.
+    ("test.cli_on_host", 535),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -4942,7 +4946,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twelve A+ units: 2527, listed.
     // And the same three slice 7d determinize_stat_tests units: 2530, listed.
     // And -1 from 979f3fed: 2529.
-    ("test.detcore_unit_on_host", 2529),
+    // The host twin includes that same in_guest_launch capability requirement unit: 2530.
+    ("test.detcore_unit_on_host", 2530),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5286,7 +5291,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Strict software-boundary replay (https://github.com/rrnewton/hermit/issues/4558):
     // The same eight finalization tests, with the existing selection unchanged.
     // And the frozen ld.so.cache container test (Hermit c10c2882): 1096.
-    ("test.hermit_unit_on_host", 1096),
+    // The host twin includes the same absent-selector unit (361f352): 1097.
+    ("test.hermit_unit_on_host", 1097),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

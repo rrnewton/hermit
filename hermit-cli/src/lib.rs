@@ -1155,8 +1155,8 @@ fn refuse_in_guest_liteinst_run(
 /// that the guest sees under `backend`, when Hermit decides it: `0` for
 /// `in-guest-trap`, which exists to run with no syscall site patched, and
 /// `None` for `liteinst`, which preserves explicit guest selectors. When its
-/// selector is unset, the launch path binds an explicit `1` before creating
-/// the authenticated preload bootstrap.
+/// selector is unset, the runtime retains its environment fallback. The sealed
+/// tool-data record separately requires the LiteInst runtime feature.
 pub fn forced_site_patching_value(backend: Backend) -> Option<&'static str> {
     match backend {
         Backend::InGuestTrap => Some("0"),
@@ -1799,25 +1799,22 @@ fn in_guest_trap_site_patching_conflict(command: &Command, backend: Backend) -> 
     })
 }
 
-/// Sets the guest's `REVERIE_LITEINST_SITE_PATCHING` to the value Hermit
-/// forces for `backend` ([`forced_site_patching_value`]). LiteInst requests
-/// patching explicitly when the caller leaves it unset, so a runtime built
-/// without the patcher refuses that request instead of silently running traps.
-/// Every explicit LiteInst selector is preserved, including `0`. The launcher
-/// captures it in the authenticated bootstrap and removes the control variable
-/// before guest code starts; later environment changes do not replace that
-/// captured selection.
+/// Forces only the Trap selector. LiteInst preserves the caller's absence or value;
+/// an absent LiteInst selection requires its runtime feature through sealed tool data.
 #[cfg(feature = "in-guest-trap")]
 fn force_in_guest_site_patching(command: &mut Command, backend: Backend) {
     if let Some(value) = forced_site_patching_value(backend) {
         command.env(reverie_liteinst::SITE_PATCHING_ENV, value);
-    } else if backend == Backend::Liteinst
-        && command
-            .get_env(reverie_liteinst::SITE_PATCHING_ENV)
-            .is_none()
-    {
-        command.env(reverie_liteinst::SITE_PATCHING_ENV, "1");
     }
+}
+
+#[cfg(feature = "in-guest-trap")]
+fn requires_liteinst_default(command: &Command, backend: Backend) -> bool {
+    backend == Backend::Liteinst
+        && command
+            .get_captured_envs()
+            .remove(std::ffi::OsStr::new(reverie_liteinst::SITE_PATCHING_ENV))
+            .is_none()
 }
 
 /// Whether every in-guest Tool image of a `backend` run checks that its runtime
@@ -5162,11 +5159,12 @@ async fn dispatch_backend(
             let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
             let mut command = command;
             refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
-            let (launch, _detlog_descriptor) =
+            let (mut launch, _detlog_descriptor) =
                 in_guest_liteinst_launch(&mut command, &in_guest_detlog_forward_policy())?;
             // After Hermit's other callbacks, so the guest's own check is the
             // last one that can change what it checks (`LaunchAudit::install`).
             let audit = neutralize_inherited_signal_producers(&mut command, backend)?;
+            launch.require_liteinst = requires_liteinst_default(&command, backend);
             let tool_data = launch.encode();
             // Every Tool image must forward on that socket, by that policy;
             // see detcore::Config::in_guest_detlog_forward_policy.
@@ -5513,11 +5511,12 @@ async fn dispatch_output_backend(
             command.stdin(output_backend_stdin()?);
             let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
             refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
-            let (launch, _detlog_descriptor) =
+            let (mut launch, _detlog_descriptor) =
                 in_guest_liteinst_launch(&mut command, &in_guest_detlog_forward_policy())?;
             // After Hermit's other callbacks, so the guest's own check is the
             // last one that can change what it checks (`LaunchAudit::install`).
             let audit = neutralize_inherited_signal_producers(&mut command, backend)?;
+            launch.require_liteinst = requires_liteinst_default(&command, backend);
             let tool_data = launch.encode();
             // Every Tool image must forward on that socket, by that policy;
             // see detcore::Config::in_guest_detlog_forward_policy.
@@ -7494,6 +7493,44 @@ mod tests {
         use std::ffi::OsStr;
 
         let name = reverie_liteinst::SITE_PATCHING_ENV;
+        // As in the existing isolated diagnostics tests, inherit into a fresh
+        // copy of this test process instead of changing global environment.
+        const CHILD: &str = "HERMIT_TEST_LITEINST_CAPTURED_ENV_CHILD";
+        if let Some(inherited) = std::env::var_os(CHILD) {
+            assert!(inherited == "0" || inherited == "1");
+            assert_eq!(
+                std::env::var_os(name).as_deref(),
+                Some(inherited.as_os_str())
+            );
+            let command = Command::new("/bin/true");
+            assert_eq!(
+                command
+                    .get_captured_envs()
+                    .remove(OsStr::new(name))
+                    .as_deref(),
+                Some(inherited.as_os_str())
+            );
+            assert!(!requires_liteinst_default(&command, Backend::Liteinst));
+        } else {
+            for inherited in ["0", "1"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::liteinst_binds_its_unset_default_but_preserves_explicit_selectors",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, inherited)
+                    .env(name, inherited)
+                    .output()
+                    .expect("run isolated captured-selector checks");
+                assert!(output.status.success(), "{output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .contains("captured selector checks complete"),
+                    "{output:?}"
+                );
+            }
+        }
         for clear_environment in [false, true] {
             let mut command = Command::new("/bin/true");
             if clear_environment {
@@ -7501,13 +7538,31 @@ mod tests {
             }
             command.env_remove(name);
             force_in_guest_site_patching(&mut command, Backend::Liteinst);
-            assert_eq!(command.get_env(name).as_deref(), Some(OsStr::new("1")));
+            assert_eq!(
+                command
+                    .get_captured_envs()
+                    .remove(OsStr::new(name))
+                    .as_deref(),
+                None
+            );
+            assert!(requires_liteinst_default(&command, Backend::Liteinst));
+            assert!(!requires_liteinst_default(&command, Backend::InGuestTrap));
         }
         for value in ["0", "1", "", "invalid"] {
             let mut command = Command::new("/bin/true");
             command.env(name, value);
             force_in_guest_site_patching(&mut command, Backend::Liteinst);
-            assert_eq!(command.get_env(name).as_deref(), Some(OsStr::new(value)));
+            assert_eq!(
+                command
+                    .get_captured_envs()
+                    .remove(OsStr::new(name))
+                    .as_deref(),
+                Some(OsStr::new(value))
+            );
+            assert!(!requires_liteinst_default(&command, Backend::Liteinst));
+        }
+        if std::env::var_os(CHILD).is_some() {
+            println!("captured selector checks complete");
         }
     }
 
