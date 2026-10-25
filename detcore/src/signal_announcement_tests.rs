@@ -81,6 +81,10 @@ struct AnnounceGuest {
     thread: ThreadState<()>,
     requests: Mutex<Vec<Vec<ResourceID>>>,
     continues: Mutex<Vec<bool>>,
+    /// What `GlobalRequest::InPidNamespaceInit` answers (A5 step 3c.1e A,
+    /// IR-15), and how many times it was asked.
+    pid_namespace_init: bool,
+    init_queries: Mutex<usize>,
 }
 
 struct UnusedStack;
@@ -124,6 +128,10 @@ impl GlobalRPC<GlobalState> for AnnounceGuest {
                     .unwrap()
                     .push(request.continues_sigreturn);
                 GlobalResponse::RequestResources(crate::tool_global::ResumeStatus::Normal)
+            }
+            GlobalRequest::InPidNamespaceInit(_) => {
+                *self.init_queries.lock().unwrap() += 1;
+                GlobalResponse::InPidNamespaceInit(self.pid_namespace_init)
             }
             request => panic!("a delivery of SIGUSR1 sent an unexpected RPC: {request:?}"),
         };
@@ -212,6 +220,8 @@ fn setup_with(adjust: impl FnOnce(&mut Config)) -> (Detcore, AnnounceGuest) {
             thread,
             requests: Mutex::new(Vec::new()),
             continues: Mutex::new(Vec::new()),
+            pid_namespace_init: false,
+            init_queries: Mutex::new(0),
         },
     )
 }
@@ -546,4 +556,33 @@ async fn boundary_signal_entries_survive_withdrawal_and_link_actual_commit_witho
         ));
     }
     assert_eq!(histories[0], histories[1]);
+}
+
+/// A5 step 3c.1e A, IR-15: under the in-guest delivery gate, an announcement
+/// for a thread of a process that is the init of a PID namespace it created
+/// is refused with `EPROTONOSUPPORT` before any turn (Linux makes such an
+/// init unkillable from inside its namespace, `SIGNAL_UNKILLABLE`,
+/// kernel/signal.c:2843-2845 at v6.12); a thread of any other process is
+/// announced as before. With the gate off nothing is asked. Mutation "guard
+/// removed": the init row takes the delivery's turn.
+#[tokio::test]
+async fn under_the_gate_an_announcement_for_a_pid_namespace_init_is_refused_before_any_turn() {
+    for (gate, init) in [(true, true), (true, false), (false, true)] {
+        let case = format!("gate {gate}, init {init}");
+        let (tool, mut guest) = setup_with(|config| config.in_guest_signal_delivery = gate);
+        guest.pid_namespace_init = init;
+        let result = tool.announce_signal_event(&mut guest, libc::SIGUSR1).await;
+        if gate && init {
+            assert_eq!(result.map(|_| ()), Err(Errno::EPROTONOSUPPORT), "{case}");
+            assert!(turns(&guest).is_empty(), "{case}: no turn");
+        } else {
+            assert!(result.is_ok(), "{case}: {result:?}");
+            assert_eq!(turns(&guest).len(), 1, "{case}: the delivery's turn");
+        }
+        assert_eq!(
+            *guest.init_queries.lock().unwrap(),
+            usize::from(gate),
+            "{case}: asked only under the gate"
+        );
+    }
 }

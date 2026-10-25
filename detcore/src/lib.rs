@@ -580,6 +580,36 @@ pub fn observes_sigreturns(cfg: &Config) -> bool {
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// A5 step 3c.1e A, IR-15 (Detcore's half): whether the calling thread's
+    /// process is the init of a PID namespace it created with `CLONE_NEWPID`
+    /// (`Scheduler`'s `pid_namespace_inits`, through
+    /// `GlobalRequest::InPidNamespaceInit`), in which case `hook` for
+    /// `signal` is refused with a named WARN. Linux marks such an init
+    /// `SIGNAL_UNKILLABLE`, so a default-fatal signal sent from inside its
+    /// namespace is queued and then discarded at dequeue (`get_signal`,
+    /// kernel/signal.c:2843-2845 at v6.12), and nothing can be predicted for
+    /// it. Called only under the in-guest delivery gate.
+    async fn pid_namespace_init_refused<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        hook: &str,
+        signal: i32,
+    ) -> bool {
+        let dettid = guest.thread_state().dettid;
+        if !tool_global::in_pid_namespace_init(guest, dettid).await {
+            return false;
+        }
+        warn!(
+            "{}",
+            crate::refused_signal_controls::pid_namespace_init_prediction_refused_warning(
+                dettid.as_raw(),
+                hook,
+                signal,
+            )
+        );
+        true
+    }
+
     /// Whether `signal`, passed on to a guest thread without a report, could
     /// have entered a handler the thread's signal-state copy never saw: where
     /// the copy is kept against the kernel's own state, for any signal but
@@ -3500,6 +3530,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             );
             return Err(Errno::EPROTONOSUPPORT);
         }
+        // A5 step 3c.1e A, IR-15: under the in-guest delivery gate, no
+        // delivery is predicted for a process that is the init of a PID
+        // namespace it created, which Linux makes unkillable from inside it
+        // (`SIGNAL_UNKILLABLE`: a default-fatal signal is queued and then
+        // discarded at dequeue, `get_signal`, kernel/signal.c:2843-2845 at
+        // v6.12). Refused before any turn, by name; nothing is asked with the
+        // gate off.
+        if self.cfg.in_guest_signal_delivery
+            && self
+                .pid_namespace_init_refused(guest, "announce_signal_event", signal)
+                .await
+        {
+            return Err(Errno::EPROTONOSUPPORT);
+        }
         let stop = self.inbound_stop(guest);
         let turn = self
             .inbound_turn(guest, SigWrapper(signal), stop, TurnScope::Announcement)
@@ -3650,6 +3694,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 "[dtid {dettid}] refusing a predicted death ({status:?}): this run does not \
                  take in-guest signal delivery"
             );
+            return Err(Errno::EPROTONOSUPPORT);
+        }
+        // A5 step 3c.1e A, IR-15: a PID namespace's init is not killed by a
+        // default-fatal signal sent from inside its namespace
+        // (`SIGNAL_UNKILLABLE`, kernel/signal.c:2843-2845 at v6.12), so no
+        // death is predicted for it: refused before the turn is held.
+        let signal = match status {
+            ExitStatus::Signaled(signal, _) => signal as i32,
+            ExitStatus::SignaledRaw(signal, _) => signal,
+            ExitStatus::Exited(_) => unreachable!("checked above"),
+        };
+        if self
+            .pid_namespace_init_refused(guest, "exit_for_predicted_death", signal)
+            .await
+        {
             return Err(Errno::EPROTONOSUPPORT);
         }
         if !tool_global::hold_turn_for_group_exit(guest, dettid).await {
