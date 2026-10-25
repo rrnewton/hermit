@@ -11513,6 +11513,28 @@ fn project_observations_snapshot(
     snapshot_sha256: &str,
     refreshed_at: &str,
 ) -> Result<(), String> {
+    project_observations_snapshot_with(
+        root,
+        snapshot_path,
+        snapshot_sha256,
+        refreshed_at,
+        || Ok(()),
+    )
+}
+
+/// `project_observations_snapshot` with a hook that runs after every guard and
+/// immediately before the held snapshot's final recheck; tests use it to
+/// change the file while it is held.
+fn project_observations_snapshot_with<BeforeVerify>(
+    root: &Path,
+    snapshot_path: &Path,
+    snapshot_sha256: &str,
+    refreshed_at: &str,
+    before_verify: BeforeVerify,
+) -> Result<(), String>
+where
+    BeforeVerify: FnOnce() -> Result<(), String>,
+{
     if refreshed_at.trim().is_empty() {
         return Err("--refreshed-at requires a nonempty deterministic stamp".into());
     }
@@ -11549,7 +11571,10 @@ fn project_observations_snapshot(
             tree: &source.tree,
         },
         refreshed_at,
-        || snapshot.verify(),
+        || {
+            before_verify()?;
+            snapshot.verify()
+        },
     )
 }
 
@@ -33919,26 +33944,25 @@ mod post_verdict_transaction_tests {
         preserve_attempt_bindings(&successor, &current).unwrap();
     }
 
-    /// Ledger retention moves original series files to an archive, so the
-    /// publisher hands the authenticated rows over as a snapshot instead of a
-    /// series worktree. Reading the same rows at the same source commit and
-    /// tree must write byte-identical history either way.
-    #[test]
-    fn snapshot_projection_writes_what_the_series_worktree_projection_writes() {
-        let _fixture_lock = history_fixture_lock();
-        let fixture = Fixture::new();
-        fixture.publish().unwrap();
+    /// One series row for the snapshot projection tests: real cell, tree and
+    /// depth of the fixture's measured source, distinct event and run ids.
+    fn snapshot_projection_row(
+        fixture: &Fixture,
+        event_id: &str,
+        run_id: &str,
+        emitted_at: &str,
+    ) -> SeriesRow {
         let measured = fixture.options.results_head.clone().unwrap();
         let row = SeriesRow {
             source: String::new(),
             schema: SeriesSchema::V3,
-            event_id: "fixture-snapshot-projection-row".into(),
+            event_id: event_id.into(),
             event_type: "series.observation".into(),
-            emitted_at: "2026-09-13T18:30:00Z".into(),
+            emitted_at: emitted_at.into(),
             team: "hermit".into(),
             host: "fixture-host".into(),
             producer: SeriesProducer::Validate,
-            run_id: "snapshot-projection-run".into(),
+            run_id: run_id.into(),
             series: SeriesPayload {
                 cell: series_cell_key(&fixture.id),
                 tree: measured.clone(),
@@ -33986,11 +34010,42 @@ mod post_verdict_transaction_tests {
             },
         };
         row.validate_for_read().unwrap();
+        row
+    }
+
+    /// Ledger retention moves original series files to an archive, so the
+    /// publisher hands the authenticated rows over as a snapshot instead of a
+    /// series worktree. Reading the same rows at the same source commit and
+    /// tree must write byte-identical history either way.
+    #[test]
+    fn snapshot_projection_writes_what_the_series_worktree_projection_writes() {
+        let _fixture_lock = history_fixture_lock();
+        let fixture = Fixture::new();
+        fixture.publish().unwrap();
+        // Two rows whose emitted_at order is the reverse of their event_id
+        // order: the worktree reader and the snapshot list them differently.
+        let rows = [
+            snapshot_projection_row(
+                &fixture,
+                "fixture-snapshot-projection-a",
+                "snapshot-projection-run-a",
+                "2026-09-13T18:31:00Z",
+            ),
+            snapshot_projection_row(
+                &fixture,
+                "fixture-snapshot-projection-b",
+                "snapshot-projection-run-b",
+                "2026-09-13T18:30:00Z",
+            ),
+        ];
         let shard = fixture.ledger.join("series/hermit/fixture/2026-09.jsonl");
         fs::create_dir_all(shard.parent().unwrap()).unwrap();
-        let mut line = serde_json::to_vec(&row).unwrap();
-        line.push(b'\n');
-        fs::write(&shard, &line).unwrap();
+        let mut lines = Vec::new();
+        for row in &rows {
+            lines.extend(serde_json::to_vec(row).unwrap());
+            lines.push(b'\n');
+        }
+        fs::write(&shard, &lines).unwrap();
         git(&fixture.ledger, &["add", "series", "scorecard"]);
         let ledger_commit = commit(&fixture.ledger, "snapshot projection fixture");
         let series_tree = git(&fixture.ledger, &["rev-parse", "HEAD:series"]);
@@ -34000,7 +34055,7 @@ mod post_verdict_transaction_tests {
         let from_worktree = read_history_files(&fixture.root).unwrap();
         assert!(from_worktree != published);
         let projection = fixture.cells().projection.unwrap();
-        assert_eq!(projection.rows_read, 1);
+        assert_eq!(projection.rows_read, 2);
         assert_eq!(
             projection.source_commit.as_deref(),
             Some(ledger_commit.as_str())
@@ -34012,18 +34067,29 @@ mod post_verdict_transaction_tests {
         git(&fixture.ledger, &["checkout", "--quiet", "--", "scorecard"]);
         assert!(read_history_files(&fixture.root).unwrap() == published);
 
-        // The archived form: the series directory no longer holds the shard.
-        // The snapshot still names the real published commit and series tree.
-        fs::remove_file(&shard).unwrap();
+        // The archived form, committed: the ledger's HEAD no longer holds the
+        // shard, so neither its worktree nor HEAD:series has these rows. The
+        // snapshot names the earlier commit and tree that did, as the
+        // publisher's authenticated archive view does.
+        git(&fixture.ledger, &["rm", "--quiet", "-r", "series"]);
+        fs::create_dir_all(fixture.ledger.join("series")).unwrap();
+        fs::write(fixture.ledger.join("series/ARCHIVE.json"), b"{}\n").unwrap();
+        git(&fixture.ledger, &["add", "series"]);
+        commit(&fixture.ledger, "archive the series fixture");
+        let mut sorted = rows.to_vec();
+        sorted.sort_by(|left, right| {
+            (&left.emitted_at, &left.event_id).cmp(&(&right.emitted_at, &right.event_id))
+        });
         let directory = tempfile::tempdir().unwrap();
-        let value = scorecard_snapshot_fixture_value(
-            &ledger_commit,
-            &series_tree,
-            std::slice::from_ref(&row),
-        )
-        .unwrap();
+        let value =
+            scorecard_snapshot_fixture_value(&ledger_commit, &series_tree, &sorted).unwrap();
         let snapshot = directory.path().join("snapshot.json");
         let snapshot_sha256 = write_scorecard_snapshot_fixture(&snapshot, &value).unwrap();
+        let write_variant = |name: &str, value: &JsonValue| {
+            let path = directory.path().join(name);
+            let sha256 = write_scorecard_snapshot_fixture(&path, value).unwrap();
+            (path, sha256)
+        };
 
         // Refusals leave both history files byte-identical.
         let error =
@@ -34035,20 +34101,46 @@ mod post_verdict_transaction_tests {
         assert!(error.contains("--refreshed-at"), "{error}");
         let mut no_repository = value.clone();
         no_repository["source"]["repository"] = JsonValue::Null;
-        let other = directory.path().join("no-repository.json");
-        let other_sha256 = write_scorecard_snapshot_fixture(&other, &no_repository).unwrap();
-        let error = project_observations_snapshot(&fixture.root, &other, &other_sha256, "nightly")
-            .unwrap_err();
+        let (path, sha256) = write_variant("no-repository.json", &no_repository);
+        let error =
+            project_observations_snapshot(&fixture.root, &path, &sha256, "nightly").unwrap_err();
         assert!(error.contains("hermit_test_ledger repository"), "{error}");
         let mut unpublished = value.clone();
-        unpublished["source"]["published_rows"] = 0.into();
-        let other = directory.path().join("unpublished.json");
-        let other_sha256 = write_scorecard_snapshot_fixture(&other, &unpublished).unwrap();
-        let error = project_observations_snapshot(&fixture.root, &other, &other_sha256, "nightly")
-            .unwrap_err();
+        unpublished["source"]["published_rows"] = 1.into();
+        let (path, sha256) = write_variant("unpublished.json", &unpublished);
+        let error =
+            project_observations_snapshot(&fixture.root, &path, &sha256, "nightly").unwrap_err();
         assert!(error.contains("published rows only"), "{error}");
+        // A local source with every row counted as published still names
+        // rows that are not in the ledger; the reader itself admits it.
+        let mut local = value.clone();
+        local["source"]["local_sources"] = serde_json::json!([{
+            "kind": "live", "path": "local.jsonl", "device": 1, "inode": 2,
+            "rows": 0, "size": 0, "sha256": "e".repeat(64),
+        }]);
+        let (path, sha256) = write_variant("local.json", &local);
+        HeldScorecardSeriesSnapshot::open(&path, &sha256).unwrap();
+        let error =
+            project_observations_snapshot(&fixture.root, &path, &sha256, "nightly").unwrap_err();
+        assert!(error.contains("published rows only"), "{error}");
+        // A snapshot changed after it was opened and checked is refused by
+        // the recheck immediately before the write.
+        let error = project_observations_snapshot_with(
+            &fixture.root,
+            &snapshot,
+            &snapshot_sha256,
+            "nightly",
+            || {
+                let mut changed = fs::read(&snapshot).unwrap();
+                changed.push(b'\n');
+                fs::write(&snapshot, &changed).map_err(|error| error.to_string())
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("changed"), "{error}");
         assert!(read_history_files(&fixture.root).unwrap() == published);
 
+        let snapshot_sha256 = write_scorecard_snapshot_fixture(&snapshot, &value).unwrap();
         project_observations_snapshot(&fixture.root, &snapshot, &snapshot_sha256, "nightly")
             .unwrap();
         assert!(read_history_files(&fixture.root).unwrap() == from_worktree);
