@@ -1325,13 +1325,41 @@ fn has_test_selection<'a>(selections: impl Iterator<Item = &'a Vec<String>>, nam
         .any(|args| args.windows(2).any(|args| args == ["--test", name]))
 }
 
+// An explicit target override also owns retained executables. Metadata and the
+// preparation lock remain source-local. Preserve the old default when no
+// nonempty override was recorded, including targets selected only by Cargo config.
+fn record_workload_directory(
+    generation: &Path,
+    target: &Path,
+    cargo_target: Option<&str>,
+) -> Result<PathBuf, String> {
+    if !cargo_target.is_some_and(|value| !value.is_empty()) {
+        return Ok(generation.join("record-workloads"));
+    }
+    Ok(target
+        .join("ci/nextest-binaries")
+        .join(
+            generation
+                .file_name()
+                .ok_or("missing prepared generation name")?,
+        )
+        .join("record-workloads"))
+}
+
 fn prepare_record_workloads(
     root: &Path,
     generation: &Path,
     cargo: &Value,
     target: &Path,
+    environment: &BTreeMap<String, String>,
 ) -> Result<RecordWorkloads, PreparationError> {
-    let directory = generation.join("record-workloads");
+    let directory = record_workload_directory(
+        generation,
+        target,
+        environment.get("CARGO_TARGET_DIR").map(String::as_str),
+    )?;
+    fs::create_dir_all(directory.parent().expect("record workloads have a parent"))
+        .map_err(|e| e.to_string())?;
     fs::create_dir(&directory).map_err(|e| e.to_string())?;
     let compiler = file_identity(&record_workloads::c_compiler()?, true)?;
     let cargo_events = file_identity(&generation.join("guests.jsonl"), false)?;
@@ -1395,7 +1423,14 @@ fn verify_record_workloads(
         .path
         .parent()
         .ok_or("missing prepared generation")?;
-    let directory = generation.join("record-workloads");
+    let directory = record_workload_directory(
+        generation,
+        &record.target,
+        record
+            .build_environment
+            .get("CARGO_TARGET_DIR")
+            .map(String::as_str),
+    )?;
     if workloads.cargo_events.path != generation.join("guests.jsonl") {
         return Err("record workload Cargo events are outside the selected generation".into());
     }
@@ -1996,6 +2031,7 @@ pub fn prepare(root: &Path, profile: &str) -> Result<(), PreparationError> {
             &generation,
             &cargo,
             &target,
+            &before_environment,
         )?)
     } else {
         None
@@ -2648,7 +2684,16 @@ mod tests {
         let (mut record, _) = fixture.selection();
         record.selections.values_mut().next().unwrap().build_args =
             argv(&["-p", "hermit-run", "--test", "record_replay"]);
-        let directory = fixture.root.join("record-workloads");
+        record.build_environment.insert(
+            "CARGO_TARGET_DIR".into(),
+            fixture.target.to_str().unwrap().into(),
+        );
+        let directory = fixture
+            .target
+            .join("ci/nextest-binaries")
+            .join(fixture.root.file_name().unwrap())
+            .join("record-workloads");
+        fs::create_dir_all(directory.parent().unwrap()).unwrap();
         fs::create_dir(&directory).unwrap();
         let mut targets = Vec::new();
         let mut events = Vec::new();
@@ -2727,8 +2772,19 @@ mod tests {
                 .find(|w| w.name == "rs_clock_gettime")
                 .unwrap()
                 .path,
-            fixture.root.join("record-workloads/rs_clock_gettime")
+            fixture
+                .target
+                .join("ci/nextest-binaries")
+                .join(fixture.root.file_name().unwrap())
+                .join("record-workloads/rs_clock_gettime")
         );
+        assert!(!fixture.root.join("record-workloads").exists());
+        for cargo_target in [None, Some("")] {
+            assert_eq!(
+                record_workload_directory(&fixture.root, &fixture.target, cargo_target).unwrap(),
+                fixture.root.join("record-workloads")
+            );
+        }
         assert!(record.guests.is_empty());
         assert_eq!(cargo_guests::CARGO_GUEST_BINARIES.len(), 21);
     }
@@ -2790,6 +2846,14 @@ mod tests {
             .executable
             .path = fixture.target.join("outside-generation");
         assert!(verify_record_workloads(&changed, &cargo).is_err());
+        let mut changed = record.clone();
+        let workload = &mut changed.record_workloads.as_mut().unwrap().workloads[0];
+        workload.executable.path = fixture.root.join("record-workloads").join(&workload.name);
+        assert!(
+            verify_record_workloads(&changed, &cargo)
+                .unwrap_err()
+                .contains("retained path differs")
+        );
         let mut changed = record.clone();
         changed
             .record_workloads
