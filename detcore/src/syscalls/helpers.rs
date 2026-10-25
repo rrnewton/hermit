@@ -491,6 +491,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             rsrc.fyi(call.name());
             (rsrc.polls_guest_state_only, rsrc.relies_on_guest_held_marks) =
                 single_fd_poll_readiness(guest, wrapped, internal_fd);
+            // Any process may open a named FIFO that joined internal polling,
+            // so its poll never makes the run a deadlock.
+            rsrc.polls_a_named_fifo =
+                internal_fd && get_fd(wrapped).is_some_and(|fd| is_named_fifo(guest, fd));
             // A pipe read: a recorded private `SIGCHLD` ends it as on Linux.
             rsrc.private_sigchld_decides = reads_a_pipe(guest, wrapped);
             // A read waits for data, a write for room (`--pipe-wake-latency`).
@@ -582,6 +586,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             "NonblockableSyscall: converting to nonblocking syscall (internal polling): writev"
         );
         let mut resources = pipe_writev_resources(guest.thread_state().dettid, call);
+        resources.polls_a_named_fifo = is_named_fifo(guest, call.fd());
         resources.polls_channel = self
             .pipe_channel_end(guest, call.fd())
             .map(|end| Box::new((end.channel, crate::pipe_wake::Wants::Space)));
@@ -934,6 +939,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (`Resources::private_sigchld_decides`).
         resources.private_sigchld_decides = true;
         resources.polls_guest_state_only = true;
+        resources.polls_a_named_fifo = is_named_fifo(guest, call.fd());
         resources.polls_channel = self
             .pipe_channel_end(guest, call.fd())
             .map(|end| Box::new((end.channel, crate::pipe_wake::Wants::Space)));
@@ -1539,6 +1545,15 @@ fn pollfd_descriptors(bytes: &[u8]) -> Vec<i32> {
         .map(|entry| i32::from_ne_bytes([entry[0], entry[1], entry[2], entry[3]]))
         .filter(|fd| *fd >= 0)
         .collect()
+}
+
+/// Whether descriptor `fd` is a named FIFO that joined internal polling
+/// (`Resources::polls_a_named_fifo`).
+fn is_named_fifo<G: Guest<Detcore<T>>, T: RecordOrReplay>(guest: &mut G, fd: i32) -> bool {
+    guest
+        .thread_state()
+        .with_detfd(fd, |detfd| detfd.is_named_fifo())
+        .unwrap_or(false)
 }
 
 /// Whether `call` is a `read` or `readv` of a descriptor Detcore records as

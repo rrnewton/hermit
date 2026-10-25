@@ -1503,8 +1503,9 @@ pub struct Scheduler {
     pipe_handoff_pending: BTreeMap<DetTid, Vec<DetTid>>,
     /// Processes a delivered signal with a fatal default action has doomed,
     /// recorded under `--pipe-wake-latency` or `--virtual-timeout` and read
-    /// through [`Scheduler::thread_is_doomed`] by the pipe hand-off scan and
-    /// the virtual bound (`a_thread_can_still_be_granted`).
+    /// through [`Scheduler::thread_is_doomed`] by the pipe hand-off scan, the
+    /// virtual bound (`a_thread_can_still_be_granted`) and the idle-poller
+    /// deadlock check (`Scheduler::only_idle_guest_pollers_remain`).
     fatal_signal_doomed: BTreeSet<DetPid>,
     /// Whether the `--pipe-wake-latency` hand-off has logged that it is inert.
     pipe_wake_inert_logged: bool,
@@ -1545,6 +1546,12 @@ pub struct Scheduler {
     /// thread's next request shows its attempt moved something (it is not a
     /// retry, or is one with `previous_attempt_made_progress`).
     last_progress: u64,
+    /// The sequence number taken at the latest thread retirement
+    /// (`logically_kill_thread`): a thread that leaves may close the last
+    /// descriptor of a pipe end, so for the idle-poller deadlock check
+    /// (`only_idle_guest_pollers_remain`) a poller's failed attempt before it
+    /// no longer shows the poller idle.
+    retired_at: u64,
     /// The sequence number of each guest-state-only poller's latest grant,
     /// until the thread commits a turn of another kind.
     guest_state_polled_at: BTreeMap<DetTid, u64>,
@@ -5029,6 +5036,7 @@ impl Scheduler {
             pending_run_queue_admissions: Default::default(),
             progress_epoch: 0,
             last_progress: 0,
+            retired_at: 0,
             guest_state_polled_at: Default::default(),
             last_commit_at: Default::default(),
             fast_forward_for_alone_poller: false,
@@ -6264,6 +6272,10 @@ impl Scheduler {
         self.chaos_had_turn.remove(dtid);
         self.chaos_first_turn_waits.remove(dtid);
         self.retire_sigalrm_thread(*dtid, *detpid);
+        // A thread that leaves may close the last descriptor of a pipe end a
+        // poller waits on (`retired_at`).
+        self.progress_epoch += 1;
+        self.retired_at = self.progress_epoch;
         // The process's last thread: its shared queue goes with it.
         let last_of_process = self
             .process_signal_targets(*detpid)
@@ -14730,6 +14742,13 @@ impl Scheduler {
         {
             classes.push("thread(s) held at a happens-before gate whose BEFORE anchor cannot fire");
         }
+        // Queued threads at a deadlock are pollers no attempt can satisfy
+        // (`only_idle_guest_pollers_remain`).
+        if !self.run_queue.is_empty() {
+            classes.push(
+                "thread(s) retrying a pipe or socket-pair call no remaining thread can satisfy",
+            );
+        }
         if classes.is_empty() {
             // Defensive: every caller fires with at least one class present.
             "thread(s) blocked with no possible wake".to_owned()
@@ -14790,7 +14809,18 @@ impl Scheduler {
             "  turn {}, committed time {}",
             self.turn, self.committed_time
         );
-        let _ = writeln!(out, "  run queue: {} runnable", self.run_queue.len());
+        if self.run_queue.is_empty() {
+            let _ = writeln!(out, "  run queue: 0 runnable");
+        } else {
+            let mut pollers: Vec<DetTid> = self.run_queue.tids().copied().collect();
+            pollers.sort();
+            let _ = writeln!(
+                out,
+                "  run queue: {} polling with no possible progress: {}",
+                pollers.len(),
+                render_tid_list(&pollers)
+            );
+        }
 
         let _ = writeln!(out, "  threads ({}), by dettid:", self.next_turns.len());
         // `next_turns` is a BTreeMap, so this walk is already ordered.
@@ -15360,6 +15390,14 @@ impl Scheduler {
         } else {
             // A queued thread ends any empty state.
             self.empty_queue_kick_turn = None;
+            // Only pollers that cannot succeed are queued, and every other
+            // thread waits for a wake that no thread can give. Without a
+            // timer or outside input that could end one of those waits, that
+            // is the deadlock an empty queue reports above; left alone, the
+            // pollers would retry forever, each retry moving virtual time on.
+            if self.stuck_with_only_idle_pollers(external_waits_empty) {
+                return Err(self.report_terminal_deadlock_unless_zap_pending());
+            }
         }
         Ok(())
     }
@@ -16720,69 +16758,200 @@ impl Scheduler {
     /// polling. When it is "nothing", the caller still waits for any timer due
     /// at a finite deadline first (`unblock_guest`).
     fn nothing_else_can_run(&self, dtid: DetTid) -> bool {
-        // A grant counts as progress unless the thread's current request
-        // repeats that grant's call after an attempt that moved nothing.
-        let progress = self
-            .guest_state_polled_at
-            .iter()
-            .filter(|&(&tid, _)| tid != dtid)
-            .filter(|&(&tid, _)| {
-                !self
-                    .next_turns
-                    .get(&tid)
-                    .and_then(|turn| turn.req.try_read())
-                    .is_some_and(
-                        |req| matches!(req, Ok(rs) if Self::retries_its_call_without_progress(&rs)),
-                    )
-            })
-            .map(|(_, &grant)| grant)
-            .fold(self.last_progress, u64::max);
+        let progress = self.latest_progress(Some(dtid));
         self.next_turns
             .keys()
             .filter(|&&tid| tid != dtid)
-            .all(|&tid| {
-                let idle_poller = self.run_queue.contains_tid(tid)
-                    && self
-                        .last_commit_at
-                        .get(&tid)
-                        .is_some_and(|&commit| commit >= progress)
-                    && self
-                        .next_turns
-                        .get(&tid)
-                        .and_then(|turn| turn.req.try_read())
-                        .is_some_and(|req| {
-                            // A poll with a timeout ends at its own deadline,
-                            // which `fast_forward_to_next_finite_deadline` does
-                            // not consider, so it is not idle: jumping over it,
-                            // or opening in the kernel while it waits, would end
-                            // it late.
-                            matches!(req, Ok(rs) if Self::is_polling_turn(&rs)
-                            && self.polls_only_guest_state(&rs)
-                            && rs.poll_deadline.is_none()
-                            && Self::waits_after_a_failed_attempt(&rs))
-                        });
-                let parked_futex = self.next_turns.get(&tid).is_some_and(is_futex_request)
-                    && self
-                        .blocked
-                        .futex_waiters
-                        .values()
-                        .any(|waiters| waiters.iter().any(|waiter| waiter.dettid == tid));
-                let parked = parked_futex
-                    || self.blocked.child_waiters.contains_key(&tid)
-                    || self
-                        .blocked
-                        .physical_child_waiters
-                        .values()
-                        .any(|waiters| waiters.contains(&tid))
-                    || self.blocked.rt_sigsuspend_blockers.contains_key(&tid)
-                    || self.blocked.external_io_blockers.contains_key(&tid)
-                    || self.blocked.timed_waiters.thread_deadline(tid).is_some()
-                    || self
-                        .happens_before
-                        .as_ref()
-                        .is_some_and(|hb| hb.parked.contains(&tid));
-                idle_poller || parked
+            .all(|&tid| self.is_idle_guest_poller(tid, progress) || self.is_parked(tid))
+    }
+
+    /// The latest committed turn an idle poller's failed attempt must not
+    /// precede (`is_idle_guest_poller`): the latest turn known to be progress
+    /// (`last_progress`), or the latest grant of a guest-state-only poller
+    /// other than `except`. A grant counts as progress unless the thread's
+    /// current request repeats that grant's call after an attempt that moved
+    /// nothing (`retries_its_call_without_progress`).
+    fn latest_progress(&self, except: Option<DetTid>) -> u64 {
+        self.guest_state_polled_at
+            .iter()
+            .filter(|&(&tid, _)| Some(tid) != except)
+            .filter(|&(&tid, _)| {
+                !self.request_satisfies(tid, Self::retries_its_call_without_progress)
             })
+            .map(|(_, &grant)| grant)
+            .fold(self.last_progress, u64::max)
+    }
+
+    /// Whether `tid` has posted a request and it passes `test`.
+    fn request_satisfies(&self, tid: DetTid, test: impl FnOnce(&Resources) -> bool) -> bool {
+        self.next_turns
+            .get(&tid)
+            .and_then(|turn| turn.req.try_read_with(|req| req.as_ref().is_ok_and(test)))
+            .unwrap_or(false)
+    }
+
+    /// Whether `tid` is queued as a poller whose attempts depend only on guest
+    /// actions (`Resources::polls_guest_state_only`), whatever its backoff,
+    /// and whose request retries after an attempt that moved nothing
+    /// (`waits_after_a_failed_attempt`), made no earlier than `progress`
+    /// (`latest_progress`): its latest commit (`last_commit_at`) is at or
+    /// after it.
+    fn is_idle_guest_poller(&self, tid: DetTid, progress: u64) -> bool {
+        self.run_queue.contains_tid(tid)
+            && self.committed_since(tid, progress)
+            && self.request_satisfies(tid, Self::waits_on_guest_state)
+    }
+
+    /// A retry, after an attempt that moved nothing, of a poll whose attempts
+    /// depend only on guest actions (`is_idle_guest_poller`).
+    fn waits_on_guest_state(rs: &Resources) -> bool {
+        Self::is_polling_turn(rs)
+            && rs.polls_guest_state_only
+            && Self::waits_after_a_failed_attempt(rs)
+    }
+
+    /// Whether `tid`'s latest commit (`last_commit_at`) is at or after `progress`.
+    fn committed_since(&self, tid: DetTid, progress: u64) -> bool {
+        self.last_commit_at
+            .get(&tid)
+            .is_some_and(|&commit| commit >= progress)
+    }
+
+    /// Whether `tid` is parked as a futex waiter, a child waiter, an
+    /// `rt_sigsuspend` waiter, at a happens-before gate, in a timed wait, or
+    /// in a call that waits on a host (external IO): only another thread, a
+    /// host or a timer can wake it.
+    fn is_parked(&self, tid: DetTid) -> bool {
+        self.parked_futex_waiter(tid).is_some()
+            || self.blocked.child_waiters.contains_key(&tid)
+            || self
+                .blocked
+                .physical_child_waiters
+                .values()
+                .any(|waiters| waiters.contains(&tid))
+            || self.blocked.rt_sigsuspend_blockers.contains_key(&tid)
+            || self.blocked.external_io_blockers.contains_key(&tid)
+            || self.blocked.timed_waiters.thread_deadline(tid).is_some()
+            || self
+                .happens_before
+                .as_ref()
+                .is_some_and(|hb| hb.parked.contains(&tid))
+    }
+
+    /// Whether no thread can make progress although threads are queued: each
+    /// queued thread is an idle guest-state poller (`is_idle_guest_poller`,
+    /// with progress counted from every thread's grants and retirements)
+    /// whose poll has no deadline of its own (`Resources::poll_deadline`), is
+    /// not of a named FIFO, which a process outside the container may also
+    /// hold (`Resources::polls_a_named_fifo`), and is not a FIFO open, which
+    /// waits in the kernel instead
+    /// (`Resources::waits_until_nothing_else_can_run`); every other thread is
+    /// parked (`is_parked`); and no thread's process is doomed
+    /// (`thread_is_doomed`), as its exit would close its descriptors at a
+    /// host-timed moment. Each poller's latest attempt then failed after
+    /// everything any thread did, and its next attempt finds the same guest
+    /// state unless a parked thread is woken first. Whether something can
+    /// still wake one is the caller's question (`stuck_with_only_idle_pollers`).
+    fn only_idle_guest_pollers_remain(&self) -> bool {
+        // The queued requests first: a runnable thread at the head of the
+        // queue, the usual case, ends the check at once.
+        let pollers_wait = !self.run_queue.is_empty()
+            && self.run_queue.tids().all(|&tid| {
+                self.request_satisfies(tid, |rs| {
+                    Self::waits_on_guest_state(rs)
+                        && rs.poll_deadline.is_none()
+                        && !rs.polls_a_named_fifo
+                        && !rs.waits_until_nothing_else_can_run
+                })
+            });
+        if !pollers_wait {
+            return false;
+        }
+        let progress = self.latest_progress(None).max(self.retired_at);
+        self.run_queue
+            .tids()
+            .all(|&tid| self.committed_since(tid, progress))
+            && self.next_turns.keys().all(|&tid| {
+                (self.run_queue.contains_tid(tid) || self.is_parked(tid))
+                    && !self.thread_is_doomed(tid)
+                    && !self.process_is_going_down(tid)
+            })
+    }
+
+    /// Whether `tid`'s process is going down although no committed turn
+    /// recorded its doom: another of its threads already left the scheduler
+    /// without a committed exit, so it died of a signal or with its process
+    /// (`committed_exits`, read the same way by `child_is_stuck`). A fatal
+    /// signal is recorded as a doom only under `--pipe-wake-latency`
+    /// (`record_committed_fatal_signal`); this sees one once its first
+    /// victim has gone, and the dying thread's removal is ordered, since the
+    /// scheduler waits for a running thread to quiesce. Siblings an exec
+    /// tore down also left without a committed exit, so such a process
+    /// counts as going down too.
+    fn process_is_going_down(&self, tid: DetTid) -> bool {
+        let Some(process) = self.thread_tree.thread_to_leader.get(&tid).copied() else {
+            return true;
+        };
+        self.thread_tree
+            .my_thread_group(&DetTid::from_raw(process.as_raw()))
+            .iter()
+            .any(|thread| self.left_without_a_committed_exit(*thread))
+    }
+
+    /// Whether `thread` left the scheduler other than by its own committed
+    /// exit (`process_is_going_down`).
+    fn left_without_a_committed_exit(&self, thread: DetTid) -> bool {
+        !self.next_turns.contains_key(&thread) && !self.committed_exits.contains(&thread)
+    }
+
+    /// Whether the run can never progress although threads are queued: only
+    /// idle guest-state pollers are queued (`only_idle_guest_pollers_remain`),
+    /// and neither a timer with a deadline, a pending physical process exit,
+    /// a SIGKILL whose victim the scheduler could not name, a doomed process
+    /// a backend may have retired before the kernel ended it
+    /// (`may_retire_before_the_kernel`), nor an outstanding host call or
+    /// child that can still exit (`external_waits_settled`) can wake a
+    /// parked thread. The cheap checks come first; the scan of every thread
+    /// the run has had comes after the run-queue check, which a runnable
+    /// thread ends at once.
+    fn stuck_with_only_idle_pollers(&self, external_waits_empty: bool) -> bool {
+        !self.next_deadline_is_reachable()
+            && self.pending_physical_process_exits.is_empty()
+            && !self.unresolved_sigkill
+            && self.only_idle_guest_pollers_remain()
+            && !(self.may_retire_before_the_kernel() && self.doomed_process_pending())
+            && self.external_waits_settled(external_waits_empty)
+    }
+
+    /// Whether this backend can retire a thread before the kernel has ended
+    /// it, so that its descriptors may still be open: a backend whose
+    /// scheduler identities do not name host tasks reports a thread's exit
+    /// before the native exit runs (`physical_thread_pidfds`), and one with
+    /// thread-directed process signals retires a SIGKILL's victims at the
+    /// sender's turn (`note_process_sigkill`). On ptrace a thread is retired
+    /// only once the kernel has finished its exit.
+    fn may_retire_before_the_kernel(&self) -> bool {
+        !self.physical_thread_pidfds.is_empty()
+            || self.backend.requires_thread_directed_process_signals
+    }
+
+    /// Whether some process may be doomed and not yet reaped: a granted
+    /// exit, a committed SIGKILL, an exec teardown in flight,
+    /// a delivered fatal signal (`thread_is_doomed`), or any thread that left
+    /// without a committed exit (`left_without_a_committed_exit`). The last
+    /// two are never forgotten, so on a backend that may retire threads early
+    /// (`may_retire_before_the_kernel`) one signal death ends the idle-poller
+    /// verdict for the run.
+    fn doomed_process_pending(&self) -> bool {
+        !self.thread_tree.granted_exits.is_empty()
+            || !self.sigkilled_processes.is_empty()
+            || !self.exec_teardowns.is_empty()
+            || !self.fatal_signal_doomed.is_empty()
+            || self
+                .thread_tree
+                .thread_to_leader
+                .keys()
+                .any(|thread| self.left_without_a_committed_exit(*thread))
     }
 
     /// Whether no guest thread other than `dtid` can run before `dtid` next
@@ -20066,6 +20235,214 @@ mod test {
         // Registered, but running: not queued and not parked.
         register_known_thread(&mut sched, DetTid::from_raw(7));
         assert!(!sched.nothing_else_can_run(opener));
+    }
+
+    /// A reader polling a pipe (dtid 3), whose latest attempt failed after
+    /// every other turn, beside the pipe's writer (dtid 5), parked in a futex
+    /// wait no thread will wake: the shape of a guest whose writer blocked on
+    /// a lock nobody holds before writing. Each thread is its own process.
+    fn reader_beside_a_blocked_writer_with(config: &Config) -> (Scheduler, Arc<Mutex<GlobalTime>>) {
+        let mut sched = Scheduler::new(config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(config)));
+        let reader = DetTid::from_raw(3);
+        queued_poller(&mut sched, reader, true);
+        let writer = DetTid::from_raw(5);
+        register_known_thread(&mut sched, writer);
+        let mut wait = Resources::new(writer);
+        wait.insert(ResourceID::FutexWait, Permission::R);
+        sched.next_turns[&writer].req.put(Ok(wait));
+        sched
+            .blocked
+            .futex_waiters
+            .entry(FutexID::private(MmId::initial(writer), 0x404100))
+            .or_default()
+            .push(futex_waiter(5, u32::MAX));
+        sched.thread_tree.add_child(reader, reader, true);
+        sched.thread_tree.add_child(reader, writer, true);
+        (sched, global_time)
+    }
+
+    fn reader_beside_a_blocked_writer() -> (Scheduler, Arc<Mutex<GlobalTime>>) {
+        reader_beside_a_blocked_writer_with(&Config::default())
+    }
+
+    /// Whether step2d let the run go on: no deadlock report.
+    fn polls_on(sched: &mut Scheduler, global_time: &Arc<Mutex<GlobalTime>>) -> bool {
+        sched.step2d_handle_empty_queue(global_time).is_ok()
+            && sched.take_terminal_deadlock().is_none()
+    }
+
+    /// No attempt of the reader's can succeed until the writer runs, and
+    /// nothing can wake the writer: the run reports the deadlock rather than
+    /// let the reader poll forever, each retry moving virtual time on.
+    #[test]
+    fn a_reader_beside_a_writer_nothing_can_wake_is_a_deadlock() {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        assert!(sched.step2d_handle_empty_queue(&global_time).is_err());
+        let report = sched
+            .take_terminal_deadlock()
+            .expect("the scheduler should report the deadlock");
+        assert!(
+            report.starts_with(
+                "Deadlock detected: thread(s) waiting on futex, and thread(s) retrying a pipe \
+                 or socket-pair call no remaining thread can satisfy, but no runnable threads \
+                 left.\n"
+            ),
+            "{report}"
+        );
+        assert!(
+            report.contains("  run queue: 1 polling with no possible progress: dtid 3\n"),
+            "{report}"
+        );
+    }
+
+    /// A turn committed since the reader's latest attempt may have made the
+    /// pipe ready: the reader tries again.
+    #[test]
+    fn a_reader_that_has_not_retried_since_progress_polls_on() {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        sched.progress_epoch += 1;
+        sched.last_progress = sched.progress_epoch;
+        assert!(polls_on(&mut sched, &global_time));
+    }
+
+    /// The writer leaves after the reader's latest attempt (its exit closes
+    /// its descriptors): the reader tries again first.
+    #[test]
+    fn a_reader_retries_after_the_writer_leaves() {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        let writer = DetTid::from_raw(5);
+        sched.logically_kill_thread(&writer, &DetPid::from_raw(5), MmId::initial(writer));
+        assert!(polls_on(&mut sched, &global_time));
+    }
+
+    /// Another thread of the writer's process already left without a
+    /// committed exit, so it died of a signal or with its process: the
+    /// writer's thread leaves too, at a host-timed moment, closing the
+    /// process's descriptors. A sibling that left by its own exit is gone
+    /// harmlessly.
+    #[test]
+    fn a_reader_beside_a_writer_whose_sibling_died_polls_on() {
+        for sibling_exited in [false, true] {
+            let (mut sched, global_time) = reader_beside_a_blocked_writer();
+            let writer = DetTid::from_raw(5);
+            let sibling = DetTid::from_raw(6);
+            sched.thread_tree.add_child(writer, sibling, false);
+            if sibling_exited {
+                sched.committed_exits.insert(sibling);
+            }
+            assert_eq!(
+                polls_on(&mut sched, &global_time),
+                !sibling_exited,
+                "sibling exited {sibling_exited}"
+            );
+        }
+    }
+
+    /// The writer's process is doomed (a committed SIGKILL here; a granted
+    /// exit, an exec teardown or a fatal signal alike) while its thread is
+    /// still registered: the thread leaves, closing its descriptors, at a
+    /// host-timed moment.
+    #[test]
+    fn a_reader_beside_a_doomed_writer_polls_on() {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        sched.record_committed_sigkill(DetTid::from_raw(5), Some(DetPid::from_raw(5)));
+        assert!(polls_on(&mut sched, &global_time));
+    }
+
+    /// A backend that retires a SIGKILL's victims at the kill retires them
+    /// before the kernel has closed their descriptors: a doomed process that
+    /// has not been reaped holds the verdict back there, and only there.
+    #[test]
+    fn a_doomed_process_holds_the_verdict_only_where_threads_retire_early() {
+        let early = Config::default().with_backend(|backend| {
+            backend.requires_thread_directed_process_signals = true;
+        });
+        for (config, retires_early) in [(Config::default(), false), (early, true)] {
+            let (mut sched, global_time) = reader_beside_a_blocked_writer_with(&config);
+            sched.record_committed_sigkill(DetTid::from_raw(9), Some(DetPid::from_raw(9)));
+            assert_eq!(
+                polls_on(&mut sched, &global_time),
+                retires_early,
+                "retires early {retires_early}"
+            );
+        }
+    }
+
+    /// A timer can still let a thread run: the reader polls on until it fires.
+    #[test]
+    fn a_reader_beside_a_finite_timer_polls_on() {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        let sleeper = DetTid::from_raw(7);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(u64::MAX / 2), sleeper);
+        assert!(polls_on(&mut sched, &global_time));
+    }
+
+    /// A call waiting on a host may still complete and wake a thread.
+    #[test]
+    fn a_reader_beside_external_io_polls_on() {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        let other = DetTid::from_raw(7);
+        register_known_thread(&mut sched, other);
+        sched
+            .blocked
+            .external_io_blockers
+            .insert(other, ExternalOpId::new(other, 1));
+        assert!(polls_on(&mut sched, &global_time));
+    }
+
+    /// Runnable work beside the reader can still wake the writer.
+    #[test]
+    fn a_reader_beside_runnable_work_polls_on() {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        let runnable = DetTid::from_raw(7);
+        register_known_thread(&mut sched, runnable);
+        sched.run_queue.push_back(runnable, DEFAULT_PRIORITY);
+        assert!(polls_on(&mut sched, &global_time));
+    }
+
+    /// A poll whose outcome a host can change, a retry on a named FIFO, which
+    /// a process outside the container may also hold, and a FIFO open, which
+    /// waits in the kernel once nothing else can run, are no deadlock.
+    #[test]
+    fn polls_a_host_may_satisfy_poll_on() {
+        let config = Config::default();
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        for kind in ["host-reachable", "named fifo", "fifo open"] {
+            let mut sched = Scheduler::new(&config);
+            let poller = DetTid::from_raw(3);
+            match kind {
+                "host-reachable" => queued_poller(&mut sched, poller, false),
+                "named fifo" => {
+                    queued_poller(&mut sched, poller, true);
+                    let mut retry = Resources::new(poller);
+                    retry.insert(ResourceID::InternalIOPolling, Permission::W);
+                    retry.poll_attempt = 1;
+                    retry.polls_guest_state_only = true;
+                    retry.polls_a_named_fifo = true;
+                    register_known_thread(&mut sched, poller);
+                    sched.next_turns[&poller].req.put(Ok(retry));
+                }
+                _ => {
+                    fifo_open_poll(&mut sched, poller);
+                    sched.run_queue.push_poller(poller, DEFAULT_PRIORITY, 1);
+                    sched.last_commit_at.insert(poller, sched.progress_epoch);
+                }
+            }
+            let writer = DetTid::from_raw(5);
+            register_known_thread(&mut sched, writer);
+            sched
+                .blocked
+                .timed_waiters
+                .insert(LogicalTime::INDEFINITE, writer);
+            sched.thread_tree.add_child(poller, poller, true);
+            sched.thread_tree.add_child(poller, writer, true);
+            assert!(polls_on(&mut sched, &global_time), "{kind}");
+        }
     }
 
     /// A FIFO open's polling request (`waits_until_nothing_else_can_run`).
@@ -36937,6 +37314,15 @@ mod test {
         );
         hb.parked.insert(held);
         scheduler.happens_before = Some(hb);
+        // Two queued pollers no attempt can satisfy, which add a headline
+        // class and are named on the run-queue line.
+        let mut pollers = vec![15, 17];
+        if reverse {
+            pollers.reverse();
+        }
+        for dettid in pollers {
+            queued_poller(&mut scheduler, DetTid::from_raw(dettid), true);
+        }
         scheduler
     }
 
@@ -37005,7 +37391,10 @@ mod test {
             "Deadlock detected: thread(s) waiting on futex, and thread(s) waiting \
              indefinitely (pause, or a timer beyond the end of logical time), and \
              thread(s) held at a happens-before gate whose BEFORE anchor cannot fire, \
-             but no runnable threads left.",
+             and thread(s) retrying a pipe or socket-pair call no remaining thread can \
+             satisfy, but no runnable threads left.",
+            "run queue: 2 polling with no possible progress: dtid 15, dtid 17",
+            "dtid 15: InternalIOPolling: W (poll_attempt 1)",
             "dtid 13: HappensBeforeCheckpoint(50): R",
             "dtid 3",
             "dtid 9",

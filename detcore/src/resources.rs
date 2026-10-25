@@ -623,6 +623,14 @@ pub struct Resources {
     /// whose outcome a host can change.
     #[serde(default)]
     pub(crate) polls_guest_state_only: bool,
+    /// Set beside `polls_guest_state_only` on a retry of a named FIFO that
+    /// joined internal polling (`DetFd::is_named_fifo`): a process outside
+    /// the container may hold its other end, so its attempts can succeed
+    /// without a guest action, and the poll never makes the run a deadlock
+    /// (`Scheduler::only_idle_guest_pollers_remain`). `false` for every other
+    /// request.
+    #[serde(default)]
+    pub(crate) polls_a_named_fifo: bool,
     /// Set with `polls_guest_state_only` when that rests on guest-held marks
     /// (`DetFd::is_guest_held`). Once a descriptor may have left the guest
     /// (`passes_descriptors_out`), the scheduler no longer counts such a poll
@@ -815,6 +823,9 @@ impl fmt::Debug for Resources {
         if self.polls_guest_state_only {
             debug.field("polls_guest_state_only", &true);
         }
+        if self.polls_a_named_fifo {
+            debug.field("polls_a_named_fifo", &true);
+        }
         if self.relies_on_guest_held_marks {
             debug.field("relies_on_guest_held_marks", &true);
         }
@@ -897,6 +908,7 @@ impl Resources {
             reads_signalfd: false,
             read_fd: None,
             polls_guest_state_only: false,
+            polls_a_named_fifo: false,
             relies_on_guest_held_marks: false,
             passes_descriptors_out: false,
             waits_until_nothing_else_can_run: false,
@@ -968,6 +980,7 @@ impl Resources {
         self.private_sigchld_decides |= other.private_sigchld_decides;
         self.replay_served_from_log |= other.replay_served_from_log;
         self.polls_guest_state_only |= other.polls_guest_state_only;
+        self.polls_a_named_fifo |= other.polls_a_named_fifo;
         self.relies_on_guest_held_marks |= other.relies_on_guest_held_marks;
         self.passes_descriptors_out |= other.passes_descriptors_out;
         self.waits_until_nothing_else_can_run |= other.waits_until_nothing_else_can_run;

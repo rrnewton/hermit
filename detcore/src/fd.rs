@@ -949,6 +949,12 @@ struct OpenFileDescription {
     #[serde(default)]
     fifo_awaiting_guest_peer: bool,
 
+    /// A FIFO opened by path that joined internal polling
+    /// (`DetFd::fifo_joins_internal_polling`): any process that can reach its
+    /// path, inside the container or not, may also hold an end of it.
+    #[serde(default)]
+    named_fifo: bool,
+
     /// cached statbuf
     ///
     /// This is the RAW stat from the file system, NOT determinized.
@@ -1228,6 +1234,7 @@ impl std::fmt::Debug for OpenFileDescription {
         debug.field("dirty", &self.dirty);
         debug.field("physically_nonblocking", &self.physically_nonblocking);
         debug.field("fifo_awaiting_guest_peer", &self.fifo_awaiting_guest_peer);
+        debug.field("named_fifo", &self.named_fifo);
         debug.field("stat", &self.stat);
         debug.field("random_device_offset", &self.random_device_offset);
         debug.field("random_device_stream", &self.random_device_stream);
@@ -1502,6 +1509,7 @@ impl DetFd {
                 inode: None,
                 dirty: false,
                 fifo_awaiting_guest_peer: false,
+                named_fifo: false,
                 stat: None,
                 random_device_offset: 0,
                 random_device_stream: RandomDeviceStream::default(),
@@ -2492,6 +2500,12 @@ impl DetFd {
         self.with_description(|d| d.fifo_awaiting_guest_peer)
     }
 
+    /// Whether this is a FIFO opened by path that joined internal polling
+    /// (see `OpenFileDescription::named_fifo`).
+    pub(crate) fn is_named_fifo(&self) -> bool {
+        self.with_description(|d| d.named_fifo)
+    }
+
     /// Mark a `Regular` FIFO as one that may become an internally polled pipe.
     pub(crate) fn mark_fifo_awaiting_guest_peer(&self) {
         self.with_description(|d| {
@@ -2507,6 +2521,7 @@ impl DetFd {
         self.with_description(|d| {
             debug_assert!(d.fifo_awaiting_guest_peer);
             d.fifo_awaiting_guest_peer = false;
+            d.named_fifo = true;
             d.ty = FdType::Pipe;
             d.physically_nonblocking = true;
         });
