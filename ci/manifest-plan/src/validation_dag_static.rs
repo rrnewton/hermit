@@ -1887,7 +1887,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And phases::tests::a_boundary_trial_still_stopped_is_reported_as_a_hang,
     // the_longest_finished_prefix_below_the_boundary_is_named and
     // a_confirmation_raises_the_bound_and_keeps_it_once_finished: 1222.
-    ("test.hermit_unit", 1222),
+    // And analyze's workspace cleanup: workspace::tests::{a_workspace_is_removed_when_dropped,
+    // a_kept_workspace_stays, a_workspace_that_cannot_be_removed_is_named,
+    // an_uncreatable_tmp_dir_is_named} and stop::tests::{the_parent_is_the_field_after_the_state,
+    // the_first_stop_signal_is_the_one_reported,
+    // a_stop_signal_reaches_the_children_and_only_them,
+    // the_handler_stops_what_analyze_started_and_nothing_else}: 1230.
+    ("test.hermit_unit", 1230),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5801,7 +5807,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two --minimize tests: 1208.
     // And the same five boundary-confirmation tests: 1133.
     // And the same three prefix-hang tests: 1216.
-    ("test.hermit_unit_on_host", 1216),
+    // And the same eight workspace-cleanup tests: 1224.
+    ("test.hermit_unit_on_host", 1224),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
