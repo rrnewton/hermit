@@ -6592,6 +6592,32 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Whether the record `--replay-preemptions-from` names carries callback
+    /// checkpoints (`Config::annotated_priority_replay`), refusing a
+    /// configuration that cannot replay such a record
+    /// (`preemption_admission::refuse_unqualified_annotated_replay`). As for
+    /// the epoch, the record is read before anything is launched. Preparing a
+    /// run sets the configuration from this answer, whatever it carried.
+    fn annotated_priority_replay_admission(&self) -> Result<bool, Error> {
+        if self.namespace_only {
+            return Ok(false);
+        }
+        let config = &self.det_opts.det_config;
+        let Some(path) = &config.replay_preemptions_from else {
+            return Ok(false);
+        };
+        let annotated =
+            detcore::preemptions::read_recorded_callback_checkpoints(path).map_err(Error::msg)?;
+        if annotated {
+            hermit::preemption_admission::refuse_unqualified_annotated_replay(
+                config,
+                self.selected_backend(),
+            )
+            .map_err(|refusal| Error::new(PolicyRefusal).context(refusal))?;
+        }
+        Ok(annotated)
+    }
+
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
     /// Used by `hermit oci run`, which resolves the user's reference to the
@@ -7368,6 +7394,9 @@ impl RunOpts {
         self.refuse_strict_with_host_drawn_inputs()?;
         self.refuse_replay_under_another_pipe_wake_latency()?;
         self.refuse_replay_under_another_signal_state_copy()?;
+        // Refused here too, before stdin is read; each run's preparation
+        // below sets the configuration from the same record.
+        self.annotated_priority_replay_admission()?;
         if !self.namespace_only
             && (self.verify_verbose
                 || global
@@ -9181,6 +9210,8 @@ impl RunOpts {
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         self.refuse_unready_exec_stop()?;
         let mut options = self.clone();
+        options.det_opts.det_config.annotated_priority_replay =
+            options.annotated_priority_replay_admission()?;
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
         #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
@@ -10428,6 +10459,8 @@ impl RunOpts {
             );
         }
         let mut options = self.clone();
+        options.det_opts.det_config.annotated_priority_replay =
+            options.annotated_priority_replay_admission()?;
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
         let resources = format!(

@@ -1165,6 +1165,8 @@ fn record_or_replay_config_with_timer_support(
         in_guest_reserved_signals: 0,
         in_guest_refuses_host_timed_producers: false,
         in_guest_signal_delivery: false,
+        // Record and replay never replay a priority history.
+        annotated_priority_replay: false,
         // The first image's link stays the kernel's in record and replay.
         launch_image: None,
         // Not measured for record and replay.

@@ -5492,7 +5492,7 @@ where
 {
     let dettid = guest.thread_state().dettid;
     let cfg = &guest.config();
-    if cfg.sequentialize_threads && cfg.should_trace_schedevent() {
+    if cfg.sequentialize_threads && cfg.observes_schedevents() {
         trace_schedevent(
             guest,
             with_guest_time(

@@ -749,6 +749,13 @@ pub struct Resources {
     /// Serde preserves the same positional and JSON payload bytes.
     #[serde(default)]
     pub(crate) callback_checkpoint: Option<Box<crate::preemptions::callback_history::Origin>>,
+    /// The recorded priority-history row a priority-change request ends,
+    /// under `Config::annotated_priority_replay`: the scheduler acknowledges
+    /// that row, and its checkpoint if it has one, when it selects the
+    /// request. `None` on every other request. Appended last, with no
+    /// skip_serializing_if, for the same positional RPCs.
+    #[serde(default)]
+    pub(crate) priority_row: Option<u64>,
 }
 
 impl fmt::Debug for Resources {
@@ -860,6 +867,7 @@ impl Resources {
             slice_boundary: None,
             guest_signal_mask: None,
             callback_checkpoint: None,
+            priority_row: None,
         }
     }
 
