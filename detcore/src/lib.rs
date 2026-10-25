@@ -6064,6 +6064,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     ) -> Result<(), Error> {
         let dettid = thread_state.dettid;
         thread_state.delivery_counters.log(dettid);
+        // Its kept /proc status file reads only ESRCH from now on.
+        crate::syscalls::forget_thread_status(Pid::from_raw(tid.as_raw()));
         // Cancellation can consume the backend's transferred state before the
         // successful-exec callback has rebound its logical identity.
         let current = DetTid::from_raw(tid.as_raw());

@@ -2866,7 +2866,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // to user memory faults where no mapping is writable): 2566, listed.
     // And 3c.1d-ii review round 4's tool_global::tests unit (a clock
     // observation grants no turn and moves no time): 2567, listed.
-    ("test.detcore_unit", 2567),
+    // And syscalls::threads::tests' two kept-status-file units (a kept
+    // /proc status file reads the current state until its thread is
+    // forgotten, and one of an exited thread is unreadable and dropped): 2569, listed.
+    ("test.detcore_unit", 2569),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5019,7 +5022,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two 3c.1d-ii review round 2 units: 2562, listed.
     // And the same four 3c.1d-ii review round 3 units: 2566, listed.
     // And the same one 3c.1d-ii review round 4 unit: 2567, listed.
-    ("test.detcore_unit_on_host", 2567),
+    // And syscalls::threads::tests' two kept-status-file units (a kept
+    // /proc status file reads the current state until its thread is
+    // forgotten, and one of an exited thread is unreadable and dropped): 2569, listed.
+    ("test.detcore_unit_on_host", 2569),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
