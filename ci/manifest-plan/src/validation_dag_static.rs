@@ -1175,7 +1175,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed.
     // Caller-owned DBT evidence validation (dh-pp7q9): two grammar units,
     // measured with the existing selection and exclusions unchanged.
-    ("test.regular_crates", 1859),
+    // And hermit-manifest-plan's
+    // runner::tests::a_replay_result_row_may_carry_its_inherited_declaration
+    // (a replay row carries its verify recipe's declared guest exit): 1860, listed.
+    ("test.regular_crates", 1860),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5693,7 +5696,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unit: 1843, listed.
     // Caller-owned DBT evidence validation (dh-pp7q9): two grammar units,
     // measured with the existing selection and exclusions unchanged.
-    ("test.regular_crates_on_host", 1845),
+    // And the same inherited-declaration runner test: 1846, listed.
+    ("test.regular_crates_on_host", 1846),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

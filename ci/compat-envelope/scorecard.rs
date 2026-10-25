@@ -58,11 +58,12 @@ use hermit_manifest_plan::runner::ExpectedGuestExit;
 use hermit_manifest_plan::runner::ExpectedOutputFailureReason;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::ObservedResult;
+use hermit_manifest_plan::runner::invocation_admits_declared_guest_exit;
 use hermit_manifest_plan::runner::parse_expected_output_failure_reason;
 use hermit_manifest_plan::runner::records_stripped_comparator;
 use hermit_manifest_plan::runner::require_stripped_comparison;
 use hermit_manifest_plan::runner::terminal_diagnostic_reason;
-use hermit_manifest_plan::runner::validate_expected_guest_exit;
+use hermit_manifest_plan::runner::validate_result_expected_guest_exit;
 use hermit_manifest_plan::stress_series::HostCapability;
 use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
 use hermit_manifest_plan::stress_series::SeriesAttemptDisposition;
@@ -2284,7 +2285,7 @@ impl ResultRow {
         // the identity: removing or changing it cannot keep the accepted row's
         // hash. Undeclared rows keep their historical identity.
         if let Some(declared) = &self.expected_guest_exit {
-            validate_expected_guest_exit("result row", &self.mode, Some(declared))?;
+            validate_result_expected_guest_exit("result row", &self.mode, Some(declared))?;
             evidence["expected_guest_exit"] = serde_json::json!({
                 "code": declared.code,
                 "reason": declared.reason,
@@ -5209,8 +5210,10 @@ fn declared_guest_exit_matches(
 /// on a result row can be recomputed, so a declaration whose report says
 /// otherwise would otherwise still hash coherently.
 ///
-/// Hermit ran in verify mode with `--verify-allow=failure` before the guest
-/// separator; Hermit's status reports the declared disposition (a signal death
+/// Hermit ran an invocation the runner writes for a declared exit before the
+/// guest separator (`invocation_admits_declared_guest_exit`: verify mode with
+/// `--verify-allow=failure`, or a replay cell's `record start`, which inherits
+/// its verify recipe's declaration); Hermit's status reports the declared disposition (a signal death
 /// either as that signal or as `128 + signo`); and the report's guest
 /// disposition and both compared outputs name exactly the declared code or
 /// signal.
@@ -5235,7 +5238,7 @@ fn declared_failure_matches(
         .iter()
         .position(|arg| *arg == "--")
         .map_or(&argv[..], |separator| &argv[..separator]);
-    if mode != "verify" || !hermit_args.contains(&"--verify-allow=failure") {
+    if !invocation_admits_declared_guest_exit(mode, hermit_args) {
         return false;
     }
     let disposition = |name: &str| match attempt.get(name) {
@@ -37812,6 +37815,62 @@ mod post_verdict_transaction_tests {
                 "{label} was accepted outside verify mode"
             );
         }
+        // A replay cell's row carries its verify recipe's declaration and is
+        // judged by the same exact match, from the replay's own invocation
+        // (`record start`, whose comparison takes --verify-allow=both).
+        const REPLAY: &[&str] = &[
+            "hermit-verify-pair",
+            "hermit",
+            "log-diff",
+            "--verify-allow=both",
+            "hermit",
+            "record",
+            "start",
+            "--",
+            "guest",
+        ];
+        for (label, declared, code, signal) in [
+            ("declared code", &code_3, Some(3), None),
+            ("signal death", &signal_11, None, Some(11)),
+        ] {
+            let expected = report(declared.code, declared.signal);
+            assert!(
+                declared_failure_matches(
+                    "replay",
+                    declared,
+                    &attempt(code, signal, REPLAY),
+                    &expected
+                ),
+                "replay {label} was refused"
+            );
+            assert!(
+                !declared_failure_matches(
+                    "replay",
+                    declared,
+                    &attempt(code, signal, ALLOW),
+                    &expected
+                ),
+                "replay {label} was accepted from a verify invocation"
+            );
+            assert!(
+                !declared_failure_matches(
+                    "verify",
+                    declared,
+                    &attempt(code, signal, REPLAY),
+                    &expected
+                ),
+                "verify {label} was accepted from a replay invocation"
+            );
+        }
+        assert!(
+            !declared_failure_matches(
+                "replay",
+                &code_3,
+                &attempt(Some(4), None, REPLAY),
+                &report(Some(4), None)
+            ),
+            "a replay that ended with another code was accepted"
+        );
         let mut one_output = report(Some(3), None);
         one_output
             .compared_outputs
