@@ -1239,6 +1239,8 @@ impl AnalyzeOpts {
         self.adopt_recorded_epoch(&recordings)?;
         // Every trial charges expired timed waits as the target did.
         self.adopt_expired_wait_charge(run1.as_deref())?;
+        // Every trial registers queued sleeps as the target did.
+        self.adopt_sleep_registration(run1.as_deref())?;
         self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
     }
 
@@ -1979,6 +1981,21 @@ mod tests {
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             if once {
                 value["expired_wait_runs_charged_once"] = serde_json::Value::from(true);
+    /// included, under the `--sleep-registration` of its target: the run
+    /// arguments' own, or else `--run1-preemptions`'s rule, or else
+    /// `when-chosen` for the chaos target it records itself. The value is put
+    /// in the run arguments, every record analyze writes carries it, and a
+    /// `--run2-preemptions` record under the other rule is refused.
+    #[test]
+    fn analyze_runs_every_trial_under_the_targets_sleep_registration() {
+        use detcore_model::config::SleepRegistration;
+        let dir = tempfile::tempdir().unwrap();
+        let record = |name: &str, first_pass: bool| {
+            let path = record_with_epoch(dir.path(), name, None);
+            let mut value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            if first_pass {
+                value["queued_sleeps_registered_at_first_pass"] = serde_json::Value::from(true);
             }
             std::fs::write(&path, value.to_string()).unwrap();
             path
@@ -2000,6 +2017,8 @@ mod tests {
         };
         let each = record("each", false);
         let once = record("once", true);
+        let chosen = record("when-chosen", false);
+        let first = record("first-pass", true);
         let written = |options: &AnalyzeOpts| {
             let (failing, passing, trial) = (
                 dir.path().join("final-failing.json"),
@@ -2024,6 +2043,32 @@ mod tests {
             (Some(&once), None, vec![], ExpiredWaitCharge::Once),
             (Some(&once), Some(&once), vec![], ExpiredWaitCharge::Once),
             (Some(&each), Some(&each), vec![], ExpiredWaitCharge::Each),
+                detcore::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(&path)
+                    .unwrap()
+            })
+        };
+        for (run1, run2, run_args, expected) in [
+            (None, None, vec![], SleepRegistration::WhenChosen),
+            (
+                None,
+                None,
+                vec!["--sleep-registration=first-pass"],
+                SleepRegistration::FirstPass,
+            ),
+            (Some(&chosen), None, vec![], SleepRegistration::WhenChosen),
+            (Some(&first), None, vec![], SleepRegistration::FirstPass),
+            (
+                Some(&first),
+                Some(&first),
+                vec![],
+                SleepRegistration::FirstPass,
+            ),
+            (
+                Some(&chosen),
+                Some(&chosen),
+                vec![],
+                SleepRegistration::WhenChosen,
+            ),
         ] {
             let case = format!("{run1:?} {run2:?} {run_args:?}");
             let options = prepare(
@@ -2052,11 +2097,32 @@ mod tests {
             (&once, Some(&each), vec![]),
             (&each, Some(&once), vec![]),
             (&once, None, vec!["--expired-wait-charge=each"]),
+            assert_eq!(options.trial_sleep_registration(), expected, "{case}");
+            assert_eq!(
+                written(&options),
+                [expected == SleepRegistration::FirstPass; 3],
+                "{case}"
+            );
+        }
+        // Without --run1-preemptions the trials use `when-chosen`, so a plain
+        // (first-pass) --run2-preemptions baseline is refused.
+        assert_eq!(
+            prepare(None, Some(&chosen), &[])
+                .unwrap()
+                .trial_sleep_registration(),
+            SleepRegistration::WhenChosen
+        );
+        assert!(prepare(None, Some(&first), &[]).is_err());
+        for (run1, run2, run_args) in [
+            (&first, Some(&chosen), vec![]),
+            (&chosen, Some(&first), vec![]),
+            (&first, None, vec!["--sleep-registration=when-chosen"]),
         ] {
             let case = format!("{run1:?} {run2:?} {run_args:?}");
             let error = prepare(Some(run1), run2.map(|p| p.as_path()), &run_args).expect_err(&case);
             assert!(
                 format!("{error:#}").contains("--expired-wait-charge"),
+                format!("{error:#}").contains("--sleep-registration"),
                 "{case}: {error:#}"
             );
         }
@@ -2266,6 +2332,8 @@ mod tests {
         let analysis = prepared_analysis(dir, None, None, &[]).unwrap();
         // No `--epoch` is added; `--expired-wait-charge` always is.
         assert_eq!(analysis.run_arg, ["--expired-wait-charge=each"]);
+        // No `--epoch` is added; `--sleep-registration` always is.
+        assert_eq!(analysis.run_arg, ["--sleep-registration=when-chosen"]);
         assert_eq!(analysis.trial_epoch_for_test(), "2026-01-01T00:00:00+00:00");
 
         // The recorded epoch reaches the trials, from either record.
@@ -2279,6 +2347,8 @@ mod tests {
             prepared_analysis(dir, Some(RECORDED), None, &["--epoch", RECORDED]).unwrap();
         // No `--epoch` is added; `--expired-wait-charge` always is.
         assert_eq!(analysis.run_arg, ["--expired-wait-charge=each"]);
+        // No `--epoch` is added; `--sleep-registration` always is.
+        assert_eq!(analysis.run_arg, ["--sleep-registration=when-chosen"]);
         assert_eq!(analysis.trial_epoch_for_test(), RECORDED_RFC3339);
 
         // A different explicit epoch is refused, naming the remedy.
