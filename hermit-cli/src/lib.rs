@@ -7951,9 +7951,10 @@ mod tests {
             command.env_clear().env("PATH", &search);
             command
         }));
-        // Without a cleared environment the launch searches Hermit's own PATH,
-        // not the command's, so the static image is not found by either.
-        assert!(!check(&|| {
+        // Without a cleared environment the command's explicit PATH still
+        // wins over the inherited one (Reverie cf745200 makes program lookup
+        // read the environment the child receives), so both find the image.
+        assert!(check(&|| {
             let mut command = Command::new(name);
             command.env("PATH", &search);
             command
