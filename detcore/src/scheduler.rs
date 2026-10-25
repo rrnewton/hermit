@@ -1297,9 +1297,9 @@ pub struct Scheduler {
 
     /// Under `cap_preemption_charge`, each live thread's clock
     /// (`GlobalTime::threads_duration`) when its last committed turn that was
-    /// not a host-timed polling retry was granted, while the thread was still
-    /// stopped at that turn's request (`Scheduler::note_granted_turn`). Empty
-    /// otherwise.
+    /// neither a host-timed polling retry nor a schedule replay's switch turn
+    /// was granted, while the thread was still stopped at that turn's request
+    /// (`Scheduler::note_granted_turn`). Empty otherwise.
     turn_clocks: BTreeMap<DetTid, LogicalTime>,
 
     /// The cap on the charge of the turn granted last, when that turn ended
@@ -15413,13 +15413,21 @@ impl Scheduler {
     /// its last turn's clock (`turn_clocks`), and when the request ends an
     /// expired timeslice (`Resources::slice_expired`), the difference from
     /// its previous turn's clock, the virtual time it ran in that slice,
-    /// caps the turn's charge (`preemption_cap`). A host-timed polling retry
-    /// is not recorded, so how many retries ran cannot change a cap. Called
+    /// caps the turn's charge (`preemption_cap`). Two kinds of turn are not
+    /// recorded: a host-timed polling retry, so how many retries ran cannot
+    /// change a cap, and a schedule replay's own switch turn (`TraceReplay`,
+    /// `is_internal_turn`), which its recording does not have: granted to a
+    /// thread stopped at a request it has not yet been granted, it would
+    /// restart that thread's measure, so a replayed preemption would be
+    /// charged about nothing where its recording charged the slice. Called
     /// at the commit of every turn, so the cap always belongs to the turn
     /// granted last.
     fn note_granted_turn(&mut self, granted: &Resources, global_time: &Mutex<GlobalTime>) {
         self.preemption_cap = None;
-        if !self.cap_preemption_charge || Self::is_polling_turn(granted) {
+        if !self.cap_preemption_charge
+            || Self::is_polling_turn(granted)
+            || Self::is_internal_turn(granted)
+        {
             return;
         }
         let clock = {
@@ -15448,9 +15456,10 @@ impl Scheduler {
     /// a slice costs at most its own length again. A thread with no earlier
     /// turn on record, every other turn, and the option off: no cap.
     ///
-    /// Both clocks are read at grants, a function of the turns both runs of
-    /// `--verify` share, and a recording and its replay grant the same turns
-    /// with the same per-thread clocks, so they charge alike.
+    /// Both clocks are read at grants of turns that both runs of `--verify`
+    /// share, and that a recording and its schedule replay share: a replay's
+    /// own switch turns are left out (`note_granted_turn`), and the turns
+    /// left are granted at the same per-thread clocks, so they charge alike.
     fn preemption_charge_cap(&mut self, last_turn: &Result<Resources, SkipTurn>) -> u64 {
         match (self.preemption_cap.take(), last_turn) {
             (Some((tid, ran)), Ok(resources)) if tid == resources.tid => ran,
@@ -21390,8 +21399,8 @@ mod test {
     /// is applied only after the granted thread has run on to its next
     /// request, and that later run does not count. Another thread's work, an
     /// unmarked turn, a thread with no earlier turn and the option off keep
-    /// the full charge, and a host-timed polling retry does not restart the
-    /// measure.
+    /// the full charge, and neither a host-timed polling retry nor a schedule
+    /// replay's switch turn restarts the measure.
     #[test]
     fn a_preemption_is_charged_at_most_the_time_its_thread_ran() {
         let full = Config::default().scheduler_turn_charge().unwrap();
@@ -21405,6 +21414,11 @@ mod test {
         let retry = |tid: DetTid| {
             let mut request = Resources::new(tid);
             request.insert(ResourceID::InternalIOPolling, Permission::W);
+            request
+        };
+        let switch = |tid: DetTid| {
+            let mut request = Resources::new(tid);
+            request.insert(ResourceID::TraceReplay, Permission::RW);
             request
         };
         // The charge of the last of `turns`, in production order: each turn's
@@ -21509,6 +21523,18 @@ mod test {
             ),
             1_500,
             "a host-timed retry does not restart the measure"
+        );
+        assert_eq!(
+            charge(
+                true,
+                &[
+                    (plain(thread), 0, 0),
+                    (switch(thread), 1_000, 0),
+                    (expired(thread), 0, 0)
+                ]
+            ),
+            1_000,
+            "nor does a schedule replay's switch turn, which the recording lacks"
         );
     }
 

@@ -1687,6 +1687,12 @@
       "why": "tests/c/preemption_callback_boundaries.c is compiled and exercised by hermit-cli/tests/clock_determinism.rs::preemption_replay_preserves_equal_rcb_software_callback_boundaries: direct unrolled clock_gettime syscalls require an Exec/Prehook endpoint at RCB zero and distinct adjacent equal-RCB software callback boundaries, then compare the complete recorded and replayed schedule bytes with exactly one attempt per run (https://github.com/rrnewton/hermit/issues/4082)."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/preemption_charge_replay.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/preemption_charge_replay.c is owned by hermit-cli/tests/cli.rs: a_capped_chaos_recording_replays_its_schedule_with_the_recordings_clock records two threads of short syscalls under --chaos --target-timeslice=20000 --cap-preemption-charge, replays the schedule with --replay-schedule-from, and requires no desync and the recording's printed virtual times; it remains a guest fixture because a generic manifest cannot compare a recording's output with its replay's."
+    },
+    {
       "disposition": "cargo-integration-test-fixture",
       "path": "tests/c/preemption_replay_syscall_slice_end.c",
       "runner": "cargo test -p hermit-run --test cli",
