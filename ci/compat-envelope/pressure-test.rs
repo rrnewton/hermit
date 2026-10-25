@@ -284,7 +284,7 @@ Commands:
       [--cells-file PATH]
       [--green --backend BACKEND --repetitions COUNT] [--no-retry] [--jobs COUNT]
       [--probe-disabled --backend BACKEND]
-      [--parity-all --repetitions COUNT]
+      [--parity-all --repetitions COUNT] [--reuse-fresh-checkout]
       Run bounded probes for the selected red cells. An exact-cell run uses the
       current working tree for fast fix/test iteration; a dirty result is
       labelled exploratory and cannot promote the scorecard. Batch runs require
@@ -428,6 +428,16 @@ Selection and bounded-batch options (run and plan):
   --kvm-guest-cap N        Separately cap KVM cells (default 4). This composes
                            with --manifest-guest-cap so non-KVM work need not be
                            throttled to the KVM-safe width.
+  --reuse-fresh-checkout   Build in, and keep, the generated checkout
+                           ignored/pressure-fresh-reusable-<SHA> instead of a
+                           new one removed after the run. A later batch run of
+                           the same commit with this option reuses it, and so
+                           its build, when its HEAD is the commit, its marker
+                           names this source, and git status reports nothing;
+                           otherwise it is removed and rebuilt. One run uses it
+                           at a time (a lock beside it); another is refused.
+                           The nightly sweep runs its parts this way, so one
+                           build serves every part of a night.
   --parity-select CELLS    Also measure these parity cells (comma-separated
                            <test-id>@<backend>) after the series, besides the
                            parity population's cells. A cell is
@@ -1326,7 +1336,16 @@ struct FreshCheckout {
     path_inode: u64,
     sha: String,
     marker_written: bool,
+    /// A reusable checkout (--reuse-fresh-checkout) outlives the run:
+    /// cleanup leaves it for the next run of the same commit.
+    keep: bool,
+    /// The reusable checkout's lock, held until this value is dropped.
+    reuse_lock: Option<fs::File>,
 }
+
+/// The name prefix of the checkout `run --reuse-fresh-checkout` keeps; the
+/// commit's full SHA follows it.
+const REUSABLE_FRESH_PREFIX: &str = "pressure-fresh-reusable-";
 
 struct SelfTestDirectory {
     path: PathBuf,
@@ -1594,8 +1613,12 @@ fn fresh_checkout_git() -> Command {
 /// process once the checkout exists. No other thread exists yet. The
 /// exploratory dirty-source mode never calls this: it runs in the source,
 /// which is the caller's repository.
-fn enter_fresh_checkout(source: &Path, sha: &str) -> Result<FreshCheckout, String> {
-    let fresh = FreshCheckout::prepare(source, sha)?;
+fn enter_fresh_checkout(source: &Path, sha: &str, reuse: bool) -> Result<FreshCheckout, String> {
+    let fresh = if reuse {
+        FreshCheckout::reuse_or_prepare(source, sha)?
+    } else {
+        FreshCheckout::prepare(source, sha)?
+    };
     for name in GIT_REPOSITORY_LOCATION_VARIABLES {
         env::remove_var(name);
     }
@@ -1647,90 +1670,251 @@ impl FreshCheckout {
             path_inode,
             sha: sha.to_string(),
             marker_written: false,
+            keep: false,
+            reuse_lock: None,
         };
-        let initialize = (|| {
-            clone_local_without_hardlinks(source, &checkout.path)?;
-            let marker = checkout
-                .path
-                .join(".git")
-                .join("pressure-test-generated-checkout");
-            fs::write(
-                &marker,
-                format!("source={}\nsha={}\n", source.display(), sha),
-            )
-            .map_err(|e| format!("cannot write {}: {e}", marker.display()))?;
-            checkout.marker_written = true;
-            command_ok(
-                fresh_checkout_git()
-                    .args([
-                        "-C",
-                        &checkout.path.to_string_lossy(),
-                        "checkout",
-                        "--detach",
-                    ])
-                    .arg(sha),
-                "check out exact pressure-test commit",
-            )?;
-            let observed =
-                git_output_from(fresh_checkout_git(), &checkout.path, &["rev-parse", "HEAD"])?;
-            if observed != sha {
+        checkout.initialize_or_cleanup()?;
+        Ok(checkout)
+    }
+
+    /// `run --reuse-fresh-checkout`: the kept checkout of SHA, reused when it
+    /// is still exactly SHA (its build with it), or rebuilt in place.
+    fn reuse_or_prepare(source: &Path, sha: &str) -> Result<Self, String> {
+        let (parent, canonical_parent, parent_device, parent_inode) =
+            fresh_checkout_parent(source)?;
+        let path = parent.join(format!("{REUSABLE_FRESH_PREFIX}{sha}"));
+        let lock_path = parent.join(format!("{REUSABLE_FRESH_PREFIX}{sha}.lock"));
+        let lock = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| format!("cannot open {}: {e}", lock_path.display()))?;
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
                 return Err(format!(
-                    "fresh pressure-test checkout resolved to {observed}, expected {sha}"
+                    "another pressure-test run is using {}; --reuse-fresh-checkout allows one run at a time",
+                    path.display()
                 ));
             }
-            // The clone's origin/main is the source's main when the clone was
-            // made, and main keeps moving during a nightly. The Reverie pin
-            // check (pre.reverie_pin) refuses a pin older than origin/main's,
-            // which is a landing rule: on 2026-10-20 main bumped Reverie at
-            // 06:48Z and every part cloned after it was refused for measuring
-            // 1e5ebe34, a commit already on main. The measured commit is the
-            // only base this run has, so the check compares the pin with
-            // itself and its other clauses still run.
-            command_ok(
-                fresh_checkout_git()
-                    .args([
-                        "-C",
-                        &checkout.path.to_string_lossy(),
-                        "update-ref",
-                        "refs/remotes/origin/main",
-                    ])
-                    .arg(sha),
-                "point the fresh checkout's origin/main at the measured commit",
-            )?;
-            command_ok(
-                fresh_checkout_git().args([
-                    "-C",
-                    &checkout.path.to_string_lossy(),
-                    "submodule",
-                    "update",
-                    "--init",
-                    "--recursive",
-                ]),
-                "initialize pressure-test submodules",
-            )?;
-            for required in [
-                "ci/compat-envelope/pressure-test.rs",
-                "agent-utils/rs/dagrun/Cargo.toml",
-            ] {
-                if !checkout.path.join(required).is_file() {
-                    return Err(format!(
-                        "fresh pressure-test checkout is missing required file {required}"
-                    ));
+            Err(fs::TryLockError::Error(error)) => {
+                return Err(format!("cannot lock {}: {error}", lock_path.display()));
+            }
+        }
+        let mut checkout = Self {
+            source: source.to_path_buf(),
+            parent,
+            canonical_parent,
+            parent_device,
+            parent_inode,
+            path,
+            path_device: 0,
+            path_inode: 0,
+            sha: sha.to_string(),
+            marker_written: false,
+            keep: false,
+            reuse_lock: None,
+        };
+        if fs::symlink_metadata(&checkout.path).is_ok() {
+            match checkout.adopt() {
+                Ok(()) => {
+                    println!("Fresh checkout reused: {}", checkout.path.display());
+                    checkout.keep = true;
+                    checkout.reuse_lock = Some(lock);
+                    return Ok(checkout);
+                }
+                Err(reason) => {
+                    eprintln!(
+                        "compatibility pressure test: not reusing {}: {reason}; rebuilding it",
+                        checkout.path.display()
+                    );
+                    validate_generated_checkout_path(
+                        &checkout.path,
+                        &checkout.parent,
+                        &checkout.canonical_parent,
+                        checkout.parent_device,
+                        checkout.parent_inode,
+                        None,
+                    )?;
+                    fs::remove_dir_all(&checkout.path).map_err(|e| {
+                        format!(
+                            "cannot remove stale reusable checkout {}: {e}",
+                            checkout.path.display()
+                        )
+                    })?;
                 }
             }
-            Ok(())
-        })();
-        if let Err(error) = initialize {
-            let cleanup = checkout.cleanup();
+        }
+        fs::create_dir(&checkout.path).map_err(|e| {
+            format!(
+                "cannot create reusable checkout {}: {e}",
+                checkout.path.display()
+            )
+        })?;
+        (checkout.path_device, checkout.path_inode) = validate_generated_checkout_path(
+            &checkout.path,
+            &checkout.parent,
+            &checkout.canonical_parent,
+            checkout.parent_device,
+            checkout.parent_inode,
+            None,
+        )?;
+        checkout.initialize_or_cleanup()?;
+        checkout.keep = true;
+        checkout.reuse_lock = Some(lock);
+        Ok(checkout)
+    }
+
+    /// Accept an existing reusable checkout only if it is still exactly this
+    /// run's commit: this source's marker, HEAD at the commit, and nothing
+    /// that git status reports, submodules included. Build outputs are
+    /// ignored files, which status does not report and which are the point.
+    fn adopt(&mut self) -> Result<(), String> {
+        (self.path_device, self.path_inode) = validate_generated_checkout_path(
+            &self.path,
+            &self.parent,
+            &self.canonical_parent,
+            self.parent_device,
+            self.parent_inode,
+            None,
+        )?;
+        let marker = self
+            .path
+            .join(".git")
+            .join("pressure-test-generated-checkout");
+        let expected = format!("source={}\nsha={}\n", self.source.display(), self.sha);
+        match fs::read_to_string(&marker) {
+            Ok(observed) if observed == expected => {}
+            Ok(_) => {
+                return Err(format!(
+                    "{} names another source or commit",
+                    marker.display()
+                ));
+            }
+            Err(error) => return Err(format!("cannot read {}: {error}", marker.display())),
+        }
+        self.marker_written = true;
+        let head = git_output_from(fresh_checkout_git(), &self.path, &["rev-parse", "HEAD"])?;
+        if head != self.sha {
+            return Err(format!("its HEAD is {head}"));
+        }
+        let status = git_output_from(
+            fresh_checkout_git(),
+            &self.path,
+            &[
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ],
+        )?;
+        if !status.is_empty() {
+            return Err(format!(
+                "git status reports changes: {}",
+                status.lines().next().unwrap_or_default()
+            ));
+        }
+        let submodules = git_output_from(
+            fresh_checkout_git(),
+            &self.path,
+            &["submodule", "status", "--recursive"],
+        )?;
+        // git_output_from trims the output, and with it the first line's
+        // leading space, so a line is out of step only by its own marker:
+        // `-` not initialized, `+` another commit, `U` conflicted.
+        if let Some(line) = submodules
+            .lines()
+            .find(|line| line.starts_with(['-', '+', 'U']))
+        {
+            return Err(format!("a submodule is not at its recorded commit: {line}"));
+        }
+        Ok(())
+    }
+
+    fn initialize_or_cleanup(&mut self) -> Result<(), String> {
+        if let Err(error) = self.initialize() {
+            let cleanup = self.cleanup();
             return Err(match cleanup {
                 Ok(()) => error,
                 Err(cleanup) => format!("{error}; fresh-checkout cleanup also failed: {cleanup}"),
             });
         }
-        Ok(checkout)
+        Ok(())
+    }
+
+    fn initialize(&mut self) -> Result<(), String> {
+        clone_local_without_hardlinks(&self.source, &self.path)?;
+        let marker = self
+            .path
+            .join(".git")
+            .join("pressure-test-generated-checkout");
+        fs::write(
+            &marker,
+            format!("source={}\nsha={}\n", self.source.display(), self.sha),
+        )
+        .map_err(|e| format!("cannot write {}: {e}", marker.display()))?;
+        self.marker_written = true;
+        command_ok(
+            fresh_checkout_git()
+                .args(["-C", &self.path.to_string_lossy(), "checkout", "--detach"])
+                .arg(&self.sha),
+            "check out exact pressure-test commit",
+        )?;
+        let observed = git_output_from(fresh_checkout_git(), &self.path, &["rev-parse", "HEAD"])?;
+        if observed != self.sha {
+            return Err(format!(
+                "fresh pressure-test checkout resolved to {observed}, expected {}",
+                self.sha
+            ));
+        }
+        // The clone's origin/main is the source's main when the clone was
+        // made, and main keeps moving during a nightly. The Reverie pin
+        // check (pre.reverie_pin) refuses a pin older than origin/main's,
+        // which is a landing rule: on 2026-10-20 main bumped Reverie at
+        // 06:48Z and every part cloned after it was refused for measuring
+        // 1e5ebe34, a commit already on main. The measured commit is the
+        // only base this run has, so the check compares the pin with
+        // itself and its other clauses still run.
+        command_ok(
+            fresh_checkout_git()
+                .args([
+                    "-C",
+                    &self.path.to_string_lossy(),
+                    "update-ref",
+                    "refs/remotes/origin/main",
+                ])
+                .arg(&self.sha),
+            "point the fresh checkout's origin/main at the measured commit",
+        )?;
+        command_ok(
+            fresh_checkout_git().args([
+                "-C",
+                &self.path.to_string_lossy(),
+                "submodule",
+                "update",
+                "--init",
+                "--recursive",
+            ]),
+            "initialize pressure-test submodules",
+        )?;
+        for required in [
+            "ci/compat-envelope/pressure-test.rs",
+            "agent-utils/rs/dagrun/Cargo.toml",
+        ] {
+            if !self.path.join(required).is_file() {
+                return Err(format!(
+                    "fresh pressure-test checkout is missing required file {required}"
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn cleanup(&self) -> Result<(), String> {
+        if self.keep {
+            return Ok(());
+        }
         validate_generated_checkout_path(
             &self.path,
             &self.parent,
@@ -2821,7 +3005,11 @@ fn run() -> Result<(), String> {
             );
         }
         "run" => {
-            let (log_tail_options, mut remaining) = log_tail_options(&mut args)?;
+            let (log_tail_options, remaining) = log_tail_options(&mut args)?;
+            let (reuse_fresh, remaining): (Vec<_>, Vec<_>) =
+                remaining.partition(|argument| argument == "--reuse-fresh-checkout");
+            let reuse_fresh = !reuse_fresh.is_empty();
+            let mut remaining = remaining.into_iter();
             let (results, output, selection) = result_options(&root, &mut remaining, true, true)?;
             if output.is_some() {
                 return Err(
@@ -2845,13 +3033,19 @@ fn run() -> Result<(), String> {
             require_empty_result_dir(&results)?;
             let started = Instant::now();
             let sha = git_output(&root, &["rev-parse", "HEAD"])?;
+            if reuse_fresh && selection.allows_dirty_source() {
+                return Err(
+                    "--reuse-fresh-checkout applies to batch runs, which use a generated checkout; an exact-cell run uses the working tree"
+                        .into(),
+                );
+            }
             let fresh = if selection.allows_dirty_source() {
                 eprintln!(
                     "compatibility pressure test: exact-cell iteration uses the current working tree; dirty results are exploratory and cannot promote the scorecard"
                 );
                 None
             } else {
-                let fresh = enter_fresh_checkout(&root, &sha)?;
+                let fresh = enter_fresh_checkout(&root, &sha, reuse_fresh)?;
                 println!("Fresh checkout: {}", fresh.path.display());
                 Some(fresh)
             };
@@ -14386,7 +14580,7 @@ fn inherited_location_fresh_checkout_self_test(source: &Path, sha: &str) -> Resu
         for (name, value) in inherited {
             env::set_var(name, value);
         }
-        let prepared = enter_fresh_checkout(source, sha);
+        let prepared = enter_fresh_checkout(source, sha, false);
         let leaked = GIT_REPOSITORY_LOCATION_VARIABLES
             .into_iter()
             .filter(|name| env::var_os(name).is_some())
@@ -14481,6 +14675,84 @@ fn fresh_checkout_base_self_test(source: &Path, sha: &str) -> Result<(), String>
         ));
     }
     Ok(())
+}
+
+/// `run --reuse-fresh-checkout` keeps one generated checkout per commit: a
+/// second run of the commit reuses the same directory and what was built in
+/// it, a concurrent run is refused, and a checkout that is no longer exactly
+/// the commit (here an untracked file) is rebuilt rather than reused.
+fn reusable_fresh_checkout_self_test(source: &Path, sha: &str) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let identity = |path: &Path| -> Result<(u64, u64), String> {
+        let metadata = fs::symlink_metadata(path)
+            .map_err(|e| format!("cannot inspect {}: {e}", path.display()))?;
+        Ok((metadata.dev(), metadata.ino()))
+    };
+    let first = FreshCheckout::reuse_or_prepare(source, sha)?;
+    let path = first.path.clone();
+    let result = (|| {
+        let expected = source
+            .join("ignored")
+            .join(format!("{REUSABLE_FRESH_PREFIX}{sha}"));
+        if path != expected {
+            return Err(format!(
+                "reusable checkout is {}, not {}",
+                path.display(),
+                expected.display()
+            ));
+        }
+        // What a build leaves behind, where git status does not look.
+        let built = path.join(".git").join("pressure-test-reuse-probe");
+        fs::write(&built, "built\n")
+            .map_err(|e| format!("cannot write {}: {e}", built.display()))?;
+        let original = identity(&path)?;
+        match FreshCheckout::reuse_or_prepare(source, sha) {
+            Err(error) if error.contains("another pressure-test run is using") => {}
+            Err(error) => {
+                return Err(format!(
+                    "concurrent reuse failed for another reason: {error}"
+                ));
+            }
+            Ok(_) => return Err("a second concurrent run was given the reusable checkout".into()),
+        }
+        first.cleanup()?;
+        drop(first);
+        if identity(&path)? != original {
+            return Err("cleanup removed the reusable checkout".into());
+        }
+        let second = FreshCheckout::reuse_or_prepare(source, sha)?;
+        if identity(&second.path)? != original || !built.is_file() {
+            return Err("an exact reusable checkout was rebuilt instead of reused".into());
+        }
+        let dirty = second.path.join("pressure-test-reuse-dirty");
+        fs::write(&dirty, "dirty\n")
+            .map_err(|e| format!("cannot write {}: {e}", dirty.display()))?;
+        drop(second);
+        let third = FreshCheckout::reuse_or_prepare(source, sha)?;
+        if built.exists() || dirty.exists() {
+            return Err("a reusable checkout with an untracked file was reused".into());
+        }
+        if git_output(&third.path, &["rev-parse", "HEAD"])? != sha || worktree_dirty(&third.path)? {
+            return Err("the rebuilt reusable checkout is not exactly the commit".into());
+        }
+        drop(third);
+        Ok(())
+    })();
+    let removed = fs::remove_dir_all(&path)
+        .and_then(|()| {
+            fs::remove_file(
+                source
+                    .join("ignored")
+                    .join(format!("{REUSABLE_FRESH_PREFIX}{sha}.lock")),
+            )
+        })
+        .map_err(|e| {
+            format!(
+                "cannot remove self-test reusable checkout {}: {e}",
+                path.display()
+            )
+        });
+    result.and(removed)
 }
 
 /// The bytes of a repository's HEAD, index, config, packed refs and loose refs,
@@ -15974,6 +16246,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     inherited_location_fresh_checkout_self_test(&clone_source, &clone_sha)?;
     fresh_checkout_base_self_test(&clone_source, &clone_sha)?;
+    reusable_fresh_checkout_self_test(&clone_source, &clone_sha)?;
     fs::write(scratch.join("old-row"), "stale\n")
         .map_err(|e| format!("cannot write self-test stale row: {e}"))?;
     if require_empty_result_dir(&scratch).is_ok() {
