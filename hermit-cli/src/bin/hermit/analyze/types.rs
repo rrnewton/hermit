@@ -181,6 +181,17 @@ pub struct AnalyzeOpts {
     #[clap(long, value_name = "PATH")]
     pub tmp_dir: Option<PathBuf>,
 
+    /// The most memory analyze's own process may hold (the schedules and the
+    /// search; each trial runs in a child process and is not counted): a size
+    /// such as `16G` or `512M` (K, M, G and T are powers of 1024) or a byte
+    /// count; `auto`, a quarter of the memory it may use (the host's, or its
+    /// cgroup's limit if lower); or `off`. A watchdog thread reads the
+    /// process's own memory, resident or swapped out, ten times a second and
+    /// ends analyze with exit code 122 once it is over the budget, instead of
+    /// letting it grow until the kernel kills it.
+    #[clap(long, value_name = "SIZE|auto|off", default_value = "auto")]
+    pub max_memory: super::MemoryBudget,
+
     /// Specify that analyze itself should return a non-zero exit code on success.
     /// This is needed under esoteric invocation scenarios.
     #[clap(long, value_name = "INT32")]

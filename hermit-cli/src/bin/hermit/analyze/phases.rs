@@ -797,6 +797,7 @@ impl AnalyzeOpts {
 
     pub fn main(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
         self.prepare(global)?;
+        let _watchdog = self.max_memory.enforce("hermit analyze")?;
 
         self.phase0_initialize()?; // Need this early to set tmp_dir.
         {
