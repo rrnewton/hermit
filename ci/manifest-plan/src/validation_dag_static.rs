@@ -1813,13 +1813,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured with the existing selection and exclusions unchanged.
     // Caller-selected DBT environment privacy adds one library regression,
     // listed with the existing feature selection and exclusions unchanged.
-    // And A5 slice 3c.1e B's forced-gate harness (in_guest_delivery_harness):
-    // the_parent_runner_never_forces_the_gate and six forced_gate_* rows:
-    // 1111, listed.
     // Caller-owned DBT private placement adds one library launch regression,
     // measured with the existing feature selection and exclusions unchanged:
-    // 1112.
-    ("test.hermit_unit", 1112),
+    // 1105 (A5 3c.1e B's seven harness units were reverted with that slice).
+    ("test.hermit_unit", 1105),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2962,10 +2959,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4710): 2606, listed.
     // And detcore's five syscall_histogram::tests outcome units for
     // the per-run syscall histogram (dh-te7ep): 2611, listed.
-    // And A5 slice 3c.1e B's unit: threads' disposition_mask_tests::
-    // a_gated_managed_wait_reads_the_guest_mask_without_replacing_it: 2612,
-    // listed.
-    ("test.detcore_unit", 2612),
+    ("test.detcore_unit", 2611),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5160,8 +5154,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two capability slice 5 units: 2605, listed.
     // And the same issue 4710 scheduler unit: 2606, listed.
     // And the same five syscall_histogram units: 2611, listed.
-    // And the same 3c.1e B unit: 2612, listed.
-    ("test.detcore_unit_on_host", 2612),
+    ("test.detcore_unit_on_host", 2611),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5516,14 +5509,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured with the existing selection and exclusions unchanged.
     // Caller-selected DBT environment privacy adds one library regression,
     // listed with the existing feature selection and exclusions unchanged.
-    // And A5 slice 3c.1e B's harness unit the_parent_runner_never_forces_the_gate;
-    // its six forced_gate_* rows launch in-guest-trap guests, which need CPUID
-    // faulting, so this hosted twin excludes them by exact name
-    // (validation_dag::HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS) while
-    // test.hermit_unit runs all seven: 1105, listed.
     // The same private-placement library regression remains in the hosted
-    // selection, measured with its existing exclusions unchanged: 1106.
-    ("test.hermit_unit_on_host", 1106),
+    // selection, measured with its existing exclusions unchanged: 1105 (A5
+    // 3c.1e B's harness unit was reverted with that slice).
+    ("test.hermit_unit_on_host", 1105),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

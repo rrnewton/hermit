@@ -1604,21 +1604,6 @@ pub(super) fn blocked_signal_mask() -> KernelSigset {
     })
 }
 
-/// Whether a managed child wait reads the guest's mask without replacing it
-/// (`block_signals_for_disposition`), and so restores nothing after:
-/// - on a backend whose application signals the runtime already holds while
-///   the callback runs (DBT, `requires_thread_directed_process_signals`);
-/// - under the in-guest delivery gate (A5 step 3c.1e B,
-///   <https://github.com/rrnewton/hermit/issues/4485>): the in-guest runtime
-///   runs every callback under its own mask, which blocks every blockable
-///   guest signal, so the guest's are held already; the query is answered from
-///   the guest's saved mask (`Guest::resume_signal_mask`'s record), and a
-///   block would make the mask the request publishes, and the guest resumes
-///   under, "every signal blocked" until the restore.
-fn reads_mask_in_place(config: &Config) -> bool {
-    config.backend.requires_thread_directed_process_signals || config.in_guest_signal_delivery
-}
-
 pub(super) async fn block_signals_for_disposition<G, T>(
     guest: &mut G,
     blocked_mask_addr: Addr<'_, KernelSigset>,
@@ -1630,7 +1615,13 @@ where
 {
     let block_signals = syscalls::RtSigprocmask::new()
         .with_how(libc::SIG_SETMASK)
-        .with_set((!reads_mask_in_place(guest.config())).then_some(blocked_mask_addr.cast()))
+        .with_set(
+            (!guest
+                .config()
+                .backend
+                .requires_thread_directed_process_signals)
+                .then_some(blocked_mask_addr.cast()),
+        )
         .with_oldset(Some(old_mask_addr.cast()))
         .with_sigsetsize(KERNEL_SIGSET_SIZE);
     guest.inject_with_retry(block_signals).await?;
@@ -1655,7 +1646,11 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if !reads_mask_in_place(guest.config()) {
+    if !guest
+        .config()
+        .backend
+        .requires_thread_directed_process_signals
+    {
         let old_mask: Addr<'_, KernelSigset> = old_mask_addr.into();
         let restore_signals = syscalls::RtSigprocmask::new()
             .with_how(libc::SIG_SETMASK)
@@ -7973,208 +7968,4 @@ fn clone_pidfd_address<M: MemoryAccess>(
         return None;
     }
     address
-}
-
-/// A5 step 3c.1e B (<https://github.com/rrnewton/hermit/issues/4485>): a
-/// managed child wait under the in-guest delivery gate reads the guest's mask
-/// without replacing it and restores nothing, so the mask its requests publish
-/// while it parks, and the one the guest resumes under, is the guest's own,
-/// never "every signal blocked".
-#[cfg(test)]
-mod disposition_mask_tests {
-    use std::sync::Mutex;
-
-    use reverie::Errno;
-    use reverie::Error;
-    use reverie::GlobalRPC;
-    use reverie::GlobalTool;
-    use reverie::Guest;
-    use reverie::Pid;
-    use reverie::syscalls::Addr;
-    use reverie::syscalls::AddrMut;
-    use reverie::syscalls::LocalMemory;
-    use reverie::syscalls::MemoryAccess;
-    use reverie::syscalls::SyscallInfo;
-
-    use super::*;
-    use crate::tool_global::GlobalState;
-
-    const GUEST_MASK: KernelSigset = (1 << (libc::SIGUSR1 - 1)) | (1 << (libc::SIGHUP - 1));
-
-    struct UnusedStack;
-    struct UnusedStackGuard;
-    impl Drop for UnusedStackGuard {
-        fn drop(&mut self) {}
-    }
-    impl reverie::Stack for UnusedStack {
-        type StackGuard = UnusedStackGuard;
-        fn size(&self) -> usize {
-            panic!("the disposition mask uses the caller's addresses")
-        }
-        fn capacity(&self) -> usize {
-            panic!("the disposition mask uses the caller's addresses")
-        }
-        fn push<'a, V>(&mut self, _: V) -> Addr<'a, V> {
-            panic!("the disposition mask uses the caller's addresses")
-        }
-        fn reserve<'a, V>(&mut self) -> AddrMut<'a, V> {
-            panic!("the disposition mask uses the caller's addresses")
-        }
-        fn commit(self) -> Result<Self::StackGuard, Errno> {
-            panic!("the disposition mask uses the caller's addresses")
-        }
-    }
-
-    /// A thread whose backend answers each injected `rt_sigprocmask` as the
-    /// kernel would for a thread whose mask is `mask`, and records the
-    /// `(how, set given)` of each.
-    struct MaskGuest {
-        config: Config,
-        thread: crate::ThreadState<()>,
-        mask: KernelSigset,
-        calls: Mutex<Vec<(i32, bool)>>,
-    }
-
-    #[reverie::tool]
-    impl GlobalRPC<GlobalState> for MaskGuest {
-        async fn send_rpc(
-            &self,
-            message: <GlobalState as GlobalTool>::Request,
-        ) -> <GlobalState as GlobalTool>::Response {
-            panic!("the disposition mask sends no RPC here: {:?}", message.2)
-        }
-        fn config(&self) -> &Config {
-            &self.config
-        }
-    }
-
-    #[reverie::tool]
-    impl Guest<Detcore> for MaskGuest {
-        type Memory = LocalMemory;
-        type Stack = UnusedStack;
-        fn tid(&self) -> Pid {
-            Pid::from_raw(41)
-        }
-        fn pid(&self) -> Pid {
-            Pid::from_raw(41)
-        }
-        fn ppid(&self) -> Option<Pid> {
-            None
-        }
-        fn memory(&self) -> LocalMemory {
-            LocalMemory::new()
-        }
-        fn thread_state(&self) -> &crate::ThreadState<()> {
-            &self.thread
-        }
-        fn thread_state_mut(&mut self) -> &mut crate::ThreadState<()> {
-            &mut self.thread
-        }
-        async fn regs(&mut self) -> libc::user_regs_struct {
-            panic!("no registers are read")
-        }
-        async fn stack(&mut self) -> UnusedStack {
-            panic!("the disposition mask uses the caller's addresses")
-        }
-        async fn daemonize(&mut self) {
-            panic!("no daemonize")
-        }
-        async fn inject<S: SyscallInfo>(&mut self, call: S) -> Result<i64, Errno> {
-            assert_eq!(call.number(), syscalls::Sysno::rt_sigprocmask);
-            let args = call.into_parts().1;
-            let (how, set, old) = (args.arg0 as i32, args.arg1, args.arg2);
-            self.calls.lock().unwrap().push((how, set != 0));
-            let previous = self.mask;
-            if set != 0 {
-                let set: KernelSigset = LocalMemory::new()
-                    .read_value(Addr::<KernelSigset>::from_raw(set).unwrap())
-                    .unwrap();
-                self.mask = set;
-            }
-            if old != 0 {
-                LocalMemory::new()
-                    .write_value(AddrMut::<KernelSigset>::from_raw(old).unwrap(), &previous)
-                    .unwrap();
-            }
-            Ok(0)
-        }
-        async fn tail_inject<S: SyscallInfo>(&mut self, _: S) -> reverie::Never {
-            panic!("no tail injection")
-        }
-        fn set_timer(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
-            panic!("no timer")
-        }
-        fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
-            panic!("no timer")
-        }
-        fn read_clock(&mut self) -> Result<u64, Error> {
-            panic!("no clock")
-        }
-    }
-
-    fn mask_guest(gate: bool) -> MaskGuest {
-        let mut config = Config {
-            sequentialize_threads: true,
-            max_timeslice: None,
-            in_guest_signal_delivery: gate,
-            ..Config::default()
-        };
-        config.backend = reverie::BackendCapabilities::LITEINST_IN_GUEST;
-        let detpid = DetPid::from_raw(41);
-        let mut thread = crate::ThreadState::new(detpid, &config, ());
-        thread.detpid = Some(detpid);
-        MaskGuest {
-            config,
-            thread,
-            mask: GUEST_MASK,
-            calls: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Under the gate the wait's mask step is a query and its restore is
-    /// nothing, so the guest's mask stays its own throughout; with the gate
-    /// off the in-guest backend keeps today's block and restore. Mutation:
-    /// "the block left in place under the gate" (the gated row's mask is the
-    /// blocked set while the wait runs, and its calls show a set).
-    #[tokio::test]
-    async fn a_gated_managed_wait_reads_the_guest_mask_without_replacing_it() {
-        for (gate, calls_during, mask_during, calls_after) in [
-            (
-                true,
-                vec![(libc::SIG_SETMASK, false)],
-                GUEST_MASK,
-                vec![(libc::SIG_SETMASK, false)],
-            ),
-            (
-                false,
-                vec![(libc::SIG_SETMASK, true)],
-                blocked_signal_mask(),
-                vec![(libc::SIG_SETMASK, true), (libc::SIG_SETMASK, true)],
-            ),
-        ] {
-            let mut guest = mask_guest(gate);
-            let blocked = blocked_signal_mask();
-            let mut old = 0 as KernelSigset;
-            let blocked_addr =
-                Addr::<KernelSigset>::from_raw(&blocked as *const _ as usize).unwrap();
-            let old_addr = AddrMut::<KernelSigset>::from_raw(&mut old as *mut _ as usize).unwrap();
-            let read = block_signals_for_disposition(&mut guest, blocked_addr, old_addr)
-                .await
-                .unwrap();
-            assert_eq!(read, GUEST_MASK, "gate={gate}");
-            assert_eq!(*guest.calls.lock().unwrap(), calls_during, "gate={gate}");
-            assert_eq!(
-                guest.mask, mask_during,
-                "gate={gate}: the mask while the wait runs"
-            );
-            restore_signals_after_disposition(&mut guest, old_addr)
-                .await
-                .unwrap();
-            assert_eq!(*guest.calls.lock().unwrap(), calls_after, "gate={gate}");
-            assert_eq!(
-                guest.mask, GUEST_MASK,
-                "gate={gate}: the mask after the wait"
-            );
-        }
-    }
 }

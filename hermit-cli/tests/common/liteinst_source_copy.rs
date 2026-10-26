@@ -150,11 +150,10 @@ fn copied_source_checks(case: &Path, original: &Path, runner: &mut Runner) -> Re
             .as_array()
             .unwrap()
             .len(),
-        // The reviewed catalog binds 64 runtime/artifact inputs, including the
-        // pidfd-self modules and their lifecycle and Guest entry points, and
-        // the signal-mask gate's runtime_mask module and its callers.
+        // The reviewed catalog binds 57 runtime/artifact inputs, including the
+        // pidfd-self modules and their lifecycle and Guest entry points.
         // The separately bound qualifier source adds one input.
-        65
+        58
     );
     let alias = case.join("cargo-alias");
     let private_home = case.join("cargo-home");

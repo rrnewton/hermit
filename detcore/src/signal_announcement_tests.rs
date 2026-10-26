@@ -574,28 +574,14 @@ async fn boundary_signal_entries_survive_withdrawal_and_link_actual_commit_witho
 #[tokio::test]
 async fn under_the_gate_an_announcement_for_a_pid_namespace_init_is_refused_before_any_turn() {
     extern "C" fn ignore(_: libc::c_int) {}
-    /// Puts back the action the test replaced, however the test ends (IR-31
-    /// (b)): later tests in the same process see the action they started
-    /// with.
-    struct RestoreAction(libc::c_int, libc::sigaction);
-    impl Drop for RestoreAction {
-        fn drop(&mut self) {
-            // SAFETY: reinstalls the action this test found.
-            let restored = unsafe { libc::sigaction(self.0, &self.1, std::ptr::null_mut()) };
-            assert_eq!(restored, 0, "restore the action of signal {}", self.0);
-        }
-    }
     let caught = libc::SIGRTMIN() + 8;
     // SAFETY: installs a no-op handler for a signal nothing else in this test
-    // process uses, so the thread's /proc status reports it caught; the guard
-    // restores the previous action.
-    let restore = unsafe {
+    // process uses, so the thread's /proc status reports it caught.
+    unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = ignore as *const () as usize;
-        let mut previous: libc::sigaction = std::mem::zeroed();
-        assert_eq!(libc::sigaction(caught, &action, &mut previous), 0);
-        RestoreAction(caught, previous)
-    };
+        assert_eq!(libc::sigaction(caught, &action, std::ptr::null_mut()), 0);
+    }
     for (gate, init, signal, blocked, refused) in [
         (true, true, libc::SIGUSR1, false, true),
         (true, true, libc::SIGUSR2, true, true),
@@ -640,13 +626,4 @@ async fn under_the_gate_an_announcement_for_a_pid_namespace_init_is_refused_befo
             "{case}: asked only under the gate, for a default action"
         );
     }
-    let previous = restore.1.sa_sigaction;
-    drop(restore);
-    // SAFETY: only reads the action.
-    let now = unsafe {
-        let mut now: libc::sigaction = std::mem::zeroed();
-        assert_eq!(libc::sigaction(caught, std::ptr::null(), &mut now), 0);
-        now.sa_sigaction
-    };
-    assert_eq!(now, previous, "the test leaves the action it found");
 }
