@@ -5683,7 +5683,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // on main. 3037 -> 3242 to match that measured recount.
     // The same priority-normalization regression at 071e77ce66928fe71c2a596f23661e96ebd56770
     // retains all 3242 host identities: 3243.
-    ("test.detcore_unit_on_host", 3243),
+    // And the same fifteen sync-edge tests as test.detcore_unit: 3258.
+    ("test.detcore_unit_on_host", 3258),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
