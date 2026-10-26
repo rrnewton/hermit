@@ -47,9 +47,10 @@ pub enum Verdict {
     NoDecidingEvent,
     /// A budget (`--time-budget`, `--trial-budget`) ended the analysis before
     /// it concluded (exit 120): `partial` says what it found so far. Its
-    /// event fields are where the closest pair of schedules found first
-    /// differs, which is the deciding event or one before it, not critical
-    /// events.
+    /// event fields are the events the search decided on when it had decided
+    /// before the budget ran out (`partial.decided`), and otherwise where the
+    /// closest pair of schedules found first differs, which is the deciding
+    /// event or one before it, not critical events.
     Partial,
 }
 
