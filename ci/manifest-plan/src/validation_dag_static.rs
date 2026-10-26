@@ -1985,7 +1985,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // real_fifo_reopen_traces_give_no_edge}: 1409.
     // And analyze::races::tests::{a_trace_without_descriptor_types_gives_no_pipe_edge,
     // a_real_trace_recorded_without_metadata_virtualization_gives_no_pipe_edge}: 1411.
-    ("test.hermit_unit", 1411),
+    // And analyze::races::tests::a_fifo_access_from_a_process_holding_no_end_gives_no_edge: 1412.
+    ("test.hermit_unit", 1412),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3238,7 +3239,23 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The inotify fault-boundary repair adds three detcore units: 3034 + 3 = 3037, by nextest list.
     // Recount at 071e77ce66928fe71c2a596f23661e96ebd56770 retains all 3242
     // identities and adds preemptions::tests::a_record_too_varied_to_renumber_keeps_its_priorities.
-    ("test.detcore_unit", 3243),
+    // And the access trace's synchronization edges: access_trace's
+    // a_clone_starts_its_child_whichever_runs_first,
+    // an_exit_wake_ends_at_the_joiners_wait_return,
+    // a_reaped_childs_exit_orders_the_wait,
+    // a_failed_send_orders_no_delivery,
+    // two_sends_from_one_sender_order_two_deliveries_in_send_order,
+    // a_process_send_and_a_thread_send_each_order_one_delivery,
+    // overlapping_sends_from_two_threads_order_nothing,
+    // realtime_signal_deliveries_take_their_sends_in_order,
+    // a_timer_expiry_takes_its_oldest_live_arm,
+    // the_cap_evicts_sends_before_a_live_timers_arm,
+    // a_group_send_reaches_each_member_once and
+    // reaping_forgets_the_sends_waiting_for_the_child, and scheduler's
+    // a_futex_wake_edge_names_the_waiter_the_wake_took,
+    // a_requeue_edge_waits_for_the_moved_waiters_return and
+    // a_clear_child_tid_wake_is_a_join_edge: 3243 + 15 = 3258.
+    ("test.detcore_unit", 3258),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4574,7 +4591,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The retry stack adds one cli case: 744 + 1 = 745.
     // And access_trace::the_trace_shows_what_leaves_a_pipes_data_edges_out: 746.
     // And access_trace::a_trace_names_the_settings_that_leave_descriptors_untyped: 747.
-    ("test.cli", 747),
+    // And access_trace's a_futex_ping_pong_yields_alternating_wake_edges and
+    // signal_child_exit_and_join_edges_name_their_events: 747 + 2 = 749.
+    ("test.cli", 749),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5149,7 +5168,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same retry-stack cli case: 663 + 1 = 664.
     // And the same pipe-records test, not excluded: 665.
     // And the same untyped-descriptor header test, not excluded: 666.
-    ("test.cli_on_host", 666),
+    // And the same two synchronization edge tests, not excluded: 666 + 2 = 668.
+    ("test.cli_on_host", 668),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1932 - 14 = 1918, re-measured 2026-10-31.
     // And the same PMU analyze node unit: 1919.
@@ -6082,7 +6102,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same waited-write and real-reopen tests: 1401.
     // And the same two FIFO-access tests: 1403.
     // And the same two untyped-descriptor tests: 1405.
-    ("test.hermit_unit_on_host", 1405),
+    // And the same FIFO-access test: 1406.
+    ("test.hermit_unit_on_host", 1406),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
