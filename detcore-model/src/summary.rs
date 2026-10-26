@@ -283,6 +283,12 @@ pub struct RunSummary {
     /// counted too; this is not a count of distinct created tasks.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub host_id_tasks: u64,
+
+    /// `--watch`: which threads armed their hardware watchpoints, and the hits.
+    /// Shown in the full report, not the INFO view, so a watch leaves what
+    /// `--verify` compares as it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WatchRunSummary>,
 }
 
 fn is_zero(count: &u64) -> bool {
@@ -340,6 +346,36 @@ fn counted(count: u64, noun: &str) -> String {
         format!("1 {noun}")
     } else {
         format!("{count} {noun}s")
+    }
+}
+
+/// The `--watch` part of a [`RunSummary`].
+#[derive(Debug, Serialize, Deserialize, Clone, Default, PartialEq, Eq)]
+pub struct WatchRunSummary {
+    /// Threads that armed their watches.
+    pub armed: u64,
+    /// Threads that never did, and why.
+    pub unarmed: Vec<(DetTid, crate::access_trace::WatchUnarmed)>,
+    /// Hits on every thread.
+    pub hits: u64,
+}
+
+impl fmt::Display for WatchRunSummary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Watch: {} thread(s) armed their watches, {} hit(s)",
+            self.armed, self.hits
+        )?;
+        if !self.unarmed.is_empty() {
+            let unarmed: Vec<String> = self
+                .unarmed
+                .iter()
+                .map(|(tid, why)| format!("thread {tid} ({why:?})"))
+                .collect();
+            write!(f, "; never armed: {}", unarmed.join(", "))?;
+        }
+        writeln!(f)
     }
 }
 
@@ -414,6 +450,7 @@ impl RunSummary {
             host_id_tasks,
             virtual_timeout_ns,
             replay_departure: _,
+            watch,
         } = self;
         writeln!(f, "Final thread-tree was: {}", threads_descrip)?;
         writeln!(
@@ -461,6 +498,9 @@ impl RunSummary {
                     "  {host_id_tasks} host-ID report(s) accepted; chosen process IDs are not guaranteed"
                 )?;
             }
+        }
+        if include_report_metadata && let Some(watch) = watch {
+            write!(f, "{watch}")?;
         }
 
         if include_report_metadata {

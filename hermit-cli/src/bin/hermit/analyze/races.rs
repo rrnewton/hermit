@@ -879,7 +879,7 @@ fn record_span(record: &TraceRecord) -> Option<(EventIndex, EventIndex)> {
         TraceRecord::Signal(signal) => Some((signal.event, signal.event)),
         TraceRecord::Edge(edge) => Some((edge.from.event, edge.to.event)),
         TraceRecord::WatchHit(hit) => Some((hit.after, hit.after)),
-        TraceRecord::Header(_) | TraceRecord::End(_) => None,
+        TraceRecord::Header(_) | TraceRecord::End(_) | TraceRecord::WatchSummary(_) => None,
     }
 }
 

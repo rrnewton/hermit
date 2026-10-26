@@ -993,7 +993,9 @@ fn record_reaches(record: &TraceRecord, decision: EventIndex) -> bool {
         TraceRecord::Signal(signal) => signal.event,
         TraceRecord::Edge(edge) => edge.to.event,
         TraceRecord::WatchHit(hit) => hit.after,
-        TraceRecord::Header(_) | TraceRecord::End(_) => return false,
+        TraceRecord::Header(_) | TraceRecord::End(_) | TraceRecord::WatchSummary(_) => {
+            return false;
+        }
     };
     last >= decision
 }

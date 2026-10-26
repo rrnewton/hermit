@@ -1061,6 +1061,24 @@ mod tests {
                 "--access-trace-max-bytes=4096",
             ],
         ),
+        (
+            "watch",
+            &[
+                "--record-preemptions-to=/tmp/p.json",
+                "--record-access-trace-to=/tmp/a.access",
+                "--watch=0x404010:8:w",
+                "--watch=0x404020:1:rw",
+            ],
+        ),
+        (
+            "watch-from",
+            &[
+                "--record-preemptions-to=/tmp/p.json",
+                "--record-access-trace-to=/tmp/a.access",
+                "--watch=0x404010",
+                "--watch-from=3",
+            ],
+        ),
         ("scheduler-turn-cost", &["--scheduler-turn-cost=10000"]),
         ("cap-preemption-charge", &["--cap-preemption-charge"]),
         ("virtual-timeout", &["--virtual-timeout=1000"]),
