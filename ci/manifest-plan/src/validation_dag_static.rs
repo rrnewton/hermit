@@ -1817,7 +1817,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Caller-owned DBT private placement adds one library launch regression,
     // measured with the existing feature selection and exclusions unchanged:
     // 1105 (A5 3c.1e B's seven harness units were reverted with that slice).
-    ("test.hermit_unit", 1105),
+    // Four PIDFD policy-refusal/output cases extend the existing population.
+    ("test.hermit_unit", 1109),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2960,7 +2961,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4710): 2606, listed.
     // And detcore's five syscall_histogram::tests outcome units for
     // the per-run syscall histogram (dh-te7ep): 2611, listed.
-    ("test.detcore_unit", 2611),
+    // Ten PIDFD spelling cases and one typed-refusal RPC case; prior main additions retained.
+    ("test.detcore_unit", 2622),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4201,7 +4203,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Caller-owned DBT private placement adds two CLI launch regressions,
     // measured with the existing feature selection and exclusions unchanged:
     // 614.
-    ("test.cli", 614),
+    // Library refusal and pinned-Guest forwarding completeness add two PIDFD cases.
+    ("test.cli", 616),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4709,7 +4712,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed with the existing feature selection and exclusions unchanged.
     // The same two private-placement regressions remain in the hosted selection,
     // measured with its existing exclusions unchanged: 533.
-    ("test.cli_on_host", 533),
+    // The same two PIDFD cases, with hosted exclusions unchanged.
+    ("test.cli_on_host", 535),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5155,7 +5159,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two capability slice 5 units: 2605, listed.
     // And the same issue 4710 scheduler unit: 2606, listed.
     // And the same five syscall_histogram units: 2611, listed.
-    ("test.detcore_unit_on_host", 2611),
+    // The same eleven PIDFD cases; prior main additions retained.
+    ("test.detcore_unit_on_host", 2622),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5513,7 +5518,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same private-placement library regression remains in the hosted
     // selection, measured with its existing exclusions unchanged: 1105 (A5
     // 3c.1e B's harness unit was reverted with that slice).
-    ("test.hermit_unit_on_host", 1105),
+    // The same four PIDFD policy-refusal/output cases, with hosted exclusions unchanged.
+    ("test.hermit_unit_on_host", 1109),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

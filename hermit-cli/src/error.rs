@@ -143,12 +143,14 @@ impl SerializableError {
 /// be the thing `kind` exists to avoid, and it would break the moment the message
 /// is reworded. This reaches through the one wrapper that hides the type.
 fn is_policy_refusal(err: &Error) -> bool {
-    // Detcore's refusal of an unsupported syscall, and reverie-ptrace's end of
-    // a run in which the guest made a syscall through Reverie's untraced
-    // private-page stub, which no tool saw
+    // Detcore's refusal of an unsupported syscall, Detcore's refusal of a
+    // self-sentinel pidfd_send_signal its backend could not qualify, and
+    // reverie-ptrace's end of a run in which the guest made a syscall through
+    // Reverie's untraced private-page stub, which no tool saw
     // (https://github.com/rrnewton/reverie/issues/1064).
     fn refuses(cause: &(dyn std::error::Error + 'static)) -> bool {
         cause.is::<detcore::UnsupportedSyscallError>()
+            || cause.is::<detcore::PidfdSelfQualificationRefusal>()
             || cause.is::<detcore::TerminalReplayRefusal>()
             || cause.is::<reverie_ptrace::UntracedStubSyscall>()
     }
@@ -490,6 +492,29 @@ mod tests {
         assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
         assert!(
             serialized.error.contains("0x71000002"),
+            "{}",
+            serialized.error
+        );
+    }
+
+    /// Detcore's refusal of a self-sentinel pidfd_send_signal whose backend
+    /// could not qualify its spelling is a policy refusal, through ptrace's
+    /// Tool wrapper and across the container boundary, and keeps its reason.
+    #[test]
+    fn an_unqualified_pidfd_self_sentinel_is_a_policy_refusal() {
+        let refusal = || detcore::PidfdSelfQualificationRefusal { sentinel: -10001 };
+        let primary = reverie::Error::Tool(Error::new(refusal()));
+        assert_eq!(
+            classify_ptrace_primary(&primary),
+            FailureKind::PolicyRefusal
+        );
+        let wrapped = Error::new(reverie::Error::Tool(Error::new(refusal())))
+            .context("the ptrace backend failed");
+        assert_eq!(classify_unwrapped(&wrapped), FailureKind::PolicyRefusal);
+        let serialized = SerializableError::from(Error::new(refusal()));
+        assert_eq!(serialized.kind(), FailureKind::PolicyRefusal);
+        assert!(
+            serialized.error.contains("self sentinel -10001"),
             "{}",
             serialized.error
         );

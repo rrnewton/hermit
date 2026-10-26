@@ -1174,6 +1174,10 @@ pub struct GlobalState {
     // refused (`GlobalRequest::PolicyRefusal`); the first report is kept.
     policy_refusal: Mutex<Option<String>>,
 
+    // The first self-sentinel `pidfd_send_signal` a Tool image refused as
+    // unqualified (`GlobalRequest::PidfdSelfQualificationRefusal`).
+    pidfd_self_qualification_refusal: Mutex<Option<crate::PidfdSelfQualificationRefusal>>,
+
     // The host identity of each file the guest opened in this run, in the
     // order the opens were reported, when `Config::record_host_inputs` is set
     // (see `detcore_model::host_input`). Written to `Config::host_input_log`
@@ -1743,6 +1747,7 @@ impl GlobalState {
             announced_handlers_not_installed: Mutex::new(BTreeSet::new()),
             announced_refused_signal_controls: Mutex::new((0, false)),
             policy_refusal: Mutex::new(None),
+            pidfd_self_qualification_refusal: Mutex::new(None),
             host_inputs: Mutex::new(Vec::new()),
             host_mutations: Mutex::new(BTreeSet::new()),
             shared_open_files: process_exit_cleanup.shared_open_files,
@@ -2008,6 +2013,15 @@ impl GlobalState {
     /// it before exiting (`GlobalRequest::PolicyRefusal`).
     pub fn policy_refusal(&self) -> Option<String> {
         self.policy_refusal.lock().unwrap().clone()
+    }
+
+    /// The first self-sentinel `pidfd_send_signal` a Tool image refused
+    /// because its backend could not qualify the sentinel's physical spelling
+    /// (`GlobalRequest::PidfdSelfQualificationRefusal`), taken once.
+    pub fn take_pidfd_self_qualification_refusal(
+        &self,
+    ) -> Option<crate::PidfdSelfQualificationRefusal> {
+        self.pidfd_self_qualification_refusal.lock().unwrap().take()
     }
 
     /// Unrecoverable fatal erorr. Bring things to a close cleanly, but as quickly as
@@ -3036,6 +3050,7 @@ impl GlobalState {
                 GlobalRequest::ParkedProtocolFailure(_)
                     | GlobalRequest::UnrecoverableShutdown
                     | GlobalRequest::PolicyRefusal(_)
+                    | GlobalRequest::PidfdSelfQualificationRefusal(_)
                     | GlobalRequest::StoppingRefusal(_)
             );
 
@@ -3329,6 +3344,17 @@ impl GlobalState {
             }
             GlobalRequest::PolicyRefusal(reason) => {
                 self.policy_refusal.lock().unwrap().get_or_insert(reason);
+                R::PolicyRefusal(())
+            }
+            GlobalRequest::PidfdSelfQualificationRefusal(refusal) => {
+                self.policy_refusal
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(|| refusal.to_string());
+                self.pidfd_self_qualification_refusal
+                    .lock()
+                    .unwrap()
+                    .get_or_insert(refusal);
                 R::PolicyRefusal(())
             }
             // Acted on even from a committed SIGKILL victim (it is in the
@@ -6990,6 +7016,13 @@ pub enum GlobalRequest {
     /// `Config::in_guest_signal_delivery` before a two-phase delivery's
     /// announcement and a predicted death. Appended last.
     InPidNamespaceInit(DetTid),
+    /// The Tool image is refusing a self-sentinel `pidfd_send_signal` whose
+    /// physical spelling its backend could not qualify. Recorded as a policy
+    /// refusal, as `PolicyRefusal` is, and kept as this type
+    /// (`GlobalState::take_pidfd_self_qualification_refusal`) for a launcher
+    /// that learns of the refusal only from the coordinator (DBT). Answered
+    /// with `PolicyRefusal`. Appended last.
+    PidfdSelfQualificationRefusal(crate::PidfdSelfQualificationRefusal),
 }
 
 /// Responses from the global object
@@ -7647,6 +7680,27 @@ where
     assert_eq!(
         response,
         GlobalResponse::AnnounceSignalHandlerNotInstalled(())
+    );
+}
+
+/// Files a self-sentinel `pidfd_send_signal` refusal with the coordinator
+/// before the Tool error that ends this image is returned
+/// (`GlobalRequest::PidfdSelfQualificationRefusal`).
+pub(crate) async fn report_pidfd_self_qualification_refusal<G, T>(
+    guest: &mut G,
+    refusal: crate::PidfdSelfQualificationRefusal,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::PidfdSelfQualificationRefusal(refusal)).await;
+    assert!(
+        matches!(
+            response,
+            GlobalResponse::PolicyRefusal(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to PidfdSelfQualificationRefusal: {response:?}"
     );
 }
 

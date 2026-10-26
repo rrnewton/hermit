@@ -1157,12 +1157,21 @@ fn error_result(error: Error) -> i64 {
 fn guest_errno_or_failure(error: Error) -> Result<i64, String> {
     match error {
         Error::Errno(errno) => Ok(-(errno.into_raw() as i64)),
-        Error::Tool(error) => match error.downcast_ref::<UnsupportedSyscallError>() {
-            Some(unsupported) => Err(format!("detcore-dbt: {unsupported}\n")),
-            None => Err(format!(
-                "detcore-dbt: Detcore failed handling a syscall: {error:#}\n"
-            )),
-        },
+        Error::Tool(error) => {
+            if let Some(unsupported) = error.downcast_ref::<UnsupportedSyscallError>() {
+                Err(format!("detcore-dbt: {unsupported}\n"))
+            } else if let Some(refusal) =
+                error.downcast_ref::<detcore::PidfdSelfQualificationRefusal>()
+            {
+                // Filed with the coordinator before it was returned; the
+                // launcher reports the run as refused from that record.
+                Err(format!("detcore-dbt: {refusal}\n"))
+            } else {
+                Err(format!(
+                    "detcore-dbt: Detcore failed handling a syscall: {error:#}\n"
+                ))
+            }
+        }
         Error::Io(error) => Err(format!(
             "detcore-dbt: Detcore failed handling a syscall: {error}\n"
         )),
@@ -3432,20 +3441,29 @@ mod tests {
         for (error, expected) in [
             (
                 Error::Tool(BrokenInvariant.into()),
-                "detcore-dbt: Detcore failed handling a syscall: serial waitid invariant broken\n",
+                "detcore-dbt: Detcore failed handling a syscall: serial waitid invariant broken\n"
+                    .to_owned(),
             ),
             (
                 Error::Io(io::Error::other("required evidence is missing")),
-                "detcore-dbt: Detcore failed handling a syscall: required evidence is missing\n",
+                "detcore-dbt: Detcore failed handling a syscall: required evidence is missing\n"
+                    .to_owned(),
             ),
             (
                 Error::Tool(UnsupportedSyscallError(reverie::syscalls::Sysno::kcmp).into()),
-                "detcore-dbt: unsupported syscall: kcmp\n",
+                "detcore-dbt: unsupported syscall: kcmp\n".to_owned(),
+            ),
+            (
+                Error::Tool(detcore::PidfdSelfQualificationRefusal { sentinel: -10001 }.into()),
+                format!(
+                    "detcore-dbt: {}\n",
+                    detcore::PidfdSelfQualificationRefusal { sentinel: -10001 }
+                ),
             ),
         ] {
             assert_eq!(
                 handler_error_outcome(error),
-                (-1, None, Some(expected.to_owned())),
+                (-1, None, Some(expected)),
                 "a non-errno handler error must end the run, never reach the guest"
             );
         }

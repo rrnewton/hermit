@@ -2022,11 +2022,12 @@ fn run_once_with_inherited_input(
                     ),
                 )
                 .map_err(|error| dbt_run_error(&drrun, error))?;
-            runtime.block_on(clean_up_dbt_global(
+            let cleaned = runtime.block_on(clean_up_dbt_global(
                 &output.status,
                 global,
                 report.as_deref(),
-            ))?;
+            ));
+            finish_refused_output(&output, cleaned, write_output)?;
             Ok(DbtPhysicalOutput::from(output))
         })
         .map(Output::from)
@@ -2073,6 +2074,12 @@ async fn clean_up_dbt_global(
     } else {
         Ok(())
     };
+    // A guest process that refused a self-sentinel pidfd_send_signal filed
+    // the typed refusal here before its Tool error ended it with the native
+    // client's failure exit. That exit alone says only that some image
+    // failed; the filed refusal is what makes this run a policy refusal, and
+    // a failure with none filed stays a backend failure.
+    let refused = global.take_pidfd_self_qualification_refusal();
     if !status.success() {
         global.force_shutdown_with_error();
         // The physical supervisor and RPC owner drain have finished. A client
@@ -2081,7 +2088,56 @@ async fn clean_up_dbt_global(
     }
     let finalized = global.clean_up(false, &None).await;
     // Export failure must never bypass scheduler cleanup or lose its class.
-    detcore::combine_finalization(exported.map_err(Error::from), finalized)
+    detcore::combine_finalization(dbt_primary_outcome(refused, exported), finalized)
+}
+
+/// The primary outcome of a DBT run's coordinator cleanup: a filed
+/// self-sentinel refusal if there is one, with a failure to export the
+/// unsupported-syscall report kept as its secondary, and the export's own
+/// result otherwise. Scheduler cleanup's failure is combined after this as
+/// the secondary.
+#[cfg(feature = "dbt")]
+fn dbt_primary_outcome(
+    refused: Option<detcore::PidfdSelfQualificationRefusal>,
+    exported: std::io::Result<()>,
+) -> Result<(), Error> {
+    match refused {
+        Some(refusal) => detcore::combine_finalization(
+            Err(Error::new(refusal)),
+            exported.map_err(|error| {
+                Error::from(error).context("exporting the DBT unsupported-syscall report")
+            }),
+        ),
+        None => exported.map_err(Error::from),
+    }
+}
+
+/// The end of an ordinary DBT run's cleanup (`cleaned`, from
+/// [`clean_up_dbt_global`]). A run refused partway by a self-sentinel
+/// refusal still shows what the guest wrote before it, as a ptrace run does:
+/// `write` delivers the captured output first. The refusal, with any cleanup
+/// failure paired with it, stays the primary error; a failure to deliver the
+/// output is kept as its secondary. Any other cleanup error is returned as it
+/// is, without writing the output.
+#[cfg(feature = "dbt")]
+fn finish_refused_output(
+    output: &Output,
+    cleaned: Result<(), Error>,
+    write: impl FnOnce(&Output) -> Result<(), Error>,
+) -> Result<(), Error> {
+    let Err(error) = cleaned else {
+        return Ok(());
+    };
+    if !error
+        .chain()
+        .any(|cause| cause.is::<detcore::PidfdSelfQualificationRefusal>())
+    {
+        return Err(error);
+    }
+    detcore::combine_finalization(
+        Err(error),
+        write(output).map_err(|error| error.context("writing the refused DBT guest's output")),
+    )
 }
 
 /// Name the stage that actually failed.
@@ -2356,6 +2412,172 @@ mod tests {
                 .to_string()
                 .contains("the `sabre` feature is not enabled")
         );
+    }
+
+    /// A self-sentinel refusal filed with the DBT coordinator is the run's
+    /// primary outcome, a policy refusal, and stays primary over a scheduler
+    /// cleanup failure; with none filed, a failed guest is not a refusal and
+    /// the export's own result stands.
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn a_filed_dbt_refusal_is_the_primary_policy_refusal() {
+        let refusal = detcore::PidfdSelfQualificationRefusal { sentinel: -10001 };
+        let primary = super::dbt_primary_outcome(Some(refusal.clone()), Ok(())).unwrap_err();
+        assert_eq!(
+            primary.downcast_ref::<detcore::PidfdSelfQualificationRefusal>(),
+            Some(&refusal)
+        );
+        assert_eq!(
+            hermit::SerializableError::from(primary).kind(),
+            hermit::FailureKind::PolicyRefusal
+        );
+        let primary = super::dbt_primary_outcome(
+            Some(refusal.clone()),
+            Err(std::io::Error::other("report pipe closed")),
+        );
+        let combined = detcore::combine_finalization(
+            primary,
+            Err(Error::msg("scheduler cleanup did not finish")),
+        )
+        .unwrap_err();
+        // Both later failures stay visible, the export's with its context,
+        // and no diagnostic is written to stderr to report them.
+        let text = format!("{combined:#}");
+        assert!(
+            text.contains("exporting the DBT unsupported-syscall report"),
+            "{text}"
+        );
+        assert!(text.contains("report pipe closed"), "{text}");
+        assert!(text.contains("scheduler cleanup did not finish"), "{text}");
+        assert_eq!(
+            hermit::SerializableError::from(combined).kind(),
+            hermit::FailureKind::PolicyRefusal
+        );
+
+        assert!(super::dbt_primary_outcome(None, Ok(())).is_ok());
+        let export =
+            super::dbt_primary_outcome(None, Err(std::io::Error::other("report pipe closed")))
+                .unwrap_err();
+        assert_ne!(
+            hermit::SerializableError::from(export).kind(),
+            hermit::FailureKind::PolicyRefusal
+        );
+    }
+
+    /// The refused run's output delivery through the helper the ordinary
+    /// DBT run uses: the refusal stays the primary policy refusal whether the
+    /// output is delivered, fails to be, or fails after a cleanup failure, and
+    /// each failure stays visible as secondary evidence. Other errors pass
+    /// through without writing anything.
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn a_refused_runs_output_failure_never_replaces_the_refusal() {
+        use std::cell::Cell;
+        use std::os::unix::process::ExitStatusExt;
+
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(101 << 8),
+            stdout: b"guest line\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        let refusal = || Error::new(detcore::PidfdSelfQualificationRefusal { sentinel: -10001 });
+        let broken = |_: &Output| -> Result<(), Error> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into())
+        };
+        let kind = |error: Error| hermit::SerializableError::from(error).kind();
+
+        let writes = Cell::new(0);
+        let delivered = super::finish_refused_output(&output, Err(refusal()), |written| {
+            assert_eq!(written.stdout, b"guest line\n");
+            writes.set(writes.get() + 1);
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(writes.get(), 1);
+        assert!(delivered.is::<detcore::PidfdSelfQualificationRefusal>());
+
+        let lost = super::finish_refused_output(&output, Err(refusal()), broken).unwrap_err();
+        let text = format!("{lost:#}");
+        assert!(
+            text.contains("writing the refused DBT guest's output"),
+            "{text}"
+        );
+        assert_eq!(kind(lost), hermit::FailureKind::PolicyRefusal);
+
+        let with_cleanup = detcore::combine_finalization::<()>(
+            Err(refusal()),
+            Err(Error::msg("scheduler cleanup did not finish")),
+        );
+        let lost = super::finish_refused_output(&output, with_cleanup, broken).unwrap_err();
+        let text = format!("{lost:#}");
+        assert!(text.contains("scheduler cleanup did not finish"), "{text}");
+        assert!(
+            text.contains("writing the refused DBT guest's output"),
+            "{text}"
+        );
+        assert_eq!(kind(lost), hermit::FailureKind::PolicyRefusal);
+
+        let other = super::finish_refused_output(&output, Err(Error::msg("backend broke")), |_| {
+            panic!("an unrefused failure wrote the output")
+        })
+        .unwrap_err();
+        assert_eq!(format!("{other:#}"), "backend broke");
+        assert!(
+            super::finish_refused_output(&output, Ok(()), |_| panic!("a clean run wrote here"))
+                .is_ok()
+        );
+    }
+
+    /// The same, with the real writer and a real closed sink: in a child
+    /// process whose stdout is a pipe with no reader, delivering a refused
+    /// run's output fails with EPIPE and the run is still a policy refusal.
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn a_refused_runs_output_into_a_closed_pipe_stays_a_policy_refusal() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::ExitStatusExt;
+
+        const CHILD: &str = "HERMIT_REFUSED_OUTPUT_CLOSED_SINK_CHILD";
+        const NAME: &str =
+            "backends::tests::a_refused_runs_output_into_a_closed_pipe_stays_a_policy_refusal";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert_eq!(status.code(), Some(0), "{status}");
+            return;
+        }
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        // SAFETY: replaces this child's stdout with the reader-less pipe.
+        assert!(unsafe { libc::dup2(writer.as_raw_fd(), libc::STDOUT_FILENO) } >= 0);
+        drop(writer);
+        let output = Output {
+            status: std::process::ExitStatus::from_raw(101 << 8),
+            stdout: b"guest line\n".to_vec(),
+            stderr: Vec::new(),
+        };
+        let refused = detcore::combine_finalization::<()>(
+            Err(Error::new(detcore::PidfdSelfQualificationRefusal {
+                sentinel: -10000,
+            })),
+            Err(Error::msg("scheduler cleanup did not finish")),
+        );
+        let error =
+            super::finish_refused_output(&output, refused, super::write_output).unwrap_err();
+        let text = format!("{error:#}");
+        let kind = hermit::SerializableError::from(error).kind();
+        // Reported on stderr and by status: stdout is the closed pipe.
+        let good = kind == hermit::FailureKind::PolicyRefusal
+            && text.contains("writing the refused DBT guest's output")
+            && text.contains("scheduler cleanup did not finish");
+        if !good {
+            eprintln!("{kind:?}: {text}");
+        }
+        std::process::exit(if good { 0 } else { 1 });
     }
 
     #[cfg(feature = "dbt")]
