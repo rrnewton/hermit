@@ -1247,7 +1247,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_timed_wait_spread_registers_sleeps_at_the_first_pass_by_default: 1964.
     // And detcore-model's three schedule_replay_options::tests (the
     // expected rows, their consistency, the user guide's copy): 1967.
-    ("test.regular_crates", 1967),
+    // And detcore-model's four schedule_replay_options::tests (the
+    // expected rows, their consistency, the rows code reads, the user
+    // guide's copy): 1968.
+    ("test.regular_crates", 1968),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5148,8 +5151,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.cli_on_host", 686),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1958 - 14 = 1944, re-measured 2026-10-31.
-    // Kept equal to the second test.regular_crates_on_host entry below: 1953.
-    ("test.regular_crates_on_host", 1953),
+    // Kept equal to the second test.regular_crates_on_host entry below: 1954.
+    ("test.regular_crates_on_host", 1954),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -6303,7 +6306,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two --chaos-timed-wait-spread config tests: 1949.
     // And the same spread registration config test: 1950.
     // And the same three schedule replay options tests: 1953.
-    ("test.regular_crates_on_host", 1953),
+    // And the same four schedule replay options tests: 1954.
+    ("test.regular_crates_on_host", 1954),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

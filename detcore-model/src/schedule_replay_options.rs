@@ -145,7 +145,10 @@ pub struct Row {
     pub past: Applies,
     pub status: Status,
     /// Whether code reads this row, rather than the row documenting what
-    /// code does.
+    /// code does. Set by hand; the test
+    /// `read_by_code_names_exactly_the_rows_code_reads` checks it against
+    /// every caller of [`ReplayOption::applies`] and [`row`] in the Hermit
+    /// crates.
     pub read_by_code: bool,
     /// What happens and why, with the gap if there is one.
     pub why: &'static str,
@@ -295,11 +298,15 @@ pub const TABLE: &[Row] = &[
         past: Applies::Yes,
         status: Status::KnownGap,
         read_by_code: false,
-        why: "The PMU maximum of every slice in both parts: it stops a thread that makes no \
-              syscalls. Past the schedule a replay without `--chaos` keeps its software slice \
-              end at the maximum time, so only this PMU maximum on the thread's own execution \
-              ends a slice, not the plain run's end on logical time, which counts expired \
-              waits (gap). Under `--no-rcb-time` it also sets the software slice end.",
+        why: "The fallback PMU stop of every slice in both parts: a replay programs the PMU \
+              at the slice's selected end when that end is finite, which takes precedence and \
+              may lie beyond the configured maximum (a replay given `--chaos` draws such ends), \
+              and at the configured maximum when the selected end is the maximum time; it stops \
+              a thread that makes no syscalls. Past the schedule a replay without `--chaos` \
+              keeps its software slice end at the maximum time, so only this PMU stop on the \
+              thread's own execution ends a slice, not the plain run's end on logical time, \
+              which counts expired waits (gap). Under `--no-rcb-time` it also sets the software \
+              slice end.",
         code: "tool_local.rs ThreadState::next_timeslice",
     },
     Row {
@@ -536,6 +543,67 @@ mod tests {
         assert!(!ReplayOption::ChaosPerThreadSlowdown.applies(false, false));
         assert!(ReplayOption::ChaosPerThreadSlowdown.applies(true, true));
         assert!(!ReplayOption::TargetTimeslice.applies(false, true));
+    }
+
+    /// `read_by_code` is set by hand, so this finds the rows code reads:
+    /// every `ReplayOption::<Variant>.applies(` and `row(ReplayOption::<Variant>)`
+    /// in the sources of detcore, detcore-model and hermit-cli, with
+    /// whitespace removed. A new reader whose row does not say so fails
+    /// here, and so does an `.applies(` call this scan cannot attribute to
+    /// one variant.
+    #[test]
+    fn read_by_code_names_exactly_the_rows_code_reads() {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let entries = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
+            for entry in entries {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        fn is_ident(c: char) -> bool {
+            c.is_alphanumeric() || c == '_'
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut files = Vec::new();
+        for krate in ["detcore/src", "detcore-model/src", "hermit-cli/src"] {
+            sources(&root.join(krate), &mut files);
+        }
+        let mut read = std::collections::BTreeSet::new();
+        for file in files
+            .iter()
+            .filter(|f| !f.ends_with("schedule_replay_options.rs"))
+        {
+            let text: String = std::fs::read_to_string(file)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", file.display()))
+                .split_whitespace()
+                .collect();
+            for (at, _) in text.match_indices(".applies(") {
+                let before = &text[..at];
+                let ident = before.trim_end_matches(is_ident);
+                assert!(
+                    ident.ends_with("ReplayOption::"),
+                    "{}: an `.applies(` call on something other than a ReplayOption \
+                     variant; mark the rows it reads read_by_code and extend this test",
+                    file.display()
+                );
+                read.insert(before[ident.len()..].to_string());
+            }
+            for (at, marker) in text.match_indices("row(ReplayOption::") {
+                let rest = &text[at + marker.len()..];
+                read.insert(rest.chars().take_while(|c| is_ident(*c)).collect());
+            }
+        }
+        let marked: std::collections::BTreeSet<String> = TABLE
+            .iter()
+            .filter(|row| row.read_by_code)
+            .map(|row| format!("{:?}", row.option))
+            .collect();
+        assert_eq!(read, marked);
     }
 
     /// docs/USER_GUIDE.md shows exactly [`markdown_table`] between its
