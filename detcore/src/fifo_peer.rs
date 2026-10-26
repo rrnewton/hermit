@@ -411,50 +411,16 @@ pub(crate) fn guest_descriptors_are_visible(
 /// descriptors are not visible ([`guest_descriptors_are_visible`]). (An
 /// absolute symlink is resolved from the tracer's root, which only a chrooted
 /// guest sees differently; a FIFO missed that way is opened as before.)
-///
-/// A path's leading `/proc/self` or `/proc/thread-self`, which the tracer's
-/// lookup would resolve for the tracer, is spelled with the guest's own
-/// numbers (`own`, its pid and tid as its `/proc` names them,
-/// `Detcore::procfs_caller_ids`), which the lookup through the guest's root
-/// finds in the guest's `/proc`: so the FIFO behind one of the guest's
-/// descriptor links (`/proc/self/fd/N`, the spelling a name below a
-/// descriptor directory takes, `syscalls::files::descriptor_directory`) is
-/// found, and its open waits in polling turns rather than in the kernel.
 pub(crate) fn fifo_at(
     backend: &reverie::BackendCapabilities,
     physical_tid: Option<i32>,
     tid: i32,
-    own: Option<(i32, i32)>,
     dirfd: i32,
     path: &Path,
 ) -> Option<((u64, u64), std::ffi::OsString)> {
     if !guest_descriptors_are_visible(backend, physical_tid) {
         return None;
     }
-    let respelled;
-    let path = match (own, path.strip_prefix("/proc")) {
-        (Some((pid, tid)), Ok(below)) => {
-            let mut components = below.components();
-            match components.next() {
-                Some(std::path::Component::Normal(name)) if name == "self" => {
-                    respelled = Path::new("/proc")
-                        .join(pid.to_string())
-                        .join(components.as_path());
-                    respelled.as_path()
-                }
-                Some(std::path::Component::Normal(name)) if name == "thread-self" => {
-                    respelled = Path::new("/proc")
-                        .join(pid.to_string())
-                        .join("task")
-                        .join(tid.to_string())
-                        .join(components.as_path());
-                    respelled.as_path()
-                }
-                _ => path,
-            }
-        }
-        _ => path,
-    };
     let base = if path.is_absolute() {
         format!("/proc/{tid}/root")
     } else if dirfd == libc::AT_FDCWD {

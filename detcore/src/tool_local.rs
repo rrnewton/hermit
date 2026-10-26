@@ -126,35 +126,6 @@ pub struct FileMetadata {
     /// says whether they are placeholders (`decide_cpuinfo_placeholders`).
     #[serde(default)]
     pending_cpuinfo_placeholders: Vec<RawFd>,
-    /// Descriptors open in this table that Detcore keeps no description of,
-    /// with whether each is close-on-exec: a received anonymous inode, or a
-    /// received descriptor whose facts could not be taken
-    /// (`Detcore::record_received_descriptors`). Listed in the table's
-    /// descriptor directory (`syscalls::files::descriptor_directory`), so a
-    /// close-all loop reaches them; forgotten when the number is closed or
-    /// replaced.
-    #[serde(default)]
-    present_unmodelled: BTreeMap<RawFd, bool>,
-    /// Whether a receive may have installed descriptors in this table whose
-    /// numbers Detcore does not know (a receive whose layout could not be
-    /// trusted, one on the background path, or one without sequentialized
-    /// threads): then a listing of the table cannot come from Detcore's
-    /// model.
-    #[serde(default)]
-    unaccounted_receipts: bool,
-    /// The capacity Linux's descriptor table has (`max_fds`): 64
-    /// (`NR_OPEN_DEFAULT`) until a descriptor at or above it is installed,
-    /// then the next power of two above the highest one installed
-    /// (`expand_files`, `alloc_fdtable`); a fork's copy is sized from the
-    /// descriptors open at the fork (`dup_fd`, `sane_fdtable_size`); `exec`
-    /// keeps the table. The end of a descriptor directory's listing.
-    #[serde(default = "default_descriptor_capacity")]
-    descriptor_capacity: u64,
-}
-
-/// `NR_OPEN_DEFAULT` on 64-bit Linux.
-fn default_descriptor_capacity() -> u64 {
-    64
 }
 
 /// Deserializes a descriptor table with its aliases restored, so a table
@@ -837,77 +808,6 @@ impl FileMetadata {
             next_accept_wait: 0,
             cpuinfo_placeholders: None,
             pending_cpuinfo_placeholders: Vec::new(),
-            present_unmodelled: BTreeMap::new(),
-            unaccounted_receipts: false,
-            descriptor_capacity: default_descriptor_capacity(),
-        }
-    }
-
-    /// Note that descriptor `fd` was installed in this table: it is no
-    /// longer an unmodelled one, and the table grows to hold it as Linux's
-    /// does ([`Self::descriptor_capacity`]).
-    fn note_installed(&mut self, fd: RawFd) {
-        self.present_unmodelled.remove(&fd);
-        self.grow_to_hold(fd);
-    }
-
-    /// Grow the table to hold descriptor `fd`, as Linux's `expand_files`
-    /// does ([`Self::descriptor_capacity`]): for an installed descriptor, and
-    /// for the target of a `dup2` or `dup3` that then fails because its old
-    /// descriptor is not open, which `ksys_dup3` expands the table for first
-    /// (<https://github.com/torvalds/linux/blob/v6.17/fs/file.c#L1408-L1415>).
-    fn grow_to_hold(&mut self, fd: RawFd) {
-        if let Ok(fd) = u64::try_from(fd)
-            && fd >= self.descriptor_capacity
-        {
-            self.descriptor_capacity = (fd + 1)
-                .checked_next_power_of_two()
-                .unwrap_or(u64::MAX / 2)
-                .max(default_descriptor_capacity());
-        }
-    }
-
-    /// Set the close-on-exec flag of descriptor `fd` if it is one this table
-    /// lists without modelling ([`Self::present_unmodelled`]); whether it is.
-    fn set_unmodelled_cloexec(&mut self, fd: RawFd, cloexec: bool) -> bool {
-        match self.present_unmodelled.get_mut(&fd) {
-            Some(flag) => {
-                *flag = cloexec;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// The descriptors open in this table that it knows of, ascending:
-    /// those it models and those it does not ([`Self::present_unmodelled`]).
-    fn descriptor_numbers(&self) -> Vec<RawFd> {
-        let mut numbers: Vec<RawFd> = self
-            .file_handles
-            .keys()
-            .copied()
-            .chain(self.present_unmodelled.keys().copied())
-            .collect();
-        numbers.sort_unstable();
-        numbers.dedup();
-        numbers
-    }
-
-    /// The capacity a fork's copy of this table gets: `dup_fd` sizes it from
-    /// the highest descriptor open, rounded up to a multiple of
-    /// `BITS_PER_LONG` (`sane_fdtable_size`), and allocates a larger table
-    /// only past `NR_OPEN_DEFAULT`, to the next power of two
-    /// (`alloc_fdtable`).
-    fn forked_descriptor_capacity(&self) -> u64 {
-        let open = self
-            .descriptor_numbers()
-            .last()
-            .and_then(|fd| u64::try_from(*fd).ok())
-            .map_or(0, |fd| (fd + 1).next_multiple_of(64));
-        if open <= default_descriptor_capacity() {
-            default_descriptor_capacity()
-        } else {
-            open.checked_next_power_of_two().unwrap_or(u64::MAX / 2)
         }
     }
 
@@ -1078,9 +978,6 @@ impl FileMetadata {
             next_accept_wait: 0,
             cpuinfo_placeholders: self.cpuinfo_placeholders,
             pending_cpuinfo_placeholders: self.pending_cpuinfo_placeholders.clone(),
-            present_unmodelled: self.present_unmodelled.clone(),
-            unaccounted_receipts: self.unaccounted_receipts,
-            descriptor_capacity: self.forked_descriptor_capacity(),
         }
     }
 
@@ -1099,14 +996,6 @@ impl FileMetadata {
             next_accept_wait: 0,
             cpuinfo_placeholders: self.cpuinfo_placeholders,
             pending_cpuinfo_placeholders: self.pending_cpuinfo_placeholders.clone(),
-            present_unmodelled: self
-                .present_unmodelled
-                .iter()
-                .filter(|(_, cloexec)| !**cloexec)
-                .map(|(fd, cloexec)| (*fd, *cloexec))
-                .collect(),
-            unaccounted_receipts: self.unaccounted_receipts,
-            descriptor_capacity: self.descriptor_capacity,
         }
     }
 
@@ -1750,7 +1639,6 @@ impl FileMetadata {
     /// add a detfd
     fn add_detfd(&mut self, detfd: DetFd) {
         let fd = detfd.fd;
-        self.note_installed(fd);
         self.file_handles.insert(fd, detfd);
     }
 
@@ -1771,15 +1659,12 @@ impl FileMetadata {
 
     /// remove a rawfd
     fn remove_fd(&mut self, fd: RawFd) -> Option<OpenFileId> {
-        self.present_unmodelled.remove(&fd);
         let detfd = self.file_handles.remove(&fd)?;
         (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())
     }
 
     /// Remove every modeled descriptor in an inclusive close_range interval.
     fn remove_fd_range(&mut self, first: u32, last: u32) -> Vec<OpenFileId> {
-        self.present_unmodelled
-            .retain(|fd, _| !(*fd >= 0 && first <= *fd as u32 && *fd as u32 <= last));
         let mut descriptors: Vec<_> = self
             .file_handles
             .keys()
@@ -1801,28 +1686,13 @@ impl FileMetadata {
         flags: OFlag,
     ) -> Result<Option<OpenFileId>, Errno> {
         if oldfd == newfd {
-            if self.present_unmodelled.contains_key(&oldfd) {
-                return Ok(None);
-            }
             self.with_detfd(oldfd, |_| ())?;
             return Ok(None);
-        }
-        // A copy of a descriptor Detcore keeps no description of is another
-        // such descriptor, which the kernel has installed.
-        if !self.file_handles.contains_key(&oldfd) && self.present_unmodelled.contains_key(&oldfd) {
-            self.note_installed(newfd);
-            self.present_unmodelled
-                .insert(newfd, flags.contains(OFlag::O_CLOEXEC));
-            let replaced = self.file_handles.remove(&newfd);
-            return Ok(replaced.and_then(|detfd| {
-                (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())
-            }));
         }
 
         let detfd = self.with_detfd(oldfd, |old_detfd| {
             old_detfd.clone().with_fd(newfd).with_fd_flags(flags)
         })?;
-        self.note_installed(newfd);
         let replaced = self.file_handles.insert(newfd, detfd);
         Ok(replaced
             .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
@@ -1858,7 +1728,6 @@ impl FileMetadata {
         }
 
         let detfd = captured.detfd.with_fd(newfd).with_fd_flags(flags);
-        self.note_installed(newfd);
         let replaced = self.file_handles.insert(newfd, detfd);
         Ok(replaced
             .and_then(|detfd| (detfd.open_file_alias_count() == 1).then(|| detfd.open_file_id())))
@@ -2535,98 +2404,6 @@ mod file_metadata_tests {
     /// descriptor Detcore discovers afresh, as it does one it did not create
     /// (one received over `SCM_RIGHTS`), has none
     /// (<https://github.com/rrnewton/hermit/issues/4380>).
-    /// The capacity a descriptor directory's end follows is Linux's: it
-    /// grows to the next power of two above an installed descriptor, keeps
-    /// it when the descriptor closes, and a fork's copy is sized from what
-    /// is open (measured: `dup2(0, 100); close(100)` ends at 130, and a
-    /// fork's child after it at 66).
-    #[test]
-    fn the_descriptor_capacity_follows_linuxs_allocation() {
-        let owner = DetTid::from_raw(9031);
-        let mut table = FileMetadata::new(owner);
-        assert_eq!(table.descriptor_capacity, 64);
-        table
-            .add_fd(owner, 100, OFlag::empty(), FdType::Regular, None)
-            .unwrap();
-        assert_eq!(table.descriptor_capacity, 128);
-        table.remove_fd(100);
-        assert_eq!(table.descriptor_capacity, 128);
-        assert_eq!(
-            table.fork_for(DetTid::from_raw(9032)).descriptor_capacity,
-            64
-        );
-        table
-            .add_fd(owner, 70, OFlag::empty(), FdType::Regular, None)
-            .unwrap();
-        assert_eq!(
-            table.fork_for(DetTid::from_raw(9033)).descriptor_capacity,
-            128
-        );
-        assert_eq!(table.for_exec(owner).descriptor_capacity, 128);
-    }
-
-    /// A `dup2` or `dup3` to 100 whose old descriptor is not open grows the
-    /// table to 128 slots, as `ksys_dup3` expands it before it looks the old
-    /// descriptor up (measured: `dup2(-1, 100)` fails with EBADF and a
-    /// listing then ends at 130); a target below the capacity changes
-    /// nothing.
-    #[test]
-    fn a_failed_dup_grows_the_table_for_its_target() {
-        let owner = DetTid::from_raw(9041);
-        let mut table = FileMetadata::new(owner);
-        table.grow_to_hold(10);
-        assert_eq!(table.descriptor_capacity, 64);
-        table.grow_to_hold(100);
-        assert_eq!(table.descriptor_capacity, 128);
-        assert!(table.descriptor_numbers().is_empty());
-        table.grow_to_hold(-1);
-        assert_eq!(table.descriptor_capacity, 128);
-    }
-
-    /// A descriptor listed without modelling keeps the close-on-exec flag
-    /// `F_SETFD`, `FIOCLEX` and `FIONCLEX` give it, which decides whether it
-    /// survives `exec`; any other descriptor is not one.
-    #[test]
-    fn an_unmodelled_descriptor_keeps_its_close_on_exec_changes() {
-        let owner = DetTid::from_raw(9042);
-        let mut table = FileMetadata::new(owner);
-        table.present_unmodelled.insert(5, false);
-        table.present_unmodelled.insert(6, true);
-        assert!(table.set_unmodelled_cloexec(5, true));
-        assert!(table.set_unmodelled_cloexec(6, false));
-        assert!(!table.set_unmodelled_cloexec(7, true));
-        let after = table.for_exec(owner);
-        assert!(!after.present_unmodelled.contains_key(&5));
-        assert_eq!(after.present_unmodelled.get(&6), Some(&false));
-    }
-
-    /// A descriptor open in the table that Detcore does not model (a
-    /// received anonymous inode) is listed until it is closed or replaced,
-    /// survives `exec` unless it is close-on-exec, and a `dup` of it is
-    /// another such descriptor.
-    #[test]
-    fn an_unmodelled_descriptor_is_listed_until_it_goes() {
-        let owner = DetTid::from_raw(9034);
-        let mut table = FileMetadata::new(owner);
-        table
-            .add_fd(owner, 0, OFlag::empty(), FdType::Regular, None)
-            .unwrap();
-        table.present_unmodelled.insert(5, false);
-        table.present_unmodelled.insert(6, true);
-        assert_eq!(table.descriptor_numbers(), vec![0, 5, 6]);
-        assert_eq!(table.for_exec(owner).descriptor_numbers(), vec![0, 5]);
-        assert_eq!(table.dup_fd(5, 9, OFlag::O_CLOEXEC).unwrap(), None);
-        assert_eq!(table.present_unmodelled.get(&9), Some(&true));
-        table.remove_fd(5);
-        table
-            .add_fd(owner, 6, OFlag::empty(), FdType::Regular, None)
-            .unwrap();
-        assert_eq!(table.descriptor_numbers(), vec![0, 6, 9]);
-        assert!(!table.present_unmodelled.contains_key(&6));
-        table.remove_fd_range(0, 100);
-        assert!(table.descriptor_numbers().is_empty());
-    }
-
     #[test]
     fn a_pipe_channel_follows_its_description_through_dup_and_fork() {
         let owner = DetTid::from_raw(9018);
@@ -5916,62 +5693,6 @@ impl<T> ThreadState<T> {
     /// get file metadata
     fn metadata(&self) -> MutexGuard<'_, FileMetadata> {
         self.file_metadata.lock().unwrap()
-    }
-
-    /// The descriptors this thread's table holds, ascending, modelled or not
-    /// (`FileMetadata::descriptor_numbers`), its capacity
-    /// (`FileMetadata::descriptor_capacity`), and whether a receive may have
-    /// installed descriptors Detcore does not know
-    /// (`FileMetadata::unaccounted_receipts`).
-    pub(crate) fn descriptor_table(&self) -> (Vec<RawFd>, u64, bool) {
-        let metadata = self.metadata();
-        (
-            metadata.descriptor_numbers(),
-            metadata.descriptor_capacity,
-            metadata.unaccounted_receipts,
-        )
-    }
-
-    /// Record that descriptor `fd`, close-on-exec or not, is open in this
-    /// thread's table though Detcore keeps no description of it
-    /// (`FileMetadata::present_unmodelled`).
-    pub(crate) fn note_unmodelled_descriptor(&self, fd: RawFd, cloexec: bool) {
-        let mut metadata = self.metadata();
-        if !metadata.file_handles.contains_key(&fd) {
-            metadata.note_installed(fd);
-            metadata.present_unmodelled.insert(fd, cloexec);
-        }
-    }
-
-    /// Grow this thread's table to hold descriptor `fd`, as a `dup2` or
-    /// `dup3` to it of a descriptor that is not open does on Linux
-    /// (`FileMetadata::grow_to_hold`): `newfd` below `RLIMIT_NOFILE`, as
-    /// Detcore keeps it for the process.
-    pub(crate) fn note_failed_dup_target(&self, fd: RawFd) {
-        let limit = self
-            .resource_limits
-            .lock()
-            .unwrap()
-            .get(reverie::syscalls::linux_abi::RLIMIT_NOFILE)
-            .map_or(0, |limit| limit.current);
-        if u64::try_from(fd).is_ok_and(|fd| fd < limit) {
-            self.metadata().grow_to_hold(fd);
-        }
-    }
-
-    /// Set the close-on-exec flag of descriptor `fd` if Detcore lists it
-    /// without modelling it (`FileMetadata::present_unmodelled`), after the
-    /// kernel changed it (`F_SETFD`, `FIOCLEX`, `FIONCLEX`); whether it is
-    /// one.
-    pub(crate) fn set_unmodelled_cloexec(&self, fd: RawFd, cloexec: bool) -> bool {
-        self.metadata().set_unmodelled_cloexec(fd, cloexec)
-    }
-
-    /// Record that a receive may have installed descriptors in this thread's
-    /// table whose numbers Detcore does not know
-    /// (`FileMetadata::unaccounted_receipts`).
-    pub(crate) fn note_unaccounted_receipt(&self) {
-        self.metadata().unaccounted_receipts = true;
     }
 
     /// Identity of this thread's descriptor table.

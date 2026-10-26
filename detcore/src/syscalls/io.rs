@@ -3753,10 +3753,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let delivered = geometry
             .map(|geometry| geometry.delivered(&guest.memory(), result))
             .unwrap_or_default();
-        let cloexec =
-            Syscall::Recvmsg(call).into_parts().1.arg2 as i32 & libc::MSG_CMSG_CLOEXEC != 0;
         let recorded = self
-            .record_received_descriptors(guest, &delivered, in_turn, cloexec)
+            .record_received_descriptors(guest, &delivered, in_turn)
             .await;
         // Where the tool discovers received descriptors, recvmsg's refresh
         // covers every descriptor delivered, as before; elsewhere only those
@@ -4156,10 +4154,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let delivered = geometry
             .map(|geometry| geometry.delivered(&guest.memory(), result))
             .unwrap_or_default();
-        let cloexec =
-            Syscall::Recvmmsg(call).into_parts().1.arg3 as i32 & libc::MSG_CMSG_CLOEXEC != 0;
         let recorded = self
-            .record_received_descriptors(guest, &delivered, in_turn, cloexec)
+            .record_received_descriptors(guest, &delivered, in_turn)
             .await;
         // Only the descriptors this receipt recorded.
         self.refresh_received_locks(guest, &recorded, super::files::LockCall::Recvmmsg)
