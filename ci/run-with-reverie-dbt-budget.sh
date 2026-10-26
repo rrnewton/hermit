@@ -2702,7 +2702,21 @@ fi
 # so the inventory, SDK and native inputs, calibrated budget, job width and
 # limits carry unchanged from the 4fc34896 entry. The reverie-dbt Rust changes
 # remain build-relevant and need fresh validation.
-expected_pin=1d6df11f748837bfb3342b7106fefb55e4e1c4b9
+# CARRY TO a58b7012279d087d6582d808b23d54bd3e19f85e (2026-10-26):
+# A5 3c.1e sub-slice B (signals lane): under Tool::in_guest_signal_delivery the
+# in-guest runtime runs under its own mask and keeps the guest's apart. Rebased
+# onto 1d6df11f; it changes reverie-inguest/src (guest/runtime_mask.rs new;
+# continuation, host, instruction, mod, sigalrm, signal, tool_install;
+# signal.rs), reverie-liteinst's rpc_tool guest and test, and two source-catalog
+# rows in reverie-liteinst-artifact/src/lib.rs. The interval adds no reverie-dbt
+# file (inventory 1009) and leaves the root Cargo.toml, Cargo.lock,
+# rust-toolchain.toml and third-party/ unchanged; both repository inputs to the
+# DynamoRIO content key are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory, SDK and native inputs, calibrated budget, job width and
+# limits carry unchanged from the 1d6df11f entry.
+expected_pin=a58b7012279d087d6582d808b23d54bd3e19f85e
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
