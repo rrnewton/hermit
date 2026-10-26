@@ -1813,7 +1813,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured with the existing selection and exclusions unchanged.
     // Caller-selected DBT environment privacy adds one library regression,
     // listed with the existing feature selection and exclusions unchanged.
-    ("test.hermit_unit", 1104),
+    // And A5 slice 3c.1e B's forced-gate harness (in_guest_delivery_harness):
+    // the_parent_runner_never_forces_the_gate and six forced_gate_* rows:
+    // 1111, listed.
+    ("test.hermit_unit", 1111),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5505,7 +5508,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured with the existing selection and exclusions unchanged.
     // Caller-selected DBT environment privacy adds one library regression,
     // listed with the existing feature selection and exclusions unchanged.
-    ("test.hermit_unit_on_host", 1104),
+    // And A5 slice 3c.1e B's harness unit the_parent_runner_never_forces_the_gate;
+    // its six forced_gate_* rows launch in-guest-trap guests, which need CPUID
+    // faulting, so this hosted twin excludes them by exact name
+    // (validation_dag::HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS) while
+    // test.hermit_unit runs all seven: 1105, listed.
+    ("test.hermit_unit_on_host", 1105),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
