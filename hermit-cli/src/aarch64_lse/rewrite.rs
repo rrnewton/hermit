@@ -78,8 +78,10 @@ pub enum Refusal {
     Undecoded,
     /// The window is decoded but is not one of the four idioms.
     NotCanonical,
-    /// A branch elsewhere in the scanned range targets the inside of the
-    /// sequence, so the replacement could be entered part-way.
+    /// A direct branch elsewhere in the scanned range targets the inside of
+    /// the sequence, so the replacement could be entered part-way. Only
+    /// direct branches are checked: an indirect branch's target (a jump
+    /// table, a landing pad) is not known here.
     BranchIntoSequence,
     /// The idiom matched but its registers break an assumption the
     /// replacement needs; the string names which one.
@@ -88,6 +90,9 @@ pub enum Refusal {
     UnsupportedOperation,
     /// A branch the replacement must move no longer reaches its target.
     BranchOutOfRange,
+    /// A relocation points into the sequence, so the loader writes those
+    /// bytes itself, for the instruction that used to be there.
+    Relocated,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,7 +251,7 @@ fn match_sequence(
     if load_size != size {
         return Err(Refusal::NotCanonical);
     }
-    if decoded[start + 1..store].iter().any(|i| *i == Insn::Other) {
+    if decoded[start + 1..store].contains(&Insn::Other) {
         return Err(Refusal::Undecoded);
     }
     // The status register must be a register the loop itself destroys and
@@ -330,6 +335,13 @@ fn swap(
     zero_status: u32,
 ) -> Result<Vec<u32>, Refusal> {
     let _ = rs;
+    // `SWPA`/`SWPAL` acquire only when their destination is not the zero
+    // register, where `LDAXR WZR` acquires regardless (Arm ARM C6.2, the
+    // "Operation" of each; the alias is `STxxx`). A loop that discards its
+    // loaded value is rare, so refuse rather than special-case it.
+    if rt == ZR {
+        return Err(Refusal::Registers("the loaded value is discarded"));
+    }
     if rv == rt {
         return Err(Refusal::Registers(
             "the stored register is the load destination",
@@ -398,6 +410,14 @@ fn rmw(
     // The stored value must be what the operation computed from the loaded one.
     if rd != rv || alu_rn != rt || alu_sf != sf {
         return Err(Refusal::NotCanonical);
+    }
+    // `LD<op>` with the zero register as its destination is the `ST<op>`
+    // alias, which performs no load and, in the A and AL forms, takes no
+    // acquire (Arm ARM C6.2). An immediate add or subtract also encodes
+    // register 31 as SP rather than the zero register, so a loop that loads
+    // into the zero register could match an operation on SP.
+    if rt == ZR {
+        return Err(Refusal::Registers("the loaded value is discarded"));
     }
     // The atomic carries the operand in Rs and the loaded value in Rt, and
     // the architecture leaves one register in both roles unpredictable.
@@ -716,6 +736,30 @@ mod tests {
         );
         assert_eq!(words[0], insn::NOP);
         assert_eq!(*words.last().unwrap(), insn::NOP);
+    }
+
+    #[test]
+    fn a_loop_that_discards_its_loaded_value_is_refused() {
+        // ldaxr xzr, [x3]; add x4, x31, #1; stlxr w5, x4, [x3]; cbnz w5.
+        // Register 31 is SP in the immediate add and the zero register in the
+        // exclusive, and `LDADD` into the zero register neither loads nor
+        // acquires, so this must not be rewritten.
+        let words = [0xc85f_fc7f, 0x9100_07e4, 0xc805_fc64, 0x35ff_ffa5];
+        let report = plan(&words, BASE);
+        assert_eq!(report.patched, vec![]);
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::Registers("the loaded value is discarded"))
+        );
+
+        // ldaxr xzr, [x1]; stlxr w2, x3, [x1]; cbnz w2: the swap form.
+        let words = [0xc85f_fc3f, 0xc802_fc23, 0x35ff_ffc2];
+        let report = plan(&words, BASE);
+        assert_eq!(report.patched, vec![]);
+        assert_eq!(
+            report.refused.first().map(|r| r.reason.clone()),
+            Some(Refusal::Registers("the loaded value is discarded"))
+        );
     }
 
     #[test]
