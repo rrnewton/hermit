@@ -1997,7 +1997,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the watch stage's named_bytes_are_watched_whatever_the_finder_found,
     // named_bytes_alone_are_watched_beside_a_found_pair and
     // a_null_fault_address_is_not_watched: 1397.
-    ("test.hermit_unit", 1397),
+    // And the report stacks' phases::tests::{
+    // a_branch_event_the_schedule_leaves_out_is_no_departure,
+    // realized_schedules_part_at_their_first_thread_difference,
+    // the_order_of_events_opening_says_what_the_stacks_show,
+    // a_realized_pair_says_why_the_schedules_were_not_followed,
+    // stacks_a_shifted_replay_took_on_other_threads_are_left_out}: 1402.
+    ("test.hermit_unit", 1402),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6127,7 +6133,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same --watch refusal test: 1362.
     // And the same 26 watch-stage tests: 1388.
     // And the same three: 1391.
-    ("test.hermit_unit_on_host", 1391),
+    // And the same five report-stack tests: 1396.
+    ("test.hermit_unit_on_host", 1396),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
