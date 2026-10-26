@@ -7090,7 +7090,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     call.len(),
                 );
                 let result = self.execute_nonblockable_fd_syscall(guest, call).await;
-                crate::syscalls::inotify::finish(guest, Some(destination), result).await
+                crate::syscalls::inotify::finish(guest, Sysno::read, Some(destination), result)
+                    .await
             }
             FdType::Memfd | FdType::Pidfd | FdType::Userfaultfd | FdType::Epoll => {
                 trace!("Read call on unusual fd {}, type {:?}", call.fd(), fd_type);
@@ -8588,7 +8589,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let result = self
                 .record_or_replay_preserving_tool_errors(guest, call)
                 .await;
-            crate::syscalls::inotify::finish(guest, destination, result).await
+            crate::syscalls::inotify::finish(guest, Sysno::readv, destination, result).await
         } else {
             self.record_or_replay_preserving_tool_errors(guest, call)
                 .await
@@ -8795,7 +8796,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let result = self
                 .record_or_replay_preserving_tool_errors(guest, call)
                 .await;
-            crate::syscalls::inotify::finish(guest, destination, result).await
+            crate::syscalls::inotify::finish(guest, Sysno::preadv2, destination, result).await
         } else {
             self.record_or_replay_preserving_tool_errors(guest, call)
                 .await
