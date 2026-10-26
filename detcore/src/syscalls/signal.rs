@@ -215,9 +215,9 @@ pub(crate) fn restart_if_first_probe_not_run<V>(result: Result<V, Error>) -> Res
 /// value makes `rt_sigprocmask` copy exactly the kernel-sized input and then
 /// return `EINVAL` without changing the mask. Use that as a permission probe,
 /// then read the already-validated word while the guest is stopped.
-/// The x86-64 System V red zone below the stack pointer, which a leaf function
-/// may use and an injected call therefore must not.
-pub(super) const STACK_RED_ZONE: usize = 128;
+/// The red zone below the stack pointer, which a leaf function may use and an
+/// injected call therefore must not.
+pub(super) const STACK_RED_ZONE: usize = crate::arch::STACK_RED_ZONE;
 
 /// The two eight-byte scratch cells `handle_rt_sigsuspend` places below the
 /// red zone: the rt_sigpending result and the copy of the call's mask.
@@ -591,6 +591,7 @@ fn logical_time_to_timeval(value: LogicalTime) -> libc::timeval {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#663)
+#[cfg(target_arch = "x86_64")]
 fn logical_time_to_alarm_seconds(value: LogicalTime) -> i64 {
     value.as_nanos().div_ceil(1_000_000_000) as i64
 }
@@ -601,6 +602,7 @@ fn logical_time_to_alarm_seconds(value: LogicalTime) -> i64 {
 /// the timer is still active. So an active timer, even one with less than a
 /// microsecond left, returns at least 1
 /// (https://github.com/rrnewton/hermit/issues/4139).
+#[cfg(target_arch = "x86_64")]
 fn linux_alarm_seconds(value: LogicalTime) -> i64 {
     let ns = value.as_nanos();
     let (secs, rem) = (ns / 1_000_000_000, ns % 1_000_000_000);
@@ -927,6 +929,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#663)
     /// We send the alarms to the global scheduler to handle.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_alarm<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1028,6 +1031,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// A pause is really just an unbounded sleep.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_pause<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1153,7 +1157,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A stack pointer, or a buffer, too close to address zero leaves no
         // room for the red zone and the cells below it. The call then fails
         // with EFAULT, as it does when a cell is not writable.
-        let below_red_zone = (guest.regs().await.rsp as usize)
+        let below_red_zone = (crate::arch::stack_pointer(&guest.regs().await) as usize)
             .checked_sub(STACK_RED_ZONE)
             .ok_or(Errno::EFAULT)?;
         let cells = below_red_zone
@@ -4643,9 +4647,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         if pending == 0 {
             return;
         }
-        // x86-64 `rt_sigreturn` reads `frame = sp - sizeof(long)` and restores
-        // `frame->uc.uc_sigmask`; `uc` starts at `sp`.
-        let sp = guest.regs().await.rsp as usize;
+        // `rt_sigreturn` restores the `uc_sigmask` of the frame at `sp`.
+        let sp = crate::arch::stack_pointer(&guest.regs().await) as usize;
         let restored = Addr::<u64>::from_raw(sp.wrapping_add(UC_SIGMASK_OFFSET))
             .and_then(|addr| guest.memory().read_value(addr).ok());
         let (observable, discarded) = match (
@@ -4673,10 +4676,9 @@ enum ValidatedSet {
     NotValidated,
 }
 
-/// The offset of `uc_sigmask` in the x86-64 kernel `ucontext` that
-/// `rt_sigreturn` restores: after uc_flags (8), uc_link (8), uc_stack (24) and
-/// uc_mcontext (256 bytes).
-pub(super) const UC_SIGMASK_OFFSET: usize = 8 + 8 + 24 + 256;
+/// The offset from the stack pointer at `rt_sigreturn` of the `uc_sigmask` it
+/// restores.
+pub(super) const UC_SIGMASK_OFFSET: usize = crate::arch::RT_SIGRETURN_SIGMASK_OFFSET;
 
 fn should_notify_cross_task_signal(sender: DetTid, target: DetTid, raw_signal: i32) -> bool {
     raw_signal != 0 && target != sender

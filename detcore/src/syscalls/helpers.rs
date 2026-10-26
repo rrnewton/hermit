@@ -1339,8 +1339,11 @@ pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 ) -> bool {
     // An epoll wait's descriptor is the epoll set it waits on, never a pipe it
     // reads; a guest that passes a pipe gets EINVAL from the kernel.
-    if matches!(call, Syscall::EpollWait(_) | Syscall::EpollPwait(_)) {
-        return false;
+    match call {
+        Syscall::EpollPwait(_) => return false,
+        #[cfg(target_arch = "x86_64")]
+        Syscall::EpollWait(_) => return false,
+        _ => {}
     }
     match get_fd(call) {
         Some(fd) => guest
@@ -1444,10 +1447,12 @@ fn replay_serves_socket_call_from_log<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 /// without running them. `epoll_wait` is excluded because replay reapplies its
 /// side effects on live descriptors, which may block.
 fn replay_serves_blocking_call_from_log(call: Syscall) -> bool {
-    matches!(
-        call,
-        Syscall::Poll(_) | Syscall::Ppoll(_) | Syscall::Select(_) | Syscall::Pselect6(_)
-    )
+    match call {
+        Syscall::Ppoll(_) | Syscall::Pselect6(_) => true,
+        #[cfg(target_arch = "x86_64")]
+        Syscall::Poll(_) | Syscall::Select(_) => true,
+        _ => false,
+    }
 }
 
 /// Is `fd` a socket whose connection record and replay keep only in the log?
@@ -1531,9 +1536,11 @@ pub(crate) fn get_fd(s: Syscall) -> Option<i32> {
         Syscall::Fadvise64(s) => Some(s.fd()),
         Syscall::InotifyAddWatch(s) => Some(s.fd()),
         Syscall::InotifyRmWatch(s) => Some(s.fd()),
+        #[cfg(target_arch = "x86_64")]
         Syscall::SyncFileRange(s) => Some(s.fd()),
         Syscall::Vmsplice(s) => Some(s.fd()),
         Syscall::Utimensat(s) => Some(s.dirfd()),
+        #[cfg(target_arch = "x86_64")]
         Syscall::Signalfd(s) => Some(s.fd()),
         Syscall::Fallocate(s) => Some(s.fd()),
         Syscall::TimerfdSettime(s) => Some(s.fd()),
@@ -1551,8 +1558,12 @@ pub(crate) fn get_fd(s: Syscall) -> Option<i32> {
         Syscall::Mkdirat(s) => Some(s.dirfd()),
         Syscall::Mknodat(s) => Some(s.dirfd()),
         Syscall::Fchownat(s) => Some(s.dirfd()),
+        #[cfg(target_arch = "x86_64")]
         Syscall::Futimesat(s) => Some(s.dirfd()),
+        #[cfg(target_arch = "x86_64")]
         Syscall::Newfstatat(s) => Some(s.dirfd()),
+        #[cfg(target_arch = "aarch64")]
+        Syscall::Fstatat(s) => Some(s.dirfd()),
         Syscall::Unlinkat(s) => Some(s.dirfd()),
         Syscall::Readlinkat(s) => Some(s.dirfd()),
         Syscall::Fchmodat(s) => Some(s.dirfd()),
@@ -1565,10 +1576,12 @@ pub(crate) fn get_fd(s: Syscall) -> Option<i32> {
         Syscall::OpenByHandleAt(s) => Some(s.mount_fd()),
 
         Syscall::EpollCtl(s) => Some(s.epfd()),
+        #[cfg(target_arch = "x86_64")]
         Syscall::EpollWait(s) => Some(s.epfd()),
         Syscall::EpollPwait(s) => Some(s.epfd()),
 
         // Ambiguous, 2 fds, no answer:
+        #[cfg(target_arch = "x86_64")]
         Syscall::Dup2(_) => None,
         // Ambiguous, 2 fds, no answer:
         Syscall::Sendfile(_) => None,
@@ -1586,6 +1599,7 @@ pub(crate) fn get_fd(s: Syscall) -> Option<i32> {
         Syscall::KexecLoad(_) => None,
 
         // Takes a pointer to fd, not directly accessible:
+        #[cfg(target_arch = "x86_64")]
         Syscall::Poll(_) => None,
         // Takes a pointer to fd, not directly accessible:
         Syscall::Ppoll(_) => None,
@@ -1705,6 +1719,7 @@ fn pipe_writev_resources(dettid: DetTid, call: reverie::syscalls::Writev) -> Res
     resources
 }
 
+#[cfg(target_arch = "x86_64")]
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::Poll {
     async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
@@ -1741,6 +1756,7 @@ impl NonblockableSyscall for reverie::syscalls::Poll {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl TimeoutableSyscall for reverie::syscalls::Poll {
     fn timeout_return_val(&self) -> Result<i64, Errno> {
         Ok(0)
@@ -1776,6 +1792,7 @@ impl TimeoutableSyscall for reverie::syscalls::Ppoll {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 #[async_trait]
 impl NonblockableSyscall for reverie::syscalls::EpollWait {
     async fn into_nonblocking<T: RecordOrReplay, G: Guest<Detcore<T>>>(
@@ -1790,6 +1807,7 @@ impl NonblockableSyscall for reverie::syscalls::EpollWait {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 impl TimeoutableSyscall for reverie::syscalls::EpollWait {
     fn timeout_return_val(&self) -> Result<i64, Errno> {
         Ok(0)
@@ -2307,9 +2325,85 @@ pub(crate) struct RestartBlock {
     pub(crate) call: RestartCall,
 }
 
+/// Guest scratch for one injected `poll` probe, reserved with the rest of a
+/// caller's scratch before it commits the stack ([`PollProbe::reserve`]).
+///
+/// aarch64 has no `poll` syscall. Its `ppoll` runs the same `do_sys_poll`
+/// (`fs/select.c`) but takes the timeout by pointer, so a probe there needs a
+/// slot of guest memory for the timeout. x86_64 injects `poll` itself and
+/// reserves nothing.
+#[derive(Clone, Copy)]
+pub(crate) struct PollProbe {
+    #[cfg(not(target_arch = "x86_64"))]
+    timeout: AddrMut<'static, Timespec>,
+}
+
+impl PollProbe {
+    /// Reserve the probe's scratch on `stack`, before the caller commits it.
+    pub(crate) fn reserve<S: Stack>(stack: &mut S) -> Self {
+        #[cfg(target_arch = "x86_64")]
+        return {
+            let _ = stack;
+            Self {}
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        return Self {
+            timeout: stack.reserve(),
+        };
+    }
+
+    /// The probe of the `nfds` entries at `fds`, waiting at most
+    /// `timeout_millis` (forever when negative), as `poll` takes them.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn call<M: MemoryAccess>(
+        self,
+        _memory: M,
+        fds: AddrMut<'_, libc::pollfd>,
+        nfds: libc::nfds_t,
+        timeout_millis: libc::c_int,
+    ) -> Result<syscalls::Poll, Errno> {
+        Ok(syscalls::Poll::new()
+            .with_fds(Some(fds.cast()))
+            .with_nfds(nfds)
+            .with_timeout(timeout_millis))
+    }
+
+    /// The probe of the `nfds` entries at `fds`, waiting at most
+    /// `timeout_millis` (forever when negative), as `poll` takes them: a
+    /// `ppoll` with no signal mask, whose timeout this stages first.
+    #[cfg(not(target_arch = "x86_64"))]
+    pub(crate) fn call<M: MemoryAccess>(
+        self,
+        mut memory: M,
+        fds: AddrMut<'_, libc::pollfd>,
+        nfds: libc::nfds_t,
+        timeout_millis: libc::c_int,
+    ) -> Result<syscalls::Ppoll, Errno> {
+        let timeout = if timeout_millis < 0 {
+            None
+        } else {
+            let timeout = Timespec {
+                tv_sec: libc::time_t::from(timeout_millis / 1000),
+                tv_nsec: libc::c_long::from(timeout_millis % 1000) * 1_000_000,
+            };
+            memory.write_value(self.timeout, &timeout)?;
+            Some(self.timeout)
+        };
+        Ok(syscalls::Ppoll::new()
+            .with_fds(Some(fds.cast()))
+            .with_nfds(nfds)
+            .with_timeout(timeout)
+            .with_sigmask(None)
+            .with_sigsetsize(KERNEL_SIGSET_SIZE))
+    }
+}
+
 /// A call whose restart keeps its deadline.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RestartCall {
+    /// Only x86_64 has `poll`; aarch64's `ppoll` restarts with
+    /// `ERESTARTNOHAND`, not a restart block.
+    #[cfg(target_arch = "x86_64")]
     Poll(syscalls::Poll),
     Futex(syscalls::Futex),
     /// A relative `nanosleep` or `clock_nanosleep` that ended for a claimed
@@ -2338,7 +2432,7 @@ pub(crate) async fn keep_restart_block<T, G>(
     G: Guest<Detcore<T>>,
 {
     if matches!(result, Err(Error::Errno(errno)) if *errno == Errno::ERESTART_RESTARTBLOCK) {
-        let rip = guest.regs().await.rip;
+        let rip = crate::arch::instruction_pointer(&guest.regs().await);
         let block = RestartBlock {
             rip,
             deadline,
@@ -5678,7 +5772,8 @@ where
     assert!(event.end_rip.is_none());
 
     let regs = guest.regs().await;
-    let end_rip = NonZeroUsize::new(regs.rip.try_into().unwrap()).unwrap();
+    let end_rip =
+        NonZeroUsize::new(crate::arch::instruction_pointer(&regs).try_into().unwrap()).unwrap();
     event.end_rip = Some(end_rip);
     event
 }

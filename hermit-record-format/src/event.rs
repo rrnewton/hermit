@@ -7,6 +7,7 @@
  */
 
 use reverie::Errno;
+#[cfg(target_arch = "x86_64")]
 use reverie::RdtscResult;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::PollFd;
@@ -130,6 +131,11 @@ pub enum SyscallEvent {
     Stat(StatEvent),
     Statfs(Vec<u8>),
     Statx(StatxBuf),
+    /// x86 only: aarch64 has no `rdtsc`, so its recordings number every later
+    /// variant one lower, and a recording made on one architecture does not
+    /// decode on the other. Recordings do not yet carry their architecture, so
+    /// nothing refuses such a replay by name.
+    #[cfg(target_arch = "x86_64")]
     Rdtsc(RdtscResult),
     Ioctl(ioctl::Output),
     Timespec(TimespecEvent),
