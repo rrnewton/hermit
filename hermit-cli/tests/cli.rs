@@ -155,6 +155,7 @@ static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PRCTL_SET_PTRACER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_TWO_THREADS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FIFO_PEER_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static BINDER_FD_PASSING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SOURCE_THEN_FUTEX_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SIGNAL_WHILE_HELD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SPAWN_DUP2_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -866,6 +867,31 @@ fn prctl_set_ptracer_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "prctl-set-ptracer guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn binder_fd_passing_guest() -> &'static Path {
+    BINDER_FD_PASSING_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("binder-fd-passing");
+        fs::create_dir_all(&build_root).expect("failed to create binder-fd-passing directory");
+        let guest = build_root.join("binder_fd_passing");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/binder_fd_passing.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile binder-fd-passing guest");
+        assert!(
+            output.status.success(),
+            "binder-fd-passing guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -52736,5 +52762,56 @@ fn a_recording_whose_stream_cannot_be_written_in_full_is_refused() {
             "This recording cannot be replayed faithfully: {reason}"
         )) && stderr.contains("File too large"),
         "{args:?}:\n{stderr}"
+    );
+}
+
+/// A descriptor one process sends another in a binder transaction is usable
+/// in the receiver under Hermit. Linux installs it when the receiver reads
+/// the transaction (`binder_apply_fd_fixups`), with no call naming it as new,
+/// so Detcore records it from the read's return commands; before, the
+/// receiver's first read through it failed with EBADF. The guest adds a
+/// device to a private binderfs instance, which the test mounts in a user and
+/// mount namespace of its own. Where the kernel has no binder filesystem, or will
+/// not mount one there, the test says so and skips.
+#[test]
+fn a_descriptor_received_in_a_binder_transaction_is_usable() {
+    let filesystems = fs::read_to_string("/proc/filesystems").unwrap_or_default();
+    if !filesystems
+        .lines()
+        .any(|line| line.split_whitespace().last() == Some("binder"))
+    {
+        eprintln!("skipping: this kernel has no binder filesystem (CONFIG_ANDROID_BINDERFS)");
+        return;
+    }
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mountpoint = directory.path().join("binderfs");
+    fs::create_dir(&mountpoint).unwrap();
+    let hermit = env!("CARGO_BIN_EXE_hermit");
+    let guest = binder_fd_passing_guest().display().to_string();
+    let mountpoint = mountpoint.display().to_string();
+    // The mount's own failure is told apart from the run's by a marker on
+    // stdout, which neither the guest nor hermit prints. The run is bounded:
+    // before this change the guest waited for a reply that never came.
+    let script = format!(
+        "mount -t binder binder {mountpoint} || {{ echo NO-BINDERFS; exit 0; }}; \
+         exec timeout --kill-after 5s 120s {hermit} run --base-env=minimal -- \
+         {guest} {mountpoint}"
+    );
+    let mut command = Command::new("unshare");
+    command.args(["--user", "--map-root-user", "--mount", "sh", "-c", &script]);
+    let label = format!("{command:?}");
+    let output = hermit_test::hermit_output(&label, &mut command);
+    if stdout(&output).contains("NO-BINDERFS") {
+        eprintln!(
+            "skipping: binderfs cannot be mounted in a user namespace here: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    assert_success(&output, &["binder_fd_passing"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("received fd ") && stdout.trim_end().ends_with(": hello"),
+        "{stdout}"
     );
 }

@@ -4290,7 +4290,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             peek: call.flags() & libc::MSG_PEEK != 0,
         };
         let recorded = self
-            .record_received_descriptors(guest, &delivered, in_turn, cloexec, from)
+            .record_received_descriptors(
+                guest,
+                &delivered,
+                super::scm_rights::Channel::ScmRights,
+                in_turn,
+                cloexec,
+                from,
+            )
             .await?;
         // Where the tool discovers received descriptors, recvmsg's refresh
         // covers every descriptor delivered, as before; elsewhere only those
@@ -4329,7 +4336,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// reads, and the refresh reads each descriptor's fdinfo live, which in
     /// replay is a stand-in eventfd's wherever the recording held a file this
     /// process held nowhere else.
-    async fn refresh_received_locks<G: Guest<Self>>(
+    pub(crate) async fn refresh_received_locks<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fds: &[RawFd],
@@ -4703,7 +4710,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             peek: call.flags() & libc::MSG_PEEK as u32 != 0,
         };
         let recorded = self
-            .record_received_descriptors(guest, &delivered, in_turn, cloexec, from)
+            .record_received_descriptors(
+                guest,
+                &delivered,
+                super::scm_rights::Channel::ScmRights,
+                in_turn,
+                cloexec,
+                from,
+            )
             .await?;
         // Only the descriptors this receipt recorded.
         self.refresh_received_locks(guest, &recorded, super::files::LockCall::Recvmmsg)

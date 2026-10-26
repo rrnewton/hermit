@@ -1626,6 +1626,9 @@ pub(crate) enum LockCall {
     Recvmsg,
     /// `recvmmsg` with `SCM_RIGHTS`, which adds slots.
     Recvmmsg,
+    /// `ioctl(BINDER_WRITE_READ)` delivering a transaction that carries
+    /// descriptors, which adds slots.
+    BinderWriteRead,
 }
 
 impl LockCall {
@@ -1637,6 +1640,7 @@ impl LockCall {
             Self::PidfdGetfd => "pidfd_getfd",
             Self::Recvmsg => "recvmsg",
             Self::Recvmmsg => "recvmmsg",
+            Self::BinderWriteRead => "ioctl(BINDER_WRITE_READ)",
         }
     }
 
@@ -11223,7 +11227,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<(), Error> {
         let model = guest.thread_state().with_detfd(fd, |detfd| {
             detfd.set_lock_tracked();
-            if matches!(call, LockCall::Recvmsg | LockCall::Recvmmsg) {
+            if matches!(
+                call,
+                LockCall::Recvmsg | LockCall::Recvmmsg | LockCall::BinderWriteRead
+            ) {
                 detfd.set_received_for_locks();
             }
             if call == LockCall::Fcntl {
@@ -12120,7 +12127,46 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
 
+        let request = Syscall::Ioctl(call).into_parts().1.arg1 as u64;
+        let argument = Syscall::Ioctl(call).into_parts().1.arg2;
+        // A binder read can install descriptors the transaction carried, which
+        // no call names as new (`crate::syscalls::binder`). Read the call's
+        // read_consumed before it runs, so only the commands it writes are
+        // parsed; the in-guest backends discover such a descriptor
+        // themselves, and parse nothing here.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        let binder_read = crate::syscalls::binder::is_write_read(request)
+            && !self.discovers_received_descriptors(guest);
+        let already_consumed = if binder_read {
+            crate::syscalls::binder::consumed_before(&guest.memory(), argument)
+        } else {
+            0
+        };
         let result = self.record_or_replay(guest, call).await?;
+        // `handle_ioctl` runs the call in the caller's turn, so no other
+        // task can have closed or replaced a delivered number yet.
+        // TODO-HUMAN-REVIEW(PR-4736)
+        if binder_read && result >= 0 {
+            let delivered =
+                crate::syscalls::binder::delivered(&guest.memory(), argument, already_consumed);
+            let recorded = self
+                .record_received_descriptors(
+                    guest,
+                    &delivered,
+                    crate::syscalls::scm_rights::Channel::Binder,
+                    true,
+                    // Binder installs every descriptor it delivers
+                    // close-on-exec (`binder_apply_fd_fixups`).
+                    true,
+                    crate::syscalls::scm_rights::ReceivedFrom {
+                        socket: fd,
+                        peek: false,
+                    },
+                )
+                .await?;
+            self.refresh_received_locks(guest, &recorded, LockCall::BinderWriteRead)
+                .await?;
+        }
         // A descriptor Detcore lists without modelling keeps its
         // close-on-exec flag too (`FileMetadata::present_unmodelled`).
         let unmodelled =

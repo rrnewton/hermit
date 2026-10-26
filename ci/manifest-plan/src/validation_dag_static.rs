@@ -3079,7 +3079,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // MSG_DONTWAIT): 2883 + 14 = 2897, measured with `cargo nextest list`
     // at 16fb7fbec04 and re-measured at this head.
     // And the TracerPid unit (32e9ef22f60): 2897 + 1 = 2898.
-    ("test.detcore_unit", 2898),
+    // And syscalls::binder's five units (return-command and object parsing
+    // for descriptors a binder read installs): 2903, listed.
+    ("test.detcore_unit", 2903),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4385,7 +4387,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 700 + 2 = 702.
     // And 11c35a504a6's two --base-env=minimal cli tests: 702 + 2 = 704,
     // measured with `cargo nextest list` at 11c35a504a6.
-    ("test.cli", 703),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
+    // And a_descriptor_received_in_a_binder_transaction_is_usable (skips
+    // where the kernel has no binder filesystem): 704.
+    ("test.cli", 704),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
     // sabre_reports_a_replaced_host_file_without_naming_it_the_cause,
@@ -4935,7 +4939,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // `cargo nextest list` at 16fb7fbec04 and re-measured at this head.
     // And the same two TracerPid cli tests: 619 + 2 = 621.
     // And the same two 11c35a504a6 tests: 621 + 2 = 623.
-    ("test.cli_on_host", 622),
+    // And the same binder descriptor test, not excluded: 623.
+    ("test.cli_on_host", 623),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5411,7 +5416,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same fourteen train-12 detcore units: 2883 + 14 = 2897,
     // measured with `cargo nextest list` at this head.
     // And the same TracerPid unit: 2898.
-    ("test.detcore_unit_on_host", 2898),
+    // And the same five binder parsing units: 2903, listed.
+    ("test.detcore_unit_on_host", 2903),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
