@@ -84,6 +84,7 @@ impl GlobalRPC<GlobalState> for ClockGuest {
                         print_stack_strace: None,
                         timeslice: None,
                         schedule_released: false,
+                        schedule_over: false,
                     }),
                 )
             }

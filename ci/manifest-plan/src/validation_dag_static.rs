@@ -4292,7 +4292,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the placeholder is mounted only for KVM), are run_kvm_ tests, which this
     // node skips and privileged-test.cli_kvm runs.
     // And a_replay_stuck_off_its_schedule_lets_every_thread_run: 623, listed.
-    ("test.cli", 623),
+    // And a_replay_past_its_schedule_ends_slices_as_a_run_without_one_does: 624.
+    ("test.cli", 624),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4809,7 +4810,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // excluded: 535.
     // And the same four P1 placeholder tests, not excluded: 539.
     // And a_replay_stuck_off_its_schedule_lets_every_thread_run: 542, listed.
-    ("test.cli_on_host", 542),
+    // And the same replay-continuation slice test: 543.
+    ("test.cli_on_host", 543),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
