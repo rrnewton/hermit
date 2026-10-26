@@ -34106,18 +34106,19 @@ mod test {
         );
     }
 
-    /// The unwind of a deadlocked guest kills every remaining thread, and the
-    /// host reports their deaths in any order. They are retired before the
+    /// The unwind of a terminal outcome (a guest deadlock, a virtual timeout)
+    /// kills every remaining thread, and the host reports their deaths in any
+    /// order. They are retired before the
     /// unwind's request, in DetTid order, as committed victims: each death
     /// report that follows, in whatever order, is only accounted. On a backend
     /// that does not retire a kill's victims at the kill turn (DBT), nothing
     /// is retired early.
     #[test]
-    fn a_deadlock_unwind_retires_the_remaining_threads_in_tid_order() {
+    fn a_terminal_outcome_unwind_retires_the_remaining_threads_in_tid_order() {
         use sigkill_retirement::SigkillReceipt;
 
         let threads = [3, 5, 7].map(DetTid::from_raw);
-        let deadlocked = |config: &Config| {
+        let ended = |config: &Config| {
             let mut sched = Scheduler::new(config);
             let leader = threads[0];
             for tid in threads {
@@ -34127,35 +34128,40 @@ mod test {
             }
             Mutex::new(sched)
         };
-        let unwound = |sched: &Mutex<Scheduler>| {
+        let unwound = |sched: &Mutex<Scheduler>, outcome| {
             let guard = TerminalOutcomeUnwindGuard::install(Box::new(|_| true));
-            assert_eq!(
-                unwind_terminal_outcome(sched, TerminalOutcome::GuestDeadlock),
-                Some(true)
-            );
+            assert_eq!(unwind_terminal_outcome(sched, outcome), Some(true));
             drop(guard);
         };
 
-        let sched = deadlocked(&Config::default());
-        unwound(&sched);
-        let mut sched = sched.into_inner().unwrap();
-        assert!(sched.next_turns.is_empty());
-        assert!(sched.thread_tree.granted_exits.contains(&threads[0]));
-        assert!(sched.sigkill_fence_holds());
-        for tid in [threads[2], threads[0], threads[1]] {
-            assert!(sched.is_unaccounted_sigkill_victim(tid), "{tid}");
-            assert_eq!(sched.route_sigkill_receipt(tid), SigkillReceipt::Committed);
+        for outcome in [
+            TerminalOutcome::GuestDeadlock,
+            TerminalOutcome::VirtualTimeout { bound_ns: 1 },
+        ] {
+            let sched = ended(&Config::default());
+            unwound(&sched, outcome);
+            let mut sched = sched.into_inner().unwrap();
+            assert!(sched.next_turns.is_empty(), "{outcome:?}");
+            assert!(sched.thread_tree.granted_exits.contains(&threads[0]));
+            assert!(sched.sigkill_fence_holds(), "{outcome:?}");
+            for tid in [threads[2], threads[0], threads[1]] {
+                assert!(
+                    sched.is_unaccounted_sigkill_victim(tid),
+                    "{outcome:?} {tid}"
+                );
+                assert_eq!(sched.route_sigkill_receipt(tid), SigkillReceipt::Committed);
+            }
+            assert!(!sched.sigkill_fence_holds(), "{outcome:?}");
         }
-        assert!(!sched.sigkill_fence_holds());
 
-        let mut direct = deadlocked(&Config::default()).into_inner().unwrap();
+        let mut direct = ended(&Config::default()).into_inner().unwrap();
         assert_eq!(direct.retire_threads_at_unwind(), threads);
 
         let dbt = Config::default().with_backend(|backend| {
             *backend = reverie::BackendCapabilities::DBT;
         });
-        let sched = deadlocked(&dbt);
-        unwound(&sched);
+        let sched = ended(&dbt);
+        unwound(&sched, TerminalOutcome::GuestDeadlock);
         let mut sched = sched.into_inner().unwrap();
         assert_eq!(sched.next_turns.len(), 3);
         for tid in threads {
