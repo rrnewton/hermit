@@ -36557,7 +36557,11 @@ mod test {
         }
         assert_eq!(
             scheduler.requeue_futex_waiters(requeuer, cond, mutex, 1, 1),
+<<<<<<< HEAD
             (1, 1, false)
+=======
+            (1, 1)
+>>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
         );
         assert_eq!(
             scheduler.wake_futex_waiters(unlocker, mutex, 1, u32::MAX),
@@ -36713,6 +36717,7 @@ mod test {
         );
     }
 
+<<<<<<< HEAD
     /// A non-leader exec keeps the caller's own pending signals under the
     /// leader's tid (Linux's `de_thread` keeps the exec caller, and
     /// `exchange_tids` gives it the leader's id), so the access trace's
@@ -36824,6 +36829,8 @@ mod test {
         );
     }
 
+=======
+>>>>>>> 029e5db2d1d (Detcore records synchronization edges in the access trace)
     /// A `FUTEX_WAKE` of one waiter wakes the longest waiter, as Linux does for
     /// waiters of equal priority. Waking the newest one let a thread that re-waits
     /// after every wake take every wake, and an older waiter never ran
