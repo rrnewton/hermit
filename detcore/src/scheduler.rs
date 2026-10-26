@@ -20704,6 +20704,7 @@ impl Scheduler {
                 virtual_timeout_ns,
                 // The backend's precise timers count these.
                 skid_overshoots: None,
+                skid_overshoot_reports: None,
                 seed_reproducible: None,
             },
             info_reprio_descrip,
