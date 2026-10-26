@@ -9336,7 +9336,16 @@ impl Scheduler {
     /// `Scheduler::reach_promised_deadline` makes the clock reach before the
     /// waiter runs.
     fn file_timed_wait(&mut self, dettid: DetTid, deadline: LogicalTime) {
-        let Some(spread) = &mut self.timed_wait_spread else {
+        // A schedule replay spreads the waits its schedule covers, as its
+        // recording did, and no wait filed after the schedule has run out:
+        // the run then continues without chaos decisions, as `hermit analyze`
+        // continues a replayed prefix, and the spread is one of them.
+        let past_the_schedule = self.replayer.as_ref().is_some_and(|r| r.ran_out());
+        let Some(spread) = self
+            .timed_wait_spread
+            .as_mut()
+            .filter(|_| !past_the_schedule)
+        else {
             self.blocked.timed_waiters.insert(deadline, dettid);
             return;
         };
@@ -31775,6 +31784,39 @@ mod test {
         assert!(scheduler.step2b_process_timed(&global_time));
         assert!(scheduler.run_queue.contains_tid(sleeper));
         assert_eq!(global_time.lock().unwrap().as_nanos(), wake, "no jump");
+    }
+
+    /// A schedule replay spreads a wait it files while recorded events
+    /// remain, as its recording did, and files one at its deadline once its
+    /// schedule has run out: the run then continues without chaos decisions,
+    /// as `hermit analyze` continues a replayed prefix.
+    #[test]
+    fn a_schedule_replay_spreads_no_wait_filed_past_its_schedule() {
+        let sleeper = DetTid::from_raw(5);
+        let (seed, factor) = spread_seed(sleeper, |factor| factor < 0.5);
+        let event = SchedEvent::syscall(sleeper, Sysno::nanosleep, SyscallPhase::Posthook);
+        for (events, spread) in [(vec![event], true), (vec![], false)] {
+            let config = Config {
+                chaos_timed_wait_spread: Some(10.0),
+                sched_seed: Some(seed),
+                ..Config::default()
+            };
+            let mut scheduler = Scheduler::new(&config);
+            scheduler.replayer = Some(Replayer::new(events));
+            let start = scheduler.committed_time;
+            let deadline = start + LogicalTime::from_nanos(1_000_000);
+            scheduler.file_timed_wait(sleeper, deadline);
+            let expected = if spread {
+                start + LogicalTime::from_nanos((1_000_000.0 * factor).round() as u64)
+            } else {
+                deadline
+            };
+            assert_eq!(
+                scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+                Some(expected),
+                "recorded events left: {spread}"
+            );
+        }
     }
 
     /// With nothing runnable, the empty-queue fast-forward of a spread wait

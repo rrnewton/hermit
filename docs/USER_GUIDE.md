@@ -543,9 +543,14 @@ first jumps to the wait's deadline, as if the other threads had been
 descheduled, so the waiter still observes its full duration; above one, the
 wait oversleeps. Poll, epoll and select timeouts and signal timers are not
 spread. A recording stores the spread and seed, and a replay under others is
-refused. Replay such a recording with `--replay-preemptions-from`, `--chaos`
-and the recorded spread and seed; `--replay-schedule-from` and `hermit
-analyze` do not support the option yet.
+refused. With the option, sleeps are registered at the first scheduler pass
+unless `--sleep-registration` says otherwise, so a recording replays with
+`--replay-schedule-from` and the recorded spread and seed, or with
+`--replay-preemptions-from` and `--chaos` as well. A schedule replay refuses a
+recording of sleeps registered when chosen, and spreads no wait it files after
+its schedule has run out, since the run then continues without chaos. `hermit analyze` cannot bisect or
+minimize such a run: its trials replay schedules found under different
+scheduler seeds, and the spread's factors are keyed on the seed.
 
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with

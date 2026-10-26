@@ -20669,6 +20669,97 @@ fn chaos_timed_wait_spread_reorders_a_wait_against_work_and_keeps_the_clock_hone
     }
 }
 
+/// A schedule replay of a `--chaos-timed-wait-spread` recording follows it:
+/// the recording registers its sleeps at the first pass, by default under the
+/// spread, and so does the replay, which draws each sleep's wake time from the
+/// same committed time. Each of seeds 1-4 replays with no desync and prints
+/// the recording's order and wait; the wait is the spread sleep's, so a
+/// replay that drew it from another clock prints another (measured: 101.46 ms
+/// instead of 135.47 ms at seed 2 when sleeps were registered when chosen). A
+/// recording made under `--sleep-registration=when-chosen` is refused, naming
+/// the registration to record with.
+#[test]
+fn a_schedule_replay_of_a_timed_wait_spread_recording_follows_it() {
+    let program = timed_wait_spread_guest()
+        .to_str()
+        .expect("timed-wait-spread guest path should be UTF-8");
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for seed in 1..=4u64 {
+        let seed_arg = format!("--seed={seed}");
+        let record = dir.path().join(format!("spread-{seed}.json"));
+        let record_arg = format!("--record-preemptions-to={}", record.display());
+        let common = [
+            "run",
+            "--strict",
+            "--chaos",
+            "--max-timeslice=disabled",
+            "--no-virtualize-cpuid",
+            "--chaos-timed-wait-spread=10",
+            seed_arg.as_str(),
+        ];
+        let mut args = common.to_vec();
+        args.extend([record_arg.as_str(), "--", program, "sleep"]);
+        let recorded = hermit(&args);
+        assert_success(&recorded, &args);
+        let summary = dir.path().join(format!("replay-{seed}.summary.json"));
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let replay_arg = format!("--replay-schedule-from={}", record.display());
+        let mut args = common.to_vec();
+        args.extend([
+            replay_arg.as_str(),
+            summary_arg.as_str(),
+            "--",
+            program,
+            "sleep",
+        ]);
+        let replayed = hermit(&args);
+        assert_success(&replayed, &args);
+        assert_eq!(stdout(&replayed), stdout(&recorded), "seed {seed}");
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+        assert_eq!(summary["schedevent_desynced"], 0, "seed {seed}: {summary}");
+    }
+
+    let record = dir.path().join("when-chosen.json");
+    let record_arg = format!("--record-preemptions-to={}", record.display());
+    let args = [
+        "run",
+        "--strict",
+        "--chaos",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+        "--chaos-timed-wait-spread=10",
+        "--sleep-registration=when-chosen",
+        "--seed=1",
+        record_arg.as_str(),
+        "--",
+        program,
+        "sleep",
+    ];
+    assert_success(&hermit(&args), &args);
+    let replay_arg = format!("--replay-schedule-from={}", record.display());
+    let args = [
+        "run",
+        "--strict",
+        "--chaos",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+        "--chaos-timed-wait-spread=10",
+        "--seed=1",
+        replay_arg.as_str(),
+        "--",
+        program,
+        "sleep",
+    ];
+    let refused = hermit(&args);
+    assert_eq!(refused.status.code(), Some(122), "{args:?}");
+    assert!(
+        stderr(&refused).contains("Record with --sleep-registration=first-pass"),
+        "{}",
+        stderr(&refused)
+    );
+}
+
 /// The same exec-boundary clock trajectory must also be reproducible, so the
 /// continuity above cannot be bought with a nondeterministic clock.
 #[test]

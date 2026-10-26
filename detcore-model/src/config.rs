@@ -788,10 +788,13 @@ pub struct Config {
     /// future deadline. Needs `--chaos`, or a replay of preemptions recorded with it, threads
     /// sequentialized by Detcore's scheduler, and the ptrace backend (or e9patch preprocessing,
     /// which runs on it); must be finite and above 1. Unset (the default), nothing changes.
-    /// `hermit analyze` refuses it: its bisect and minimize replays mix schedules found
-    /// under different seeds. `--replay-schedule-from` refuses it too: it evaluates a sleep
-    /// when its schedule next runs the thread, later than the recording did, and would draw
-    /// the wake time from another clock; replay with `--replay-preemptions-from` and `--chaos`.
+    /// Its sleeps are registered at the first scheduler pass by default
+    /// (`--sleep-registration=first-pass`), so a schedule replay draws each wake time from the
+    /// committed time the recording drew it from; `--replay-schedule-from` refuses a record of
+    /// sleeps registered when chosen, which it cannot reproduce, and spreads no wait filed after
+    /// its schedule has run out, where the run continues without chaos. `hermit analyze` refuses to
+    /// bisect or minimize it: those trials replay schedules found under different scheduler
+    /// seeds, and the factors are keyed on the seed.
     #[serde(default)]
     #[clap(long, value_name = "factor")]
     pub chaos_timed_wait_spread: Option<f64>,
@@ -1159,10 +1162,11 @@ pub struct Config {
     /// does not select by priority, where those late wakes are what real sleep-ordered races
     /// depend on, and on a backend whose sleepers' signal mask and dispositions the scheduler
     /// does not read (DBT, SaBRe and LiteInst without the in-guest delivery gate, KVM), and
-    /// `first-pass` otherwise. On such a backend a sleep parked at the first pass would be ended
-    /// by any signal the scheduler sends it, including one Linux ignores or the sleeper blocks,
-    /// so `first-pass` there, asked for or taken from a record, is refused by name before the
-    /// guest starts. A replay of a schedule or of preemptions that
+    /// `first-pass` otherwise, and always under `--chaos-timed-wait-spread`, whose wake times a
+    /// schedule replay can then reproduce. On such a backend a sleep parked at the first pass
+    /// would be ended by any signal the scheduler sends it, including one Linux ignores or the
+    /// sleeper blocks, so `first-pass` there, asked for or taken from a record, is refused by
+    /// name before the guest starts. A replay of a schedule or of preemptions that
     /// leaves this unset takes the value its record stores (a record that stores none, written
     /// before the option existed or by a `when-chosen` run, registered sleeps when chosen), and an
     /// explicit value that disagrees with the record is refused. `hermit analyze` and `hermit
@@ -2057,9 +2061,10 @@ impl Config {
             && match self.sleep_registration {
                 Some(registration) => registration == SleepRegistration::FirstPass,
                 None => {
-                    !self.chaos
+                    (!self.chaos
                         && self.sched_heuristic.is_priority_ordered()
-                        && self.reads_sleeper_signal_state()
+                        && self.reads_sleeper_signal_state())
+                        || self.chaos_timed_wait_spread.is_some()
                 }
             }
     }
@@ -5964,6 +5969,41 @@ mod tests {
     /// `--chaos-timed-wait-spread` is unset by default, parses, and survives
     /// the rendered command line and serde; a configuration from before the
     /// option reads as unset.
+    /// `--chaos-timed-wait-spread` registers queued sleeps at the first pass
+    /// unless `--sleep-registration` says otherwise, under `--chaos` as well,
+    /// so a schedule replay can reproduce its wake times; `hermit record` and
+    /// `hermit replay` still register them when chosen.
+    #[test]
+    fn a_timed_wait_spread_registers_sleeps_at_the_first_pass_by_default() {
+        let spread = Config {
+            chaos: true,
+            chaos_timed_wait_spread: Some(8.0),
+            ..Default::default()
+        };
+        assert!(spread.queued_sleeps_registered_at_first_pass());
+        assert!(
+            !Config {
+                chaos_timed_wait_spread: None,
+                ..spread.clone()
+            }
+            .queued_sleeps_registered_at_first_pass()
+        );
+        assert!(
+            !Config {
+                sleep_registration: Some(SleepRegistration::WhenChosen),
+                ..spread.clone()
+            }
+            .queued_sleeps_registered_at_first_pass()
+        );
+        assert!(
+            !Config {
+                recordreplay_modes: true,
+                ..spread
+            }
+            .queued_sleeps_registered_at_first_pass()
+        );
+    }
+
     #[test]
     fn chaos_timed_wait_spread_is_opt_in_and_round_trips() {
         let default = Config::default();
