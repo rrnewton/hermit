@@ -1975,7 +1975,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The split retains nine additional core identities: 1335 + 9 = 1344.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 1212 + 1 = 1213 (Train 5 delta +1).
-    ("test.hermit_unit", 1221),
+    // And fifteen for the aarch64 exclusive-loop rewrite: thirteen in
+    // hermit-cli/src/aarch64_lse (the decoder, the four idioms and their
+    // refusals), one for the packed-relative-relocation decoder, and one
+    // that the rewrite flags survive into a printed reproducer: 1236,
+    // listed. Derived with this node's own selection: `cargo nextest list
+    // -p hermit-run --features third-party-backends,kvm-native-test-support
+    // --lib --bins` lists 1241, of which this node's `--skip` patterns
+    // remove 5; one `#[ignore]` test, listed only with `--run-ignored all`
+    // (1242), is never executed.
+    ("test.hermit_unit", 1236),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
