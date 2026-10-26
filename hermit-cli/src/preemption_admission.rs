@@ -67,6 +67,9 @@ pub fn refuse_unsupported_preemption(
     let setting = if config.chaos_timeslice_range.is_some() {
         // The range sets the maximum, a timer request in its own right.
         "--chaos-timeslice-range"
+    } else if config.chaos_timeslice.is_some() {
+        // A replayed record's drawn maximum binds the replay as much.
+        "a replayed record's drawn --max-timeslice"
     } else if maximum_requested && config.max_timeslice.is_some() {
         "--max-timeslice"
     } else if config.imprecise_timers {

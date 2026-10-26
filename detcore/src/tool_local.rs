@@ -7306,9 +7306,12 @@ impl<T> ThreadState<T> {
                     // stream, so slices of every scale in it mix in one run. A
                     // schedule replay draws none: its slices end where the
                     // record says, and the drawn ends would only add PMU
-                    // check-ins.
+                    // check-ins. A per-run timeslice (`--chaos-timeslice-draw=run`,
+                    // or one a replayed record states) replaces the draw too.
                     let target_timeout_rcbs = match cfg.chaos_timeslice_range {
-                        Some(range) if !replay_controls_deadline => {
+                        Some(range)
+                            if !replay_controls_deadline && cfg.chaos_timeslice.is_none() =>
+                        {
                             range.log_uniform(self.chaos_prng.random::<f64>()) / nanos_per_rcb
                         }
                         _ => target_timeout_rcbs,

@@ -18349,6 +18349,90 @@ fn a_chaos_timeslice_range_draws_slices_from_the_seed_and_replays() {
     assert_eq!(preemptions(&plain), schedule);
 }
 
+/// `--chaos-timeslice-draw=run` draws a chaos run's `--max-timeslice` from
+/// its seed: the summary reports it, the preemption record stores it, and a
+/// preemption replay of the record runs under it with no timeslice option of
+/// its own and prints what the recording printed. Another seed draws another
+/// timeslice.
+#[test]
+fn a_run_draw_picks_the_timeslice_and_a_replay_runs_under_it() {
+    let _guard = hermit_run_guard();
+    let guest = chaos_spinner_and_new_thread_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = |name: &str| directory.path().join(name).to_str().unwrap().to_owned();
+    let run = |extra: &[&str], summary: &str| {
+        let mut args = vec![
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--chaos",
+        ];
+        let summary_arg = format!("--summary-json={summary}");
+        args.extend_from_slice(extra);
+        args.push(&summary_arg);
+        args.extend(["--", guest]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(summary).unwrap()).unwrap();
+        let timeslice = summary["preemption"]["max_timeslice_ns"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no timeslice in {summary}"));
+        (stdout(&output), timeslice)
+    };
+    let range = "--chaos-timeslice-range=1000..200000000";
+    let record = path("record.json");
+    let draw = "--chaos-timeslice-draw=run";
+    let (recorded, drawn) = run(
+        &[
+            "--seed=3",
+            range,
+            draw,
+            &format!("--record-preemptions-to={record}"),
+        ],
+        &path("record.summary.json"),
+    );
+    assert!((1_000..=200_000_000).contains(&drawn), "{drawn}");
+    let json: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    assert_eq!(
+        json["chaos_timeslice"], drawn,
+        "the record does not state the draw"
+    );
+    // Under another seed, with no timeslice option: the record decides.
+    let rerecord = path("rerecord.json");
+    let (replayed, replayed_timeslice) = run(
+        &[
+            "--seed=4",
+            &format!("--replay-preemptions-from={record}"),
+            &format!("--record-preemptions-to={rerecord}"),
+        ],
+        &path("replay.summary.json"),
+    );
+    assert_eq!(replayed_timeslice, drawn);
+    assert_eq!(replayed, recorded);
+    let preemptions = |path: &str| -> serde_json::Value {
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("no preemption record")).unwrap();
+        json["per_thread"]
+            .as_object()
+            .expect("per_thread")
+            .iter()
+            .map(|(tid, thread)| (tid.clone(), thread["preemption_rcbs"].clone()))
+            .collect()
+    };
+    assert_eq!(preemptions(&rerecord), preemptions(&record));
+    let json: serde_json::Value = serde_json::from_slice(&fs::read(&rerecord).unwrap()).unwrap();
+    assert_eq!(
+        json["chaos_timeslice"], drawn,
+        "the re-recorded record lost the draw"
+    );
+    let (_, other) = run(&["--seed=4", range, draw], &path("other.summary.json"));
+    assert_ne!(other, drawn, "seeds 3 and 4 drew the same timeslice");
+}
+
 /// The same bound on KVM, where the spinner's getpid takes no scheduler turn
 /// either: 90 ms before, 4 ms now.
 #[test]

@@ -75,6 +75,14 @@ pub struct PreemptionRecord {
     /// before the field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     cap_preemption_charge: bool,
+    /// The `--max-timeslice` the run that produced this record drew under
+    /// `--chaos-timeslice-draw=run` (`Config::chaos_timeslice`), in virtual
+    /// nanoseconds. A replay of the record runs under it (`hermit run` takes
+    /// it unless the replay gives another `--max-timeslice`, which is
+    /// refused). `None`, which writes nothing, for a run that drew none and
+    /// for records written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    chaos_timeslice: Option<u64>,
     /// Actual callback expirations associated with existing priority-history rows.
     /// Absent in old/edited recordings; never inferred from time or branch counts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -160,6 +168,7 @@ impl PreemptionRecord {
             pipe_wake_latency: None,
             signal_state_copy: None,
             cap_preemption_charge: false,
+            chaos_timeslice: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
@@ -221,6 +230,7 @@ impl PreemptionRecord {
             pipe_wake_latency,
             signal_state_copy,
             cap_preemption_charge,
+            chaos_timeslice,
             callback_checkpoints,
             rng_seed,
             expired_wait_runs_charged_once,
@@ -268,6 +278,7 @@ impl PreemptionRecord {
             pipe_wake_latency: *pipe_wake_latency,
             signal_state_copy: *signal_state_copy,
             cap_preemption_charge: *cap_preemption_charge,
+            chaos_timeslice: *chaos_timeslice,
             callback_checkpoints,
             rng_seed: *rng_seed,
             expired_wait_runs_charged_once: *expired_wait_runs_charged_once,
@@ -286,6 +297,18 @@ impl PreemptionRecord {
         let mut record = self.clone();
         record.global = events;
         record.validate().is_ok().then_some(record)
+    }
+
+    /// The `--max-timeslice` the run that produced this record drew under
+    /// `--chaos-timeslice-draw=run`, if it drew one.
+    pub fn chaos_timeslice(&self) -> Option<u64> {
+        self.chaos_timeslice
+    }
+
+    /// The same record, stating the timeslice its run drew.
+    pub fn with_chaos_timeslice(mut self, timeslice: Option<u64>) -> Self {
+        self.chaos_timeslice = timeslice;
+        self
     }
 
     /// The same record, stating the `--pipe-wake-latency` of the trials it
@@ -412,6 +435,7 @@ impl PreemptionRecord {
             pipe_wake_latency: self.pipe_wake_latency,
             signal_state_copy: self.signal_state_copy,
             cap_preemption_charge: self.cap_preemption_charge,
+            chaos_timeslice: self.chaos_timeslice,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: self.rng_seed,
             expired_wait_runs_charged_once: self.expired_wait_runs_charged_once,
@@ -478,6 +502,7 @@ impl PreemptionRecord {
             pipe_wake_latency: None,
             signal_state_copy: None,
             cap_preemption_charge: false,
+            chaos_timeslice: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
@@ -1035,6 +1060,48 @@ mod tests {
     /// The signal-state copy setting rides in a preemption record as the
     /// pipe-wake latency does, and a replay under the other setting is
     /// refused; a record that does not say (older, or synthesized) is not.
+    /// `--chaos-timeslice-draw=run` draws a pure function of the scheduler
+    /// seed, inside the range, spread evenly over its decades (log-uniform),
+    /// and a record stores the draw only when there is one.
+    #[test]
+    fn a_drawn_chaos_timeslice_is_seeded_log_uniform_and_recorded() {
+        let range: detcore_model::config::TimesliceRange = "1000..1000000000".parse().unwrap();
+        let mut decades = [0u32; 6];
+        for seed in 0..3000 {
+            let drawn = draw_chaos_timeslice(range, seed).get();
+            assert_eq!(draw_chaos_timeslice(range, seed).get(), drawn);
+            assert!((1_000..=1_000_000_000).contains(&drawn), "{drawn}");
+            decades[((drawn as f64).log10() as usize - 3).min(5)] += 1;
+        }
+        // 500 expected in each decade.
+        assert!(
+            decades.iter().all(|count| (400..=600).contains(count)),
+            "{decades:?}"
+        );
+        assert_ne!(
+            draw_chaos_timeslice(range, 1),
+            draw_chaos_timeslice(range, 2)
+        );
+        let point = "4321..4321".parse().unwrap();
+        assert_eq!(draw_chaos_timeslice(point, 9).get(), 4321);
+
+        let unsaid = PreemptionWriter::new(None).into_string();
+        assert!(!unsaid.contains("chaos_timeslice"), "{unsaid}");
+        let written = PreemptionWriter::new(None)
+            .with_chaos_timeslice(std::num::NonZeroU64::new(4321))
+            .into_string();
+        assert!(written.contains("\"chaos_timeslice\":4321"), "{written}");
+        let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert_eq!(back.chaos_timeslice(), Some(4321));
+        assert_eq!(back.clone_preemptions_only().chaos_timeslice(), Some(4321));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        std::fs::write(&path, &written).unwrap();
+        assert_eq!(read_recorded_chaos_timeslice(&path), Ok(Some(4321)));
+        std::fs::write(&path, &unsaid).unwrap();
+        assert_eq!(read_recorded_chaos_timeslice(&path), Ok(None));
+    }
+
     #[test]
     fn the_signal_state_copy_setting_round_trips_and_is_compared() {
         let unsaid = PreemptionRecord::from_sched_events(Vec::new());
@@ -1836,6 +1903,13 @@ impl PreemptionWriter {
         self.inner.store_exclusive_failures = HostObservedCount(failures);
     }
 
+    /// Store the `--max-timeslice` the run drew under `--chaos-timeslice-draw=run`
+    /// (`Config::chaos_timeslice`; `None` writes nothing).
+    pub fn with_chaos_timeslice(mut self, timeslice: Option<std::num::NonZeroU64>) -> Self {
+        self.inner.chaos_timeslice = timeslice.map(std::num::NonZeroU64::get);
+        self
+    }
+
     /// Does the record have zero entries?
     pub fn is_empty(&self) -> bool {
         self.inner.per_thread.is_empty()
@@ -2288,6 +2362,37 @@ pub fn expired_wait_charge_mismatch(
             replay.as_str(),
         )
     })
+}
+
+/// Read only the timeslice a preemption record file states its run drew under
+/// `--chaos-timeslice-draw=run` (`PreemptionRecord::chaos_timeslice`), as
+/// [`read_recorded_epoch`] reads the epoch. `Ok(None)` for a record without
+/// one.
+pub fn read_recorded_chaos_timeslice(path: &Path) -> Result<Option<u64>, String> {
+    #[derive(Deserialize)]
+    struct TimesliceOnly {
+        #[serde(default)]
+        chaos_timeslice: Option<u64>,
+    }
+    Ok(boundary_recording::read_settings::<TimesliceOnly>(path)?.chaos_timeslice)
+}
+
+/// The `--max-timeslice` a chaos run with `--chaos-timeslice-draw=run` draws:
+/// log-uniform over `range`, both bounds included, as a pure function of the
+/// scheduler seed. A stream of its own (`CHAOS_TIMESLICE_SALT`) keeps it
+/// independent of the seed's other draws, so adding the option changes no
+/// other random choice of the run.
+pub fn draw_chaos_timeslice(
+    range: detcore_model::config::TimesliceRange,
+    sched_seed: u64,
+) -> std::num::NonZeroU64 {
+    use rand::RngExt as _;
+    use rand::SeedableRng as _;
+    const CHAOS_TIMESLICE_SALT: u64 = 0x7469_6d65_736c_6963; // "timeslic"
+    let mut prng = rand_pcg::Pcg64Mcg::seed_from_u64(sched_seed ^ CHAOS_TIMESLICE_SALT);
+    let drawn = range.log_uniform(prng.random::<f64>()).round() as u64;
+    std::num::NonZeroU64::new(drawn.clamp(range.min.get(), range.max.get()))
+        .expect("the range starts at one RCB")
 }
 
 /// The refusal of a replay whose signal-state copy setting differs from the
