@@ -278,7 +278,8 @@ impl InterceptedCpuid {
 /// Whether CPUID's answer to `leaf` names the CPU that executes it: leaf 1's
 /// initial APIC ID (EBX bits 31-24), the x2APIC ID leaves 0xB and 0x1F give
 /// in EDX for every subleaf, and AMD's extended APIC IDs (leaf 0x8000001E's
-/// EAX, leaf 0x80000026's EDX).
+/// EAX, leaf 0x80000026's EDX). CPUID, and so this, is x86_64 only.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn names_executing_cpu(leaf: u32) -> bool {
     matches!(leaf, 0x1 | 0xb | 0x1f | 0x8000_001e | 0x8000_0026)
 }
@@ -288,6 +289,7 @@ pub(crate) fn names_executing_cpu(leaf: u32) -> bool {
 /// APIC ID [`names_executing_cpu`] lists is the CPU's number, and nothing
 /// else differs from CPU to CPU. Leaf 1's count of logical processors, leaf
 /// 4 and leaf 0xB's counts already describe a one-thread, one-core package.
+#[cfg(target_arch = "x86_64")]
 pub(crate) fn on_virtual_cpu(leaf: u32, mut result: CpuIdResult, cpu: u32) -> CpuIdResult {
     match leaf {
         0x1 => result.ebx = (result.ebx & 0x00ff_ffff) | (cpu << 24),
@@ -1062,6 +1064,7 @@ mod tests {
 
     /// The APIC IDs a CPUID answer names are the executing virtual CPU's;
     /// every other register and leaf is the table's.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn apic_ids_name_the_executing_virtual_cpu() {
         let table = InterceptedCpuid::new();
