@@ -29278,6 +29278,17 @@ fn liteinst_verify_with_forwarded_records_under(
     guest: &[&str],
     rust_log: Option<&str>,
 ) -> ForwardedVerify {
+    in_guest_verify_with_forwarded_records_on("liteinst", guest, rust_log)
+}
+
+/// [`liteinst_verify_with_forwarded_records_under`] on in-guest `backend`
+/// (`liteinst` or `in-guest-trap`).
+#[cfg(feature = "liteinst")]
+fn in_guest_verify_with_forwarded_records_on(
+    backend: &str,
+    guest: &[&str],
+    rust_log: Option<&str>,
+) -> ForwardedVerify {
     const FORWARDED: &str = "1970-01-01T00:00:00.000000Z INFO detcore";
 
     let logs = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -29286,7 +29297,7 @@ fn liteinst_verify_with_forwarded_records_under(
     let report_arg = report.to_str().expect("UTF-8 temporary path");
     let mut args = vec![
         "--backend",
-        "liteinst",
+        backend,
         "run",
         "--max-timeslice=disabled",
         "--verify",
@@ -30247,6 +30258,60 @@ fn liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader() {
         liteinst_verify_with_forwarded_records(&["/usr/bin/python3", "-I", "-B", "-c", GUEST]);
     assert_eq!(run.stdout, "alive\n");
     assert!(run.syscall_records > 0);
+}
+
+/// A guest that dup2s onto every number from 1016 to 1040, which covers where
+/// the in-guest runtime keeps its coordinator connection, performance counter
+/// and Tool output socket (1025 and up, or the top 8 numbers below a lower
+/// soft RLIMIT_NOFILE), gets each number as on Linux, and the runtime goes on
+/// working afterwards on both in-guest backends: the coordinator answers its
+/// calls and a fork child's, the counter keeps virtual time moving across a
+/// busy loop, and Tool records are still forwarded, including those of calls
+/// made after every dup2. The runtime moves each of its descriptors off a
+/// number the guest takes rather than refuse the call.
+#[test]
+#[cfg(feature = "liteinst")]
+fn in_guest_runtime_survives_a_guest_dup2_onto_each_of_its_descriptors() {
+    const GUEST: &str = "import os, time\n\
+        for fd in range(1016, 1041):\n\
+        \x20   assert os.dup2(1, fd) == fd, fd\n\
+        os.closerange(1016, 1041)\n\
+        t0 = time.clock_gettime_ns(time.CLOCK_MONOTONIC)\n\
+        n = 0\n\
+        for i in range(200000):\n\
+        \x20   n += i\n\
+        t1 = time.clock_gettime_ns(time.CLOCK_MONOTONIC)\n\
+        assert t1 > t0, (t0, t1)\n\
+        pid = os.fork()\n\
+        if pid == 0:\n\
+        \x20   os.getcwd()\n\
+        \x20   os._exit(7)\n\
+        _, status = os.waitpid(pid, 0)\n\
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 7, status\n\
+        os.getcwd()\n\
+        print('alive', flush=True)\n";
+
+    let _lock = hermit_run_guard();
+    for backend in ["liteinst", "in-guest-trap"] {
+        // -I -B: a writable bytecode cache would make the two runs differ.
+        let run = in_guest_verify_with_forwarded_records_on(
+            backend,
+            &["/usr/bin/python3", "-I", "-B", "-c", GUEST],
+            None,
+        );
+        assert_eq!(run.stdout, "alive\n", "{backend}");
+        let last_dup2 = run
+            .golden_log
+            .find("inbound syscall: dup2(1, 1040)")
+            .unwrap_or_else(|| {
+                panic!("{backend}: no record of the last dup2:\n{}", run.golden_log)
+            });
+        let after = &run.golden_log[last_dup2..];
+        assert!(
+            after.matches("inbound syscall: getcwd(").count() >= 2,
+            "{backend}: the parent's and the fork child's getcwd after the dup2s were not forwarded:\n{after}"
+        );
+    }
 }
 
 /// A guest whose own shared library's constructor, which the loader runs

@@ -4201,7 +4201,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Caller-owned DBT private placement adds two CLI launch regressions,
     // measured with the existing feature selection and exclusions unchanged:
     // 614.
-    ("test.cli", 614),
+    // And in_guest_runtime_survives_a_guest_dup2_onto_each_of_its_descriptors
+    // (https://github.com/rrnewton/hermit/issues/4689): 615.
+    ("test.cli", 615),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4709,7 +4711,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed with the existing feature selection and exclusions unchanged.
     // The same two private-placement regressions remain in the hosted selection,
     // measured with its existing exclusions unchanged: 533.
-    ("test.cli_on_host", 533),
+    // And the same in-guest dup2-onto-runtime-descriptors test, not excluded:
+    // 534.
+    ("test.cli_on_host", 534),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
