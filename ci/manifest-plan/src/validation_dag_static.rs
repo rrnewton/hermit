@@ -3258,7 +3258,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And a_format_this_hermit_does_not_read_survives_the_offsets_cap: 3270.
     // And a_writer_that_noted_an_instruction_offset_cannot_become_a_boundary_writer: 3271.
     // And a_priority_replay_of_an_unread_format_exits_with_the_policy_status: 3378.
-    ("test.detcore_unit", 3378),
+    // And tool_global's
+    // a_start_grant_carries_the_threads_replayed_first_slice and
+    // finish_thread_start_installs_a_replayed_first_slice: 3311, listed.
+    ("test.detcore_unit", 3380),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5779,7 +5782,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same unread-format cap unit: 3270.
     // And the same boundary-writer offsets unit: 3271.
     // And the same priority-installer refusal unit: 3378.
-    ("test.detcore_unit_on_host", 3378),
+    // And the same two start-grant units: 3311, listed.
+    ("test.detcore_unit_on_host", 3380),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
