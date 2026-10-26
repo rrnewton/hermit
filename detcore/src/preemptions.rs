@@ -42,6 +42,23 @@ use crate::types::DetTid;
 use crate::types::LogicalTime;
 use crate::types::SchedEvent;
 
+/// A turn the scheduler gave a polling thread only to skip it
+/// (`Scheduler::step4_resource_block`): a scheduling decision that runs no
+/// guest code and so leaves no event. It is recorded after the global
+/// schedule's first `after` events, attached to the last of them, so it does
+/// not change any event's number. A schedule replay takes the same skip at the
+/// same point: a poller's skips alternate with its attempts, and a skip the
+/// replay takes later than its recording moves the poller's next attempt by a
+/// whole scheduler pass.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PollSkip {
+    /// How many events of the global schedule came before the skip.
+    pub after: u64,
+    /// The polling thread the scheduler skipped.
+    pub thread: DetTid,
+}
+
 /// A record of all the preemptions and other scheduling events that occur during execution.
 #[derive(PartialEq, Default, Debug, Eq, Clone, Hash)]
 pub struct PreemptionRecord {
@@ -157,6 +174,11 @@ pub struct PreemptionRecord {
     /// Analyze and bisect carry a source record's jumps into the trial
     /// schedules they splice from it (`with_time_skips`).
     time_skips: Option<Vec<TimeSkip>>,
+    /// The turns the scheduler gave polling threads only to skip them, in the
+    /// order it took them (`PollSkip`). Absent in records written before the
+    /// field existed, which replay as before, and dropped, as the callback
+    /// checkpoints are, by any edit of the schedule.
+    poll_skips: Vec<PollSkip>,
 }
 
 /// A count a record's run observed on its host rather than decided: it is
@@ -293,6 +315,7 @@ impl PreemptionRecord {
             store_exclusive_failures: HostObservedCount::default(),
             format_version: None,
             time_skips: None,
+            poll_skips: Vec::new(),
         }
     }
 
@@ -701,6 +724,7 @@ impl PreemptionRecord {
     /// TODO: provide a better way to create an empty PreemptionRecord but with entries for a given set of tids.
     pub fn strip_contents(mut self) -> Self {
         self.callback_checkpoints.clear();
+        self.drop_poll_skips();
         for history in self.per_thread.values_mut() {
             history.prio_changes = Vec::new();
             history.preemption_rcbs = Vec::new();
@@ -719,6 +743,7 @@ impl PreemptionRecord {
         F: Fn(SchedEvent, &ReplayCursor<SchedEvent>) -> R,
     {
         self.callback_checkpoints.clear();
+        self.drop_poll_skips();
         let mut result = Vec::new();
         let global = std::mem::take(&mut self.global);
         let mut cursor = ReplayCursor::from_iter(global);
@@ -734,12 +759,14 @@ impl PreemptionRecord {
     /// Iterate over the schedevents.
     pub fn schedevents_iter_mut(&mut self) -> std::slice::IterMut<'_, SchedEvent> {
         self.callback_checkpoints.clear();
+        self.drop_poll_skips();
         self.global.iter_mut()
     }
 
     /// Leave only the per-thread preemption records, not the global schedule.
     pub fn preemptions_only(&mut self) {
         self.callback_checkpoints.clear();
+        self.drop_poll_skips();
         self.global.clear();
     }
 
@@ -765,6 +792,7 @@ impl PreemptionRecord {
             store_exclusive_failures: HostObservedCount::default(),
             format_version: None,
             time_skips: None,
+            poll_skips: Vec::new(),
         }
     }
 
@@ -836,6 +864,7 @@ impl PreemptionRecord {
             store_exclusive_failures: HostObservedCount::default(),
             format_version: None,
             time_skips: None,
+            poll_skips: Vec::new(),
         }
     }
 
@@ -849,6 +878,17 @@ impl PreemptionRecord {
         &self,
     ) -> &BTreeMap<DetTid, Vec<callback_history::Checkpoint>> {
         &self.callback_checkpoints
+    }
+
+    /// The poll skips the record holds, in order (`PollSkip`).
+    pub fn poll_skips(&self) -> &[PollSkip] {
+        &self.poll_skips
+    }
+
+    /// Forget the poll skips: an edit of the schedule moves the events they
+    /// follow. The record keeps its format, the rules its run followed.
+    fn drop_poll_skips(&mut self) {
+        self.poll_skips.clear();
     }
 
     /// Timestamp stripping preserves the event/progress relation, unlike an editor.
@@ -893,6 +933,21 @@ impl PreemptionRecord {
     /// ([`Self::validate_format`]), whose failure is a refusal rather than a
     /// malformed record, and which readers check separately for that reason.
     pub fn validate_contents(&self) -> Result<(), String> {
+        let events = self.global.len() as u64;
+        if let Some(skip) = self
+            .poll_skips
+            .iter()
+            .zip(self.poll_skips.iter().skip(1))
+            .find(|(a, b)| a.after > b.after)
+            .map(|(_, b)| b)
+            .or_else(|| self.poll_skips.iter().find(|skip| skip.after > events))
+        {
+            return Err(format!(
+                "poll skip after event {} of thread {} is out of order or past the {} recorded \
+                 events",
+                skip.after, skip.thread, events
+            ));
+        }
         self.validate_callback_checkpoints()?;
         self.validate_histories()
     }
@@ -1139,6 +1194,7 @@ impl PreemptionRecord {
 
         let mut clone = self.clone();
         clone.callback_checkpoints.clear();
+        clone.drop_poll_skips();
         if let Some(tid) = tid_with_preempt_to_drop {
             let thread_history = &mut clone.per_thread.get_mut(&tid).unwrap();
             if !thread_history.prio_changes.is_empty() {
@@ -1428,6 +1484,71 @@ mod tests {
         assert!(!exact.contains("replay_departed_at"), "{exact}");
         std::fs::write(&path, &exact).unwrap();
         assert_eq!(read_recorded_replay_departure(&path), Ok(None));
+    }
+
+    /// Poll skips are recorded after the events before them and stamp the
+    /// record format 2. They round-trip through JSON, and a record without
+    /// them is written as before, with neither field. A record of a newer
+    /// format, or with a skip out of order or past its events, is refused.
+    /// An edit of the schedule drops them, and stripping event times keeps
+    /// them.
+    #[test]
+    fn poll_skips_are_recorded_after_their_events_and_version_the_record() {
+        let event = |tid: i32| SchedEvent {
+            dettid: DetTid::from_raw(tid),
+            op: Op::OtherInstructions,
+            count: 1,
+            start_rip: None,
+            end_rip: None,
+            end_time: Some(LogicalTime::from_nanos(5)),
+        };
+        let mut plain = PreemptionWriter::new(None);
+        plain.insert_schedevent(event(3));
+        let plain = plain.into_string();
+        assert!(!plain.contains("poll_skips"), "{plain}");
+        assert!(!plain.contains("format_version"), "{plain}");
+
+        let mut writer = PreemptionWriter::new(None);
+        writer.insert_poll_skip(DetTid::from_raw(5));
+        writer.insert_schedevent(event(3));
+        writer.insert_poll_skip(DetTid::from_raw(5));
+        writer.insert_poll_skip(DetTid::from_raw(7));
+        writer.insert_schedevent(event(7));
+        let json = writer.into_string();
+        let record: PreemptionRecord = serde_json::from_str(&json).unwrap();
+        record.validate().unwrap();
+        assert_eq!(record.format_version, Some(PREEMPTION_RECORD_FORMAT));
+        let skip = |after, tid| PollSkip {
+            after,
+            thread: DetTid::from_raw(tid),
+        };
+        assert_eq!(
+            record.poll_skips(),
+            &[skip(0, 5), skip(1, 5), skip(1, 7)][..]
+        );
+
+        let mut stripped = record.clone();
+        stripped.strip_event_times();
+        assert_eq!(stripped.poll_skips(), record.poll_skips());
+        let mut edited = record.clone();
+        edited.schedevents_iter_mut().for_each(drop);
+        assert!(edited.poll_skips().is_empty());
+        assert_eq!(edited.format_version, record.format_version);
+
+        let mut newer = record.clone();
+        newer.format_version = Some(PREEMPTION_RECORD_FORMAT + 1);
+        assert!(
+            newer
+                .validate()
+                .unwrap_err()
+                .contains("this Hermit reads formats 1 to"),
+        );
+        let mut out_of_order = record.clone();
+        out_of_order.poll_skips.swap(0, 1);
+        assert!(out_of_order.validate().is_err());
+        let mut past_the_end = record;
+        past_the_end.poll_skips.push(skip(3, 5));
+        assert!(past_the_end.validate().is_err());
     }
 
     /// `--pipe-wake-latency` rides in a preemption record as the epoch does:
@@ -2732,6 +2853,20 @@ impl PreemptionWriter {
         } else {
             trace!("NOT recording scheduled event with zero count!");
         }
+    }
+
+    /// Record that the scheduler gave the polling thread `thread` a turn only
+    /// to skip it, after the events recorded so far (`PollSkip`). A writer of
+    /// the slice-boundary stream records none.
+    pub(crate) fn insert_poll_skip(&mut self, thread: DetTid) {
+        if self.boundary_records.is_some() {
+            return;
+        }
+        self.inner.poll_skips.push(PollSkip {
+            after: self.inner.global.len() as u64,
+            thread,
+        });
+        self.inner.format_version = Some(PREEMPTION_RECORD_FORMAT);
     }
 
     /// Append the observation of an existing slice-end request at its exact

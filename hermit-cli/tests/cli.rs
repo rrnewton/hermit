@@ -20459,6 +20459,58 @@ fn prctl_set_ptracer_answers_as_the_host_kernel_does() {
     assert_eq!(stdout(&output), native_stdout);
 }
 
+/// A recording notes each turn the scheduler gave a polling thread only to
+/// skip it, and a schedule replay takes those skips where its recording did.
+/// The guest's pipe reader retries as a poller; seeds 1, 5, 6 and 7, recorded
+/// under `--chaos`, each skip it right after a failed attempt and before a
+/// writer runs. Each record must hold its skips, as format 2, and each replay
+/// must print the recording's line with no desync. This guest replays
+/// faithfully without the skips too: the replay takes such a skip one pass
+/// late, which here moves nothing. The test pins the record and the replay of
+/// skips, whose loss desynced replays of programs where that pass moved the
+/// clock.
+#[test]
+fn a_schedule_replay_takes_a_pollers_skipped_turns_where_its_recording_did() {
+    let program = pipe_reader_replay_guest()
+        .to_str()
+        .expect("pipe-reader-replay guest path should be UTF-8");
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for seed in [1, 5, 6, 7] {
+        let record = dir.path().join(format!("seed-{seed}.json"));
+        let summary = dir.path().join(format!("seed-{seed}.summary.json"));
+        let seed_arg = format!("--seed={seed}");
+        let record_arg = format!("--record-preemptions-to={}", record.display());
+        let replay_arg = format!("--replay-schedule-from={}", record.display());
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let run = |extra: &[&str]| {
+            let mut args = vec!["run", "--strict", "--epoch=2026-01-01T00:00:00Z"];
+            args.extend_from_slice(extra);
+            args.extend(["--", program]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            stdout(&output)
+        };
+        let recorded = run(&["--chaos", seed_arg.as_str(), record_arg.as_str()]);
+        let record_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+        assert!(
+            record_json["poll_skips"]
+                .as_array()
+                .is_some_and(|skips| !skips.is_empty()),
+            "seed {seed}: no poll skip recorded"
+        );
+        assert_eq!(record_json["format_version"], 2, "seed {seed}");
+        assert_eq!(
+            run(&[replay_arg.as_str(), summary_arg.as_str()]),
+            recorded,
+            "seed {seed}"
+        );
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+        assert_eq!(summary["schedevent_desynced"], 0, "seed {seed}: {summary}");
+    }
+}
+
 /// The same exec-boundary clock trajectory must also be reproducible, so the
 /// continuity above cannot be bought with a nondeterministic clock.
 #[test]
