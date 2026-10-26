@@ -2733,7 +2733,18 @@ fi
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory (1009), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the bbac9b47 entry.
-expected_pin=fbd29608ec2902e33e630fc6a30ff18f8d77c90e
+# CARRY TO 2459e33e501a8610a7f806303ef558800b2f1b34 (2026-10-26): from
+# fbd29608ec2902e33e630fc6a30ff18f8d77c90e. One commit (linuxemu lane, S3): LinuxEmu's getcwd
+# walks the working-directory handle at each call. It changes
+# reverie-linuxemu/src/executor/file.rs and the executor's tests only. git
+# diff is empty under reverie-dbt/ and third-party/ and for the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml; both repository inputs to
+# the DynamoRIO content key are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory (1009), SDK and native inputs, calibrated budget, job width
+# and limits carry unchanged from the fbd29608 entry.
+expected_pin=2459e33e501a8610a7f806303ef558800b2f1b34
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
