@@ -1964,7 +1964,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_weak_nap_ranks_after_the_evidenced_pairs}: 1350.
     // And analyze::races::tests::
     // a_nearer_wait_of_similar_length_ranks_before_a_long_nap: 1351.
-    ("test.hermit_unit", 1351),
+    // And the racing-accesses report's races::tests::{
+    // the_outcome_point_is_the_first_criterion_met_after_the_decision,
+    // the_block_prints_each_access_stack_and_an_unavailable_reason} and
+    // race_report::tests::{an_unreadable_realized_schedule_is_named,
+    // a_traced_replay_carries_the_record_cap}: 1355.
+    ("test.hermit_unit", 1355),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6071,7 +6076,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same seven ranked-candidate finder tests: 1342.
     // And the same two change-of-course timing tests: 1344.
     // And the same wait-ranking test: 1345.
-    ("test.hermit_unit_on_host", 1345),
+    // And the same four racing-accesses report tests: 1349.
+    ("test.hermit_unit_on_host", 1349),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
