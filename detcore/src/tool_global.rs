@@ -53,6 +53,9 @@ use detcore_model::procfs::mount_ids_are_ordered_subset;
 use detcore_model::summary::PreemptionSummary;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
+use detcore_model::syscall_histogram::SyscallHistogram;
+pub use detcore_model::syscall_histogram::SyscallObservationGap;
+use detcore_model::syscall_histogram::SyscallObservationScope;
 pub(crate) use exec_identity::reconnect_exec;
 pub(crate) use exec_identity::retire_exec;
 use nix::sys::signal;
@@ -1154,6 +1157,11 @@ pub struct GlobalState {
     // Unsupported syscall names observed across every process in this run.
     unsupported_syscalls: Mutex<BTreeSet<String>>,
 
+    /// Why the syscall histogram may miss calls, as the launcher reports it
+    /// (`GlobalState::note_syscall_observation_gap`); `--passthru-opt` is
+    /// added from the configuration.
+    syscall_observation_gaps: Mutex<BTreeSet<SyscallObservationGap>>,
+
     // Signals whose requested disposition Detcore did not install, already
     // announced in this run (`GlobalRequest::AnnounceSignalHandlerNotInstalled`).
     announced_handlers_not_installed: Mutex<BTreeSet<i32>>,
@@ -1731,6 +1739,7 @@ impl GlobalState {
             next_port: AtomicU16::new(range[0]),
             used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
+            syscall_observation_gaps: Mutex::new(BTreeSet::new()),
             announced_handlers_not_installed: Mutex::new(BTreeSet::new()),
             announced_refused_signal_controls: Mutex::new((0, false)),
             policy_refusal: Mutex::new(None),
@@ -1988,6 +1997,13 @@ impl GlobalState {
         }
     }
 
+    /// Record that the run's syscall histogram cannot count every syscall the
+    /// guest makes, for `gap`. Its summary then reports a partial observation
+    /// scope.
+    pub fn note_syscall_observation_gap(&self, gap: SyscallObservationGap) {
+        self.syscall_observation_gaps.lock().unwrap().insert(gap);
+    }
+
     /// Why the fail-closed policy ended the run, when a Tool image reported
     /// it before exiting (`GlobalRequest::PolicyRefusal`).
     pub fn policy_refusal(&self) -> Option<String> {
@@ -2222,6 +2238,13 @@ impl GlobalState {
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the
         // CURRENT time -- that we are calling summarize -- as the end time:
         summary.realtime_elapsed = Some(self.realtime_start.elapsed()?);
+        if let Some(histogram) = &mut summary.syscall_histogram {
+            let mut gaps = self.syscall_observation_gaps.lock().unwrap().clone();
+            if self.cfg.passthru_opt {
+                gaps.insert(SyscallObservationGap::PassthruOpt);
+            }
+            histogram.observation_scope = SyscallObservationScope::from_gaps(gaps);
+        }
 
         if self.cfg.virtualize_time {
             let final_time = self.global_time.lock().unwrap();
@@ -5580,6 +5603,7 @@ impl GlobalState {
             vfork_origin: _,
             timeslice_stats,
             syscall_count,
+            syscall_histogram,
             chaos_epochs,
         } = deregistration;
         if !sched.rpc_incarnation_matches(dettid, mm) {
@@ -5608,7 +5632,7 @@ impl GlobalState {
             }
         }
         sched.record_timeslice_stats(dettid, timeslice_stats);
-        sched.record_syscall_count(dettid, syscall_count);
+        sched.record_syscall_count(dettid, syscall_count, syscall_histogram);
         // A SIGKILL victim is retired at its sender's turn, not here
         // (`scheduler::sigkill_retirement`): its receipt is accounted above
         // and only counted.
@@ -6200,6 +6224,8 @@ pub struct ThreadDeregistration {
     pub(crate) vfork_origin: Option<ExternalOpId>,
     pub(crate) timeslice_stats: TimesliceStats,
     pub(crate) syscall_count: u64,
+    /// The thread's syscall entries and outcomes; its total is `syscall_count`.
+    pub(crate) syscall_histogram: SyscallHistogram,
     pub(crate) chaos_epochs: Vec<ChaosEpochTransition>,
 }
 
@@ -11879,6 +11905,7 @@ mod tests {
                     vfork_origin: None,
                     timeslice_stats: TimesliceStats::default(),
                     syscall_count: 0,
+                    syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
                 },
             );
@@ -14387,6 +14414,7 @@ mod tests {
                         max_ns: 10,
                     },
                     syscall_count: 3,
+                    syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
                 };
                 for _ in 0..2 {
@@ -14512,6 +14540,7 @@ mod tests {
                                 max_ns: 10,
                             },
                             syscall_count: 3,
+                            syscall_histogram: Default::default(),
                             chaos_epochs: Vec::new(),
                         }),
                     ),
@@ -16198,6 +16227,7 @@ mod tests {
                     mm: MmId::initial(detpid),
                     timeslice_stats: TimesliceStats::default(),
                     syscall_count: 0,
+                    syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
                 },
             )
@@ -16357,6 +16387,7 @@ mod tests {
                         mm: old_mm,
                         timeslice_stats: TimesliceStats::default(),
                         syscall_count: 0,
+                        syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
                     }),
                 ),
@@ -17213,7 +17244,7 @@ mod tests {
         // traces the guest counts it before post-exec. (A backend that starts
         // the guest already executing reaches its first post-exec with nothing
         // counted, and post-exec charges the execve itself.)
-        thread.stats.count_syscall();
+        thread.stats.count_syscall(Sysno::execve);
         thread.thread_logical_time.add_syscall_with_cost(137);
         let mut guest = ExternalRegistrationGuest {
             global: &state,
@@ -17766,6 +17797,7 @@ mod tests {
                     mm: MmId::initial(detpid),
                     timeslice_stats: TimesliceStats::default(),
                     syscall_count: 0,
+                    syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
                 },
             )
@@ -17793,6 +17825,7 @@ mod tests {
                     mm: MmId::initial(detpid).for_exec(detpid),
                     timeslice_stats: TimesliceStats::default(),
                     syscall_count: 0,
+                    syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
                 },
             )
@@ -18108,6 +18141,7 @@ mod tests {
                         mm: MmId::initial(detpid),
                         timeslice_stats: final_stats,
                         syscall_count: 17,
+                        syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
                     }),
                 ),
@@ -18143,6 +18177,7 @@ mod tests {
                         mm: MmId::initial(detpid),
                         timeslice_stats: final_stats,
                         syscall_count: 99,
+                        syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
                     }),
                 ),

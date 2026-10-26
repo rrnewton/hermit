@@ -1165,7 +1165,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (848214c0, HERMIT_CPU_PROFILE): 1845, listed.
     // And runner::tests::verify_and_chaos_pairs_share_the_hosts_ld_so_cache_and_replay_pairs_do_not
     // (https://github.com/rrnewton/hermit/issues/4693): 1846, listed.
-    ("test.regular_crates", 1846),
+    // And detcore-model's eight syscall_histogram::tests units for
+    // the per-run syscall histogram (dh-te7ep): 1854, listed.
+    ("test.regular_crates", 1854),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2933,7 +2935,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the scheduler unit
     // a_thread_directed_child_exit_sigchld_stands_for_the_exit_without_publication
     // (https://github.com/rrnewton/hermit/issues/4710): 2606, listed.
-    ("test.detcore_unit", 2606),
+    // And detcore's five syscall_histogram::tests outcome units for
+    // the per-run syscall histogram (dh-te7ep): 2611, listed.
+    ("test.detcore_unit", 2611),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3267,7 +3271,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and recvmsg-import refusals and native-lock control, and
     // proc_locks_determinism's copied-child OFD unlock and stale-flock-record
     // tests: 285, listed.
-    ("test.hermit_integration_2", 285),
+    // And dispatch_stats::ptrace_syscall_histograms_of_two_runs_are_identical
+    // (the per-run syscall histogram (dh-te7ep)): 286, listed.
+    ("test.hermit_integration_2", 286),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -5113,7 +5119,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two 3c.1e A review round 3 units: 2603, listed.
     // And the same two capability slice 5 units: 2605, listed.
     // And the same issue 4710 scheduler unit: 2606, listed.
-    ("test.detcore_unit_on_host", 2606),
+    // And the same five syscall_histogram units: 2611, listed.
+    ("test.detcore_unit_on_host", 2611),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5226,7 +5233,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Split the five birth cases into separately bounded identities (+4): 689.
     // And two pure declared-Redis input controls in redis_strict: 691, listed.
     // Name the optional e9patch consumer leg separately; all ten legs remain (+1): 692.
-    ("test.hermit_integration_on_host", 692),
+    // And the same two-run syscall-histogram test: 693, listed.
+    ("test.hermit_integration_on_host", 693),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -5657,7 +5665,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two detcore-dbt configuration tests: 1830, listed.
     // And the same HERMIT_CPU_PROFILE detcore-model test (848214c0): 1831, listed.
     // And the same ld.so.cache-sharing runner test: 1832, listed.
-    ("test.regular_crates_on_host", 1832),
+    // And the same eight syscall_histogram units: 1840, listed.
+    ("test.regular_crates_on_host", 1840),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
