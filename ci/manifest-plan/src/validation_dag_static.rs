@@ -1986,7 +1986,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And analyze::races::tests::{a_trace_without_descriptor_types_gives_no_pipe_edge,
     // a_real_trace_recorded_without_metadata_virtualization_gives_no_pipe_edge}: 1411.
     // And analyze::races::tests::a_fifo_access_from_a_process_holding_no_end_gives_no_edge: 1412.
-    ("test.hermit_unit", 1412),
+    // And the racing-accesses report's races::tests::{
+    // the_outcome_point_is_the_first_criterion_met_after_the_decision,
+    // the_block_prints_each_access_stack_and_an_unavailable_reason} and
+    // race_report::tests::{an_unreadable_realized_schedule_is_named,
+    // a_traced_replay_carries_the_record_cap}: 1416.
+    ("test.hermit_unit", 1416),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6116,7 +6121,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two FIFO-access tests: 1403.
     // And the same two untyped-descriptor tests: 1405.
     // And the same FIFO-access test: 1406.
-    ("test.hermit_unit_on_host", 1406),
+    // And the same four racing-accesses report tests: 1410.
+    ("test.hermit_unit_on_host", 1410),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
