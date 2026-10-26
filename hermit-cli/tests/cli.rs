@@ -151,6 +151,7 @@ static ABSTRACT_UNIX_BIND_GUEST: OnceLock<PathBuf> = OnceLock::new();
 #[cfg(feature = "liteinst")]
 static LITEINST_INERT_RUNTIME: OnceLock<PathBuf> = OnceLock::new();
 static EXEC_CLOCK_CONTINUITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PRCTL_SET_PTRACER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_TWO_THREADS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FIFO_PEER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HB_SOURCE_THEN_FUTEX_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -805,6 +806,32 @@ fn exec_clock_continuity_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "exec-clock-continuity guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn prctl_set_ptracer_guest() -> &'static Path {
+    PRCTL_SET_PTRACER_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("prctl-set-ptracer");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create prctl-set-ptracer guest directory");
+        let guest = build_root.join("prctl_set_ptracer");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/prctl_set_ptracer.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile prctl-set-ptracer guest");
+        assert!(
+            output.status.success(),
+            "prctl-set-ptracer guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -18409,6 +18436,37 @@ fn run_ptrace_virtual_clock_advances_across_execve() {
     let output = hermit(&args);
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "exec-clock-continuity-ok\n");
+}
+
+/// `prctl(PR_SET_PTRACER)` answers under Hermit as it does natively on the
+/// same host: 0 with the Yama LSM, EINVAL without it. Detcore used to answer
+/// ENOSYS, which bionic's crash handler treats as fatal, so every crashing
+/// guest on Android exited 1 instead of dying of its signal.
+#[test]
+fn prctl_set_ptracer_answers_as_the_host_kernel_does() {
+    let program = prctl_set_ptracer_guest()
+        .to_str()
+        .expect("prctl-set-ptracer guest path should be UTF-8");
+    let native = Command::new(program)
+        .output()
+        .expect("failed to run the prctl-set-ptracer guest natively");
+    assert!(native.status.success(), "native run failed: {native:?}");
+    let native_stdout = String::from_utf8_lossy(&native.stdout).into_owned();
+    assert!(
+        !native_stdout.contains("ENOSYS"),
+        "the host kernel answered ENOSYS:\n{native_stdout}"
+    );
+    let args = [
+        "run",
+        "--strict",
+        "--max-timeslice=disabled",
+        "--no-virtualize-cpuid",
+        "--",
+        program,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), native_stdout);
 }
 
 /// The same exec-boundary clock trajectory must also be reproducible, so the

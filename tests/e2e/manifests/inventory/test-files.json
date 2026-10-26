@@ -1729,6 +1729,12 @@
       "why": "tests/c/prctl_pdeathsig.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/prctl_set_ptracer.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/prctl_set_ptracer.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this guest, runs it natively and under Hermit on the same host, and asserts that prctl(PR_SET_PTRACER) answers identically (0 with the Yama LSM, EINVAL without it); it remains a guest fixture because a generic manifest cannot express the native-versus-Hermit comparison on the host's own LSM configuration."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/preadv2_flags.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
