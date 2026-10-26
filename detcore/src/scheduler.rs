@@ -3130,6 +3130,11 @@ impl ThreadTree {
         self.thread_group_leaders.contains(tid) || self.thread_to_leader.contains_key(tid)
     }
 
+    /// Every thread the thread group of `me` has had, live or not, found by
+    /// walking the tree from its leader. The tree keeps exited threads, so
+    /// this costs every thread the group ever had; for the live ones use
+    /// `Scheduler::live_thread_group`.
+    ///
     /// Locks: takes scheduler lock.
     pub fn my_thread_group(&self, me: &DetTid) -> Vec<DetTid> {
         let root_tid: DetTid = if self.thread_group_leaders.contains(me) {
@@ -5655,22 +5660,14 @@ impl Scheduler {
 
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(#663)
-        let live_process_thread = self
-            .thread_tree
-            .my_thread_group(detpid)
-            .into_iter()
-            .any(|tid| self.next_turns.contains_key(&tid));
+        let live_process_thread = self.live_thread_group(detpid).next().is_some();
         // A raw clone child with a non-SIGCHLD exit signal is its own process
         // in the thread tree, although the backend reports its creator's pid
         // (`ResourceID::Exit` below makes the same distinction). Its exit
         // still decides its orphans, when its last thread leaves.
         if let Some(registered) = self.registered_process(*dtid)
             && registered != *detpid
-            && !self
-                .thread_tree
-                .my_thread_group(&registered)
-                .into_iter()
-                .any(|tid| self.next_turns.contains_key(&tid))
+            && self.live_thread_group(&registered).next().is_none()
         {
             self.namespace_zap_victims.remove(&registered);
             self.signal_death_victims.remove(&registered);
@@ -10653,10 +10650,31 @@ impl Scheduler {
         let Some(leader) = self.signal_target_process(detpid) else {
             return Vec::new();
         };
-        let mut targets = self.thread_tree.my_thread_group(&leader);
-        targets.retain(|tid| self.next_turns.contains_key(tid));
-        targets.sort();
-        targets
+        self.live_thread_group(&leader).collect()
+    }
+
+    /// The live threads of the thread group that `member` belongs to, in
+    /// DetTid order: the threads with turn state (`next_turns`) whose group
+    /// leader is that group's. Without reused thread IDs these are the threads
+    /// of `ThreadTree::my_thread_group` that have turn state, but finding them
+    /// costs the run's live threads, not every thread the group ever had: the
+    /// tree keeps exited threads, and every thread exit asks this question, so
+    /// walking the tree made a guest that starts and joins N threads cost
+    /// O(N^2). After Linux reuses a thread ID the tree can also list the
+    /// thread under its earlier group, or twice, and `thread_group_leaders`
+    /// still holds an ID that once led a process; `thread_to_leader`, which
+    /// maps every registered thread (a leader to itself), holds its current
+    /// group.
+    pub(crate) fn live_thread_group(&self, member: &DetTid) -> impl Iterator<Item = DetTid> + '_ {
+        let leader = *self
+            .thread_tree
+            .thread_to_leader
+            .get(member)
+            .expect("thread must be in to_leader table");
+        self.next_turns
+            .keys()
+            .copied()
+            .filter(move |tid| self.thread_tree.thread_to_leader.get(tid) == Some(&leader))
     }
 
     fn wake_timed_event(&mut self, time_ns: LogicalTime, dettid: DetTid) {
@@ -14586,12 +14604,7 @@ impl Scheduler {
                 // thread in: for a raw clone child with a non-SIGCHLD exit
                 // signal, the backend's `process` names its creator instead.
                 if let Some(exiting) = self.registered_process(dettid)
-                    && (*group
-                        || !self
-                            .thread_tree
-                            .my_thread_group(&exiting)
-                            .into_iter()
-                            .any(|tid| tid != dettid && self.next_turns.contains_key(&tid)))
+                    && (*group || !self.live_thread_group(&exiting).any(|tid| tid != dettid))
                 {
                     self.thread_tree.granted_exits.insert(exiting);
                     self.note_pid_namespace_end(exiting);
@@ -14609,11 +14622,7 @@ impl Scheduler {
                 // The thread leaves by its own committed exit, not by dying
                 // with its process (https://github.com/rrnewton/hermit/issues/3904).
                 self.committed_exits.insert(dettid);
-                let last_live_thread = !self
-                    .thread_tree
-                    .my_thread_group(process)
-                    .into_iter()
-                    .any(|tid| tid != dettid && self.next_turns.contains_key(&tid));
+                let last_live_thread = !self.live_thread_group(process).any(|tid| tid != dettid);
                 // An exit that ends its process leaves the host some time after
                 // this grant. Hold turn selection from here until the backend
                 // reports the process physically gone (asynchronous exit
@@ -24332,6 +24341,103 @@ mod test {
         assert_eq!(&v, &[p3, p4, p5]);
         let s = tree.pretty_print();
         assert!(!s.is_empty());
+    }
+
+    /// A process whose threads come and go: its live threads are those with
+    /// turn state, from any depth of the creation tree and whichever thread
+    /// created them, and never a thread of a child process.
+    #[test]
+    fn the_live_thread_group_is_the_tree_walk_less_exited_threads() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw;
+        let (leader, first, second, third, child) =
+            (tid(100), tid(101), tid(102), tid(103), tid(104));
+        scheduler.thread_tree.add_child(leader, leader, true);
+        scheduler.thread_tree.add_child(leader, first, false);
+        scheduler.thread_tree.add_child(first, second, false);
+        scheduler.thread_tree.add_child(second, third, false);
+        scheduler.thread_tree.add_child(third, child, true);
+        for thread in [leader, second, third, child] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        // `first` exited; `third` hangs below it in the tree.
+        let walked: Vec<DetTid> = {
+            let mut group = scheduler.thread_tree.my_thread_group(&leader);
+            group.retain(|thread| scheduler.next_turns.contains_key(thread));
+            group.sort();
+            group
+        };
+        assert_eq!(walked, [leader, second, third]);
+        for member in [leader, first, third] {
+            assert_eq!(
+                scheduler.live_thread_group(&member).collect::<Vec<_>>(),
+                walked
+            );
+        }
+        assert_eq!(scheduler.process_signal_targets(leader), walked);
+        assert_eq!(
+            scheduler.live_thread_group(&child).collect::<Vec<_>>(),
+            [child]
+        );
+    }
+
+    /// The tree keeps the edge to an exited thread, so after Linux gives its
+    /// ID to a thread of another process the tree lists that thread under
+    /// both. Its live group is only the one it belongs to now.
+    #[test]
+    fn a_reused_thread_id_is_live_only_in_its_current_group() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw;
+        let (parent, old_leader, reused, new_leader) = (tid(37), tid(38), tid(39), tid(50));
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, old_leader, true);
+        scheduler.thread_tree.add_child(old_leader, reused, false);
+        scheduler.thread_tree.add_child(parent, new_leader, true);
+        scheduler.thread_tree.add_child(new_leader, reused, false);
+        for thread in [old_leader, new_leader, reused] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        assert!(
+            scheduler
+                .thread_tree
+                .my_thread_group(&old_leader)
+                .contains(&reused),
+            "the stale edge this test is about must exist"
+        );
+        assert_eq!(scheduler.process_signal_targets(old_leader), [old_leader]);
+        assert_eq!(
+            scheduler.process_signal_targets(new_leader),
+            [reused, new_leader]
+        );
+    }
+
+    /// An ID that once led a process, given later to a thread of another
+    /// process, belongs to that process: its live group is that process's.
+    #[test]
+    fn a_former_leaders_id_reused_as_a_thread_joins_its_new_group() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw;
+        let (parent, former_leader, new_leader) = (tid(37), tid(38), tid(50));
+        scheduler.thread_tree.add_child(parent, parent, true);
+        scheduler.thread_tree.add_child(parent, former_leader, true);
+        // Process 38 has exited; Linux gives 38 to a thread of process 50.
+        scheduler.thread_tree.add_child(parent, new_leader, true);
+        scheduler
+            .thread_tree
+            .add_child(new_leader, former_leader, false);
+        for thread in [parent, new_leader, former_leader] {
+            register_known_thread(&mut scheduler, thread);
+        }
+        let group = [former_leader, new_leader];
+        for member in [former_leader, new_leader] {
+            assert_eq!(
+                scheduler.live_thread_group(&member).collect::<Vec<_>>(),
+                group
+            );
+        }
+        // A signal to 38 goes to the process it is a thread of, as Linux's
+        // kill(2) of a thread ID reaches that thread's group.
+        assert_eq!(scheduler.process_signal_targets(former_leader), group);
     }
 
     /// A cross-task signal must interrupt a precise-mode futex waiter, which sleeps
