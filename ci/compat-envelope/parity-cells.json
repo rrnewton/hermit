@@ -8,59 +8,59 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 3000,
-      "applicable": 1891,
-      "selectable": 1654,
-      "population": 2935,
-      "population_candidate_selected": 1654,
+      "cells": 3005,
+      "applicable": 1892,
+      "selectable": 1655,
+      "population": 2940,
+      "population_candidate_selected": 1655,
       "population_candidate_not_selected": 230,
-      "population_candidate_disabled": 1051
+      "population_candidate_disabled": 1055
     },
     "by_backend": {
       "dbt": {
-        "cells": 600,
+        "cells": 601,
         "applicable": 255,
         "selectable": 254,
-        "population": 587,
+        "population": 588,
         "population_candidate_selected": 254,
         "population_candidate_not_selected": 1,
-        "population_candidate_disabled": 332
+        "population_candidate_disabled": 333
       },
       "in-guest-trap": {
-        "cells": 600,
+        "cells": 601,
         "applicable": 304,
         "selectable": 304,
-        "population": 587,
+        "population": 588,
         "population_candidate_selected": 304,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 283
+        "population_candidate_disabled": 284
       },
       "kvm": {
-        "cells": 600,
-        "applicable": 557,
-        "selectable": 554,
-        "population": 587,
-        "population_candidate_selected": 554,
+        "cells": 601,
+        "applicable": 558,
+        "selectable": 555,
+        "population": 588,
+        "population_candidate_selected": 555,
         "population_candidate_not_selected": 1,
         "population_candidate_disabled": 32
       },
       "liteinst": {
-        "cells": 600,
+        "cells": 601,
         "applicable": 305,
         "selectable": 305,
-        "population": 587,
+        "population": 588,
         "population_candidate_selected": 305,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 282
+        "population_candidate_disabled": 283
       },
       "sabre": {
-        "cells": 600,
+        "cells": 601,
         "applicable": 470,
         "selectable": 237,
-        "population": 587,
+        "population": 588,
         "population_candidate_selected": 237,
         "population_candidate_not_selected": 228,
-        "population_candidate_disabled": 122
+        "population_candidate_disabled": 123
       }
     }
   },
@@ -895,6 +895,11 @@
     {"test_id":"c-programs/proc-cmdline-other-processes","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: KNOWN GAP (https://github.com/rrnewton/hermit/issues/4564): Detcore cannot read another process's memory, so another process's /proc/<pid>/cmdline, and a descriptor its owner opened read by another process, are the kernel beneath's; on KVM that is the executor's host /proc lookup, whose answer (EACCES, or ENOENT where the supervisor has no task with that number) depends on the host, so no row can be pinned."},
     {"test_id":"c-programs/proc-cmdline-other-processes","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: NAMED GAP: the guest re-executes itself to choose its own arguments and environment, and the in-guest runtime refuses execve and execveat with a typed refusal that ends the run (https://github.com/rrnewton/hermit/issues/4567); LiteInst also reports no initial stack pointer (https://github.com/rrnewton/hermit/issues/4565)."},
     {"test_id":"c-programs/proc-cmdline-other-processes","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: NAMED GAP, not fixed, under the owner's ruling that SaBRe is a drop candidate: SaBRe kills this guest with SIGSEGV when its first thread exits, at glibc's madvise(MADV_DONTNEED) of the exiting thread's stack (https://github.com/rrnewton/hermit/issues/4562); SaBRe also reports no initial stack pointer, so its file is the kernel's (https://github.com/rrnewton/hermit/issues/4565)."},
+    {"test_id":"c-programs/proc-fd-directory","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: The backend runtime's own descriptors are in the guest's descriptor table and no provider fact names them, so the directory stays the kernel's listing on this backend (package K slice F1's capability-keyed residual)"},
+    {"test_id":"c-programs/proc-fd-directory","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The backend runtime's own descriptors are in the guest's descriptor table and no provider fact names them, so the directory stays the kernel's listing on this backend (package K slice F1's capability-keyed residual)"},
+    {"test_id":"c-programs/proc-fd-directory","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/proc-fd-directory","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The backend runtime's own descriptors are in the guest's descriptor table and no provider fact names them, so the directory stays the kernel's listing on this backend (package K slice F1's capability-keyed residual)"},
+    {"test_id":"c-programs/proc-fd-directory","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: The backend runtime's own descriptors are in the guest's descriptor table and no provider fact names them, so the directory stays the kernel's listing on this backend (package K slice F1's capability-keyed residual)"},
     {"test_id":"c-programs/proc-fd-link-aliases","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/proc-fd-link-aliases","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/proc-fd-link-aliases","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: kvm verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately"},

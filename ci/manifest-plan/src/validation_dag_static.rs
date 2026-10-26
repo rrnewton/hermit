@@ -2930,7 +2930,18 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_continuation_without_a_child_past_its_valve_refuses_the_run_and_stays
     // and a_vfork_child_torn_down_before_registering_ends_the_barrier_at_continuation:
     // 2605, listed.
-    ("test.detcore_unit", 2605),
+    // And package K slice F1's nineteen units: procfs::fd_directory's nine
+    // (the own directories classified, the entries at Linux positions, the
+    // end at the table's capacity, a leader without a table, the capacity's
+    // powers of two, paging, lseek, tags, the lookup base of a bound
+    // directory), syscalls::files::descriptor_directory's six (a name below
+    // a directory, a path through a descriptor link, the bytes of the rest
+    // of such a path, the links before a descriptor link, a procfs root told
+    // without opening anything, the respelled operands) and tool_local's
+    // four (the descriptor capacity, an unmodelled descriptor, a failed
+    // dup's growth, an unmodelled descriptor's close-on-exec changes): 2624,
+    // listed.
+    ("test.detcore_unit", 2624),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5109,7 +5120,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three 3c.1e A review round 2 units: 2601, listed.
     // And the same two 3c.1e A review round 3 units: 2603, listed.
     // And the same two capability slice 5 units: 2605, listed.
-    ("test.detcore_unit_on_host", 2605),
+    // And the same nineteen F1 units: 2624, listed.
+    ("test.detcore_unit_on_host", 2624),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
