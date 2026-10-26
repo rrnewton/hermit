@@ -676,6 +676,26 @@ pub struct Config {
     )]
     pub chaos_timeslice_range: Option<TimesliceRange>,
 
+    /// How `--chaos-timeslice-range` draws. `slice` (the default) draws each slice's mean from
+    /// the range. `run` instead draws the run's `--max-timeslice` once, log-uniformly from the
+    /// range as a pure function of the scheduler seed, and the run is then an ordinary chaos run
+    /// under it: a sweep's seeds spread over the scales of the range, each seed at one scale.
+    /// That reaches a race needing one scale throughout in more seeds, at a higher cost per run
+    /// for the fine draws. The drawn value is printed in `--summary-json`
+    /// (`preemption.max_timeslice_ns`) and stored in a `--record-preemptions-to` record, from
+    /// which a replay takes it.
+    #[serde(default)]
+    #[clap(long, value_enum, default_value_t, requires = "chaos_timeslice_range")]
+    pub chaos_timeslice_draw: ChaosTimesliceDraw,
+
+    /// The `--max-timeslice` this run drew under `--chaos-timeslice-draw=run`, or took from the
+    /// preemption record it replays. `hermit run` sets it, and `max_timeslice` to the same
+    /// value, before the run starts; the run's own preemption record stores it. When set, no
+    /// slice draws its mean from `--chaos-timeslice-range`.
+    #[serde(default)]
+    #[clap(skip)]
+    pub chaos_timeslice: Option<NonZeroU64>,
+
     /// Uses the `--fuzz-seed` to generate randomness and fuzz nondeterminism in the futex semantics.
     #[clap(long)]
     pub fuzz_futexes: bool,
@@ -1903,6 +1923,9 @@ impl fmt::Display for Config {
         }
         if let Some(range) = self.chaos_timeslice_range {
             write!(f, " --chaos-timeslice-range={range}")?;
+            if self.chaos_timeslice_draw == ChaosTimesliceDraw::Run {
+                write!(f, " --chaos-timeslice-draw=run")?;
+            }
         }
         if self.strict_schedule_boundaries {
             write!(f, " --strict-schedule-boundaries")?;
@@ -1958,8 +1981,12 @@ impl fmt::Display for Config {
             write!(f, " --gdbserver-port={}", self.gdbserver_port)?;
         }
         match &self.max_timeslice {
-            // The range sets the maximum itself, and refuses an explicit one.
-            Some(x) if self.chaos_timeslice_range.map(|range| range.max) == Some(*x) => {}
+            // The range sets the maximum itself (its MAX, or the value it
+            // drew or a replayed record gave), and refuses an explicit one.
+            Some(x)
+                if self.chaos_timeslice_range.is_some()
+                    && (self.chaos_timeslice_range.map(|range| range.max) == Some(*x)
+                        || self.chaos_timeslice == Some(*x)) => {}
             Some(x) => {
                 if *x != NonZeroU64::new(200_000_000).unwrap() {
                     write!(f, " --max-timeslice={}", x)?;
@@ -2294,6 +2321,27 @@ impl FromStr for SchedHeuristic {
 
 /// An optional virtual-timeslice duration. `None` disables that preemption mechanism.
 pub type MaybeTimeslice = Option<NonZeroU64>;
+
+/// How `--chaos-timeslice-range` draws (`--chaos-timeslice-draw`).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum
+)]
+#[serde(rename_all = "kebab-case")]
+pub enum ChaosTimesliceDraw {
+    /// Each chaos slice draws its mean from the range.
+    #[default]
+    Slice,
+    /// The run draws its `--max-timeslice` from the range once.
+    Run,
+}
 
 /// The bounds of `--chaos-timeslice-range`, in virtual nanoseconds, both
 /// included: `MIN..MAX`, with `MIN` at least one RCB and no larger than `MAX`.
@@ -3272,7 +3320,9 @@ mod legacy_backend_json {
     /// false.
     /// `chaos_timeslice_range` came after it too: the scheduler draws the
     /// slices, not the runtime, so it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 35] = [
+    /// `chaos_timeslice_draw` and `chaos_timeslice` came with it, for the same
+    /// reason; they read as `slice` and unset.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 37] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3308,6 +3358,8 @@ mod legacy_backend_json {
         "replay_edited_preemptions",
         "eager_lone_preemptions",
         "chaos_timeslice_range",
+        "chaos_timeslice_draw",
+        "chaos_timeslice",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3476,11 +3528,20 @@ mod legacy_backend_json {
                     | "work_span_report"
                     | "signal_at"
                     | "virtual_cpus"
-                    | "chaos_timeslice_range",
+                    | "chaos_timeslice_range"
+                    | "chaos_timeslice",
                 ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
                     .map_err(<A::Error as de::Error>::custom),
+                // Per-slice, as its serde default is.
+                Some("chaos_timeslice_draw") => {
+                    let slice = serde_json::to_value(super::ChaosTimesliceDraw::Slice)
+                        .map_err(<A::Error as de::Error>::custom)?;
+                    seed.deserialize(slice)
+                        .map(Some)
+                        .map_err(<A::Error as de::Error>::custom)
+                }
                 // x86-64-v2, as their serde defaults are.
                 Some("cpu_profile") => {
                     let v2 = serde_json::to_value(crate::cpu_profile::CpuProfile::X86_64V2)
@@ -3773,7 +3834,9 @@ mod legacy_backend_json {
                 | "notice_host_network_abstract_binds"
                 | "replay_edited_preemptions"
                 | "eager_lone_preemptions"
-                | "chaos_timeslice_range" => Ok(()),
+                | "chaos_timeslice_range"
+                | "chaos_timeslice_draw"
+                | "chaos_timeslice" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -3855,6 +3918,37 @@ mod tests {
             "1000..2000"
         );
         assert!(serde_json::from_str::<TimesliceRange>("\"2000..1000\"").is_err());
+        assert_eq!(config.chaos_timeslice_draw, ChaosTimesliceDraw::Slice);
+        assert_eq!(config.chaos_timeslice, None);
+        let config = Config::try_parse_from([
+            "config",
+            "--chaos",
+            "--chaos-timeslice-range=1000..2000",
+            "--chaos-timeslice-draw=run",
+        ])
+        .unwrap();
+        assert_eq!(config.chaos_timeslice_draw, ChaosTimesliceDraw::Run);
+        assert!(
+            Config::try_parse_from(["config", "--chaos", "--chaos-timeslice-draw=run"]).is_err(),
+            "a draw without a range was accepted"
+        );
+        // A drawn maximum renders as the range and the draw, which parse
+        // back to the same request.
+        let mut drawn = config.clone();
+        drawn.max_timeslice = NonZeroU64::new(1234);
+        drawn.chaos_timeslice = NonZeroU64::new(1234);
+        let rendered = drawn.to_string();
+        assert!(
+            rendered.contains(" --chaos-timeslice-range=1000..2000 --chaos-timeslice-draw=run"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("--max-timeslice"), "{rendered}");
+        let reparsed = Config::parse_from(
+            std::iter::once("detcore".to_string())
+                .chain(rendered.split_whitespace().map(String::from)),
+        );
+        assert_eq!(reparsed.chaos_timeslice_range, config.chaos_timeslice_range);
+        assert_eq!(reparsed.chaos_timeslice_draw, ChaosTimesliceDraw::Run);
 
         // Six decades, an equal share each: u = k/6 lands on 10^(3+k).
         for k in 0..=6 {
@@ -4589,7 +4683,9 @@ mod tests {
                 | "notice_host_network_abstract_binds"
                 | "replay_edited_preemptions"
                 | "eager_lone_preemptions"
-                | "chaos_timeslice_range" => {}
+                | "chaos_timeslice_range"
+                | "chaos_timeslice_draw"
+                | "chaos_timeslice" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -4613,11 +4709,12 @@ mod tests {
         // `work_span_report`, `signal_at`, `in_guest_signal_delivery`,
         // `annotated_priority_replay`, `virtual_cpus`,
         // `replay_edited_preemptions`, `notice_host_network_abstract_binds`,
-        // `eager_lone_preemptions`, `chaos_timeslice_range` and
-        // `strict_schedule_boundaries` none: fourteen more keys and
-        // thirty-four fewer, so twenty keys fewer than fields.
+        // `eager_lone_preemptions`, `chaos_timeslice_range`,
+        // `chaos_timeslice_draw`, `chaos_timeslice` and
+        // `strict_schedule_boundaries` none: fourteen more keys and thirty-six
+        // fewer, so twenty-two keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 20);
+        assert_eq!(fields.len(), keys.len() + 22);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:

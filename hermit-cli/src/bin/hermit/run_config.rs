@@ -934,6 +934,14 @@ mod tests {
             "chaos-timeslice-range",
             &["--chaos", "--chaos-timeslice-range=1000..2000000"],
         ),
+        (
+            "chaos-timeslice-draw",
+            &[
+                "--chaos",
+                "--chaos-timeslice-range=1000..2000000",
+                "--chaos-timeslice-draw=run",
+            ],
+        ),
         ("fuzz-futexes", &["--fuzz-futexes"]),
         ("chaos-target-races", &["--chaos-target-races"]),
         (

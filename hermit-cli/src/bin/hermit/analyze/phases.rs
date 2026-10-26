@@ -1239,6 +1239,7 @@ impl AnalyzeOpts {
         self.adopt_recorded_epoch(&recordings)?;
         // Every trial charges expired timed waits as the target did.
         self.adopt_expired_wait_charge(run1.as_deref())?;
+        self.adopt_recorded_timeslice(&recordings)?;
         // Every trial registers queued sleeps as the target did.
         self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
     }

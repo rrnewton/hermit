@@ -4527,7 +4527,8 @@ impl Scheduler {
                 .with_signal_state_copy(cfg.signal_state_copy)
                 .with_rng_seed(cfg.rng_seed())
                 .with_expired_wait_runs_charged_once(expired_wait_runs_charged_once)
-                .with_cap_preemption_charge(cfg.cap_preemption_charge);
+                .with_cap_preemption_charge(cfg.cap_preemption_charge)
+                .with_chaos_timeslice(cfg.chaos_timeslice);
             if boundaries {
                 writer
                     .with_slice_boundaries()

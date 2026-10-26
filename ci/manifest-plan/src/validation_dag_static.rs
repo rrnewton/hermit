@@ -1860,7 +1860,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // validate at 24fbff99c7a saw 1224 before 11c35a504a6 added one):
     // 1202 + 23 = 1225.
     // And run's a_chaos_timeslice_range_caps_the_run_at_its_max: 1222.
-    ("test.hermit_unit", 1222),    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
+    // And run's a_run_draw_picks_the_maximum_and_a_replay_takes_the_recorded_one and analyze's trials_run_under_the_timeslice_a_recording_drew: 1224.
+    ("test.hermit_unit", 1224),    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
     // Four process-retirement fence controls and four uncontrolled-retirement
@@ -3082,7 +3083,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // at 16fb7fbec04 and re-measured at this head.
     // And the TracerPid unit (32e9ef22f60): 2897 + 1 = 2898.
     // And tool_local a_chaos_timeslice_range_draws_slices_of_every_scale_up_to_its_max and a_schedule_replay_draws_nothing_from_the_chaos_timeslice_range: 2900.
-    ("test.detcore_unit", 2900),
+    // And preemptions::tests::a_drawn_chaos_timeslice_is_seeded_log_uniform_and_recorded: 2901.
+    ("test.detcore_unit", 2901),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4389,7 +4391,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And 11c35a504a6's two --base-env=minimal cli tests: 702 + 2 = 704,
     // measured with `cargo nextest list` at 11c35a504a6.
     // And a_chaos_timeslice_range_draws_slices_from_the_seed_and_replays: 704.
-    ("test.cli", 704),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
+    // And a_run_draw_picks_the_timeslice_and_a_replay_runs_under_it: 705.
+    ("test.cli", 705),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
     // sabre_reports_a_replaced_host_file_without_naming_it_the_cause,
@@ -4475,7 +4478,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // replay needs a PMU stop on a branch count to go wrong, joins them: 17,
     // listed.
     // a_chaos_timeslice_range_draws_slices_from_the_seed_and_replays needs the PMU timer (a range is refused without one): 19, listed.
-    ("privileged-test.pmu_cli_cases", 19),
+    // a_run_draw_picks_the_timeslice_and_a_replay_runs_under_it needs the PMU timer (a drawn timeslice is refused without one): 20, listed.
+    ("privileged-test.pmu_cli_cases", 20),
     // The six x86-64-v3 CLI cases that run a guest, with
     // HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 so that a refusal fails
     // (https://github.com/rrnewton/hermit/issues/4243): 6, listed with this
@@ -5417,7 +5421,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured with `cargo nextest list` at this head.
     // And the same TracerPid unit: 2898.
     // And the same two units: 2900.
-    ("test.detcore_unit_on_host", 2900),
+    // And preemptions::tests::a_drawn_chaos_timeslice_is_seeded_log_uniform_and_recorded: 2901.
+    ("test.detcore_unit_on_host", 2901),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5790,7 +5795,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 1181.
     // The same 23, keeping the six local-only cases: 1196 + 23 = 1219.
     // And the same run unit: 1216.
-    ("test.hermit_unit_on_host", 1216),
+    // And the same two units: 1218.
+    ("test.hermit_unit_on_host", 1218),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

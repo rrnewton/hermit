@@ -794,6 +794,97 @@ impl AnalyzeOpts {
         )
     }
 
+    /// Run every trial under the `--max-timeslice` the recordings state their
+    /// run drew under `--chaos-timeslice-draw=run`
+    /// (`PreemptionRecord::chaos_timeslice`), as `adopt_recorded_epoch` runs
+    /// them from the recorded epoch. A trial replays schedules analyze writes,
+    /// which state no timeslice, so a replay that took it from its record
+    /// would not find it there: the timeslice is passed as an explicit
+    /// `--max-timeslice` instead.
+    ///
+    /// The run arguments may not draw a timeslice per run
+    /// (`--chaos-timeslice-draw=run`): each trial would draw its own from its
+    /// own seed, and the trials must share one. A per-slice range
+    /// (`--chaos-timeslice-range` alone) is fine: every trial gets its MAX. Recordings that state different timeslices, or an explicit
+    /// `--max-timeslice` that differs from theirs, are refused before any
+    /// trial.
+    pub fn adopt_recorded_timeslice(&mut self, recordings: &[(&str, &Path)]) -> anyhow::Result<()> {
+        let run_cmd = std::iter::once("hermit-run").chain(
+            self.run_arg
+                .iter()
+                .chain(&self.run_args)
+                .map(String::as_str),
+        );
+        let matches = RunOpts::command()
+            .try_get_matches_from(run_cmd)
+            .context("cannot parse the trials' run arguments")?;
+        let parsed = RunOpts::from_arg_matches(&matches)?;
+        let refuse = |message: String| {
+            Err(anyhow::Error::new(crate::container::PolicyRefusal).context(message))
+        };
+        let config = &parsed.det_opts.det_config;
+        if let Some(range) = config.chaos_timeslice_range
+            && config.chaos_timeslice_draw == detcore_model::config::ChaosTimesliceDraw::Run
+        {
+            return refuse(format!(
+                "`hermit analyze` and `hermit bisect` cannot take --chaos-timeslice-range={range} \
+                 --chaos-timeslice-draw=run in their run arguments: each trial would draw another \
+                 --max-timeslice from its own seed, and every trial must run under one. Pass the \
+                 timeslice of the run being analyzed instead, --max-timeslice=<ns>, as its \
+                 --summary-json reports it (preemption.max_timeslice_ns); a recording of it given \
+                 here supplies it."
+            ));
+        }
+        let mut recorded: Option<(u64, String)> = None;
+        for (option, path) in recordings {
+            let Some(timeslice) = detcore::preemptions::read_recorded_chaos_timeslice(path)
+                .map_err(anyhow::Error::msg)?
+            else {
+                continue;
+            };
+            let source = format!("{option} {}", path.display());
+            match &recorded {
+                Some((first, first_source)) if *first != timeslice => {
+                    return refuse(format!(
+                        "{first_source} was recorded under a drawn --max-timeslice of {first} ns \
+                         and {source} under {timeslice} ns. Every trial runs under one \
+                         timeslice, so no single one replays both. Record both under the same \
+                         --max-timeslice."
+                    ));
+                }
+                Some(_) => {}
+                None => recorded = Some((timeslice, source)),
+            }
+        }
+        let Some((timeslice, source)) = recorded else {
+            return Ok(());
+        };
+        if config.chaos_timeslice_range.is_some() {
+            // Every trial replays a record or runs under the range's MAX; a
+            // drawn timeslice cannot also be given beside the range.
+            return refuse(format!(
+                "{source} was recorded under a --max-timeslice of {timeslice} ns drawn by \
+                 --chaos-timeslice-draw=run, and the run arguments give --chaos-timeslice-range, \
+                 which would run the trials under another. Remove --chaos-timeslice-range from \
+                 the run arguments to run them under the recorded timeslice."
+            ));
+        }
+        if matches.value_source("max_timeslice") == Some(ValueSource::DefaultValue) {
+            self.run_arg.push(format!("--max-timeslice={timeslice}"));
+            return Ok(());
+        }
+        let explicit = config.max_timeslice;
+        if explicit.map(std::num::NonZeroU64::get) == Some(timeslice) {
+            return Ok(());
+        }
+        refuse(format!(
+            "the run arguments' --max-timeslice ({}) differs from the {timeslice} ns that {source} \
+             was recorded under, drawn by --chaos-timeslice-draw=run. Omit --max-timeslice to run \
+             the trials under the recorded one, or pass --max-timeslice={timeslice}.",
+            explicit.map_or_else(|| "disabled".to_owned(), |maximum| format!("{maximum} ns"))
+        ))
+    }
+
     /// The trials' `--pipe-wake-latency`, from their run arguments (`None`
     /// for off).
     pub fn trial_pipe_wake_latency(&self) -> Option<u64> {
@@ -1136,6 +1227,116 @@ mod tests {
             "{}",
             recording.to_repro()
         );
+    }
+
+    /// Analyze and bisect run every trial under the timeslice a recording says
+    /// its run drew (`--chaos-timeslice-draw=run`): an explicit
+    /// `--max-timeslice` passed to the trials, an equal explicit one kept, a
+    /// different one refused. Run arguments that draw per run are refused,
+    /// and a per-slice range beside a drawn recording is refused too.
+    #[test]
+    fn trials_run_under_the_timeslice_a_recording_drew() {
+        let options = |run_args: &[&str]| {
+            let mut argv: Vec<String> = vec!["hermit".into(), "analyze".into()];
+            argv.extend(run_args.iter().map(|arg| format!("--run-arg={arg}")));
+            argv.extend(["--".into(), "/bin/true".into()]);
+            let args = crate::Args::try_parse_from(&argv)
+                .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
+            let crate::Subcommand::Analyze(options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            *options
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let drawn = dir.path().join("drawn.json");
+        detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+            .with_chaos_timeslice(Some(4321))
+            .write_to_disk(&drawn)
+            .unwrap();
+        let other = dir.path().join("other.json");
+        detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+            .with_chaos_timeslice(Some(9999))
+            .write_to_disk(&other)
+            .unwrap();
+        let plain = dir.path().join("plain.json");
+        detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+            .write_to_disk(&plain)
+            .unwrap();
+        let recordings = [("--run1-preemptions", drawn.as_path())];
+
+        let mut adopting = options(&[]);
+        adopting.adopt_recorded_timeslice(&recordings).unwrap();
+        assert!(
+            adopting
+                .run_arg
+                .iter()
+                .any(|arg| arg == "--max-timeslice=4321"),
+            "{:?}",
+            adopting.run_arg
+        );
+        let mut equal = options(&["--max-timeslice=4321"]);
+        equal.adopt_recorded_timeslice(&recordings).unwrap();
+        assert_eq!(
+            equal.run_arg,
+            ["--max-timeslice=4321"],
+            "added a second one"
+        );
+        let mut unmarked = options(&[]);
+        unmarked
+            .adopt_recorded_timeslice(&[("--run1-preemptions", plain.as_path())])
+            .unwrap();
+        assert!(
+            unmarked
+                .run_arg
+                .iter()
+                .all(|arg| !arg.starts_with("--max-timeslice"))
+        );
+        // A per-slice range alone is fine without a drawn recording.
+        let mut slices = options(&["--chaos", "--chaos-timeslice-range=1000..2000"]);
+        slices
+            .adopt_recorded_timeslice(&[("--run1-preemptions", plain.as_path())])
+            .unwrap();
+
+        for (run_args, recordings, expected) in [
+            (
+                &["--max-timeslice=5000"][..],
+                &recordings[..],
+                "pass --max-timeslice=4321",
+            ),
+            (
+                &[],
+                &[
+                    ("--run1-preemptions", drawn.as_path()),
+                    ("--run2-preemptions", other.as_path()),
+                ][..],
+                "Record both under the same",
+            ),
+            (
+                &[
+                    "--chaos",
+                    "--chaos-timeslice-range=1000..2000",
+                    "--chaos-timeslice-draw=run",
+                ],
+                &[],
+                "every trial must run under one",
+            ),
+            (
+                &["--chaos", "--chaos-timeslice-range=1000..2000"],
+                &recordings[..],
+                "Remove --chaos-timeslice-range",
+            ),
+        ] {
+            let error = options(run_args)
+                .adopt_recorded_timeslice(recordings)
+                .unwrap_err();
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{error:#}"
+            );
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
     }
 
     /// Round-2 review of https://github.com/rrnewton/hermit/pull/3686, finding

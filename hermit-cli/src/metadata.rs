@@ -1316,6 +1316,8 @@ fn record_or_replay_config_with_timer_support(
         chaos: false,
         // `hermit record` draws no chaos slices.
         chaos_timeslice_range: None,
+        chaos_timeslice_draw: Default::default(),
+        chaos_timeslice: None,
         sigint_instakill: false,
         warn_non_zero_binds: false,
         sched_heuristic: Default::default(),

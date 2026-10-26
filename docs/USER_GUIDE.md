@@ -521,6 +521,20 @@ range sets the run's `--max-timeslice` to MAX; give one or the other, and do
 not combine it with `--target-timeslice`. It needs PMU-backed preemption. A
 small MIN makes runs slower, because fine slices mean many preemptions.
 
+`--chaos-timeslice-draw=run` draws once per run instead: the run's
+`--max-timeslice` comes log-uniformly from the range, as a pure function of the
+scheduler seed, and the run is an ordinary chaos run under it. Each seed then
+explores one scale, which reaches a race that needs one scale throughout in
+more seeds, at a higher cost per run for the fine draws. `--summary-json`
+reports the drawn value (`preemption.max_timeslice_ns`), a
+`--record-preemptions-to` record stores it, and a replay of that record runs
+under it. Such a record's value takes precedence over any range the replay
+gives (no per-slice drawing then), so replay it with no `--max-timeslice`, or
+with `--max-timeslice=N` for its drawn N; the `--max-timeslice=MAX` advice
+above is for per-slice records. `hermit analyze` and `hermit bisect` take it
+from such a record, or as `--max-timeslice=N`, and refuse a per-run draw in
+their run arguments.
+
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with
 `--replay-preemptions-from=FILE`. A record edited after it was recorded (for
@@ -840,6 +854,7 @@ hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
 | `--preemption-timeout=N` | Deprecated alias for `--max-timeslice=N`. |
 | `--cap-preemption-charge` | Charges a turn that ends an expired timeslice at most the time its thread ran since its previous turn. |
 | `--chaos-timeslice-range=MIN..MAX` | With `--chaos`, draws each slice's mean log-uniformly from MIN..MAX virtual nanoseconds and caps slices at MAX (the run's `--max-timeslice`). Not with `--chaos-seeded-timeslice`, which draws the maximum instead. |
+| `--chaos-timeslice-draw=run` | Draws the run's `--max-timeslice` once from the range, from the scheduler seed, instead of each slice's mean. |
 
 `--no-sequentialize-threads` is useful for compatibility experiments and
 workloads such as virtual machines that need real host parallelism. It removes
