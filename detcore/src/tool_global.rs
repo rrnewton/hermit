@@ -32,7 +32,9 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicI32;
 use std::sync::atomic::AtomicU16;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::SeqCst;
 use std::task::Poll;
 use std::time::Duration;
@@ -1151,6 +1153,18 @@ pub struct GlobalState {
     // next port to use if input port is 0
     next_port: AtomicU16,
 
+    /// The ID the next guest task gets when Detcore chooses the IDs
+    /// (`GuestIds::Chosen`): one past the first process's at the start, one
+    /// more for every clone-family call that asks (`NextGuestId`). Zero when
+    /// the kernel numbers the guest.
+    next_guest_id: AtomicI32,
+
+    /// How many guest tasks were created with a host ID although Detcore
+    /// chooses the IDs (`GuestIds::Chosen` without `refuse_host_ids`): the
+    /// run's IDs are then not deterministic, which the summary says and the
+    /// preemption record states, so that a replay refuses it.
+    host_id_tasks: AtomicU64,
+
     // used ports
     used_ports: Mutex<HashSet<u16>>,
 
@@ -1741,6 +1755,12 @@ impl GlobalState {
             #[cfg(feature = "physical-mm-test-support")]
             initial_mm_probe: Mutex::new(None),
             next_port: AtomicU16::new(range[0]),
+            next_guest_id: AtomicI32::new(
+                cfg.guest_ids
+                    .base()
+                    .map_or(0, |base| base.saturating_add(1)),
+            ),
+            host_id_tasks: AtomicU64::new(0),
             used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
             syscall_observation_gaps: Mutex::new(BTreeSet::new()),
@@ -2238,6 +2258,9 @@ impl GlobalState {
             max_timeslice_ns: self.cfg.max_timeslice.map(|maximum| maximum.get()),
             timer_enabled: Some(self.cfg.use_preemption_timer()),
         });
+        summary.guest_ids = (self.cfg.guest_ids != detcore_model::pid::GuestIds::Namespace)
+            .then_some(self.cfg.guest_ids);
+        summary.host_id_tasks = self.host_id_tasks.load(SeqCst);
         //
         // Real time report:
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the
@@ -2306,6 +2329,11 @@ impl GlobalTool for GlobalState {
         // A backend whose guest thread IDs are not host tasks never reads a
         // host task's `/proc` signal state for them (`read_kernel_signal_state`).
         crate::syscalls::refuse_host_signal_state_reads(&cfg.backend);
+        // How the guest is numbered, where no PID namespace of its own does
+        // it, so that a run's log says which IDs it can be compared by.
+        if cfg.guest_ids != detcore_model::pid::GuestIds::Namespace {
+            info!("[detcore] guest process IDs: {}", cfg.guest_ids);
+        }
         GlobalState::initialize(cfg, true)
     }
 
@@ -2631,6 +2659,16 @@ impl GlobalTool for GlobalState {
 }
 
 impl GlobalState {
+    /// The ID for the next guest task, when Detcore chooses the IDs: each
+    /// call takes the next one, whether or not the clone that asked succeeds,
+    /// so an ID is never given out twice. Asked in the caller's turn, so the
+    /// order of the takes is the guest's own order of clone-family calls.
+    /// `None` when the kernel numbers the guest.
+    fn take_guest_id(&self) -> Option<i32> {
+        self.cfg.guest_ids.base()?;
+        Some(self.next_guest_id.fetch_add(1, SeqCst))
+    }
+
     /// Evaluate a brk predicate in the controller's unchanged procfs view.
     /// The scheduler lock retains the caller's grant and physical identity
     /// until all temporary descriptors have closed. The backend fact excludes
@@ -3822,6 +3860,16 @@ impl GlobalState {
                         .map(|cookie| table.virtualize(cookie))
                         .collect(),
                 )
+            }
+            GlobalRequest::NextGuestId => R::NextGuestId(self.take_guest_id()),
+            GlobalRequest::GaveHostId => {
+                self.host_id_tasks.fetch_add(1, SeqCst);
+                // The run's IDs now depend on the host: a record of it says
+                // so, and a replay refuses it.
+                if let Some(writer) = &mut self.lock_rpc_scheduler(false).await.preemption_writer {
+                    writer.set_guest_ids(detcore_model::pid::GuestIds::Host);
+                }
+                R::GaveHostId(())
             }
             GlobalRequest::InPidNamespaceInit(thread) => {
                 let scheduler = self.lock_rpc_scheduler(false).await;
@@ -7021,6 +7069,13 @@ pub enum GlobalRequest {
     /// order (`crate::syscalls::inotify`). Answered in the sender's own turn
     /// with no scheduling decision. Appended last.
     VirtualInotifyCookies(Vec<u32>),
+    /// Take the ID for the task a clone-family call is about to create, when
+    /// Detcore chooses the IDs (`GuestIds::Chosen`), in the caller's turn.
+    /// Appended last.
+    NextGuestId,
+    /// A guest task was created with a host ID although Detcore chooses the
+    /// IDs (`GlobalState::host_id_tasks`). Appended last.
+    GaveHostId,
 }
 
 /// Responses from the global object
@@ -7304,6 +7359,11 @@ pub enum GlobalResponse {
     /// The answer to `GlobalRequest::VirtualInotifyCookies`: one virtual
     /// cookie per host cookie, in order. Appended last.
     VirtualInotifyCookies(Vec<u32>),
+    /// The answer to `GlobalRequest::NextGuestId`: the ID taken, or `None`
+    /// when the kernel numbers the guest. Appended last.
+    NextGuestId(Option<i32>),
+    /// The answer to `GlobalRequest::GaveHostId`. Appended last.
+    GaveHostId(()),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -9460,6 +9520,32 @@ where
         GlobalResponse::ThreadIsLive(live) => live,
         _ => unreachable!(),
     }
+}
+
+/// The ID the task that the caller's clone-family call is about to create
+/// gets, when Detcore chooses the IDs (`GuestIds::Chosen`); `None` when the
+/// kernel numbers the guest (`GlobalState::take_guest_id`).
+pub(crate) async fn next_guest_id<G, T>(guest: &mut G) -> Option<i32>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::NextGuestId).await;
+    match response.1 {
+        GlobalResponse::NextGuestId(id) => id,
+        _ => unreachable!(),
+    }
+}
+
+/// Tell the global state that a guest task was created with a host ID
+/// although Detcore chooses the IDs (`GlobalState::host_id_tasks`).
+pub(crate) async fn note_host_id_task<G, T>(guest: &mut G)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::GaveHostId).await;
+    assert_eq!(response.1, GlobalResponse::GaveHostId(()));
 }
 
 /// Whether a `clone3` `set_tid` naming `dettid` is refused: a task of this

@@ -67,6 +67,14 @@ pub struct PreemptionRecord {
     /// in memory, which are replayed under either setting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     signal_state_copy: Option<bool>,
+    /// How the run that produced this record numbered its guest's process
+    /// and thread IDs (`Config::guest_ids`), when no PID namespace of its own
+    /// did (`--no-namespace`). Every thread above is keyed by those IDs, so a
+    /// replay under another numbering is refused. `None` for a run its PID
+    /// namespace numbered, which writes the record exactly as before the
+    /// field existed, and for records written before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    guest_ids: Option<detcore_model::pid::GuestIds>,
     /// Actual callback expirations associated with existing priority-history rows.
     /// Absent in old/edited recordings; never inferred from time or branch counts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -89,6 +97,7 @@ impl PreemptionRecord {
             epoch: None,
             pipe_wake_latency: None,
             signal_state_copy: None,
+            guest_ids: None,
             callback_checkpoints: BTreeMap::new(),
         }
     }
@@ -125,6 +134,12 @@ impl PreemptionRecord {
     pub fn with_signal_state_copy(mut self, on: Option<bool>) -> Self {
         self.signal_state_copy = on;
         self
+    }
+
+    /// How the run this record came from numbered its guest, if no PID
+    /// namespace of its own did.
+    pub fn guest_ids(&self) -> Option<detcore_model::pid::GuestIds> {
+        self.guest_ids
     }
 
     /// Make a copy of everything in the `PreemptionRecord` in a public format.
@@ -193,6 +208,7 @@ impl PreemptionRecord {
             epoch: self.epoch,
             pipe_wake_latency: self.pipe_wake_latency,
             signal_state_copy: self.signal_state_copy,
+            guest_ids: self.guest_ids,
             callback_checkpoints: BTreeMap::new(),
         }
     }
@@ -253,6 +269,7 @@ impl PreemptionRecord {
             epoch: None,
             pipe_wake_latency: None,
             signal_state_copy: None,
+            guest_ids: None,
             callback_checkpoints: BTreeMap::new(),
         }
     }
@@ -750,6 +767,51 @@ mod tests {
         ] {
             assert_eq!(
                 pipe_wake_latency_mismatch("--replay-schedule-from=x", recorded, replay).is_some(),
+                refused,
+                "{recorded:?} replayed with {replay:?}"
+            );
+        }
+    }
+
+    /// The guest numbering of a run without a PID namespace rides in its
+    /// record, and a replay that numbers otherwise is refused; a namespace
+    /// run's record is written as before and reads back as namespace-numbered.
+    #[test]
+    fn the_guest_numbering_round_trips_and_is_compared() {
+        use detcore_model::pid::GuestIds;
+        let chosen = |base, refuse_host_ids| GuestIds::Chosen {
+            base,
+            refuse_host_ids,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.json");
+        let namespace = PreemptionWriter::new(None)
+            .with_guest_ids(GuestIds::Namespace)
+            .into_string();
+        assert!(!namespace.contains("guest_ids"), "{namespace}");
+        std::fs::write(&path, &namespace).unwrap();
+        assert_eq!(read_recorded_guest_ids(&path), Ok(GuestIds::Namespace));
+        for ids in [GuestIds::Host, chosen(4000, false)] {
+            let written = PreemptionWriter::new(None)
+                .with_guest_ids(ids)
+                .into_string();
+            let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+            assert_eq!(back.guest_ids(), Some(ids));
+            assert_eq!(back.clone_preemptions_only().guest_ids(), Some(ids));
+            std::fs::write(&path, &written).unwrap();
+            assert_eq!(read_recorded_guest_ids(&path), Ok(ids));
+        }
+        for (recorded, replay, refused) in [
+            (GuestIds::Namespace, GuestIds::Namespace, false),
+            (chosen(4000, false), chosen(4000, true), false),
+            (chosen(4000, false), chosen(4001, false), true),
+            (chosen(4000, false), GuestIds::Namespace, true),
+            (GuestIds::Namespace, chosen(4000, true), true),
+            (GuestIds::Host, GuestIds::Host, false),
+            (GuestIds::Host, GuestIds::Namespace, true),
+        ] {
+            assert_eq!(
+                guest_ids_mismatch("--replay-schedule-from=x", recorded, replay).is_some(),
                 refused,
                 "{recorded:?} replayed with {replay:?}"
             );
@@ -1287,6 +1349,20 @@ impl PreemptionWriter {
         self
     }
 
+    /// Store how the run numbered its guest (`Config::guest_ids`), unless its
+    /// PID namespace did, which leaves the record as it was before the field
+    /// existed.
+    pub fn with_guest_ids(mut self, ids: detcore_model::pid::GuestIds) -> Self {
+        self.set_guest_ids(ids);
+        self
+    }
+
+    /// [`Self::with_guest_ids`] on a writer in use: a run whose guest got a
+    /// host ID after all states `GuestIds::Host`.
+    pub fn set_guest_ids(&mut self, ids: detcore_model::pid::GuestIds) {
+        self.inner.guest_ids = (ids != detcore_model::pid::GuestIds::Namespace).then_some(ids);
+    }
+
     /// Does the record have zero entries?
     pub fn is_empty(&self) -> bool {
         self.inner.per_thread.is_empty()
@@ -1620,6 +1696,37 @@ pub fn signal_state_copy_mismatch(
             show(recorded),
             show(replay),
             show(recorded),
+        )
+    })
+}
+
+/// How the run that wrote the record at `path` numbered its guest, as the
+/// record stores it: `GuestIds::Namespace` for a record that does not say,
+/// which only a run its PID namespace numbered, or one before the field
+/// existed, writes.
+pub fn read_recorded_guest_ids(path: &Path) -> Result<detcore_model::pid::GuestIds, String> {
+    #[derive(Deserialize)]
+    struct IdsOnly {
+        #[serde(default)]
+        guest_ids: Option<detcore_model::pid::GuestIds>,
+    }
+    Ok(boundary_recording::read_settings::<IdsOnly>(path)?
+        .guest_ids
+        .unwrap_or_default())
+}
+
+/// The refusal of a replay whose guest would be numbered otherwise than the
+/// run that a record (named by `source`, an option and a path) came from,
+/// or `None` when they number it alike (`GuestIds::numbers_like`).
+pub fn guest_ids_mismatch(
+    source: &str,
+    recorded: detcore_model::pid::GuestIds,
+    replay: detcore_model::pid::GuestIds,
+) -> Option<String> {
+    (!recorded.numbers_like(&replay)).then(|| {
+        format!(
+            "{source} was recorded with guest process IDs {recorded}, and this replay's would be \
+             {replay}. The record names every thread by its ID, so the replay cannot follow it."
         )
     })
 }
