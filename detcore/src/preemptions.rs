@@ -157,6 +157,36 @@ pub struct PreemptionRecord {
     /// Analyze and bisect carry a source record's jumps into the trial
     /// schedules they splice from it (`with_time_skips`).
     time_skips: Option<Vec<TimeSkip>>,
+    /// Whether every branch segment of this record carries the
+    /// store-exclusives its thread failed in it (`SchedEvent::strex_fails`):
+    /// aarch64, where the run's counters and every guest thread's own counter
+    /// opened and were read, and none was multiplexed. Absent where they were not, so a zero
+    /// `strex_fails` then means "not counted" rather than "none failed".
+    segment_store_exclusives: HostObservedFlag,
+}
+
+/// A fact a record's run observed on its host, like [`HostObservedCount`]:
+/// kept in the record but comparing and hashing as equal whatever its value.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+struct HostObservedFlag(bool);
+
+impl HostObservedFlag {
+    fn is_false(&self) -> bool {
+        !self.0
+    }
+}
+
+impl PartialEq for HostObservedFlag {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for HostObservedFlag {}
+
+impl std::hash::Hash for HostObservedFlag {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
 }
 
 /// A count a record's run observed on its host rather than decided: it is
@@ -293,6 +323,7 @@ impl PreemptionRecord {
             store_exclusive_failures: HostObservedCount::default(),
             format_version: None,
             time_skips: None,
+            segment_store_exclusives: HostObservedFlag::default(),
         }
     }
 
@@ -651,6 +682,12 @@ impl PreemptionRecord {
         self
     }
 
+    /// Whether every branch segment carries the store-exclusives its thread
+    /// failed in it (`SchedEvent::strex_fails`); see the field.
+    pub fn segment_store_exclusives(&self) -> bool {
+        self.segment_store_exclusives.0
+    }
+
     /// The same record, stating whether the copy was on in the trials it
     /// came from (`None` for unknown). Every record analyze, minimize or
     /// bisect writes from trials carries it, as it carries the pipe-wake
@@ -765,6 +802,7 @@ impl PreemptionRecord {
             store_exclusive_failures: HostObservedCount::default(),
             format_version: None,
             time_skips: None,
+            segment_store_exclusives: HostObservedFlag::default(),
         }
     }
 
@@ -836,6 +874,7 @@ impl PreemptionRecord {
             store_exclusive_failures: HostObservedCount::default(),
             format_version: None,
             time_skips: None,
+            segment_store_exclusives: HostObservedFlag::default(),
         }
     }
 
@@ -1686,6 +1725,46 @@ mod tests {
                 "{recorded} replayed with {replay}"
             );
         }
+    }
+
+    /// Each segment's failed store-exclusives ride in the record for
+    /// diagnosis: an event that differs only in them is equal to one without
+    /// and logs the same, and neither they nor the record-level flag are
+    /// written when zero or false, so a record that counted nothing is
+    /// byte-for-byte what it was before the fields existed.
+    #[test]
+    fn segment_store_exclusives_round_trip_and_never_change_equality() {
+        let tid = DetTid::from_raw(3);
+        let mut failing = SchedEvent::branches(tid, 35);
+        failing.strex_fails = detcore_model::schedule::HostObserved(1);
+        let clean = SchedEvent::branches(tid, 35);
+        // A diagnosis aid: two events that differ only in it are equal and
+        // log the same.
+        assert_eq!(failing, clean);
+        assert_eq!(format!("{failing:?}"), format!("{clean:?}"));
+        assert_eq!(failing.to_string(), clean.to_string());
+
+        let mut writer = PreemptionWriter::new(None);
+        writer.insert_schedevent(failing.clone());
+        writer.record_segment_store_exclusives(true);
+        let written = writer.into_string();
+        assert!(written.contains("\"strex_fails\":1"), "{written}");
+        assert!(
+            written.contains("\"segment_store_exclusives\":true"),
+            "{written}"
+        );
+        let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert!(back.segment_store_exclusives());
+        assert_eq!(back.global[0].strex_fails.0, 1);
+
+        // Zero and false are not written, so a record that counted nothing,
+        // or was written before the fields existed, reads them as absent.
+        let legacy = PreemptionRecord::from_sched_events(vec![clean]).to_string();
+        assert!(!legacy.contains("strex_fails"), "{legacy}");
+        assert!(!legacy.contains("segment_store_exclusives"), "{legacy}");
+        let back: PreemptionRecord = serde_json::from_str(&legacy).unwrap();
+        assert!(!back.segment_store_exclusives());
+        assert_eq!(back.global[0].strex_fails.0, 0);
     }
 
     /// The run's failed store-exclusives ride in a record so that a replay
@@ -2569,6 +2648,12 @@ impl PreemptionWriter {
     /// host ID after all states `GuestIds::Host`.
     pub fn set_guest_ids(&mut self, ids: detcore_model::pid::GuestIds) {
         self.inner.guest_ids = (ids != detcore_model::pid::GuestIds::Namespace).then_some(ids);
+    }
+
+    /// Record whether every branch segment carries its failed
+    /// store-exclusives.
+    pub fn record_segment_store_exclusives(&mut self, counted: bool) {
+        self.inner.segment_store_exclusives = HostObservedFlag(counted);
     }
 
     /// Does the record have zero entries?

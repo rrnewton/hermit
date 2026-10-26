@@ -901,6 +901,10 @@ mod runtime {
 
     impl Counters {
         fn open(root: i32) -> Result<Self, String> {
+            // A run whose probe fails counts no segments either.
+            *SEGMENT_PMUS.lock().unwrap() = None;
+            SEGMENTS.lock().unwrap().clear();
+            SEGMENTS_INCOMPLETE.store(false, std::sync::atomic::Ordering::Relaxed);
             let cpus = affinity(root)
                 .map_err(|error| format!("cannot read the guest's CPU affinity: {error}"))?;
             let mut names = Vec::new();
@@ -948,7 +952,7 @@ mod runtime {
                     )
                 })
             };
-            covering
+            let counters = covering
                 .iter()
                 .map(|(pmu, _)| {
                     Ok(PmuEvents {
@@ -961,7 +965,11 @@ mod runtime {
                     })
                 })
                 .collect::<Result<_, String>>()
-                .map(Self)
+                .map(Self)?;
+            // Each guest thread counts its own segments on the same PMUs.
+            *SEGMENT_PMUS.lock().unwrap() =
+                Some(covering.into_iter().map(|(pmu, _)| pmu).collect());
+            Ok(counters)
         }
 
         /// Read the counts. A counter that was enabled but never on a
@@ -1077,6 +1085,113 @@ mod runtime {
             };
             (pedigree, mm.generation())
         }
+    }
+
+    /// The PMUs this run's counters were opened on, once its probe passed:
+    /// each guest thread counts its own segments on the same PMUs. `None`
+    /// before that, and in a run that does not count store-exclusives.
+    static SEGMENT_PMUS: Mutex<Option<Vec<CpuPmu>>> = Mutex::new(None);
+
+    /// Each live guest thread's own `STREX_FAIL_SPEC` counters (one per PMU,
+    /// not inherited), by host thread ID, with the count already attributed
+    /// to earlier segments. Like the run's own counters these are per Hermit
+    /// process: one counting run at a time (concurrent runs in one process,
+    /// as tests may make, reset each other's).
+    static SEGMENTS: Mutex<BTreeMap<i32, (Vec<OwnedFd>, u64)>> = Mutex::new(BTreeMap::new());
+
+    /// Whether some guest thread's segment counters could not be opened or
+    /// read, so that the run's segments are not all counted.
+    static SEGMENTS_INCOMPLETE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Start counting the failed store-exclusives of the guest thread `tid`
+    /// for its segments, afresh, before it runs: at its start, and at each
+    /// exec. Whatever was kept under `tid` before is dropped: a new thread
+    /// may reuse an exited one's ID, and an exec by a thread other than the
+    /// leader gives the execing task the leader's ID, while its old counter
+    /// follows it under its former ID. Nothing in a run that does not count
+    /// them.
+    pub(crate) fn open_segment_counter(cfg: &Config, tid: i32) {
+        if !counts_store_exclusives(cfg) {
+            return;
+        }
+        let Some(pmus) = SEGMENT_PMUS.lock().unwrap().clone() else {
+            return;
+        };
+        let mut segments = SEGMENTS.lock().unwrap();
+        segments.remove(&tid);
+        match pmus
+            .iter()
+            .map(|pmu| open_event(pmu, STREX_FAIL_SPEC, tid, false))
+            .collect::<std::io::Result<Vec<_>>>()
+        {
+            Ok(events) => {
+                segments.insert(tid, (events, 0));
+            }
+            Err(error) => {
+                debug!("[store-exclusive] cannot count the segments of thread {tid}: {error}");
+                SEGMENTS_INCOMPLETE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The store-exclusives the guest thread `tid` failed since the last
+    /// call, for the segment that ends now; 0 where it is not counted.
+    /// Failures after a thread's last kept segment are not attributed to any
+    /// segment (they still count in the run's total). Counters whose summed
+    /// times running fall short of the time enabled (multiplexed) give a
+    /// lower bound, and mark the run's segments as not all counted. The
+    /// counter an execing non-leader task carried under its former ID stays
+    /// open until that ID is reused or the run ends.
+    pub(crate) fn take_segment_failures(tid: i32) -> u32 {
+        let mut segments = SEGMENTS.lock().unwrap();
+        let Some((events, taken)) = segments.get_mut(&tid) else {
+            return 0;
+        };
+        let mut reads = Vec::with_capacity(events.len());
+        for event in events.iter() {
+            match read_event(event) {
+                Ok(read) => reads.push(read),
+                Err(error) => {
+                    debug!(
+                        "[store-exclusive] cannot read the segment counter of thread {tid}: {error}"
+                    );
+                    SEGMENTS_INCOMPLETE.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return 0;
+                }
+            }
+        }
+        // Combined across the PMUs as the run's counters are: on a host with
+        // several, each counts only while the thread is on its CPUs, so only
+        // their summed times running say whether anything was multiplexed.
+        let total = match combine(&reads) {
+            Some((total, fully_counted)) => {
+                if !fully_counted {
+                    SEGMENTS_INCOMPLETE.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                total
+            }
+            None => {
+                SEGMENTS_INCOMPLETE.store(true, std::sync::atomic::Ordering::Relaxed);
+                0
+            }
+        };
+        let failed = total.saturating_sub(*taken);
+        *taken = total;
+        u32::try_from(failed).unwrap_or(u32::MAX)
+    }
+
+    /// Stop counting the segments of the guest thread `tid`, which exited.
+    pub(crate) fn close_segment_counter(tid: i32) {
+        SEGMENTS.lock().unwrap().remove(&tid);
+    }
+
+    /// Whether this run's segments carry their failed store-exclusives: its
+    /// counters opened, and every guest thread's own counter opened, read and
+    /// was never multiplexed.
+    pub(crate) fn segments_counted() -> bool {
+        SEGMENT_PMUS.lock().unwrap().is_some()
+            && !SEGMENTS_INCOMPLETE.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A scanned file range, as `/proc/<pid>/maps` names it.
@@ -1362,6 +1477,10 @@ mod runtime {
             let root = guest.tid().as_raw();
             send(guest, Report::Attach { root }).await;
         }
+        // The run's counters are open now (the report above opened them), so
+        // the thread that execs counts its segments from its first
+        // instruction.
+        open_segment_counter(guest.config(), guest.tid().as_raw());
         if reads_guest_tasks(guest.config()) {
             report_pairs(guest, None).await;
         }

@@ -26,6 +26,7 @@ use serde::de::value::StringDeserializer;
 use serde::ser::SerializeMap;
 
 use super::HostObservedCount;
+use super::HostObservedFlag;
 use super::PreemptionRecord;
 use super::ReservedInputMetadata;
 use super::ThreadHistory;
@@ -75,6 +76,8 @@ struct RawRecord {
     format_version: Option<u32>,
     #[serde(default, skip_serializing_if = "super::lists_no_time_skips")]
     time_skips: Option<Vec<TimeSkip>>,
+    #[serde(default, skip_serializing_if = "HostObservedFlag::is_false")]
+    segment_store_exclusives: HostObservedFlag,
 }
 
 struct LegacyFields<'a>(&'a PreemptionRecord);

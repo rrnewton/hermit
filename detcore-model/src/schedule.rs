@@ -28,7 +28,7 @@ pub mod boundary;
 
 /// A scheduled action by one thread in the system.  This can be recorded, or replayed to guide the
 /// schedule.
-#[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Clone, Hash, Deserialize)]
 pub struct SchedEvent {
     /// The thread that originated the event.
     pub dettid: DetTid,
@@ -43,6 +43,103 @@ pub struct SchedEvent {
     /// An optional snapshot of the thread logical time at this point.
     /// This includes time waiting on the global scheduler.
     pub end_time: Option<LogicalTime>,
+    /// aarch64: the store-exclusives this thread failed during this run of
+    /// branches, in a run that counts them per segment (one that records or
+    /// replays preemptions, on a core that counts `STREX_FAIL_SPEC`). Each
+    /// failure retried a load/store-exclusive loop and so added branches to
+    /// this event's `count`. A diagnosis aid only: it never takes part in
+    /// comparing, hashing or printing events, so a replay that fails a
+    /// different number of store-exclusives is judged exactly as before.
+    /// A self-describing format (a JSON record) leaves a zero out; see the
+    /// `Serialize` impl.
+    #[serde(default)]
+    pub strex_fails: HostObserved,
+}
+
+/// The derived form, except that a self-describing format (a JSON record)
+/// leaves out a zero `strex_fails`, so that a record without failures, and
+/// every record of a run that does not count them, is byte-for-byte what it
+/// was before the field. A non-self-describing format (the bincode of
+/// Detcore's RPCs) always writes it: its decoder reads every field in order.
+impl Serialize for SchedEvent {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let SchedEvent {
+            dettid,
+            op,
+            count,
+            start_rip,
+            end_rip,
+            end_time,
+            strex_fails,
+        } = self;
+        let carry = !strex_fails.is_zero() || !serializer.is_human_readable();
+        let mut event = serializer.serialize_struct("SchedEvent", 6 + usize::from(carry))?;
+        event.serialize_field("dettid", dettid)?;
+        event.serialize_field("op", op)?;
+        event.serialize_field("count", count)?;
+        event.serialize_field("start_rip", start_rip)?;
+        event.serialize_field("end_rip", end_rip)?;
+        event.serialize_field("end_time", end_time)?;
+        if carry {
+            event.serialize_field("strex_fails", strex_fails)?;
+        } else {
+            event.skip_field("strex_fails")?;
+        }
+        event.end()
+    }
+}
+
+/// A count a run observed on its host rather than decided, carried with a
+/// record for diagnosis. Whatever its value it compares and hashes as equal,
+/// so two runs of one schedule still compare equal; read the value itself,
+/// or the serialized record.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HostObserved(pub u32);
+
+impl HostObserved {
+    /// Whether nothing was observed (or nothing counted).
+    pub fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl PartialEq for HostObserved {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for HostObserved {}
+
+impl std::hash::Hash for HostObserved {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
+}
+
+/// The derived form, without `strex_fails`: logs print events with this, and
+/// a count the host decided must not change what two runs of one schedule
+/// log.
+impl fmt::Debug for SchedEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let SchedEvent {
+            dettid,
+            op,
+            count,
+            start_rip,
+            end_rip,
+            end_time,
+            strex_fails: _,
+        } = self;
+        f.debug_struct("SchedEvent")
+            .field("dettid", dettid)
+            .field("op", op)
+            .field("count", count)
+            .field("start_rip", start_rip)
+            .field("end_rip", end_rip)
+            .field("end_time", end_time)
+            .finish()
+    }
 }
 
 /// A more compact printing.
@@ -77,6 +174,7 @@ impl SchedEvent {
             start_rip: None,
             end_rip: None,
             end_time: None,
+            strex_fails: HostObserved::default(),
         }
     }
 
@@ -89,6 +187,7 @@ impl SchedEvent {
             start_rip: None, // TODO: track the start of the interval as well.
             end_rip: None,
             end_time: None,
+            strex_fails: HostObserved::default(),
         }
     }
 
@@ -381,4 +480,74 @@ pub enum Op {
     /// The point a signal handler is received, just after whatever regular user instruction
     /// preceeded it, and just before the first instruction of the signal handler.
     SignalReceived(SigWrapper),
+}
+
+#[cfg(test)]
+mod strex_fails_wire_tests {
+    use super::*;
+
+    fn event(fails: u32) -> SchedEvent {
+        let mut event =
+            SchedEvent::branches(DetTid::from_raw(3), 35).with_time(LogicalDuration::from_nanos(9));
+        event.end_rip = InstructionPointer::new(0x1234);
+        event.strex_fails = HostObserved(fails);
+        event
+    }
+
+    /// A JSON record leaves a zero count out, byte-for-byte as the event was
+    /// written before the field existed, and reads either form back.
+    #[test]
+    fn json_leaves_out_only_a_zero_count() {
+        /// The event as it was before `strex_fails`.
+        #[derive(Serialize)]
+        struct Before {
+            dettid: DetTid,
+            op: Op,
+            count: u32,
+            start_rip: Option<InstructionPointer>,
+            end_rip: Option<InstructionPointer>,
+            end_time: Option<LogicalTime>,
+        }
+        let zero = event(0);
+        let before = Before {
+            dettid: zero.dettid,
+            op: zero.op,
+            count: zero.count,
+            start_rip: zero.start_rip,
+            end_rip: zero.end_rip,
+            end_time: zero.end_time,
+        };
+        let written = serde_json::to_string(&zero).unwrap();
+        assert_eq!(written, serde_json::to_string(&before).unwrap());
+        let back: SchedEvent = serde_json::from_str(&written).unwrap();
+        assert_eq!(back.strex_fails.0, 0);
+
+        let written = serde_json::to_string(&event(7)).unwrap();
+        assert!(written.ends_with(",\"strex_fails\":7}"), "{written}");
+        let back: SchedEvent = serde_json::from_str(&written).unwrap();
+        assert_eq!(back.strex_fails.0, 7);
+    }
+
+    /// Detcore's RPCs use bincode, which is positional: the count is always
+    /// written, zero or not, so an event, and the event inside a
+    /// `TraceSchedEvent` request's tuple, decodes whole in both configurations.
+    #[test]
+    fn bincode_always_carries_the_count() {
+        fn round_trip<C: bincode::config::Config>(config: C) {
+            for fails in [0, 7] {
+                let request = (event(fails), DetTid::from_raw(5), true);
+                let bytes = bincode::serde::encode_to_vec(&request, config).unwrap();
+                let (back, read): ((SchedEvent, DetTid, bool), usize) =
+                    bincode::serde::decode_from_slice(&bytes, config).unwrap();
+                assert_eq!(read, bytes.len());
+                assert_eq!(back.0.strex_fails.0, fails);
+                assert_eq!(back.0.count, 35);
+                assert_eq!(back.0.end_rip, InstructionPointer::new(0x1234));
+                assert_eq!(back.1, DetTid::from_raw(5));
+                assert!(back.2);
+            }
+        }
+        round_trip(bincode::config::legacy());
+        round_trip(bincode::config::standard());
+    }
 }
