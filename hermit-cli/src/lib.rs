@@ -26,6 +26,7 @@ reverie_liteinst::declare_legacy_tool_backing!();
 #[path = "../tests/common/dbt_placement_probe.rs"]
 mod dbt_placement_probe;
 
+pub mod aarch64_lse;
 mod backend_stats;
 pub mod build_info;
 pub mod canonical_verdict;
