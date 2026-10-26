@@ -71,6 +71,7 @@ use crate::detlog;
 use crate::fd::FdType;
 use crate::fd::VirtualTimerfd;
 use crate::record_or_replay::RecordOrReplay;
+use crate::syscalls::helpers::PollProbe;
 use crate::syscalls::helpers::poll_deadline_for;
 use crate::tool_global::thread_observe_time;
 use crate::tool_local::Detcore;
@@ -290,8 +291,10 @@ where
         })
     };
     match call {
+        #[cfg(target_arch = "x86_64")]
         Syscall::Poll(poll) => pollfds(poll.fds().map(|fds| fds.as_raw()), poll.nfds()),
         Syscall::Ppoll(ppoll) => pollfds(ppoll.fds().map(|fds| fds.as_raw()), ppoll.nfds()),
+        #[cfg(target_arch = "x86_64")]
         Syscall::Select(select) => fd_sets(
             select.nfds(),
             [select.readfds(), select.writefds(), select.exceptfds()]
@@ -340,12 +343,9 @@ where
     G: Guest<Detcore<T>>,
 {
     match call {
-        Syscall::Poll(_)
-        | Syscall::Ppoll(_)
-        | Syscall::Select(_)
-        | Syscall::Pselect6(_)
-        | Syscall::EpollWait(_)
-        | Syscall::EpollPwait(_) => true,
+        Syscall::Ppoll(_) | Syscall::Pselect6(_) | Syscall::EpollPwait(_) => true,
+        #[cfg(target_arch = "x86_64")]
+        Syscall::Poll(_) | Syscall::Select(_) | Syscall::EpollWait(_) => true,
         Syscall::Other(Sysno::epoll_pwait2, _) => true,
         Syscall::Read(read) => is_timerfd(guest, read.fd()),
         Syscall::Readv(readv) => is_timerfd(guest, readv.fd()),
@@ -406,6 +406,7 @@ where
 pub(crate) struct Scratch {
     setting: AddrMut<'static, libc::itimerspec>,
     pollfd: AddrMut<'static, libc::pollfd>,
+    probe: PollProbe,
 }
 
 /// Reserve a [`Scratch`] on `stack`, before the caller commits it.
@@ -433,6 +434,7 @@ pub(crate) fn reserve_scratch<S: Stack>(stack: &mut S) -> Scratch {
     Scratch {
         setting: stack.reserve(),
         pollfd: stack.reserve(),
+        probe: PollProbe::reserve(stack),
     }
 }
 
@@ -580,8 +582,8 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    let (setting, pollfd, _guard) = match scratch {
-        Some(scratch) => (scratch.setting, scratch.pollfd, None),
+    let (setting, pollfd, poll_probe, _guard) = match scratch {
+        Some(scratch) => (scratch.setting, scratch.pollfd, scratch.probe, None),
         None => {
             let mut stack = guest.stack().await;
             let scratch = reserve_scratch(&mut stack);
@@ -590,7 +592,7 @@ where
                     "no scratch memory to make expired timerfd {fd} readable"
                 ));
             };
-            (scratch.setting, scratch.pollfd, Some(guard))
+            (scratch.setting, scratch.pollfd, scratch.probe, Some(guard))
         }
     };
     let fault = take_fault();
@@ -660,10 +662,12 @@ where
         }
         // A 1 ms host wait where the backend honors it (ptrace); KVM probes
         // without waiting, so this loop then spins until the timer fires.
-        let probe = syscalls::Poll::new()
-            .with_fds(Some(pollfd.cast()))
-            .with_nfds(1)
-            .with_timeout(1);
+        let probe = match poll_probe.call(guest.memory(), pollfd, 1, 1) {
+            Ok(probe) => probe,
+            Err(error) => refuse(format_args!(
+                "could not stage the readiness probe of timerfd {fd}: {error}"
+            )),
+        };
         let ready = inject_bounded(
             guest,
             probe,

@@ -1431,8 +1431,13 @@ type RemovedName<'a> = (RawFd, Option<PathPtr<'a>>);
 /// [`Detcore::guest_made_fifos_removed_by`] (without) look up.
 fn removed_names<'a>(
     call: &'a Syscall,
+    #[cfg_attr(
+        target_arch = "aarch64",
+        allow(unused_variables, reason = "only x86_64 has rmdir")
+    )]
     with_rmdir: bool,
 ) -> Option<(RemovedName<'a>, Option<RemovedName<'a>>)> {
+    #[cfg(not(target_arch = "aarch64"))]
     let at = libc::AT_FDCWD;
     Some(match call {
         #[cfg(not(target_arch = "aarch64"))]
@@ -3732,8 +3737,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A `/proc` path naming a process or thread by the guest's number
         // is looked up by the kernel's (DBT), as the guest's own call is
         // (`procfs_numbers`).
-        let probe = Syscall::Newfstatat(
-            syscalls::Newfstatat::new()
+        let probe = crate::arch::fstatat_syscall(
+            syscalls::Fstatat::new()
                 .with_dirfd(dirfd)
                 .with_path(Some(path))
                 .with_flags(flags),
@@ -3773,8 +3778,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         flags: AtFlags,
     ) -> Result<libc::stat, Errno> {
         let lstatat = move |statptr: StatPtr<'_>| {
-            Syscall::Newfstatat(
-                syscalls::Newfstatat::new()
+            crate::arch::fstatat_syscall(
+                syscalls::Fstatat::new()
                     .with_dirfd(dirfd)
                     .with_path(Some(path))
                     .with_stat(Some(statptr))
@@ -3784,7 +3789,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         // The scratch starts 128 bytes below the stack pointer, at addresses
         // computed by subtraction.
         let scratch = 128 + std::mem::size_of::<libc::stat>();
-        if usize::try_from(guest.regs().await.rsp).map_or(true, |rsp| rsp <= scratch) {
+        if usize::try_from(crate::arch::stack_pointer(&guest.regs().await))
+            .map_or(true, |rsp| rsp <= scratch)
+        {
             return Self::inject_stat_in_transient_page(guest, lstatat, None)
                 .await
                 .map_err(StatFailure::errno);
@@ -4468,6 +4475,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: &Syscall,
     ) {
+        #[cfg(not(target_arch = "aarch64"))]
         let at = libc::AT_FDCWD;
         let changed: Vec<(i32, Option<syscalls::PathPtr>)> = match call {
             #[cfg(not(target_arch = "aarch64"))]
@@ -6682,16 +6690,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         capacity: usize,
     ) -> Option<Vec<u8>> {
         let target = AddrMut::<u8>::from_raw(target)?;
-        let length = self
-            .record_or_replay(
-                guest,
-                syscalls::Readlink::new()
-                    .with_path(PathPtr::from_ptr(link as *const libc::c_char))
-                    .with_buf(Some(target.cast::<libc::c_char>()))
-                    .with_bufsize(capacity),
-            )
-            .await
-            .ok()?;
+        let path = PathPtr::from_ptr(link as *const libc::c_char);
+        let buf = Some(target.cast::<libc::c_char>());
+        #[cfg(target_arch = "x86_64")]
+        let call = syscalls::Readlink::new()
+            .with_path(path)
+            .with_buf(buf)
+            .with_bufsize(capacity);
+        // aarch64 has only `readlinkat`.
+        #[cfg(not(target_arch = "x86_64"))]
+        let call = syscalls::Readlinkat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(path)
+            .with_buf(buf)
+            .with_buf_len(capacity);
+        let length = self.record_or_replay(guest, call).await.ok()?;
         let length = usize::try_from(length)
             .ok()
             .filter(|length| *length < capacity)?;
@@ -11994,10 +12007,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         // below name the same four syscalls. Fail closed if they drift: "not
         // attempted" must never be observationally identical to a validated
         // emulated success.
-        if !matches!(
-            call,
-            Syscall::Chown(_) | Syscall::Fchown(_) | Syscall::Fchownat(_) | Syscall::Lchown(_)
-        ) {
+        let ownership_change = match call {
+            Syscall::Fchown(_) | Syscall::Fchownat(_) => true,
+            #[cfg(target_arch = "x86_64")]
+            Syscall::Chown(_) | Syscall::Lchown(_) => true,
+            _ => false,
+        };
+        if !ownership_change {
             warn!(
                 "ownership-change no-op reached with an unexpected syscall {:?}; \
                  refusing unvalidated success",
@@ -12035,22 +12051,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             stack.commit()?;
 
             let validate = match &call {
-                Syscall::Chown(c) => Syscall::Newfstatat(
-                    syscalls::Newfstatat::new()
+                #[cfg(target_arch = "x86_64")]
+                Syscall::Chown(c) => crate::arch::fstatat_syscall(
+                    syscalls::Fstatat::new()
                         .with_dirfd(libc::AT_FDCWD)
                         .with_path(c.path())
                         .with_stat(Some(statptr))
                         .with_flags(AtFlags::empty()),
                 ),
-                Syscall::Lchown(c) => Syscall::Newfstatat(
-                    syscalls::Newfstatat::new()
+                #[cfg(target_arch = "x86_64")]
+                Syscall::Lchown(c) => crate::arch::fstatat_syscall(
+                    syscalls::Fstatat::new()
                         .with_dirfd(libc::AT_FDCWD)
                         .with_path(c.path())
                         .with_stat(Some(statptr))
                         .with_flags(AtFlags::AT_SYMLINK_NOFOLLOW),
                 ),
-                Syscall::Fchownat(c) => Syscall::Newfstatat(
-                    syscalls::Newfstatat::new()
+                Syscall::Fchownat(c) => crate::arch::fstatat_syscall(
+                    syscalls::Fstatat::new()
                         .with_dirfd(c.dirfd())
                         .with_path(c.path())
                         .with_stat(Some(statptr))
@@ -12083,12 +12101,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_owner(KEEP_ID)
                     .with_group(KEEP_ID),
             ),
+            #[cfg(target_arch = "x86_64")]
             Syscall::Chown(c) => Syscall::Chown(
                 syscalls::Chown::new()
                     .with_path(c.path())
                     .with_owner(KEEP_ID)
                     .with_group(KEEP_ID),
             ),
+            #[cfg(target_arch = "x86_64")]
             Syscall::Lchown(c) => Syscall::Lchown(
                 syscalls::Lchown::new()
                     .with_path(c.path())
@@ -12168,6 +12188,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// dup2 system call.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_dup2<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -12427,6 +12448,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// utime syscall: update access/modification time on a file
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_utime<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -12460,6 +12482,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// utimes syscall
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_utimes<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -12528,7 +12551,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let scratch = 128
             + staged.map_or(0, |_| std::mem::size_of::<[Timespec; 2]>())
             + std::mem::size_of::<libc::stat>();
-        if usize::try_from(guest.regs().await.rsp).map_or(true, |rsp| rsp <= scratch) {
+        if usize::try_from(crate::arch::stack_pointer(&guest.regs().await))
+            .map_or(true, |rsp| rsp <= scratch)
+        {
             info!(
                 "Guest stack pointer cannot hold the utimensat target lookup; \
                  leaving the virtual mtime unchanged."
@@ -12702,8 +12727,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             ),
             Some(path) => {
                 let allowed = libc::AT_SYMLINK_NOFOLLOW | libc::AT_EMPTY_PATH;
-                Syscall::Newfstatat(
-                    syscalls::Newfstatat::new()
+                crate::arch::fstatat_syscall(
+                    syscalls::Fstatat::new()
                         .with_dirfd(call.dirfd())
                         .with_path(Some(path))
                         .with_stat(Some(statptr))
@@ -14191,6 +14216,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// getdents system call.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_getdents<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -15690,6 +15716,7 @@ impl<'a> GetdentsCall<'a> {
     /// The same call reading at most `count` bytes into `buf` instead.
     fn into_scratch<'b>(self, buf: AddrMut<'b, u8>, count: u32) -> GetdentsCall<'b> {
         let call = match self.call {
+            #[cfg(target_arch = "x86_64")]
             Syscall::Getdents(call) => {
                 Syscall::from(call.with_dirent(Some(buf.cast())).with_count(count))
             }

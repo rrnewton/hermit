@@ -1188,10 +1188,18 @@ const LEGACY_MAP_MASK: libc::c_int = libc::MAP_SHARED
     | libc::MAP_NONBLOCK
     | libc::MAP_STACK
     | libc::MAP_HUGETLB
-    | libc::MAP_32BIT
-    | 0x80 // MAP_ABOVE4G
+    | MAP_32BIT_AND_ABOVE4G
     | (21 << 26) // MAP_HUGE_2MB
     | (30 << 26); // MAP_HUGE_1GB
+
+/// `MAP_32BIT | MAP_ABOVE4G`: x86's placement flags. Every other architecture
+/// defines both as 0 in `include/linux/mman.h`.
+#[cfg(target_arch = "x86_64")]
+const MAP_32BIT_AND_ABOVE4G: libc::c_int = libc::MAP_32BIT | 0x80;
+/// `MAP_32BIT | MAP_ABOVE4G`: x86's placement flags. Every other architecture
+/// defines both as 0 in `include/linux/mman.h`.
+#[cfg(not(target_arch = "x86_64"))]
+const MAP_32BIT_AND_ABOVE4G: libc::c_int = 0;
 
 /// Linux's answer to mapping a procfs file Detcore renders, where the range
 /// overlaps no mapping (`MAP_FIXED_NOREPLACE` then has nothing to refuse):
@@ -3367,8 +3375,10 @@ impl<T: RecordOrReplay> Detcore<T> {
              of such a file tells apart (procfs_inode::MAX_INCARNATION)",
             procfs_inode::MAX_INCARNATION
         );
-        let sysno = reverie::syscalls::Sysno::new(guest.regs().await.orig_rax as usize)
-            .unwrap_or(reverie::syscalls::Sysno::openat);
+        let sysno = reverie::syscalls::Sysno::new(
+            crate::arch::syscall_number(&guest.regs().await) as usize
+        )
+        .unwrap_or(reverie::syscalls::Sysno::openat);
         error!("Detcore refuses {sysno}: {reason}");
         crate::syscalls::helpers::refuse_unserviceable_operation_with(
             guest,
@@ -4823,7 +4833,9 @@ enum PathRequest {
     Chdir,
     /// Arguments Linux refuses before it looks at the file.
     Invalid,
-    /// Arguments Linux cannot read.
+    /// Arguments Linux cannot read: the legacy `utime` and `utimes` times,
+    /// which only x86_64 has.
+    #[cfg(target_arch = "x86_64")]
     Fault,
 }
 
@@ -4886,6 +4898,7 @@ fn path_request_answer(
         } => Err(Errno::EPERM),
         PathRequest::Chdir => Err(Errno::ENOTDIR),
         PathRequest::Invalid => Err(Errno::EINVAL),
+        #[cfg(target_arch = "x86_64")]
         PathRequest::Fault => Err(Errno::EFAULT),
     }
 }
@@ -4945,6 +4958,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let (dirfd, path, flags, request, name) = match kind {
             // Linux declares mode and flags `int`: it ignores the upper bits
             // of the raw registers.
+            #[cfg(target_arch = "x86_64")]
             PathCall::Access => (
                 at,
                 a0,
@@ -5010,6 +5024,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 a1,
             ),
+            #[cfg(target_arch = "x86_64")]
             PathCall::Chmod => (at, a0, 0, PathRequest::Chmod { flags: 0 }, 0),
             PathCall::Fchmodat => (a0, a1, 0, PathRequest::Chmod { flags: 0 }, 0),
             PathCall::Fchmodat2 => (a0, a1, a3, PathRequest::Chmod { flags: a3 }, 0),
@@ -5065,6 +5080,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     0,
                 )
             }
+            #[cfg(target_arch = "x86_64")]
             PathCall::Utime => (
                 at,
                 a0,
@@ -5072,6 +5088,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 legacy_times_request(&guest.memory(), a1, false),
                 0,
             ),
+            #[cfg(target_arch = "x86_64")]
             PathCall::Utimes => (
                 at,
                 a0,
@@ -5290,7 +5307,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 libc::UTIME_NOW => None,
                 _ => Some((mtime.tv_sec, mtime.tv_nsec)),
             }
-        } else if sysno == Sysno::utime {
+        } else if is_utime(sysno) {
             let [_, modtime] = read_pair::<libc::time_t, _>(&guest.memory(), times)
                 .ok()
                 .flatten()?;
@@ -5357,6 +5374,17 @@ enum DescriptorPositions {
     WhenPathNamesItself { dirfd: usize, path: usize },
 }
 
+/// Whether `sysno` is `utime`, which only x86_64 has.
+fn is_utime(sysno: Sysno) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return sysno == Sysno::utime;
+    #[cfg(not(target_arch = "x86_64"))]
+    return {
+        let _ = sysno;
+        false
+    };
+}
+
 /// The argument positions of the descriptors a call numbered `sysno` may
 /// name ([`descriptor_arguments`]); `None` for a call that names none.
 fn descriptor_positions(sysno: Sysno) -> Option<DescriptorPositions> {
@@ -5383,7 +5411,6 @@ fn descriptor_positions(sysno: Sysno) -> Option<DescriptorPositions> {
         | Sysno::syncfs
         | Sysno::fadvise64
         | Sysno::readahead
-        | Sysno::sync_file_range
         | Sysno::fchmod
         | Sysno::fchown
         | Sysno::fgetxattr
@@ -5392,22 +5419,27 @@ fn descriptor_positions(sysno: Sysno) -> Option<DescriptorPositions> {
         | Sysno::fremovexattr
         | Sysno::flock
         | Sysno::dup
-        | Sysno::dup2
         | Sysno::dup3
-        | Sysno::getdents
         | Sysno::getdents64
         | Sysno::fchdir => DescriptorPositions::Always(&[0]),
+        #[cfg(target_arch = "x86_64")]
+        Sysno::sync_file_range | Sysno::dup2 | Sysno::getdents => DescriptorPositions::Always(&[0]),
+        #[cfg(target_arch = "aarch64")]
+        Sysno::sync_file_range2 => DescriptorPositions::Always(&[0]),
         Sysno::mmap => DescriptorPositions::Always(&[4]),
         Sysno::sendfile | Sysno::tee => DescriptorPositions::Always(&[0, 1]),
         Sysno::splice | Sysno::copy_file_range => DescriptorPositions::Always(&[0, 2]),
         Sysno::epoll_ctl => DescriptorPositions::Always(&[2]),
-        Sysno::newfstatat
-        | Sysno::statx
+        Sysno::statx
         | Sysno::utimensat
         | Sysno::faccessat2
         | Sysno::fchownat
         | Sysno::fchmodat
         | Sysno::readlinkat => DescriptorPositions::WhenPathNamesItself { dirfd: 0, path: 1 },
+        #[cfg(target_arch = "x86_64")]
+        Sysno::newfstatat => DescriptorPositions::WhenPathNamesItself { dirfd: 0, path: 1 },
+        #[cfg(target_arch = "aarch64")]
+        Sysno::fstatat => DescriptorPositions::WhenPathNamesItself { dirfd: 0, path: 1 },
         _ => return None,
     })
 }
@@ -5481,6 +5513,7 @@ pub(crate) fn may_answer_mapping(sysno: Sysno) -> bool {
 /// here.
 #[derive(Clone, Copy, Debug)]
 enum PathCall {
+    #[cfg(target_arch = "x86_64")]
     Access,
     Faccessat,
     Faccessat2,
@@ -5492,12 +5525,15 @@ enum PathCall {
     Setxattr,
     /// `removexattr` and `lremovexattr`.
     Removexattr,
+    #[cfg(target_arch = "x86_64")]
     Chmod,
     Fchmodat,
     Fchmodat2,
     Truncate,
     Utimensat,
+    #[cfg(target_arch = "x86_64")]
     Utime,
+    #[cfg(target_arch = "x86_64")]
     Utimes,
     Chdir,
 }
@@ -5506,6 +5542,7 @@ enum PathCall {
 /// call numbered `sysno`, or `None` for a call the table has no arm for.
 fn path_call_kind(sysno: Sysno) -> Option<PathCall> {
     Some(match sysno {
+        #[cfg(target_arch = "x86_64")]
         Sysno::access => PathCall::Access,
         Sysno::faccessat => PathCall::Faccessat,
         Sysno::faccessat2 => PathCall::Faccessat2,
@@ -5515,12 +5552,15 @@ fn path_call_kind(sysno: Sysno) -> Option<PathCall> {
         Sysno::llistxattr => PathCall::Llistxattr,
         Sysno::setxattr | Sysno::lsetxattr => PathCall::Setxattr,
         Sysno::removexattr | Sysno::lremovexattr => PathCall::Removexattr,
+        #[cfg(target_arch = "x86_64")]
         Sysno::chmod => PathCall::Chmod,
         Sysno::fchmodat => PathCall::Fchmodat,
         Sysno::fchmodat2 => PathCall::Fchmodat2,
         Sysno::truncate => PathCall::Truncate,
         Sysno::utimensat => PathCall::Utimensat,
+        #[cfg(target_arch = "x86_64")]
         Sysno::utime => PathCall::Utime,
+        #[cfg(target_arch = "x86_64")]
         Sysno::utimes => PathCall::Utimes,
         Sysno::chdir => PathCall::Chdir,
         _ => return None,
@@ -5722,6 +5762,7 @@ fn read_value<M: MemoryAccess>(memory: &M, address: u64, size: usize) -> Option<
 /// timeval`, when `timevals`) asks of a file's times at guest address
 /// `times`: NULL is the current time; the times are read, and for `timeval`s
 /// their microseconds checked, before the file is.
+#[cfg(target_arch = "x86_64")]
 fn legacy_times_request<M: MemoryAccess>(memory: &M, times: u64, timevals: bool) -> PathRequest {
     if times == 0 {
         return PathRequest::Times { explicit: None };

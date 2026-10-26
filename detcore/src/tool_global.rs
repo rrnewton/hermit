@@ -9763,7 +9763,7 @@ where
                 Some(projection) => projection,
                 None => guest.regs().await,
             };
-            NonZeroUsize::new(regs.rip.try_into().unwrap()).unwrap()
+            NonZeroUsize::new(crate::arch::instruction_pointer(&regs).try_into().unwrap()).unwrap()
         };
         SchedEvent {
             end_rip: Some(end_rip),

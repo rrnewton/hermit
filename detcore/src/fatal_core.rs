@@ -717,6 +717,26 @@ fn nt_file(maps: &[MemoryMap]) -> Vec<u8> {
     out
 }
 
+/// The fields of `struct elf_prstatus_common` (include/linux/elfcore.h) that
+/// precede `pr_reg` and do not come from registers, at the same offsets on
+/// every 64-bit architecture: `pr_info.si_signo`, `pr_cursig`, the pending
+/// and blocked signal sets, then the thread's, parent's, process group's and
+/// session's IDs. The four times after them stay zero.
+#[cfg_attr(
+    not(any(target_arch = "x86_64", target_arch = "aarch64")),
+    allow(dead_code, reason = "no other architecture has a prstatus layout here")
+)]
+fn prstatus_common(out: &mut [u8], signal: i32, id: &Identity) {
+    put(out, 0, &signal.to_le_bytes()); // pr_info.si_signo
+    put(out, 12, &(signal as i16).to_le_bytes()); // pr_cursig
+    put(out, 16, &id.sigpend.to_le_bytes());
+    put(out, 24, &id.sighold.to_le_bytes());
+    put(out, 32, &id.tid.to_le_bytes());
+    put(out, 36, &id.ppid.to_le_bytes());
+    put(out, 40, &id.pgrp.to_le_bytes());
+    put(out, 44, &id.sid.to_le_bytes());
+}
+
 #[cfg(target_arch = "x86_64")]
 mod arch {
     use super::Identity;
@@ -733,14 +753,7 @@ mod arch {
         const REGS: usize = std::mem::size_of::<libc::user_regs_struct>();
         const _: () = assert!(REGS == 216);
         let mut out = vec![0u8; 336];
-        put(&mut out, 0, &signal.to_le_bytes()); // pr_info.si_signo
-        put(&mut out, 12, &(signal as i16).to_le_bytes()); // pr_cursig
-        put(&mut out, 16, &id.sigpend.to_le_bytes());
-        put(&mut out, 24, &id.sighold.to_le_bytes());
-        put(&mut out, 32, &id.tid.to_le_bytes());
-        put(&mut out, 36, &id.ppid.to_le_bytes());
-        put(&mut out, 40, &id.pgrp.to_le_bytes());
-        put(&mut out, 44, &id.sid.to_le_bytes());
+        super::prstatus_common(&mut out, signal, id);
         // SAFETY: user_regs_struct is plain old data of exactly REGS bytes.
         let bytes = unsafe { std::slice::from_raw_parts(regs as *const _ as *const u8, REGS) };
         put(&mut out, 112, bytes);
@@ -748,7 +761,33 @@ mod arch {
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+mod arch {
+    use super::Identity;
+    use super::put;
+
+    pub(super) const MACHINE: u16 = 183; // EM_AARCH64
+
+    pub(super) fn stack_pointer(regs: &libc::user_regs_struct) -> u64 {
+        regs.sp
+    }
+
+    /// `struct elf_prstatus` for arm64 (392 bytes): the common fields, then
+    /// `pr_reg`, the 34 words of `struct user_pt_regs` (x0-x30, sp, pc,
+    /// pstate), then `pr_fpvalid`.
+    pub(super) fn prstatus(signal: i32, id: &Identity, regs: &libc::user_regs_struct) -> Vec<u8> {
+        const REGS: usize = std::mem::size_of::<libc::user_regs_struct>();
+        const _: () = assert!(REGS == 272);
+        let mut out = vec![0u8; 392];
+        super::prstatus_common(&mut out, signal, id);
+        // SAFETY: user_regs_struct is plain old data of exactly REGS bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(regs as *const _ as *const u8, REGS) };
+        put(&mut out, 112, bytes);
+        out
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 mod arch {
     use super::Identity;
 

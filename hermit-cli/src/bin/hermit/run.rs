@@ -7779,14 +7779,7 @@ impl RunOpts {
         }
         match hermit::cpu_profile_admission::admit(&request) {
             Ok((probe, host)) => {
-                tracing::info!(
-                    "--cpu-profile x86-64-v3 admitted: XINUSE probe on CPU {}, XCR0 {:#x}, {} cases, \
-                     {} certified pairs",
-                    probe.cpu,
-                    probe.xcr0,
-                    probe.cases,
-                    probe.certified_pairs
-                );
+                log_v3_admission(&probe);
                 self.det_opts.det_config.cpu_profile_host = Some(host);
                 super::verify::CPU_PROFILE_V3_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
@@ -13403,6 +13396,25 @@ pub(crate) fn physical_mm_cancellation_control(
             "physical MM={error:#}; image close={close:#}"
         )),
     }
+}
+
+/// Logs a successful x86-64-v3 admission.
+#[cfg(target_arch = "x86_64")]
+fn log_v3_admission(probe: &hermit::xstate_probe::ProbeReport) {
+    tracing::info!(
+        "--cpu-profile x86-64-v3 admitted: XINUSE probe on CPU {}, XCR0 {:#x}, {} cases, \
+         {} certified pairs",
+        probe.cpu,
+        probe.xcr0,
+        probe.cases,
+        probe.certified_pairs
+    );
+}
+
+/// No x86-64-v3 admission succeeds off x86 (`cpu_profile_admission::Qualification`).
+#[cfg(not(target_arch = "x86_64"))]
+fn log_v3_admission(probe: &std::convert::Infallible) {
+    match *probe {}
 }
 
 #[cfg(test)]
