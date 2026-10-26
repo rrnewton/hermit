@@ -2756,8 +2756,18 @@ fi
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory (1009), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the 9a3577e7 entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d94f6bd3017ca036b4de47b45b02efdea22f2cca ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d94f6bd3017ca036b4de47b45b02efdea22f2cca (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 178c3ed5254635b2de8c728fc271fd09b651ad66 (2026-10-26): from
+# d94f6bd3017ca036b4de47b45b02efdea22f2cca. One commit (linuxemu lane, S2): LinuxEmu fills
+# AT_RANDOM from the host's getrandom. It changes reverie-linuxemu/src/elf.rs
+# only. git diff is empty under reverie-dbt/ and third-party/ and for the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml; both repository inputs to
+# the DynamoRIO content key are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory (1009), SDK and native inputs, calibrated budget, job width
+# and limits carry unchanged from the d94f6bd3 entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 178c3ed5254635b2de8c728fc271fd09b651ad66 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 178c3ed5254635b2de8c728fc271fd09b651ad66 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
