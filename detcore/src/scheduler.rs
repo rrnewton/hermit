@@ -20702,6 +20702,9 @@ impl Scheduler {
                 guest_ids: None,
                 host_id_tasks: 0,
                 virtual_timeout_ns,
+                // The backend's precise timers count these.
+                skid_overshoots: None,
+                seed_reproducible: None,
             },
             info_reprio_descrip,
         ))
