@@ -41,6 +41,7 @@ use crate::analyze::budget::BudgetKind;
 use crate::analyze::checkpoint::BisectInterval;
 use crate::analyze::checkpoint::CHECKPOINT_VERSION;
 use crate::analyze::checkpoint::Checkpoint;
+use crate::analyze::checkpoint::DecidedEvents;
 use crate::analyze::checkpoint::FileIdentity;
 use crate::analyze::checkpoint::Identity;
 use crate::analyze::checkpoint::IntervalResume;
@@ -1725,10 +1726,13 @@ impl AnalyzeOpts {
             continuation,
         } = found;
         self.progress.phase(Phase::StackTraces);
-        self.progress.decided(format!(
-            "event #{decision} of the target schedule decides the outcome ({})",
-            schedule.schedevents()[decision]
-        ));
+        self.progress.decided(
+            format!(
+                "event #{decision} of the target schedule decides the outcome ({})",
+                schedule.schedevents()[decision]
+            ),
+            DecidedEvents::Deciding(decision),
+        );
         let notes: Vec<String> = [refused, unfinished.clone()]
             .into_iter()
             .flatten()
@@ -2821,15 +2825,18 @@ impl AnalyzeOpts {
             critical_event_index,
         } = crit;
         self.progress.phase(Phase::StackTraces);
-        self.progress.decided(format!(
-            "events #{} and #{critical_event_index} of the failing schedule are the critical \
-             pair, in {}",
-            critical_event_index - 1,
-            self.get_tmp()?
-                .join("final_target_for_stacktraces")
-                .with_extension(SCHED_EXT)
-                .display()
-        ));
+        self.progress.decided(
+            format!(
+                "events #{} and #{critical_event_index} of the failing schedule are the critical \
+                 pair, in {}",
+                critical_event_index - 1,
+                self.get_tmp()?
+                    .join("final_target_for_stacktraces")
+                    .with_extension(SCHED_EXT)
+                    .display()
+            ),
+            DecidedEvents::CriticalPair(critical_event_index - 1, critical_event_index),
+        );
 
         let runname1 = "final_target_for_stacktraces";
         let runname2 = "final_baseline_for_stacktraces";
@@ -3152,11 +3159,37 @@ impl AnalyzeOpts {
         let mut critical = [None, None];
         let mut stacks =
             "not applicable: the default search had no pair of schedules yet".to_owned();
+        // The events the report's structured fields name: the critical pair's
+        // and the deciding event's indices.
+        let mut critical_indices = progress
+            .interval
+            .as_ref()
+            .map_or([0, 0], |interval| [interval.common_prefix; 2]);
+        let mut deciding_event = None;
         if let Some(decided) = &progress.decided {
             header.push_str(&format!(
                 "The search had finished: {decided}. Its stack-trace runs did not finish within \
                  the budget; --resume takes them.\n"
             ));
+            // A budget hit after the search decided still reports the
+            // decision, in the fields a complete report puts it in; only the
+            // stacks are missing.
+            stacks = "not taken: the budget ran out during the stack-trace runs; --resume takes \
+                      them"
+                .to_owned();
+            match progress.decision {
+                Some(DecidedEvents::Deciding(decision)) => {
+                    critical_indices = [decision; 2];
+                    deciding_event = Some(ReportCriticalEvent {
+                        event_index: decision,
+                        stack: None,
+                    });
+                }
+                Some(DecidedEvents::CriticalPair(first, second)) => {
+                    critical_indices = [first, second];
+                }
+                None => {}
+            }
         } else if let Some(interval) = &progress.interval
             && progress.phase == Phase::Bisect
         {
@@ -3249,20 +3282,14 @@ impl AnalyzeOpts {
             additional_context: String::new(),
             baseline_run: true,
             critical_event1: ReportCriticalEvent {
-                event_index: progress
-                    .interval
-                    .as_ref()
-                    .map_or(0, |interval| interval.common_prefix),
+                event_index: critical_indices[0],
                 stack: critical1,
             },
             critical_event2: ReportCriticalEvent {
-                event_index: progress
-                    .interval
-                    .as_ref()
-                    .map_or(0, |interval| interval.common_prefix),
+                event_index: critical_indices[1],
                 stack: critical2,
             },
-            deciding_event: None,
+            deciding_event,
             partial: Some(PartialReport {
                 reason: expired.kind,
                 phase: progress.phase,
@@ -5610,6 +5637,88 @@ mod tests {
         interval.record(&options, None, [&baseline, &target], None, None);
         options.resumed_progress = Some(options.progress.snapshot());
         assert!(options.resumable_interval(&endpoints).is_none());
+    }
+
+    /// A budget hit after the search decided, during the stack-trace runs,
+    /// still reports the decision in the report's structured fields: the
+    /// deciding event for `--prefix-search`, and the critical pair for the
+    /// default search, with no stacks, and exits 120. Before, the decision
+    /// was only text, and the event indices were 0 on the prefix path.
+    #[test]
+    fn a_budget_hit_after_the_decision_reports_it() {
+        for (decided, events, critical, deciding) in [
+            (
+                "event #41 of the target schedule decides the outcome (tid 3)",
+                DecidedEvents::Deciding(41),
+                [41, 41],
+                Some(41),
+            ),
+            (
+                "events #6 and #7 of the failing schedule are the critical pair",
+                DecidedEvents::CriticalPair(6, 7),
+                [6, 7],
+                None,
+            ),
+        ] {
+            let parent = tempfile::tempdir().unwrap();
+            let report_file = parent.path().join("report.json");
+            let report = format!("--report-file={}", report_file.display());
+            let (mut options, _workspace) =
+                analysis_in(parent.path(), &[report.as_str(), "--time-budget=30m"]);
+            options.budget = Budget::new(options.time_budget, options.trial_budget);
+            options.progress.phase(Phase::StackTraces);
+            options.progress.decided(decided.to_owned(), events);
+            let expired = BudgetExpired {
+                kind: BudgetKind::TimeBudget,
+                cut: Some("final_target_for_stacktraces".to_owned()),
+            };
+
+            let status = options.report_partial(expired).unwrap();
+            assert_eq!(
+                status,
+                ExitStatus::Exited(hermit::HERMIT_ANALYZE_PARTIAL_EXIT)
+            );
+            let written: Report =
+                serde_json::from_str(&std::fs::read_to_string(&report_file).unwrap()).unwrap();
+            assert_eq!(
+                [
+                    written.critical_event1.event_index,
+                    written.critical_event2.event_index
+                ],
+                critical,
+                "{events:?}"
+            );
+            assert_eq!(
+                written
+                    .deciding_event
+                    .as_ref()
+                    .map(|event| event.event_index),
+                deciding,
+                "{events:?}"
+            );
+            assert!(written.critical_event1.stack.is_none());
+            assert!(written.critical_event2.stack.is_none());
+            assert!(
+                written
+                    .deciding_event
+                    .as_ref()
+                    .is_none_or(|event| event.stack.is_none())
+            );
+            let partial = written.partial.unwrap();
+            assert_eq!(partial.phase, Phase::StackTraces);
+            assert_eq!(partial.decided.as_deref(), Some(decided));
+            assert_eq!(
+                partial.stacks,
+                "not taken: the budget ran out during the stack-trace runs; --resume takes them"
+            );
+            assert!(
+                written
+                    .header
+                    .contains(&format!("The search had finished: {decided}.")),
+                "{}",
+                written.header
+            );
+        }
     }
 
     /// The default search's partial report names its pair of schedules, the
