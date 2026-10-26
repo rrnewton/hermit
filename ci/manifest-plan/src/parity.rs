@@ -6224,7 +6224,12 @@ mod tests {
         // guest) adds one row per candidate backend: 2995.
         // c-programs/syscall-clobbers (the capability-flag lane's slice 3
         // guest) adds one row per candidate backend: 3000.
-        assert_eq!(parsed.cells.len(), 3000);
+        // c-programs/inotify-rename-cookies (the inotify cookie guest,
+        // https://github.com/rrnewton/hermit/issues/4765) adds one row per
+        // candidate backend: 3005.
+        // c-programs/inotify-write-only-buffer (an inotify read into a
+        // write-only page) adds one row per candidate backend: 3010.
+        assert_eq!(parsed.cells.len(), 3010);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448

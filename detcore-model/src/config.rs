@@ -2085,15 +2085,18 @@ pub const MAX_SCHEDULER_TURN_COST: u64 = 1_000_000_000;
 
 /// N.B. we don't want to specify two different notions of "default", so we use the
 /// `Clap` instance above.
-/// Environment variable carrying the coordinator's [`config_wire_fingerprint`]
-/// to an out-of-process plugin.
+/// Environment variable carrying the coordinator's fingerprint to an
+/// out-of-process plugin: `detcore::config_wire_fingerprint`, which extends
+/// [`config_wire_fingerprint`] with Detcore's global RPC definitions.
 ///
 /// Named alongside the other `REVERIE_SABRE_HERMIT_*` launch variables so the
 /// two travel together and a reader finds them in one place.
 pub const CONFIG_FINGERPRINT_ENV: &str = "REVERIE_SABRE_HERMIT_CONFIG_FINGERPRINT";
 
-/// Environment variable carrying the coordinator's [`config_wire_fingerprint`]
-/// to the in-guest LiteInst runtime (`libdetcore_liteinst.so`), which checks it
+/// Environment variable carrying the coordinator's fingerprint
+/// (`detcore::config_wire_fingerprint`, which extends
+/// [`config_wire_fingerprint`] with Detcore's global RPC definitions) to the
+/// in-guest LiteInst runtime (`libdetcore_liteinst.so`), which checks it
 /// before it decodes the configuration the coordinator sends. Without the
 /// check, a runtime built from another tree fails with a bare decoding error
 /// that names neither build (<https://github.com/rrnewton/hermit/issues/3986>).
