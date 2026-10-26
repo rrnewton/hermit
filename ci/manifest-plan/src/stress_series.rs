@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use detcore_model::syscall_histogram::CompactSyscallHistogram;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -149,6 +150,29 @@ pub struct SeriesRuntimeMeasurement {
     pub virtual_nanoseconds: Option<u64>,
     #[serde(default)]
     pub syscalls: Option<u64>,
+    /// Run 1's syscall histogram, from its verification report. Usage totals
+    /// count one canonical execution per cell, so only `run1` may carry it;
+    /// its calls must sum to `syscalls`. Absent on rows written before it
+    /// existed, which a coverage reader shows as incomplete rather than zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syscall_histogram: Option<CompactSyscallHistogram>,
+}
+
+impl SeriesRuntimeMeasurement {
+    /// Why this run's histogram cannot be admitted, if it cannot.
+    fn histogram_error(&self, run: &str) -> Option<String> {
+        let histogram = self.syscall_histogram.as_ref()?;
+        if let Some(malformation) = histogram.malformation() {
+            return Some(format!("runtime {run} {malformation}"));
+        }
+        (Some(histogram.total_calls()) != self.syscalls).then(|| {
+            format!(
+                "runtime {run} syscall histogram counts {} calls but syscalls is {:?}",
+                histogram.total_calls(),
+                self.syscalls
+            )
+        })
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -936,6 +960,23 @@ impl SeriesRow {
                 if minimum > maximum {
                     return Err("runtime wall_time_min_ms must not exceed wall_time_max_ms".into());
                 }
+            }
+            if runtime
+                .run2
+                .as_ref()
+                .is_some_and(|run2| run2.syscall_histogram.is_some())
+            {
+                return Err(
+                    "runtime run2 must not carry a syscall histogram; usage counts run 1 only"
+                        .into(),
+                );
+            }
+            if let Some(error) = runtime
+                .run1
+                .as_ref()
+                .and_then(|run1| run1.histogram_error("run1"))
+            {
+                return Err(error);
             }
         }
         for (repository, depth) in &self.series.depth {
@@ -2028,6 +2069,91 @@ mod tests {
                 divergence: None,
             },
         }
+    }
+
+    /// A verify row whose run 1 carries `histogram` beside `syscalls`.
+    fn histogram_row(
+        syscalls: u64,
+        histogram: CompactSyscallHistogram,
+        run2_histogram: bool,
+    ) -> SeriesRow {
+        let mut fixture = row(SeriesSchema::V3);
+        let measurement = |histogram| SeriesRuntimeMeasurement {
+            scheduler_turns: Some(12),
+            virtual_nanoseconds: Some(34),
+            syscalls: Some(syscalls),
+            syscall_histogram: histogram,
+        };
+        fixture.series.runtime = Some(SeriesRuntime {
+            run1: Some(measurement(Some(histogram.clone()))),
+            run2: Some(measurement(run2_histogram.then_some(histogram))),
+            wall_time_min_ms: Some(5.0),
+            wall_time_max_ms: Some(5.0),
+        });
+        fixture
+    }
+
+    fn compact_histogram(counts: Vec<[u64; 5]>) -> CompactSyscallHistogram {
+        CompactSyscallHistogram {
+            architecture: "x86_64".into(),
+            observation_scope: detcore_model::syscall_histogram::SyscallObservationScope::Complete,
+            counts,
+        }
+    }
+
+    #[test]
+    fn run_one_histogram_round_trips_and_must_sum_to_its_syscalls() {
+        let fixture = histogram_row(
+            5,
+            compact_histogram(vec![[0, 3, 0, 3, 0], [231, 2, 0, 0, 1]]),
+            false,
+        );
+        fixture.validate_for_write().unwrap();
+        let json = serde_json::to_string(&fixture).unwrap();
+        assert!(
+            json.contains(r#""syscall_histogram":{"architecture":"x86_64","observation_scope":{"kind":"complete"},"counts":[[0,3,0,3,0],[231,2,0,0,1]]}"#),
+            "{json}"
+        );
+        let mut parsed: SeriesRow = serde_json::from_str(&json).unwrap();
+        parsed.source = fixture.source.clone();
+        assert_eq!(parsed, fixture);
+        // A row written before the histogram existed stays readable.
+        let mut historical = fixture.clone();
+        historical
+            .series
+            .runtime
+            .as_mut()
+            .unwrap()
+            .run1
+            .as_mut()
+            .unwrap()
+            .syscall_histogram = None;
+        historical.validate_for_read().unwrap();
+
+        let mismatched = histogram_row(
+            6,
+            compact_histogram(vec![[0, 3, 0, 3, 0], [231, 2, 0, 0, 1]]),
+            false,
+        );
+        let error = mismatched.validate_for_read().unwrap_err();
+        assert!(
+            error.contains("counts 5 calls but syscalls is Some(6)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_run_two_or_malformed_histogram_is_refused() {
+        let run2 = histogram_row(3, compact_histogram(vec![[0, 3, 0, 3, 0]]), true);
+        let error = run2.validate_for_write().unwrap_err();
+        assert!(
+            error.contains("run2 must not carry a syscall histogram"),
+            "{error}"
+        );
+
+        let malformed = histogram_row(3, compact_histogram(vec![[0, 3, 2, 2, 0]]), false);
+        let error = malformed.validate_for_read().unwrap_err();
+        assert!(error.contains("more outcomes"), "{error}");
     }
 
     fn no_verdict_row() -> SeriesRow {

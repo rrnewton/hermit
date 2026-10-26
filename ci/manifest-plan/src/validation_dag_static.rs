@@ -1167,7 +1167,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4693): 1846, listed.
     // And detcore-model's eight syscall_histogram::tests units for
     // the per-run syscall histogram (dh-te7ep): 1854, listed.
-    ("test.regular_crates", 1854),
+    // And stress_series' two run-1 syscall-histogram row tests
+    // (run_one_histogram_round_trips_and_must_sum_to_its_syscalls and
+    // a_run_two_or_malformed_histogram_is_refused), and detcore-model's
+    // syscall_histogram::tests::the_pinned_table_names_every_countable_syscall_once
+    // (the table a coverage report's never-exercised list comes from): 1857,
+    // listed.
+    ("test.regular_crates", 1857),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5666,7 +5672,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same HERMIT_CPU_PROFILE detcore-model test (848214c0): 1831, listed.
     // And the same ld.so.cache-sharing runner test: 1832, listed.
     // And the same eight syscall_histogram units: 1840, listed.
-    ("test.regular_crates_on_host", 1840),
+    // And the same two stress_series histogram row tests and the pinned-table
+    // unit: 1843, listed.
+    ("test.regular_crates_on_host", 1843),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
