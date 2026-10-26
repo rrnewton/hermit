@@ -4921,6 +4921,15 @@ pub struct ThreadState<T> {
     pub(crate) slice_boundary: Option<crate::slice_boundary::Observations>,
     #[serde(default)]
     pub(crate) callback_history: crate::preemptions::callback_history::State,
+
+    /// Under `--replay-schedule-from`, whether the replayed schedule is over
+    /// for this thread: it ran out, or the replay released it
+    /// (`Scheduler::schedule_replay_over`). The thread learns it from the
+    /// reply to its next traced event, and a new thread inherits it from the
+    /// thread that created it. From then on its slices end as in a run
+    /// without a schedule (`follows_replayed_schedule`).
+    #[serde(default)]
+    pub(crate) schedule_replay_over: bool,
 }
 
 /// We cannot assume that the record_or_replay "subtool" is Debug, so it is handy to be able to
@@ -5627,6 +5636,7 @@ impl<T> ThreadState<T> {
             robust_list_process: Arc::new(Mutex::new(RobustListProcessState::default())),
             slice_boundary: None,
             callback_history: Default::default(),
+            schedule_replay_over: false,
         }
     }
 
@@ -6665,6 +6675,17 @@ impl<T> ThreadState<T> {
         &mut self.prng
     }
 
+    /// Whether this thread's slices still follow a replayed schedule
+    /// (`--replay-schedule-from`): they end where the schedule says, and no
+    /// pending deadline or PMU maximum ends them. False without a schedule,
+    /// and once the schedule is over for this thread
+    /// (`schedule_replay_over`): its slices then end as in a run without a
+    /// schedule, which `hermit analyze` assumes of a replayed prefix's
+    /// continuation.
+    pub(crate) fn follows_replayed_schedule(&self, cfg: &Config) -> bool {
+        cfg.replay_schedule_from.is_some() && !self.schedule_replay_over
+    }
+
     /// Whether a trapped instruction (`rdtsc`, `cpuid`) should end the current
     /// timeslice.
     ///
@@ -6681,7 +6702,7 @@ impl<T> ThreadState<T> {
     /// and it still ends the expired target. Replay of recorded preemptions or
     /// schedules keeps its recorded boundaries.
     pub(crate) fn instruction_trap_ends_timeslice(&self, cfg: &Config) -> bool {
-        let replaying = self.preemption_points.is_some() || cfg.replay_schedule_from.is_some();
+        let replaying = self.preemption_points.is_some() || self.follows_replayed_schedule(cfg);
         match self.max_timeslice_end {
             Some(max_end) if cfg.target_timeslice_syscalls_only && !replaying => {
                 self.thread_logical_time.as_nanos() >= max_end
@@ -6896,7 +6917,7 @@ impl<T> ThreadState<T> {
             let mut result = None;
             self.replay_rcb_end = None;
             let replay_controls_deadline =
-                self.preemption_points.is_some() || cfg.replay_schedule_from.is_some();
+                self.preemption_points.is_some() || self.follows_replayed_schedule(cfg);
 
             // Preemption-point replay from recorded --chaos configuration.
             if let Some(thi) = &mut self.preemption_points {
@@ -6963,7 +6984,7 @@ impl<T> ThreadState<T> {
                     result = Some(thi.final_priority())
                 }
             } else if !cfg.chaos {
-                if cfg.replay_schedule_from.is_some() {
+                if self.follows_replayed_schedule(cfg) {
                     if cfg.no_rcb_time {
                         let max_timeslice = cfg
                             .max_timeslice

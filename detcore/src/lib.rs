@@ -4283,6 +4283,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // never inherit its parent's occurrence/hint ownership.
                     slice_boundary: None,
                     callback_history: Default::default(),
+                    schedule_replay_over: pts.1.schedule_replay_over,
                     detpid: None, // Initialized later.
                     thread_start_entered: false,
                     vfork_origin: if clone_flags.contains(CloneFlags::CLONE_VFORK) {
@@ -4926,7 +4927,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 let ev = with_guest_rip(guest, ev).await;
                 trace_schedevent(guest, ev, false).await;
             }
-            if self.cfg.replay_schedule_from.is_some()
+            if guest.thread_state().follows_replayed_schedule(&self.cfg)
                 && guest.thread_state().slice_boundary.is_none()
             {
                 let fallback_deadline = max_timeslice_end

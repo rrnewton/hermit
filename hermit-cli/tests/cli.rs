@@ -14608,6 +14608,46 @@ fn run_kvm_names_the_execve_filename_in_at_execfn_as_ptrace_does() {
     assert_eq!(execfns[3], "./sub/inner.sh");
 }
 
+/// A schedule replay that has run out of its schedule ends slices as a run
+/// without a schedule does, which `hermit analyze` assumes of the
+/// continuation after a replayed prefix. A 5 ms sleep requested while a
+/// sibling spins on getppid ends near 5 ms in a plain run: the spinner's slice
+/// ends at the sleeper's deadline
+/// (https://github.com/rrnewton/hermit/issues/4121). Replaying an empty
+/// schedule must print the same. Before, the replay kept its threads' slices
+/// uncapped after its schedule ran out, and the sleep waited out the
+/// spinner's 200 ms slice (`waited_us=201009`).
+#[test]
+fn a_replay_past_its_schedule_ends_slices_as_a_run_without_one_does() {
+    let guest = kvm_deadline_spin_wait_guest()
+        .to_str()
+        .expect("deadline guest path should be UTF-8");
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = dir.path().join("empty.json");
+    fs::write(&schedule, r#"{"per_thread":{},"global":[]}"#).unwrap();
+    let replay = format!("--replay-schedule-from={}", schedule.display());
+    let run = |extra: &[&str]| {
+        let mut args = vec!["run", "--strict", "--epoch=2026-01-01T00:00:00Z"];
+        args.extend_from_slice(extra);
+        args.extend(["--", guest, "nanosleep", "getppid", "late"]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        stdout(&output)
+    };
+    let plain = run(&[]);
+    let waited: i64 = plain
+        .split("waited_us=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("no waited_us in stdout:\n{plain}"));
+    assert!(
+        (5_000..20_000).contains(&waited),
+        "a 5 ms sleep took {waited} us:\n{plain}"
+    );
+    assert_eq!(run(&[replay.as_str()]), plain);
+}
+
 /// On KVM a 5 ms sleep requested while a sibling spins on getppid is a
 /// parked request, and its grant's reply carries the deadline cap of
 /// https://github.com/rrnewton/hermit/issues/4121: the sleep ends near 5 ms,

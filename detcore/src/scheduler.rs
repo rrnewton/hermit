@@ -16252,6 +16252,16 @@ impl Scheduler {
         self.replayer.as_ref().is_some_and(Replayer::released)
     }
 
+    /// Whether the replayed schedule is over: its last event was consumed, or
+    /// the replay released the rest (`release_replay_priorities_if_exhausted`,
+    /// at a scheduled event of a running thread). Each thread hears of it in
+    /// the reply to its next traced event and then runs, and creates threads,
+    /// as a run without a schedule does
+    /// (`ThreadState::follows_replayed_schedule`).
+    pub(crate) fn schedule_replay_over(&self) -> bool {
+        self.replay_priorities_released
+    }
+
     /// A released schedule takes its callback checkpoints with it: they
     /// belong to the recorded slices the replay no longer follows, and acting
     /// on them in the unguided rest of the run would add scheduler turns and
