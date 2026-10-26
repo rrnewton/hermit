@@ -561,7 +561,16 @@ impl Replayer {
         if let Some(next_ev) = self.cursor.peek() {
             let mytid = observed.dettid;
             let time = observed.end_time.expect("timestamps required for now");
-            let is_prehook = matches!(observed.op, Op::Syscall(_, SyscallPhase::Prehook));
+            // A failed attempt at a blocking call (`SyscallPhase::Polling`) is
+            // followed by the thread's next attempt, a request that blocks it,
+            // with no guest code between, as a prehook is followed by its
+            // call. The thread goes on to that request: holding it to hand
+            // its turn back first (`TraceReplay`) would take a scheduler pass
+            // its recording did not have.
+            let is_prehook = matches!(
+                observed.op,
+                Op::Syscall(_, SyscallPhase::Prehook | SyscallPhase::Polling)
+            );
 
             // A recorded poll skip due now is the schedule's next decision: its
             // thread runs next only to be skipped (`take_poll_skip`), so the
@@ -975,6 +984,24 @@ mod tests {
         assert_eq!(replayer.pending_poll_skip(), Some(tid(9)));
         let _ = replayer.observe_event(&schedule[2]);
         assert_eq!(replayer.pending_poll_skip(), None);
+    }
+
+    /// A failed attempt at a blocking call hands over as a prehook does: the
+    /// thread goes on to its next attempt, which blocks it, rather than wait
+    /// for its turn to be handed back.
+    #[test]
+    fn a_failed_attempt_hands_over_after_the_thread_blocks() {
+        let mut b = builder::SchedTestBuilder::new();
+        let attempt = SchedEvent {
+            op: Op::Syscall(Sysno::read, SyscallPhase::Polling),
+            ..b.syscall_pre(Sysno::read, SOME_RIP, tid(5))
+        };
+        let schedule = vec![attempt, b.syscall_post(Sysno::write, SOME_RIP, tid(3))];
+        let mut replayer = Replayer::new(schedule.clone());
+        assert_eq!(
+            replayer.observe_event(&schedule[0]),
+            ReplayAction::ContextSwitch(false, tid(3), None)
+        );
     }
 
     #[test]

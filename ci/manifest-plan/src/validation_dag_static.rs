@@ -3070,7 +3070,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (a replay wakes a sleeper where its recording did): 2746, listed.
     // And preemptions::tests::poll_skips_are_recorded_after_their_events_and_version_the_record
     // and replayer::tests::a_recorded_poll_skip_is_the_next_decision_after_the_events_it_follows: 2748.
-    ("test.detcore_unit", 2748),
+    // And replayer::tests::a_failed_attempt_hands_over_after_the_thread_blocks: 2749.
+    ("test.detcore_unit", 2749),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5357,7 +5358,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same four replay-diagnostics units: 2745, listed.
     // And the same recorded-wake unit: 2746, listed.
     // And the same two poll-skip units: 2748.
-    ("test.detcore_unit_on_host", 2748),
+    // And replayer::tests::a_failed_attempt_hands_over_after_the_thread_blocks: 2749.
+    ("test.detcore_unit_on_host", 2749),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
