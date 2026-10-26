@@ -1688,6 +1688,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/poll_restart_stop_signals.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/poll_restart_stop_signals.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test runs this guest natively, under --no-sequentialize-threads and under record start --verify --verify-strict with race probes delaying backgrounded calls, asserting native's lines each time, so a kernel-run poll's restart around a job-control stop and two caught signals replays as recorded; it remains a guest fixture because a generic manifest cannot set race-probe environment variables or compare a recording with its replay."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/poll_timeout_restart.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/poll_timeout_restart.c is owned by hermit-cli/tests/cli.rs: a_kernel_run_poll_a_signal_ends_restarts_until_its_deadline runs its chld, storm and alrm modes natively, under ptrace with --strict, plain and with --no-sequentialize-threads, and (but for storm) under record start --verify --verify-strict, and requires native's lines: 100 ms polls that children's SIGCHLD ends in the kernel restart until they time out, a restarted poll still reports a later write, a poll that 40 ignored SIGWINCH end over and over still times out before they stop, and a SIGALRM handler's interruption returns EINTR. It stays a fixture because the test compares native and Hermit output."

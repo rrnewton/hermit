@@ -1303,7 +1303,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             #[cfg(target_arch = "x86_64")]
             syscalls::helpers::RestartCall::KernelPoll(poll, deadline) => {
-                self.resume_kernel_poll(guest, poll, deadline).await
+                self.resume_kernel_poll(guest, poll, deadline, call).await
             }
             syscalls::helpers::RestartCall::Futex(futex) => {
                 self.handle_futex_from(

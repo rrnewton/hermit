@@ -886,7 +886,14 @@ impl RecordVersion {
 // replayed under the new rendering would show the guest 0 where it read 1,
 // and a guest that branches on the value, as a death test that looks for a
 // debugger does, would diverge. It is refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x193);
+// 0x193 -> 0x194 (the next value above main's 0x193; the lander may renumber
+// it per its ledger at landing): the kernel's restart of a poll a signal ended
+// in the kernel is the guest's own restart_syscall, run in place and recorded
+// with the poll's outputs, where it was a poll Detcore injected in its stead.
+// A recording holds restart_syscall at that point instead of poll, so an older
+// replayer would refuse it as a desync, and this one would refuse an older
+// recording the same way; the exact-match gate names the cause instead.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x194);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -911,7 +918,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x193);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x193;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x194;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

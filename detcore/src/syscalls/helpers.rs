@@ -138,6 +138,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
     }
 
+    /// `record_or_replay_blocking`, with `run` the call that runs for `call`,
+    /// or that replay serves: the scheduler, the checks and the continuation
+    /// mask all see `call`. A kernel-run poll's restart is the one such pair:
+    /// the guest's own `restart_syscall` runs for the poll
+    /// (`Detcore::resume_kernel_poll`). Only x86_64 has `poll`.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) async fn record_or_replay_blocking_as<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        run: Syscall,
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid;
+        let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
+        self.record_or_replay_blocking_resource_then(
+            guest,
+            (call, run),
+            ResourceID::BlockingExternalIO(op_id),
+            None,
+            false,
+            |_| {},
+        )
+        .await
+    }
+
     /// `record_or_replay_blocking` for a call that sleeps under its own
     /// temporary signal mask (`ppoll`, `pselect6`, or an `rt_sigsuspend` that
     /// finds a signal already pending): `blocked_signal_mask` is the mask the
@@ -189,7 +214,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
         self.record_or_replay_blocking_resource_then(
             guest,
-            call,
+            (call, call),
             ResourceID::BlockingExternalIO(op_id),
             None,
             true,
@@ -252,7 +277,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         self.record_or_replay_blocking_resource_then(
             guest,
-            call,
+            (call, call),
             blocking_resource,
             blocked_signal_mask,
             blocked_signal_mask_unknown,
@@ -262,11 +287,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// `record_or_replay_blocking_resource`, running `after_grant` between the
-    /// grant and the call.
+    /// grant and the call, and running `run` for `call`
+    /// (`record_or_replay_blocking_as`).
     async fn record_or_replay_blocking_resource_then<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        call: Syscall,
+        (call, run): (Syscall, Syscall),
         blocking_resource: ResourceID,
         blocked_signal_mask: Option<u64>,
         blocked_signal_mask_unknown: bool,
@@ -344,7 +370,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             call.name()
         );
         let res = self
-            .record_or_replay_preserving_tool_errors(guest, call)
+            .record_or_replay_preserving_tool_errors(guest, run)
             .await;
         crate::race_probe::delay(crate::race_probe::BG_POST_CALL).await;
         // N.B. BlockingExternalIO is a "oneshot" resource, so no need to release

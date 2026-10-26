@@ -63,6 +63,7 @@ use crate::event::ExecMaterialization;
 use crate::event::ExecMaterializationBase;
 use crate::event::ExecRequest;
 use crate::event::ExecTarget;
+use crate::event::InterruptedPoll;
 use crate::event::MkdirEvent;
 use crate::event::OpenEvent;
 use crate::event::OpenMaterialization;
@@ -78,6 +79,10 @@ const MAX_EXEC_DEPENDENCY_DEPTH: usize = 5;
 #[derive(Default, Serialize, Deserialize)]
 pub struct RecorderThreadState {
     events: EventWriter,
+    /// The poll a signal just ended in the kernel, until this thread's next
+    /// syscall (`InterruptedPoll`).
+    #[serde(default)]
+    interrupted_poll: Option<InterruptedPoll>,
     stream_id: EventStreamId,
     child_stream_ids: ChildEventStreamIds,
     pending_exec: Option<PreparedExec>,
@@ -498,6 +503,7 @@ impl Tool for Recorder {
             stream_id,
             child_stream_ids: ChildEventStreamIds::default(),
             pending_exec: None,
+            interrupted_poll: None,
             bootstrapped: parent.is_some_and(|(_, state)| state.bootstrapped),
             outputs: match parent {
                 None => ContainerOutputs {
@@ -547,6 +553,14 @@ impl Tool for Recorder {
         syscall: Syscall,
     ) -> Result<i64, Error> {
         self.record_raw_syscall(guest, syscall);
+
+        // The kernel's restart of a poll a signal ended there runs in place
+        // (`InterruptedPoll`); any other syscall forgets the poll.
+        if let Some(poll) = guest.thread_state_mut().interrupted_poll.take()
+            && poll.restarted_by(&syscall)
+        {
+            return Ok(self.handle_restarted_poll(guest, syscall, poll).await?);
+        }
 
         Ok(match syscall {
             // AUTONOMOUS-BOT-IMPLEMENTED
