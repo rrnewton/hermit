@@ -2615,7 +2615,15 @@ fi
 # reverie-dbt/ and third-party/ and for the root Cargo.toml, Cargo.lock and
 # rust-toolchain.toml, so the inventory, SDK and native inputs, calibrated
 # budget, job width and limits carry unchanged from the 8b7ab5f3 entry.
-expected_pin=77e4e4f43802b57101e3087ebf768351b36dd97d
+# CARRY TO d9487fbcab15d758c4e02be4f479b5f1a0f7d420 (2026-10-26): from
+# 77e4e4f43802b57101e3087ebf768351b36dd97d. One unlanded commit (d9487fbc)
+# updates two entries of reverie-liteinst-artifact's reviewed source catalog
+# (reverie/src/pmu.rs, reverie/src/pmu_config.rs) to the corrected PMU
+# sources. git diff is empty under reverie-dbt/ and third-party/ and for the
+# root Cargo.toml, Cargo.lock and rust-toolchain.toml, so the inventory, SDK
+# and native inputs, calibrated budget, job width and limits carry unchanged
+# from the 77e4e4f4 entry.
+expected_pin=d9487fbcab15d758c4e02be4f479b5f1a0f7d420
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
