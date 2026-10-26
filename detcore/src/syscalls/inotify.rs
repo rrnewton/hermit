@@ -36,19 +36,27 @@
 //! - A read that fails with EFAULT (warned). `inotify_read` copies events one
 //!   at a time and returns -EFAULT when a later copy faults, after the
 //!   earlier events were copied and dequeued (fs/notify/inotify/inotify_user.c),
-//!   and Detcore does not learn how much was written. A `readv` whose later
-//!   iovec faults returns the earlier iovecs' bytes instead (not warned:
-//!   nothing tells it apart from a short read); the events copied into the
-//!   faulting iovec keep theirs.
+//!   and Detcore does not learn how much was written. A `readv` or `preadv2`
+//!   whose later iovec faults returns the earlier iovecs' bytes instead (not
+//!   warned: nothing tells it apart from a short read); the events copied into
+//!   the faulting iovec keep theirs
+//!   (<https://github.com/rrnewton/hermit/issues/4793>).
 //! - A destination Hermit cannot read (warned): a write-only page on the
 //!   in-process backends (<https://github.com/rrnewton/hermit/issues/4530>).
-//! - A `readv` whose iovecs overlap (warned). Linux reads one iovec at a
-//!   time, so a later event overwrites part of an earlier one where they
-//!   overlap, and the bytes left no longer parse as the events Linux returned:
-//!   a field that looks like a cookie there may be a watch descriptor or part
-//!   of a name. Those bytes are left exactly as Linux wrote them.
-//! - A descriptor received over `SCM_RIGHTS`, which Detcore does not record
-//!   (`crate::syscalls::scm_rights`), so its reads do not come here.
+//! - A `readv` or `preadv2` whose iovecs overlap (warned). Linux reads one
+//!   iovec at a time, so a later event overwrites part of an earlier one
+//!   where they overlap, and the bytes left no longer parse as the events
+//!   Linux returned: a field that looks like a cookie there may be a watch
+//!   descriptor or part of a name. Those bytes are left exactly as Linux
+//!   wrote them. The iovec after the ones filled counts too, when the count
+//!   ends at its start: Linux may have written it before a fault
+//!   ([`Destination::plan`]).
+//! - A descriptor received over `SCM_RIGHTS` where Detcore records no
+//!   received descriptor: under record and replay, without sequentialized
+//!   threads, or from a receive on the background path
+//!   (`crate::syscalls::scm_rights`). Its reads do not come here. Elsewhere
+//!   a received inotify descriptor is recorded as one: an anonymous inode
+//!   has no file type, so its link ([`INOTIFY_LINK`]) says what it is.
 
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -58,6 +66,7 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Sysno;
 use tracing::warn;
 
 use crate::record_or_replay::RecordOrReplay;
@@ -71,6 +80,10 @@ const EVENT_COOKIE: usize = 8;
 const EVENT_LENGTH: usize = 12;
 /// `sizeof(struct iovec)`.
 const IOVEC: usize = std::mem::size_of::<libc::iovec>();
+/// What an inotify instance's descriptor links to: `inotify_init1` makes it
+/// with `anon_inode_getfd("inotify", ...)` (fs/notify/inotify/inotify_user.c),
+/// and an anonymous inode has no file type to tell it by.
+pub(crate) const INOTIFY_LINK: &[u8] = b"anon_inode:inotify";
 
 /// Run-wide map from host rename cookies to virtual ones.
 ///
@@ -163,6 +176,56 @@ impl Destination {
         }
         pieces
     }
+
+    /// The buffer that a read which returned `length` bytes may have
+    /// written past them before a fault: the first nonempty buffer after the
+    /// ones it filled, when they end exactly at its start. Linux's readv goes
+    /// on to the next iovec only after filling one, and returns the bytes
+    /// before an iovec whose read fails (do_loop_readv_writev). A buffer
+    /// shorter than an event header is never written: inotify_read refuses a
+    /// count smaller than the next event before it copies anything.
+    fn possibly_written(&self, length: usize) -> Option<(usize, usize)> {
+        let mut filled = 0usize;
+        for &(address, size) in &self.0 {
+            if size == 0 {
+                continue;
+            }
+            if filled == length {
+                return (size >= EVENT_HEADER).then_some((address, size));
+            }
+            filled = filled.checked_add(size)?;
+            if filled > length {
+                return None;
+            }
+        }
+        None
+    }
+
+    /// What [`finish`] does after a read returned `length` bytes: renumber
+    /// the events in the buffers it filled, unless those, or the buffer it may
+    /// have written before a fault, overlap.
+    fn plan(&self, length: usize) -> Plan {
+        let filled = self.filled(length);
+        let mut written = filled.clone();
+        written.extend(self.possibly_written(length));
+        if overlapping(&written) {
+            Plan::LeaveOverlapping(written)
+        } else {
+            Plan::Renumber(filled)
+        }
+    }
+}
+
+/// What [`finish`] does with the buffers of a read ([`Destination::plan`]).
+#[derive(Debug, PartialEq, Eq)]
+enum Plan {
+    /// Renumber the cookies of the events the read returned in these
+    /// buffers.
+    Renumber(Vec<(usize, usize)>),
+    /// Leave every byte as Linux wrote it, and ask global state nothing: the
+    /// buffers the read wrote, or may have written before a fault, overlap,
+    /// so the bytes left are not the events it returned.
+    LeaveOverlapping(Vec<(usize, usize)>),
 }
 
 /// Whether two of `pieces` share a byte.
@@ -280,11 +343,13 @@ fn changed_cookies(offsets: &[usize], host: &[u32], virtual_cookies: &[u32]) -> 
         .collect()
 }
 
-/// After a read of an inotify descriptor into `destination` (`None`: iovecs
-/// Hermit could not read) returned `result`: put virtual cookies in the
-/// events it read. The result is returned as it is, whatever happens here.
+/// After `call`, a read of an inotify descriptor into `destination` (`None`:
+/// iovecs Hermit could not read), returned `result`: put virtual cookies in
+/// the events it read. The result is returned as it is, whatever happens
+/// here.
 pub(crate) async fn finish<G, T>(
     guest: &mut G,
+    call: Sysno,
     destination: Option<Destination>,
     result: Result<i64, Error>,
 ) -> Result<i64, Error>
@@ -300,9 +365,9 @@ where
         },
         Err(Error::Errno(Errno::EFAULT)) => {
             warn!(
-                "[detcore, dtid {dettid}] an inotify read failed with EFAULT: any events Linux \
+                "[detcore, dtid {dettid}] an inotify {call} failed with EFAULT: any events Linux \
                  copied before the fault keep their host rename cookies \
-                 (https://github.com/rrnewton/hermit/issues/4765)"
+                 (https://github.com/rrnewton/hermit/issues/4793)"
             );
             return result;
         }
@@ -310,27 +375,29 @@ where
     };
     let Some(destination) = destination else {
         warn!(
-            "[detcore, dtid {dettid}] an inotify readv's events keep their host rename cookies: \
+            "[detcore, dtid {dettid}] an inotify {call}'s events keep their host rename cookies: \
              Hermit cannot read its iovecs (https://github.com/rrnewton/hermit/issues/4530)"
         );
         return result;
     };
-    let pieces = destination.filled(length);
-    if overlapping(&pieces) {
-        warn!(
-            "[detcore, dtid {dettid}] an inotify readv's events at {} keep their host rename \
-             cookies: its iovecs overlap, so the bytes left are not the events Linux returned in \
-             order, and they are left as Linux wrote them",
-            describe(&pieces)
-        );
-        return result;
-    }
+    let pieces = match destination.plan(length) {
+        Plan::Renumber(pieces) => pieces,
+        Plan::LeaveOverlapping(written) => {
+            warn!(
+                "[detcore, dtid {dettid}] an inotify {call}'s events at {} keep their host \
+                 rename cookies: its iovecs overlap, so the bytes left are not the events Linux \
+                 returned in order, and they are left as Linux wrote them",
+                describe(&written)
+            );
+            return result;
+        }
+    };
     let records = match gather(&guest.memory(), &pieces) {
         Ok(records) => records,
         Err(error) => {
             warn!(
-                "[detcore, dtid {dettid}] the events an inotify read wrote at {} keep their host \
-                 rename cookies: Hermit cannot read them ({error}; \
+                "[detcore, dtid {dettid}] the events an inotify {call} wrote at {} keep their \
+                 host rename cookies: Hermit cannot read them ({error}; \
                  https://github.com/rrnewton/hermit/issues/4530)",
                 describe(&pieces)
             );
@@ -349,7 +416,7 @@ where
     let changes = changed_cookies(&offsets, &host, &virtual_cookies);
     if let Err(error) = write_cookies(&mut guest.memory(), &pieces, &changes) {
         warn!(
-            "[detcore, dtid {dettid}] the events an inotify read wrote at {} keep some host \
+            "[detcore, dtid {dettid}] the events an inotify {call} wrote at {} keep some host \
              rename cookies: Hermit cannot write them ({error})",
             describe(&pieces)
         );
@@ -447,6 +514,46 @@ mod tests {
         assert!(!overlapping(&[(0x1000, 0), (0x1000, 16)]), "an empty iovec");
         assert!(!overlapping(&[(0x1000, 16)]));
         assert!(overlapping(&[(usize::MAX - 4, 16), (usize::MAX - 2, 1)]));
+    }
+
+    /// `finish` leaves a read alone, without asking global state, exactly when
+    /// the buffers it wrote overlap: those it filled, and the next one when
+    /// the count ends at its start, which it may have written before a fault.
+    #[test]
+    fn a_read_into_overlapping_buffers_is_left_alone() {
+        // The case Linux was measured on: two 16-byte IN_IGNORED events read
+        // into {buf, 16} and {buf + 8, 16}.
+        let overlapping = Destination(vec![(0x1000, 16), (0x1008, 16)]);
+        assert_eq!(
+            overlapping.plan(32),
+            Plan::LeaveOverlapping(vec![(0x1000, 16), (0x1008, 16)])
+        );
+        // One event returned: the second buffer may hold the start of the
+        // next event, copied before a fault over the first event's last bytes.
+        assert_eq!(
+            overlapping.plan(16),
+            Plan::LeaveOverlapping(vec![(0x1000, 16), (0x1008, 16)])
+        );
+        // A next buffer shorter than an event header is never written, so a
+        // completed pair before it is renumbered.
+        let short_next = Destination(vec![(0x1000, 64), (0x1008, 1)]);
+        assert_eq!(short_next.plan(64), Plan::Renumber(vec![(0x1000, 64)]));
+        let apart = Destination(vec![(0x1000, 16), (0x2000, 64), (0x2000, 64)]);
+        assert_eq!(
+            apart.plan(48),
+            Plan::Renumber(vec![(0x1000, 16), (0x2000, 32)]),
+            "the third iovec, which overlaps the second, was never reached"
+        );
+        assert_eq!(
+            apart.plan(16),
+            Plan::Renumber(vec![(0x1000, 16)]),
+            "the second iovec may hold bytes copied before a fault, but overlaps nothing written"
+        );
+        assert_eq!(
+            apart.plan(80),
+            Plan::LeaveOverlapping(vec![(0x1000, 16), (0x2000, 64), (0x2000, 64)]),
+            "the second iovec filled, the third may hold bytes copied before a fault"
+        );
     }
 
     /// The iovec geometry is what the array held when it was read, before

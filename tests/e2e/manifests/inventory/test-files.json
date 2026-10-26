@@ -926,6 +926,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/inotify_received_descriptor.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on every backend; ci=true)",
+      "why": "tests/c/inotify_received_descriptor.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: an inotify descriptor received over SCM_RIGHTS, in the process that sent it and in a forked child that holds it only by receiving it, must give each rename the cookie another instance gives it, with values that repeat in every run (https://github.com/rrnewton/hermit/issues/4765)"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/inotify_rename_cookies.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on every backend; ci=true)",
       "why": "tests/c/inotify_rename_cookies.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: a readv with overlapping iovecs must leave exactly Linux's bytes; five inotify instances, two created later and one in a forked child that sees a rename before the parent, read with read (a pair split over two reads among them), readv over three iovecs and preadv2 at offset -1, must see each rename's IN_MOVED_FROM and IN_MOVED_TO share one nonzero cookie, four renames get four cookies, every instance agrees, and the cookie values must repeat in every run (https://github.com/rrnewton/hermit/issues/4765)"
