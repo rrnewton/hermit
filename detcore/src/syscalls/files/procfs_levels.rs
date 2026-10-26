@@ -332,7 +332,7 @@ struct Replacement {
 
 /// A transient anonymous page of at least `length` bytes in the guest, or
 /// `None` if the guest's address space has no room.
-pub(super) async fn map_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) async fn map_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
     guest: &mut G,
     length: usize,
 ) -> Option<AddrMut<'static, u8>> {
@@ -354,7 +354,7 @@ pub(super) async fn map_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
 
 /// Unmap a page from [`map_transient`]: a mapping left behind would be
 /// visible to the guest.
-pub(super) async fn unmap_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
+pub(crate) async fn unmap_transient<T: RecordOrReplay, G: Guest<Detcore<T>>>(
     guest: &mut G,
     page: AddrMut<'_, u8>,
     length: usize,
