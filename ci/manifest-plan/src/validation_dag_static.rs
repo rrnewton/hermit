@@ -192,6 +192,7 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "test.regular_crates_on_host",
     "test.rr_suite_contract_on_host",
     "test.sabre_examples_on_host",
+    "sabrecompat.sabre_examples",
 ];
 
 pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
@@ -5737,6 +5738,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three program-break tests: 36, and the heap-record test: 37.
     // The smoke pair of the archived SaBRe backend, as test.sabre_examples.
     ("test.sabre_examples_on_host", 2),
+    // The rest of hermit-cli/tests/sabre_examples.rs: 36 non-ignored tests less
+    // the smoke pair test.sabre_examples runs per commit.
+    ("sabrecompat.sabre_examples", 34),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
@@ -8842,6 +8846,38 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         jobs_env: None,
     },
     StaticStepSpec {
+        group: r########"sabrecompat"########,
+        job: r########"sabre_examples"########,
+        desc: r########"SaBRe run type: the sabre_examples tests outside the per-commit smoke pair (archived backend)"########,
+        description: r########"SaBRe is archived (owner, 2026-10-25: no feature work, tests nightly only; ci/manifest-plan/src/archived.rs). test.sabre_examples keeps two tests of hermit-cli/tests/sabre_examples.rs per commit; this node runs the other 34 non-ignored ones, its count pinned by NEXTEST_EXPECTED_EXECUTED, in the SaBRe run type that `scripts/validate.rs --sabre-compat-only` selects and the nightly pressure sweep's sabre-examples part runs. Same environment as test.sabre_examples: one test at a time in the pinned root, against an explicitly configured SaBRe loader, so a missing loader, libdetcore_sabre.so or revision file fails rather than skips. It covers time repeatability (examples/date.sh and a clock-progress guest over three runs per backend), getrandom parity, the plugin's DETLOG forwarding and its refusals (a guest that closes or dup2s onto the forwarding socket, a guest stderr file or socket at the passed number), guest RDTSC before and after the plugin starts and in a signal handler, Detcore's stack limit at guest start-up, the program break and heap records, exe links, the timerfd refusal and a readied pipe poller across exec. A failure here is a SaBRe regression on an archived backend: it does not block a landing, and the nightly report names it.""########,
+        labels: &[r########"sabre-compat-only"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_SABRE_TEST_BINARY=$PWD/target/ci/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test sabre_examples -j 1 -E 'not (test(=sabre_root_pid_matches_ptrace) | test(=sabre_and_ptrace_detlogs_agree_through_post_exec))'"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: Some(&[r########"sabre_examples"########]),
+        deps: &[
+            r########"build.e2e_artifact"########,
+            r########"setup.nextest"########,
+        ],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 90.0,
+            rss_baseline_bytes: Some(1073741824),
+            hard_mem_max_bytes: Some(3221225472),
+            classification: StepClass::LatencyBound,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 900,
+        cpu_timeout: 7200,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
         group: r########"test"########,
         job: r########"hermit_modes"########,
         desc: r########"Portable Hermit mode cases (skips default_ and chaos_buck_)"########,
@@ -11245,7 +11281,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         group: r########"compatprep"########,
         job: r########"hermit_release"########,
         desc: r########"Release Hermit for compatibility"########,
-        description: r########"Dedicated release build for the focused compatibility profiles that still run per-program probes (e9patch; the corpus-only profile builds its twin in the pinned root); it preserves their pre-cutover command, budgets, memory cap, and eight-job CPU allocation without selecting the broader full-profile runtime build. The sabre-compat-only, strict-compat-only and rr-compat-only profiles do not take it: their buckets run the validation's one build, the e2e artifact."########,
+        description: r########"Dedicated release build for the focused compatibility profiles that still run per-program probes (e9patch; the corpus-only profile builds its twin in the pinned root); it preserves their pre-cutover command, budgets, memory cap, and eight-job CPU allocation without selecting the broader full-profile runtime build. The sabre-compat-only, strict-compat-only and rr-compat-only profiles do not take it: their buckets run the validation's one build, the e2e artifact. CPU 2400 s since 2026-10-26: a cold build of the same command at -j 8 measured 148 s of wall and 1,155 CPU-s (1,117 user, 38 sys) with a 2.3-GiB peak, and the former 840 CPU-s cap, sized for a warm target, killed the first e9patch-compat-only run in a fresh checkout after 111 s; the nightly e9patch-corpus part runs this lane in a fresh checkout every night."########,
         labels: &[
             r########"portable-strict-compat-only"########,
             r########"e9patch-compat-only"########,
@@ -11269,7 +11305,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit-run --f
         networkonly: false,
         engine_only: false,
         timeout: 420,
-        cpu_timeout: 840,
+        cpu_timeout: 2400,
         jobs_flag: None,
         jobs_env: None,
     },

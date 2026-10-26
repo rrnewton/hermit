@@ -212,7 +212,7 @@ Linux ABI.
 SaBRe and e9patch preprocessing are **archived** since 2026-10-25: they still
 build and keep per-commit smoke checks, but they get no feature work. SaBRe's
 manifest cells run nightly, in the pressure sweep, rather than per commit;
-e9patch has no manifest cells, and its corpus runs on demand
+e9patch has no manifest cells, and its corpus runs nightly
 (`ci/manifest-plan/src/archived.rs`).
 
 SaBRe's measured post-0.2 `Stripped` envelope, build instructions, and explicit
