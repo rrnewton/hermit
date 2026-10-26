@@ -4849,6 +4849,145 @@ fn work_span_report_is_refused_where_there_are_no_turns() {
     }
 }
 
+/// `--record-access-trace-to` is refused wherever its records would name no
+/// recorded schedule or no turns: without a recorded schedule, without
+/// sequentialized threads, with `--namespace-only`, and on backends other
+/// than ptrace. `--access-trace-from` and `--access-trace-max-records`
+/// without the trace are refused too.
+/// Each refusal names the flag to add or drop.
+#[test]
+fn access_trace_is_refused_where_its_records_would_name_nothing() {
+    let mut accepted = run_opts_for(&[
+        "hermit",
+        "run",
+        "--record-preemptions-to=/var/run.events",
+        "--record-access-trace-to=/var/run.access",
+        "--access-trace-from=10",
+        "prog",
+    ]);
+    accepted.validate_args_with_perf_support(true).unwrap();
+    for (argv, expected) in [
+        (
+            vec!["hermit", "run", "--record-access-trace-to=/var/a", "prog"],
+            "add --record-preemptions-to=PATH",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--no-sequentialize-threads",
+                "--record-preemptions-to=/var/e",
+                "--record-access-trace-to=/var/a",
+                "prog",
+            ],
+            "drop --no-sequentialize-threads, or drop --record-access-trace-to",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--strace-only",
+                "--record-preemptions-to=/var/e",
+                "--record-access-trace-to=/var/a",
+                "prog",
+            ],
+            "drop --strace-only, or drop --record-access-trace-to",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--image=busybox",
+                "--record-preemptions-to=/var/e",
+                "--record-access-trace-to=/var/a",
+                "prog",
+            ],
+            "drop --image, or drop --record-access-trace-to",
+        ),
+        (
+            vec![
+                "hermit",
+                "run",
+                "--namespace-only",
+                "--record-preemptions-to=/var/e",
+                "--record-access-trace-to=/var/a",
+                "prog",
+            ],
+            "drop --namespace-only, or drop --record-access-trace-to",
+        ),
+        (
+            vec![
+                "hermit",
+                "--backend=kvm",
+                "run",
+                "--record-preemptions-to=/var/e",
+                "--record-access-trace-to=/var/a",
+                "prog",
+            ],
+            "backend `kvm` is refused: use --backend=ptrace",
+        ),
+        (
+            vec!["hermit", "run", "--access-trace-from=5", "prog"],
+            "--access-trace-from=5 only shapes an access trace",
+        ),
+        (
+            vec!["hermit", "run", "--access-trace-max-records=5", "prog"],
+            "--access-trace-max-records=5 only shapes an access trace; add \
+             --record-access-trace-to=PATH, or drop it",
+        ),
+    ] {
+        let error = run_opts_for(&argv)
+            .validate_args_with_perf_support(true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(expected), "{argv:?}: {error}");
+    }
+    let hidden = run_opts_for(&[
+        "hermit",
+        "run",
+        "--record-preemptions-to=/var/e",
+        "--record-access-trace-to=/var/../tmp/a",
+        "prog",
+    ]);
+    let error = hidden
+        .validate_access_trace_visibility()
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("`..` component"), "{error}");
+}
+
+/// A run manifest leaves the access trace out, as it does every output
+/// destination, and `--access-trace-from` and `--access-trace-max-records`
+/// with it, which a rerun without the trace would refuse.
+#[test]
+fn a_manifest_leaves_out_the_access_trace() {
+    let argv = [
+        "hermit",
+        "run",
+        "--record-preemptions-to=/var/e",
+        "--record-access-trace-to=/var/a",
+        "--access-trace-from=4",
+        "--access-trace-max-records=9",
+        "/bin/true",
+    ];
+    let matches = <crate::Args as clap::CommandFactory>::command()
+        .try_get_matches_from(argv)
+        .unwrap();
+    let args = crate::args_from_matches_with_clock(&matches, SystemTime::now).unwrap();
+    let crate::Subcommand::Run(ro) = args.command else {
+        panic!("{argv:?} is not a `run` command");
+    };
+    let config = ro.saved_run_config().unwrap();
+    let (mut global, mut run) = crate::run_config::to_manifest_parts(&config).unwrap();
+    assert!(run.contains_key("record-access-trace-to"), "{run:?}");
+    assert!(run.contains_key("access-trace-from"), "{run:?}");
+    assert!(run.contains_key("access-trace-max-records"), "{run:?}");
+    crate::manifest::drop_outputs(&mut global, &mut run);
+    assert!(!run.contains_key("record-access-trace-to"), "{run:?}");
+    assert!(!run.contains_key("access-trace-from"), "{run:?}");
+    assert!(!run.contains_key("access-trace-max-records"), "{run:?}");
+}
+
 /// A run manifest leaves `--work-span-report` out, as it does every output
 /// destination, so a rerun with `--from` does not overwrite the original
 /// report; the saved run configuration keeps it.
@@ -8610,6 +8749,7 @@ impl RunOpts {
         // After the event listing, which runs no guest and writes no summary.
         self.validate_summary_json_visibility()?;
         self.validate_work_span_report_visibility()?;
+        self.validate_access_trace_visibility()?;
         if self.happens_before.is_some() {
             // Resolve the spec against the guest binary's debug info now and cache
             // it so every subsequent `effective_det_config()` (including both
@@ -9071,6 +9211,70 @@ impl RunOpts {
                 );
             }
         }
+        // `--record-access-trace-to` names each record by its position in the
+        // run's recorded schedule, which the scheduler of sequentialized
+        // threads records; a launch without one would write a trace of
+        // nothing, so it is refused.
+        if let Some(trace) = &config.access_trace {
+            let trace = trace.display();
+            if self.namespace_only {
+                anyhow::bail!(
+                    "--record-access-trace-to={trace} needs Detcore's scheduler; \
+                     --namespace-only (--lite) runs the guest natively, without it; drop \
+                     --namespace-only, or drop --record-access-trace-to"
+                );
+            }
+            if self.strace_only {
+                anyhow::bail!(
+                    "--record-access-trace-to={trace} reads the events of sequentialized \
+                     threads; --strace-only turns sequentialization off; drop --strace-only, or \
+                     drop --record-access-trace-to"
+                );
+            }
+            if !config.sequentialize_threads {
+                anyhow::bail!(
+                    "--record-access-trace-to={trace} reads the events of sequentialized \
+                     threads; drop --no-sequentialize-threads, or drop --record-access-trace-to"
+                );
+            }
+            if !config.record_preemptions && config.record_preemptions_to.is_none() {
+                anyhow::bail!(
+                    "--record-access-trace-to={trace} names each record by its position in the \
+                     run's recorded schedule, and this run records none; add \
+                     --record-preemptions-to=PATH"
+                );
+            }
+            if self.image.is_some() {
+                anyhow::bail!(
+                    "--record-access-trace-to={trace} is written from inside the run container, \
+                     and --image (a prototype) replaces its root, so the trace would be lost; drop \
+                     --image, or drop --record-access-trace-to"
+                );
+            }
+            if !matches!(backend, Backend::Ptrace | Backend::E9patch) {
+                anyhow::bail!(
+                    "--record-access-trace-to has been checked on the ptrace backend only (and \
+                     on e9patch preprocessing, which runs on it); backend `{}` is refused: use \
+                     --backend=ptrace",
+                    backend.as_str()
+                );
+            }
+        } else if let Some(shaping) = [
+            (config.access_trace_from != 0)
+                .then(|| format!("--access-trace-from={}", config.access_trace_from)),
+            config
+                .access_trace_max_records
+                .map(|records| format!("--access-trace-max-records={records}")),
+        ]
+        .into_iter()
+        .flatten()
+        .next()
+        {
+            anyhow::bail!(
+                "{shaping} only shapes an access trace; add --record-access-trace-to=PATH, or \
+                 drop it"
+            );
+        }
         if config.scheduler_turn_cost.is_some() && backend == Backend::Dbt {
             anyhow::bail!(
                 "the dbt backend cannot apply --scheduler-turn-cost: its runtime reads a frozen \
@@ -9401,6 +9605,11 @@ impl RunOpts {
             (
                 config.preemption_stacktrace_log_file.is_some(),
                 "--preemption-stacktrace-log-file",
+                SHARED,
+            ),
+            (
+                config.access_trace.is_some(),
+                "--record-access-trace-to",
                 SHARED,
             ),
         ]
@@ -10034,7 +10243,35 @@ impl RunOpts {
     /// parent directory's host resolution, so a symlinked parent directory
     /// into a hidden one is refused too.
     fn validate_work_span_report_visibility(&self) -> Result<(), Error> {
-        let Some(path) = self.det_opts.det_config.work_span_report.as_deref() else {
+        self.validate_scheduler_output(
+            "--work-span-report",
+            "report",
+            self.det_opts.det_config.work_span_report.as_deref(),
+        )
+    }
+
+    /// The `--record-access-trace-to` counterpart of
+    /// `validate_work_span_report_visibility`: the scheduler writes the trace
+    /// from inside the container too, and every mode that would not write it
+    /// is refused earlier.
+    fn validate_access_trace_visibility(&self) -> Result<(), Error> {
+        self.validate_scheduler_output(
+            "--record-access-trace-to",
+            "trace",
+            self.det_opts.det_config.access_trace.as_deref(),
+        )
+    }
+
+    /// Refuse an output the scheduler writes from inside the run container
+    /// (`flag`'s `what`) at a path the container would resolve elsewhere: a
+    /// `..` component, a hidden directory, or a symlinked parent into one.
+    fn validate_scheduler_output(
+        &self,
+        flag: &str,
+        what: &str,
+        path: Option<&Path>,
+    ) -> Result<(), Error> {
+        let Some(path) = path else {
             return Ok(());
         };
         if !self.no_namespace
@@ -10043,22 +10280,18 @@ impl RunOpts {
                 .any(|component| matches!(component, std::path::Component::ParentDir))
         {
             anyhow::bail!(
-                "--work-span-report {} has a `..` component, which the run container's mounts can \
-                 resolve into a directory it hides, losing the report. Name the directory directly.",
+                "{flag} {} has a `..` component, which the run container's mounts can \
+                 resolve into a directory it hides, losing the {what}. Name the directory directly.",
                 path.display()
             );
         }
-        self.validate_output_visibility("--work-span-report", "report", Some(path))?;
+        self.validate_output_visibility(flag, what, Some(path))?;
         if path.is_absolute()
             && let (Some(parent), Some(name)) = (path.parent(), path.file_name())
             && let Ok(resolved) = std::fs::canonicalize(parent)
             && resolved != parent
         {
-            self.validate_output_visibility(
-                "--work-span-report",
-                "report",
-                Some(&resolved.join(name)),
-            )?;
+            self.validate_output_visibility(flag, what, Some(&resolved.join(name)))?;
         }
         Ok(())
     }
