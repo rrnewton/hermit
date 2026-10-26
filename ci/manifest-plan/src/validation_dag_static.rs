@@ -1202,7 +1202,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Trains since then add four (measured with `cargo nextest list` at
     // 11c35a504a6; the full validate at 24fbff99c7a also saw 1912):
     // 1908 + 4 = 1912.
-    ("test.regular_crates", 1910),    // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
+    // And detcore-model's six access_trace::tests (record round trip, on-disk
+    // spelling, out_bytes hex, returned_digest, reader refusals, conflict
+    // rules), the access trace's record types: 1916.
+    ("test.regular_crates", 1916),    // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
     // Two proc-fallback container tests and one broken-stderr warning test
