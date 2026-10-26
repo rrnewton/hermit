@@ -1202,7 +1202,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Trains since then add four (measured with `cargo nextest list` at
     // 11c35a504a6; the full validate at 24fbff99c7a also saw 1912):
     // 1908 + 4 = 1912.
-    ("test.regular_crates", 1910),    // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
+    // And detcore-model's config::tests::the_guest_numbering_never_enters_the_legacy_form
+    // (--no-namespace chosen guest IDs): 1911, listed.
+    ("test.regular_crates", 1911),    // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
     // Two proc-fallback container tests and one broken-stderr warning test
@@ -1858,7 +1860,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 11c35a504a6, less the five real_random_ skips: 1230 - 5; the full
     // validate at 24fbff99c7a saw 1224 before 11c35a504a6 added one):
     // 1202 + 23 = 1225.
-    ("test.hermit_unit", 1221),    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
+    // And guest_ids' six --pid-base resolution units: 1160 + 6 = 1227, listed.
+    ("test.hermit_unit", 1227),    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
     // Four process-retirement fence controls and four uncontrolled-retirement
@@ -3079,7 +3082,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // MSG_DONTWAIT): 2883 + 14 = 2897, measured with `cargo nextest list`
     // at 16fb7fbec04 and re-measured at this head.
     // And the TracerPid unit (32e9ef22f60): 2897 + 1 = 2898.
-    ("test.detcore_unit", 2898),
+    // And syscalls::chosen_ids' eight clone3-form units and preemptions'
+    // the_guest_numbering_round_trips_and_is_compared: 2695 + 9 = 2907, listed.
+    ("test.detcore_unit", 2907),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4385,7 +4390,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 700 + 2 = 702.
     // And 11c35a504a6's two --base-env=minimal cli tests: 702 + 2 = 704,
     // measured with `cargo nextest list` at 11c35a504a6.
-    ("test.cli", 703),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
+    // And the four --no-namespace chosen-ID tests (no_namespace_guest_ids_follow_the_base_and_creation_order,
+    // no_namespace_reports_its_guest_numbering, no_namespace_refuses_a_taken_chosen_id_only_when_asked,
+    // no_namespace_refuses_a_held_pid_base) and
+    // no_namespace_concurrent_runs_take_different_windows: 637 + 5 = 708.
+    ("test.cli", 708),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
     // sabre_reports_a_replaced_host_file_without_naming_it_the_cause,
@@ -4935,7 +4944,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // `cargo nextest list` at 16fb7fbec04 and re-measured at this head.
     // And the same two TracerPid cli tests: 619 + 2 = 621.
     // And the same two 11c35a504a6 tests: 621 + 2 = 623.
-    ("test.cli_on_host", 622),
+    // And the same five --no-namespace chosen-ID tests, not excluded: 556 + 5 = 627.
+    ("test.cli_on_host", 627),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5411,7 +5421,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same fourteen train-12 detcore units: 2883 + 14 = 2897,
     // measured with `cargo nextest list` at this head.
     // And the same TracerPid unit: 2898.
-    ("test.detcore_unit_on_host", 2898),
+    // And the same nine chosen-ID units: 2695 + 9 = 2907.
+    ("test.detcore_unit_on_host", 2907),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5783,7 +5794,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1166.
     // Train 6 recount (measured on 21f770f6 base): 1181.
     // The same 23, keeping the six local-only cases: 1196 + 23 = 1219.
-    ("test.hermit_unit_on_host", 1215),
+    // And the same six --pid-base resolution units: 1154 + 6 = 1221.
+    ("test.hermit_unit_on_host", 1221),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5997,7 +6009,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1892 + 2 = 1894 (the local twin's fourteen hosted exclusions are
     // unchanged, so 1894 + 14 = 1908).
     // And the same four since: 1898.
-    ("test.regular_crates_on_host", 1898),
+    // And the same guest-numbering legacy-form test: 1899, listed.
+    ("test.regular_crates_on_host", 1899),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

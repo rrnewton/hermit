@@ -247,6 +247,18 @@ pub struct RunSummary {
     /// records or replays preemptions. Full report only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store_exclusives_unavailable: Option<String>,
+    /// How the guest's process and thread IDs were numbered, for a run
+    /// without a PID namespace of its own (`--no-namespace`): chosen from a
+    /// base, or the host's. Absent for a run its PID namespace numbered. Shown
+    /// in the full report as launch configuration, not in the INFO view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_ids: Option<crate::pid::GuestIds>,
+
+    /// How many guest tasks were created with a host ID although their IDs
+    /// were to be chosen (`guest_ids`): nonzero means the run's IDs are not
+    /// deterministic. Shown in the full report beside `guest_ids`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub host_id_tasks: u64,
 }
 
 /// The store-exclusives a run's guest speculatively executed that failed,
@@ -301,6 +313,10 @@ fn counted(count: u64, noun: &str) -> String {
     } else {
         format!("{count} {noun}s")
     }
+}
+
+fn is_zero(count: &u64) -> bool {
+    *count == 0
 }
 
 /// The full human-readable report, including recorded launch configuration.
@@ -369,6 +385,8 @@ impl RunSummary {
             exclusive_pairs,
             store_exclusives,
             store_exclusives_unavailable,
+            guest_ids,
+            host_id_tasks,
         } = self;
         writeln!(f, "Final thread-tree was: {}", threads_descrip)?;
         writeln!(
@@ -395,6 +413,16 @@ impl RunSummary {
 
         if include_report_metadata && let Some(preemption) = preemption {
             writeln!(f, "{preemption}")?;
+        }
+        if include_report_metadata && let Some(guest_ids) = guest_ids {
+            writeln!(f, "Guest process IDs: {guest_ids}")?;
+            if *host_id_tasks > 0 {
+                writeln!(
+                    f,
+                    "  {host_id_tasks} task(s) got a host ID instead, so this run's process IDs \
+                     are not deterministic"
+                )?;
+            }
         }
 
         if include_report_metadata {

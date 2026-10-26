@@ -2093,6 +2093,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(refused);
         }
 
+        // The child's ID, when Detcore chooses the IDs: taken here, in this
+        // turn, before the vfork parent below gives the turn up.
+        let clone_plan = self
+            .plan_clone_id(guest, &Syscall::from(clone_family))
+            .await?;
+
         let ts = guest.thread_state_mut();
         assert_eq!(ts.clone_flags, None);
         assert!(ts.pending_vfork.is_none());
@@ -2154,14 +2160,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, resources).await;
         }
 
-        let sysno = Syscall::from(clone_family).number();
-        let (maybe_res, untraced_refusal) =
-            match inject_traced_clone(guest, clone_family, flags).await {
-                CloneInjection::Ran(result) => (result, None),
-                // No call ran. ENOMEM is what the guest gets with
-                // --allow-unsupported-syscalls: a clone Linux could not complete.
-                CloneInjection::Refused(reason) => (Err(Errno::ENOMEM), Some(reason)),
-            };
+        let call = Syscall::from(clone_family);
+        let sysno = call.number();
+        let (maybe_res, untraced_refusal) = match clone_plan {
+            // Detcore does not choose the IDs: the call is issued as the guest
+            // made it, without CLONE_UNTRACED.
+            super::chosen_ids::ClonePlan::Kernel => {
+                match inject_traced_clone(guest, clone_family, flags).await {
+                    CloneInjection::Ran(result) => (result, None),
+                    // No call ran. ENOMEM is what the guest gets with
+                    // --allow-unsupported-syscalls: a clone Linux could not complete.
+                    CloneInjection::Refused(reason) => (Err(Errno::ENOMEM), Some(reason)),
+                }
+            }
+            clone_plan => (
+                self.inject_clone_planned(guest, call, clone_plan).await,
+                None,
+            ),
+        };
         // Ask before anything else is injected: the next injection replaces
         // the backend's record.
         let refusal = if maybe_res.is_err() && untraced_refusal.is_none() {
