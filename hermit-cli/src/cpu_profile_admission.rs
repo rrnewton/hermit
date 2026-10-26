@@ -19,7 +19,17 @@ use nix::sched::sched_getaffinity;
 use nix::sched::sched_setaffinity;
 use nix::unistd::Pid;
 
+#[cfg(target_arch = "x86_64")]
 use crate::xstate_probe;
+
+/// What a host qualification yields: the XSTATE probe's report and the host
+/// facts a v3 run binds.
+#[cfg(target_arch = "x86_64")]
+pub type Qualification = (xstate_probe::ProbeReport, HostXstate);
+/// What a host qualification yields. The XSTATE probe runs x86 instructions,
+/// so on other architectures no qualification exists.
+#[cfg(not(target_arch = "x86_64"))]
+pub type Qualification = (std::convert::Infallible, HostXstate);
 
 /// Why a profile is refused, after `--cpu-profile <profile> refused: `.
 pub type AdmissionRefusal = String;
@@ -183,6 +193,7 @@ pub fn check_host_no_rdrand_request(
     Ok(())
 }
 
+#[cfg(target_arch = "x86_64")]
 const CPUID_FAULTING_REMEDY: &str = "use a CPU and Linux kernel with CPUID faulting support (capable AMD CPUs need \
      Linux 6.17 or its CPUID-faulting backport)";
 
@@ -205,6 +216,7 @@ pub fn cpuid_faulting_vm_pointer(host: &dyn HostCpuid, release: &str) -> Option<
     })
 }
 
+#[cfg(target_arch = "x86_64")]
 fn native_cpuid_faulting_vm_pointer() -> Option<String> {
     let uname = nix::sys::utsname::uname().ok()?;
     cpuid_faulting_vm_pointer(&NativeCpuid, &uname.release().to_string_lossy())
@@ -228,6 +240,7 @@ pub fn missing_cpuid_faulting_note(messages: &[String]) -> Option<String> {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
 fn check_host_no_rdrand_cpuid(host: &dyn HostCpuid) -> Result<(), AdmissionRefusal> {
     let intel_hybrid = host.cpuid(0, 0)[0] >= 7 && host.cpuid(7, 0)[3] & (1 << 15) != 0;
     // AMD advertises heterogeneous cores independently of Intel's hybrid bit:
@@ -248,6 +261,7 @@ fn check_host_no_rdrand_cpuid(host: &dyn HostCpuid) -> Result<(), AdmissionRefus
 /// tracer would also fault Rust's and libc's own feature detection, so only
 /// the forked child changes its state. After fork the child uses only libc
 /// syscalls and `_exit`, without allocation, locks or unwinding.
+#[cfg(target_arch = "x86_64")]
 pub fn qualify_host_no_rdrand() -> Result<(), AdmissionRefusal> {
     const ARCH_GET_CPUID: libc::c_int = 0x1011;
     const ARCH_SET_CPUID: libc::c_int = 0x1012;
@@ -422,6 +436,7 @@ pub trait HostCpuid {
 /// The CPUID instruction of the host this process runs on.
 pub struct NativeCpuid;
 
+#[cfg(target_arch = "x86_64")]
 impl HostCpuid for NativeCpuid {
     fn cpuid(&self, leaf: u32, subleaf: u32) -> [u32; 4] {
         let r = std::arch::x86_64::__cpuid_count(leaf, subleaf);
@@ -495,13 +510,19 @@ pub fn check_host_cpuid(
 /// The user-dynamic xstate component (AMX TILEDATA): Linux enables it in XCR0
 /// while withholding process permission, so a permission request changes
 /// process state and the three XCOMP answers differ.
+#[cfg(target_arch = "x86_64")]
 const XFEATURE_TILEDATA: u64 = 1 << 18;
 
+#[cfg(target_arch = "x86_64")]
 const ARCH_GET_XCOMP_SUPP: libc::c_int = 0x1021;
+#[cfg(target_arch = "x86_64")]
 const ARCH_GET_XCOMP_PERM: libc::c_int = 0x1022;
+#[cfg(target_arch = "x86_64")]
 const ARCH_REQ_XCOMP_PERM: libc::c_int = 0x1023;
+#[cfg(target_arch = "x86_64")]
 const ARCH_GET_XCOMP_GUEST_PERM: libc::c_int = 0x1024;
 
+#[cfg(target_arch = "x86_64")]
 fn arch_prctl_mask(cmd: libc::c_int) -> Result<u64, AdmissionRefusal> {
     let mut mask = 0u64;
     // SAFETY: the GET commands write one u64 through the pointer.
@@ -519,6 +540,7 @@ fn arch_prctl_mask(cmd: libc::c_int) -> Result<u64, AdmissionRefusal> {
 /// index it answers EINVAL for. Every index below must answer EOPNOTSUPP; an
 /// index that is granted would mean a dynamic feature, which is refused
 /// before this runs.
+#[cfg(target_arch = "x86_64")]
 fn xfeature_max() -> Result<u32, AdmissionRefusal> {
     for index in 0..64u64 {
         // SAFETY: the request takes the component index by value.
@@ -539,6 +561,7 @@ fn xfeature_max() -> Result<u32, AdmissionRefusal> {
 }
 
 /// The host facts a qualified v3 run binds.
+#[cfg(target_arch = "x86_64")]
 fn capture(probe: &xstate_probe::ProbeReport) -> Result<HostXstate, AdmissionRefusal> {
     let host = host_facts(probe.cases as u32, probe.forced_exit)?;
     if host.xcr0 != probe.xcr0 {
@@ -552,6 +575,7 @@ fn capture(probe: &xstate_probe::ProbeReport) -> Result<HostXstate, AdmissionRef
 
 /// This host's facts, with the qualification fields given rather than probed.
 /// The caller has checked OSXSAVE.
+#[cfg(target_arch = "x86_64")]
 fn host_facts(probe_cases: u32, probe_forced_exit: bool) -> Result<HostXstate, AdmissionRefusal> {
     let host = NativeCpuid;
     let leaf0 = host.cpuid(0, 0);
@@ -586,6 +610,7 @@ fn host_facts(probe_cases: u32, probe_forced_exit: bool) -> Result<HostXstate, A
 /// one this replayer computes from them. The probe costs seconds of CPU, and a
 /// replay on a different CPU, or of an altered recording, needs none of it to
 /// be refused. Returns the recorded facts.
+#[cfg(target_arch = "x86_64")]
 pub fn precheck_replay(
     profile: CpuProfile,
     recorded: Option<&HostXstate>,
@@ -623,17 +648,14 @@ pub fn precheck_replay(
 /// in the CLI process, before its container child is forked, so the child
 /// reuses this result instead of probing again from inside the container,
 /// whose CPU affinity can be one busy CPU.
-static ADMITTED: std::sync::OnceLock<(xstate_probe::ProbeReport, HostXstate)> =
-    std::sync::OnceLock::new();
+static ADMITTED: std::sync::OnceLock<Qualification> = std::sync::OnceLock::new();
 
 /// Admits a v3 run on this host, or names why not. On success the probe report
 /// and the host facts to bind are returned, and this process's ptrace
 /// floating-point register writes are refused from then on. The request's own
 /// refusals are checked every time; the host qualification runs once per
 /// process.
-pub fn admit(
-    request: &AdmissionRequest<'_>,
-) -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal> {
+pub fn admit(request: &AdmissionRequest<'_>) -> Result<Qualification, AdmissionRefusal> {
     admit_with(request, qualify_host)
 }
 
@@ -641,8 +663,8 @@ pub fn admit(
 /// admit without probing.
 fn admit_with(
     request: &AdmissionRequest<'_>,
-    qualify: impl FnOnce() -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal>,
-) -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal> {
+    qualify: impl FnOnce() -> Result<Qualification, AdmissionRefusal>,
+) -> Result<Qualification, AdmissionRefusal> {
     check_request(request)?;
     if let Some(admitted) = ADMITTED.get() {
         return Ok(admitted.clone());
@@ -728,7 +750,8 @@ pub fn refuse_unadmitted_launch(
 /// The host half of [`admit`], run once per process: the kernel, the
 /// every-bit CPUID check, the dynamic-feature refusal, the probe and the host
 /// facts. `hermit host-capabilities --cpu-profile x86-64-v3` runs it alone.
-pub fn qualify_host() -> Result<(xstate_probe::ProbeReport, HostXstate), AdmissionRefusal> {
+#[cfg(target_arch = "x86_64")]
+pub fn qualify_host() -> Result<Qualification, AdmissionRefusal> {
     let release = nix::sys::utsname::uname()
         .map_err(|e| format!("uname failed: {e}"))?
         .release()
@@ -747,6 +770,7 @@ pub fn qualify_host() -> Result<(xstate_probe::ProbeReport, HostXstate), Admissi
 /// Refuses a host with a user-dynamic xstate feature (AMX TILEDATA, bit 18) in
 /// XCR0 or in ARCH_GET_XCOMP_SUPP: a guest's permission request for it changes
 /// process state, which the profile cannot bind.
+#[cfg(target_arch = "x86_64")]
 fn refuse_dynamic_features(xcr0: u64, xcomp_supp: u64) -> Result<(), AdmissionRefusal> {
     if (xcr0 | xcomp_supp) & XFEATURE_TILEDATA != 0 {
         return Err(
@@ -756,6 +780,44 @@ fn refuse_dynamic_features(xcr0: u64, xcomp_supp: u64) -> Result<(), AdmissionRe
         );
     }
     Ok(())
+}
+
+/// CPUID faulting is an x86 feature, so other architectures refuse the host
+/// profile.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn qualify_host_no_rdrand() -> Result<(), AdmissionRefusal> {
+    Err(non_x86_refusal())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn native_cpuid_faulting_vm_pointer() -> Option<String> {
+    None
+}
+
+/// The v3 profile binds x86 XSTATE facts, so other architectures refuse it.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn precheck_replay(
+    profile: CpuProfile,
+    _recorded: Option<&HostXstate>,
+    _recorded_digest: Option<&str>,
+) -> Result<HostXstate, CpuProfileRefusal> {
+    check_record_or_replay(profile)?;
+    Err(CpuProfileRefusal::new(profile, non_x86_refusal()))
+}
+
+/// The v3 profile binds x86 XSTATE facts, so other architectures refuse it.
+#[cfg(not(target_arch = "x86_64"))]
+pub fn qualify_host() -> Result<Qualification, AdmissionRefusal> {
+    Err(non_x86_refusal())
+}
+
+/// Why a nondefault profile is refused off x86: both describe x86 CPUs.
+#[cfg(not(target_arch = "x86_64"))]
+fn non_x86_refusal() -> AdmissionRefusal {
+    format!(
+        "the nondefault CPU profiles describe x86-64 CPUs, and this host is {}",
+        std::env::consts::ARCH
+    )
 }
 
 #[cfg(test)]

@@ -613,6 +613,7 @@ pub(crate) fn exe_link_subject(path: &[u8], pid: i32) -> Option<ExeLinkSubject> 
 }
 
 // TODO-HUMAN-REVIEW(PR-1079): Review numeric virtual-self proc-fd path rewriting.
+#[cfg(target_arch = "x86_64")]
 fn host_self_proc_fd_alias(path: &Path, current_pid: i64) -> Option<PathBuf> {
     let (Some(subject), fd) = proc_fd_target(path)? else {
         return None;
@@ -981,6 +982,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(written as i64)
     }
 
+    #[cfg(target_arch = "x86_64")]
     async fn finish_other_proc_fd_readlink<G>(
         &self,
         guest: &mut G,
@@ -1953,12 +1955,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut stack = guest.stack().await;
         let path_address = stack.push(path_buffer).cast::<libc::c_char>();
         let stack_guard = stack.commit()?;
+        let path = PathPtr::from_ptr(path_address.as_raw() as *const libc::c_char);
+        #[cfg(target_arch = "x86_64")]
         let call = syscalls::Readlink::new()
-            .with_path(PathPtr::from_ptr(
-                path_address.as_raw() as *const libc::c_char
-            ))
+            .with_path(path)
             .with_buf(buffer)
             .with_bufsize(size);
+        // aarch64 has only `readlinkat`.
+        #[cfg(not(target_arch = "x86_64"))]
+        let call = syscalls::Readlinkat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(path)
+            .with_buf(buffer)
+            .with_buf_len(size);
         let result = self.record_or_replay(guest, call).await?;
         // The stack is released before anything else uses it; a placeholder
         // is confirmed through the guest's own pathname, as before.
@@ -2023,6 +2032,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#877)
     /// Preserve Linux readlink errors and canonicalize procfs namespace identities.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_readlink<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2098,6 +2108,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// [`Self::handle_readlink`] of a link Detcore does not answer from an
     /// exec record.
+    #[cfg(target_arch = "x86_64")]
     async fn readlink_unlaunched<G: Guest<Self>>(
         &self,
         guest: &mut G,

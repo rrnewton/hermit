@@ -259,19 +259,86 @@ impl fmt::Display for DebugEvent {
 /// -- not the typed field count -- guarantees we never zero a meaningful
 /// argument and therefore never mask a genuine divergence.
 fn kernel_arg_count(sysno: Sysno) -> Option<u8> {
-    use reverie::syscalls::Sysno::*;
+    // Every name is qualified: a bare name that the target's table lacks
+    // would be a catch-all binding, not a pattern.
     Some(match sysno {
-        close | chdir | fchdir | dup | time | unlink | rmdir => 1,
-        access | getcwd | set_robust_list | stat | fstat | lstat | dup2 | clock_gettime
-        | clock_getres | gettimeofday | settimeofday | mkdir | statfs | fstatfs | ftruncate
-        | kill | listen | shutdown | rt_sigpending | rename | link | symlink | chmod => 2,
-        mprotect | read | readv | write | writev | lseek | getdents | getdents64 | dup3 | ioctl
-        | socket | fcntl | connect | sendmsg | poll | getpeername | getsockname | getrandom
-        | readlink | unlinkat | open | execve | close_range | tgkill | faccessat | chown
-        | lchown | mknod | accept | bind => 3,
-        pread64 | pwrite64 | newfstatat | fadvise64 | openat | faccessat2 | accept4 => 4,
-        statx | pwritev | preadv | ppoll | setsockopt | getsockopt | execveat | prctl => 5,
-        recvfrom | sendto | pwritev2 | preadv2 | mmap => 6,
+        Sysno::close | Sysno::chdir | Sysno::fchdir | Sysno::dup => 1,
+        Sysno::getcwd
+        | Sysno::set_robust_list
+        | Sysno::fstat
+        | Sysno::clock_gettime
+        | Sysno::clock_getres
+        | Sysno::gettimeofday
+        | Sysno::settimeofday
+        | Sysno::statfs
+        | Sysno::fstatfs
+        | Sysno::ftruncate
+        | Sysno::kill
+        | Sysno::listen
+        | Sysno::shutdown
+        | Sysno::rt_sigpending => 2,
+        Sysno::mprotect
+        | Sysno::read
+        | Sysno::readv
+        | Sysno::write
+        | Sysno::writev
+        | Sysno::lseek
+        | Sysno::getdents64
+        | Sysno::dup3
+        | Sysno::ioctl
+        | Sysno::socket
+        | Sysno::fcntl
+        | Sysno::connect
+        | Sysno::sendmsg
+        | Sysno::getpeername
+        | Sysno::getsockname
+        | Sysno::getrandom
+        | Sysno::unlinkat
+        | Sysno::execve
+        | Sysno::close_range
+        | Sysno::tgkill
+        | Sysno::faccessat
+        | Sysno::accept
+        | Sysno::bind => 3,
+        Sysno::pread64
+        | Sysno::pwrite64
+        | Sysno::fadvise64
+        | Sysno::openat
+        | Sysno::faccessat2
+        | Sysno::accept4 => 4,
+        Sysno::statx
+        | Sysno::pwritev
+        | Sysno::preadv
+        | Sysno::ppoll
+        | Sysno::setsockopt
+        | Sysno::getsockopt
+        | Sysno::execveat
+        | Sysno::prctl => 5,
+        Sysno::recvfrom | Sysno::sendto | Sysno::pwritev2 | Sysno::preadv2 | Sysno::mmap => 6,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::time | Sysno::unlink | Sysno::rmdir => 1,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::access
+        | Sysno::stat
+        | Sysno::lstat
+        | Sysno::dup2
+        | Sysno::mkdir
+        | Sysno::rename
+        | Sysno::link
+        | Sysno::symlink
+        | Sysno::chmod => 2,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::getdents
+        | Sysno::poll
+        | Sysno::readlink
+        | Sysno::open
+        | Sysno::chown
+        | Sysno::lchown
+        | Sysno::mknod => 3,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::newfstatat => 4,
+        #[cfg(target_arch = "aarch64")]
+        Sysno::fstatat => 4,
         _ => return None,
     })
 }

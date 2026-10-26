@@ -131,29 +131,24 @@ pub(crate) fn take_proc_device() {
     let _ = rendered_procfs::proc_device();
 }
 
+/// Whether `sysno` opens a new descriptor for its path.
+fn creates_descriptor(sysno: Sysno) -> bool {
+    match sysno {
+        Sysno::openat => true,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::open | Sysno::creat => true,
+        _ => false,
+    }
+}
+
 /// The path operands of a call that looks up paths ([`Lookups::Paths`] of
 /// [`looked_up`]), without allocating; `None` for every other call.
 pub(super) fn path_operands(sysno: Sysno) -> Option<&'static [(Option<usize>, usize)]> {
     let paths: &'static [(Option<usize>, usize)] = match sysno {
-        Sysno::open
-        | Sysno::creat
-        | Sysno::stat
-        | Sysno::lstat
-        | Sysno::access
-        | Sysno::readlink
-        | Sysno::execve
+        Sysno::execve
         | Sysno::chdir
         | Sysno::chroot
-        | Sysno::mkdir
-        | Sysno::mknod
-        | Sysno::rmdir
-        | Sysno::unlink
         | Sysno::truncate
-        | Sysno::chmod
-        | Sysno::chown
-        | Sysno::lchown
-        | Sysno::utime
-        | Sysno::utimes
         | Sysno::getxattr
         | Sysno::lgetxattr
         | Sysno::setxattr
@@ -163,8 +158,23 @@ pub(super) fn path_operands(sysno: Sysno) -> Option<&'static [(Option<usize>, us
         | Sysno::removexattr
         | Sysno::lremovexattr
         | Sysno::statfs => &[(None, 0)],
+        #[cfg(target_arch = "x86_64")]
+        Sysno::open
+        | Sysno::creat
+        | Sysno::stat
+        | Sysno::lstat
+        | Sysno::access
+        | Sysno::readlink
+        | Sysno::mkdir
+        | Sysno::mknod
+        | Sysno::rmdir
+        | Sysno::unlink
+        | Sysno::chmod
+        | Sysno::chown
+        | Sysno::lchown
+        | Sysno::utime
+        | Sysno::utimes => &[(None, 0)],
         Sysno::openat
-        | Sysno::newfstatat
         | Sysno::statx
         | Sysno::faccessat
         | Sysno::faccessat2
@@ -176,11 +186,16 @@ pub(super) fn path_operands(sysno: Sysno) -> Option<&'static [(Option<usize>, us
         | Sysno::fchmodat
         | Sysno::fchmodat2
         | Sysno::fchownat
-        | Sysno::utimensat
-        | Sysno::futimesat => &[(Some(0), 1)],
+        | Sysno::utimensat => &[(Some(0), 1)],
+        #[cfg(target_arch = "x86_64")]
+        Sysno::newfstatat | Sysno::futimesat => &[(Some(0), 1)],
+        #[cfg(target_arch = "aarch64")]
+        Sysno::fstatat => &[(Some(0), 1)],
+        #[cfg(target_arch = "x86_64")]
         Sysno::symlink => &[(None, 1)],
         Sysno::symlinkat => &[(Some(1), 2)],
         Sysno::inotify_add_watch => &[(None, 1)],
+        #[cfg(target_arch = "x86_64")]
         Sysno::rename | Sysno::link => &[(None, 0), (None, 1)],
         Sysno::renameat | Sysno::renameat2 | Sysno::linkat => &[(Some(0), 1), (Some(2), 3)],
         _ => return None,
@@ -905,7 +920,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         unmap_transient(guest, page, length).await;
         match result {
             Ok(value) => {
-                if matches!(sysno, Sysno::open | Sysno::openat | Sysno::creat) {
+                if creates_descriptor(sysno) {
                     let _ = self
                         .record_or_replay(guest, syscalls::Close::new().with_fd(value as RawFd))
                         .await;

@@ -399,7 +399,12 @@ pub(crate) const HASHED_SYSCALLS: &[reverie::syscalls::Sysno] = &[
 ];
 
 fn ret_gates_output(call: &Syscall) -> bool {
-    !matches!(call, Syscall::Poll(_) | Syscall::Ppoll(_))
+    match call {
+        Syscall::Ppoll(_) => false,
+        #[cfg(target_arch = "x86_64")]
+        Syscall::Poll(_) => false,
+        _ => true,
+    }
 }
 
 /// The structure a stat-family call fills: its guest address and size.
@@ -419,10 +424,15 @@ fn stat_buffer(call: &Syscall) -> Option<(Option<u64>, u64)> {
     let stat = |p: Option<reverie::syscalls::StatPtr<'_>>| p.map(|p| p.0.as_raw() as u64);
     let stat_len = std::mem::size_of::<libc::stat>() as u64;
     Some(match call {
+        #[cfg(target_arch = "x86_64")]
         Syscall::Stat(c) => (stat(c.stat()), stat_len),
+        #[cfg(target_arch = "x86_64")]
         Syscall::Lstat(c) => (stat(c.stat()), stat_len),
         Syscall::Fstat(c) => (stat(c.stat()), stat_len),
+        #[cfg(target_arch = "x86_64")]
         Syscall::Newfstatat(c) => (stat(c.stat()), stat_len),
+        #[cfg(target_arch = "aarch64")]
+        Syscall::Fstatat(c) => (stat(c.stat()), stat_len),
         Syscall::Statx(c) => (
             c.statx().map(|p| p.0.as_raw() as u64),
             std::mem::size_of::<reverie::syscalls::linux_abi::Statx>() as u64,
@@ -517,6 +527,7 @@ fn extents<M: MemoryAccess>(
             c.count() as usize,
             ret,
         ),
+        #[cfg(target_arch = "x86_64")]
         Syscall::Readlink(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.bufsize(), ret),
         Syscall::Readlinkat(c) => clamp(c.buf().map(|p| p.as_raw() as u64), c.buf_len(), ret),
         Syscall::Recvmsg(c) => msghdr_extents(memory, c.msg().map_or(0, |p| p.as_raw()), ret)?,
@@ -548,6 +559,7 @@ fn extents<M: MemoryAccess>(
         // `unsigned int`, so only its low 32 bits count: a guest that sets the
         // high word gets the low word's array, and the observer must not read
         // more.
+        #[cfg(target_arch = "x86_64")]
         Syscall::Poll(c) => whole(
             c.fds().map(|p| p.as_raw() as u64),
             pollfd_array_len(c.nfds()),

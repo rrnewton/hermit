@@ -31,7 +31,9 @@ use reverie::Error;
 use reverie::GlobalTool;
 use reverie::Guest;
 use reverie::Pid;
+#[cfg(target_arch = "x86_64")]
 use reverie::Rdtsc;
+#[cfg(target_arch = "x86_64")]
 use reverie::RdtscResult;
 use reverie::Subscription;
 use reverie::Tid;
@@ -521,6 +523,7 @@ impl Tool for Recorder {
             Syscall::Execve(_) | Syscall::Execveat(_) => self.handle_exec(guest, syscall).await,
             Syscall::Brk(_) => self.let_through(guest, syscall).await,
             Syscall::Mprotect(_) => self.let_through(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::ArchPrctl(_) => {
                 // To properly handle arch_prctl, we should prevent calls from
                 // using ARCH_SET_CPUID since we already do that for the
@@ -572,14 +575,21 @@ impl Tool for Recorder {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#3598): faccessat/faccessat2 are pure queries;
             // recording their result keeps replay off the replay chroot's files.
-            Syscall::Access(_) | Syscall::Faccessat(_) | Syscall::Other(Sysno::faccessat2, _) => {
+            Syscall::Faccessat(_) | Syscall::Other(Sysno::faccessat2, _) => {
                 self.handle_simple(guest, syscall).await
             }
+            #[cfg(target_arch = "x86_64")]
+            Syscall::Access(_) => self.handle_simple(guest, syscall).await,
             Syscall::Lseek(_) => self.handle_simple(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Stat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Fstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Lstat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Newfstatat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
+            #[cfg(target_arch = "aarch64")]
+            Syscall::Fstatat(syscall) => self.handle_stat_family(guest, syscall.into()).await,
             Syscall::Statfs(syscall) => {
                 self.handle_statfs(guest, syscall.into(), syscall.buf())
                     .await
@@ -589,13 +599,16 @@ impl Tool for Recorder {
                     .await
             }
             Syscall::Statx(syscall) => self.handle_statx(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Getdents(syscall) => self.handle_getdents(guest, syscall).await,
             Syscall::Getdents64(syscall) => self.handle_getdents64(guest, syscall).await,
             Syscall::Mmap(syscall) => self.handle_mmap(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             Syscall::Madvise(syscall) => self.handle_madvise(guest, syscall).await,
             Syscall::Munmap(_) => self.let_through(guest, syscall).await,
-            Syscall::Open(_) | Syscall::Openat(_) => self.handle_open(guest, syscall).await,
+            Syscall::Openat(_) => self.handle_open(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
+            Syscall::Open(_) => self.handle_open(guest, syscall).await,
             Syscall::Close(_) => self.handle_fd_table_mutation(guest, syscall).await,
             Syscall::Openat2(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -611,6 +624,7 @@ impl Tool for Recorder {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(#3598): legacy path mutations share the *at
             // forms' result-only recording.
+            #[cfg(target_arch = "x86_64")]
             Syscall::Rename(_)
             | Syscall::Link(_)
             | Syscall::Symlink(_)
@@ -656,9 +670,9 @@ impl Tool for Recorder {
             Syscall::Flock(_) => self.handle_simple(guest, syscall).await,
             Syscall::Ftruncate(syscall) => self.handle_ftruncate(guest, syscall).await,
             Syscall::Dup(_) => self.handle_simple(guest, syscall).await,
-            Syscall::Dup2(_) | Syscall::Dup3(_) => {
-                self.handle_fd_table_mutation(guest, syscall).await
-            }
+            Syscall::Dup3(_) => self.handle_fd_table_mutation(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
+            Syscall::Dup2(_) => self.handle_fd_table_mutation(guest, syscall).await,
             Syscall::Ioctl(syscall) => self.handle_ioctl(guest, syscall).await,
             Syscall::Socket(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -672,6 +686,7 @@ impl Tool for Recorder {
             Syscall::ClockGetres(syscall) => self.handle_clock_getres(guest, syscall).await,
             Syscall::Gettimeofday(syscall) => self.handle_gettimeofday(guest, syscall).await,
             Syscall::Settimeofday(_) => self.handle_simple(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Time(syscall) => self.handle_time(guest, syscall).await,
             Syscall::Setsockopt(_) => self.handle_simple(guest, syscall).await,
             Syscall::Fcntl(call) if crate::event::fcntl_output(&call).is_some() => {
@@ -695,10 +710,13 @@ impl Tool for Recorder {
             Syscall::Accept4(call) => self.handle_accept4(guest, call).await,
             Syscall::Sendto(_) => self.handle_simple(guest, syscall).await,
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
             Syscall::Ppoll(syscall) => self.handle_ppoll(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Select(syscall) => self.handle_select(guest, syscall).await,
             Syscall::Pselect6(syscall) => self.handle_pselect6(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::EpollWait(syscall) => self.handle_epoll_wait(guest, syscall).await,
             Syscall::EpollPwait(syscall) => self.handle_epoll_pwait(guest, syscall).await,
             Syscall::Other(Sysno::epoll_pwait2, _) => {
@@ -712,9 +730,12 @@ impl Tool for Recorder {
                 self.handle_sockopt_family(guest, syscall.into()).await
             }
             Syscall::Getrandom(syscall) => self.handle_getrandom(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Readlink(syscall) => self.handle_readlink(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
+            #[cfg(target_arch = "x86_64")]
             Syscall::Mkdir(_) => self.handle_mkdir(guest, syscall).await,
+            #[cfg(target_arch = "x86_64")]
             Syscall::Unlink(_) => self.handle_simple(guest, syscall).await,
             Syscall::Unlinkat(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -755,6 +776,7 @@ impl Tool for Recorder {
         result
     }
 
+    #[cfg(target_arch = "x86_64")]
     async fn handle_rdtsc_event<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -841,6 +863,7 @@ impl Recorder {
         syscall: Syscall,
     ) -> Result<bool, Errno> {
         let result = match syscall {
+            #[cfg(target_arch = "x86_64")]
             Syscall::Mkdir(call) => {
                 let path = call.path().ok_or(Errno::EFAULT)?;
                 guest

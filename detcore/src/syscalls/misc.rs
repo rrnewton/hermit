@@ -17,6 +17,7 @@ use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
 use reverie::syscalls::AddrMut;
+#[cfg(target_arch = "x86_64")]
 use reverie::syscalls::ArchPrctlCmd;
 use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
@@ -44,17 +45,28 @@ use crate::tool_global::set_process_group;
 use crate::tool_local::Detcore;
 use crate::types::DetPid;
 
+#[cfg(target_arch = "x86_64")]
 const ARCH_GET_XCOMP_SUPP: libc::c_int = 0x1021;
+#[cfg(target_arch = "x86_64")]
 const ARCH_GET_XCOMP_PERM: libc::c_int = 0x1022;
+#[cfg(target_arch = "x86_64")]
 const ARCH_REQ_XCOMP_PERM: libc::c_int = 0x1023;
+#[cfg(target_arch = "x86_64")]
 const ARCH_GET_XCOMP_GUEST_PERM: libc::c_int = 0x1024;
+#[cfg(target_arch = "x86_64")]
 const ARCH_REQ_XCOMP_GUEST_PERM: libc::c_int = 0x1025;
 
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_ENABLE: libc::c_int = 0x5001;
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_DISABLE: libc::c_int = 0x5002;
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_LOCK: libc::c_int = 0x5003;
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_UNLOCK: libc::c_int = 0x5004;
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_STATUS: libc::c_int = 0x5005;
+#[cfg(target_arch = "x86_64")]
 const ARCH_SHSTK_VALID_MASK: usize = 0b11;
 
 const SECCOMP_SET_MODE_STRICT: u32 = 0;
@@ -327,10 +339,10 @@ fn write_get_mempolicy_output<M: MemoryAccess>(
     }
 }
 
-fn from_str(s: &str) -> [i8; 65] {
-    let mut ret: [i8; 65] = [0; 65];
+fn from_str(s: &str) -> [libc::c_char; 65] {
+    let mut ret: [libc::c_char; 65] = [0; 65];
     for (i, ch) in s.bytes().take(64).enumerate() {
-        ret[i] = ch as i8;
+        ret[i] = ch as libc::c_char;
     }
     ret
 }
@@ -416,12 +428,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// The host xstate facts of an x86-64-v3 run, or `None` under v2.
+    #[cfg(target_arch = "x86_64")]
     fn v3_host_xstate(&self) -> Option<&detcore_model::cpu_profile::HostXstate> {
         (self.cfg.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3)
             .then_some(self.cfg.cpu_profile_host.as_ref())
             .flatten()
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn write_arch_prctl_u64<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -436,6 +450,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#539): Confirm the virtual arch_prctl control policy.
     /// Preserve thread-local bases while hiding host CPU feature controls.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_arch_prctl<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -960,9 +975,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(guest.inject(call).await?);
         }
         let (sysno, args) = reverie::syscalls::SyscallInfo::into_parts(call);
+        #[cfg(target_arch = "x86_64")]
         let pid = if sysno == Sysno::getpgrp {
             0
         } else {
+            args.arg0 as libc::pid_t
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let pid = {
+            let _ = sysno;
             args.arg0 as libc::pid_t
         };
         let task = match pid {
@@ -1264,7 +1285,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EINVAL.into());
         }
         // The flags argument is an unsigned long; Reverie decodes it as u32.
-        let flags = guest.regs().await.r8;
+        let flags = crate::arch::syscall_arguments(&guest.regs().await)[4];
         if flags & !(MPOL_F_NODE | MPOL_F_ADDR | MPOL_F_MEMS_ALLOWED) != 0 {
             return Err(Errno::EINVAL.into());
         }
