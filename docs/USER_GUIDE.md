@@ -501,6 +501,26 @@ preemptions or events, manual interrupt points, a happens-before program or
 `--gdbserver` (a debugger stopping the thread between skipped ends would see
 Hermit's slice bookkeeping behind its program counter).
 
+Which slice length exposes a race depends on the race: some need a preemption
+in a short window (fine slices), others a long uninterrupted run of one thread
+(coarse slices), and a seed sweep under one `--max-timeslice` explores mostly
+one scale. `--chaos-timeslice-range=MIN..MAX` draws each slice's mean
+log-uniformly from MIN..MAX virtual nanoseconds, so every run mixes all the
+scales in the range, and caps every slice at MAX. Slices are still random
+around the drawn mean, so some fall below MIN:
+
+```bash
+for seed in $(seq 1 32); do
+  hermit run --chaos --sched-seed="$seed" --chaos-timeslice-range=1000..200000000 \
+    -- ./target/debug/hello_race
+done
+```
+
+The draws come from the scheduler seed, so a seed reproduces its run. The
+range sets the run's `--max-timeslice` to MAX; give one or the other, and do
+not combine it with `--target-timeslice`. It needs PMU-backed preemption. A
+small MIN makes runs slower, because fine slices mean many preemptions.
+
 Advanced investigations can save preemption decisions with
 `--record-preemptions-to=FILE` and replay them with
 `--replay-preemptions-from=FILE`. A record edited after it was recorded (for
@@ -510,6 +530,10 @@ never does, so Hermit stops it there; add `--replay-edited-preemptions` to skip
 those slices and go on with the first recorded slice still ahead, at its
 priority (at a thread's start, the record's first priority holds until that
 slice ends). `hermit analyze` adds it to the records it edits.
+A record pins every slice end, so a run under
+`--chaos-timeslice-range` replays from it exactly; give the replay the same
+range, or `--max-timeslice=MAX`, so slices past the end of the record are
+capped as in the recording.
 
 A replay reproduces the recording only if the guest reads the same host
 files. The recorded schedule therefore keeps the set of host files the run
@@ -815,6 +839,8 @@ hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
 | `--max-timeslice=disabled` | Disables PMU timer preemption. |
 | `--preemption-timeout=N` | Deprecated alias for `--max-timeslice=N`. |
 | `--cap-preemption-charge` | Charges a turn that ends an expired timeslice at most the time its thread ran since its previous turn. |
+
+| `--chaos-timeslice-range=MIN..MAX` | With `--chaos`, draws each slice's mean log-uniformly from MIN..MAX virtual nanoseconds and caps slices at MAX (the run's `--max-timeslice`). |
 
 `--no-sequentialize-threads` is useful for compatibility experiments and
 workloads such as virtual machines that need real host parallelism. It removes

@@ -18220,6 +18220,130 @@ fn a_bounded_chaos_schedule_replays_as_recorded() {
     );
 }
 
+/// `--chaos-timeslice-range` draws each chaos slice's mean from the range. The
+/// run reports the range's MAX as its timeslice and records the same
+/// preemptions twice for one seed. It preempts more often than a plain run
+/// capped at the same MAX. A preemption replay of its record under another seed,
+/// whose own range run prints something else, prints what the recording
+/// printed and re-records the same preemption RCB counts, with or without the
+/// range on the replay.
+#[test]
+fn a_chaos_timeslice_range_draws_slices_from_the_seed_and_replays() {
+    let _guard = hermit_run_guard();
+    let guest = chaos_spinner_and_new_thread_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = |name: &str| directory.path().join(name).to_str().unwrap().to_owned();
+    let run = |extra: &[&str], name: &str| {
+        let summary = path(&format!("{name}.summary.json"));
+        let summary_arg = format!("--summary-json={summary}");
+        let mut args = vec![
+            "run",
+            "--strict",
+            "--base-env=minimal",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--chaos",
+            &summary_arg,
+        ];
+        args.extend_from_slice(extra);
+        args.extend(["--", guest]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(&summary).unwrap()).unwrap();
+        (
+            stdout(&output),
+            summary["preemption"]["max_timeslice_ns"].clone(),
+        )
+    };
+    // Each thread's preemption RCB counts, by thread.
+    let preemptions = |path: &str| -> Vec<(String, serde_json::Value)> {
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("no preemption record")).unwrap();
+        json["per_thread"]
+            .as_object()
+            .expect("per_thread")
+            .iter()
+            .map(|(tid, thread)| (tid.clone(), thread["preemption_rcbs"].clone()))
+            .collect()
+    };
+    let count = |schedule: &[(String, serde_json::Value)]| -> usize {
+        schedule
+            .iter()
+            .map(|(_, rcbs)| rcbs.as_array().map_or(0, Vec::len))
+            .sum()
+    };
+    let range = "--chaos-timeslice-range=1000..2000000";
+    let [first, second, capped, replayed, plain] =
+        ["first", "second", "capped", "replayed", "plain"].map(&path);
+    let (recorded, timeslice) = run(
+        &[
+            "--seed=9",
+            range,
+            &format!("--record-preemptions-to={first}"),
+        ],
+        "first",
+    );
+    assert_eq!(
+        timeslice, 2_000_000,
+        "the range's MAX is the run's timeslice"
+    );
+    run(
+        &[
+            "--seed=9",
+            range,
+            &format!("--record-preemptions-to={second}"),
+        ],
+        "second",
+    );
+    assert_eq!(
+        fs::read(&first).unwrap(),
+        fs::read(&second).unwrap(),
+        "one seed recorded two different schedules"
+    );
+    run(
+        &[
+            "--seed=9",
+            "--max-timeslice=2000000",
+            &format!("--record-preemptions-to={capped}"),
+        ],
+        "capped",
+    );
+    let schedule = preemptions(&first);
+    assert!(
+        count(&schedule) > count(&preemptions(&capped)),
+        "the range preempted no more often than a plain run at its MAX"
+    );
+    let (fresh, _) = run(&["--seed=3", range], "fresh");
+    assert_ne!(
+        fresh, recorded,
+        "seed 3 must schedule differently for the replays below to show anything"
+    );
+    let (replay, _) = run(
+        &[
+            "--seed=3",
+            range,
+            &format!("--replay-preemptions-from={first}"),
+            &format!("--record-preemptions-to={replayed}"),
+        ],
+        "replay",
+    );
+    assert_eq!(replay, recorded);
+    assert_eq!(preemptions(&replayed), schedule);
+    let (without, _) = run(
+        &[
+            "--seed=3",
+            "--max-timeslice=2000000",
+            &format!("--replay-preemptions-from={first}"),
+            &format!("--record-preemptions-to={plain}"),
+        ],
+        "without",
+    );
+    assert_eq!(without, recorded);
+    assert_eq!(preemptions(&plain), schedule);
+}
+
 /// The same bound on KVM, where the spinner's getpid takes no scheduler turn
 /// either: 90 ms before, 4 ms now.
 #[test]

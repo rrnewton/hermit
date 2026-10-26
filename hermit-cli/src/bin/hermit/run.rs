@@ -4539,6 +4539,74 @@ fn replay_takes_the_recorded_rng_seed_and_refuses_another() {
     assert_eq!(matching.det_opts.det_config.rng_seed(), 6);
 }
 
+/// `--chaos-timeslice-range` sets the run's `--max-timeslice` to the range's
+/// MAX, through `validate_args` and again on a second validation (analyze
+/// revalidates its trials), and refuses an explicit `--max-timeslice` in any
+/// spelling beside it.
+#[test]
+fn a_chaos_timeslice_range_caps_the_run_at_its_max() {
+    let mut validated = run_opts_for(&[
+        "hermit",
+        "run",
+        "--chaos",
+        "--chaos-timeslice-range=1000..5000000",
+        "prog",
+    ]);
+    for _ in 0..2 {
+        validated.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(
+            validated.det_opts.det_config.max_timeslice,
+            std::num::NonZeroU64::new(5_000_000)
+        );
+    }
+    for explicit in ["--max-timeslice=disabled", "--preemption-timeout=1000"] {
+        let mut refused = run_opts_for(&[
+            "hermit",
+            "run",
+            "--chaos",
+            explicit,
+            "--chaos-timeslice-range=1000..5000000",
+            "prog",
+        ]);
+        let error = format!(
+            "{:#}",
+            refused.validate_args_with_perf_support(true).unwrap_err()
+        );
+        assert!(
+            error.contains("give one of them, not both"),
+            "{explicit}: {error}"
+        );
+    }
+    let resolve = |argv: &[&str]| {
+        let mut ro = run_opts_for(argv);
+        ro.resolve_chaos_timeslice_range().map(|()| ro)
+    };
+    let range = "--chaos-timeslice-range=1000..5000000";
+    let ro = resolve(&["hermit", "run", "--chaos", range, "prog"]).unwrap();
+    assert_eq!(
+        ro.det_opts.det_config.max_timeslice,
+        std::num::NonZeroU64::new(5_000_000)
+    );
+    let error = format!(
+        "{:#}",
+        resolve(&[
+            "hermit",
+            "run",
+            "--chaos",
+            "--max-timeslice=5000000",
+            range,
+            "prog"
+        ])
+        .unwrap_err()
+    );
+    assert!(error.contains("give one of them, not both"), "{error}");
+    let plain = resolve(&["hermit", "run", "--chaos", "prog"]).unwrap();
+    assert_eq!(
+        plain.det_opts.det_config.max_timeslice,
+        std::num::NonZeroU64::new(200_000_000)
+    );
+}
+
 /// The environment variable that turned the signal-state copy on while it
 /// was opt-in (before A5 step 2d). It is no longer read.
 const SIGNAL_STATE_CHECK_ENV: &str = "HERMIT_SIGNAL_STATE_CHECK";
@@ -9238,6 +9306,8 @@ impl RunOpts {
         // without `dispatch_before_validation`; lowering again is a no-op.
         self.lower_strace_only();
         self.refuse_unready_exec_stop()?;
+        // Before the timer settings are checked, which read the timeslice.
+        self.resolve_chaos_timeslice_range()?;
         self.resolve_preemption_settings()?;
         let backend = self.selected_backend();
         // LiteInst passes here so that the in-guest refusal, which names why
@@ -9596,6 +9666,23 @@ impl RunOpts {
         // Perform internal validation on the Config args, before taking into account the
         // hermit run args. User-controlled panic conditions are checked above.
         config.validate();
+
+        // A range draws PMU-backed slices; without the timer it would do
+        // nothing, and the run's saved command would contradict itself.
+        if let Some(range) = config.chaos_timeslice_range
+            && let Err(unavailable) = &timer
+        {
+            let reason = match unavailable {
+                TimerUnavailable::NoPerfEvents => {
+                    "user-space perf counters are unavailable (perf_event_open)".to_owned()
+                }
+                TimerUnavailable::NoPmuProfile(reason) => reason.to_string(),
+            };
+            return Err(anyhow::Error::new(PolicyRefusal).context(format!(
+                "--chaos-timeslice-range={range} needs PMU-backed preemption, but {reason}. \
+                 Remove the range to run with --max-timeslice=disabled."
+            )));
+        }
 
         // This is a Detcore Config-internal matter, but relies on reverie_ptrace, which detcore is
         // allowed to depend on:
@@ -12455,6 +12542,26 @@ impl RunOpts {
                     .unwrap_or(hermit::chaos_timeslice::DEFAULT_MAX_TIMESLICE),
             );
         }
+        Ok(())
+    }
+
+    /// Under `--chaos-timeslice-range`, the run's `--max-timeslice` is the
+    /// range's MAX: chaos draws each slice's mean from the range and caps it
+    /// there. An explicit `--max-timeslice` with a range is refused rather than
+    /// letting one silently win. Repeating this (analyze revalidates its trials'
+    /// options) gives the same result.
+    fn resolve_chaos_timeslice_range(&mut self) -> Result<(), Error> {
+        let Some(range) = self.det_opts.det_config.chaos_timeslice_range else {
+            return Ok(());
+        };
+        if self.max_timeslice_explicit {
+            return Err(Error::new(PolicyRefusal).context(format!(
+                "--chaos-timeslice-range={range} sets the run's --max-timeslice to its MAX ({} \
+                 ns); give one of them, not both",
+                range.max
+            )));
+        }
+        self.det_opts.det_config.max_timeslice = Some(range.max);
         Ok(())
     }
 
