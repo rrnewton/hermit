@@ -11749,17 +11749,35 @@ impl Scheduler {
     /// replaced it, so it could name a stopped thread while the kernel woke an
     /// `rt_sigsuspend` sibling that nothing armed (the Codex review of
     /// https://github.com/rrnewton/hermit/commit/2f046e41b49d4b24b1bec605f269e3c3afde5895).
-    /// One chaos draw per send, as before.
+    /// One chaos draw per send, as before. With `thread_directed`
+    /// (`own_sigchld_thread_directed`), the send goes to that thread's own
+    /// queue instead, with no chaos draw: it is the process's one thread.
     pub(super) fn fire_child_exit_alarm(
         &mut self,
         parent: DetPid,
         creator: DetTid,
         info: Option<[u8; 128]>,
+        thread_directed: Option<DetTid>,
     ) -> Option<DetTid> {
         let sig = Signal::SIGCHLD;
         #[cfg(test)]
         {
             self.host_signal_attempts += 1;
+        }
+        if let Some(target) = thread_directed {
+            info!(
+                "[dtid {}] Alarm fired, delivering signal {} to guest.",
+                target, sig
+            );
+            self.send_guest_signal(
+                target,
+                sig,
+                Some(parent),
+                info,
+                target,
+                discarded_at_send::SendFate::Classify(None),
+            );
+            return Some(target);
         }
         if !self.models_signal_targets {
             let target = self.select_signal_target(parent, Some(creator));
@@ -31502,6 +31520,220 @@ mod test {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// Without publication reports or modelled signal targets (SaBRe), the
+    /// `ChildExit` timer sends the scheduler's copy to a one-thread parent's
+    /// own queue, marked, and that thread's take of the kernel's copy of the
+    /// exit is not delivered, in either order it takes the two: the
+    /// scheduler's copy stands for the exit. Before, the scheduler's copy went
+    /// to the shared queue, where a pending kernel copy of an earlier child's
+    /// exit could absorb it, and that kernel copy was then dropped as a
+    /// duplicate (<https://github.com/rrnewton/hermit/issues/4710>). Decided
+    /// as before: a parent with a second thread at the send (process-directed
+    /// send, kept kernel copy); another thread's take of the kernel copy (a
+    /// thread created after the send, which on Linux could have taken the
+    /// scheduler's copy from the shared queue); and the holder's take while a
+    /// process-directed scheduler copy is outstanding, which may have merged
+    /// into the kernel copy.
+    #[test]
+    fn a_thread_directed_child_exit_sigchld_stands_for_the_exit_without_publication() {
+        use crate::scheduler::child_exit_sigchld::ChildExitSend;
+        use crate::scheduler::child_exit_sigchld::ChildExitSigchldAnswer;
+        use crate::scheduler::child_exit_sigchld::ChildExitSigchldControl;
+        use crate::scheduler::child_exit_sigchld::ChildExitSiginfo;
+        use crate::scheduler::child_exit_sigchld::OWN_SIGCHLD_MARK;
+        use crate::scheduler::child_exit_sigchld::OwnCopy;
+        use crate::scheduler::child_exit_sigchld::marked_own_copy;
+        use crate::scheduler::child_exit_sigchld::siginfo_code_and_pid;
+        use crate::scheduler::child_exit_sigchld::taken_control;
+
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Case {
+            KernelFirst,
+            OwnFirst,
+            SecondThreadAtSend,
+            ThreadAddedAfterSend,
+            ProcessDirectedOutstanding,
+        }
+        fn add_thread(scheduler: &mut Scheduler, parent: DetPid, thread: DetTid) {
+            scheduler.thread_tree.add_child(parent, thread, false);
+            scheduler.next_turns.insert(
+                thread,
+                ThreadNextTurn {
+                    dettid: thread,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+            scheduler.priorities.insert(thread, DEFAULT_PRIORITY);
+        }
+        fn exit_child(scheduler: &mut Scheduler, child: DetPid, status: i32) {
+            let report = ChildExitSigchldControl::ExitStatus {
+                code: libc::CLD_EXITED,
+                status,
+                uid: 0,
+            };
+            assert_eq!(
+                scheduler.child_exit_sigchld_control(child, report),
+                ChildExitSigchldAnswer::Recorded
+            );
+            grant_group_exit(scheduler, child);
+            assert!(child_exit_timer_armed(scheduler, child));
+        }
+        let kernel = sigchld_info(libc::CLD_EXITED, 200);
+        let exited = ChildExitSiginfo {
+            code: libc::CLD_EXITED,
+            pid: 200,
+            uid: 0,
+            status: 7,
+        };
+        let own = marked_own_copy(0, nix::unistd::getuid().as_raw());
+        let worker = DetTid::from_raw(101);
+        for case in [
+            Case::KernelFirst,
+            Case::OwnFirst,
+            Case::SecondThreadAtSend,
+            Case::ThreadAddedAfterSend,
+            Case::ProcessDirectedOutstanding,
+        ] {
+            let (mut scheduler, parent, child) =
+                child_exit_fixture(false, libc::SIGCHLD, Some("read"), Option::None);
+            scheduler.backend.reports_kernel_child_exit_signals = true;
+            assert!(!scheduler.models_signal_targets, "{case:?}");
+            if case == Case::SecondThreadAtSend {
+                add_thread(&mut scheduler, parent, worker);
+            }
+            scheduler.test_sent_signals = Some(Vec::new());
+            exit_child(&mut scheduler, child, 7);
+            assert_eq!(
+                scheduler.send_child_exit_sigchld(parent, parent, child),
+                ChildExitSend::Sent(Some(parent)),
+                "{case:?}"
+            );
+            let sent = scheduler.test_sent_signals.take().unwrap();
+            let [(target, signal, info, thread_of)] = sent.as_slice() else {
+                panic!("{case:?}: one send expected, got {sent:?}");
+            };
+            assert_eq!((*target, *signal), (parent, libc::SIGCHLD), "{case:?}");
+            let take = |scheduler: &mut Scheduler, taker: DetTid, info: &[u8; 128]| {
+                scheduler.child_exit_sigchld_control_for_receiver(taker, taken_control(info, true))
+            };
+            if case == Case::SecondThreadAtSend {
+                assert_eq!(*thread_of, Option::None, "{case:?}");
+                assert_eq!(*info, Option::None, "{case:?}");
+                // The kept kernel copy is delivered with the ledger's siginfo,
+                // as before.
+                assert_eq!(
+                    take(&mut scheduler, parent, &kernel),
+                    ChildExitSigchldAnswer::ClaimedFor(exited),
+                    "{case:?}"
+                );
+                continue;
+            }
+            assert_eq!(*thread_of, Some(parent), "{case:?}");
+            let sent_own = (*info)
+                .expect("a thread-directed copy carries its mark")
+                .to_user();
+            assert_eq!(sent_own, own, "{case:?}");
+            assert_eq!(siginfo_code_and_pid(&own), (libc::SI_QUEUE, 0), "{case:?}");
+            assert_eq!(
+                i32::from_ne_bytes(own[24..28].try_into().unwrap()),
+                OWN_SIGCHLD_MARK,
+                "{case:?}"
+            );
+            let own_answer = ChildExitSigchldAnswer::OwnCopy(OwnCopy::Deliver(exited));
+            match case {
+                Case::KernelFirst => {
+                    assert_eq!(
+                        take(&mut scheduler, parent, &kernel),
+                        ChildExitSigchldAnswer::Claimed(true),
+                        "{case:?}"
+                    );
+                    assert_eq!(take(&mut scheduler, parent, &own), own_answer, "{case:?}");
+                    // The delivered exit stays for the parent's death.
+                    assert!(
+                        !scheduler.child_exit_sigchld.thread_directed.is_empty(),
+                        "{case:?}"
+                    );
+                }
+                Case::OwnFirst => {
+                    assert_eq!(take(&mut scheduler, parent, &own), own_answer, "{case:?}");
+                    assert_eq!(
+                        take(&mut scheduler, parent, &kernel),
+                        ChildExitSigchldAnswer::Claimed(true),
+                        "{case:?}"
+                    );
+                    // A kernel copy taken last forgets the exit, as `claim`
+                    // does.
+                    assert!(
+                        scheduler.child_exit_sigchld.thread_directed.is_empty(),
+                        "{case:?}"
+                    );
+                }
+                Case::ThreadAddedAfterSend => {
+                    // The holder blocks SIGCHLD; a thread created after the
+                    // send takes the kernel's copy, which is delivered, and
+                    // the holder's copy, taken later, is then a duplicate.
+                    add_thread(&mut scheduler, parent, worker);
+                    assert_eq!(
+                        take(&mut scheduler, worker, &kernel),
+                        ChildExitSigchldAnswer::ClaimedFor(exited),
+                        "{case:?}"
+                    );
+                    assert_eq!(
+                        take(&mut scheduler, parent, &own),
+                        ChildExitSigchldAnswer::OwnCopy(OwnCopy::Duplicate),
+                        "{case:?}"
+                    );
+                }
+                Case::ProcessDirectedOutstanding => {
+                    // Once the parent has a second thread, another child's
+                    // copy goes process-directed and may merge into the
+                    // kernel's copy of the first child's exit.
+                    add_thread(&mut scheduler, parent, worker);
+                    let second = DetPid::from_raw(201);
+                    scheduler.thread_tree.add_child_with_wait_metadata(
+                        parent,
+                        second,
+                        true,
+                        false,
+                        libc::SIGCHLD,
+                    );
+                    scheduler.next_turns.insert(
+                        second,
+                        ThreadNextTurn {
+                            dettid: second,
+                            child_tid_addr: 0,
+                            req: Ivar::new(),
+                            resp: Ivar::new(),
+                            protocol: Default::default(),
+                        },
+                    );
+                    scheduler.priorities.insert(second, DEFAULT_PRIORITY);
+                    exit_child(&mut scheduler, second, 8);
+                    scheduler.test_sent_signals = Some(Vec::new());
+                    assert_eq!(
+                        scheduler.send_child_exit_sigchld(parent, parent, second),
+                        ChildExitSend::Sent(Some(parent)),
+                        "{case:?}"
+                    );
+                    let sent = scheduler.test_sent_signals.take().unwrap();
+                    assert!(
+                        matches!(sent.as_slice(), [(_, _, Option::None, Option::None)]),
+                        "{case:?}: {sent:?}"
+                    );
+                    assert_eq!(
+                        take(&mut scheduler, parent, &kernel),
+                        ChildExitSigchldAnswer::ClaimedFor(exited),
+                        "{case:?}"
+                    );
+                }
+                Case::SecondThreadAtSend => unreachable!("handled above"),
             }
         }
     }

@@ -743,7 +743,7 @@ impl Scheduler {
                 };
                 let receiver = match self.send_child_exit_sigchld(parent, tid, child) {
                     super::child_exit_sigchld::ChildExitSend::NotOwned => {
-                        self.fire_child_exit_alarm(parent, tid, None)
+                        self.fire_child_exit_alarm(parent, tid, None, None)
                     }
                     super::child_exit_sigchld::ChildExitSend::Nothing => {
                         // No copy will take the process's mark set above.
