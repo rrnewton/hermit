@@ -2001,7 +2001,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_alternative_timing_trial_decides_the_cause_by_how_it_ends: 1381.
     // Less phases::tests::an_empty_prefix_that_meets_the_target_is_a_verdict,
     // which adopting main's completed-outcome rule drops: 1380.
-    ("test.hermit_unit", 1380),
+    // And analyze's budget and resume: five budget::tests, four
+    // checkpoint::tests, seven rundata::tests (journaled runs, budget bounds,
+    // a cut run, the key's input digest, the reproducer's own bound), nine
+    // phases::tests (budget-ended prefix search and its resume, bracket,
+    // partial reports, resume refusal, restart from a whole interval, the
+    // kept workspace, a resume through the journal) and two
+    // schedule_search::tests (a stopped search's closest pair and its resume,
+    // a search started from an observed interval): 1407.
+    ("test.hermit_unit", 1407),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6116,7 +6124,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same eleven verdict and precondition tests: 1372.
     // And the same three timing-semantics verdict tests: 1375.
     // Less the same empty-prefix verdict test: 1374.
-    ("test.hermit_unit_on_host", 1374),
+    // And the same twenty-seven budget-and-resume tests: 1401.
+    ("test.hermit_unit_on_host", 1401),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

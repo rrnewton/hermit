@@ -45,6 +45,12 @@ pub enum Verdict {
     /// the scheduler alone meets the target. The report says why and names
     /// no event.
     NoDecidingEvent,
+    /// A budget (`--time-budget`, `--trial-budget`) ended the analysis before
+    /// it concluded (exit 120): `partial` says what it found so far. Its
+    /// event fields are where the closest pair of schedules found first
+    /// differs, which is the deciding event or one before it, not critical
+    /// events.
+    Partial,
 }
 
 /// Why analyze concluded [`Verdict::NoDecidingEvent`]: the `verdict_reason`
