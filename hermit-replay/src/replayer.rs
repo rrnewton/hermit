@@ -730,11 +730,6 @@ impl Tool for Replayer {
             // got EPERM, so the recorded answer stands
             // (https://github.com/rrnewton/hermit/issues/31).
             Syscall::EpollCtl(_) => self.handle_epoll_ctl(guest, syscall).await,
-            // Detcore's probe of a descriptor received over SCM_RIGHTS. Replay
-            // holds placeholders where the recording held the received open
-            // files, so a live kcmp would compare different files; the
-            // recorded answer stands.
-            Syscall::Kcmp(_) => self.handle_simple(guest, syscall).await,
             Syscall::Connect(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-3871): Replay does not recreate a connection's

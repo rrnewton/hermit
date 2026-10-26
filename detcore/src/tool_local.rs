@@ -6744,6 +6744,17 @@ impl<T> ThreadState<T> {
             .any(|detfd| detfd.placeholder().is_some())
     }
 
+    /// The lowest numbered descriptor of this thread's table that names the
+    /// open file description `open_file`, if any.
+    pub(crate) fn lowest_slot_naming(&self, open_file: OpenFileId) -> Option<RawFd> {
+        self.metadata()
+            .file_handles
+            .iter()
+            .filter(|(_, detfd)| detfd.open_file_id() == open_file)
+            .map(|(&fd, _)| fd)
+            .min()
+    }
+
     /// The descriptions in this thread's table whose locks
     /// `procfs::locks::LockLedger` follows, each with how many slots name it,
     /// in description order.
