@@ -181,7 +181,10 @@ use hermit::Error;
 use hermit::ExitStatus;
 use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
 
+use self::analyze::AnalyzeFailure;
 use self::analyze::AnalyzeOpts;
+use self::analyze::AnalyzeVerdict;
+use self::analyze::precondition_class;
 use self::bisect::BisectOpts;
 use self::container::ContainerChildExit;
 use self::container::ContainerChildPanic;
@@ -925,6 +928,22 @@ fn failure_exit_code(error: &Error) -> i32 {
     if error.downcast_ref::<LogCapExceeded>().is_some() {
         return hermit::HERMIT_LOG_CAP_EXIT;
     }
+    // What `hermit analyze` (or `hermit bisect`) concluded is not a failure of
+    // Hermit. Inputs that do not give it what it needs end it with 2, as `diff`
+    // and `grep` end with 2 when they cannot do what was asked; the class line
+    // tells it apart from clap's usage error. A verdict is a completed
+    // analysis, which analyze reports itself; one that reaches here still is.
+    if precondition_class(error).is_some() {
+        return hermit::HERMIT_ANALYZE_PRECONDITION_EXIT;
+    }
+    if error.downcast_ref::<AnalyzeVerdict>().is_some() {
+        return 0;
+    }
+    // Analyze could not conclude because replay or its search failed: still
+    // Hermit failing, under a class line that says which.
+    if error.downcast_ref::<AnalyzeFailure>().is_some() {
+        return HERMIT_INTERNAL_FAILURE_EXIT;
+    }
     match error.downcast_ref::<GuestProgramFault>() {
         Some(fault) => fault.exit_code(),
         None => HERMIT_INTERNAL_FAILURE_EXIT,
@@ -966,6 +985,16 @@ fn classify_failure(error: &Error) -> String {
     // best effort and may be missing.
     if error.downcast_ref::<LogCapExceeded>().is_some() {
         return "HERMIT_LOG_CAP class=log-cap".to_string();
+    }
+    // NOT HERMIT_INTERNAL_FAILURE: analyze concluded (`failure_exit_code`).
+    if let Some(class) = precondition_class(error) {
+        return class.class_line();
+    }
+    if let Some(verdict) = error.downcast_ref::<AnalyzeVerdict>() {
+        return verdict.class_line();
+    }
+    if let Some(failure) = error.downcast_ref::<AnalyzeFailure>() {
+        return failure.class_line();
     }
     // ONE discriminant, read once, covering all three flattenings.
     if let Some(ContainerChildExit(status)) = error.downcast_ref::<ContainerChildExit>() {
@@ -1082,9 +1111,13 @@ mod tests {
     use hermit::Backend;
     use hermit::BackendUnavailable;
     use hermit::Error;
+    use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
 
     use super::Args;
     use super::Subcommand;
+    use super::analyze::AnalyzeFailure;
+    use super::analyze::AnalyzePrecondition;
+    use super::analyze::AnalyzeVerdict;
     use super::args_from_matches_with_clock;
     use super::classify_failure;
     use super::failure_exit_code;
@@ -1876,6 +1909,89 @@ mod tests {
         assert_eq!(
             classify_failure(&error),
             "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2"
+        );
+    }
+
+    /// What `hermit analyze` concludes is never a failure of Hermit: an input
+    /// that does not give it what it needs exits 2 with its own class line,
+    /// for each class and through added context, and a verdict that names no
+    /// event exits 0 with `HERMIT_ANALYZE_VERDICT`. A failure to conclude
+    /// (replay not reproducible, a search that did not converge) exits 125
+    /// under its own class line. Before, all of them exited 125 with
+    /// `HERMIT_INTERNAL_FAILURE class=cli-error`.
+    #[test]
+    fn analyze_conclusions_have_their_own_exit_codes_and_class_lines() {
+        for (precondition, class) in [
+            (
+                AnalyzePrecondition::target_not_reproduced("the run did not match"),
+                "target-not-reproduced",
+            ),
+            (
+                AnalyzePrecondition::baseline_not_reproduced("the baseline matched"),
+                "baseline-not-reproduced",
+            ),
+            (
+                AnalyzePrecondition::no_prefix_continuation("no continuation"),
+                "no-prefix-continuation",
+            ),
+            (
+                AnalyzePrecondition::endpoints_identical("identical event traces"),
+                "endpoints-identical",
+            ),
+        ] {
+            for error in [
+                Error::new(precondition.clone()),
+                Error::new(precondition).context("bisecting"),
+            ] {
+                assert_eq!(failure_exit_code(&error), 2, "{error:#}");
+                assert_eq!(
+                    failure_exit_code(&error),
+                    hermit::HERMIT_ANALYZE_PRECONDITION_EXIT
+                );
+                assert_eq!(
+                    classify_failure(&error),
+                    format!("HERMIT_ANALYZE_PRECONDITION class={class}")
+                );
+            }
+        }
+        let separable = Error::new(crate::schedule_search::NoSingleSwap {
+            failing_only_events: 1,
+        });
+        assert_eq!(failure_exit_code(&separable), 2);
+        assert_eq!(
+            classify_failure(&separable),
+            "HERMIT_ANALYZE_PRECONDITION class=endpoints-not-separable"
+        );
+        // A failure to conclude is still Hermit failing, under its own line.
+        for (failure, class) in [
+            (
+                AnalyzeFailure::ReplayNotReproducible("log differences".into()),
+                "replay-not-reproducible",
+            ),
+            (
+                AnalyzeFailure::SearchDidNotConverge("no convergence".into()),
+                "search-did-not-converge",
+            ),
+        ] {
+            let error = Error::new(failure);
+            assert_eq!(failure_exit_code(&error), HERMIT_INTERNAL_FAILURE_EXIT);
+            assert_eq!(
+                classify_failure(&error),
+                format!("HERMIT_INTERNAL_FAILURE class={class}")
+            );
+        }
+        let verdict = Error::new(AnalyzeVerdict::NoDecidingEvent("no event decides".into()));
+        assert_eq!(failure_exit_code(&verdict), 0);
+        assert_eq!(
+            classify_failure(&verdict),
+            "HERMIT_ANALYZE_VERDICT class=no-deciding-event"
+        );
+        // The same words without the type stay an internal failure.
+        let prose = Error::msg("no event of the target schedule decides the outcome");
+        assert_eq!(failure_exit_code(&prose), HERMIT_INTERNAL_FAILURE_EXIT);
+        assert_eq!(
+            classify_failure(&prose),
+            "HERMIT_INTERNAL_FAILURE class=cli-error"
         );
     }
 

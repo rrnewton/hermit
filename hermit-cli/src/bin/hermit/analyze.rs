@@ -14,9 +14,14 @@ mod phases;
 mod rundata;
 mod stop;
 mod types;
+mod verdict;
 mod workspace;
 
 pub use types::AnalyzeOpts;
 pub use types::ContinuationTimeslice;
 pub use types::ExitStatusConstraint;
 pub use types::TrialTimeout;
+pub use verdict::AnalyzeFailure;
+pub use verdict::AnalyzePrecondition;
+pub use verdict::AnalyzeVerdict;
+pub use verdict::precondition_class;
