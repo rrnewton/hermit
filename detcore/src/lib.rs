@@ -1308,6 +1308,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.handle_internal_poll_until(guest, poll, block.deadline)
                     .await
             }
+            #[cfg(target_arch = "x86_64")]
             syscalls::helpers::RestartCall::KernelPoll(poll, deadline) => {
                 self.resume_kernel_poll(guest, poll, deadline).await
             }

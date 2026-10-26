@@ -2399,7 +2399,8 @@ pub(crate) enum RestartCall {
     /// (`Detcore::handle_external_poll`: record and replay, and
     /// `--no-sequentialize-threads`), with the end of its timeout. Its restart
     /// runs the poll again in the kernel, through the recorder, with the time
-    /// left (`Detcore::resume_kernel_poll`).
+    /// left (`Detcore::resume_kernel_poll`). Only x86_64 has `poll`.
+    #[cfg(target_arch = "x86_64")]
     KernelPoll(syscalls::Poll, KernelPollDeadline),
     Futex(syscalls::Futex),
     /// A relative `nanosleep` or `clock_nanosleep` that ended for a claimed
@@ -2418,6 +2419,7 @@ pub(crate) enum RestartCall {
 /// timeout it was issued with. The recording holds each poll's arguments and
 /// replay checks them, and no clock that replay reproduces moves while the
 /// poll blocks, so a time left is not replayed today.
+#[cfg(target_arch = "x86_64")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct KernelPollDeadline(pub(crate) Option<std::time::Instant>);
 
