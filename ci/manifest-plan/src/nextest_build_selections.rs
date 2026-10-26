@@ -377,7 +377,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "cli",
         ]),
-        "test.sabre_examples" => Some(&[
+        "test.sabre_examples" | "sabrecompat.sabre_examples" => Some(&[
             "-p",
             "hermit-run",
             "--features",

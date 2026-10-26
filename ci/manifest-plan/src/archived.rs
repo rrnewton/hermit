@@ -60,9 +60,11 @@ pub const ARCHIVED: &[Archived] = &[
                    test.sabre_examples smoke test (ptrace and SaBRe parity and a \
                    canonical --verify-strict run of one shell guest, and DETLOG \
                    agreement through post-exec). Nightly: every \
-                   manifest cell, in the pressure sweep. On demand: the rest of \
-                   hermit-cli/tests/sabre_examples.rs (34 tests) and the \
-                   sabre-compat-only run type.",
+                   manifest cell, in the pressure sweep, and the SaBRe run type \
+                   (scripts/validate.rs --sabre-compat-only: its compat cells and \
+                   sabrecompat.sabre_examples, the other 34 tests of \
+                   hermit-cli/tests/sabre_examples.rs), in the sweep's \
+                   sabre-examples part.",
     },
     Archived {
         name: "e9patch",
