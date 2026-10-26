@@ -2223,6 +2223,12 @@ pub struct Scheduler {
     /// (`drop_released_callback_checkpoints`), for the run summary.
     released_callback_checkpoints: BTreeMap<DetTid, usize>,
 
+    /// For a schedule replay of a record whose slices ran without the
+    /// `--max-timeslice` bound (`PreemptionRecord::uncapped_slices`): a slice
+    /// length no recorded slice exceeds (`uncapped_replay_backstop_for`), which
+    /// replaces the bound while the record lasts (`uncapped_backstop`).
+    uncapped_replay_backstop: Option<LogicalTime>,
+
     /// Count record_event calls which determines the event number if we're recording a schedule
     /// event trace.
     pub recorded_event_count: u64,
@@ -4224,6 +4230,25 @@ pub struct ConsumeResult {
     pub event_ix: u64,
 }
 
+/// A slice length that no slice of `events` exceeds, for the schedule replay
+/// of a record whose slices ran without the `--max-timeslice` bound: the
+/// latest logical time any thread reached at a recorded event, plus the bound.
+/// A recorded slice begins and ends within the record, so a backstop this long
+/// never ends one early. A slice's end is not marked as such in the event
+/// stream (a thread also traces its branch count before each syscall), so
+/// nothing shorter is known to be safe. Once the record has run out the
+/// replay goes back to the bound (`Scheduler::uncapped_backstop`).
+fn uncapped_replay_backstop_for(events: &[SchedEvent], cfg: &Config) -> LogicalTime {
+    let latest = events
+        .iter()
+        .filter_map(|event| event.end_time)
+        .map(|end| end.as_nanos())
+        .max()
+        .unwrap_or(0);
+    let bound = cfg.max_timeslice.map_or(0, std::num::NonZeroU64::get);
+    LogicalTime::from_nanos(latest.saturating_add(bound))
+}
+
 /// Any non-None response means that the guest should print its stack trace before proceeding, and
 /// a response that further includes a path means print to a file at that location.
 pub type MaybePrintStack = Option<Option<PathBuf>>;
@@ -4277,6 +4302,7 @@ impl Scheduler {
         let mut boundary_replayer = None;
         let mut boundary_stacktrace_events = BTreeMap::new();
         let mut recorded_host_inputs = None;
+        let mut uncapped_replay_backstop = None;
         let (replayer, m_vec) = match &cfg.replay_schedule_from {
             Some(path) => {
                 trace!("Scheduler loading trace from path {}", path.display());
@@ -4289,6 +4315,9 @@ impl Scheduler {
                 recorded_host_inputs = recording.host_inputs().cloned();
                 match recording {
                     Recording::Legacy(record) => {
+                        uncapped_replay_backstop = record
+                            .uncapped_slices()
+                            .then(|| uncapped_replay_backstop_for(record.schedevents(), cfg));
                         callback_checkpoints = record
                             .callback_checkpoints()
                             .iter()
@@ -4372,13 +4401,19 @@ impl Scheduler {
         // producers and the recovery/editor path keep the legacy representation.
         let boundaries = cfg.strict_schedule_boundaries;
         let preemption_writer = cfg.record_preemptions.then(|| {
+            // A preemption replay ends its slices where its record says, past
+            // the bound, and a schedule replay of such a record keeps them
+            // (`PreemptionRecord::uncapped_slices`).
             let writer = PreemptionWriter::new(cfg.record_preemptions_to.clone())
                 .with_epoch(cfg.epoch)
                 .with_pipe_wake_latency(cfg.pipe_wake_latency_in_effect())
                 .with_signal_state_copy(cfg.signal_state_copy)
                 .with_rng_seed(cfg.rng_seed())
                 .with_expired_wait_runs_charged_once(expired_wait_runs_charged_once)
-                .with_cap_preemption_charge(cfg.cap_preemption_charge);
+                .with_cap_preemption_charge(cfg.cap_preemption_charge)
+                .with_uncapped_slices(
+                    cfg.replay_preemptions_from.is_some() || uncapped_replay_backstop.is_some(),
+                );
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -4413,6 +4448,7 @@ impl Scheduler {
             recorded_host_inputs,
             replay_priorities_released: false,
             released_callback_checkpoints: BTreeMap::new(),
+            uncapped_replay_backstop,
             recorded_event_count: 0,
             stacktrace_events,
             stop_after_turn: cfg.stop_after_turn,
@@ -16236,6 +16272,15 @@ impl Scheduler {
     /// the rest of the schedule after a long run of events that match none of
     /// it (`Replayer::release_schedule`). Either is a scheduled event of a
     /// running thread, so it is the same in every run.
+    /// The slice length a thread uses instead of `--max-timeslice` while it
+    /// replays a record whose slices ran without that bound
+    /// (`uncapped_replay_backstop`): `None` once the record has run out, so
+    /// the run goes on under the bound, and for every other run.
+    pub(crate) fn uncapped_backstop(&self) -> Option<LogicalTime> {
+        self.uncapped_replay_backstop
+            .filter(|_| self.replay_has_records_left())
+    }
+
     fn release_replay_priorities_if_exhausted(&mut self) {
         if self.replay_priorities_released
             || !self.has_schedule_replay()
@@ -17654,6 +17699,39 @@ mod test {
     use crate::tool_local::RobustListExit;
     use crate::tool_local::RobustListWake;
     use crate::tool_local::ThreadState;
+
+    /// The backstop for an uncapped record outlasts every recorded slice: it
+    /// runs from a thread's start past the latest logical time any thread
+    /// reached at a recorded event, by the configured bound.
+    #[test]
+    fn an_uncapped_records_backstop_outlasts_its_latest_event() {
+        let event = |dettid: i32, end: Option<u64>| SchedEvent {
+            dettid: DetTid::from_raw(dettid),
+            op: detcore_model::schedule::Op::Branch,
+            count: 1,
+            start_rip: None,
+            end_rip: None,
+            end_time: end.map(LogicalTime::from_nanos),
+        };
+        let config = Config {
+            max_timeslice: std::num::NonZeroU64::new(100_000),
+            ..Default::default()
+        };
+        let events = [
+            event(3, Some(250_000)),
+            event(5, Some(9_400_000)),
+            event(3, None),
+            event(3, Some(1_200_000)),
+        ];
+        assert_eq!(
+            uncapped_replay_backstop_for(&events, &config),
+            LogicalTime::from_nanos(9_500_000)
+        );
+        assert_eq!(
+            uncapped_replay_backstop_for(&[], &config),
+            LogicalTime::from_nanos(100_000)
+        );
+    }
 
     #[test]
     fn initial_current_birth_binds_both_identities_without_a_turn() {
