@@ -1409,7 +1409,9 @@ class ParityRouteTest(unittest.TestCase):
         for routing in self.CONFIGS:
             routes = self.routes(routing)
             sabre = sorted(test for test, backend in routes if backend == "sabre")
-            self.assertGreater(len(sabre), 200, routing)
+            # SaBRe is archived (ci/manifest-plan/src/archived.rs): its cells left
+            # per-commit validation for the nightly sweep, so no Buck cell remains.
+            self.assertEqual(len(sabre), 0, routing)
             for test in sabre:
                 if (test, "ptrace") in routes:
                     self.assertEqual(routes[(test, "sabre")], routes[(test, "ptrace")], (routing, test))
