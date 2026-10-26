@@ -733,6 +733,7 @@ instrument_init(void)
 {
     size_t i;
 
+    heap_private_reservation_observer_init();
     init_client_aux_libs();
 
 #ifdef X86
@@ -907,8 +908,7 @@ instrument_exit_event(void)
     /* Withdraw while both the observer's code and its client-owned state are
      * alive. Process-exit callbacks may destroy that state, and instrument_exit or
      * loader_exit can unload the client before bootstrap/heap withdrawal. */
-    heap_retire_private_reservations();
-    heap_set_private_reservation_retirement_callback(NULL);
+    heap_close_private_reservation_observer();
 
     /* support dr_get_mcontext() from the exit event */
     if (!standalone_library)
@@ -3772,11 +3772,10 @@ dr_mutex_destroy(void *mutex)
     HEAP_TYPE_FREE(GLOBAL_DCONTEXT, (mutex_t *)mutex, mutex_t, ACCT_CLIENT, UNPROTECTED);
 }
 
-DR_API
-/* Locks mutex
- */
+/* Shared with SDK observer synchronization: guard before acquiring and release
+ * only after unlocking, exactly as for a public client mutex. */
 void
-dr_mutex_lock(void *mutex)
+instrument_client_mutex_lock(mutex_t *mutex)
 {
     dcontext_t *dcontext = get_thread_private_dcontext();
     /* set client_grab_mutex so that we know to set client_thread_safe_for_synch
@@ -3793,11 +3792,8 @@ dr_mutex_lock(void *mutex)
         dcontext->client_data->client_grab_mutex = NULL;
 }
 
-DR_API
-/* Unlocks mutex
- */
 void
-dr_mutex_unlock(void *mutex)
+instrument_client_mutex_unlock(mutex_t *mutex)
 {
     dcontext_t *dcontext = get_thread_private_dcontext();
     d_r_mutex_unlock((mutex_t *)mutex);
@@ -3809,6 +3805,20 @@ dr_mutex_unlock(void *mutex)
                       "internal client mutex nesting error");
         dcontext->client_data->mutex_count--;
     }
+}
+
+DR_API
+void
+dr_mutex_lock(void *mutex)
+{
+    instrument_client_mutex_lock((mutex_t *)mutex);
+}
+
+DR_API
+void
+dr_mutex_unlock(void *mutex)
+{
+    instrument_client_mutex_unlock((mutex_t *)mutex);
 }
 
 DR_API

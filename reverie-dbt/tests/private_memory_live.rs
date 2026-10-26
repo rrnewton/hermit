@@ -303,6 +303,78 @@ fn child_test_words(bytes: &[u8]) -> Vec<u64> {
         .collect()
 }
 
+fn disconnect_observation(mode: &str) {
+    let sdk = std::env::var_os("REVERIE_DBT_PRIVATE_OBSERVER_WITNESS_SDK")
+        .map(std::path::PathBuf::from)
+        .expect("build the private witness SDK using fixtures/private_memory_disconnect/README.md")
+        .canonicalize()
+        .expect("existing private witness SDK");
+    let (_temporary, directory) =
+        child_test_directory("REVERIE_DBT_PRIVATE_MEMORY_DISCONNECT_ARTIFACT_DIR", mode);
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/private_memory_disconnect");
+    let cmake = std::env::var_os("CMAKE").unwrap_or_else(|| "cmake".into());
+    let configured = child_test_run(
+        &directory,
+        "configure",
+        Command::new(&cmake)
+            .arg("-S")
+            .arg(source)
+            .arg("-B")
+            .arg(&directory)
+            .arg(format!("-DDynamoRIO_DIR={}", sdk.join("cmake").display())),
+    );
+    assert!(configured.status.success(), "{configured:?}");
+    let built = child_test_run(
+        &directory,
+        "build",
+        Command::new(&cmake)
+            .arg("--build")
+            .arg(&directory)
+            .args(["--parallel", "2"]),
+    );
+    assert!(built.status.success(), "{built:?}");
+    let record = directory.join("observation.record");
+    let output = child_test_run(
+        &directory,
+        mode,
+        Command::new("timeout")
+            .args(["--signal=TERM", "--kill-after=2s", "20s"])
+            .arg(directory.join("private_memory_disconnect_supervisor"))
+            .arg(sdk.join("bin64/drrun"))
+            .arg(directory.join("libprivate_memory_disconnect_client.so"))
+            .arg(&record)
+            .arg(directory.join("private_memory_disconnect_guest"))
+            .arg(mode),
+    );
+    let bytes = std::fs::read(record).expect("actual shared observer record");
+    let words: Vec<_> = bytes[..24 * 8]
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|word| u64::from_le_bytes(*word))
+        .collect();
+    eprintln!("{mode} private SDK disconnect observations: {words:?}");
+    assert!(output.status.success(), "{mode}: {output:?}");
+    assert!(output.stdout.is_empty(), "{mode}: unexpected guest output");
+    let stderr = std::str::from_utf8(&output.stderr).unwrap();
+    assert!(stderr.contains("PRIVATE_MEMORY_DISCONNECT entered=1 completed=1 early=0 destroyed=1"));
+    assert!(!stderr.contains("Internal Error"), "{stderr}");
+    assert!(!stderr.contains("SIGSEGV"), "{stderr}");
+}
+
+#[test]
+#[ignore = "requires the private witness SDK recipe in fixtures/private_memory_disconnect/README.md"]
+fn private_memory_observer_disconnect_waits_for_client_callback() {
+    disconnect_observation("close");
+}
+
+#[test]
+#[ignore = "requires the private witness SDK recipe in fixtures/private_memory_disconnect/README.md"]
+fn private_memory_observer_disconnect_resists_unrelated_suspension() {
+    disconnect_observation("sync");
+}
+
 fn sdk_fork_observation(mode: &str) {
     let (_temporary, directory) =
         child_test_directory("REVERIE_DBT_PRIVATE_MEMORY_FORK_ARTIFACT_DIR", mode);

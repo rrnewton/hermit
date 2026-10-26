@@ -67,12 +67,17 @@
 
 extern bool vm_areas_exited;
 
-/* Set before application execution or after separate-mm child initialization;
- * cleared without notification at separate-mm fork entry, and before the client
- * is unloaded at final address-space shutdown. CLONE_VM retains this observer.
- * The observer only withdraws a fixed ownership fact. It cannot call back into
- * DR or allocate, and no DR lock is held on its behalf. */
+/* The observer's code and state remain live until completed withdrawal. The
+ * leaf lock is also a client critical region: a client thread cannot be stopped
+ * at its callback PC while a disconnect waits for it. Callback code cannot call
+ * DR, allocate, or acquire a lock held by the disconnecting caller. */
 DECLARE_NEVERPROT_VAR(static void (*private_reservation_retirement)(void), NULL);
+DECLARE_NEVERPROT_VAR(static mutex_t private_reservation_observer_lock,
+                     INIT_LOCK_FREE(private_reservation_observer_lock));
+/* CLOSED is readable without a context, including before client initialization
+ * and after final withdrawal/context destruction. The lock serializes OPEN
+ * publication and invocation; a waiter always rechecks CLOSED under the lock. */
+DECLARE_NEVERPROT_VAR(static volatile int private_reservation_observer_closed, 1);
 /* The loader publishes only authenticated PT_LOAD pages. Keep this independent
  * of loader metadata and locks: retirement can run during heap teardown. */
 DECLARE_NEVERPROT_VAR(static byte *bootstrap_private_starts[PRIVATE_RESERVATION_CAPACITY],
@@ -82,16 +87,70 @@ DECLARE_NEVERPROT_VAR(static size_t bootstrap_private_sizes[PRIVATE_RESERVATION_
 DECLARE_NEVERPROT_VAR(static size_t bootstrap_private_count, 0);
 
 void
+heap_private_reservation_observer_init(void)
+{
+    /* Genuine SDK initialization/reattach, before calling any client. */
+    ASSERT(private_reservation_retirement == NULL);
+    ASSIGN_INIT_LOCK_FREE(private_reservation_observer_lock,
+                          private_reservation_observer_lock);
+    ATOMIC_4BYTE_ALIGNED_WRITE(&private_reservation_observer_closed, 0, false);
+}
+
+#ifdef UNIX
+void
+heap_private_reservation_observer_fork_reset(void)
+{
+    /* A separate-mm child must not wait on copied ownership or notify a parent
+     * owner. CLONE_VM does not enter this initialization boundary. */
+    private_reservation_retirement = NULL;
+    d_r_mutex_fork_reset(&private_reservation_observer_lock);
+    ATOMIC_4BYTE_ALIGNED_WRITE(&private_reservation_observer_closed, 0, false);
+}
+#endif
+
+void
 heap_set_private_reservation_retirement_callback(void (*callback)(void))
 {
-    private_reservation_retirement = callback;
+    if (atomic_aligned_read_int(&private_reservation_observer_closed)) {
+        CLIENT_ASSERT(callback == NULL, "private observer registration after shutdown");
+        return;
+    }
+    instrument_client_mutex_lock(&private_reservation_observer_lock);
+    if (!private_reservation_observer_closed)
+        private_reservation_retirement = callback;
+    else
+        CLIENT_ASSERT(callback == NULL, "private observer registration after shutdown");
+    instrument_client_mutex_unlock(&private_reservation_observer_lock);
+}
+
+static void
+heap_retire_private_reservations_locked(void)
+{
+    ASSERT_OWN_MUTEX(true, &private_reservation_observer_lock);
+    if (!private_reservation_observer_closed && private_reservation_retirement != NULL)
+        private_reservation_retirement();
 }
 
 void
 heap_retire_private_reservations(void)
 {
-    if (private_reservation_retirement != NULL)
-        private_reservation_retirement();
+    if (atomic_aligned_read_int(&private_reservation_observer_closed))
+        return;
+    instrument_client_mutex_lock(&private_reservation_observer_lock);
+    heap_retire_private_reservations_locked();
+    instrument_client_mutex_unlock(&private_reservation_observer_lock);
+}
+
+void
+heap_close_private_reservation_observer(void)
+{
+    if (atomic_aligned_read_int(&private_reservation_observer_closed))
+        return;
+    instrument_client_mutex_lock(&private_reservation_observer_lock);
+    heap_retire_private_reservations_locked();
+    private_reservation_retirement = NULL;
+    ATOMIC_4BYTE_ALIGNED_WRITE(&private_reservation_observer_closed, 1, false);
+    instrument_client_mutex_unlock(&private_reservation_observer_lock);
 }
 
 /***************************************************************************
@@ -1420,28 +1479,33 @@ heap_private_reservations(byte **starts, size_t *sizes, size_t capacity)
 void
 heap_retire_private_reservation_overlap(byte *start, size_t size)
 {
-    if (private_reservation_retirement == NULL || size == 0)
+    if (size == 0 || atomic_aligned_read_int(&private_reservation_observer_closed))
         return;
+    instrument_client_mutex_lock(&private_reservation_observer_lock);
+    if (private_reservation_observer_closed || private_reservation_retirement == NULL)
+        goto done;
     ptr_uint_t lo = (ptr_uint_t)start;
     if (lo > POINTER_MAX - size) {
-        heap_retire_private_reservations();
-        return;
+        heap_retire_private_reservations_locked();
+        goto done;
     }
     byte *starts[PRIVATE_RESERVATION_CAPACITY];
     size_t sizes[PRIVATE_RESERVATION_CAPACITY];
     size_t count =
         heap_private_reservations(starts, sizes, PRIVATE_RESERVATION_CAPACITY);
     if (count == 0) {
-        heap_retire_private_reservations();
-        return;
+        heap_retire_private_reservations_locked();
+        goto done;
     }
     for (size_t i = 0; i < count; ++i) {
         if (lo < (ptr_uint_t)starts[i] + sizes[i] &&
             (ptr_uint_t)starts[i] < lo + size) {
-            heap_retire_private_reservations();
-            return;
+            heap_retire_private_reservations_locked();
+            break;
         }
     }
+done:
+    instrument_client_mutex_unlock(&private_reservation_observer_lock);
 }
 
 byte *
@@ -2590,6 +2654,7 @@ d_r_heap_exit(void)
     DELETE_RECURSIVE_LOCK(heap_unit_lock);
     DELETE_RECURSIVE_LOCK(global_alloc_lock);
     DELETE_RECURSIVE_LOCK(low_on_memory_pending_lock);
+    DELETE_LOCK(private_reservation_observer_lock);
 
 #ifdef X64
     DELETE_LOCK(request_region_be_heap_reachable_lock);

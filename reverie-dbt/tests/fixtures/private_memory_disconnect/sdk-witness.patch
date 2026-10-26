@@ -1,0 +1,77 @@
+--- a/core/heap.c
++++ b/core/heap.c
+@@ -78,6 +78,23 @@
+  * and after final withdrawal/context destruction. The lock serializes OPEN
+  * publication and invocation; a waiter always rechecks CLOSED under the lock. */
+ DECLARE_NEVERPROT_VAR(static volatile int private_reservation_observer_closed, 1);
++/* PRIVATE TEST SDK: observe actual close contention, never emulate it. */
++DECLARE_NEVERPROT_VAR(static thread_id_t private_observer_test_close_tid, 0);
++
++void
++heap_private_observer_test_contended(mutex_t *lock)
++{
++    if (lock == &private_reservation_observer_lock &&
++        get_sys_thread_id() == private_observer_test_close_tid) {
++        uint64 record[4] = { 0x434c4f5345575431ULL, 1,
++                             (uint64)get_sys_thread_id(),
++                             (uint64)atomic_aligned_read_int(&lock->lock_requests) };
++        /* A missing/short write is an unavailable witness, never a test pass. */
++        ssize_t written = os_write(253, record, sizeof(record));
++        (void)written;
++    }
++}
++
+ /* The loader publishes only authenticated PT_LOAD pages. Keep this independent
+  * of loader metadata and locks: retirement can run during heap teardown. */
+ DECLARE_NEVERPROT_VAR(static byte *bootstrap_private_starts[PRIVATE_RESERVATION_CAPACITY],
+@@ -146,6 +163,7 @@
+ {
+     if (atomic_aligned_read_int(&private_reservation_observer_closed))
+         return;
++    private_observer_test_close_tid = get_sys_thread_id();
+     instrument_client_mutex_lock(&private_reservation_observer_lock);
+     heap_retire_private_reservations_locked();
+     private_reservation_retirement = NULL;
+--- a/core/utils.c
++++ b/core/utils.c
+@@ -882,6 +882,7 @@
+     DEADLOCK_AVOIDANCE_LOCK(lock, acquired, ownable);
+ 
+     if (!acquired) {
++        heap_private_observer_test_contended(lock);
+         mutex_wait_contended_lock(lock, mc);
+ #ifdef DEADLOCK_AVOIDANCE
+         DEADLOCK_AVOIDANCE_LOCK(lock, true, ownable); /* now we got it  */
+--- a/core/utils.h
++++ b/core/utils.h
+@@ -776,6 +776,9 @@
+ d_r_mutex_delete(mutex_t *lock);
+ 
+ /* basic synchronization functions */
++/* Private test SDK only. */
++void
++heap_private_observer_test_contended(mutex_t *lock);
+ void
+ d_r_mutex_lock(mutex_t *mutex);
+ bool
+--- a/core/synch.c
++++ b/core/synch.c
+@@ -630,6 +630,18 @@
+                 */
+                !is_dynamo_address(mc->pc)) {
+         safe = true;
++    }
++    /* PRIVATE TEST SDK: record the existing final safe-point decision once
++     * for each actual client thread, without changing that decision. */
++    if (IS_CLIENT_THREAD(trec->dcontext)) {
++        static thread_id_t last_observed_tid;
++        if (last_observed_tid != trec->id) {
++            uint64 record[4] = { 0x434c4f5345575431ULL, safe ? 2 : 3,
++                                 (uint64)trec->id, (uint64)desired_state };
++            last_observed_tid = trec->id;
++            ssize_t written = os_write(253, record, sizeof(record));
++            (void)written;
++        }
+     }
+     if (safe) {
+         ASSERT(trec->dcontext->whereami == DR_WHERE_FCACHE ||

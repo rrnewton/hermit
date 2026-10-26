@@ -161,6 +161,14 @@ heap_set_bootstrap_private_segments(byte **starts, size_t *sizes, size_t count);
 size_t
 heap_private_reservations(byte **starts, size_t *sizes, size_t capacity);
 void
+heap_private_reservation_observer_init(void);
+#ifdef UNIX
+void
+heap_private_reservation_observer_fork_reset(void);
+#endif
+void
+heap_close_private_reservation_observer(void);
+void
 heap_set_private_reservation_retirement_callback(void (*callback)(void));
 void
 heap_retire_private_reservation_overlap(byte *start, size_t size);

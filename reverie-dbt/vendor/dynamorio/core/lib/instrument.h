@@ -61,6 +61,11 @@
 /* to make our own code shorter */
 #define MINSERT instrlist_meta_preinsert
 
+/* Internal use of the public client-mutex critical-region discipline. */
+void
+instrument_client_mutex_lock(mutex_t *mutex);
+void
+instrument_client_mutex_unlock(mutex_t *mutex);
 void
 instrument_load_client_libs(void);
 void

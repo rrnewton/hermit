@@ -796,7 +796,7 @@ dynamorio_fork_init(dcontext_t *dcontext)
     /* A separate address space must not notify an inherited client owner while
      * reinitializing or exiting before client admission. The child can install
      * its own observer after rekeying its state. CLONE_VM does not enter here. */
-    heap_set_private_reservation_retirement_callback(NULL);
+    heap_private_reservation_observer_fork_reset();
 
     /* on a fork we want to re-initialize some data structures, especially
      * log files, which we want a separate directory for

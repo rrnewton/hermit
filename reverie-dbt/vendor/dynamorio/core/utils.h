@@ -629,6 +629,8 @@ enum {
 #    endif
 
     LOCK_RANK(prng_lock),
+    /* Observer callbacks cannot acquire SDK locks. */
+    LOCK_RANK(private_reservation_observer_lock),
     /* ---------------------------------------------------------- */
     /* No new locks below this line, reserved for innermost ASSERT,
      * SYSLOG and STATS facilities */

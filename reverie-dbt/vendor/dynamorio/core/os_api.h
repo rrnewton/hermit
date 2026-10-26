@@ -841,7 +841,12 @@ DR_API
  * process-exit callbacks can destroy its state or the client's code can be
  * unloaded. Thread-exit callbacks can run earlier: observer state must survive
  * them, or the client must disconnect before destroying the referenced state.
- * NULL also explicitly removes the observer during client shutdown.
+ * NULL explicitly disconnects the observer during client shutdown. On return,
+ * every earlier invocation has completed and none can start until a permitted
+ * initialization-time registration. Final shutdown is terminal: it cannot be
+ * followed by registration in that address-space lifetime. The disconnecting
+ * caller must not hold a private client lock needed by its observer. Observer
+ * invocations are serialized; the callback must not reenter this API.
  */
 void
 dr_set_private_reservation_retirement_callback(void (*callback)(void));
