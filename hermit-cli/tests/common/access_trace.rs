@@ -332,7 +332,13 @@ fn access_trace_indices_name_the_runs_own_events() {
         |call: &SyscallRecord, wanted: &dyn Fn(&Access) -> bool| call.accesses.iter().any(wanted);
     // A dup2 onto a free number dups without a close; one onto an open
     // number closes it first.
-    let dup2 = find("dup2");
+    // aarch64's C library makes dup2(3) a dup3 call: the generic syscall
+    // table (include/uapi/asm-generic/unistd.h) has no dup2.
+    let dup2 = find(if cfg!(target_arch = "x86_64") {
+        "dup2"
+    } else {
+        "dup3"
+    });
     let ops = |call: &SyscallRecord| -> Vec<FdOp> {
         call.accesses
             .iter()

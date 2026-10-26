@@ -363,7 +363,10 @@ pub(crate) fn written_locations(
     }
     match sysno {
         Sysno::timer_create => vec![(args[2], WrittenField::TimerId)],
-        Sysno::pipe | Sysno::pipe2 => vec![(args[0], WrittenField::FdPair)],
+        // aarch64 has only pipe2 (include/uapi/asm-generic/unistd.h).
+        #[cfg(target_arch = "x86_64")]
+        Sysno::pipe => vec![(args[0], WrittenField::FdPair)],
+        Sysno::pipe2 => vec![(args[0], WrittenField::FdPair)],
         Sysno::socketpair => vec![(args[3], WrittenField::FdPair)],
         // `si_pid` is the union's first member, at byte 16 of the siginfo.
         Sysno::waitid if args[2] != 0 => vec![(args[2] + 16, WrittenField::WaitedPid)],
@@ -448,12 +451,20 @@ fn operand_fds(sysno: Sysno, args: [u64; 6]) -> Vec<(i32, Role)> {
         epoll_ctl => vec![(fd(0), Role::Use), (fd(2), Role::Use)],
         mmap if args[3] & libc::MAP_ANONYMOUS as u64 == 0 => vec![(fd(4), Role::Use)],
         signalfd4 if fd(0) >= 0 => vec![(fd(0), Role::Use)],
-        fstat | fsync | fdatasync | fchmod | fchown | flock | fcntl | ioctl | getdents
-        | getdents64 | fadvise64 | fstatfs | fchdir | syncfs | sync_file_range | accept
-        | accept4 | connect | bind | listen | getsockname | getpeername | setsockopt
-        | getsockopt | epoll_wait | epoll_pwait | epoll_pwait2 | inotify_add_watch
-        | inotify_rm_watch | fgetxattr | fsetxattr | flistxattr | fremovexattr
-        | pidfd_send_signal | pidfd_getfd | dup | dup2 | dup3 => vec![(fd(0), Role::Use)],
+        fstat | fsync | fdatasync | fchmod | fchown | flock | fcntl | ioctl | getdents64
+        | fadvise64 | fstatfs | fchdir | syncfs | accept | accept4 | connect | bind | listen
+        | getsockname | getpeername | setsockopt | getsockopt | epoll_pwait | epoll_pwait2
+        | inotify_add_watch | inotify_rm_watch | fgetxattr | fsetxattr | flistxattr
+        | fremovexattr | pidfd_send_signal | pidfd_getfd | dup | dup3 => {
+            vec![(fd(0), Role::Use)]
+        }
+        // The legacy calls only x86_64 has. aarch64's generic table
+        // (include/uapi/asm-generic/unistd.h) has getdents64, epoll_pwait and
+        // dup3 above instead, and names sync_file_range sync_file_range2.
+        #[cfg(target_arch = "x86_64")]
+        getdents | sync_file_range | epoll_wait | dup2 => vec![(fd(0), Role::Use)],
+        #[cfg(target_arch = "aarch64")]
+        sync_file_range2 => vec![(fd(0), Role::Use)],
         _ => Vec::new(),
     }
 }
@@ -468,7 +479,9 @@ pub(crate) fn named_fds(sysno: Sysno, args: [u64; 6]) -> Vec<i32> {
         .collect();
     match sysno {
         Sysno::close => fds.push(args[0] as i32),
-        Sysno::dup2 | Sysno::dup3 => fds.push(args[1] as i32),
+        #[cfg(target_arch = "x86_64")]
+        Sysno::dup2 => fds.push(args[1] as i32),
+        Sysno::dup3 => fds.push(args[1] as i32),
         _ => {}
     }
     fds.retain(|fd| *fd >= 0);
@@ -523,7 +536,13 @@ pub(crate) fn time_outputs(
         times if ok => vec![at(args[0], TMS)],
         _ => Vec::new(),
     };
-    let value = (ok && matches!(sysno, time | alarm | times)).then_some(result);
+    // time and alarm are x86_64-only; aarch64's C library builds them on
+    // clock_gettime and setitimer, whose outputs are above.
+    #[cfg(target_arch = "x86_64")]
+    let returns_time = matches!(sysno, time | alarm | times);
+    #[cfg(not(target_arch = "x86_64"))]
+    let returns_time = sysno == times;
+    let value = (ok && returns_time).then_some(result);
     (value, buffers.into_iter().flatten().collect())
 }
 
@@ -786,6 +805,8 @@ fn timer_accesses(f: &CallFacts<'_>, out: &mut Vec<Access>) {
         Sysno::timer_delete => Some((posix(f.args[0] as i32), TimerOp::Delete)),
         Sysno::setitimer => Some((interval(f.args[0] as i32), TimerOp::Set)),
         Sysno::getitimer => Some((interval(f.args[0] as i32), TimerOp::Get)),
+        // x86_64 only; on aarch64 alarm(3) is a setitimer call.
+        #[cfg(target_arch = "x86_64")]
         Sysno::alarm => Some((interval(libc::ITIMER_REAL), TimerOp::Set)),
         Sysno::timerfd_create if ok => f
             .notes
@@ -822,6 +843,9 @@ fn lifetime_accesses(f: &CallFacts<'_>, out: &mut Vec<Access>) {
             .clone3_flags
             .and_then(created)
             .map(|t| (t, LifetimeOp::Create)),
+        // x86_64 only; on aarch64 fork(2) and vfork(2) are clone calls
+        // with SIGCHLD (and CLONE_VM | CLONE_VFORK) as the flags, above.
+        #[cfg(target_arch = "x86_64")]
         Sysno::fork | Sysno::vfork => created(0).map(|t| (t, LifetimeOp::Create)),
         Sysno::exit => Some((Task::Thread(f.tid), LifetimeOp::Exit)),
         Sysno::exit_group => Some((Task::Process(f.pid), LifetimeOp::Exit)),
@@ -901,6 +925,17 @@ pub(crate) fn summarize_output<E>(
         digest,
         truncated: len > RETURNED_DIGEST_CAP,
     })
+}
+
+/// Whether `sysno` returns two connected descriptors: pipe2, socketpair,
+/// and x86_64's legacy pipe.
+fn creates_a_channel_pair(sysno: Sysno) -> bool {
+    match sysno {
+        Sysno::pipe2 | Sysno::socketpair => true,
+        #[cfg(target_arch = "x86_64")]
+        Sysno::pipe => true,
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1046,9 +1081,7 @@ impl AccessTraceWriter {
     /// identities of its accesses, and write it unless it ends before
     /// `--access-trace-from`.
     fn finish_record(&mut self, mut record: SyscallRecord) {
-        if matches!(record.sysno, Sysno::pipe | Sysno::pipe2 | Sysno::socketpair)
-            && record.result == Some(0)
-        {
+        if creates_a_channel_pair(record.sysno) && record.result == Some(0) {
             let opened: Vec<OpenFileId> = record
                 .accesses
                 .iter()
@@ -1395,6 +1428,8 @@ mod tests {
                 },
             ]
         );
+        assert_eq!(named_fds(Sysno::dup3, [6, 5, 0, 0, 0, 0]), vec![5, 6]);
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(named_fds(Sysno::dup2, [6, 5, 0, 0, 0, 0]), vec![5, 6]);
     }
 
@@ -1705,6 +1740,7 @@ mod tests {
                 "{sysno}"
             );
         }
+        #[cfg(target_arch = "x86_64")]
         assert_eq!(
             run(
                 Sysno::alarm,
@@ -1968,7 +2004,13 @@ mod tests {
                 "{sysno}"
             );
         }
-        let (value, buffers) = time_outputs(Sysno::time, [0, 0, 0, 0, 0, 0], 1_700_000_000);
+        // times' result is output on every architecture; time's on x86_64.
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(
+            time_outputs(Sysno::time, [0, 0, 0, 0, 0, 0], 1_700_000_000),
+            (Some(1_700_000_000), vec![])
+        );
+        let (value, buffers) = time_outputs(Sysno::times, [0, 0, 0, 0, 0, 0], 1_700_000_000);
         assert_eq!((value, buffers.clone()), (Some(1_700_000_000), vec![]));
         let first = summarize_output::<()>(value, &buffers, |_, _| unreachable!()).unwrap();
         let second =
