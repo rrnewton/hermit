@@ -841,7 +841,13 @@ phase was running:
   runs, still reports the decision, in the fields a complete report uses:
   `deciding_event` for `--prefix-search` and `critical_event1` and
   `critical_event2` for the default search, without stacks (`partial.stacks`
-  says why); `--resume` takes them.
+  says why); `--resume` takes them. On the prefix path both critical events
+  name the deciding event too, until the stack-trace runs place them: which
+  shape the complete report takes (critical events at the deciding event, or
+  a timing decision with `deciding_event` and the critical events at
+  continuation positions) is known only after those runs. So in a partial
+  report `deciding_event`'s presence does not mean a timing decision; a
+  script reads `partial` first.
 
 Analyze stops itself only between runs, and the default search's computation
 between runs and the stack replays after the budget can take a little longer,
