@@ -395,6 +395,33 @@ pub const HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS: &[&str] = &[
     "verify_run_strict_rust_exit_group",
 ];
 
+/// `test.hermit_unit` cases the GitHub-hosted portable profile excludes by
+/// exact name.
+///
+/// The forced-gate rows of A5 step 3c.1's harness
+/// (hermit-cli/src/in_guest_delivery_harness.rs, design D60) each launch a
+/// guest on in-guest-trap, whose in-guest LiteInst runtime needs CPUID
+/// faulting before the guest's first instruction, the facility
+/// [`HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS`] keeps off GitHub-hosted
+/// runners; the harness counts a skip as a failure, so on those runners they
+/// could never pass. The local `test.hermit_unit` keeps running every one in
+/// the pinned root, as root. Only its hosted twin excludes them, with one
+/// exact-name filterset placed before the test binary's own arguments; the
+/// harness's `the_parent_runner_never_forces_the_gate`, which launches no
+/// guest, still runs there.
+pub const HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS: &[&str] = &[
+    "in_guest_delivery_harness::forced_gate_a_managed_wait4_publishes_the_guests_own_mask",
+    "in_guest_delivery_harness::forced_gate_a_masked_waits_arrivals_are_removed",
+    "in_guest_delivery_harness::forced_gate_a_send_to_a_vfork_parent_is_refused_by_name",
+    "in_guest_delivery_harness::forced_gate_d37_removal_runs_through_the_tools_injection",
+    "in_guest_delivery_harness::forced_gate_mask_calls_act_on_the_saved_mask_in_linuxs_order",
+    "in_guest_delivery_harness::forced_gate_the_polled_guest_sigtimedwait_runs",
+];
+
+/// Where the hosted unit twin's filterset goes: before the test binary's own
+/// arguments, which follow its one ` -- `.
+const HERMIT_UNIT_ARGUMENTS: &str = " -- ";
+
 /// Where the hosted regular-crates twin's filterset goes: after its selection.
 const REGULAR_CRATES_SELECTION_END: &str = "--exclude hermetic_infra_hermit_flaky-tests";
 
@@ -1545,6 +1572,24 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
                     &format!(
                         "--test rr_suite{} -j 1",
                         hosted_exclusion_filterset(HOSTED_PORTABLE_PMU_TIMER_RR_TESTS)
+                    ),
+                    1,
+                );
+            }
+            if hosted.tag() == "test.hermit_unit" {
+                if hosted.cmd.matches(HERMIT_UNIT_ARGUMENTS).count() != 1 {
+                    return Err(format!(
+                        "test.hermit_unit must pass its test binary's arguments after one \
+                         `{HERMIT_UNIT_ARGUMENTS}`"
+                    ));
+                }
+                hosted.cmd = hosted.cmd.replacen(
+                    HERMIT_UNIT_ARGUMENTS,
+                    &format!(
+                        "{}{HERMIT_UNIT_ARGUMENTS}",
+                        hosted_exclusion_filterset(
+                            HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS
+                        )
                     ),
                     1,
                 );
@@ -6878,6 +6923,40 @@ sys.exit(37)
                     ),
                     1,
                 )
+            } else if local_tag == "test.hermit_unit" {
+                // The hosted twin excludes exactly the forced-gate harness
+                // rows, by exact name, which the local selection must keep
+                // running: no local filter names one, and no local substring
+                // --skip matches one.
+                let local_argv = shell_words::split(&local_payload).unwrap();
+                assert!(!local_argv.iter().any(|arg| arg == "-E"));
+                for name in HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS {
+                    assert!(
+                        !local_payload.contains(name),
+                        "test.hermit_unit must keep running {name}"
+                    );
+                    for pattern in local_argv
+                        .windows(2)
+                        .filter(|pair| pair[0] == "--skip")
+                        .map(|pair| &pair[1])
+                    {
+                        assert!(
+                            !name.contains(pattern.as_str()),
+                            "test.hermit_unit's --skip {pattern} skips {name}"
+                        );
+                    }
+                }
+                assert_eq!(local_payload.matches(HERMIT_UNIT_ARGUMENTS).count(), 1);
+                local_payload.replacen(
+                    HERMIT_UNIT_ARGUMENTS,
+                    &format!(
+                        "{}{HERMIT_UNIT_ARGUMENTS}",
+                        hosted_exclusion_filterset(
+                            HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS
+                        )
+                    ),
+                    1,
+                )
             } else if local_tag == "test.rr_suite_contract" {
                 // The hosted twin excludes exactly the PMU-timer rr cases,
                 // which the local selection must keep running.
@@ -6931,6 +7010,7 @@ sys.exit(37)
             // else is excluded.
             let hosted_only_skips = match local_tag.as_str() {
                 "test.cli" => HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS.len(),
+                "test.hermit_unit" => HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS.len(),
                 "test.rr_suite_contract" => HOSTED_PORTABLE_PMU_TIMER_RR_TESTS.len(),
                 "test.regular_crates" => HOSTED_PORTABLE_PMU_TIMER_REPLAY_TESTS.len(),
                 _ => 0,
