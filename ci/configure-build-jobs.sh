@@ -2911,8 +2911,21 @@ fi
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory, SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the 394619b9 entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f443afab11361467fdf6560171bb3f588164880e ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie f443afab11361467fdf6560171bb3f588164880e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO ad1af8514f172ae05337837ce9f24f448f04059a (2026-10-26): from
+# f443afab11361467fdf6560171bb3f588164880e. One commit (coordinator): the
+# revert of f443afab (in-guest runtime descriptor registry), patch-id identical
+# to its inverse; its tree is byte-identical to 394619b9's. It changes
+# reverie-inguest/src, reverie/src/perf.rs and in_guest_rcb.rs, and the source
+# catalog in reverie-liteinst-artifact/src/lib.rs back to their pre-f443afab
+# content. git diff is empty under reverie-dbt/ and third-party/ and for the
+# root Cargo.toml, Cargo.lock and rust-toolchain.toml; both repository inputs
+# to the DynamoRIO content key are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory, SDK and native inputs, calibrated budget, job width
+# and limits carry unchanged from the f443afab entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ad1af8514f172ae05337837ce9f24f448f04059a ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ad1af8514f172ae05337837ce9f24f448f04059a (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
