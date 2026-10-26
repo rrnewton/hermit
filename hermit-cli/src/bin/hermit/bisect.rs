@@ -137,7 +137,6 @@ impl BisectOpts {
             // the run arguments' --timeout alone.
             trial_timeout: crate::analyze::TrialTimeout::Off,
             endpoints: Default::default(),
-            trial_bound_factor: 1,
             // Bisect has no budget and no journal: its replays run as they
             // did before analyze had them.
             time_budget: crate::analyze::TimeBudget::Off,
@@ -150,6 +149,7 @@ impl BisectOpts {
             partial_report_written: false,
             resumed_progress: None,
             trial_runner: Default::default(),
+            slowest_run: Default::default(),
         };
         // Before the schedules are read: a refused cap or counter reads and
         // starts nothing.

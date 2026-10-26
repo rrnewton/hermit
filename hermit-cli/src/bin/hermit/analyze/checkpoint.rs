@@ -238,8 +238,13 @@ pub fn write_atomically(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 pub enum RecordedEnd {
     /// It finished; `matched` says whether it met the target criteria.
     Finished { matched: bool },
-    /// Its own `--timeout` (the trial bound, never the budget's) ended it.
-    Timeout,
+    /// The run arguments' own `--timeout` ended it, after `seconds` when
+    /// recorded; never analyze's own bound (a run it stops is not journaled)
+    /// nor the budget's.
+    Timeout {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        seconds: Option<u64>,
+    },
     /// Hermit refused it at an operation its guest reached.
     Refusal,
 }

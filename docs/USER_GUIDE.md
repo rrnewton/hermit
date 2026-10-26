@@ -734,31 +734,43 @@ bisect` keeps its workspace and names it when it exits.
 
 A replayed or spliced schedule can leave the guest spinning or waiting for an
 event that never comes, so once the target run has been measured, every later
-run is bounded: by default at max(60 s, 10 times the slowest endpoint run),
-which analyze prints (`--trial-timeout=SECONDS|auto|off`). With
-`--run1-preemptions` there is no target run to measure, so pass an explicit
-`--trial-timeout`; on a backend that does not enforce `--timeout`, bound the
-whole analysis from outside. A trial that reaches the bound counts as not
-meeting the target, and a baseline run that reaches it makes analyze search
-within the target schedule instead, as `--prefix-search` does. A bound stops a
-trial at a time the host decides, so such a trial does not decide a
-`--prefix-search` boundary: when the search settles next to one, it runs that
-trial again with 4 times the bound (within the run arguments' own
-`--timeout`). If it then meets the target, the deciding event is an earlier
-one, and the search goes on below it. If it misses, the boundary stands on
-that finished trial. Once a confirmation finishes, whatever its outcome, every
-later run keeps the longer bound. If it is still stopped, or no longer bound
-can be given, the report calls that trial a hang, a third outcome rather than
-a run that misses (for example a deadlock while other threads keep polling),
-and notes that the boundary rests on a wall-clock bound. If the trial
-confirmed is the empty prefix's and it meets the target, the scheduler alone
-meets it, and analyze ends with an error that says so. A search whose baseline
-side never finishes thus runs one trial at 4 times the bound instead of
-rechecking it at the usual one, and one whose confirmation finishes runs the
-rest of its trials under the longer bound. A trial that Hermit refuses when
-its guest reaches an operation Hermit does not support (exit 122) counts as
-not meeting the target too, with a warning; a refused target run still ends
-the analysis.
+run is bounded: by default at max(60 s, 10 times the slowest endpoint run, 4
+times the slowest run that finished so far), which analyze prints
+(`--trial-timeout=SECONDS|auto|off`). The last term lets the bound follow a
+continuation without chaos, which can run far slower than the endpoint runs.
+With `--run1-preemptions` there is no target run to measure, so pass an
+explicit `--trial-timeout`; on a backend that does not enforce `--timeout`,
+bound the whole analysis from outside.
+
+This bound stops a trial at a time the host decides, so a trial it stops has
+no outcome when the trial is a `--prefix-search` trial, a default-search
+(bisection) trial or the baseline run. Such a trial runs again at once, as
+`<trial>_retry`, with 4 times the bound (within the run arguments' own
+`--timeout` and the time budget left), and the rerun's outcome counts. If the
+rerun is stopped too, the guest hangs (for example in a deadlock while other
+threads keep polling) or needs longer still. A hang is a third outcome, not a
+run that misses, so analyze ends with a partial report (exit 120,
+`HERMIT_ANALYZE_PARTIAL class=trial-inconclusive`, below) that names the
+trial, its prefix and both bounds, and gives the command that continues with a
+longer `--trial-timeout`. In those searches and the baseline run, which trials
+finish within analyze's bound never changes what analyze finds, only where it
+stops. With `--continuation-timeslice=auto`, a continuation one of whose two
+endpoint trials is stopped twice ends the analysis the same way: moving on to
+the next, coarser continuation would let a slower host answer at another
+timeslice. The partial report also gives the command that searches at that
+next continuation, a new analysis you may choose instead.
+
+A trial that a `--timeout` in the run arguments ends counts as not meeting the
+target: that bound is yours, and analyze does not rerun it. It is a wall-clock
+bound too, so on a slower or busier host it can stop a trial that finishes on
+another, and change what analyze finds; leave it room, or leave the bounding
+to analyze's own. When a prefix search settles next to such a trial, the
+report calls it a hang and notes that the boundary rests on a wall-clock bound.
+Elsewhere (`--search` rounds, `--minimize`'s knock-outs and the stack-trace
+runs) analyze's own bound still counts a run it stops as not meeting the
+target. A trial that Hermit refuses when its guest reaches an operation Hermit
+does not support (exit 122) counts as not meeting the target too, with a
+warning; a refused target run still ends the analysis.
 
 By default analyze bisects between the failing schedule and a passing one from
 another run. When the two runs differ in events only one of them executed (for
@@ -788,7 +800,8 @@ shortened to the time left; a run the budget cuts short is thrown away rather
 than counted as not meeting the target, so the budget decides only when
 analyze stops, never what it finds. When it runs out, analyze exits **120**
 after the stderr line `HERMIT_ANALYZE_PARTIAL class=time-budget` (or
-`class=trial-budget`) and a report that says it is partial, why, and which
+`class=trial-budget`, or `class=trial-inconclusive` for a trial analyze's
+bound stopped twice) and a report that says it is partial, why, and which
 phase was running:
 
 - The default search reports the closest pair of schedules it found, a

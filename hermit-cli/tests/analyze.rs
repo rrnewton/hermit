@@ -390,7 +390,8 @@ fn analyze_nanosleep_threads_rejects_indistinguishable_baseline() {
 
 /// The first chaos seed under which `analyze_race_then THEN`, run with
 /// `run_args`, takes the order that finishes ("b-first", exit 0). A run in
-/// the other order may not end by itself, so each is bounded at 5 s.
+/// the other order may not end by itself, so each is bounded at 5 s, in
+/// place of any `--timeout` in `run_args`.
 fn race_then_target_seed(then: &str, run_args: &[&str]) -> u64 {
     let guest = &workloads().race_then;
     (0..40)
@@ -398,7 +399,7 @@ fn race_then_target_seed(then: &str, run_args: &[&str]) -> u64 {
             let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
             command
                 .args(["run", "--chaos", "--timeout=5"])
-                .args(run_args)
+                .args(run_args.iter().filter(|arg| !arg.starts_with("--timeout=")))
                 .arg(format!("--seed={seed}"))
                 .arg("--")
                 .arg(guest)
@@ -479,47 +480,130 @@ fn analyze_race_then(
     (combined, report)
 }
 
-const BOUND_REACHED: &str = "reached hermit analyze's bound of 3 s for this run \
-                             (--trial-timeout=SECONDS raises it, --trial-timeout=off lifts it)); \
-                             counted as not meeting the target";
-
 /// Every prefix trial in which thread a wins the race spins for ever, the
-/// run without chaos (the prefix search's baseline) among them. Each is
-/// bounded by `--trial-timeout` and counts as not meeting the target, so
-/// the search still finds the deciding event. Before the bound, the first
-/// such trial never ended. The trial on the boundary's baseline side runs
-/// once more with 4 times the bound, does not finish then either, and the
-/// report says the boundary rests on that bound rather than on an outcome.
+/// run without chaos (the prefix search's baseline) among them. Analyze's
+/// own bound (`--trial-timeout=3`) stops the first, the empty prefix's; when
+/// that bound fires is the host's, so the trial has no outcome and runs
+/// again with 4 times the bound. Stopped again, it ends the analysis with a
+/// partial report (exit 120) that names the trial, says that the guest
+/// hangs or needs longer, and keeps the workspace. Before, the stopped trial
+/// counted as not meeting the target, so which trials the host finished in
+/// time steered the search.
 #[test]
 #[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_bounds_trials_that_never_end() {
     let label = "analyze --prefix-search analyze_race_then spin";
-    let (combined, report) = analyze_race_then(label, "spin", &["--prefix-search"]);
+    let seed = race_then_target_seed("spin", &[]);
+    let _guard = analyze_lock();
+    let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
+    let report_file = report_dir.path().join("report.json");
+    let tmp_dir = tmp_dir_in(report_dir.path());
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command
+        .arg("analyze")
+        .args([
+            "--target-stdout=b-first",
+            "--target-exit-code=0",
+            "--trial-timeout=3",
+            "--prefix-search",
+        ])
+        .arg(format!("--run1-seed={seed}"))
+        .arg(format!("--report-file={}", report_file.display()))
+        .arg(format!("--tmp-dir={}", tmp_dir.display()))
+        .args(["--", "--chaos", "--"])
+        .arg(&workloads().race_then)
+        .arg("spin");
+    let output = hermit_test::hermit_output(label, &mut command);
+    let combined = combined_output(&output);
+    assert_eq!(output.status.code(), Some(120), "{label}\n{combined}");
     assert!(
-        combined.contains(BOUND_REACHED),
-        "{label}: no trial reached the bound\n{combined}"
+        combined.contains("HERMIT_ANALYZE_PARTIAL class=trial-inconclusive phase=prefix-search"),
+        "{label}: no class line\n{combined}"
     );
     assert!(
-        combined.contains("running it again with a bound of 12 s, so that a finished trial"),
-        "{label}: the boundary was not confirmed\n{combined}"
+        combined.contains(
+            "prefix_round_001 did not finish within hermit analyze's wall-clock bound of 3 s"
+        ) && combined.contains("running it again as prefix_round_001_retry with a bound of 12 s"),
+        "{label}: the stopped trial did not run again\n{combined}"
+    );
+    let report: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&report_file)
+            .unwrap_or_else(|error| panic!("{label}: no report ({error})\n{combined}")),
+    )
+    .unwrap();
+    let partial = &report["partial"];
+    assert_eq!(partial["reason"], "trial-inconclusive", "{report}");
+    let inconclusive = &partial["inconclusive"];
+    assert_eq!(inconclusive["prefix"], 0, "{report}");
+    assert_eq!(
+        inconclusive["runs"],
+        serde_json::json!(["prefix_round_001", "prefix_round_001_retry"]),
+        "{report}"
+    );
+    assert_eq!(
+        inconclusive["bounds"],
+        serde_json::json!([3, 12]),
+        "{report}"
     );
     let header = report["header"].as_str().unwrap();
     assert!(
-        header.contains("does not finish, which the search counts as not meeting")
+        header.contains("the guest hangs (for example in a deadlock while other threads keep")
+            && header.contains("--trial-timeout=48"),
+        "{label}: {report}"
+    );
+    let workspace = PathBuf::from(partial["workspace"].as_str().unwrap());
+    assert!(
+        workspace.join("analyze-journal.jsonl").is_file(),
+        "{label}: the workspace was not kept\n{combined}"
+    );
+    fs::remove_dir_all(&workspace).unwrap();
+}
+
+/// The same trials, ended by a `--timeout` in the run arguments instead:
+/// that bound is the user's, so each trial it ends counts as not meeting
+/// the target, and the search still finds the deciding event. The trial on
+/// the boundary's baseline side cannot be given longer, and the report says
+/// the boundary rests on that bound rather than on an outcome.
+#[test]
+#[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_counts_a_trial_its_own_timeout_ends_as_not_meeting_the_target() {
+    let label = "analyze --prefix-search analyze_race_then spin, --timeout=3";
+    let (output, report) = analyze_race_then_with("spin", &["--prefix-search"], &["--timeout=3"]);
+    let combined = combined_output(&output);
+    assert!(
+        output.status.success(),
+        "{label} failed: {}\n{combined}",
+        output.status
+    );
+    assert!(
+        combined.contains("counted as not meeting the target") && !combined.contains("_retry"),
+        "{label}: no trial reached the bound, or one ran again\n{combined}"
+    );
+    let report = report.unwrap_or_else(|| panic!("{label}: no report\n{combined}"));
+    let header = report["header"].as_str().unwrap();
+    assert!(
+        header.contains("the guest hangs")
             && header.contains("this boundary rests on a wall-clock bound, not on an outcome"),
         "{label}: {report}"
     );
 }
 
 /// The default search's baseline is the run without chaos, which here spins
-/// for ever. The bound ends it too, and with no baseline schedule analyze
-/// searches within the target schedule instead. Before, the baseline run
-/// never ended, whatever --trial-timeout said.
+/// for ever. The run arguments' `--timeout` ends it, and with no baseline
+/// schedule analyze searches within the target schedule instead, where that
+/// bound ends the spinning trials too. Before the trial bound, the baseline
+/// run never ended.
 #[test]
 #[ignore = "slow: replays chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_searches_the_target_schedule_when_the_baseline_never_ends() {
     let label = "analyze analyze_race_then spin";
-    let (combined, _) = analyze_race_then(label, "spin", &[]);
+    let (output, _) = analyze_race_then_with("spin", &[], &["--timeout=3"]);
+    let combined = combined_output(&output);
+    assert!(
+        output.status.success(),
+        "{label} failed: {}\n{combined}",
+        output.status
+    );
     assert!(
         combined.contains(
             "the baseline run (non-chaos (0 extra preemptions) run) did not finish, so it \
@@ -552,7 +636,7 @@ fn analyze_counts_a_refused_trial_as_the_baseline() {
         report["header"]
             .as_str()
             .unwrap()
-            .contains("trial(s) were refused by Hermit (exit 122) and counted as not reaching"),
+            .contains("trial(s) were refused by Hermit (exit 122) and counted as not meeting"),
         "{label}: {report}"
     );
 }

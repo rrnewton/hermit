@@ -183,12 +183,13 @@ pub const HERMIT_DEADLINE_EXIT: i32 = 124;
 /// (`classify_container_result`) or it is rewritten to 125.
 pub const HERMIT_LOG_CAP_EXIT: i32 = 123;
 /// `hermit analyze` stopped at its own budget (`--time-budget`,
-/// `--trial-budget`) and reported its best answer so far: **120**.
+/// `--trial-budget`), or a search trial that its own wall-clock bound stopped
+/// twice, and reported its best answer so far: **120**.
 ///
 /// The analysis neither failed (125) nor found the critical events (0, or
 /// `--success-exit-code`): its report says that it is partial, why, and how
 /// to continue it, after the stderr line `HERMIT_ANALYZE_PARTIAL
-/// class=time-budget|trial-budget`. It is not 124, the status of every
+/// class=time-budget|trial-budget|trial-inconclusive`. It is not 124, the status of every
 /// deadline that kills what it bounds (`docs/TIMEOUT_LADDER.md`), because
 /// nothing is killed and the result is an answer, not a stopped run. Its row
 /// in the exit-code allocation table below carves it out of the guest's
@@ -250,9 +251,11 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //              stops at 119 because 120 is allocated below; a guest may still
 //              CHOOSE any value, see the caveat at the end.)
 //   120        HERMIT_ANALYZE_PARTIAL_EXIT -- `hermit analyze` only: a budget
-//              (`--time-budget`, `--trial-budget`) ended the analysis and it
+//              (`--time-budget`, `--trial-budget`) or a search trial its
+//              wall-clock bound stopped twice ended the analysis and it
 //              reported its best answer so far, after the stderr line
-//              `HERMIT_ANALYZE_PARTIAL class=time-budget|trial-budget`.
+//              `HERMIT_ANALYZE_PARTIAL class=time-budget|trial-budget|
+//              trial-inconclusive`.
 //              Analyze never relays a guest's status; `hermit run` never
 //              emits 120 and passes a guest's 120 through like any other.
 //   121        THE GUEST'S OWN STATUS, as 2 ..= 119.

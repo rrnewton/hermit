@@ -31,6 +31,8 @@ use detcore::types::SchedEvent;
 use detcore_model::config::ExpiredWaitCharge;
 use hermit::process::Bind;
 use reverie::process::Output;
+use serde::Deserialize;
+use serde::Serialize;
 use tracing::metadata::LevelFilter;
 
 use crate::analyze::budget::BudgetExpired;
@@ -41,8 +43,8 @@ use crate::analyze::checkpoint::RecordedFile;
 use crate::analyze::consts::*;
 use crate::analyze::stop;
 use crate::analyze::types::AnalyzeOpts;
-use crate::analyze::types::CONFIRM_BOUND_FACTOR;
 use crate::analyze::types::ContinuationTimeslice;
+use crate::analyze::types::SLOWEST_RUN_FACTOR;
 use crate::analyze::types::TRIAL_LOG_FACTOR;
 use crate::analyze::types::TRIAL_LOG_FLOOR;
 use crate::analyze::types::TRIAL_TIMEOUT_FACTOR;
@@ -66,9 +68,15 @@ pub enum TrialEnd {
 /// What stopped an unfinished trial.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stop {
-    /// A wall-clock bound: `--trial-timeout`, or a `--timeout` in the run
-    /// arguments.
+    /// The run arguments' own `--timeout`: a bound the user chose, so a run
+    /// it stops counts as not meeting the target.
     Bound,
+    /// Hermit analyze's own wall-clock bound (`--trial-timeout`), shorter
+    /// than the run arguments' `--timeout`. The host's speed decides when it
+    /// fires, so a trial it stops has no outcome: a search trial runs again
+    /// with a longer bound ([`AnalyzeOpts::decisive_trial`]), and elsewhere
+    /// it counts as not meeting the target, as before.
+    Backstop,
     /// Hermit refused it (exit 122) when the guest reached an operation it
     /// does not support.
     Refusal,
@@ -89,7 +97,8 @@ impl TrialEnd {
     /// wall-clock bound's and a run-time refusal ([`guest_reached_a_refusal`])
     /// is returned unchanged. `matched` says whether a finished trial met the
     /// criteria; `log` is the trial's own log file, if it has one, where a
-    /// refusal's reason is.
+    /// refusal's reason is; `backstop` whether the `--timeout` in force was
+    /// analyze's own bound rather than the run arguments'.
     ///
     /// A trial replays a schedule no endpoint run took, and that can lead
     /// the guest to an operation Hermit refuses
@@ -99,10 +108,15 @@ impl TrialEnd {
         launched: anyhow::Result<()>,
         matched: impl FnOnce() -> bool,
         log: Option<&Path>,
+        backstop: bool,
     ) -> anyhow::Result<Self> {
         match launched {
             Ok(()) if matched() => Ok(TrialEnd::Met),
             Ok(()) => Ok(TrialEnd::Missed),
+            Err(error) if backstop && error.downcast_ref::<RunTimeoutMarker>().is_some() => {
+                eprintln!(" => Timed out ({error}); no outcome");
+                Ok(TrialEnd::Unfinished(Stop::Backstop))
+            }
             Err(error) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
                 eprintln!(" => Timed out ({error}); counted as not meeting the target");
                 Ok(TrialEnd::Unfinished(Stop::Bound))
@@ -123,6 +137,51 @@ impl TrialEnd {
         }
     }
 }
+
+/// A search trial that analyze's own wall-clock bound stopped, and stopped
+/// again when it ran once more with a longer bound
+/// ([`AnalyzeOpts::decisive_trial`]). It has no outcome, and the search
+/// cannot go on without letting the host's speed decide, so the analysis
+/// ends with a partial report (exit 120).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TrialInconclusive {
+    /// What the trial replays, for a message: "replaying the first 6272
+    /// events and then scheduling without chaos", say.
+    pub trial: String,
+    /// The prefix a `--prefix-search` trial replays, in events.
+    pub prefix: Option<usize>,
+    /// The two runs, in the workspace: the trial and its rerun.
+    pub runs: [String; 2],
+    /// The wall-clock bound each ran under, in seconds.
+    pub bounds: [Option<u64>; 2],
+    /// For an endpoint trial of a `--continuation-timeslice=auto` candidate,
+    /// the next, coarser candidate's timeslice, in nanoseconds: the user may
+    /// choose it, but analyze does not move on to it by itself, as a slower
+    /// host would then answer at another timeslice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_continuation: Option<u64>,
+}
+
+impl std::fmt::Display for TrialInconclusive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let within = |bound: Option<u64>| bound.map_or_else(String::new, |s| format!(" {s} s"));
+        write!(
+            f,
+            "{} ({}) did not finish within hermit analyze's wall-clock bound of{}, nor within{} \
+             when it ran again ({}): the guest hangs (for example in a deadlock while other \
+             threads keep polling), or needs longer still. A hang is a third outcome, not a run \
+             that misses the target, and a wall-clock bound stops a trial at a time the host \
+             decides, so analyze stops here rather than let the host's speed steer the search",
+            self.trial,
+            self.runs[0],
+            within(self.bounds[0]),
+            within(self.bounds[1]),
+            self.runs[1],
+        )
+    }
+}
+
+impl std::error::Error for TrialInconclusive {}
 
 /// Whether Hermit refused a run after its guest started, at an operation it
 /// does not support. The container's exit-122 arm returns a bare
@@ -183,6 +242,13 @@ pub struct RunData {
     /// The `--trial-timeout` bound this run took, when it is shorter than the
     /// run arguments' own `--timeout` ([`AnalyzeOpts::trial_bound`]).
     trial_bound: Option<NonZeroU64>,
+    /// The run's own `--timeout`, before the `--trial-timeout` bound.
+    own_timeout: Option<NonZeroU64>,
+    /// Whether the journal answered the run instead of running it.
+    from_journal: bool,
+    /// For a run the journal answered with a stop by its own `--timeout`,
+    /// that `--timeout`, in seconds, as recorded.
+    stopped_by: Option<u64>,
     /// How long the run took, once it finished.
     wall: Option<Duration>,
     /// The log file the run wrote, once it launched (`--verbose` or
@@ -362,6 +428,10 @@ impl RunData {
             && let Some(answered) = self.answer_from_journal(&entry)?
         {
             journal.note_answered();
+            self.from_journal = true;
+            if answered.is_ok() {
+                self.note_finished();
+            }
             return answered;
         }
         let own_timeout = self.runopts.run_timeout_seconds();
@@ -381,7 +451,43 @@ impl RunData {
         if let Some(key) = key {
             self.journal_outcome(&journal, key, &launched)?;
         }
+        if launched.is_ok() {
+            self.note_finished();
+        }
         launched
+    }
+
+    /// Record how long this finished run took, which bounds the runs created
+    /// after it ([`AnalyzeOpts::trial_bound`]), and say what bound they now
+    /// get when that grew.
+    fn note_finished(&self) {
+        let Some(wall) = self.wall else {
+            return;
+        };
+        let opts = &self.analyze_opts;
+        let before = opts.trial_bound_times(&self.runopts, 1);
+        if !opts.slowest_run.record(wall) || opts.trial_timeout != TrialTimeout::Auto {
+            return;
+        }
+        let after = opts.trial_bound_times(&self.runopts, 1);
+        if let Some(bound) = after
+            && after > before
+            && before.is_some()
+        {
+            let shorter = self
+                .own_timeout
+                .filter(|own| own.get() < bound.get())
+                .map_or(String::new(), |own| {
+                    format!("; the run arguments' shorter --timeout={own} applies instead")
+                });
+            eprintln!(
+                ":: Runs from here on are bounded at {bound} s of wall-clock time: \
+                 {SLOWEST_RUN_FACTOR} x the slowest finished run, {} at {:.1} s \
+                 (--trial-timeout{shorter}).",
+                self.runname,
+                wall.as_secs_f64(),
+            );
+        }
     }
 
     /// Start the budget's count of this run and shorten its `--timeout` to
@@ -405,10 +511,17 @@ impl RunData {
     }
 
     /// What names this run in the journal: its name, its `hermit run`
-    /// command (with its own `--timeout`, never the budget's), and the
+    /// command (with its own `--timeout`, never the budget's or
+    /// `--trial-timeout`'s, which decide only when a run is stopped), and the
     /// contents of the schedule or record it replays.
-    fn journal_key(&self) -> String {
-        let mut material = format!("{}\n{}\n", self.runname, self.to_repro());
+    fn journal_key(&mut self) -> String {
+        let bounded = self.runopts.run_timeout_seconds();
+        if self.trial_bound.is_some() {
+            self.runopts.set_run_timeout(self.own_timeout);
+        }
+        let repro = self.to_repro();
+        self.runopts.set_run_timeout(bounded);
+        let mut material = format!("{}\n{}\n", self.runname, repro);
         let config = &self.runopts.det_opts.det_config;
         for input in [
             &config.replay_schedule_from,
@@ -465,7 +578,7 @@ impl RunData {
             match entry.end {
                 RecordedEnd::Finished { matched: true } => "met the target",
                 RecordedEnd::Finished { matched: false } => "missed the target",
-                RecordedEnd::Timeout => "its bound stopped it",
+                RecordedEnd::Timeout { .. } => "its own --timeout stopped it",
                 RecordedEnd::Refusal => "Hermit refused it",
             }
         );
@@ -475,8 +588,13 @@ impl RunData {
                 self.wall = entry.wall_ms.map(Duration::from_millis);
                 Ok(())
             }
-            RecordedEnd::Timeout => {
-                Err(self.name_the_trial_bound(anyhow::Error::new(RunTimeoutMarker)))
+            RecordedEnd::Timeout { seconds } => {
+                self.stopped_by = seconds;
+                Err(anyhow::Error::new(RunTimeoutMarker).context(format!(
+                    "the run arguments' --timeout{} stopped {}",
+                    seconds.map_or_else(String::new, |seconds| format!(" of {seconds} s")),
+                    self.runname
+                )))
             }
             RecordedEnd::Refusal => Err(anyhow::Error::new(crate::container::PolicyRefusal)),
         }))
@@ -484,7 +602,9 @@ impl RunData {
 
     /// Journal the run that `launched` as it did, keyed `key`. A run that
     /// ended any other way than finishing, its own bound or a refusal is not
-    /// journaled: it ends the analysis, and a resume runs it again.
+    /// journaled: it ends the analysis, and a resume runs it again. Neither
+    /// is one that `--trial-timeout`'s bound stopped: when it fired is the
+    /// host's, not the guest's, so a resume runs it again too.
     fn journal_outcome(
         &mut self,
         journal: &Journal,
@@ -496,7 +616,12 @@ impl RunData {
                 matched: self.is_a_match(),
             },
             Err(error) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
-                RecordedEnd::Timeout
+                if self.trial_bound.is_some() {
+                    return Ok(());
+                }
+                RecordedEnd::Timeout {
+                    seconds: self.runopts.run_timeout_seconds().map(NonZeroU64::get),
+                }
             }
             Err(error) if guest_reached_a_refusal(error) => RecordedEnd::Refusal,
             Err(_) => return Ok(()),
@@ -639,13 +764,46 @@ impl RunData {
     /// Launch a trial and say how it ended ([`TrialEnd::classify`]).
     pub fn launch_trial(&mut self) -> anyhow::Result<TrialEnd> {
         let launched = self.launch();
-        TrialEnd::classify(launched, || self.is_a_match(), self.logged_to.as_deref())
+        let backstop = self.trial_bound.is_some() && !self.from_journal;
+        TrialEnd::classify(
+            launched,
+            || self.is_a_match(),
+            self.logged_to.as_deref(),
+            backstop,
+        )
+    }
+
+    /// The `--trial-timeout` bound this run took, in seconds, when it is
+    /// shorter than the run arguments' own `--timeout`.
+    pub fn trial_bound(&self) -> Option<u64> {
+        self.trial_bound.map(NonZeroU64::get)
+    }
+
+    /// The `--timeout` that stopped this run, in seconds, as the journal
+    /// recorded it, for a run the journal answered with such a stop.
+    pub fn stopped_by(&self) -> Option<u64> {
+        self.stopped_by
+    }
+
+    /// This run with `factor` times its usual `--trial-timeout` bound
+    /// instead, within the run arguments' own `--timeout`.
+    pub fn with_bound_factor(mut self, factor: u32) -> Self {
+        self.runopts.set_run_timeout(self.own_timeout);
+        self.trial_bound = None;
+        self.apply_trial_bound_times(factor);
+        self
     }
 
     /// Bound the run's wall-clock time ([`AnalyzeOpts::trial_bound`]) by the
     /// endpoint runs measured before it was created.
     fn apply_trial_bound(&mut self) {
-        let Some(bound) = self.analyze_opts.trial_bound(&self.runopts) else {
+        self.apply_trial_bound_times(1);
+    }
+
+    /// [`RunData::apply_trial_bound`] with `factor` times the usual bound.
+    fn apply_trial_bound_times(&mut self, factor: u32) {
+        self.own_timeout = self.runopts.run_timeout_seconds();
+        let Some(bound) = self.analyze_opts.trial_bound_times(&self.runopts, factor) else {
             return;
         };
         if self
@@ -755,6 +913,9 @@ impl RunData {
             is_a_match: None,
             log_level,
             trial_bound: None,
+            own_timeout: None,
+            from_journal: false,
+            stopped_by: None,
             wall: None,
             logged_to: None,
             journaled_log_bytes: None,
@@ -959,6 +1120,9 @@ impl RunData {
             // Invariant: minimize should always return an on-target configuration:
             is_a_match: Some(true),
             trial_bound: None,
+            own_timeout: None,
+            from_journal: false,
+            stopped_by: None,
             wall: None,
             logged_to: None,
             journaled_log_bytes: None,
@@ -987,6 +1151,9 @@ impl RunData {
             // Don't claim that it was run:
             is_a_match: None,
             trial_bound: None,
+            own_timeout: None,
+            from_journal: false,
+            stopped_by: None,
             wall: None,
             logged_to: None,
             journaled_log_bytes: None,
@@ -1066,10 +1233,15 @@ impl AnalyzeOpts {
     /// The wall-clock bound, in whole seconds, on a run with `trial`'s
     /// options (`--trial-timeout`): none where `--timeout` cannot be
     /// enforced, and with `auto` max(60 s, 10 times the slowest endpoint run
-    /// measured so far), none before one was, times
-    /// [`AnalyzeOpts::trial_bound_factor`].
+    /// measured so far, [`SLOWEST_RUN_FACTOR`] times the slowest run that
+    /// finished so far), none before an endpoint was measured. The bound
+    /// decides only when a
+    /// search trial is stopped, never its outcome
+    /// ([`AnalyzeOpts::decisive_trial`]), so it may follow the host's speed:
+    /// a continuation without chaos can run far slower than the endpoint
+    /// runs it was measured from.
     pub fn trial_bound(&self, trial: &RunOpts) -> Option<NonZeroU64> {
-        self.trial_bound_times(trial, self.trial_bound_factor)
+        self.trial_bound_times(trial, 1)
     }
 
     /// [`AnalyzeOpts::trial_bound`] with the bound multiplied by `factor`.
@@ -1087,27 +1259,17 @@ impl AnalyzeOpts {
                     .endpoints
                     .slowest?
                     .saturating_mul(TRIAL_TIMEOUT_FACTOR)
+                    .max(
+                        self.slowest_run
+                            .get()
+                            .unwrap_or_default()
+                            .saturating_mul(SLOWEST_RUN_FACTOR),
+                    )
                     .max(TRIAL_TIMEOUT_FLOOR)
                     .saturating_mul(factor);
                 NonZeroU64::new(bound.as_secs() + u64::from(bound.subsec_nanos() > 0))
             }
         }
-    }
-
-    /// The wall-clock bound, in whole seconds, a `--prefix-search` trial gets
-    /// when it runs again to confirm the boundary: [`CONFIRM_BOUND_FACTOR`]
-    /// times `--trial-timeout`'s, within the run arguments' own `--timeout`.
-    /// None unless that is longer than the bound trials get now: none with
-    /// `--trial-timeout=off`, once the bound was raised, or where a shorter
-    /// `--timeout` in the run arguments applies.
-    pub fn confirmation_bound(&self) -> Option<u64> {
-        if self.trial_bound_factor != 1 {
-            return None;
-        }
-        let longer = self.effective_trial_bound_times(CONFIRM_BOUND_FACTOR)?;
-        self.effective_trial_bound_times(1)
-            .is_some_and(|now| longer > now)
-            .then_some(longer)
     }
 
     /// The run arguments' own `--timeout`, in whole seconds.
@@ -1121,7 +1283,7 @@ impl AnalyzeOpts {
     /// under: [`AnalyzeOpts::trial_bound`], or the run arguments' own
     /// `--timeout` where that is shorter.
     pub fn effective_trial_bound(&self) -> Option<u64> {
-        self.effective_trial_bound_times(self.trial_bound_factor)
+        self.effective_trial_bound_times(1)
     }
 
     /// [`AnalyzeOpts::effective_trial_bound`] with `--trial-timeout`'s bound
@@ -1705,6 +1867,7 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+    use crate::analyze::types::CONFIRM_BOUND_FACTOR;
 
     /// Round-2 review of https://github.com/rrnewton/hermit/pull/3686, finding
     /// 2: the refusal `RunOpts::main` makes never sees an analyze or bisect
@@ -2808,14 +2971,14 @@ mod tests {
         );
     }
 
-    /// A `--prefix-search` confirmation runs under 4 times `--trial-timeout`'s
-    /// bound, within the run arguments' own `--timeout`, and once the bound
-    /// is raised the runs created after that take it. `off`, a shorter
-    /// `--timeout` in the run arguments, or a bound raised already leaves
-    /// nothing longer to give.
+    /// A rerun of a trial analyze's bound stopped runs under 4 times
+    /// `--trial-timeout`'s bound, within the run arguments' own `--timeout`.
+    /// Where that `--timeout` is the shorter, it is the rerun's bound, and a
+    /// stop by it is the run's own (no `trial_bound`); `off` gives none.
     #[test]
-    fn a_confirmation_lengthens_the_trial_bound() {
-        let options = |extra: &[&str], run_args: &[&str]| {
+    fn a_rerun_lengthens_the_trial_bound() {
+        let workspace = tempfile::tempdir().unwrap();
+        let rerun = |extra: &[&str], run_args: &[&str]| {
             let mut argv = vec!["analyze"];
             argv.extend(extra);
             argv.push("--");
@@ -2825,35 +2988,148 @@ mod tests {
             options
                 .endpoints
                 .record(std::time::Duration::from_millis(10_400), None);
-            options
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            let first = RunData::new_baseline(&options, "prefix_round_002".to_owned()).unwrap();
+            let again = RunData::new_baseline(&options, "prefix_round_002_retry".to_owned())
+                .unwrap()
+                .with_bound_factor(CONFIRM_BOUND_FACTOR);
+            let bounds = |run: &RunData| {
+                (
+                    run.runopts.run_timeout().map(|bound| bound.as_secs()),
+                    run.trial_bound(),
+                )
+            };
+            (bounds(&first), bounds(&again))
         };
-        assert_eq!(options(&[], &[]).confirmation_bound(), Some(416));
         assert_eq!(
-            options(&[], &["--timeout=120"]).confirmation_bound(),
-            Some(120)
-        );
-        assert_eq!(options(&[], &["--timeout=30"]).confirmation_bound(), None);
-        assert_eq!(
-            options(&["--trial-timeout=5"], &[]).confirmation_bound(),
-            Some(20)
+            rerun(&[], &[]),
+            ((Some(104), Some(104)), (Some(416), Some(416)))
         );
         assert_eq!(
-            options(&["--trial-timeout=off"], &[]).confirmation_bound(),
-            None
+            rerun(&[], &["--timeout=120"]),
+            ((Some(104), Some(104)), (Some(120), None))
         );
-        let mut raised = options(&[], &[]);
-        assert_eq!(raised.effective_trial_bound(), Some(104));
-        raised.trial_bound_factor = CONFIRM_BOUND_FACTOR;
-        assert_eq!(raised.confirmation_bound(), None);
-        assert_eq!(raised.effective_trial_bound(), Some(416));
+        assert_eq!(
+            rerun(&[], &["--timeout=30"]),
+            ((Some(30), None), (Some(30), None))
+        );
+        assert_eq!(
+            rerun(&["--trial-timeout=5"], &[]),
+            ((Some(5), Some(5)), (Some(20), Some(20)))
+        );
+        assert_eq!(
+            rerun(&["--trial-timeout=off"], &[]),
+            ((None, None), (None, None))
+        );
+    }
+
+    /// With `--trial-timeout=auto`, a run also gets 4 times the slowest run
+    /// that finished so far, which every copy of the options shares: a
+    /// continuation without chaos can run far slower than the endpoint runs.
+    /// An explicit `--trial-timeout` stays as given.
+    #[test]
+    fn the_auto_bound_grows_with_the_slowest_finished_run() {
+        use std::time::Duration;
+        let trial = |options: &AnalyzeOpts| {
+            options
+                .trial_bound(&RunData::get_raw_runopts(options))
+                .map(NonZeroU64::get)
+        };
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        options.endpoints.record(Duration::from_secs(3), None);
+        let copy = options.clone();
+        assert_eq!(trial(&options), Some(60));
+        assert!(copy.slowest_run.record(Duration::from_secs(10)));
+        assert_eq!(trial(&options), Some(60));
+        assert!(copy.slowest_run.record(Duration::from_millis(94_200)));
+        assert_eq!(trial(&options), Some(377));
+        assert!(!options.slowest_run.record(Duration::from_secs(50)));
+        assert_eq!(trial(&options), Some(377));
+        assert_eq!(
+            options
+                .trial_bound_times(&RunData::get_raw_runopts(&options), CONFIRM_BOUND_FACTOR)
+                .map(NonZeroU64::get),
+            Some(1508)
+        );
+        let explicit =
+            AnalyzeOpts::try_parse_from(["analyze", "--trial-timeout=30", "--", "/bin/true"])
+                .unwrap();
+        explicit.slowest_run.record(Duration::from_secs(500));
+        assert_eq!(trial(&explicit), Some(30));
+    }
+
+    /// A run that analyze's own bound stopped is not journaled, so a resume
+    /// runs it again, and a run's journal key leaves that bound out, so a
+    /// resume under another one still finds the runs that finished. A stop by
+    /// the run arguments' own `--timeout` is journaled as before.
+    #[test]
+    fn a_backstop_stop_is_not_journaled_and_the_key_ignores_the_bound() {
         let workspace = tempfile::tempdir().unwrap();
-        raised.tmp_dir = Some(workspace.path().to_path_buf());
-        let run = RunData::new_baseline(&raised, "prefix_round_002".to_owned()).unwrap();
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", "--trial-timeout=10", "--", "/bin/true"])
+                .unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        options.journal = Journal::open(workspace.path()).unwrap();
+        options.trial_runner = TrialRunner(Some(std::sync::Arc::new(|_: &mut RunData| {
+            Err(anyhow::Error::new(RunTimeoutMarker))
+        })));
+        let mut stopped = RunData::new_baseline(&options, "prefix_round_003".into()).unwrap();
+        assert_eq!(stopped.trial_bound(), Some(10));
+        let key = stopped.journal_key();
         assert_eq!(
-            run.runopts.run_timeout().map(|bound| bound.as_secs()),
-            Some(416)
+            stopped.launch_trial().unwrap(),
+            TrialEnd::Unfinished(Stop::Backstop)
         );
-        assert_eq!(run.trial_bound, NonZeroU64::new(416));
+        assert!(options.journal.lookup(&key).is_none());
+        let mut longer = RunData::new_baseline(&options, "prefix_round_003".into())
+            .unwrap()
+            .with_bound_factor(CONFIRM_BOUND_FACTOR);
+        assert_eq!(longer.trial_bound(), Some(40));
+        assert_eq!(longer.journal_key(), key);
+
+        let mut own = AnalyzeOpts::try_parse_from([
+            "analyze",
+            "--trial-timeout=off",
+            "--",
+            "--timeout=5",
+            "/bin/true",
+        ])
+        .unwrap();
+        own.tmp_dir = options.tmp_dir.clone();
+        own.journal = options.journal.clone();
+        own.trial_runner = options.trial_runner.clone();
+        let mut bounded = RunData::new_baseline(&own, "prefix_round_004".into()).unwrap();
+        assert_eq!(bounded.trial_bound(), None);
+        let key = bounded.journal_key();
+        assert_eq!(
+            bounded.launch_trial().unwrap(),
+            TrialEnd::Unfinished(Stop::Bound)
+        );
+        assert!(options.journal.lookup(&key).is_some());
+
+        // Resumed under a lower bound of analyze's own, that journaled stop
+        // is still the run arguments' --timeout's, and so not rerun: it
+        // ended the same way in the uninterrupted analysis.
+        let mut lower = AnalyzeOpts::try_parse_from([
+            "analyze",
+            "--trial-timeout=2",
+            "--",
+            "--timeout=5",
+            "/bin/true",
+        ])
+        .unwrap();
+        lower.tmp_dir = options.tmp_dir.clone();
+        lower.journal = options.journal.clone();
+        lower.trial_runner = TrialRunner(Some(std::sync::Arc::new(|run: &mut RunData| {
+            panic!("{} ran instead of taking its journaled stop", run.name())
+        })));
+        let mut answered = RunData::new_baseline(&lower, "prefix_round_004".into()).unwrap();
+        assert_eq!(answered.trial_bound(), Some(2));
+        assert_eq!(
+            answered.launch_trial().unwrap(),
+            TrialEnd::Unfinished(Stop::Bound)
+        );
+        assert_eq!(answered.stopped_by(), Some(5));
     }
 
     /// A run that the bound ended says which bound it was and how to change
@@ -2914,7 +3190,7 @@ mod tests {
     #[test]
     fn a_trial_that_did_not_finish_did_not_reach_the_target() {
         let classify = |launched: anyhow::Result<()>, matched: bool| {
-            TrialEnd::classify(launched, || matched, None)
+            TrialEnd::classify(launched, || matched, None, false)
         };
         assert_eq!(classify(Ok(()), true).unwrap(), TrialEnd::Met);
         assert_eq!(classify(Ok(()), false).unwrap(), TrialEnd::Missed);
@@ -2923,6 +3199,16 @@ mod tests {
         let end = classify(Err(timed_out), true).unwrap();
         assert_eq!(end, TrialEnd::Unfinished(Stop::Bound));
         assert!(!end.reached_target() && !end.finished());
+        // Analyze's own bound, not the run arguments', stopped it.
+        let backstopped = TrialEnd::classify(
+            Err(anyhow::Error::new(RunTimeoutMarker)),
+            || true,
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(backstopped, TrialEnd::Unfinished(Stop::Backstop));
+        assert!(!backstopped.reached_target() && !backstopped.finished());
         let refused = anyhow::Error::new(crate::container::PolicyRefusal);
         assert_eq!(
             classify(Err(refused), true).unwrap(),
@@ -3146,7 +3432,7 @@ mod tests {
         assert_eq!(reopened.journal.answered(), 1);
 
         // Another trial (another name, so another key) is not.
-        let other = RunData::new_baseline(&reopened, "prefix_round_008".into()).unwrap();
+        let mut other = RunData::new_baseline(&reopened, "prefix_round_008".into()).unwrap();
         assert_ne!(other.journal_key(), key);
 
         // A file it wrote changed: it runs again.

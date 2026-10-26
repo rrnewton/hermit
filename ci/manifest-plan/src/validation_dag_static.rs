@@ -1905,7 +1905,21 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a search started from an observed interval): 1245.
     // And phases::tests::a_budget_hit_after_the_decision_reports_it: 1246.
     // And phases::tests::a_trial_budget_that_ends_at_the_stack_trace_runs_reports_the_decision: 1247.
-    ("test.hermit_unit", 1247),
+    // And a trial analyze's wall-clock bound stops is no outcome:
+    // phases::tests::{a_trial_the_backstop_stopped_runs_again_and_does_not_change_the_answer,
+    // a_trial_stopped_again_ends_the_search_with_a_partial_report,
+    // a_stop_by_the_run_arguments_timeout_still_counts_as_not_meeting_the_target,
+    // a_bisection_trial_the_backstop_stopped_runs_again_and_does_not_change_the_pair}
+    // and rundata::tests::{the_auto_bound_grows_with_the_slowest_finished_run,
+    // a_backstop_stop_is_not_journaled_and_the_key_ignores_the_bound}: 1188.
+    // Less #4649's five boundary-confirmation tests, removed with the
+    // confirmation (phases::tests::{a_confirmation_raises_the_bound_and_keeps_it_once_finished,
+    // a_trial_a_bound_stopped_does_not_decide_the_boundary, a_confirmed_trial_keeps_the_boundary,
+    // a_refuted_boundary_resumes_above_the_last_finished_miss,
+    // an_empty_prefix_that_meets_the_target_given_longer_ends_the_search}), plus
+    // phases::tests::{a_continuation_with_an_inconclusive_endpoint_trial_ends_the_search,
+    // a_baseline_run_the_backstop_stopped_runs_again}: 1250.
+    ("test.hermit_unit", 1250),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5785,7 +5799,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twenty-seven budget-and-resume tests: 1239.
     // And the same decided-budget test: 1240.
     // And the same cut-path decided-budget test: 1241.
-    ("test.hermit_unit_on_host", 1241),
+    // And the same six backstop tests: 1188.
+    // Less the same five confirmation tests, plus the same two backstop tests: 1244.
+    ("test.hermit_unit_on_host", 1244),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
