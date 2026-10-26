@@ -8,59 +8,59 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 3000,
-      "applicable": 1897,
-      "selectable": 1424,
-      "population": 2935,
-      "population_candidate_selected": 1424,
-      "population_candidate_not_selected": 466,
-      "population_candidate_disabled": 1045
+      "cells": 3010,
+      "applicable": 1903,
+      "selectable": 1429,
+      "population": 2945,
+      "population_candidate_selected": 1429,
+      "population_candidate_not_selected": 467,
+      "population_candidate_disabled": 1049
     },
     "by_backend": {
       "dbt": {
-        "cells": 600,
-        "applicable": 255,
-        "selectable": 254,
-        "population": 587,
-        "population_candidate_selected": 254,
+        "cells": 602,
+        "applicable": 256,
+        "selectable": 255,
+        "population": 589,
+        "population_candidate_selected": 255,
         "population_candidate_not_selected": 1,
-        "population_candidate_disabled": 332
+        "population_candidate_disabled": 333
       },
       "in-guest-trap": {
-        "cells": 600,
-        "applicable": 305,
-        "selectable": 305,
-        "population": 587,
-        "population_candidate_selected": 305,
+        "cells": 602,
+        "applicable": 306,
+        "selectable": 306,
+        "population": 589,
+        "population_candidate_selected": 306,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 282
+        "population_candidate_disabled": 283
       },
       "kvm": {
-        "cells": 600,
-        "applicable": 561,
-        "selectable": 559,
-        "population": 587,
-        "population_candidate_selected": 559,
+        "cells": 602,
+        "applicable": 563,
+        "selectable": 561,
+        "population": 589,
+        "population_candidate_selected": 561,
         "population_candidate_not_selected": 0,
         "population_candidate_disabled": 28
       },
       "liteinst": {
-        "cells": 600,
-        "applicable": 306,
-        "selectable": 306,
-        "population": 587,
-        "population_candidate_selected": 306,
+        "cells": 602,
+        "applicable": 307,
+        "selectable": 307,
+        "population": 589,
+        "population_candidate_selected": 307,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 281
+        "population_candidate_disabled": 282
       },
       "sabre": {
-        "cells": 600,
-        "applicable": 470,
+        "cells": 602,
+        "applicable": 471,
         "selectable": 0,
-        "population": 587,
+        "population": 589,
         "population_candidate_selected": 0,
-        "population_candidate_not_selected": 465,
-        "population_candidate_disabled": 122
+        "population_candidate_not_selected": 466,
+        "population_candidate_disabled": 123
       }
     }
   },
@@ -455,11 +455,21 @@
     {"test_id":"c-programs/inline-syscall-sites","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/inline-syscall-sites","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/inline-syscall-sites","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: NAMED GAP (dh-dk8kv): SaBRe crashes this guest since Reverie 80fc77fa (\"SaBRe loader: keep address space free above a PIE client's image for its program break\", picked up by Hermit 5f2d987e5). The guest, built by the pinned image's GCC 15.3.0 as a PIE, has two syscall sites 10 bytes apart; under that loader the first site's trampoline returns into the middle of the second site's patch (SIGSEGV at offset 0x1096, 3 of 3 runs), while a loader built from its parent 94513271 passes 3 of 3. Kept as a named gap, not fixed, under the owner's ruling that SaBRe is a drop candidate. Disabled on every route: the Buck route builds this guest with another compiler and passed only because its binary does not trigger the bug."},
+    {"test_id":"c-programs/inotify-rename-cookies","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/inotify-rename-cookies","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/inotify-rename-cookies","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/inotify-rename-cookies","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/inotify-rename-cookies","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"c-programs/inotify-watch","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/inotify-watch","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/inotify-watch","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/inotify-watch","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/inotify-watch","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"c-programs/inotify-write-only-buffer","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: The in-process backends read guest memory with process_vm_readv alone, which refuses a write-only page, so the io-buffer observation `--verify-strict` makes turns this successful read into EFAULT (https://github.com/rrnewton/hermit/issues/3824, https://github.com/rrnewton/hermit/issues/4530)"},
+    {"test_id":"c-programs/inotify-write-only-buffer","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The in-process backends read guest memory with process_vm_readv alone, which refuses a write-only page, so the io-buffer observation `--verify-strict` makes turns this successful read into EFAULT (https://github.com/rrnewton/hermit/issues/3824, https://github.com/rrnewton/hermit/issues/4530)"},
+    {"test_id":"c-programs/inotify-write-only-buffer","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/inotify-write-only-buffer","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The in-process backends read guest memory with process_vm_readv alone, which refuses a write-only page, so the io-buffer observation `--verify-strict` makes turns this successful read into EFAULT (https://github.com/rrnewton/hermit/issues/3824, https://github.com/rrnewton/hermit/issues/4530)"},
+    {"test_id":"c-programs/inotify-write-only-buffer","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: The in-process backends read guest memory with process_vm_readv alone, which refuses a write-only page, so the io-buffer observation `--verify-strict` makes turns this successful read into EFAULT (https://github.com/rrnewton/hermit/issues/3824, https://github.com/rrnewton/hermit/issues/4530)"},
     {"test_id":"c-programs/io-uring-fallback","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/io-uring-fallback","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/io-uring-fallback","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
