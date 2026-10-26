@@ -3421,11 +3421,13 @@ impl ResultRow {
                 ) => true,
                 Some(ObservedResult::Timeout) => timed_out,
                 Some(ObservedResult::Oom) => !retained_crash,
+                // A chaos-floor failure's attempts all passed and matched.
                 Some(
                     ObservedResult::Pass
                     | ObservedResult::DeterminismFailure
                     | ObservedResult::ParityFailure
-                    | ObservedResult::ReplayFailure,
+                    | ObservedResult::ReplayFailure
+                    | ObservedResult::ChaosFloorFailure,
                 ) => false,
             };
             if !consistent {
@@ -15654,11 +15656,14 @@ fn series_evidence(row: &SeriesRow, id: &CellId) -> Option<SeriesEvidence> {
     }
     if row.schema == SeriesSchema::V3 {
         return match row.series.result {
+            // A chaos-floor failure is a product result over attempts that each
+            // matched: an observation of its cell, as a divergence is.
             Some(
                 result @ (ObservedResult::Pass
                 | ObservedResult::DeterminismFailure
                 | ObservedResult::ParityFailure
-                | ObservedResult::ReplayFailure),
+                | ObservedResult::ReplayFailure
+                | ObservedResult::ChaosFloorFailure),
             ) => Some(SeriesEvidence {
                 result: Some(result),
                 no_verdict: false,
