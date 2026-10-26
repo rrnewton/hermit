@@ -33,10 +33,12 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 
 use tracing::info;
 
 use super::Scheduler;
+use crate::syscalls::robust_list::RobustListSnapshot;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::FutexID;
@@ -54,6 +56,8 @@ pub(crate) struct SigkillVictim {
 #[derive(Debug)]
 struct Reservation {
     victims: Vec<SigkillVictim>,
+    /// The thread that sends it.
+    sender: DetTid,
     /// The target's real uid, read by the sender before the send, for the
     /// parent's `CLD_KILLED` siginfo.
     uid: u32,
@@ -199,6 +203,11 @@ pub(crate) struct SigkillRetirement {
     retained_wakes: BTreeMap<(DetTid, u64), Vec<(DetTid, FutexID)>>,
     /// The next batch position of each victim with retained batches.
     wake_batches: BTreeMap<DetTid, u64>,
+    /// The robust lists a sender recorded before its send for the threads the
+    /// send kills, keyed by thread and address space, with the reservation's
+    /// token, until each thread's exit callback takes its own
+    /// ([`Scheduler::take_sigkill_robust_list`]).
+    robust_lists: HashMap<(DetTid, MmId), (u64, RobustListSnapshot)>,
     /// Victims whose first consuming receipt was counted (held or committed):
     /// a later deregistration of the same thread changes nothing. Forgotten
     /// when a new thread registers on the tid (`forget_committed_exit`).
@@ -331,6 +340,7 @@ impl Scheduler {
             token,
             Reservation {
                 victims,
+                sender,
                 uid,
                 includes_sender,
             },
@@ -344,6 +354,11 @@ impl Scheduler {
     /// Route a consuming receipt of `tid` (its deregistration, after its final
     /// accounting): see [`SigkillReceipt`].
     pub(crate) fn route_sigkill_receipt(&mut self, tid: DetTid) -> SigkillReceipt {
+        // The thread's exit callback, which takes its recorded robust list,
+        // came before this receipt: whatever is left was never wanted.
+        self.sigkill
+            .robust_lists
+            .retain(|(owner, _), _| *owner != tid);
         if self.sigkill.reserved.contains_key(&tid) {
             self.sigkill.held_receipts.insert(tid);
             self.sigkill.accounted.insert(tid);
@@ -378,6 +393,10 @@ impl Scheduler {
             self.sigkill.reserved.remove(&victim.tid);
         }
         if !sent {
+            // No thread died, so no robust list is walked.
+            self.sigkill
+                .robust_lists
+                .retain(|_, (recorded_for, _)| *recorded_for != token);
             // No kill happened: wakes and a receipt that arrived meanwhile
             // take the ordinary path now.
             let victims: BTreeSet<DetTid> = reservation.victims.iter().map(|v| v.tid).collect();
@@ -632,6 +651,61 @@ impl Scheduler {
         self.sigkill.unaccounted.contains(&tid)
     }
 
+    /// The threads reservation `token`'s send kills, each with the address
+    /// space it registered with, in tid order: its victims, and its sender too
+    /// when the send ends the sender's own process. Empty for a token that is
+    /// not reserved.
+    pub(crate) fn sigkill_dying_threads(&self, token: u64) -> Vec<(DetTid, MmId)> {
+        let Some(reservation) = self.sigkill.reservations.get(&token) else {
+            return Vec::new();
+        };
+        let mut dying: Vec<(DetTid, MmId)> = reservation
+            .victims
+            .iter()
+            .map(|victim| (victim.tid, victim.mm))
+            .collect();
+        if reservation.includes_sender
+            && let Some(mm) = self.thread_mm(reservation.sender)
+        {
+            dying.push((reservation.sender, mm));
+        }
+        dying.sort_by_key(|(tid, _)| *tid);
+        dying
+    }
+
+    /// Keep the robust lists the sender of reservation `token` recorded before
+    /// its send, for the threads it kills (`Self::sigkill_dying_threads`) whose
+    /// receipt has not come; a list for any other thread is dropped. They are
+    /// kept apart from the reservation, which the commit removes before the
+    /// victims' exit callbacks take them.
+    pub(crate) fn record_sigkill_robust_lists(
+        &mut self,
+        token: u64,
+        lists: Vec<(DetTid, MmId, RobustListSnapshot)>,
+    ) {
+        let dying = self.sigkill_dying_threads(token);
+        for (tid, mm, list) in lists {
+            // A victim whose receipt already came died on its own before the
+            // send, and walked its own list then; nothing would take this.
+            if dying.contains(&(tid, mm)) && !self.sigkill.accounted.contains(&tid) {
+                self.sigkill.robust_lists.insert((tid, mm), (token, list));
+            }
+        }
+    }
+
+    /// The robust list recorded for thread `tid` of address space `mm` before
+    /// the SIGKILL that killed it, taken by its exit callback.
+    pub(crate) fn take_sigkill_robust_list(
+        &mut self,
+        tid: DetTid,
+        mm: MmId,
+    ) -> Option<RobustListSnapshot> {
+        self.sigkill
+            .robust_lists
+            .remove(&(tid, mm))
+            .map(|(_token, list)| list)
+    }
+
     /// Retain a victim's non-empty owner-death wake batch instead of running
     /// it at receipt, and say whether it was retained. Selecting waiters,
     /// consuming the fuzz arm's selection randomness and logging the result
@@ -721,6 +795,126 @@ mod tests {
 
     fn live(scheduler: &Scheduler, tid: i32) -> bool {
         scheduler.next_turns.contains_key(&DetTid::from_raw(tid))
+    }
+
+    /// A sender's recorded robust lists are kept for exactly the threads its
+    /// send kills, each taken once by that thread's exit callback.
+    #[test]
+    fn recorded_robust_lists_are_kept_for_the_threads_the_send_kills() {
+        let mut scheduler = family();
+        let [sender, target, worker] = [2, 3, 4].map(DetTid::from_raw);
+        let mm = |tid: DetTid| MmId::initial(tid);
+        let token = scheduler
+            .reserve_sigkill(sender, DetPid::from_raw(3), 0)
+            .unwrap()
+            .token;
+        assert_eq!(
+            scheduler.sigkill_dying_threads(token),
+            vec![(target, mm(target)), (worker, mm(worker))]
+        );
+        let list = RobustListSnapshot::default;
+        scheduler.record_sigkill_robust_lists(
+            token,
+            vec![
+                (sender, mm(sender), list()),
+                (target, mm(target), list()),
+                (worker, mm(sender), list()),
+                (worker, mm(worker), list()),
+            ],
+        );
+        scheduler.commit_sigkill(token, true);
+        // The sender survives, and a list under another address space is no
+        // thread's this send kills.
+        assert!(
+            scheduler
+                .take_sigkill_robust_list(sender, mm(sender))
+                .is_none()
+        );
+        assert!(
+            scheduler
+                .take_sigkill_robust_list(worker, mm(sender))
+                .is_none()
+        );
+        assert!(
+            scheduler
+                .take_sigkill_robust_list(worker, mm(worker))
+                .is_some()
+        );
+        assert!(
+            scheduler
+                .take_sigkill_robust_list(worker, mm(worker))
+                .is_none()
+        );
+        // A receipt drops a list its thread never took.
+        scheduler.route_sigkill_receipt(target);
+        assert!(
+            scheduler
+                .take_sigkill_robust_list(target, mm(target))
+                .is_none()
+        );
+    }
+
+    /// An unwound send kills nobody, so it keeps none of its lists; a victim
+    /// that died before the record keeps none either; a send that ends its
+    /// sender's own process records the sender's list too.
+    #[test]
+    fn an_unwound_send_keeps_no_robust_list_and_a_self_send_keeps_the_senders() {
+        let mut scheduler = family();
+        let [sender, target, worker] = [2, 3, 4].map(DetTid::from_raw);
+        let mm = |tid: DetTid| MmId::initial(tid);
+        let token = scheduler
+            .reserve_sigkill(sender, DetPid::from_raw(3), 0)
+            .unwrap()
+            .token;
+        scheduler.record_sigkill_robust_lists(
+            token,
+            vec![(target, mm(target), RobustListSnapshot::default())],
+        );
+        scheduler.commit_sigkill(token, false);
+        assert!(
+            scheduler
+                .take_sigkill_robust_list(target, mm(target))
+                .is_none()
+        );
+
+        let own = scheduler
+            .reserve_sigkill(worker, DetPid::from_raw(3), 0)
+            .unwrap();
+        assert!(own.includes_sender);
+        assert_eq!(
+            scheduler.sigkill_dying_threads(own.token),
+            vec![(target, mm(target)), (worker, mm(worker))]
+        );
+
+        // A victim that died on its own before the record keeps none.
+        let mut scheduler = family();
+        let token = scheduler
+            .reserve_sigkill(sender, DetPid::from_raw(3), 0)
+            .unwrap()
+            .token;
+        assert_eq!(
+            scheduler.route_sigkill_receipt(target),
+            SigkillReceipt::Held
+        );
+        scheduler.record_sigkill_robust_lists(
+            token,
+            vec![
+                (target, mm(target), RobustListSnapshot::default()),
+                (worker, mm(worker), RobustListSnapshot::default()),
+            ],
+        );
+        scheduler.commit_sigkill(token, true);
+        assert!(
+            scheduler
+                .take_sigkill_robust_list(target, mm(target))
+                .is_none()
+        );
+        assert!(
+            scheduler
+                .take_sigkill_robust_list(worker, mm(worker))
+                .is_some()
+        );
+        scheduler.route_sigkill_receipt(worker);
     }
 
     /// The commit retires every thread of the target at the sending turn, and

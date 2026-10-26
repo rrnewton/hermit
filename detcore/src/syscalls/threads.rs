@@ -18,6 +18,7 @@ use procfs::process::Process;
 use rand::Rng;
 use reverie::BackendCapabilities;
 use reverie::Error;
+use reverie::GlobalRPC;
 use reverie::Guest;
 use reverie::Pid;
 use reverie::Stack;
@@ -60,6 +61,7 @@ use crate::syscalls::helpers::retry_nonblocking_syscall;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::robust_list;
 use crate::tool_global::FutexAction;
+use crate::tool_global::GlobalState;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::await_exact_child_physical_exit;
 use crate::tool_global::cancel_exec;
@@ -84,6 +86,7 @@ use crate::tool_local::PendingVfork;
 use crate::tool_local::RobustListExit;
 use crate::tool_local::RobustListOwner;
 use crate::tool_local::RobustListWake;
+use crate::tool_local::ThreadState;
 use crate::types::ChildWaitExitClass;
 use crate::types::ChildWaitSelector;
 use crate::types::ChildWaitSpec;
@@ -2427,6 +2430,99 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// not model futexes at all.
     fn robust_owner_death_path(&self) -> Option<OwnerDeathPath> {
         owner_death_path(&self.cfg)
+    }
+
+    /// Before the send of SIGKILL reservation `token`, record the robust list
+    /// of every thread the send kills (`Scheduler::sigkill_dying_threads`),
+    /// for its exit callback to walk ([`Self::sigkill_robust_list_wakes`]).
+    ///
+    /// Linux walks a dying thread's robust list in its own exit, before its
+    /// address space goes away (`exit_mm_release`, `futex_exit_release`,
+    /// `exit_robust_list`), however the thread dies. A SIGKILL leaves no stop
+    /// at which Detcore could read the list, and the exit callback comes after
+    /// the address space is gone, so the sender reads it here, in its own turn.
+    /// Nothing changes the list between this read and Linux's walk: the
+    /// victims run no guest code again, and no other guest thread takes a turn
+    /// before the send. Only the backends whose exit callback follows Linux's
+    /// walk need it ([`OwnerDeathPath::Kernel`]), and those run Detcore in the
+    /// tracer, which may read every guest's memory.
+    pub(crate) async fn record_sigkill_robust_lists<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        token: u64,
+    ) {
+        if self.robust_owner_death_path() != Some(OwnerDeathPath::Kernel) {
+            return;
+        }
+        let mut lists = Vec::new();
+        for (tid, mm) in crate::tool_global::sigkill_dying_threads(guest, token).await {
+            if let Some(list) = robust_list::record_robust_list(tid.as_raw()).await {
+                lists.push((tid, mm, list));
+            }
+        }
+        if !lists.is_empty() {
+            crate::tool_global::record_sigkill_robust_lists(guest, token, lists).await;
+        }
+    }
+
+    /// In the exit callback of a thread a SIGKILL ended, replay Linux's
+    /// `exit_robust_list` over the list the SIGKILL's sender recorded for it
+    /// ([`Self::record_sigkill_robust_lists`]) and deliver its wakes: one
+    /// waiter per futex Linux marked `FUTEX_OWNER_DIED` with `FUTEX_WAITERS`
+    /// set, and one per pending word that held no owner. Linux has made every
+    /// owner-word transition by now, as for the other exits on this path. A
+    /// victim's wakes are held until every victim of the send is accounted and
+    /// then run in victim order (`Scheduler::retain_sigkill_victim_wakes`); the
+    /// sender of a send that ended its own process still holds its `Exit`
+    /// grant, so its wakes run at once, before any other thread takes a turn.
+    pub(crate) async fn sigkill_robust_list_wakes<R: GlobalRPC<GlobalState>>(
+        &self,
+        global_state: &R,
+        thread_state: &ThreadState<T::ThreadState>,
+        exit_signal: Option<i32>,
+    ) {
+        if exit_signal != Some(libc::SIGKILL)
+            || self.robust_owner_death_path() != Some(OwnerDeathPath::Kernel)
+            // A list staged for this exit is delivered by the staged path.
+            || thread_state.has_matching_robust_list_exit(exit_signal)
+        {
+            return;
+        }
+        let time = thread_state.thread_logical_time.clone();
+        let mm = thread_state.mm_id;
+        let Some(list) =
+            crate::tool_global::take_sigkill_robust_list(time.clone(), global_state, mm).await
+        else {
+            return;
+        };
+        let dettid = thread_state.dettid;
+        // The owner word holds the TID the kernel gave the thread, which is the
+        // raw `DetTid` (see `Self::run_robust_list_owner_death`).
+        let (futexes, outcome) =
+            robust_list::owner_death_wakes_in_snapshot(&list, dettid.as_raw() as u32, |address| {
+                thread_state.futex_id(address, false)
+            })
+            .await;
+        if outcome.head_unreadable || outcome.aborted || outcome.next_faulted || outcome.truncated {
+            trace!(
+                "[detcore, dtid {}] SIGKILLed thread's robust-list walk stopped early: {:?}",
+                dettid, outcome,
+            );
+        }
+        let wakes: Vec<(DetTid, RobustListWake)> = futexes
+            .into_iter()
+            .map(|futex| (dettid, RobustListWake { futex }))
+            .collect();
+        let identities: Vec<FutexID> = wakes.iter().map(|(_, wake)| wake.futex).collect();
+        let counts =
+            crate::tool_global::robust_list_wakes_after_exit(time, global_state, mm, wakes).await;
+        // A held batch is answered with no counts and logged when it runs.
+        for (futex, count) in identities.into_iter().zip(counts) {
+            info!(
+                "[detcore, dtid {}] robust-list owner death woke {} waiter(s) on futex {:?} after physical exit",
+                dettid, count, futex,
+            );
+        }
     }
 
     /// The owner-death wakes a successful execve makes Linux deliver, in

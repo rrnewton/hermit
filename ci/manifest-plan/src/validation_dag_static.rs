@@ -3066,7 +3066,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
-    ("test.detcore_unit", 2811),
+    // And the four robust-list record units and two SIGKILL record-keeping
+    // units for robust-futex owner death by SIGKILL: 2817, listed.
+    ("test.detcore_unit", 2817),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3456,7 +3458,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And random_determinism's
     // a_schedule_replay_hands_the_guest_the_recorded_random_values (a replay
     // adopts the recorded --rng-seed and refuses another): 347, listed.
-    ("test.hermit_integration_3", 347),
+    // And robust_futex_owner_death's native and ptrace SIGKILL owner-death
+    // tests: 349, listed.
+    ("test.hermit_integration_3", 349),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -5378,7 +5382,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
-    ("test.detcore_unit_on_host", 2811),
+    // And the same six SIGKILL robust-list units: 2817, listed.
+    ("test.detcore_unit_on_host", 2817),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5494,7 +5499,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two-run syscall-histogram test: 693, listed.
     // And the same random_determinism schedule-replay test: 694, listed.
     // Train 6 recount (measured on 21f770f6 base): 695.
-    ("test.hermit_integration_on_host", 698),
+    // And robust_futex_owner_death's two SIGKILL owner-death tests: 700, listed.
+    ("test.hermit_integration_on_host", 700),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

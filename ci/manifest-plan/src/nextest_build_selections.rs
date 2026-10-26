@@ -947,7 +947,9 @@ mod tests {
             // fatal_core_capture's
             // a_fault_ends_the_run_while_the_leader_waits_on_a_condition_variable
             // (+1): 695.
-            assert_eq!(population, 698);
+            // And robust_futex_owner_death's native and ptrace SIGKILL
+            // owner-death tests (+2): 700.
+            assert_eq!(population, 700);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
