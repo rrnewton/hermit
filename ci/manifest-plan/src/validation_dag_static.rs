@@ -1195,7 +1195,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // capability_clear_image_readiness_preserves_legacy_conditions: 1883, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1894.
     // Train 6 recount (measured on 21f770f6 base): 1899.
-    ("test.regular_crates", 1899),
+    // And detcore-model's six access_trace::tests (record round trip, on-disk
+    // spelling, out_bytes hex, returned_digest, reader refusals, conflict
+    // rules), the access trace's record types: 1905.
+    ("test.regular_crates", 1905),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
