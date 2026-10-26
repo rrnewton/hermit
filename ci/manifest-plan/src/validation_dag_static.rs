@@ -1264,7 +1264,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1971 pin: 1971 + 2 = 1973, measured by that run.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 1944 + 2 = 1946 (Train 5 delta +2).
-    ("test.regular_crates", 1951),
+    // And host_input::tests::host_file_identities_without_and_with_contents
+    // (a property snapshot copy is identified by its contents): 1973 + 1 = 1974, listed.
+    // Rebased onto main ffe313b16: 1944 + 1 = 1945.
+    // Rebased onto main fbf9d5f0c: 1946 + 1 = 1947.
+    // Rebased onto main fcd62385f: 1951 + 1 = 1952.
+    ("test.regular_crates", 1952),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1975,7 +1980,19 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The split retains nine additional core identities: 1335 + 9 = 1344.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 1212 + 1 = 1213 (Train 5 delta +1).
-    ("test.hermit_unit", 1221),
+    // Composed source count; re-measure with the compiled inventory.
+    // Batch 1 (PRs 4539/4677/4561/4707) adds two hermit-run units:
+    // 1344 + 2 = 1346, from the batch1 validate at 9baea420 carried
+    // through the split rebase.
+    // And property_snapshot.rs's five units (the Android property area
+    // copy, shared content-named copies, a changed shared copy not joined,
+    // the root and path-length refusals, stale and held copies) and
+    // host_input_change's snapshot-copy unit: 1335 + 6 = 1341, listed.
+    // Rebased onto main e8e0f9a1c: 1348 + 6 = 1354.
+    // Rebased onto main ffe313b16: 1212 + 6 = 1218.
+    // Rebased onto main fbf9d5f0c: 1213 + 6 = 1219.
+    // Rebased onto main fcd62385f: 1221 + 6 = 1227.
+    ("test.hermit_unit", 1227),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3256,7 +3273,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 216dbc929a full validate.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 3395 + 44 = 3439 (Train 5 delta +44).
-    ("test.detcore_unit", 3465),
+    // And the property snapshot's path rule, content identity and
+    // property-service address units: 3384 + 3 = 3387, listed.
+    // Rebased onto main e8e0f9a1c: 3386 + 3 = 3389.
+    // Rebased onto main ffe313b16: 3395 + 3 = 3398.
+    // Rebased onto main fbf9d5f0c: 3439 + 3 = 3442.
+    // Rebased onto main fcd62385f: 3465 + 3 = 3468.
+    ("test.detcore_unit", 3468),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3360,7 +3383,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // received and read on a tight stack is recorded and renumbered: 164.
     // And the in-flight SCM_RIGHTS queue's seventeen scm_rights tests
     // (https://github.com/rrnewton/hermit/issues/4930): 191 + 17 = 208.
-    ("test.detcore_misc", 209),
+    // And property_snapshot's four tests (pure reads served from the copy,
+    // with metadata virtualization on and off; mappings that read no
+    // property file not refused; a file the area gained after its snapshot
+    // refused): 212.
+    // Rebased onto main e8e0f9a1c: 209 + 4 = 213.
+    ("test.detcore_misc", 213),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -5270,7 +5298,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a): 1957 + 2 = 1959 (1973 - 14).
     // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
-    ("test.regular_crates_on_host", 1937),
+    // 14 PMU/timer/replay skips: 1958 - 14 = 1944, re-measured 2026-10-31.
+    // And this change's tests, as at this node's second entry below: 1959 + 1 = 1960.
+    // Rebased onto main ffe313b16: 1930 + 1 = 1931.
+    // Rebased onto main fbf9d5f0c: 1932 + 1 = 1933.
+    // Rebased onto main fcd62385f: 1937 + 1 = 1938.
+    ("test.regular_crates_on_host", 1938),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5376,7 +5409,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same four F0a readdir_order variants: 163.
     // And the same tight-stack received-inotify test: 164.
     // And the same seventeen SCM_RIGHTS queue tests: 191 + 17 = 208.
-    ("test.detcore_misc_on_host", 209),
+    // And the four property snapshot tests: 212.
+    // Rebased onto main e8e0f9a1c: 209 + 4 = 213.
+    ("test.detcore_misc_on_host", 213),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -5814,7 +5849,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
     // Train 5 recount (same growth as test.detcore_unit), composed on measured main: 3395 + 44 = 3439.
-    ("test.detcore_unit_on_host", 3465),
+    // And the same three property snapshot units: 3384 + 3 = 3387.
+    // Rebased onto main e8e0f9a1c: 3386 + 3 = 3389.
+    // Rebased onto main ffe313b16: 3395 + 3 = 3398.
+    // Rebased onto main fbf9d5f0c: 3439 + 3 = 3442.
+    // Rebased onto main fcd62385f: 3465 + 3 = 3468.
+    ("test.detcore_unit_on_host", 3468),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6232,7 +6272,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the hosted CPUID-faulting skip set): 1327 + 2 = 1329.
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
-    ("test.hermit_unit_on_host", 1215),
+    // Composed source count; re-measure with the compiled inventory.
+    // Batch 1 recount (same growth as test.hermit_unit): 1338 + 2 = 1340.
+    // And the same six property snapshot units: 1329 + 6 = 1335.
+    // Rebased onto main e8e0f9a1c: 1342 + 6 = 1348.
+    // Rebased onto main ffe313b16: 1206 + 6 = 1212.
+    // Rebased onto main fbf9d5f0c: 1207 + 6 = 1213.
+    // Rebased onto main fcd62385f: 1215 + 6 = 1221.
+    ("test.hermit_unit_on_host", 1221),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6471,7 +6518,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a), none hosted-excluded: 1957 + 2 = 1959 (1973 - 14).
     // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
-    ("test.regular_crates_on_host", 1937),
+    // The same twenty known_gaps units, none of them hosted-excluded: 1958 - 14 = 1944.
+    // And the same host_input identity unit: 1959 + 1 = 1960.
+    // Rebased onto main ffe313b16: 1930 + 1 = 1931.
+    // Rebased onto main fbf9d5f0c: 1932 + 1 = 1933.
+    // Rebased onto main fcd62385f: 1937 + 1 = 1938.
+    ("test.regular_crates_on_host", 1938),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
