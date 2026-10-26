@@ -2795,7 +2795,22 @@ fi
 # entry. The reused SDK is not a new cold-build calibration; fresh Rust, real
 # option queries and all three Hermit constructor controls are checked
 # separately.
-expected_pin=cac18db225ca059db61305cbb1446dc834203745
+# CARRY TO 65f130ad3eb6cb7ad6cfbe32e4b246a606ceb13f (2026-10-26): from
+# cac18db225ca059db61305cbb1446dc834203745. One commit (DBT lane, generic
+# basics dh-3hkbj; 345c68cc via 6d8c7ca0, rebased onto cac18db2, patch-id
+# identical): registers the generic basics conformance tests through a new
+# reverie-test-support workspace member (tests/basics.rs,
+# tests/tool_fixtures/basics.rs, root Cargo.toml member, Cargo.lock and BUCK),
+# plus the LiteInst lane's reviewed root Cargo.toml source-catalog row
+# (dh-onmkj). git diff is empty under reverie-dbt/ and third-party/ and for
+# rust-toolchain.toml; the root Cargo.toml and Cargo.lock change only by the
+# new test-support member, which no runtime depends on. Both repository inputs
+# to the DynamoRIO content key are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory (1012), SDK and native inputs, calibrated budget, job width
+# and limits carry unchanged from the cac18db2 entry.
+expected_pin=65f130ad3eb6cb7ad6cfbe32e4b246a606ceb13f
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
