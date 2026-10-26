@@ -78,6 +78,7 @@ mod pinned_cpu;
 mod podman_store;
 mod record;
 mod record_envelope;
+mod rewrite_exclusives;
 mod record_start;
 mod remove;
 mod replay;
@@ -498,6 +499,11 @@ enum Subcommand {
     #[clap(name = "version")]
     Version(VersionOpts),
 
+    /// Report, and optionally write, the LSE rewrite of an aarch64 ELF file's
+    /// load/store-exclusive retry loops.
+    #[clap(name = "rewrite-exclusives")]
+    RewriteExclusives(rewrite_exclusives::RewriteExclusivesOpts),
+
     /// Run a program sandboxed and fully deterministically (unless external networking is allowed).
     #[clap(name = "run", trailing_var_arg = true)]
     Run(Box<RunOpts>),
@@ -668,7 +674,7 @@ impl Subcommand {
             | Subcommand::Version(_)
             | Subcommand::LogDiff(_)
             | Subcommand::InstructionMap(_)
-            | Subcommand::VerifyInputs(_) => false,
+            | Subcommand::VerifyInputs(_) | Subcommand::RewriteExclusives(_) => false,
         }
     }
 
@@ -781,6 +787,7 @@ impl Subcommand {
             Subcommand::InstructionMap(x) => x.main(global),
             Subcommand::Oci(x) => x.main(global),
             Subcommand::VerifyInputs(x) => x.main(),
+            Subcommand::RewriteExclusives(x) => x.main(),
         }
     }
 }
