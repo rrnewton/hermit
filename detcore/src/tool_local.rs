@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use detcore_model::pedigree::Pedigree;
 use detcore_model::summary::TimesliceStats;
+use detcore_model::syscall_histogram::SyscallHistogram;
 use nix::fcntl::OFlag;
 use nix::sys::stat;
 use nix::unistd::Pid;
@@ -3631,6 +3632,16 @@ pub struct ThreadStats {
     /// A simple count of how many syscalls have been handled on this thread.
     pub syscall_count: u64,
 
+    /// This thread's syscall entries by number, with the outcome of each
+    /// completed one (`crate::syscall_histogram`). Its total is
+    /// `syscall_count`. Handed to the scheduler when the thread deregisters.
+    pub syscall_histogram: SyscallHistogram,
+
+    /// A Detcore refusal policy answered the current syscall
+    /// (`crate::syscall_histogram::mark_refused`). Cleared at each syscall
+    /// entry.
+    pub syscall_refused: bool,
+
     /// This thread's happens-before counting state: per (syscall, fd, futex
     /// operation) a syscall-occurrence anchor names, how many of this thread's
     /// syscall entries matched, and the origin of each relative anchor whose
@@ -3689,11 +3700,12 @@ impl ThreadStats {
         Default::default()
     }
 
-    // TODO: this can evolve to keep a full histogram:
-    /// Increment the count of system calls
-    pub fn count_syscall(&mut self) {
+    /// Count one entry of `sysno`.
+    pub fn count_syscall(&mut self, sysno: Sysno) {
         self.syscall_count += 1;
         self.timeslice_syscall_count += 1;
+        self.syscall_histogram.enter(sysno);
+        self.syscall_refused = false;
     }
 
     /// Increment the count of signals.

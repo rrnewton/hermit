@@ -3831,15 +3831,20 @@ pub(crate) fn tool_decided_injection_failure(
 /// - `tail_inject`, whose result goes straight to the guest.
 ///
 /// A general guard needs a Reverie API hook and is not part of this change.
+///
+/// Any other refusal it takes counts the call as refused in the syscall
+/// histogram (`crate::syscall_histogram`).
 pub(crate) fn fail_on_tool_decided_injection<T, G>(guest: &mut G, sysno: Sysno)
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
     let dettid = guest.thread_state().dettid;
-    if let Some(failure) =
-        tool_decided_injection_failure(guest.take_unsupported_refusal(), dettid, sysno)
-    {
+    let refusal = guest.take_unsupported_refusal();
+    if refusal.is_some() {
+        crate::syscall_histogram::mark_refused::<T, G>(guest);
+    }
+    if let Some(failure) = tool_decided_injection_failure(refusal, dettid, sysno) {
         tracing::error!("{failure}");
         panic!("{failure}");
     }
@@ -3860,6 +3865,7 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
+    crate::syscall_histogram::mark_refused::<T, G>(guest);
     if !panic_on_unsupported_syscalls {
         return Err(fallback.into());
     }

@@ -21729,6 +21729,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             virtual_nanoseconds: 35,
             syscalls: Some(6),
             dispatch: None,
+            syscall_histogram: None,
         }),
         run2: None,
     };
