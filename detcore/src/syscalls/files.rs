@@ -7086,6 +7086,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     fd_type
                 );
                 let destination = crate::syscalls::inotify::Destination::buffer(
+                    &guest.memory(),
                     call.buf().map_or(0, |buf| buf.as_raw()),
                     call.len(),
                 );

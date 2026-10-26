@@ -60,9 +60,11 @@ use std::os::fd::RawFd;
 
 use reverie::Error;
 use reverie::Guest;
+use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::Addr;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::PathPtr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::linux_abi::Mmsghdr;
 use reverie::syscalls::linux_abi::Msghdr;
@@ -641,9 +643,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `fstat` cannot tell which it is. Recorded as an ordinary file, its
         // reads and flag changes would take paths that are wrong for it (a
         // blocking signalfd read held in the caller's turn, an
-        // `EFD_SEMAPHORE` eventfd read twice). Left unrecorded instead, as
-        // before.
-        if stat.st_mode & libc::S_IFMT == 0 {
+        // `EFD_SEMAPHORE` eventfd read twice). Its link names an inotify
+        // instance, which is recorded as one, so its reads renumber rename
+        // cookies (`crate::syscalls::inotify`); any other is left unrecorded,
+        // as before.
+        let link = if stat.st_mode & libc::S_IFMT == 0 {
+            self.received_descriptor_link(guest, fd).await
+        } else {
+            None
+        };
+        if stat.st_mode & libc::S_IFMT == 0
+            && link.as_deref() != Some(crate::syscalls::inotify::INOTIFY_LINK)
+        {
             warn!(
                 "[detcore] descriptor {fd}, received over SCM_RIGHTS, is an anonymous inode \
                  whose kind fstat does not tell: not recorded"
@@ -663,10 +674,55 @@ impl<T: RecordOrReplay> Detcore<T> {
         // even where it is an alias of one this process holds (see the
         // module documentation), made exactly as the in-guest discovery
         // makes it: a directory gets a sorted stream of its own.
-        guest
-            .thread_state()
-            .add_discovered_fd(fd, descriptor_flags, status_flags, &stat)?;
+        guest.thread_state().add_discovered_fd(
+            fd,
+            descriptor_flags,
+            status_flags,
+            &stat,
+            link.as_deref(),
+        )?;
         Ok(true)
+    }
+
+    /// What descriptor `fd` of the calling thread links to, read in the
+    /// guest (`readlinkat` of `/proc/thread-self/fd/<fd>`, injected), or
+    /// `None` where that read fails.
+    async fn received_descriptor_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Option<Vec<u8>> {
+        const TARGET_CAPACITY: usize = 64;
+        let mut path = [0_u8; 32];
+        let spelled = format!("/proc/thread-self/fd/{fd}");
+        path.get_mut(..spelled.len())?
+            .copy_from_slice(spelled.as_bytes());
+        let mut stack = guest.stack().await;
+        let link = stack.push(path);
+        let target = stack.reserve::<[u8; TARGET_CAPACITY]>();
+        let stack_guard = stack.commit().ok()?;
+        let length = guest
+            .inject_with_retry(
+                syscalls::Readlinkat::new()
+                    .with_dirfd(libc::AT_FDCWD)
+                    .with_path(PathPtr::from_ptr(link.as_raw() as *const libc::c_char))
+                    .with_buf(Some(target.cast::<libc::c_char>()))
+                    .with_buf_len(TARGET_CAPACITY),
+            )
+            .await
+            .ok()
+            .and_then(|length| usize::try_from(length).ok())
+            .filter(|length| *length < TARGET_CAPACITY);
+        let bytes = length.and_then(|length| {
+            let mut bytes = vec![0; length];
+            guest
+                .memory()
+                .read_exact(target.cast::<u8>(), &mut bytes)
+                .ok()
+                .map(|()| bytes)
+        });
+        drop(stack_guard);
+        bytes
     }
 }
 
