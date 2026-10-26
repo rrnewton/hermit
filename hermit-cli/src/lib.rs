@@ -1254,6 +1254,26 @@ pub fn scheduler_owns_guest_pid_namespace() -> bool {
 #[cfg(feature = "liteinst")]
 const IN_GUEST_RUNTIME_DELIVERS_SIGNALS: bool = false;
 
+/// Set only in a test child that re-executed this test binary as PID 1 of its
+/// own user and PID namespaces (`in_guest_delivery_harness`, design D60): the
+/// gate's set points then take the runtime as delivering signals, so the dark
+/// 3c.1 mechanisms run end to end before the flip. No shipped build has it.
+#[cfg(all(test, feature = "liteinst"))]
+static FORCE_IN_GUEST_DELIVERY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the in-guest runtime delivers signals itself, at the gate's set
+/// points: [`IN_GUEST_RUNTIME_DELIVERS_SIGNALS`], or, in a test child,
+/// [`FORCE_IN_GUEST_DELIVERY`].
+#[cfg(feature = "liteinst")]
+fn runtime_delivers_signals() -> bool {
+    #[cfg(test)]
+    if FORCE_IN_GUEST_DELIVERY.load(std::sync::atomic::Ordering::Acquire) {
+        return true;
+    }
+    IN_GUEST_RUNTIME_DELIVERS_SIGNALS
+}
+
 /// The in-guest delivery gate (`detcore::Config::in_guest_signal_delivery`,
 /// D35 of the A5 step 3c design) for a run of `backend` on Hermit's default
 /// in-guest route, from its final prepared configuration and the launcher's
@@ -4738,7 +4758,7 @@ async fn dispatch_backend(
             // The delivery gate, from the final configuration and whether
             // this process owns the guests' PID namespace; off until the
             // runtime takes it (A5 step 3c.1, D35, D52).
-            config.in_guest_signal_delivery = IN_GUEST_RUNTIME_DELIVERS_SIGNALS
+            config.in_guest_signal_delivery = runtime_delivers_signals()
                 && in_guest_signal_delivery_gate(
                     &config,
                     backend,
@@ -5085,7 +5105,7 @@ async fn dispatch_output_backend(
             // The delivery gate, from the final configuration and whether
             // this process owns the guests' PID namespace; off until the
             // runtime takes it (A5 step 3c.1, D35, D52).
-            config.in_guest_signal_delivery = IN_GUEST_RUNTIME_DELIVERS_SIGNALS
+            config.in_guest_signal_delivery = runtime_delivers_signals()
                 && in_guest_signal_delivery_gate(
                     &config,
                     backend,
@@ -6061,6 +6081,9 @@ pub fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Result<Out
         report.finish(result)
     })
 }
+
+#[cfg(all(test, feature = "liteinst"))]
+mod in_guest_delivery_harness;
 
 #[cfg(test)]
 mod tests {
