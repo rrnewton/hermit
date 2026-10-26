@@ -23908,6 +23908,7 @@ mod tests {
             size,
             mtime_sec: 1_700_000_000,
             mtime_nsec: 5,
+            content: None,
         };
         let open = |path: &str, ino: u64, size: i64| HostInputRecord {
             path: path.to_owned(),
@@ -24325,6 +24326,7 @@ mod tests {
             size: 100,
             mtime_sec: 1_700_000_000,
             mtime_nsec: 5,
+            content: None,
         };
         let mut sender_time = DetTime::new(&config);
         sender_time.add_syscall();
