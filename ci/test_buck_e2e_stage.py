@@ -32,15 +32,18 @@ run in the fixed directory's copy of the checkout, with CARGO_HOME reached throu
 fixed directory's symlink and SOURCE_DATE_EPOCH at HEAD's commit time; the symlink and
 the holder note are removed afterwards, and the copy and its target are kept for the next
 stage, which refreshes the copy by content (an unchanged file keeps its time, a changed
-or new file is written anew, a removed one goes) unless the copy is older than
-HERMIT_BUCK_STAGE_MAX_AGE_SECONDS or larger than HERMIT_BUCK_STAGE_MAX_BYTES, when it is
-wiped and the stage is cold; a failed build keeps the previous staging and returns its
+or new file is written anew, a removed one goes) from the files Git tracks only (an
+ignored or untracked file in the checkout, such as another node's build output, is
+never read, and what the stage itself wrote into the copy stays) unless the copy is
+older than HERMIT_BUCK_STAGE_MAX_AGE_SECONDS, larger than HERMIT_BUCK_STAGE_MAX_BYTES or
+without a record of what was copied, when it is wiped and the stage is cold; a failed build keeps the previous staging and returns its
 status; a stage that cannot take the lock within
 HERMIT_BUCK_STAGE_LOCK_TIMEOUT fails naming the holder, runs no build and leaves the
 holder's note alone; a missing host package is refused before the lock; and an
 uncommitted change is refused even when the copy cannot read a submodule whose .git file
 names its gitdir by a relative path (git status fails there and prints nothing), and a
-status git cannot read at all is refused rather than taken as clean.
+status git cannot read at all is refused rather than taken as clean (under reproducible
+staging the listing of tracked files fails on it first, by name).
 """
 
 from __future__ import annotations
@@ -62,7 +65,7 @@ LIBS = ("libunwind.so.8", "libunwind-x86_64.so.8")
 # Commands stage runs on its way to the check and just after it.
 HOST_COMMANDS = ("dirname", "realpath", "rm", "mkdir", "git", "cp", "python3", "du", "cut", "cat")
 # And the reproducible-staging wrapper's own.
-WRAPPER_COMMANDS = ("flock", "ln", "date", "rsync", "stat")
+WRAPPER_COMMANDS = ("flock", "ln", "date", "rsync", "stat", "sort", "comm", "xargs", "mv")
 DOC = '(docs/BUCK2_OSS.md, "Host prerequisites for Buck validation")'
 
 
@@ -620,6 +623,46 @@ class StageReproducibleTest(unittest.TestCase):
         self.assertEqual((src / "target" / "built").read_text(), "object\n")
         self.assertNotIn("this stage is cold", proc.stderr)
 
+    def test_only_tracked_files_are_copied_and_the_stages_own_files_stay(self) -> None:
+        # Another node builds into the checkout while the stage copies it (the
+        # validate of 3b0374ae: build.rust_scripts wrote agent-utils/rs/target and
+        # rsync failed with code 24 when a compiler temporary vanished). Ignored and
+        # untracked files are never read.
+        (self.tree / ".gitignore").write_text("ci/buck-e2e/staged/\ntool/target/\n")
+        (self.tree / "tracked.txt").write_text("tracked\n")
+        self.commit_tree("tracked")
+        (self.tree / "tool" / "target" / "deps").mkdir(parents=True)
+        (self.tree / "tool" / "target" / "deps" / "x.rcgu.o").write_text("in progress\n")
+        (self.tree / "scratch.txt").write_text("untracked\n")
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        src = self.fixed / "src"
+        self.assertEqual((src / "tracked.txt").read_text(), "tracked\n")
+        self.assertTrue((src / ".git").exists(), "the checkout's .git link was not copied")
+        self.assertFalse((src / "tool" / "target").exists(), "another node's build output was copied")
+        self.assertFalse((src / "scratch.txt").exists(), "an untracked file was copied")
+        copied = (self.fixed / "src.copied").read_bytes().split(b"\0")
+        self.assertIn(b"tracked.txt", copied)
+        # What a build writes into the copy is the stage's own, and stays.
+        (src / "generated.txt").write_text("written by a build script\n")
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertEqual((src / "generated.txt").read_text(), "written by a build script\n")
+        self.assertNotIn("this stage is cold", proc.stderr)
+
+    def test_a_copy_without_a_record_of_what_was_copied_is_wiped(self) -> None:
+        # The first warm version copied everything but target/ and ignored/,
+        # other nodes' build output included, and kept no record of it.
+        junk = self.fixed / "src" / "agent-utils" / "rs" / "target" / "deps" / "x.rcgu.o"
+        junk.parent.mkdir(parents=True)
+        junk.write_text("copied build output\n")
+        (self.fixed / "src" / ".stage-born").write_text("")
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("has no record of what was copied; this stage is cold", proc.stderr)
+        self.assertFalse(junk.exists())
+        self.assertTrue((self.fixed / "src.copied").is_file())
+
     def test_an_old_or_large_kept_copy_is_wiped_and_that_stage_is_cold(self) -> None:
         for bound, value in (("HERMIT_BUCK_STAGE_MAX_AGE_SECONDS", "86400"), ("HERMIT_BUCK_STAGE_MAX_BYTES", "1")):
             proc = self.run_stage(FAKE_CARGO_FAIL="release")
@@ -729,7 +772,9 @@ class StageReproducibleTest(unittest.TestCase):
         shutil.rmtree(self.tmp / "sub-gitdir")
         proc = self.run_stage()
         self.assertEqual(proc.returncode, 2, proc.stderr)
-        self.assertIn(f"ci/buck-e2e/stage: cannot read the status of {self.tree}", proc.stderr)
+        # Under reproducible staging the copy lists the tracked files first, and
+        # that git read fails the same way, before the status is read.
+        self.assertIn(f"ci/buck-e2e/stage: cannot list the files Git tracks in {self.tree}", proc.stderr)
         self.assertFalse(self.log.exists(), "a build ran without a readable status")
         self.assert_cleaned_up_and_previous_staging_kept(proc)
 

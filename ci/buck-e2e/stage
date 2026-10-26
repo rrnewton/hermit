@@ -82,12 +82,21 @@ fi
 #   - the build is warm (2026-10-26): the fixed directory, its target with it, is
 #     kept between stages, so a stage rebuilds only what changed since the last
 #     one (wiped and built cold every run, the stage compiled 862 crates, 1.17
-#     CPU-h of each validate of ccbec065). The copy is refreshed by content,
-#     rsync --checksum --delete, never preserving times: a file whose bytes are
-#     unchanged keeps the time of the stage that copied it, older than every build
-#     since, and a changed or new file is written now, newer than every build, so
-#     Cargo's mtime freshness rebuilds exactly the crates and build scripts whose
-#     inputs changed. Copying this checkout's own times (cp -a) would not be safe
+#     CPU-h of each validate of ccbec065). The copy is the files Git tracks
+#     (submodules included, with their .git links), refreshed by content with
+#     rsync --checksum --files-from, never preserving times: a file whose bytes
+#     are unchanged keeps the time of the stage that copied it, older than every
+#     build since, and a changed or new file is written now, newer than every
+#     build, so Cargo's mtime freshness rebuilds exactly the crates and build
+#     scripts whose inputs changed. A file an earlier stage copied that Git no
+#     longer tracks is removed (each stage records what it copied in
+#     $HERMIT_BUCK_STAGE_DIR/src.copied); what the stage's own builds write into
+#     the copy stays. Only tracked files are read: the validation's other nodes
+#     build into the checkout while this stage runs (build.rust_scripts writes
+#     agent-utils/rs/target), and copying that tree, as the first version of
+#     this did with rsync --delete over everything but target/ and ignored/,
+#     failed the validate of 3b0374ae with rsync code 24 when a compiler
+#     temporary vanished mid-copy. Copying this checkout's own times (cp -a) would not be safe
 #     once the target is kept: a checkout made before another validate's stage
 #     carries times older than that stage's build, and Cargo would keep stale
 #     objects. Measured on two consecutive main commits (ebf077bc, 44981290c):
@@ -100,7 +109,9 @@ fi
 #     (default a day), which bounds how long an input some build script reads
 #     without declaring it could leave an output stale, or larger than
 #     HERMIT_BUCK_STAGE_MAX_BYTES (default 64 GiB; about 5.5 GiB after one
-#     stage). Only staged/ is copied back into this checkout.
+#     stage), or when it has no record of what an earlier stage copied (a
+#     directory the first version of this left, holding copies of other nodes'
+#     build output). Only staged/ is copied back into this checkout.
 # One stage at a time holds the fixed directory: concurrent validations on a host
 # wait for the lock (about three minutes, one stage's length), up to
 # HERMIT_BUCK_STAGE_LOCK_TIMEOUT seconds (default 1200). flock releases the lock
@@ -129,22 +140,48 @@ if [[ $mode == cargo && -z ${HERMIT_BUCK_STAGE_INNER:-} && ${HERMIT_BUCK_STAGE_R
     max_bytes=${HERMIT_BUCK_STAGE_MAX_BYTES:-$((64 * 1024 * 1024 * 1024))}
     max_age=${HERMIT_BUCK_STAGE_MAX_AGE_SECONDS:-86400}
     born=$fixed_src/.stage-born
+    copied=$fixed/src.copied
     if [[ -d $fixed_src ]]; then
         held=$(du -sb "$fixed_src" 2>/dev/null | cut -f1) || held=0
         age=$(($(date +%s) - $(stat -c %Y "$born" 2>/dev/null || echo 0)))
-        if [[ ${held:-0} -gt $max_bytes || $age -gt $max_age ]]; then
-            echo "ci/buck-e2e/stage: $fixed_src holds ${held:-0} bytes (bound $max_bytes) and is ${age} s old (bound $max_age); this stage is cold" >&2
-            rm -rf "${fixed_src:?}"
+        if [[ ${held:-0} -gt $max_bytes || $age -gt $max_age || ! -f $copied ]]; then
+            echo "ci/buck-e2e/stage: $fixed_src holds ${held:-0} bytes (bound $max_bytes), is ${age} s old (bound $max_age)" \
+                "and $([[ -f $copied ]] && echo has || echo has no) record of what was copied; this stage is cold" >&2
+            rm -rf "${fixed_src:?}" "${copied:?}"
         fi
     fi
     mkdir -p "$fixed_src"
     [[ -e $born ]] || : >"$born"
-    # Everything but build outputs and local state, refreshed by content (above).
-    # The copy keeps .git, so the inner stage reads this checkout's commit and
-    # status. The kept target and the inner stage's staged/ are excluded, which
-    # also keeps --delete from removing them.
-    rsync -rlp --checksum --delete --exclude=/target --exclude=/ignored \
-        --exclude=/ci/buck-e2e/staged --exclude=/.stage-born "$root"/ "$fixed_src"/
+    # The files Git tracks, refreshed by content (above), and the .git links of
+    # the checkout and its submodules, which hermit-install's build script reads
+    # through `git -C`. Nothing untracked is read, so no other node's build
+    # output can vanish under the copy.
+    wanted=$fixed/src.wanted
+    # list_tracked DIR PREFIX: DIR's tracked files, NUL-terminated and named from
+    # the checkout's root; an initialized submodule (a mode-160000 entry) gives
+    # its .git link and, recursively, its own files.
+    list_tracked() {
+        local dir=$1 prefix=$2 entry path
+        git -C "$dir" ls-files -z --stage | while IFS= read -r -d '' entry; do
+            path=${entry#*$'\t'}
+            if [[ $entry == 160000\ * ]]; then
+                if [[ -e $dir/$path/.git ]]; then
+                    printf '%s\0' "$prefix$path/.git"
+                    list_tracked "$dir/$path" "$prefix$path/"
+                fi
+            else
+                printf '%s\0' "$prefix$path"
+            fi
+        done
+    }
+    { printf '.git\0' && list_tracked "$root" ""; } >"$wanted" ||
+        { echo "ci/buck-e2e/stage: cannot list the files Git tracks in $root" >&2; exit 2; }
+    rsync -rlp --checksum --from0 --files-from="$wanted" "$root"/ "$fixed_src"/
+    if [[ -f $copied ]]; then
+        LC_ALL=C comm -z -23 <(LC_ALL=C sort -z "$copied") <(LC_ALL=C sort -z "$wanted") |
+            (cd "$fixed_src" && xargs -0 -r rm -rf --)
+    fi
+    mv "$wanted" "$copied"
     ln -sfn "$(realpath -m "${CARGO_HOME:-$HOME/.cargo}")" "$fixed/cargo"
     status=0
     HERMIT_BUCK_STAGE_INNER=1 HERMIT_BUCK_STAGE_GIT_ROOT=$root CARGO_HOME=$fixed/cargo \
