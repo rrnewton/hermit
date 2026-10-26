@@ -3164,7 +3164,7 @@ async fn run_sabre(
     // The plugin is a separate artifact in the same target directory, so it can
     // be stale without looking it. Its check before connecting names the mismatch
     // instead of failing to decode Config or a later DetTime request field.
-    // See detcore_model::config_wire_fingerprint.
+    // See detcore::config_wire_fingerprint.
     setting(
         detcore::CONFIG_FINGERPRINT_ENV,
         OsStr::new(&detcore::config_wire_fingerprint()),
@@ -4202,7 +4202,14 @@ async fn run_dbt(
     }
 
     let program = command.get_program().to_owned();
-    let environment = command.get_captured_envs();
+    let mut environment = command.get_captured_envs();
+    // The runtime checks this against its own build before it reads the
+    // configuration frame (`detcore_dbt::CONFIG_FINGERPRINT_ENV`); the
+    // runner's private prefix keeps it from the guest.
+    environment.insert(
+        detcore_dbt::CONFIG_FINGERPRINT_ENV.into(),
+        detcore::config_wire_fingerprint().into(),
+    );
     let guest = command.into_std_lossy();
     tracing::info!(
         target: "hermit::dbt",
