@@ -3108,10 +3108,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             .iter()
             .find(|(signal, _)| *signal == sig)
             .map(|(_, why)| *why);
-        let receiver = if appropriated.is_some()
-            || self.cfg.recordreplay_modes
-            || self.cfg.replay_schedule_from.is_some()
-        {
+        // A schedule replay decides as a run does: every input of the choice
+        // is a function of the schedule, which the replay follows, and the
+        // forwarded copy is taken by the first thread the replay resumes that
+        // does not block it, which is the thread its recording resumed
+        // (`Scheduler::process_signal_receiver` refuses a replay whose
+        // schedule runs another first).
+        let receiver = if appropriated.is_some() || self.cfg.recordreplay_modes {
             None
         } else {
             Some(crate::tool_global::process_signal_receiver(guest, tgid, named, sig).await)
@@ -3154,14 +3157,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                  state is the guest's (ptrace)"
                     .to_owned()
             }
+            Some(ProcessSignalReceiver::ScheduleRunsFirst { receiver, first }) => format!(
+                "the replayed schedule runs thread {first} next, which could take the copy \
+                 before thread {receiver}, the thread its recording gave it: the replay has \
+                 left its recording"
+            ),
             None => match appropriated {
                 Some(why) => format!("the receiving thread could not take it: {why}"),
-                None if self.cfg.replay_schedule_from.is_some() => {
-                    "the run replays a recorded schedule (--replay-schedule-from), whose trace \
-                     turn can hand the turn to another thread before the chosen one takes the \
-                     copy"
-                        .to_owned()
-                }
                 None => "the run records or replays, and a replay does not reproduce the masks \
                          the choice reads"
                     .to_owned(),

@@ -4369,7 +4369,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and each_unforced_signal_to_the_senders_own_process_reaches_the_thread_linux_chooses
     // split from the own-process refusal test
     // (https://github.com/rrnewton/hermit/issues/4034): 669.
-    ("test.cli", 669),
+    // And a_schedule_replay_delivers_a_process_directed_signal_as_its_recording_did: 670.
+    ("test.cli", 670),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4917,7 +4918,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
     // And the same three process-directed signal tests: 588.
-    ("test.cli_on_host", 588),
+    // And the same process-directed signal schedule-replay test: 589.
+    ("test.cli_on_host", 589),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
