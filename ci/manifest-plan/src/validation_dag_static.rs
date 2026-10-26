@@ -1945,7 +1945,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_block_prints_each_access_stack_and_an_unavailable_reason} and
     // race_report::tests::{an_unreadable_realized_schedule_is_named,
     // a_traced_replay_carries_the_record_cap}: 1272.
-    ("test.hermit_unit", 1272),
+    // And race_report::tests::{
+    // the_first_thread_difference_is_where_realized_schedules_part,
+    // a_replay_that_left_its_schedule_is_compared_as_it_ran}: 1274.
+    ("test.hermit_unit", 1274),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5897,7 +5900,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same wait-ranking test: 1260.
     // And the same two access-trace run:: tests as test.hermit_unit: 1262.
     // And the same four racing-accesses report tests: 1266.
-    ("test.hermit_unit_on_host", 1266),
+    // And the same two realized-replay report tests: 1268.
+    ("test.hermit_unit_on_host", 1268),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
