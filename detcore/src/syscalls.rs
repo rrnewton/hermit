@@ -10,6 +10,7 @@
 
 mod accept_in_turn;
 pub(crate) mod entry_import;
+pub(crate) mod chosen_ids;
 mod files;
 /// The `SigBlk` a `/proc` status snapshot reports in place of the kernel's,
 /// for the guest-mask publication tests (`initialize_procfs_snapshot` calls it

@@ -1282,6 +1282,8 @@ fn record_or_replay_config_with_timer_support(
         // `hermit record start --network=host` included; only `hermit run`
         // sets it.
         notice_host_network_abstract_binds: false,
+        // A recording runs in a PID namespace of its own.
+        guest_ids: detcore::GuestIds::Namespace,
         // The path to the directory where syscalls will be recorded.
         replay_data: Some(data.to_path_buf()),
         clock_multiplier: None,

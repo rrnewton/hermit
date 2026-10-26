@@ -27,6 +27,7 @@ mod exec_stop_launch_tests;
 mod gdb_client;
 mod gdb_watch_helper;
 mod global_opts;
+mod guest_ids;
 mod host_capabilities;
 mod host_seccomp;
 mod image;

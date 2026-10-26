@@ -160,6 +160,7 @@ pub use config::to_legacy_backend_json;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1120): Review the public canonical Detcore root identity.
 pub use consts::ROOT_DETPID;
+pub use detcore_model::pid::GuestIds;
 pub use digest::Digest;
 pub use finalization::FinalizationFailure;
 pub use finalization::PriorityHistoryRefusal;
@@ -207,6 +208,7 @@ pub use scheduler::runqueue::DEFAULT_PRIORITY;
 pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
 pub use scheduler::set_terminal_deadlock_hook;
+pub use syscalls::chosen_ids::holder_of as chosen_id_holder;
 pub use tool_global::BackendFailureCleanup;
 pub use tool_global::GlobalState;
 pub use tool_global::SyscallObservationGap;
@@ -4829,6 +4831,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     thread_cpu_start_system_time: last_accounted_system_time,
                     clone_flags: None,
                     pending_vfork: pts.1.pending_vfork.clone(),
+                    restarted_clone_id: None,
 
                     // Child RNG identity follows the deterministic creation
                     // pedigree, never the backend/host Tid. Guest-visible IDs
