@@ -1150,10 +1150,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         // stack, whose commit writes one contiguous region down from the red
         // zone and so would cover a buffer inside it.
         let caller_mask = mask_addr.as_raw()..mask_addr.as_raw() + KERNEL_SIGSET_SIZE;
-        let below_red_zone = (guest.regs().await.rsp as usize).wrapping_sub(STACK_RED_ZONE);
-        let cells = (below_red_zone - SCRATCH_CELLS_SIZE)..below_red_zone;
+        // A stack pointer, or a buffer, too close to address zero leaves no
+        // room for the red zone and the cells below it. The call then fails
+        // with EFAULT, as it does when a cell is not writable.
+        let below_red_zone = (guest.regs().await.rsp as usize)
+            .checked_sub(STACK_RED_ZONE)
+            .ok_or(Errno::EFAULT)?;
+        let cells = below_red_zone
+            .checked_sub(SCRATCH_CELLS_SIZE)
+            .ok_or(Errno::EFAULT)?..below_red_zone;
         let cells_start = if cells.start < caller_mask.end && caller_mask.start < cells.end {
-            (caller_mask.start - SCRATCH_CELLS_SIZE) & !(std::mem::align_of::<u64>() - 1)
+            // Checked for symmetry only: the mask was just read, and nothing
+            // below address 16 is readable.
+            caller_mask
+                .start
+                .checked_sub(SCRATCH_CELLS_SIZE)
+                .ok_or(Errno::EFAULT)?
+                & !(std::mem::align_of::<u64>() - 1)
         } else {
             cells.start
         };
@@ -6881,11 +6894,13 @@ mod rt_sigsuspend_tests {
     /// and before the real call, rewrites it to `rewritten` if one is given,
     /// as another process sharing the buffer could while the call waits for
     /// its turn. Every mask a real `rt_sigsuspend` is given is kept in
-    /// `suspended_under`.
+    /// `suspended_under`. `stack_pointer`, when given, replaces the arena's
+    /// stack pointer in `regs`.
     struct SuspendGuest {
         config: Config,
         thread: ThreadState<()>,
         arena: Box<[u64; ARENA_WORDS]>,
+        stack_pointer: Option<usize>,
         caller_mask: usize,
         rewritten: Option<KernelSigset>,
         suspended_under: Vec<KernelSigset>,
@@ -6933,7 +6948,10 @@ mod rt_sigsuspend_tests {
         async fn regs(&mut self) -> libc::user_regs_struct {
             // SAFETY: user_regs_struct is plain integers; all zeroes is valid.
             let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
-            regs.rsp = (self.arena.as_ptr() as usize + STACK_WORD * 8) as u64;
+            regs.rsp = self
+                .stack_pointer
+                .unwrap_or(self.arena.as_ptr() as usize + STACK_WORD * 8)
+                as u64;
             regs
         }
         async fn stack(&mut self) -> Self::Stack {
@@ -7001,6 +7019,7 @@ mod rt_sigsuspend_tests {
             thread: ThreadState::new(DetPid::from_raw(1), &config, ()),
             config: config.clone(),
             arena: Box::new([u64::MAX; ARENA_WORDS]),
+            stack_pointer: None,
             caller_mask: caller_address,
             rewritten: Some(blocks_sigchld),
             suspended_under: Vec::new(),
@@ -7041,6 +7060,7 @@ mod rt_sigsuspend_tests {
                 thread: ThreadState::new(DetPid::from_raw(1), &config, ()),
                 config: config.clone(),
                 arena,
+                stack_pointer: None,
                 caller_mask: caller_address,
                 rewritten: peer_rewrite,
                 suspended_under: Vec::new(),
@@ -7059,6 +7079,56 @@ mod rt_sigsuspend_tests {
                 guest.arena[slot],
                 peer_rewrite.unwrap_or(original),
                 "slot {slot}: the caller's buffer holds only what the guest wrote"
+            );
+        }
+    }
+
+    /// A stack pointer that leaves no room for the red zone and the two cells
+    /// below it fails the call with EFAULT, as a cell at address zero or on
+    /// unwritable memory does, and the real call never runs. Rows: a stack
+    /// pointer of 0 and one inside the red zone's size (no room for the red
+    /// zone on x86_64; aarch64 has none), the red zone's bottom 0, 8 and 15
+    /// bytes above address zero (no room for the cells), and 16 bytes above it
+    /// (the cells would start at address zero, which is refused as null).
+    /// Mutation "an unchecked subtraction for the cells": the rows 0, 8 and 15
+    /// bytes above the red zone's bottom overflow, which panics in a debug
+    /// build.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rt_sigsuspend_with_no_room_below_the_red_zone_fails_with_efault() {
+        let config = Config::default();
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &config);
+        let mut caller_mask: Box<KernelSigset> = Box::new(kernel_sigset_bit(libc::SIGUSR2));
+        let caller_address = &mut *caller_mask as *mut KernelSigset as usize;
+        let rows = [
+            0,
+            STACK_RED_ZONE / 2,
+            STACK_RED_ZONE,
+            STACK_RED_ZONE + 8,
+            STACK_RED_ZONE + 15,
+            STACK_RED_ZONE + 16,
+        ];
+        for stack_pointer in rows {
+            let mut guest = SuspendGuest {
+                thread: ThreadState::new(DetPid::from_raw(1), &config, ()),
+                config: config.clone(),
+                arena: Box::new([u64::MAX; ARENA_WORDS]),
+                stack_pointer: Some(stack_pointer),
+                caller_mask: caller_address,
+                rewritten: None,
+                suspended_under: Vec::new(),
+            };
+            let call = syscalls::RtSigsuspend::new()
+                .with_mask(Addr::from_raw(caller_address))
+                .with_sigsetsize(KERNEL_SIGSET_SIZE);
+
+            let result = tool.handle_rt_sigsuspend(&mut guest, call).await;
+            assert!(
+                matches!(result, Err(Error::Errno(Errno::EFAULT))),
+                "stack pointer {stack_pointer}: {result:?}"
+            );
+            assert!(
+                guest.suspended_under.is_empty(),
+                "stack pointer {stack_pointer}"
             );
         }
     }
