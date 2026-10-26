@@ -43658,13 +43658,17 @@ fn a_blocking_fifo_open_with_a_host_peer_completes_as_on_linux() {
 /// does not fix where such a thread rejoins
 /// (https://github.com/rrnewton/hermit/issues/4359). Those three rows failed
 /// `--verify` in 3 of 9 full validates, so they run under `--strict` alone
-/// until that is fixed; see `HOST_TIMED_REJOIN` below.
+/// until that is fixed; see `HOST_TIMED_REJOIN` in
+/// `assert_discard_at_send_rows`. The rows are split across this test,
+/// `a_discarded_timer_expiry_or_take_fault_keeps_linuxs_wait_and_take_results`
+/// and `a_signal_discarded_by_its_named_task_or_namespace_init_reaches_no_take`,
+/// 15 each: as one test the 45 rows took up to 50 s of nextest's 57 s
+/// slow-timeout on a loaded host, and one loaded run timed a test.cli case
+/// out.
 #[test]
 fn a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take() {
-    let _guard = hermit_run_guard();
-    let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
     // (mode, hermit line, native line where it differs)
-    let rows: &[(&str, &str, Option<&str>)] = &[
+    assert_discard_at_send_rows(&[
         (
             "futex-dfl",
             "futex -1 ETIMEDOUT, handled 1",
@@ -43728,6 +43732,18 @@ fn a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take() {
             "first -1 EAGAIN, write -1 EPIPE, second 13 0",
             None,
         ),
+    ]);
+}
+
+/// The timer, take-fault and signalfd-read rows of
+/// `a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take`,
+/// whose comment describes every row; split out with
+/// `a_signal_discarded_by_its_named_task_or_namespace_init_reaches_no_take`
+/// so that each test fits nextest's slow-timeout under load.
+#[test]
+fn a_discarded_timer_expiry_or_take_fault_keeps_linuxs_wait_and_take_results() {
+    // (mode, hermit line, native line where it differs)
+    assert_discard_at_send_rows(&[
         ("timer-unchanged", "sigtimedwait 10 0", None),
         ("timer-rearm-far", "sigtimedwait -1 EAGAIN", None),
         ("timer-rearm-near", "sigtimedwait 10 0", None),
@@ -43758,6 +43774,19 @@ fn a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take() {
         ),
         // A take with a siginfo buffer copies the kept copy's siginfo out.
         ("take-info", "sigtimedwait 10 0, info signal 10", None),
+    ]);
+}
+
+/// The kept-timer, named-task, PID-namespace-init, tight-stack,
+/// partial-fault and host-timed signalfd rows of
+/// `a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take`,
+/// whose comment describes every row; split out with
+/// `a_discarded_timer_expiry_or_take_fault_keeps_linuxs_wait_and_take_results`
+/// so that each test fits nextest's slow-timeout under load.
+#[test]
+fn a_signal_discarded_by_its_named_task_or_namespace_init_reaches_no_take() {
+    // (mode, hermit line, native line where it differs)
+    assert_discard_at_send_rows(&[
         // A kept SIGEV_THREAD_ID expiry sent after a discarded copy clears
         // its bit (R5-3).
         (
@@ -43813,7 +43842,15 @@ fn a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take() {
             "read -1 EINTR, usr2 handled 1, changed 0",
             None,
         ),
-    ];
+    ]);
+}
+
+/// Runs each row of the discarded-at-send tests: the guest's line under
+/// `--strict --verify --verify-strict` (ptrace, canonical bitwise parity), or
+/// under `--strict` alone for the `HOST_TIMED_REJOIN` rows.
+fn assert_discard_at_send_rows(rows: &[(&str, &str, Option<&str>)]) {
+    let _guard = hermit_run_guard();
+    let guest = guest_discard_at_send_guest().to_str().unwrap().to_owned();
     // KNOWN NONDETERMINISTIC, https://github.com/rrnewton/hermit/issues/4359:
     // in these rows the worker's real signalfd read is woken by main's
     // discarded SIGUSR1 at a moment the host picks, and the scheduler

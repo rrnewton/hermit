@@ -4201,7 +4201,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Caller-owned DBT private placement adds two CLI launch regressions,
     // measured with the existing feature selection and exclusions unchanged:
     // 614.
-    ("test.cli", 614),
+    // Splitting a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take's
+    // 45 rows across three tests adds
+    // a_discarded_timer_expiry_or_take_fault_keeps_linuxs_wait_and_take_results
+    // and a_signal_discarded_by_its_named_task_or_namespace_init_reaches_no_take:
+    // 616.
+    ("test.cli", 616),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4709,7 +4714,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed with the existing feature selection and exclusions unchanged.
     // The same two private-placement regressions remain in the hosted selection,
     // measured with its existing exclusions unchanged: 533.
-    ("test.cli_on_host", 533),
+    // And the same two tests split out of the discarded-at-send test, not
+    // excluded: 535.
+    ("test.cli_on_host", 535),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

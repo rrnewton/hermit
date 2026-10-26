@@ -766,7 +766,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/guest_discard_at_send.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/guest_discard_at_send.c is owned by hermit-cli/tests/cli.rs: the Rust CLI integration tests a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take, a_signal_linux_discarded_before_a_wait_files_does_not_end_it and the_discarded_at_send_rows_record_and_replay compile this guest, whose modes send a standard signal Linux discards at generation and then install a handler, and require each mode's exact line under strict verify and record/replay (https://github.com/rrnewton/hermit/issues/4293); it remains a guest fixture because its CLI tests check the exact status and stdout of strict runs."
+      "why": "tests/c/guest_discard_at_send.c is owned by hermit-cli/tests/cli.rs: the Rust CLI integration tests a_signal_linux_discards_when_sent_ends_no_wait_and_reaches_no_take, a_discarded_timer_expiry_or_take_fault_keeps_linuxs_wait_and_take_results, a_signal_discarded_by_its_named_task_or_namespace_init_reaches_no_take, a_signal_linux_discarded_before_a_wait_files_does_not_end_it and the_discarded_at_send_rows_record_and_replay compile this guest, whose modes send a standard signal Linux discards at generation and then install a handler, and require each mode's exact line under strict verify and record/replay (https://github.com/rrnewton/hermit/issues/4293); it remains a guest fixture because its CLI tests check the exact status and stdout of strict runs."
     },
     {
       "disposition": "guest-fixture",
