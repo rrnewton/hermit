@@ -1195,7 +1195,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // capability_clear_image_readiness_preserves_legacy_conditions: 1883, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1894.
     // Train 6 recount (measured on 21f770f6 base): 1899.
-    ("test.regular_crates", 1899),
+    // And detcore-model's config::tests::the_guest_numbering_never_enters_the_legacy_form
+    // (--no-namespace chosen guest IDs): 1900, listed.
+    ("test.regular_crates", 1900),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1848,7 +1850,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // pinned to (https://github.com/rrnewton/hermit/issues/4824): 1135, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1172.
     // Train 6 recount (measured on 21f770f6 base): 1187.
-    ("test.hermit_unit", 1187),
+    // And guest_ids' six --pid-base resolution units: 1193, listed.
+    ("test.hermit_unit", 1193),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3064,7 +3067,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 2738 + 3 = 2741, listed.
     // And +6 from 82cbd684: 2747.
     // Train 6 recount (measured on 21f770f6 base): 2788.
-    ("test.detcore_unit", 2788),
+    // And syscalls::chosen_ids' eight clone3-form units and preemptions'
+    // the_guest_numbering_round_trips_and_is_compared: 2797, listed.
+    ("test.detcore_unit", 2797),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4360,7 +4365,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 654 + 5 = 659, listed.
     // And +1 from 82cbd684: 660.
     // Train 6 recount (measured on 21f770f6 base): 666.
-    ("test.cli", 666),
+    // And the four --no-namespace chosen-ID tests (no_namespace_guest_ids_follow_the_base_and_creation_order,
+    // no_namespace_reports_its_guest_numbering, no_namespace_refuses_a_taken_chosen_id_only_when_asked,
+    // no_namespace_refuses_a_held_pid_base) and
+    // no_namespace_concurrent_runs_take_different_windows: 671.
+    ("test.cli", 671),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4903,7 +4912,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 5 = 578, listed.
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
-    ("test.cli_on_host", 585),
+    // And the same five --no-namespace chosen-ID tests, not excluded: 590.
+    ("test.cli_on_host", 590),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5374,7 +5384,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three working-directory units: 2738 + 3 = 2741, listed.
     // And +6 from 82cbd684: 2747.
     // Train 6 recount (measured on 21f770f6 base): 2788.
-    ("test.detcore_unit_on_host", 2788),
+    // And the same nine chosen-ID units: 2797.
+    ("test.detcore_unit_on_host", 2797),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5745,7 +5756,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same fourteen pinned_cpu::tests units: 1129, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1166.
     // Train 6 recount (measured on 21f770f6 base): 1181.
-    ("test.hermit_unit_on_host", 1181),
+    // And the same six --pid-base resolution units: 1187.
+    ("test.hermit_unit_on_host", 1187),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5955,7 +5967,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hosted exclusions unchanged: 1869, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1880.
     // Train 6 recount (measured on 21f770f6 base): 1885.
-    ("test.regular_crates_on_host", 1885),
+    // And the same guest-numbering legacy-form test: 1886, listed.
+    ("test.regular_crates_on_host", 1886),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

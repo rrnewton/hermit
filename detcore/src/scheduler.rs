@@ -4378,7 +4378,8 @@ impl Scheduler {
                 .with_signal_state_copy(cfg.signal_state_copy)
                 .with_rng_seed(cfg.rng_seed())
                 .with_expired_wait_runs_charged_once(expired_wait_runs_charged_once)
-                .with_cap_preemption_charge(cfg.cap_preemption_charge);
+                .with_cap_preemption_charge(cfg.cap_preemption_charge)
+                .with_guest_ids(cfg.guest_ids);
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -17330,6 +17331,8 @@ impl Scheduler {
                 // GlobalState keeps the host-input records.
                 host_inputs: None,
                 host_inputs_changed: Vec::new(),
+                guest_ids: None,
+                host_id_tasks: 0,
             },
             info_reprio_descrip,
         ))
