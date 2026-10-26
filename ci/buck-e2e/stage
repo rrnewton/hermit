@@ -79,8 +79,28 @@ fi
 #     checkout through HERMIT_BUCK_STAGE_GIT_ROOT, not to the copy: a submodule
 #     whose .git file names its gitdir by a relative path (agent-utils) does not
 #     resolve from the copy, and `git status` there fails;
-#   - the build is still cold every run: the fixed directory is wiped before and
-#     removed after, and only staged/ is copied back into this checkout.
+#   - the build is warm (2026-10-26): the fixed directory, its target with it, is
+#     kept between stages, so a stage rebuilds only what changed since the last
+#     one (wiped and built cold every run, the stage compiled 862 crates, 1.17
+#     CPU-h of each validate of ccbec065). The copy is refreshed by content,
+#     rsync --checksum --delete, never preserving times: a file whose bytes are
+#     unchanged keeps the time of the stage that copied it, older than every build
+#     since, and a changed or new file is written now, newer than every build, so
+#     Cargo's mtime freshness rebuilds exactly the crates and build scripts whose
+#     inputs changed. Copying this checkout's own times (cp -a) would not be safe
+#     once the target is kept: a checkout made before another validate's stage
+#     carries times older than that stage's build, and Cargo would keep stale
+#     objects. Measured on two consecutive main commits (ebf077bc, 44981290c):
+#     cold 263-280 s and 3,157-3,384 CPU-s, 863 crates; warm after a Detcore
+#     change 157 s and 1,273 CPU-s, 17 crates; warm with nothing changed 17 s;
+#     and every staged file of the warm stage byte-identical to the cold stage's
+#     except libdetcore_liteinst.package.json, whose receipt names its run's own
+#     log directory and timings in any stage. The directory is wiped, and that
+#     stage is cold, once it is older than HERMIT_BUCK_STAGE_MAX_AGE_SECONDS
+#     (default a day), which bounds how long an input some build script reads
+#     without declaring it could leave an output stale, or larger than
+#     HERMIT_BUCK_STAGE_MAX_BYTES (default 64 GiB; about 5.5 GiB after one
+#     stage). Only staged/ is copied back into this checkout.
 # One stage at a time holds the fixed directory: concurrent validations on a host
 # wait for the lock (about three minutes, one stage's length), up to
 # HERMIT_BUCK_STAGE_LOCK_TIMEOUT seconds (default 1200). flock releases the lock
@@ -104,16 +124,27 @@ if [[ $mode == cargo && -z ${HERMIT_BUCK_STAGE_INNER:-} && ${HERMIT_BUCK_STAGE_R
         exit 1
     fi
     echo "pid $$ since $(date -u +%FT%TZ) for $root" >"$fixed.holder"
-    cleanup_fixed() { rm -rf "${fixed_src:?}" "${fixed:?}/cargo" "${fixed:?}.holder"; }
+    cleanup_fixed() { rm -rf "${fixed:?}/cargo" "${fixed:?}.holder"; }
     trap cleanup_fixed EXIT
-    rm -rf "${fixed_src:?}"
+    max_bytes=${HERMIT_BUCK_STAGE_MAX_BYTES:-$((64 * 1024 * 1024 * 1024))}
+    max_age=${HERMIT_BUCK_STAGE_MAX_AGE_SECONDS:-86400}
+    born=$fixed_src/.stage-born
+    if [[ -d $fixed_src ]]; then
+        held=$(du -sb "$fixed_src" 2>/dev/null | cut -f1) || held=0
+        age=$(($(date +%s) - $(stat -c %Y "$born" 2>/dev/null || echo 0)))
+        if [[ ${held:-0} -gt $max_bytes || $age -gt $max_age ]]; then
+            echo "ci/buck-e2e/stage: $fixed_src holds ${held:-0} bytes (bound $max_bytes) and is ${age} s old (bound $max_age); this stage is cold" >&2
+            rm -rf "${fixed_src:?}"
+        fi
+    fi
     mkdir -p "$fixed_src"
-    # Everything but build outputs and local state. The copy keeps .git, so the
-    # inner stage reads this checkout's commit and status.
-    for entry in "$root"/* "$root"/.[!.]*; do
-        case ${entry##*/} in target | ignored) continue ;; esac
-        cp -a --reflink=auto "$entry" "$fixed_src/"
-    done
+    [[ -e $born ]] || : >"$born"
+    # Everything but build outputs and local state, refreshed by content (above).
+    # The copy keeps .git, so the inner stage reads this checkout's commit and
+    # status. The kept target and the inner stage's staged/ are excluded, which
+    # also keeps --delete from removing them.
+    rsync -rlp --checksum --delete --exclude=/target --exclude=/ignored \
+        --exclude=/ci/buck-e2e/staged --exclude=/.stage-born "$root"/ "$fixed_src"/
     ln -sfn "$(realpath -m "${CARGO_HOME:-$HOME/.cargo}")" "$fixed/cargo"
     status=0
     HERMIT_BUCK_STAGE_INNER=1 HERMIT_BUCK_STAGE_GIT_ROOT=$root CARGO_HOME=$fixed/cargo \
