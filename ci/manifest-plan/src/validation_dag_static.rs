@@ -1219,7 +1219,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738 adds nine detcore-model units: 1918 + 9 = 1927, re-measured at this integration head.
     // The 4843 overshoot fix adds one detcore-model unit: 1927 + 1 = 1928, re-measured at this integration head.
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
-    ("test.regular_crates", 1929),
+    // And detcore-model's five schedule::sched_event_tests (the stopless mark's
+    // JSON, binary encoding, Debug form, RIP refusal and same_operations): 1934.
+    ("test.regular_crates", 1934),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1901,7 +1903,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix adds six hermit-run units: 1281 + 6 = 1287, re-measured at this integration head.
     // Its detlog correction adds one hermit-run unit: 1287 + 1 = 1288, re-measured at this integration head.
     // PR 4912 adds one hermit-run unit: 1288 + 1 = 1289, re-measured at this integration head.
-    ("test.hermit_unit", 1289),
+    // And schedule_search::tests::schedules_align_however_their_slice_ends_were_taken: 1290.
+    ("test.hermit_unit", 1290),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3150,7 +3153,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The socketpair readiness increment adds one detcore unit: 2999 + 1 = 3000, re-measured at this integration head.
     // Three recvmsg attempt-observation controls bring the measured selection to 3003.
     // The kconc/4966 V4c replay-priority transplant adds fourteen detcore units: 3003 + 14 = 3017, re-measured at this integration head.
-    ("test.detcore_unit", 3017),
+    // And the three replayer::tests units of recorded stopless slice ends: 3020.
+    ("test.detcore_unit", 3020),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4617,7 +4621,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 2026-10-17 test audit deleted
     // itimer_syscall_heavy_timer_delivers_each_5_ms_period, the 2 ms case's
     // function, guest and bound at a second period in the same regime: 36.
-    ("test.pmu_integration_cases", 41),
+    // And the two deadline_slice_cap cases of recorded and replayed slice ends
+    // taken without a stop (a_recording_keeps_lone_slice_ends_and_marks_them,
+    // replays_take_recorded_lone_slice_ends_the_same_way): 43.
+    ("test.pmu_integration_cases", 43),
     // And signal_determinism's
     // ptrace_delivery_check_approves_a_signal_to_a_thread_in_user_code: its
     // spinning guest takes the signal only at a PMU timer preemption (A5 step
@@ -5543,7 +5550,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same socketpair readiness unit: 2999 + 1 = 3000.
     // Three recvmsg attempt-observation controls bring the measured selection to 3003.
     // The same fourteen kconc/4966 V4c replay-priority units: 3003 + 14 = 3017.
-    ("test.detcore_unit_on_host", 3017),
+    // And the same three replayer units: 3020.
+    ("test.detcore_unit_on_host", 3020),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5936,7 +5944,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same six 4843 overshoot fix units: 1275 + 6 = 1281.
     // The same detlog correction unit: 1281 + 1 = 1282.
     // The same PR 4912 unit: 1282 + 1 = 1283.
-    ("test.hermit_unit_on_host", 1283),
+    // And the same schedule_search alignment test: 1284.
+    ("test.hermit_unit_on_host", 1284),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6163,7 +6172,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4738: the same nine added cases: 1927 - 14 = 1913.
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
-    ("test.regular_crates_on_host", 1915),
+    // And the same five schedule::sched_event_tests: 1920.
+    ("test.regular_crates_on_host", 1920),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

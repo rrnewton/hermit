@@ -79,6 +79,7 @@ use rand::SeedableRng;
 use rand::seq::IndexedRandom;
 use rand::seq::SliceRandom;
 use rand_pcg::Pcg64Mcg;
+pub use replayer::ReplayedSliceEnd;
 use reverie::BackendCapabilities;
 use reverie::Errno;
 use reverie::syscalls::Syscall;
@@ -4658,8 +4659,10 @@ pub fn immediate_fatal_exit() {
 pub struct ConsumeResult {
     /// Should we keep runnning this thread, if false we background the current thread after this schedevent to let the next thread run.
     pub keep_running: bool,
-    /// A remaining (delta) timeslice this thread is required to run according to the replay schedule
-    pub timeslice_remaining: Option<LogicalTime>,
+    /// A remaining (delta) timeslice this thread is required to run according to the replay
+    /// schedule, and whether the thread may take its end without a stop (only when it is
+    /// this thread's own next recorded event, matched in order).
+    pub timeslice_remaining: Option<replayer::ReplayedSliceEnd>,
     /// Should we print the stacktrace in the guest, as per --stacktrace-event
     pub print_stack: MaybePrintStack,
     /// The number of this event in the global total order of events.
@@ -6100,7 +6103,11 @@ impl Scheduler {
                             // immediate_fatal_exit();
                         }
                     }
-                    self.timeslices.insert(new_tid, timeslice_remaining);
+                    // A thread the replay switches to takes its first
+                    // timeslice end with a stop: the grant that resumes it
+                    // carries only the length.
+                    self.timeslices
+                        .insert(new_tid, timeslice_remaining.map(|end| end.length));
                     return ConsumeResult {
                         keep_running: !is_now,
                         print_stack,
@@ -22250,7 +22257,7 @@ mod test {
             let consumed = sched.consume_schedevent(&prehook);
             assert!(consumed.keep_running);
             assert_eq!(consumed.event_ix, 0);
-            assert_eq!(consumed.timeslice_remaining, duration);
+            assert_eq!(consumed.timeslice_remaining.map(|end| end.length), duration);
             assert_eq!(sched.priorities[&caller], REPLAY_DEFERRED_PRIORITY);
             assert_eq!(sched.priorities[&leader], REPLAY_FOREGROUND_PRIORITY);
             assert_eq!(sched.timeslices.get(&leader), Some(&duration));
