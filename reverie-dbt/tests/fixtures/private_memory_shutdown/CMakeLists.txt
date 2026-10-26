@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.14)
+project(private_memory_shutdown_controls C ASM)
+find_package(DynamoRIO REQUIRED)
+add_library(private_memory_shutdown_client SHARED client.c)
+configure_DynamoRIO_client(private_memory_shutdown_client)
+target_compile_options(private_memory_shutdown_client PRIVATE -Wall -Wextra -Werror)
+add_executable(private_memory_shutdown_guest guest.S)
+target_link_options(private_memory_shutdown_guest PRIVATE -nostdlib -static -no-pie)

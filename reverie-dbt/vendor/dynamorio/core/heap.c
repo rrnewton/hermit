@@ -67,7 +67,9 @@
 
 extern bool vm_areas_exited;
 
-/* Set before application execution; cleared before the client is unloaded.
+/* Set before application execution or after separate-mm child initialization;
+ * cleared without notification at separate-mm fork entry, and before the client
+ * is unloaded at final address-space shutdown. CLONE_VM retains this observer.
  * The observer only withdraws a fixed ownership fact. It cannot call back into
  * DR or allocate, and no DR lock is held on its behalf. */
 DECLARE_NEVERPROT_VAR(static void (*private_reservation_retirement)(void), NULL);

@@ -827,12 +827,21 @@ dr_get_private_reservations(dr_private_reservation_t *regions, size_t capacity);
 
 DR_API
 /**
- * Installs one initialization-time observer of lost reservation authority.
+ * Installs one address-space observer of lost reservation authority during
+ * client initialization. A separate-address-space fork disconnects the copied
+ * observer without notifying it, before child reinitialization and client fork
+ * callbacks. After rekeying its ownership state, the child can install its own
+ * observer before returning to the application. CLONE_VM retains the common
+ * observer until the final task releases that address space.
  * The callback runs before an application operation may replace/release any
  * reservation, or before the heap manager releases a whole reservation.  It
  * must not allocate, inject a syscall, or call back into DynamoRIO.  Internal
- * commitment/protection changes do not notify it.  NULL removes the observer
- * during client shutdown, before the client's code can be unloaded.
+ * commitment/protection changes do not notify it. At process shutdown or
+ * detach, DR makes a final notification and removes the observer before client
+ * process-exit callbacks can destroy its state or the client's code can be
+ * unloaded. Thread-exit callbacks can run earlier: observer state must survive
+ * them, or the client must disconnect before destroying the referenced state.
+ * NULL also explicitly removes the observer during client shutdown.
  */
 void
 dr_set_private_reservation_retirement_callback(void (*callback)(void));
@@ -945,7 +954,9 @@ DR_API
 /**
  * Regression-test seam: invoke the production normalized-syscall ownership
  * retirement path without executing a kernel syscall.  The installed observer
- * may run; callers must use this only during isolated client initialization.
+ * may run; callers must use this only during isolated client initialization,
+ * including an admitted separate-mm child's initialization before application
+ * execution, with the parent held at an explicit test barrier.
  */
 void
 dr_test_private_reservation_syscall(int sysnum, const reg_t args[6]);

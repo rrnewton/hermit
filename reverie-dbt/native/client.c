@@ -575,6 +575,14 @@ static bool test_private_memory_loss_injected;
 static bool test_private_memory_close_failure;
 static int test_private_memory_old_layout;
 static bool private_memory_test_check(bool condition, const char* check);
+static const char* test_private_memory_child_path;
+static int test_private_memory_child_mode;
+static void private_memory_child_test_initialize(void);
+static void private_memory_child_test_before_birth(void);
+static void private_memory_child_test_parent_setup(void);
+static void private_memory_child_test_refused(void);
+static void private_memory_child_test_rebound(void);
+static void private_memory_child_test_waited(void);
 static atomic_flag compare_exchange_self_tested = ATOMIC_FLAG_INIT;
 static void run_compare_exchange_self_test(void);
 static uint32_t compare_exchange_word(
@@ -1654,6 +1662,7 @@ static bool require_supported_child_pid_namespace(void) {
   namespace_admission_refused = true;
   release_clone_identity_handoff(atomic_load_explicit(
       &pending_clone_birth_token, memory_order_acquire));
+  private_memory_child_test_refused();
   (void)dr_invoke_syscall_as_app(
       dr_get_current_drcontext(), SYS_exit, 1, (reg_t)101);
   /* The terminal syscall cannot return. Keep an API failure child-local. */
@@ -2511,6 +2520,10 @@ static void rebind_private_memory_after_clone(uint64_t flags) {
   runtime_memory_owner_epoch = child_epoch;
   runtime_memory_owner_pid = child;
   task_state_unlock();
+  // The SDK drops the parent's registration before separate-mm fork reinit.
+  // Publish the child's observer only after its real owner rekey is complete.
+  dr_set_private_reservation_retirement_callback(retire_private_memory);
+  private_memory_child_test_rebound();
 }
 
 // 1 means kernel exit is complete, 0 means still pending, -1 is a failure.
@@ -4074,6 +4087,8 @@ static bool prepare_clone_birth(
     const uint64_t* args,
     clone_syscall_origin_t origin) {
   uint64_t flags;
+  if (is_clone_syscall(sysnum))
+    private_memory_child_test_before_birth();
   capture_observe_lifecycle(sysnum, args);
   if (fail_if_process_clone_result_pending(counters, sysnum))
     return false;
@@ -4307,6 +4322,8 @@ static int32_t complete_clone_birth(
         dr_get_process_id() != runtime_owner_pid &&
         runtime_uses_external_global()))
     counters->pending_clone_flags = 0;
+  if (result > 0 && (flags & (CLONE_VM | CLONE_THREAD)) == 0)
+    private_memory_child_test_parent_setup();
   return result > 0 ? (int32_t)result : 0;
 }
 
@@ -5386,6 +5403,8 @@ static void post_syscall(void* drcontext, int sysnum) {
   if (counters->pending_birth_token != 0 && is_clone_syscall(sysnum)) {
     completed_child_tid = complete_clone_birth(counters, syscall_result);
   }
+  if (sysnum == SYS_wait4 && host_syscall_result > 0)
+    private_memory_child_test_waited();
 
   if (is_exec_syscall(sysnum) && evidence_is_enabled())
     require_evidence_flush(EVIDENCE_FRAME_EXEC_CANCEL);
@@ -7254,6 +7273,7 @@ static void signal_admission_return(void) {
 }
 
 #include "mapping_capture.h"
+#include "private_memory_child_test.h"
 
 static void runtime_idle(void) {
   if (!runtime_retirement_requested &&
@@ -7417,6 +7437,13 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
       test_skip_terminal_cleanup = true;
     else if (strcmp(argv[i], "-test-backend-failure-sender-lookup-miss") == 0)
       test_backend_failure_sender_lookup_miss = true;
+    else if (strcmp(argv[i], "-test-private-memory-child") == 0) {
+      DR_ASSERT(i + 2 < argc);
+      const char* mode = argv[++i];
+      DR_ASSERT(strcmp(mode, "refused") == 0 || strcmp(mode, "accepted") == 0);
+      test_private_memory_child_mode = strcmp(mode, "refused") == 0 ? 1 : 2;
+      test_private_memory_child_path = argv[++i];
+    }
     else if (strcmp(argv[i], "-test-private-memory") == 0) {
       if (++i >= argc) {
         dr_fprintf(diagnostic_file, "PRIVATE_MEMORY_TEST missing-mode\n");
@@ -7667,6 +7694,7 @@ DR_EXPORT void dr_client_main(client_id_t id, int argc, const char* argv[]) {
   runtime_callbacks_page.value.branch_fact = query_branch_fact;
   mapping_capture_initialize();
   runtime_callbacks_page.value.mapping_capture = runtime_mapping_capture;
+  private_memory_child_test_initialize();
   if (!run_private_memory_self_test())
     return;
 

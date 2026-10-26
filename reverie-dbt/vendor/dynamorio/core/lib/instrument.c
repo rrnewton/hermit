@@ -904,6 +904,12 @@ instrument_exit_event(void)
 {
     /* Note - currently own initexit lock when this is called (see PR 227619). */
 
+    /* Withdraw while both the observer's code and its client-owned state are
+     * alive. Process-exit callbacks may destroy that state, and instrument_exit or
+     * loader_exit can unload the client before bootstrap/heap withdrawal. */
+    heap_retire_private_reservations();
+    heap_set_private_reservation_retirement_callback(NULL);
+
     /* support dr_get_mcontext() from the exit event */
     if (!standalone_library)
         get_thread_private_dcontext()->client_data->mcontext_in_dcontext = true;
