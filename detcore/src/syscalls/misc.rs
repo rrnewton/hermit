@@ -218,7 +218,7 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
             | libc::PR_CAPBSET_DROP
             | libc::PR_CAP_AMBIENT
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-NUMBER)
+            // TODO-HUMAN-REVIEW(PR-4763)
             //
             // PR_SET_PTRACER names which process may ptrace the caller's
             // process under the Yama LSM's ptrace scope 1, or any process
