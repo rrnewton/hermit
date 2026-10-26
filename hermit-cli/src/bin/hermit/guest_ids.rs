@@ -61,10 +61,28 @@ const RESERVED_PIDS: i32 = 300;
 /// until this process exits.
 pub(super) fn resolve(
     no_namespace: bool,
-    pid_base: Option<i32>,
+    required: Option<Required<'_>>,
     strict: bool,
 ) -> Result<(GuestIds, Option<String>), Error> {
-    resolve_with(no_namespace, pid_base, strict, &Host)
+    resolve_with(no_namespace, required, strict, &Host)
+}
+
+/// A base the run must have, and why.
+#[derive(Clone, Copy, Debug)]
+pub(super) enum Required<'a> {
+    /// The run gave `--pid-base`.
+    PidBase(i32),
+    /// The run replays a record (`source`, an option and a path) whose
+    /// guest IDs were chosen from `base`.
+    Replay { source: &'a str, base: i32 },
+}
+
+impl Required<'_> {
+    fn base(&self) -> i32 {
+        match *self {
+            Required::PidBase(base) | Required::Replay { base, .. } => base,
+        }
+    }
 }
 
 /// The host facts [`resolve`] reads, replaced in tests.
@@ -192,7 +210,7 @@ impl Reservation {
 
 fn resolve_with(
     no_namespace: bool,
-    pid_base: Option<i32>,
+    required: Option<Required<'_>>,
     strict: bool,
     host: &dyn HostIds,
 ) -> Result<(GuestIds, Option<String>), Error> {
@@ -200,15 +218,24 @@ fn resolve_with(
         return Ok((GuestIds::Namespace, None));
     }
     let pid_max = host.pid_max().map_err(Error::msg)?;
-    // An explicit base the kernel can never give is a usage error.
-    if let Some(base) = pid_base
-        && (base < 1 || base >= pid_max)
-    {
-        anyhow::bail!(
+    // A base the kernel can never give: a usage error when given, a refusal
+    // when a record asks for it (it was recorded on a host with a larger
+    // pid_max).
+    match required {
+        Some(Required::PidBase(base)) if base < 1 || base >= pid_max => anyhow::bail!(
             "--pid-base={base} is not a process ID this host can give: it must be at least 1 \
              and below pid_max, {pid_max}"
-        );
+        ),
+        Some(Required::Replay { source, base }) if base < 1 || base >= pid_max => {
+            return Err(Error::new(PolicyRefusal).context(format!(
+                "{source} was recorded with guest process IDs chosen from {base}, which this \
+                 host cannot give (its pid_max is {pid_max}), so the replay cannot follow it. \
+                 Record the run again on this host"
+            )));
+        }
+        _ => {}
     }
+    let pid_base = required.map(|required| required.base());
     let size = window_ids(pid_max);
     let cursor = host.cursor().unwrap_or(pid_max / 2).clamp(1, pid_max - 1);
     // The cheap check first: a run that may not choose IDs warns without
@@ -245,19 +272,27 @@ fn resolve_with(
                 },
                 None,
             )),
-            Some(cause) => {
-                let asked = if pid_base.is_some() {
-                    "--pid-base"
-                } else {
-                    "--strict"
-                };
-                Err(Error::new(PolicyRefusal).context(format!(
-                    "{asked} with --no-namespace needs the guest's process IDs chosen from \
-                     {base}, and Hermit cannot choose them: {cause}. Pass a --pid-base whose IDs \
-                     no host task or other run holds, or run as a user that may choose process \
-                     IDs (CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN)"
-                )))
-            }
+            Some(cause) => Err(Error::new(PolicyRefusal).context(match required {
+                Some(Required::Replay { source, .. }) => format!(
+                    "{source} was recorded with guest process IDs chosen from {base}, and this \
+                     replay needs exactly those IDs but cannot have them: {cause}. Stop what \
+                     holds them, run as a user that may choose process IDs \
+                     (CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN), or record the run again"
+                ),
+                _ => {
+                    let asked = if pid_base.is_some() {
+                        "--pid-base"
+                    } else {
+                        "--strict"
+                    };
+                    format!(
+                        "{asked} with --no-namespace needs the guest's process IDs chosen from \
+                         {base}, and Hermit cannot choose them: {cause}. Pass a --pid-base whose \
+                         IDs no host task or other run holds, or run as a user that may choose \
+                         process IDs (CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN)"
+                    )
+                }
+            })),
         };
     }
     // Windows wholly inside RESERVED_PIDS..pid_max: just behind the cursor's
@@ -536,7 +571,9 @@ mod tests {
     fn an_explicit_base_or_strict_refuses_host_ids() {
         let host = FakeHost::new();
         assert_eq!(
-            resolve_with(true, Some(20000), false, &host).unwrap().0,
+            resolve_with(true, Some(Required::PidBase(20000)), false, &host)
+                .unwrap()
+                .0,
             chosen(20000, true)
         );
         // 20000 starts in window 19 and its 1024 IDs end in window 20.
@@ -560,25 +597,55 @@ mod tests {
         );
         // One past the window is not checked.
         assert_eq!(
-            resolve_with(true, Some(16384 - 1024), false, &host)
+            resolve_with(true, Some(Required::PidBase(16384 - 1024)), false, &host)
                 .unwrap()
                 .0,
             chosen(15360, true)
         );
-        let error = refusal(resolve_with(true, Some(16500), false, &host));
+        let error = refusal(resolve_with(
+            true,
+            Some(Required::PidBase(16500)),
+            false,
+            &host,
+        ));
         assert!(error.contains("--pid-base"), "{error}");
+    }
+
+    /// A replay's base is a requirement like `--pid-base`, but its refusals
+    /// name the record, and a base this host cannot give is a refusal, not a
+    /// usage error.
+    #[test]
+    fn a_replayed_base_is_required_and_named_by_its_record() {
+        let source = "--replay-preemptions-from rec.json";
+        let host = FakeHost::new();
+        let replay = |base| Some(Required::Replay { source, base });
+        assert_eq!(
+            resolve_with(true, replay(20000), false, &host).unwrap().0,
+            chosen(20000, true)
+        );
+        // Now held by that run: a second replay of the record is refused.
+        let error = refusal(resolve_with(true, replay(20000), false, &host));
+        assert!(
+            error.contains(source)
+                && error.contains("needs exactly those IDs")
+                && !error.contains("--pid-base"),
+            "{error}"
+        );
+        let error = refusal(resolve_with(true, replay(2097152), false, &host));
+        assert!(error.contains("its pid_max is 32768"), "{error}");
     }
 
     #[test]
     fn a_base_the_kernel_cannot_give_is_a_usage_error() {
         let host = FakeHost::new();
         for base in [0, -5, 32768, 40000] {
-            let error = resolve_with(true, Some(base), false, &host).unwrap_err();
+            let error =
+                resolve_with(true, Some(Required::PidBase(base)), false, &host).unwrap_err();
             assert!(error.downcast_ref::<PolicyRefusal>().is_none());
             assert!(format!("{error}").contains("pid_max, 32768"), "{error}");
         }
         // The window is cut at pid_max.
-        assert!(resolve_with(true, Some(32767), false, &host).is_ok());
+        assert!(resolve_with(true, Some(Required::PidBase(32767)), false, &host).is_ok());
     }
 
     /// Without the capability, a run that asked is refused and any other
@@ -588,7 +655,12 @@ mod tests {
     fn without_the_capability_or_a_window() {
         let mut host = FakeHost::new();
         host.can_choose = Err("this user may not choose process IDs");
-        let error = refusal(resolve_with(true, Some(1000), false, &host));
+        let error = refusal(resolve_with(
+            true,
+            Some(Required::PidBase(1000)),
+            false,
+            &host,
+        ));
         assert!(error.contains("may not choose"), "{error}");
         let (ids, warning) = resolve_with(true, None, false, &host).unwrap();
         assert_eq!(ids, GuestIds::Host);

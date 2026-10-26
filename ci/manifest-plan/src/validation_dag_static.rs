@@ -1864,7 +1864,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And guest_ids' a_pid_max_under_two_windows_leaves_no_default_window and
     // run's a_base_or_host_ids_the_host_decided_are_host_drawn and
     // saved_config_records_the_guest_id_base_hermit_chose: 1166 + 3 = 1230, listed.
-    ("test.hermit_unit", 1230),    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
+    // And the --no-namespace replay units
+    // a_replayed_base_is_required_and_named_by_its_record and
+    // no_namespace_replays_follow_only_records_whose_ids_were_chosen_alike: 1169 + 2 = 1232.
+    ("test.hermit_unit", 1232),    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
     // Four process-retirement fence controls and four uncontrolled-retirement
@@ -4417,7 +4420,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // no_namespace_completes_a_guest_set_tid_with_the_chosen_id: 643 + 2 = 645.
     // And no_namespace_gives_a_new_pid_namespace_child_its_chosen_id and
     // no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id: 645 + 2 = 713.
-    ("test.cli", 713),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
+    // And no_namespace_preemption_records_replay_under_their_base: 647 + 1 = 714.
+    ("test.cli", 714),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
     // sabre_reports_a_replaced_host_file_without_naming_it_the_cause,
@@ -4971,7 +4975,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same pid_max refusal test, not excluded: 561 + 1 = 628.
     // And the same two clone tests, not excluded: 562 + 2 = 630.
     // And the same two tests, not excluded: 564 + 2 = 632.
-    ("test.cli_on_host", 632),
+    // And the same --no-namespace replay test: 566 + 1 = 633.
+    ("test.cli_on_host", 633),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5829,7 +5834,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same 23, keeping the six local-only cases: 1196 + 23 = 1219.
     // And the same six --pid-base resolution units: 1154 + 6 = 1221.
     // And the same three units: 1160 + 3 = 1224.
-    ("test.hermit_unit_on_host", 1224),
+    // And the same two --no-namespace replay units: 1163 + 2 = 1226.
+    ("test.hermit_unit_on_host", 1226),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
