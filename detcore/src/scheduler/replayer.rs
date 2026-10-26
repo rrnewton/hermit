@@ -303,6 +303,15 @@ impl Replayer {
         self.cursor.next()
     }
 
+    /// The thread of the first remaining recorded event that one of
+    /// `threads` runs, other than `except`, if any.
+    pub(super) fn next_thread_among(&self, threads: &[DetTid], except: DetTid) -> Option<DetTid> {
+        (0..)
+            .map_while(|index| self.cursor.peek_nth(index))
+            .map(|event| event.dettid)
+            .find(|thread| *thread != except && threads.contains(thread))
+    }
+
     fn peek_next(&self) -> Option<SchedEvent> {
         self.cursor.peek().cloned()
     }

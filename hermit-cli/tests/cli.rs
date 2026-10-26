@@ -36345,6 +36345,77 @@ fn a_process_directed_signal_goes_to_the_thread_linux_chooses() {
     }
 }
 
+/// A schedule replay delivers a process-directed signal to the thread its
+/// recording delivered it to (https://github.com/rrnewton/hermit/issues/4034).
+/// It decides from the same schedule as the recording, and the forwarded copy
+/// goes to the first thread it resumes that does not block the signal, which
+/// is the thread the recording resumed first. Each mode of the guest above
+/// is recorded under `--chaos` and replayed with `--replay-schedule-from`:
+/// the replay prints the recording's receiver, worker 2 in `term-one` and
+/// `term-queued`, with no desync, and `segv-pidfd`'s fatal signal ends the
+/// replay's process as it ended the recording's. `segv-pidfd`'s schedule is
+/// not compared: the deaths of a group a fatal signal ends are retired at
+/// host-timed moments until https://github.com/rrnewton/hermit/pull/4589 and
+/// the change stacked on it land, so its parent's wait ends at another point
+/// (its `--verify` is not at parity either, above). Before, the replay refused
+/// every such send by name.
+#[test]
+fn a_schedule_replay_delivers_a_process_directed_signal_as_its_recording_did() {
+    let guest = process_signal_receiver_guest().to_str().unwrap().to_owned();
+    let receiver =
+        |thread: &str| format!("receiver: {thread}\nsi_code: SI_USER\nsi_pid is the sender: yes\n");
+    let exited = "child exit status: 0\n";
+    let cases: Vec<(&str, String, bool)> = vec![
+        ("term", receiver("main thread") + exited, true),
+        ("term-one", receiver("worker 2") + exited, true),
+        (
+            "term-queued",
+            "pending after the send: SIGTERM\n".to_owned() + &receiver("worker 2") + exited,
+            true,
+        ),
+        (
+            "segv-pidfd",
+            "child killed by signal 11\n".to_owned(),
+            false,
+        ),
+    ];
+    for (mode, expected, exact) in cases {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let schedule = directory.path().join("schedule.json");
+        let summary = directory.path().join("replay.summary.json");
+        let record = format!("--record-preemptions-to={}", schedule.display());
+        let replay = format!("--replay-schedule-from={}", schedule.display());
+        let summary_arg = format!("--summary-json={}", summary.display());
+        for (leg, run_args) in [
+            ("recording", vec!["--chaos", "--seed=1", record.as_str()]),
+            ("replay", vec![replay.as_str(), summary_arg.as_str()]),
+        ] {
+            let mut command_args = vec!["--log=error", "run", "--strict"];
+            command_args.extend(run_args);
+            command_args.extend(["--timeout", "60", "--", guest.as_str(), mode]);
+            let (status, log) = run_with_deadline(
+                hermit_command(&command_args),
+                directory.path(),
+                Duration::from_secs(180),
+                false,
+            );
+            let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+                .expect("failed to read the guest's stdout");
+            assert_eq!(
+                status.and_then(|status| status.code()),
+                Some(0),
+                "{mode} {leg}:\nstdout:\n{stdout}\nstderr:\n{log}"
+            );
+            assert_eq!(stdout, expected, "{mode} {leg}: stderr:\n{log}");
+        }
+        if exact {
+            let summary: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+            assert_eq!(summary["schedevent_desynced"], 0, "{mode}: {summary}");
+        }
+    }
+}
+
 /// A thread's process-directed signal to its own process that Linux gives to
 /// another thread is refused by name
 /// (https://github.com/rrnewton/hermit/issues/4034). Under ptrace every other

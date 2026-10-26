@@ -154,6 +154,10 @@ pub enum ProcessSignalReceiver {
     ExecInFlight,
     /// This scheduler does not model signal targets (only ptrace does).
     NotModeled,
+    /// A schedule replay chose `receiver`, as its recording did, but the
+    /// recorded schedule next runs `first`, another thread of the process
+    /// that could take the copy before it: the replay has left its recording.
+    ScheduleRunsFirst { receiver: DetTid, first: DetTid },
 }
 
 /// Whether one thread `wants_signal`, in the model above.
@@ -313,6 +317,28 @@ impl Scheduler {
             .copied()
             .unwrap_or_else(|| DetTid::from_raw(process.as_raw()));
         let (receiver, moved) = complete_signal(&threads, named, curr_target);
+        // A schedule replay decides as its recording did, from the same
+        // schedule, and resumes the threads in the recorded order, so the
+        // chosen thread, which the recording resumed before any other that
+        // could take the copy (`first_process_signal_taker`), is the next of
+        // them its schedule runs. If it is not, the replay has left its
+        // recording, and another thread could take the copy first.
+        if let ProcessSignalReceiver::Thread {
+            thread,
+            sole: false,
+        } = receiver
+            && thread != sender
+            && let Some(first) = self.replayer.as_ref().and_then(|replayer| {
+                let process_threads: Vec<DetTid> = threads.iter().map(|(tid, _)| *tid).collect();
+                replayer.next_thread_among(&process_threads, sender)
+            })
+            && first != thread
+        {
+            return ProcessSignalReceiver::ScheduleRunsFirst {
+                receiver: thread,
+                first,
+            };
+        }
         // A signal Linux discards as it is sent never reaches
         // `complete_signal` (`prepare_signal`, signal.c:1053-1054), so it
         // moves nothing and takes no thread; its copy is dropped at the send.
