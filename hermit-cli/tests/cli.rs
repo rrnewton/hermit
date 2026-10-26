@@ -56442,6 +56442,9 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
     };
 
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 7bcb3a229a (Compare re-recorded branch counts only when the counter is exact)
     // The schedule as a host whose branch counter fails Reverie's validation
     // can repeat it: which thread ran which event, in order. Such a counter
     // (an AMD Zen host with SpecLockMap on, say) can tally a few branches
@@ -56459,10 +56462,13 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
     let record = directory.path().join("record.json");
     let recorded = run(13, &record, None);
     let exact_counter = !stderr(&recorded).contains("performance counters failed");
+<<<<<<< HEAD
 =======
     let record = directory.path().join("record.json");
     let recorded = run(13, &record, None);
 >>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
+=======
+>>>>>>> 7bcb3a229a (Compare re-recorded branch counts only when the counter is exact)
     let recorded_order = order(&recorded);
     let recording = read(&record);
     let rejoins = &recording["rejoins"];
@@ -56487,6 +56493,9 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
         );
         let replay = read(&rerecord);
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 7bcb3a229a (Compare re-recorded branch counts only when the counter is exact)
         assert_eq!(
             replay["rejoins"], recording["rejoins"],
             "probe seed {probe_seed}: the replay re-recorded other readmissions"
@@ -56499,6 +56508,7 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
                 );
             }
         } else {
+<<<<<<< HEAD
             assert_eq!(
                 events(&replay["global"]),
                 events(&recording["global"]),
@@ -56509,6 +56519,12 @@ fn a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did() {
                 replay[field], recording[field],
                 "probe seed {probe_seed}: the replay re-recorded another {field}"
 >>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
+=======
+            assert_eq!(
+                events(&replay["global"]),
+                events(&recording["global"]),
+                "probe seed {probe_seed}: the replay re-recorded another schedule"
+>>>>>>> 7bcb3a229a (Compare re-recorded branch counts only when the counter is exact)
             );
         }
     }
