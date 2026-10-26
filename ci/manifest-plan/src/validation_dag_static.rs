@@ -3197,7 +3197,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // for main's record serde: 3060.
     // And a_marked_record_states_its_format_inside_its_envelope: 3061.
     // And an_unread_stated_format_survives_every_format_raise: 3062.
-    ("test.detcore_unit", 3062),
+    // And tool_global's
+    // a_start_grant_carries_the_threads_replayed_first_slice and
+    // finish_thread_start_installs_a_replayed_first_slice: 3064, listed.
+    ("test.detcore_unit", 3064),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5624,7 +5627,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same record-serde unit: 3060.
     // And the same marked-record format unit: 3061.
     // And the same stated-format unit: 3062.
-    ("test.detcore_unit_on_host", 3062),
+    // And the same two start-grant units: 3064, listed.
+    ("test.detcore_unit_on_host", 3064),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
