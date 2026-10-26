@@ -432,6 +432,14 @@ fn protected_evidence_capture_ready(protected_level: i32, tracing_active: bool) 
 /// environment carries only what the guest was given.
 pub const DETCONFIG_ENV: &str = "HERMIT_DBT_DETCONFIG";
 
+/// Hermit's legacy private environment namespace for DBT launches.
+///
+/// Every Hermit DBT runner selects this prefix explicitly. Reverie's generic
+/// default keeps application variables visible; adopting that default without
+/// the companion selections would expose Hermit's previously private inputs.
+/// This policy does not hide the broader `HERMIT_` namespace.
+pub const PRIVATE_ENV_PREFIX: &str = "HERMIT_DBT_";
+
 /// Where the effective Detcore [`Config`] came from, for native diagnostics.
 enum ConfigSource {
     /// Received from the coordinator through its existing first Config frame.

@@ -2612,7 +2612,15 @@ fi
 # default-off native test emitter. SDK tree and build.rs are byte-identical to
 # 8b7ab5f3; the verified a0f4981c SDK recipe and existing budgets carry unchanged.
 # Fresh focused Rust/native controls are required and recorded for this pin.
-expected_pin=23ec3768f245d58643bf6bb96d629799b5e12722
+# CARRY TO c0b6687fb4f9c3d3b9e378fababd111ced15f0b6 (2026-10-26):
+# Caller-selected environment privacy changes Rust launch configuration and tests;
+# the native client delta is comment-only. The complete DynamoRIO tree, build.rs
+# and native CMakeLists.txt are byte-identical to 23ec3768. With CMAKE=cmake,
+# CMAKE_GENERATOR unset and SOURCE_DATE_EPOCH=0, SDK recipe a0f4981c is unchanged.
+# Carry the existing SDK budget/job limits on those unchanged cold-build inputs;
+# a warm cache hit is not a new cold-build calibration. Fresh Rust/caller checks
+# remain separate, and this pin requires the Hermit-owned privacy selection.
+expected_pin=c0b6687fb4f9c3d3b9e378fababd111ced15f0b6
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

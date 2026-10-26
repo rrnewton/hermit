@@ -1780,7 +1780,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed.
     // Caller-owned DBT evidence validation (dh-pp7q9): one production-configuration refusal unit,
     // measured with the existing selection and exclusions unchanged.
-    ("test.hermit_unit", 1092),
+    // Caller-selected DBT environment privacy adds one library regression,
+    // listed with the existing feature selection and exclusions unchanged.
+    ("test.hermit_unit", 1093),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4047,7 +4049,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // putting its configuration in the DBT guest's environment: 608, listed.
     // And verify_print_verify_logs_echoes_a_refused_first_runs_log, added by
     // Hermit bbcd2f3e without a count: 609 (validate at 285a61ae saw 609).
-    ("test.cli", 609),
+    // Caller-selected DBT environment privacy adds one CLI regression,
+    // listed with the existing feature selection and exclusions unchanged.
+    ("test.cli", 610),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4545,7 +4549,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 527.
     // And the same uncounted verify-log echo test from bbcd2f3e, not excluded:
     // 528.
-    ("test.cli_on_host", 528),
+    // Caller-selected DBT environment privacy adds one CLI regression,
+    // listed with the existing feature selection and exclusions unchanged.
+    ("test.cli_on_host", 529),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5317,7 +5323,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // strict-schedule-boundaries refusal unit: 1091, listed.
     // Caller-owned DBT evidence validation (dh-pp7q9): one production-configuration refusal unit,
     // measured with the existing selection and exclusions unchanged.
-    ("test.hermit_unit_on_host", 1092),
+    // Caller-selected DBT environment privacy adds one library regression,
+    // listed with the existing feature selection and exclusions unchanged.
+    ("test.hermit_unit_on_host", 1093),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

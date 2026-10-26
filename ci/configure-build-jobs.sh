@@ -2688,8 +2688,16 @@ fi
 # default-off native test emitter. SDK tree and build.rs are byte-identical to
 # 8b7ab5f3; the verified a0f4981c SDK recipe and existing budgets carry unchanged.
 # Fresh focused Rust/native controls are required and recorded for this pin.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 23ec3768f245d58643bf6bb96d629799b5e12722 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 23ec3768f245d58643bf6bb96d629799b5e12722 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO c0b6687fb4f9c3d3b9e378fababd111ced15f0b6 (2026-10-26):
+# Caller-selected environment privacy changes Rust launch configuration and tests;
+# the native client delta is comment-only. The complete DynamoRIO tree, build.rs
+# and native CMakeLists.txt are byte-identical to 23ec3768. With CMAKE=cmake,
+# CMAKE_GENERATOR unset and SOURCE_DATE_EPOCH=0, SDK recipe a0f4981c is unchanged.
+# Carry the existing SDK budget/job limits on those unchanged cold-build inputs;
+# a warm cache hit is not a new cold-build calibration. Fresh Rust/caller checks
+# remain separate, and this pin requires the Hermit-owned privacy selection.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c0b6687fb4f9c3d3b9e378fababd111ced15f0b6 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c0b6687fb4f9c3d3b9e378fababd111ced15f0b6 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
