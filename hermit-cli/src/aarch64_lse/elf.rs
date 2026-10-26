@@ -119,7 +119,9 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
     if bytes.len() < 4 || bytes[..4] != *goblin::elf::header::ELFMAG {
         return Ok(None);
     }
-    let mut relocated: Vec<(u64, u64)> = Vec::new();
+    // The byte ranges relocations cover, filled inside the block below, which
+    // is where the parsed ELF lives.
+    let relocated: Vec<(u64, u64)>;
     let mut relr_unreadable = false;
     let sections = {
         let elf = Elf::parse(bytes)?;
@@ -137,7 +139,7 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
         // A relocation's own width is not in the entry, so take the widest
         // aarch64 relocation (8 bytes): any sequence those bytes touch is
         // refused.
-        relocated = elf
+        let mut relocations: Vec<(u64, u64)> = elf
             .shdr_relocs
             .iter()
             .flat_map(|(_, relocs)| relocs.iter().map(|reloc| reloc.r_offset))
@@ -166,8 +168,9 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
                 continue;
             };
             let start = sh.sh_offset as usize;
-            relocated.extend(decode_relr(&bytes[start..end]));
+            relocations.extend(decode_relr(&bytes[start..end]));
         }
+        relocated = relocations;
         if elf.section_headers.is_empty() {
             let mut report = FileReport::default();
             report
