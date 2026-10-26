@@ -7301,6 +7301,18 @@ impl<T> ThreadState<T> {
                     );
                 }
                 let next_rcbs: u64 = if cfg.chaos {
+                    // `--chaos-timeslice-range`: this slice's mean is drawn
+                    // log-uniformly from the range, from the same seeded chaos
+                    // stream, so slices of every scale in it mix in one run. A
+                    // schedule replay draws none: its slices end where the
+                    // record says, and the drawn ends would only add PMU
+                    // check-ins.
+                    let target_timeout_rcbs = match cfg.chaos_timeslice_range {
+                        Some(range) if !replay_controls_deadline => {
+                            range.log_uniform(self.chaos_prng.random::<f64>()) / nanos_per_rcb
+                        }
+                        _ => target_timeout_rcbs,
+                    };
                     // Average frequency of preemptions per nanosecond:
                     let lambda = 1.0 / target_timeout_rcbs;
                     let exp = Exp::new(lambda).unwrap();
@@ -8851,6 +8863,68 @@ mod timeslice_tests {
         assert_eq!(state.max_timeslice_end, state.end_of_timeslice);
         assert!(state.max_timeslice_end.unwrap() <= configured_max);
         assert!(state.max_timeslice_end.unwrap() >= minimum_progress);
+    }
+
+    /// Under `--chaos-timeslice-range` every slice ends within one RCB and
+    /// MAX of its start, and the slices span the range's scales.
+    #[test]
+    fn a_chaos_timeslice_range_draws_slices_of_every_scale_up_to_its_max() {
+        let config = Config {
+            chaos: true,
+            max_timeslice: nz(100_000_000),
+            chaos_timeslice_range: Some("1000..100000000".parse().unwrap()),
+            ..Default::default()
+        };
+        let mut state = ThreadState::new(DetPid::from_raw(1), &config, ());
+        let now = state.thread_logical_time.as_nanos();
+        let lengths: Vec<u64> = (0..3000)
+            .map(|_| {
+                state.next_timeslice(&config);
+                let end = state.end_of_timeslice.unwrap();
+                assert_eq!(state.max_timeslice_end, Some(end));
+                (end - now).as_nanos()
+            })
+            .collect();
+        assert!(
+            lengths
+                .iter()
+                .all(|length| (10..=100_000_000).contains(length)),
+            "{:?}",
+            lengths.iter().max()
+        );
+        assert!(lengths.iter().filter(|length| **length < 10_000).count() > 100);
+        assert!(
+            lengths
+                .iter()
+                .filter(|length| **length > 10_000_000)
+                .count()
+                > 100
+        );
+    }
+
+    /// A schedule replay draws no slice mean from the range: its deadlines
+    /// and generator state are those of the same replay without one.
+    #[test]
+    fn a_schedule_replay_draws_nothing_from_the_chaos_timeslice_range() {
+        let plain = Config {
+            chaos: true,
+            max_timeslice: nz(100_000),
+            replay_schedule_from: Some(std::path::PathBuf::from("schedule.json")),
+            ..Default::default()
+        };
+        let ranged = Config {
+            chaos_timeslice_range: Some("1000..100000".parse().unwrap()),
+            ..plain.clone()
+        };
+        let mut without = ThreadState::new(DetPid::from_raw(1), &plain, ());
+        let mut with = ThreadState::new(DetPid::from_raw(1), &ranged, ());
+        for _ in 0..16 {
+            without.next_timeslice(&plain);
+            with.next_timeslice(&ranged);
+            assert_eq!(with.end_of_timeslice, without.end_of_timeslice);
+            assert_eq!(with.max_timeslice_end, without.max_timeslice_end);
+        }
+        assert!(with.chaos_prng == without.chaos_prng);
     }
 
     #[test]

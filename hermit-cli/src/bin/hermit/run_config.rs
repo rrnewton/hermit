@@ -930,6 +930,10 @@ mod tests {
         ("eager-lone-preemptions", &["--eager-lone-preemptions"]),
         ("no-signal-state-copy", &["--no-signal-state-copy"]),
         ("chaos", &["--chaos"]),
+        (
+            "chaos-timeslice-range",
+            &["--chaos", "--chaos-timeslice-range=1000..2000000"],
+        ),
         ("fuzz-futexes", &["--fuzz-futexes"]),
         ("chaos-target-races", &["--chaos-target-races"]),
         (

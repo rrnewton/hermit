@@ -64,7 +64,10 @@ pub fn refuse_unsupported_preemption(
     if crate::backend_delivers_preemption_timer(backend) {
         return Ok(());
     }
-    let setting = if maximum_requested && config.max_timeslice.is_some() {
+    let setting = if config.chaos_timeslice_range.is_some() {
+        // The range sets the maximum, a timer request in its own right.
+        "--chaos-timeslice-range"
+    } else if maximum_requested && config.max_timeslice.is_some() {
         "--max-timeslice"
     } else if config.imprecise_timers {
         "--imprecise-timers"
@@ -225,6 +228,10 @@ mod tests {
             (
                 vec!["--replay-preemptions-from=unused"],
                 "--replay-preemptions-from",
+            ),
+            (
+                vec!["--chaos", "--chaos-timeslice-range=1000..2000"],
+                "--chaos-timeslice-range",
             ),
         ] {
             let config = Config::parse_from(
