@@ -1824,7 +1824,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And tests::a_dbt_runtime_without_the_fingerprint_check_is_refused (Hermit
     // refuses a DBT runtime built before its coordinator fingerprint check):
     // 1106, listed.
-    ("test.hermit_unit", 1106),
+    // And tests::defined_dynamic_symbols_are_read_from_the_dynamic_segment_alone
+    // and tests::the_dynamic_symbol_count_comes_from_the_hash_table (that check
+    // reads only the runtime's dynamic symbols): 1108, listed.
+    ("test.hermit_unit", 1108),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2975,7 +2978,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and config's two units for the global RPC revision in the runtimes'
     // fingerprint (https://github.com/rrnewton/hermit/issues/4765): 2622,
     // listed.
-    ("test.detcore_unit", 2622),
+    // And syscalls::inotify's two units for a read that faults (each buffer's
+    // first bytes kept before the call, and a faulted buffer compared with
+    // them): 2624, listed.
+    // And syscalls::inotify's a_read_into_overlapping_buffers_is_left_alone
+    // (the overlap decision, without global state): 2625, listed.
+    ("test.detcore_unit", 2625),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5179,7 +5187,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five syscall_histogram units: 2611, listed.
     // And the same nine syscalls::inotify and two config units: 2622,
     // listed.
-    ("test.detcore_unit_on_host", 2622),
+    // And the same two units for a read that faults: 2624, listed.
+    // And the same overlap-decision unit: 2625, listed.
+    ("test.detcore_unit_on_host", 2625),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5538,7 +5548,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // selection, measured with its existing exclusions unchanged: 1105 (A5
     // 3c.1e B's harness unit was reverted with that slice).
     // And the same DBT runtime fingerprint-check unit: 1106, listed.
-    ("test.hermit_unit_on_host", 1106),
+    // And the same two dynamic-symbol units: 1108, listed.
+    ("test.hermit_unit_on_host", 1108),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
