@@ -6757,6 +6757,95 @@ fn detcore_lists_procfs_from_its_model_on_every_backend() {
     );
 }
 
+/// Detcore serves `/proc` and the caller's descriptor directory on a
+/// descriptor of the placeholder directory that hermit-cli mounts in the
+/// container, an empty read-only tmpfs at `/proc/fs/nfsd` (package K slice
+/// P1, toward https://github.com/rrnewton/hermit/issues/4604). Without a
+/// container (`--no-namespace`) there is no placeholder and Detcore serves
+/// neither directory: ptrace keeps the kernel's. A ptrace run in the
+/// container and one under `--no-namespace` list the same descriptors and
+/// both list `/proc`, and only the container's run serves them on the
+/// placeholder (Detcore's debug log names each descriptor it serves there).
+/// On KVM the container's run lists the same, serves both on the
+/// placeholder, and never reaches the executor's own `/proc` handle (no
+/// `[detcore] KVM /proc anchor reached` line): the tripwire for that
+/// handle's removal from the executor (slice P2). KVM under `--no-namespace`
+/// is named as not checked: the executor refuses both directories there
+/// with EACCES, the named residual of the approved design. Relaxation:
+/// `--strict` refuses `--no-namespace`, so those runs are not strict; the
+/// container's runs are.
+#[test]
+fn procfs_directories_are_served_on_the_placeholder_only_in_a_container() {
+    let test = "procfs_directories_are_served_on_the_placeholder_only_in_a_container";
+    let script = "ls -1a /proc/self/fd && ls /proc >/dev/null && echo listed /proc";
+    let mut compared = Vec::new();
+    for backend in ["ptrace", "kvm"] {
+        if backend == "kvm" && kvm_unavailable(test) {
+            eprintln!("{test}: NOT COMPARED: kvm is not available on this host");
+            continue;
+        }
+        let mut listings = Vec::new();
+        for mode in ["--strict", "--no-namespace"] {
+            if backend == "kvm" && mode == "--no-namespace" {
+                eprintln!(
+                    "{test}: kvm --no-namespace: NOT CHECKED: without a placeholder Detcore \
+                     serves neither directory, and the executor refuses both with EACCES"
+                );
+                continue;
+            }
+            let args = [
+                "--log=debug",
+                "--backend",
+                backend,
+                "run",
+                mode,
+                "--",
+                "/bin/sh",
+                "-c",
+                script,
+            ];
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            let listing = stdout(&output);
+            assert!(
+                listing.starts_with(".\n..\n0\n1\n2\n") && listing.ends_with("\nlisted /proc\n"),
+                "{backend} {mode}: {listing}"
+            );
+            let log = stderr(&output);
+            assert!(
+                !log.contains("KVM /proc anchor reached"),
+                "{backend} {mode} reached the executor's /proc handle"
+            );
+            let served = |directory: &str| {
+                log.lines().any(|line| {
+                    line.contains(&format!(
+                        ": {directory} served on the placeholder directory /proc/fs/nfsd"
+                    ))
+                })
+            };
+            let in_container = mode == "--strict";
+            assert_eq!(
+                served("/proc"),
+                in_container,
+                "{backend} {mode}: whether /proc was served on the placeholder"
+            );
+            assert_eq!(
+                log.lines()
+                    .any(|line| line.contains("/fd served on the placeholder directory")),
+                in_container,
+                "{backend} {mode}: whether the descriptor directory was served on the placeholder"
+            );
+            listings.push(listing);
+            compared.push(format!("{backend} {mode}"));
+        }
+        assert!(
+            listings.windows(2).all(|pair| pair[0] == pair[1]),
+            "{backend}: the container's listing differs from --no-namespace's: {listings:?}"
+        );
+    }
+    eprintln!("{test} compared {compared:?}");
+}
+
 /// Detcore renders `/proc/sys/kernel/random/uuid`, `/proc/sys/kernel/pty/nr`,
 /// `/proc/uptime`, `/proc/stat` and `/proc/cpuinfo` (where it answers the
 /// guest's CPUID instruction from its own table, as on every backend here)

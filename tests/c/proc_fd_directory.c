@@ -78,12 +78,15 @@
 #include <sys/xattr.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <linux/fs.h>
 #include <linux/futex.h>
+#include <linux/openat2.h>
 
 static int failures;
 
@@ -182,6 +185,22 @@ static const char *errno_name(int error) {
       return "EOPNOTSUPP";
     case ELOOP:
       return "ELOOP";
+    case EPERM:
+      return "EPERM";
+    case ENOTTY:
+      return "ENOTTY";
+    case EWOULDBLOCK:
+      return "EWOULDBLOCK";
+    case ENOSYS:
+      return "ENOSYS";
+    case EROFS:
+      return "EROFS";
+    case ENOTDIR:
+      return "ENOTDIR";
+    case EXDEV:
+      return "EXDEV";
+    case ENOLCK:
+      return "ENOLCK";
     default:
       return "other";
   }
@@ -402,6 +421,292 @@ static void print_errno(const char *label, long result) {
   printf("%s=%ld errno=%s\n", label, result, errno_name(result < 0 ? errno : 0));
 }
 
+/* The fdinfo of descriptor `fd`: its pos and ino, and its mnt_id. */
+static int read_fdinfo(int fd, long long *pos, unsigned long long *ino, int *mnt_id) {
+  char path[64], text[512];
+  snprintf(path, sizeof(path), "/proc/self/fdinfo/%d", fd);
+  int info = open(path, O_RDONLY);
+  if (info < 0) {
+    return -errno;
+  }
+  ssize_t n = read(info, text, sizeof(text) - 1);
+  int error = n < 0 ? errno : 0;
+  close(info);
+  if (n < 0) {
+    return -error;
+  }
+  text[n] = '\0';
+  const char *at = strstr(text, "pos:");
+  *pos = at != NULL ? strtoll(at + 4, NULL, 10) : -1;
+  at = strstr(text, "ino:");
+  *ino = at != NULL ? strtoull(at + 4, NULL, 10) : 0;
+  at = strstr(text, "mnt_id:");
+  *mnt_id = at != NULL ? atoi(at + 7) : -1;
+  return 0;
+}
+
+/* The mount ID of the mount /proc/self/mountinfo shows at /proc, the last
+ * row there (the one on top), or -1. */
+static int proc_mount_id(void) {
+  FILE *rows = fopen("/proc/self/mountinfo", "r");
+  if (rows == NULL) {
+    return -1;
+  }
+  char line[1024];
+  int found = -1;
+  while (fgets(line, sizeof(line), rows) != NULL) {
+    int id = 0, parent = 0;
+    char device[64], root[256], point[256];
+    if (sscanf(line, "%d %d %63s %255s %255s", &id, &parent, device, root, point) == 5 &&
+        strcmp(point, "/proc") == 0) {
+      found = id;
+    }
+  }
+  fclose(rows);
+  return found;
+}
+
+/* /proc and /proc/self/fd are directories of their own on Linux: procfs's
+ * root and the task's descriptor directory. Hermit serves both on
+ * placeholder descriptors (package K slice P1), and every call through such
+ * a descriptor gets procfs's answer. `directory` is open on /proc/self/fd. */
+static void check_procfs_directories(int directory) {
+  char cwd[128], listing[8192], label[160];
+  int root = open_directory("/proc", O_RDONLY | O_DIRECTORY);
+  struct stat root_stat, root_path, dir_stat;
+  CHECK(fstat(root, &root_stat) == 0, "fstat /proc: %s", strerror(errno));
+  CHECK(stat("/proc", &root_path) == 0, "stat /proc: %s", strerror(errno));
+  CHECK(fstat(directory, &dir_stat) == 0, "fstat directory: %s", strerror(errno));
+  printf("root: fstat dir=%d mode=%o blksize=%ld size=%lld stat-path-same-ino=%d\n",
+         S_ISDIR(root_stat.st_mode), root_stat.st_mode & 07777, (long)root_stat.st_blksize,
+         (long long)root_stat.st_size, root_path.st_ino == root_stat.st_ino);
+  struct statx extended;
+  CHECK(statx(root, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &extended) == 0, "statx /proc: %s",
+        strerror(errno));
+  printf("root: statx mount-root=%d same-ino=%d\n",
+         (extended.stx_attributes & STATX_ATTR_MOUNT_ROOT) != 0,
+         extended.stx_ino == root_stat.st_ino);
+  uint64_t dot = 0;
+  list(root, 4096, 0, listing, sizeof(listing), &dot);
+  char own_pid[24];
+  snprintf(own_pid, sizeof(own_pid), " %d ", (int)getpid());
+  strcat(listing, " ");
+  printf("root: listing self=%d thread-self=%d own-pid=%d fs=%d dot-ino-is-fstat-ino=%d\n",
+         strstr(listing, " self ") != NULL, strstr(listing, " thread-self ") != NULL,
+         strstr(listing, own_pid) != NULL, strstr(listing, " fs ") != NULL,
+         dot == root_stat.st_ino);
+  /* The descriptor's own link names /proc. */
+  char link[128], own_link[64];
+  snprintf(own_link, sizeof(own_link), "/proc/self/fd/%d", root);
+  ssize_t length = readlink(own_link, link, sizeof(link) - 1);
+  link[length < 0 ? 0 : length] = '\0';
+  printf("root: own link names /proc=%d\n", strcmp(link, "/proc") == 0);
+
+  /* fstatfs: procfs (PROC_SUPER_MAGIC), whose blocks and files are none. */
+  struct statfs fs_root, fs_dir;
+  CHECK(fstatfs(root, &fs_root) == 0, "fstatfs /proc: %s", strerror(errno));
+  CHECK(fstatfs(directory, &fs_dir) == 0, "fstatfs directory: %s", strerror(errno));
+  printf("fstatfs: /proc type=%lx bsize=%ld namelen=%ld blocks=%llu files=%llu, "
+         "/proc/self/fd type=%lx\n",
+         (unsigned long)fs_root.f_type, (long)fs_root.f_bsize, (long)fs_root.f_namelen,
+         (unsigned long long)fs_root.f_blocks, (unsigned long long)fs_root.f_files,
+         (unsigned long)fs_dir.f_type);
+
+  /* The calls procfs refuses, each with its errno, on both directories. */
+  int fds[2] = {root, directory};
+  const char *which[2] = {"/proc", "/proc/self/fd"};
+  for (int i = 0; i < 2; i++) {
+    int fd = fds[i];
+    errno = 0;
+    int fsynced = fsync(fd);
+    int fsync_error = fsynced < 0 ? errno : 0;
+    errno = 0;
+    int datasynced = fdatasync(fd);
+    int datasync_error = datasynced < 0 ? errno : 0;
+    errno = 0;
+    int synced = syncfs(fd);
+    printf("sync: %s fsync=%d errno=%s fdatasync=%d errno=%s syncfs=%d errno=%s\n", which[i],
+           fsynced, errno_name(fsync_error), datasynced, errno_name(datasync_error), synced,
+           errno_name(synced < 0 ? errno : 0));
+    char value[16], names[64];
+    errno = 0;
+    ssize_t got = fgetxattr(fd, "user.hermit", value, sizeof(value));
+    int get_error = got < 0 ? errno : 0;
+    errno = 0;
+    ssize_t listed = flistxattr(fd, names, sizeof(names));
+    int list_error = listed < 0 ? errno : 0;
+    errno = 0;
+    int set = fsetxattr(fd, "user.hermit", "1", 1, 0);
+    int set_error = set < 0 ? errno : 0;
+    errno = 0;
+    int removed = fremovexattr(fd, "user.hermit");
+    printf("xattr: %s fgetxattr=%zd errno=%s flistxattr=%zd errno=%s fsetxattr=%d errno=%s "
+           "fremovexattr=%d errno=%s\n",
+           which[i], got, errno_name(get_error), listed, errno_name(list_error), set,
+           errno_name(set_error), removed, errno_name(removed < 0 ? errno : 0));
+    unsigned int attributes = 0;
+    errno = 0;
+    int flags = ioctl(fd, FS_IOC_GETFLAGS, &attributes);
+    int flags_error = flags < 0 ? errno : 0;
+    int block = 0;
+    errno = 0;
+    int sized = ioctl(fd, FIGETBSZ, &block);
+    int sized_error = sized < 0 ? errno : 0;
+    int pending = 0;
+    errno = 0;
+    int counted = ioctl(fd, FIONREAD, &pending);
+    printf("ioctl: %s FS_IOC_GETFLAGS=%d errno=%s FIGETBSZ=%d errno=%s block=%d FIONREAD=%d "
+           "errno=%s\n",
+           which[i], flags, errno_name(flags_error), sized, errno_name(sized_error), block,
+           counted, errno_name(counted < 0 ? errno : 0));
+    errno = 0;
+    int moded = fchmod(fd, 0700);
+    int mode_error = moded < 0 ? errno : 0;
+    errno = 0;
+    int owned = fchown(fd, (uid_t)-1, (gid_t)-1);
+    int own_error = owned < 0 ? errno : 0;
+    errno = 0;
+    int touched = futimens(fd, NULL);
+    int touch_error = touched < 0 ? errno : 0;
+    errno = 0;
+    int truncated = ftruncate(fd, 0);
+    int truncate_error = truncated < 0 ? errno : 0;
+    errno = 0;
+    ssize_t read_bytes = read(fd, value, sizeof(value));
+    printf("mutation: %s fchmod=%d errno=%s fchown=%d errno=%s futimens=%d errno=%s "
+           "ftruncate=%d errno=%s read=%zd errno=%s\n",
+           which[i], moded, errno_name(mode_error), owned, errno_name(own_error), touched,
+           errno_name(touch_error), truncated, errno_name(truncate_error), read_bytes,
+           errno_name(read_bytes < 0 ? errno : 0));
+  }
+  /* A name made below /proc: procfs refuses it. */
+  errno = 0;
+  int made = mkdirat(root, "hermit-placeholder", 0755);
+  printf("mutation: mkdirat /proc=%d errno=%s\n", made, errno_name(made < 0 ? errno : 0));
+
+  /* flock: each directory is an inode of its own, whose lock another open
+   * of the same directory meets, and a dup shares. */
+  int root_again = open_directory("/proc", O_RDONLY | O_DIRECTORY);
+  int directory_again = open_directory("/proc/self/fd", O_RDONLY | O_DIRECTORY);
+  int thread_directory = open_directory("/proc/thread-self/fd", O_RDONLY | O_DIRECTORY);
+  int locks[8];
+  locks[0] = flock(root, LOCK_EX | LOCK_NB);
+  locks[1] = flock(directory, LOCK_EX | LOCK_NB);
+  errno = 0;
+  locks[2] = flock(root_again, LOCK_EX | LOCK_NB) < 0 ? -errno : 0;
+  errno = 0;
+  locks[3] = flock(directory_again, LOCK_SH | LOCK_NB) < 0 ? -errno : 0;
+  locks[4] = flock(thread_directory, LOCK_EX | LOCK_NB);
+  int root_dup = dup(root);
+  locks[5] = flock(root_dup, LOCK_EX | LOCK_NB);
+  locks[6] = flock(root, LOCK_UN);
+  locks[7] = flock(root_again, LOCK_EX | LOCK_NB);
+  printf("flock: /proc=%d /proc/self/fd=%d /proc again=%s /proc/self/fd again=%s "
+         "/proc/thread-self/fd=%d dup of /proc=%d unlock=%d /proc again after=%d\n",
+         locks[0], locks[1], errno_name(-locks[2]), errno_name(-locks[3]), locks[4], locks[5],
+         locks[6], locks[7]);
+  flock(root_again, LOCK_UN);
+  flock(directory, LOCK_UN);
+  flock(thread_directory, LOCK_UN);
+  close(root_dup);
+  close(root_again);
+  close(directory_again);
+  close(thread_directory);
+
+  /* fdinfo: the position, the directory's inode, and the mount mountinfo
+   * shows at /proc. */
+  long long root_pos = -2, dir_pos = -2;
+  unsigned long long root_ino = 0, dir_ino = 0;
+  int root_mnt = -1, dir_mnt = -2;
+  lseek(root, 3, SEEK_SET);
+  lseek(directory, 2, SEEK_SET);
+  int root_info = read_fdinfo(root, &root_pos, &root_ino, &root_mnt);
+  int dir_info = read_fdinfo(directory, &dir_pos, &dir_ino, &dir_mnt);
+  int proc_mount = proc_mount_id();
+  printf("fdinfo: /proc rc=%s pos=%lld ino-is-fstat-ino=%d, /proc/self/fd rc=%s pos=%lld "
+         "ino-is-fstat-ino=%d, both on the mount mountinfo shows at /proc=%d\n",
+         errno_name(-root_info), root_pos, root_ino == root_stat.st_ino, errno_name(-dir_info),
+         dir_pos, dir_ino == dir_stat.st_ino, root_mnt == proc_mount && dir_mnt == proc_mount);
+  lseek(root, 0, SEEK_SET);
+  lseek(directory, 0, SEEK_SET);
+
+  /* fchdir to /proc: getcwd names /proc. */
+  errno = 0;
+  int entered = fchdir(root);
+  int enter_error = entered < 0 ? errno : 0;
+  int in_proc = entered == 0 && getcwd(cwd, sizeof(cwd)) != NULL && strcmp(cwd, "/proc") == 0;
+  if (entered == 0) {
+    CHECK(chdir("/") == 0, "chdir: %s", strerror(errno));
+  }
+  printf("fchdir: /proc=%d errno=%s cwd is /proc=%d\n", entered, errno_name(enter_error),
+         in_proc);
+
+  /* openat2 below /proc (Hermit answers every openat2 with ENOSYS). */
+  struct open_how how;
+  memset(&how, 0, sizeof(how));
+  how.flags = O_RDONLY;
+  errno = 0;
+  long opened2 = syscall(SYS_openat2, root, "self", &how, sizeof(how));
+  printf("openat2: below /proc=%s\n", opened2 >= 0 ? "opened" : errno_name(errno));
+  if (opened2 >= 0) {
+    close((int)opened2);
+  }
+
+  /* /proc/fs, which Hermit hides at every --proc level, by every spelling
+   * below the two directories. */
+  struct {
+    int dirfd;
+    const char *path;
+  } hidden[] = {
+      {root, "fs"},
+      {root, "fs/nfsd"},
+      {root, "./fs/"},
+      {root, "self/../fs"},
+      {directory, "../../fs"},
+      {AT_FDCWD, "/proc/fs/nfsd"},
+      {AT_FDCWD, "/proc//fs/nfsd/."},
+  };
+  printf("hidden:");
+  for (size_t i = 0; i < sizeof(hidden) / sizeof(hidden[0]); i++) {
+    struct stat found;
+    errno = 0;
+    int stated = fstatat(hidden[i].dirfd, hidden[i].path, &found, 0);
+    int stat_error = stated < 0 ? errno : 0;
+    errno = 0;
+    int opened = openat(hidden[i].dirfd, hidden[i].path, O_RDONLY | O_DIRECTORY);
+    int open_error = opened < 0 ? errno : 0;
+    if (opened >= 0) {
+      close(opened);
+    }
+    printf(" %s%s:stat=%s,open=%s",
+           hidden[i].dirfd == root        ? "(/proc)"
+           : hidden[i].dirfd == directory ? "(/proc/self/fd)"
+                                          : "",
+           hidden[i].path, errno_name(stat_error), errno_name(open_error));
+  }
+  snprintf(label, sizeof(label), "/proc/self/fd/%d/fs", root);
+  struct stat found;
+  errno = 0;
+  int through = stat(label, &found);
+  printf(" /proc/self/fd/(/proc)/fs:stat=%s\n", errno_name(through < 0 ? errno : 0));
+
+  /* A received /proc descriptor is /proc: its identity is the placeholder's,
+   * and its kernel position tags it. */
+  int pair[2];
+  CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0, "socketpair: %s", strerror(errno));
+  int received = pass_to_self(pair, root);
+  struct stat received_stat;
+  CHECK(fstat(received, &received_stat) == 0, "fstat received: %s", strerror(errno));
+  list(received, 4096, 0, listing, sizeof(listing), NULL);
+  strcat(listing, " ");
+  printf("received /proc: same-ino=%d lists self=%d\n", received_stat.st_ino == root_stat.st_ino,
+         strstr(listing, " self ") != NULL);
+  close(received);
+  close(pair[0]);
+  close(pair[1]);
+  close(root);
+}
+
 int main(int argc, char **argv) {
   if (argc == 7 && strcmp(argv[1], "--after-exec") == 0) {
     return after_exec(atoi(argv[2]), atoi(argv[3]), atoi(argv[4]), atoi(argv[5]), atoi(argv[6]));
@@ -556,12 +861,17 @@ int main(int argc, char **argv) {
   printf("O_PATH: readlinkat N=%s\n", link);
   close(path_only);
 
-  /* fchdir: refused under Hermit until the directory has an object of its
-   * own; Linux changes the working directory. */
+  /* fchdir enters the directory, as Linux does: getcwd then names
+   * /proc/<pid>/fd. (KVM's executor refuses a working directory on /proc
+   * with EACCES.) */
   errno = 0;
   rc = fchdir(directory);
   printf("fchdir=%d errno=%s\n", rc, errno_name(rc < 0 ? errno : 0));
   if (rc == 0) {
+    char cwd[128], expected[64];
+    snprintf(expected, sizeof(expected), "/proc/%d/fd", (int)getpid());
+    printf("fchdir: cwd is /proc/<pid>/fd=%d\n",
+           getcwd(cwd, sizeof(cwd)) != NULL && strcmp(cwd, expected) == 0);
     CHECK(chdir("/") == 0, "chdir: %s", strerror(errno));
   }
 
@@ -969,6 +1279,8 @@ int main(int argc, char **argv) {
       }
     }
   }
+
+  check_procfs_directories(directory);
 
   /* exec: the directory, not close-on-exec, survives; a close-on-exec
    * descriptor does not. */

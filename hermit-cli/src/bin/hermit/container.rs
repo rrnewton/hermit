@@ -64,6 +64,31 @@ const DETERMINISTIC_LD_SO_CACHE_ROOT: &[u8] = b"/tmpvol/.hermit/etc/ld.so.cache"
 const DETERMINISTIC_NSCD_ROOT: &[u8] = b"/tmpvol/.hermit/run/nscd";
 const DETERMINISTIC_TMP_ROOT: &[u8] = b"/tmpvol/.hermit/tmp";
 
+/// Where a container holds Detcore's placeholder directory
+/// (`DetConfig::directory_placeholder`): procfs's `/proc/fs/nfsd`, a
+/// directory every procfs has, empty and permanently so (`proc_root_init`
+/// makes it with `proc_create_mount_point`, there for the nfsd filesystem to
+/// be mounted on). Detcore's `--proc` level table hides `/proc/fs` from the
+/// guest at every level, so no guest path reaches it, and the guest's mount
+/// table leaves its mount out ([`PlannedMount::placeholder`]). Mounting on it
+/// creates nothing on the host or on an image, and a guest's own procfs mount
+/// stays permitted after it (`mnt_already_visible` accepts a submount on a
+/// permanently empty directory).
+pub(super) const DIRECTORY_PLACEHOLDER: &str = "/proc/fs/nfsd";
+
+/// The mount of Detcore's placeholder directory at `target`: a fresh tmpfs
+/// named `hermit`, read-only, holding nothing (one inode, its root, of mode
+/// 0555), with no set-user-ID, device or executable file possible on it. A
+/// fresh filesystem, not a bind of a host directory, so its mountinfo row
+/// names no host path, and nothing on the host has to outlive the run.
+pub(super) fn directory_placeholder_mount(target: impl AsRef<std::ffi::OsStr>) -> Mount {
+    Mount::tmpfs(target)
+        .source("hermit")
+        .readonly()
+        .flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV | MountFlags::MS_NOEXEC)
+        .data("mode=0555,size=4k,nr_inodes=1")
+}
+
 #[derive(Debug)]
 struct MountInfoRootSource {
     source: Option<File>,
@@ -581,6 +606,9 @@ pub(super) struct IdentityGuard {
     /// recorded in the container's init before the guest starts
     /// ([`Self::record_plan`]).
     plan: MountPlan,
+    /// The guest path of the placeholder directory the plan mounts
+    /// ([`DIRECTORY_PLACEHOLDER`]), if it mounts one.
+    directory_placeholder: Option<PathBuf>,
 }
 
 /// One mount of the container's mount plan.
@@ -589,11 +617,13 @@ pub(super) struct PlannedMount {
     /// The mount, at the target it is installed at (a mount below guest
     /// `/tmp` is installed in Hermit's private tmp directory first).
     pub(super) mount: Mount,
-    /// Whether it is a backend's own mount (DBT's statistics bind, e9patch's
-    /// overlay of the rewritten program), which the guest's mount table leaves
-    /// out by this identity, not by its path. DBT's tmpfs at the test workdir
-    /// is not one: it is the guest's working directory, shown as the caller's
-    /// mount there is on every other backend.
+    /// Whether it is plumbing the guest's machine does not have, which the
+    /// guest's mount table leaves out by this identity, not by its path: a
+    /// backend's own mount (DBT's statistics bind, e9patch's overlay of the
+    /// rewritten program) or Detcore's placeholder directory
+    /// ([`PlannedMount::placeholder`]). DBT's tmpfs at the test workdir is not
+    /// one: it is the guest's working directory, shown as the caller's mount
+    /// there is on every other backend.
     pub(super) backend: bool,
 }
 
@@ -612,6 +642,14 @@ impl PlannedMount {
             mount,
             backend: true,
         }
+    }
+
+    /// Detcore's placeholder directory ([`directory_placeholder_mount`]):
+    /// plumbing, which the guest's mount table leaves out as it leaves out a
+    /// backend's own mounts. No path of the guest's reaches it either: it is
+    /// below `/proc/fs`, which Detcore's `--proc` level table hides.
+    pub(super) fn placeholder(mount: Mount) -> Self {
+        Self::backend(mount)
     }
 }
 
@@ -654,7 +692,20 @@ impl IdentityGuard {
             user_binds: Vec::new(),
             host_rows: Vec::new(),
             plan: MountPlan::Unrecorded,
+            directory_placeholder: None,
         }
+    }
+
+    /// The guest path of the placeholder directory the container's setup
+    /// mounts, if it mounts one (`DetConfig::directory_placeholder`).
+    pub(super) fn directory_placeholder(&self) -> Option<&Path> {
+        self.directory_placeholder.as_deref()
+    }
+
+    /// Record that the container's setup mounts the placeholder directory at
+    /// guest path `path` (or none).
+    pub(super) fn set_directory_placeholder(&mut self, path: Option<PathBuf>) {
+        self.directory_placeholder = path;
     }
 
     /// Give `plan` to `container`'s setup, which installs it after every
@@ -832,7 +883,21 @@ impl IdentityGuard {
             }
             MountPlan::ImageRoot => {
                 let installed = current.iter().map(|row| row.raw_mount_id).collect();
-                (current, installed, std::collections::BTreeSet::new())
+                // Every row under an image root is one the setup installed,
+                // the placeholder directory's among them, which the table
+                // leaves out as plumbing (`PlannedMount::placeholder`): the
+                // one tmpfs at its path.
+                let placeholder = current
+                    .iter()
+                    .filter(|row| {
+                        self.directory_placeholder.as_deref().is_some_and(|path| {
+                            row.mountpoint == mountinfo_escape_path(path)
+                                && row.fstype.as_slice() == b"tmpfs"
+                        })
+                    })
+                    .map(|row| row.raw_mount_id)
+                    .collect();
+                (current, installed, placeholder)
             }
         };
         let never = rows
@@ -1219,6 +1284,7 @@ pub(super) fn identity_hardening_mounts(
             user_binds: Vec::new(),
             host_rows: Vec::new(),
             plan: MountPlan::Unrecorded,
+            directory_placeholder: None,
         },
     ))
 }
@@ -1329,6 +1395,13 @@ pub(super) fn image_container(
     // defers dir creation to the pre-exec child on a tiny clone stack).
     let proc_target = rootfs.join("proc");
     container.mount(Mount::proc().allow_readonly_fallback().target(&proc_target));
+    // Detcore's placeholder directory, on the image's own procfs
+    // (`DIRECTORY_PLACEHOLDER`), which the image's table leaves out
+    // (`IdentityGuard::container_mount_table_of`).
+    let placeholder = Path::new(DIRECTORY_PLACEHOLDER);
+    container.mount(directory_placeholder_mount(
+        proc_target.join(placeholder.strip_prefix("/proc").unwrap_or(placeholder)),
+    ));
 
     // A minimal /dev. An OCI image layer ships no device nodes, so without this
     // the guest sees an empty /dev on a read-only root: `> /dev/null` fails with
@@ -1388,6 +1461,7 @@ pub(super) fn image_container(
         identity_sources.add_private_tmp(tmpfs)?;
     }
     identity_sources.set_image_root();
+    identity_sources.set_directory_placeholder(Some(PathBuf::from(DIRECTORY_PLACEHOLDER)));
     Ok((container, identity_sources))
 }
 
@@ -5623,6 +5697,114 @@ mod tests {
         });
     }
 
+    /// Detcore's placeholder directory is a fresh tmpfs, read-only, holding
+    /// nothing and unable to hold a set-user-ID, device or executable file,
+    /// installed at procfs's own empty mount point right after the
+    /// container's `/proc`, as plumbing the guest's mount table leaves out.
+    #[test]
+    fn the_placeholder_directory_is_a_hidden_empty_read_only_tmpfs() {
+        let mount = directory_placeholder_mount(DIRECTORY_PLACEHOLDER);
+        assert_eq!(
+            mount,
+            Mount::tmpfs("/proc/fs/nfsd")
+                .source("hermit")
+                .flags(
+                    MountFlags::MS_RDONLY
+                        | MountFlags::MS_NOSUID
+                        | MountFlags::MS_NODEV
+                        | MountFlags::MS_NOEXEC
+                )
+                .data("mode=0555,size=4k,nr_inodes=1")
+        );
+        let plan = [
+            PlannedMount::hermit(container_proc_mount()),
+            PlannedMount::placeholder(mount),
+        ];
+        let installations = installations_of(&plan);
+        assert_eq!(
+            installations[1].mountpoints,
+            vec![mountinfo_escape_path(Path::new("/proc/fs/nfsd"))]
+        );
+        assert!(installations[1].sources.is_empty(), "a fresh filesystem");
+        assert!(!installations[0].backend);
+        assert!(installations[1].backend, "left out of the guest's table");
+    }
+
+    /// What a process in a container with the placeholder directory finds
+    /// there: its filesystem type, whether it is read-only, how many entries
+    /// it holds, what a `mkdir` in it gets, and whether a procfs of its own
+    /// still mounts.
+    fn placeholder_directory_facts() -> Result<(i64, bool, usize, i32, i32), String> {
+        let mut statfs = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        // SAFETY: the path is NUL-terminated and `statfs` is writable.
+        if unsafe { libc::statfs(c"/proc/fs/nfsd".as_ptr(), statfs.as_mut_ptr()) } != 0 {
+            return Err(format!("statfs: {}", io::Error::last_os_error()));
+        }
+        // SAFETY: statfs returned 0, so it initialized `statfs`.
+        let statfs = unsafe { statfs.assume_init() };
+        let mut statvfs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: the path is NUL-terminated and `statvfs` is writable.
+        if unsafe { libc::statvfs(c"/proc/fs/nfsd".as_ptr(), statvfs.as_mut_ptr()) } != 0 {
+            return Err(format!("statvfs: {}", io::Error::last_os_error()));
+        }
+        // SAFETY: statvfs returned 0, so it initialized `statvfs`.
+        let read_only = unsafe { statvfs.assume_init() }.f_flag & libc::ST_RDONLY != 0;
+        let entries = fs::read_dir("/proc/fs/nfsd")
+            .map_err(|error| error.to_string())?
+            .count();
+        // SAFETY: the path is NUL-terminated.
+        let mkdir = unsafe { libc::mkdir(c"/proc/fs/nfsd/x".as_ptr(), 0o755) };
+        let mkdir_errno = if mkdir == 0 {
+            0
+        } else {
+            io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        };
+        let scratch = tempfile::tempdir().map_err(|error| error.to_string())?;
+        let target = std::ffi::CString::new(scratch.path().as_os_str().as_encoded_bytes())
+            .map_err(|error| error.to_string())?;
+        // SAFETY: every string is NUL-terminated; the data pointer may be null.
+        let mounted = unsafe {
+            libc::mount(
+                c"proc".as_ptr(),
+                target.as_ptr(),
+                c"proc".as_ptr(),
+                0,
+                std::ptr::null(),
+            )
+        };
+        let mount_errno = if mounted == 0 {
+            // SAFETY: the path is NUL-terminated.
+            unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+            0
+        } else {
+            io::Error::last_os_error().raw_os_error().unwrap_or(0)
+        };
+        Ok((statfs.f_type, read_only, entries, mkdir_errno, mount_errno))
+    }
+
+    /// The placeholder directory mounts in the container's user namespace,
+    /// on its own procfs, and leaves the guest free to mount a procfs of its
+    /// own, as procfs permits a submount on a permanently empty directory
+    /// (`mnt_already_visible`).
+    #[test]
+    fn the_placeholder_directory_mounts_and_leaves_procfs_mountable() {
+        let facts = Container::new()
+            .run(|| {
+                let mut container = default_container(false);
+                container.mount(directory_placeholder_mount(DIRECTORY_PLACEHOLDER));
+                container
+                    .run(placeholder_directory_facts)
+                    .map_err(|error| format!("{error:?}"))?
+            })
+            .unwrap()
+            .expect("the placeholder directory should mount over procfs's empty mount point");
+        assert_eq!(
+            facts,
+            (0x0102_1994, true, 0, libc::EROFS, 0),
+            "(f_type TMPFS_MAGIC, read-only, empty, mkdir EROFS, a procfs of its own mounts)"
+        );
+    }
+
     fn namespace_proc_contents() -> Result<(String, String), String> {
         Ok((
             fs::read_to_string("/proc/mounts").map_err(|error| error.to_string())?,
@@ -6062,6 +6244,7 @@ mod tests {
             user_binds: Vec::new(),
             host_rows: Vec::new(),
             plan: MountPlan::Unrecorded,
+            directory_placeholder: None,
         };
 
         let rewrites = guard.mountinfo_root_rewrites().unwrap();
@@ -6137,6 +6320,7 @@ mod tests {
             user_binds: Vec::new(),
             host_rows: Vec::new(),
             plan: MountPlan::Unrecorded,
+            directory_placeholder: None,
         };
 
         let error = guard.mountinfo_root_rewrites().unwrap_err().to_string();

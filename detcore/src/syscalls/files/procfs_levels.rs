@@ -679,6 +679,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         else {
             return Decision::default();
         };
+        // The path Linux's walk reaches: through the caller's descriptor
+        // links to the `/proc` directories Detcore serves on placeholders,
+        // and back through `..` over the directories every procfs has, so
+        // that no spelling a placeholder's respelling or a `..` makes of an
+        // omitted name reaches it (`descriptor_directory`).
+        let observed = match Self::decided_path(guest, &observed) {
+            Ok((decided, _)) => decided,
+            Err(_) => observed,
+        };
+        let observed =
+            super::descriptor_directory::resolved_procfs_dotdot(&observed).unwrap_or(observed);
         let in_view = match root {
             None => observed.clone(),
             Some(root) => root.join(observed.strip_prefix("/").unwrap_or(&observed)),

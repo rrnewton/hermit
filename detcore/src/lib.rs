@@ -4978,8 +4978,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             crate::syscalls::take_proc_device();
             None
         } else if sigalrm_refusal.is_none()
-            && let Some(answer) =
-                Box::pin(self.answer_descriptor_directory_call(guest, &call)).await
+            && let Some(answer) = Box::pin(self.answer_placeholder_call(guest, &call)).await
         {
             Some(answer)
         } else if sigalrm_refusal.is_none() {

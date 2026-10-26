@@ -428,6 +428,55 @@ pub(crate) struct LockLedger {
     /// Why no `/proc/locks` snapshot can be decided for the rest of the run
     /// ([`LockLedger::refuse`]): set once, never cleared.
     refused: Option<String>,
+    /// The `flock` locks held on the `/proc` directories Detcore serves on
+    /// placeholder descriptors ([`LockLedger::placeholder_flock`]), by
+    /// directory, each held by an open file description some table
+    /// references, followed as the ledger follows every description's
+    /// references: a description no table references any more holds none.
+    placeholder_flocks:
+        BTreeMap<crate::procfs::fd_directory::PlaceholderLockKey, BTreeMap<OpenFileId, FlockMode>>,
+}
+
+/// The mode of a `flock` lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FlockMode {
+    /// `LOCK_SH`.
+    Shared,
+    /// `LOCK_EX`.
+    Exclusive,
+}
+
+/// A `flock` through a placeholder descriptor
+/// ([`LockLedger::placeholder_flock`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlaceholderFlock {
+    /// The directory the descriptor stands for.
+    pub key: crate::procfs::fd_directory::PlaceholderLockKey,
+    /// The descriptor's open file description, which owns the lock.
+    pub open_file: OpenFileId,
+    /// How many slots of the caller's table name the description.
+    pub slots: u32,
+    /// The lock asked for, or `None` for `LOCK_UN`.
+    pub mode: Option<FlockMode>,
+    /// `LOCK_NB`.
+    pub nonblocking: bool,
+}
+
+/// What [`LockLedger::placeholder_flock`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlaceholderFlockOutcome {
+    /// Granted, released, or already held in that mode.
+    Done,
+    /// Another description holds a conflicting lock and the caller asked not
+    /// to wait: `EWOULDBLOCK`. A lock of another mode the description held
+    /// is gone, as Linux's conversion deletes it before it looks for a
+    /// conflict (`flock_lock_inode`).
+    WouldBlock,
+    /// Another description holds a conflicting lock and the caller asked to
+    /// wait, which Detcore does not model: refused, with the description's
+    /// earlier lock kept, as `Detcore::handle_flock` refuses a contended
+    /// blocking `flock`.
+    Contended,
 }
 
 /// The locks a description holds, as its fdinfo last showed them, or why
@@ -457,7 +506,63 @@ impl LockLedger {
         if references.is_empty() {
             self.references.remove(&open_file);
             self.locks.remove(&open_file);
+            // Linux releases a description's `flock` locks with its last
+            // reference (`locks_remove_file`, from `__fput`).
+            self.placeholder_flocks.retain(|_, holders| {
+                holders.remove(&open_file);
+                !holders.is_empty()
+            });
         }
+    }
+
+    /// A `flock` through a descriptor of `process`'s table that Detcore
+    /// serves as a `/proc` directory on a placeholder
+    /// (`procfs::fd_directory::PlaceholderDirectory`). Every placeholder
+    /// descriptor is on the one inode of the placeholder directory, where
+    /// Linux gives procfs's root and each task's descriptor directory an
+    /// inode of its own, so the locks are kept here, by directory, as Linux's
+    /// `flock_lock_inode` keeps them on each inode: a description holds at
+    /// most one lock per directory; asking again for the mode it holds
+    /// changes nothing; another mode deletes the one it holds first; a lock
+    /// conflicts with another description's exclusive lock, and an exclusive
+    /// one with any. The description is followed as every description whose
+    /// locks the ledger knows (it holds no `/proc/locks` row), so its locks go
+    /// with its last reference, and survive an exec its descriptor survives.
+    pub(crate) fn placeholder_flock(
+        &mut self,
+        process: DetPid,
+        request: PlaceholderFlock,
+    ) -> PlaceholderFlockOutcome {
+        self.note(process, request.open_file, Ok(Vec::new()), request.slots);
+        let holders = self.placeholder_flocks.entry(request.key).or_default();
+        let held = holders.get(&request.open_file).copied();
+        let outcome = match request.mode {
+            None => {
+                holders.remove(&request.open_file);
+                PlaceholderFlockOutcome::Done
+            }
+            Some(mode) if held == Some(mode) => PlaceholderFlockOutcome::Done,
+            Some(mode) => {
+                holders.remove(&request.open_file);
+                let conflicts = holders
+                    .values()
+                    .any(|other| mode == FlockMode::Exclusive || *other == FlockMode::Exclusive);
+                if !conflicts {
+                    holders.insert(request.open_file, mode);
+                    PlaceholderFlockOutcome::Done
+                } else if request.nonblocking {
+                    PlaceholderFlockOutcome::WouldBlock
+                } else {
+                    if let Some(held) = held {
+                        holders.insert(request.open_file, held);
+                    }
+                    PlaceholderFlockOutcome::Contended
+                }
+            }
+        };
+        self.placeholder_flocks
+            .retain(|_, holders| !holders.is_empty());
+        outcome
     }
 
     /// `open_file` holds `locks` (perhaps none), as its fdinfo showed them
@@ -1155,6 +1260,93 @@ lock:\t4: OFDLCK ADVISORY  WRITE -1 00:2a:1003 0 EOF\n";
         // A release from a table the ledger never saw changes nothing.
         ledger.release(DetPid::from_raw(9), description(0), 1);
         assert!(ledger.held().is_empty());
+    }
+
+    /// `flock` through placeholder descriptors locks each directory apart,
+    /// as Linux's separate inodes do: two descriptions conflict only on the
+    /// same directory, a description re-asking for its mode keeps it, a
+    /// refused blocking conversion keeps the earlier lock, a refused
+    /// nonblocking one loses it, and the last close releases the lock.
+    #[test]
+    fn placeholder_flocks_lock_each_directory_apart() {
+        use crate::procfs::fd_directory::DescriptorDirectoryTable;
+        use crate::procfs::fd_directory::PlaceholderLockKey;
+        let process = DetPid::from_raw(3);
+        let fd_directory = PlaceholderLockKey::Descriptors {
+            table: DescriptorDirectoryTable::Process,
+            pid: 3,
+            process_incarnation: 1,
+            thread: None,
+        };
+        let flock = |key, open_file, slots, mode, nonblocking| PlaceholderFlock {
+            key,
+            open_file,
+            slots,
+            mode,
+            nonblocking,
+        };
+        let (shared, exclusive) = (Some(FlockMode::Shared), Some(FlockMode::Exclusive));
+        let mut ledger = LockLedger::default();
+        let root = PlaceholderLockKey::Root;
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(0), 1, exclusive, true)),
+            PlaceholderFlockOutcome::Done
+        );
+        // Another directory is another inode: no conflict.
+        assert_eq!(
+            ledger.placeholder_flock(
+                process,
+                flock(fd_directory, description(1), 1, exclusive, true)
+            ),
+            PlaceholderFlockOutcome::Done
+        );
+        // The same directory through another description conflicts.
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(2), 1, shared, true)),
+            PlaceholderFlockOutcome::WouldBlock
+        );
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(2), 1, shared, false)),
+            PlaceholderFlockOutcome::Contended
+        );
+        // The holder asking again changes nothing.
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(0), 2, exclusive, true)),
+            PlaceholderFlockOutcome::Done
+        );
+        // Shared locks share.
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(0), 2, shared, true)),
+            PlaceholderFlockOutcome::Done
+        );
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(2), 1, shared, true)),
+            PlaceholderFlockOutcome::Done
+        );
+        // A refused blocking conversion keeps the shared lock...
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(2), 1, exclusive, false)),
+            PlaceholderFlockOutcome::Contended
+        );
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(0), 2, exclusive, true)),
+            PlaceholderFlockOutcome::WouldBlock,
+            "description 2 still holds its shared lock"
+        );
+        // ...and description 0 lost its own by asking without waiting. Once
+        // description 2's last slot closes, nothing holds the root.
+        ledger.release(process, description(2), 0);
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(3), 1, exclusive, true)),
+            PlaceholderFlockOutcome::Done
+        );
+        // An unlock releases; the placeholder flocks add no /proc/locks row.
+        assert_eq!(
+            ledger.placeholder_flock(process, flock(root, description(3), 1, None, true)),
+            PlaceholderFlockOutcome::Done
+        );
+        assert!(ledger.held().is_empty());
+        assert_eq!(ledger.unknown(), None);
     }
 
     #[test]
