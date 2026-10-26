@@ -541,10 +541,35 @@ struct CanonicalOwnedCellId {
     test: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct TrackedCells {
     schema: u64,
     cells: Vec<TrackedCell>,
+}
+
+thread_local! {
+    /// Tracked cells that pressure_cells selects from in place of the
+    /// checkout's ci/compat-envelope/cells.json. Only the self-test sets them
+    /// (PlantedTrackedCells), to plant a cell status the live scorecard no
+    /// longer has; no command reaches them.
+    static PLANTED_TRACKED_CELLS: std::cell::RefCell<Option<TrackedCells>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Plants tracked cells for this thread's pressure_cells until dropped.
+struct PlantedTrackedCells;
+
+impl PlantedTrackedCells {
+    fn install(cells: TrackedCells) -> Self {
+        PLANTED_TRACKED_CELLS.with(|planted| *planted.borrow_mut() = Some(cells));
+        Self
+    }
+}
+
+impl Drop for PlantedTrackedCells {
+    fn drop(&mut self) {
+        PLANTED_TRACKED_CELLS.with(|planted| *planted.borrow_mut() = None);
+    }
 }
 
 fn load_tracked_cells(root: &Path) -> Result<TrackedCells, String> {
@@ -4573,7 +4598,10 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         return Err("--sample must be positive".into());
     }
     let budgets = load_budgets(root)?;
-    let tracked = load_tracked_cells(root)?;
+    let tracked = match PLANTED_TRACKED_CELLS.with(|planted| planted.borrow().clone()) {
+        Some(planted) => planted,
+        None => load_tracked_cells(root)?,
+    };
     let (requested_cells, cells_file_sha256) = if let Some(path) = &selection.cells_file {
         let (cells, digest) = load_cells_file(path)?;
         (Some(cells), Some(digest))
@@ -16656,19 +16684,34 @@ fn self_test(root: &Path) -> Result<(), String> {
         .cloned()
         .ok_or("self-test needs one executable non-KVM red verify cell for --cells-file")?;
     // The mixed --cells-file plan below checks the kvm_guest resource and cap,
-    // and a cells-file names only red cells, so it still needs a red KVM
-    // verify cell (https://github.com/rrnewton/hermit/issues/4538).
-    let red_kvm = tracked
-        .cells
-        .iter()
-        .find(|cell| {
-            cell.is_applicable()
-                && cell.status == "red"
-                && cell.id.mode == "verify"
-                && cell.id.backend == "kvm"
-        })
-        .ok_or("self-test needs at least one red KVM verify cell for its --cells-file plan")?;
-    let mut cells_file_ids = vec![red_kvm.id.clone(), non_kvm_cells_file_id];
+    // and a cells-file names only red cells, so it needs a red KVM verify
+    // cell. Once every KVM verify cell is selected the live scorecard has
+    // none (https://github.com/rrnewton/hermit/issues/4538), so that plan
+    // selects from a copy of the tracked cells in which one applicable green
+    // KVM verify cell is planted red; a red one, while there is one, is used
+    // as it is.
+    let mut planted_tracked = tracked.clone();
+    let red_kvm = match planted_tracked.cells.iter().position(|cell| {
+        cell.is_applicable()
+            && cell.status == "red"
+            && cell.id.mode == "verify"
+            && cell.id.backend == "kvm"
+    }) {
+        Some(index) => index,
+        None => {
+            let index = planted_tracked
+                .cells
+                .iter()
+                .position(|cell| {
+                    cell.status == "green" && cell.id.mode == "verify" && cell.id.backend == "kvm"
+                })
+                .ok_or("self-test needs an applicable KVM verify cell for its --cells-file plan")?;
+            planted_tracked.cells[index].status = "red".into();
+            index
+        }
+    };
+    let red_kvm_id = planted_tracked.cells[red_kvm].id.clone();
+    let mut cells_file_ids = vec![red_kvm_id, non_kvm_cells_file_id];
     cells_file_ids.sort();
     let cells_file_path = scratch.join("selected-cells.jsonl");
     let cells_file_text = canonical_cells_jsonl(&cells_file_ids)?;
@@ -16775,6 +16818,9 @@ fn self_test(root: &Path) -> Result<(), String> {
     run_state_exclusive_self_test(root, &scratch)?;
     unsampleable_sample_self_test(root, &scratch)?;
 
+    // From here to the retained-run checks every selection reads the planted
+    // tracked cells (above).
+    let planted = PlantedTrackedCells::install(planted_tracked);
     let cells_file_results = scratch.join("cells-file-plan");
     let cells_file_budget_keys = cells_file_ids
         .iter()
@@ -17102,6 +17148,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             "retained --cells-file population mutation reported the wrong error: {population_mutation_error}"
         ));
     }
+    drop(planted);
     let green_id = tracked
         .cells
         .iter()
