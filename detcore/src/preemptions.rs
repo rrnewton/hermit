@@ -75,17 +75,21 @@ pub struct PreemptionRecord {
     /// before the field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     cap_preemption_charge: bool,
-    /// Whether the run that produced this record ended its slices without
+    /// Set when the run that produced this record ended its slices without
     /// the `--max-timeslice` bound: a run that replayed a preemption record
     /// (`--replay-preemptions-from`), whose slices end where that record
     /// says, so they can run far longer than the bound, or a schedule replay
-    /// of a record that says so. A schedule replay of such a record installs
-    /// no `--max-timeslice` slice end while the record lasts
+    /// of a record that says so. It holds the latest logical time, in
+    /// nanoseconds, any of the run's recorded events reached, which no slice
+    /// of the run outlasts. A schedule replay of such a record installs no
+    /// `--max-timeslice` slice end while the record lasts
     /// (`Scheduler::uncapped_backstop`); one that did would end a recorded
-    /// slice early and leave the record. `false`, which writes nothing, for
-    /// every other run and for records written before the field existed.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    uncapped_slices: bool,
+    /// slice early and leave the record. The value survives where event
+    /// times do not (analyze writes its trial schedules without them).
+    /// `None`, which writes nothing, for every other run and for records
+    /// written before the field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uncapped_slices: Option<u64>,
     /// Actual callback expirations associated with existing priority-history rows.
     /// Absent in old/edited recordings; never inferred from time or branch counts.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -138,7 +142,7 @@ impl PreemptionRecord {
             pipe_wake_latency: None,
             signal_state_copy: None,
             cap_preemption_charge: false,
-            uncapped_slices: false,
+            uncapped_slices: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
@@ -211,17 +215,31 @@ impl PreemptionRecord {
         self.cap_preemption_charge
     }
 
-    /// Whether the run this record came from ended its slices without the
+    /// The latest logical time of the run this record came from, in
+    /// nanoseconds, when that run ended its slices without the
     /// `--max-timeslice` bound (see the field).
-    pub fn uncapped_slices(&self) -> bool {
+    pub fn uncapped_slices(&self) -> Option<u64> {
         self.uncapped_slices
     }
 
-    /// The same record, stating whether the run it came from ended its slices
-    /// without the `--max-timeslice` bound.
-    pub fn with_uncapped_slices(mut self, uncapped: bool) -> Self {
+    /// The same record, stating that the run (or the trials) it came from
+    /// ended their slices without the `--max-timeslice` bound, and the
+    /// latest logical time they reached. Every record analyze writes from
+    /// trials carries it, as it carries the pipe-wake latency.
+    pub fn with_uncapped_slices(mut self, uncapped: Option<u64>) -> Self {
         self.uncapped_slices = uncapped;
         self
+    }
+
+    /// The latest logical time, in nanoseconds, any event of this record
+    /// carries.
+    fn latest_event_time(&self) -> u64 {
+        self.global
+            .iter()
+            .filter_map(|event| event.end_time)
+            .map(|end| end.as_nanos())
+            .max()
+            .unwrap_or(0)
     }
 
     /// Make a copy of everything in the `PreemptionRecord` in a public format.
@@ -356,7 +374,7 @@ impl PreemptionRecord {
             pipe_wake_latency: None,
             signal_state_copy: None,
             cap_preemption_charge: false,
-            uncapped_slices: false,
+            uncapped_slices: None,
             callback_checkpoints: BTreeMap::new(),
             rng_seed: None,
             expired_wait_runs_charged_once: false,
@@ -922,22 +940,36 @@ mod tests {
         let ordinary = PreemptionWriter::new(None).into_string();
         assert!(!ordinary.contains("uncapped_slices"), "{ordinary}");
         let back: PreemptionRecord = serde_json::from_str(&ordinary).unwrap();
-        assert!(!back.uncapped_slices());
+        assert_eq!(back.uncapped_slices(), None);
         let unmarked = PreemptionWriter::new(None)
             .with_uncapped_slices(false)
             .into_string();
         assert_eq!(unmarked, ordinary);
-        let marked = PreemptionWriter::new(None)
-            .with_uncapped_slices(true)
-            .into_string();
-        assert!(marked.contains("\"uncapped_slices\":true"), "{marked}");
+        // A marked record states the latest time its events reached.
+        let mut writer = PreemptionWriter::new(None).with_uncapped_slices(true);
+        for end in [Some(250_000), Some(9_400_000), None, Some(1_200_000)] {
+            writer.inner.global.push(SchedEvent {
+                dettid: DetTid::from_raw(3),
+                op: detcore_model::schedule::Op::Branch,
+                count: 1,
+                start_rip: None,
+                end_rip: None,
+                end_time: end.map(LogicalTime::from_nanos),
+            });
+        }
+        let marked = writer.into_string();
+        assert!(marked.contains("\"uncapped_slices\":9400000"), "{marked}");
         let back: PreemptionRecord = serde_json::from_str(&marked).unwrap();
-        assert!(back.uncapped_slices());
-        assert!(back.clone_preemptions_only().uncapped_slices());
-        assert!(
+        assert_eq!(back.uncapped_slices(), Some(9_400_000));
+        assert_eq!(
+            back.clone_preemptions_only().uncapped_slices(),
+            Some(9_400_000)
+        );
+        assert_eq!(
             PreemptionRecord::from_sched_events(Vec::new())
-                .with_uncapped_slices(true)
-                .uncapped_slices()
+                .with_uncapped_slices(Some(7))
+                .uncapped_slices(),
+            Some(7)
         );
     }
 
@@ -1449,6 +1481,9 @@ pub struct PreemptionWriter {
     boundary_records: Option<Vec<detcore_model::schedule::boundary::Record>>,
     dest: Option<PathBuf>,
     flushed: bool,
+    /// Whether the run ends its slices without the `--max-timeslice` bound
+    /// (`with_uncapped_slices`).
+    uncapped: bool,
 }
 
 impl PreemptionWriter {
@@ -1458,6 +1493,7 @@ impl PreemptionWriter {
         PreemptionWriter {
             inner: Default::default(),
             boundary_records: None,
+            uncapped: false,
             dest: path,
             flushed: false,
         }
@@ -1536,11 +1572,20 @@ impl PreemptionWriter {
         self.inner.host_inputs = Some(inputs);
     }
 
-    /// Store whether the run ends its slices without the `--max-timeslice`
+    /// Store that the run ends its slices without the `--max-timeslice`
     /// bound (`PreemptionRecord::uncapped_slices`; `false` writes nothing).
+    /// The latest event time is filled in when the record is written.
     pub fn with_uncapped_slices(mut self, uncapped: bool) -> Self {
-        self.inner.uncapped_slices = uncapped;
+        self.uncapped = uncapped;
         self
+    }
+
+    /// Fill in the uncapped-slices mark, if the run ends its slices without
+    /// the bound, from the events recorded so far.
+    fn mark_uncapped_slices(&mut self) {
+        if self.uncapped {
+            self.inner.uncapped_slices = Some(self.inner.latest_event_time());
+        }
     }
 
     /// Does the record have zero entries?
@@ -1702,6 +1747,7 @@ impl PreemptionWriter {
     /// Abort writing to disk and instead gather the output thusfar into a string.
     pub fn into_string(mut self) -> String {
         self.flushed = true;
+        self.mark_uncapped_slices();
         self.serialized_string()
             .expect("invalid preemption recording")
     }
@@ -1714,6 +1760,7 @@ impl PreemptionWriter {
     }
 
     fn write_to_disk(&mut self) -> Result<(), String> {
+        self.mark_uncapped_slices();
         if let Some(path) = &self.dest {
             if self.boundary_records.is_none() {
                 return self.inner.write_to_disk(path);
@@ -1995,6 +2042,18 @@ pub fn expired_wait_charge_mismatch(
             replay.as_str(),
         )
     })
+}
+
+/// Read only the uncapped-slices mark of a preemption record file
+/// (`PreemptionRecord::uncapped_slices`), as [`read_recorded_epoch`] reads the
+/// epoch. `Ok(None)` for an unmarked record.
+pub fn read_recorded_uncapped_slices(path: &Path) -> Result<Option<u64>, String> {
+    #[derive(Deserialize)]
+    struct MarkOnly {
+        #[serde(default)]
+        uncapped_slices: Option<u64>,
+    }
+    Ok(boundary_recording::read_settings::<MarkOnly>(path)?.uncapped_slices)
 }
 
 /// The refusal of a replay whose signal-state copy setting differs from the

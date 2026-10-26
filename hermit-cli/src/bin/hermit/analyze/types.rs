@@ -224,6 +224,13 @@ pub struct AnalyzeOpts {
     /// (`Report::branch_counter_warning`); `None` when it printed none.
     #[clap(skip)]
     pub branch_counter_warning: Option<String>,
+
+    /// The uncapped-slices mark the trials' schedules carry
+    /// (`PreemptionRecord::uncapped_slices`): set from the schedules they are
+    /// made from when those carry it, so that a trial's schedule replay
+    /// keeps their long slices (`Self::stamp_trial_record`).
+    #[clap(skip)]
+    pub trial_schedules_uncapped: std::cell::Cell<Option<u64>>,
 }
 
 // TODO: introduce a new type to encapsulate the state of the search, and make it immutable.
