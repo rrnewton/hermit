@@ -18333,6 +18333,11 @@ impl Scheduler {
                 // GlobalState keeps the host-input records.
                 host_inputs: None,
                 host_inputs_changed: Vec::new(),
+                // GlobalState records what the run learned of its
+                // store-exclusive sequences (aarch64).
+                exclusive_pairs: Default::default(),
+                store_exclusives: None,
+                store_exclusives_unavailable: None,
             },
             info_reprio_descrip,
         ))

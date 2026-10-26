@@ -95,6 +95,7 @@ mod signal_state;
 pub mod slice_boundary;
 mod sock_diag;
 mod stat;
+mod store_exclusive;
 mod syscall_classification;
 mod syscall_histogram;
 #[cfg(test)]
@@ -5083,6 +5084,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // The new image's program-break model, checked against the kernel's
         // once its exec record is in place.
         self.check_brk_model(guest).await;
+        // The new image's exclusive pairs (store-exclusive retry loops).
+        // Boxed, so its scan does not grow the post-exec future either.
+        #[cfg(target_arch = "aarch64")]
+        Box::pin(store_exclusive::report_after_exec(guest)).await;
         // Linux discards every queued POSIX timer signal at exec
         // (`flush_itimer_signals`), and Hermit's are ordinary signals it sent:
         // take them back before the new image runs
@@ -6629,6 +6634,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // observes the result (crate::exit_dependencies).
         if let Ok(ret) = res {
             self.refuse_exit_dependencies(guest, &call, ret).await;
+        }
+        // A new executable file mapping's exclusive pairs (store-exclusive
+        // retry loops). Boxed, so this rare path does not grow every
+        // syscall's future.
+        #[cfg(target_arch = "aarch64")]
+        if let Ok(ret) = res
+            && let Some(range) = store_exclusive::range_to_scan(guest, &call, ret)
+        {
+            Box::pin(store_exclusive::report_new_mapping(guest, range)).await;
         }
 
         // The guest resumes with this result in its return register (A5 step
