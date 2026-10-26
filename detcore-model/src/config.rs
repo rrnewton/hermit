@@ -770,6 +770,39 @@ pub struct Config {
     #[clap(long, value_name = "signame")]
     pub stacktrace_signal: Option<SigWrapper>,
 
+    /// Write an access trace to this path as the run records its schedule; its end line is written
+    /// when the run ends, and a trace without it was cut short. The trace is JSON Lines with one
+    /// record per syscall (its prehook and posthook positions in the recorded schedule, the thread,
+    /// the thread's syscall count, the arguments, the result, and the resources it used: descriptor
+    /// slots and the open files behind them, file contents, pipes, sockets, futex words, memory
+    /// ranges, timers, threads and processes), one per signal delivery (its code, fault address and
+    /// sender), and the first 256 bytes of each write to fd 1 or 2. `hermit analyze` reads it to
+    /// name the operations whose order decides a run. An observer: it adds no scheduler request and
+    /// moves no virtual time, so the schedule and the guest's results are those of a run without
+    /// it, except that Hermit's own command line, which a guest can read as PID 1's, shows the
+    /// option. Needs a recorded schedule (`--record-preemptions-to` or `--record-preemptions`),
+    /// whose positions the records name, sequentialized threads and the ptrace backend. The format
+    /// is `detcore_model::access_trace`.
+    #[serde(default)]
+    #[clap(long = "record-access-trace-to", value_name = "path")]
+    pub access_trace: Option<PathBuf>,
+
+    /// With `--record-access-trace-to`, leave out the records whose last schedule event comes
+    /// before this position. 0, the default, keeps every record. Resource state from before
+    /// the position, such as which open file a descriptor number names, is then only partly
+    /// visible in the trace.
+    #[serde(default)]
+    #[clap(long, value_name = "event", default_value = "0")]
+    pub access_trace_from: u64,
+
+    /// With `--record-access-trace-to`, write at most this many records from
+    /// `--access-trace-from` on. Past it the trace stops, without its end line, so a reader
+    /// sees it cut short; a run whose records all fit still ends with it. Unlimited by
+    /// default.
+    #[serde(default)]
+    #[clap(long, value_name = "records")]
+    pub access_trace_max_records: Option<u64>,
+
     /// **Deprecated:** Print a stacktrace each time the program is preempted.  Only makes sense in `--chaos` mode
     /// and typically goes with preemption recording/replaying.
     #[clap(long)]
@@ -1915,6 +1948,16 @@ impl fmt::Display for Config {
                 let s = p.to_str().expect("valid unicode path");
                 write!(f, ",{}", shell_words::quote(s))?;
             }
+        }
+        if let Some(p) = &self.access_trace {
+            let s = p.to_str().expect("valid unicode path");
+            write!(f, " --record-access-trace-to={}", shell_words::quote(s))?;
+        }
+        if self.access_trace_from != 0 {
+            write!(f, " --access-trace-from={}", self.access_trace_from)?;
+        }
+        if let Some(records) = self.access_trace_max_records {
+            write!(f, " --access-trace-max-records={}", records)?;
         }
         if self.preemption_stacktrace {
             write!(f, " --preemption-stacktrace")?;
@@ -3177,7 +3220,11 @@ mod legacy_backend_json {
     /// `eager_lone_preemptions` came after it too. DBT has no PMU timer, so
     /// the option has no effect there; it is never written and reads as
     /// false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 34] = [
+    /// `access_trace`, `access_trace_from` and `access_trace_max_records`
+    /// came after it too; the scheduler writes the trace, and `hermit run`
+    /// refuses it on DBT, so they are never written and read as unset, 0 and
+    /// unset.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 37] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3212,6 +3259,9 @@ mod legacy_backend_json {
         "notice_host_network_abstract_binds",
         "replay_edited_preemptions",
         "eager_lone_preemptions",
+        "access_trace",
+        "access_trace_from",
+        "access_trace_max_records",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3359,8 +3409,8 @@ mod legacy_backend_json {
                     | "replay_edited_preemptions"
                     | "eager_lone_preemptions",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
-                // Empty, as its serde default is.
-                Some("in_guest_reserved_signals") => {
+                // Empty, as its serde default is; and 0, the default.
+                Some("in_guest_reserved_signals" | "access_trace_from") => {
                     seed.deserialize(U64Deserializer::new(0)).map(Some)
                 }
                 // On, as its serde default is.
@@ -3379,7 +3429,9 @@ mod legacy_backend_json {
                     | "directory_placeholder"
                     | "work_span_report"
                     | "signal_at"
-                    | "virtual_cpus",
+                    | "virtual_cpus"
+                    | "access_trace"
+                    | "access_trace_max_records",
                 ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
@@ -3675,7 +3727,10 @@ mod legacy_backend_json {
                 | "virtual_cpus"
                 | "notice_host_network_abstract_binds"
                 | "replay_edited_preemptions"
-                | "eager_lone_preemptions" => Ok(()),
+                | "eager_lone_preemptions"
+                | "access_trace"
+                | "access_trace_from"
+                | "access_trace_max_records" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -4421,7 +4476,10 @@ mod tests {
                 | "virtual_cpus"
                 | "notice_host_network_abstract_binds"
                 | "replay_edited_preemptions"
-                | "eager_lone_preemptions" => {}
+                | "eager_lone_preemptions"
+                | "access_trace"
+                | "access_trace_from"
+                | "access_trace_max_records" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -4443,13 +4501,14 @@ mod tests {
         // `mountinfo_mount_namespace`, `directory_placeholder`,
         // `container_procfs`, `signal_delivery_check_fatal`,
         // `work_span_report`, `signal_at`, `in_guest_signal_delivery`,
-        // `annotated_priority_replay`, `virtual_cpus`, `replay_edited_preemptions`,
-        // `notice_host_network_abstract_binds`, `eager_lone_preemptions` and
-        // `strict_schedule_boundaries`
-        // none: fourteen more keys and thirty-three fewer, so nineteen keys fewer
+        // `annotated_priority_replay`, `virtual_cpus`,
+        // `replay_edited_preemptions`, `notice_host_network_abstract_binds`,
+        // `eager_lone_preemptions`, `access_trace`, `access_trace_from`,
+        // `access_trace_max_records` and `strict_schedule_boundaries` none:
+        // fourteen more keys and thirty-six fewer, so twenty-two keys fewer
         // than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 19);
+        assert_eq!(fields.len(), keys.len() + 22);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -5284,6 +5343,69 @@ mod tests {
                 notice_host_network_abstract_binds
             );
         }
+    }
+
+    /// The access trace's two fields came after the legacy form froze, so
+    /// they never enter it, and both the object and the array form read them
+    /// back as unset and 0. Set or not, they cross Reverie RPC's positional
+    /// bincode and the CLI spelling (`Display`) unchanged.
+    #[test]
+    fn access_trace_never_enters_the_legacy_form_and_round_trips() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            access_trace: Some(PathBuf::from("/var/run 1.access")),
+            access_trace_from: 7586,
+            access_trace_max_records: Some(40),
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("access_trace"), "{json}");
+        let decoded = from_legacy_backend_json(&json).unwrap();
+        assert_eq!((decoded.access_trace, decoded.access_trace_from), (None, 0));
+        assert_eq!(decoded.access_trace_max_records, None);
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        let decoded = from_legacy_backend_json(&array).unwrap();
+        assert_eq!((decoded.access_trace, decoded.access_trace_from), (None, 0));
+
+        for config in [Config::default(), on.clone()] {
+            let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+            let (decoded, read): (Config, usize) =
+                bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+            assert_eq!(read, wire.len());
+            assert_eq!(decoded.access_trace, config.access_trace);
+            assert_eq!(decoded.access_trace_from, config.access_trace_from);
+            assert_eq!(
+                decoded.access_trace_max_records,
+                config.access_trace_max_records
+            );
+        }
+
+        let spelled = on.to_string();
+        assert!(
+            spelled.contains(
+                " --record-access-trace-to='/var/run 1.access' --access-trace-from=7586 \
+                 --access-trace-max-records=40"
+            ),
+            "{spelled}"
+        );
+        assert!(!Config::default().to_string().contains("access-trace"));
+        let reparsed = Config::parse_from([
+            "hermit",
+            "--record-access-trace-to=/var/run 1.access",
+            "--access-trace-from=7586",
+            "--access-trace-max-records=40",
+        ]);
+        assert_eq!(reparsed.access_trace, on.access_trace);
+        assert_eq!(reparsed.access_trace_from, 7586);
+        assert_eq!(reparsed.access_trace_max_records, Some(40));
     }
 
     /// The in-guest reserved-signal set as an in-guest default-route run

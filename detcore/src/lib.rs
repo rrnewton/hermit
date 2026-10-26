@@ -36,6 +36,7 @@
 #![deny(missing_docs)]
 #![allow(clippy::uninlined_format_args)]
 
+pub mod access_trace;
 mod arch;
 mod config;
 mod consts;
@@ -421,6 +422,7 @@ use crate::syscalls::helpers::with_guest_time;
 use crate::syscalls::time::guest_clock_time;
 use crate::tool_global::resource_request;
 use crate::tool_global::trace_schedevent;
+use crate::tool_global::trace_schedevent_with_access;
 use crate::tool_global::unrecoverable_shutdown;
 use crate::types::SigWrapper;
 
@@ -612,6 +614,34 @@ where
         Some(copied) => copied.caught & bit != 0,
         None => crate::syscalls::read_kernel_signal_state(guest.pid(), guest.tid())
             .map_or(true, |state| state.caught & bit != 0),
+    }
+}
+
+/// How the access trace records the delivery of `signal`: a handler runs,
+/// the default action ends the process, or another default action applies.
+/// The dispositions come from where [`delivery_runs_handler`] reads them.
+fn traced_delivery<G, T>(guest: &G, signal: i32) -> detcore_model::access_trace::SignalDelivery
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    use detcore_model::access_trace::SignalDelivery;
+    let dispositions = match crate::syscalls::signal_shadow::copied_dispositions_for(guest, signal)
+    {
+        Some(copied) => Some((copied.ignored, copied.caught)),
+        None => crate::syscalls::read_kernel_signal_state(guest.pid(), guest.tid())
+            .ok()
+            .map(|state| (state.ignored, state.caught)),
+    };
+    let Some((ignored, caught)) = dispositions else {
+        return SignalDelivery::Handler;
+    };
+    if caught & crate::syscalls::kernel_sigset_bit(signal) != 0 {
+        SignalDelivery::Handler
+    } else if crate::syscalls::default_action_ends_process(ignored, caught, signal) {
+        SignalDelivery::Fatal
+    } else {
+        SignalDelivery::Default
     }
 }
 
@@ -1643,6 +1673,103 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// What a syscall's prehook event adds to the access trace: what the
+    /// registers say. `None` unless the run records one.
+    fn access_trace_entry<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        call: &Syscall,
+    ) -> Option<access_trace::AccessPayload> {
+        self.cfg.access_trace.as_ref()?;
+        let (sysno, args) = call.into_parts();
+        let thread = guest.thread_state();
+        let pid = thread.detpid.expect("detpid unset");
+        Some(access_trace::AccessPayload::SyscallEntry(
+            access_trace::SyscallEntry {
+                pid,
+                // `count_syscall` counts this call right after the prehook.
+                nth: thread.stats.syscall_count + 1,
+                sysno,
+                args: raw_syscall_args(args),
+                accesses: access_trace::entry_accesses(sysno, pid, thread.dettid),
+            },
+        ))
+    }
+
+    /// Start noting the descriptor slots a traced syscall changes, from the
+    /// descriptors it names as it reaches them.
+    fn begin_traced_call<G: Guest<Self>>(&self, guest: &G, call: &Syscall) {
+        if self.cfg.access_trace.is_none() {
+            return;
+        }
+        let (sysno, args) = call.into_parts();
+        let thread = guest.thread_state();
+        let fds = thread.access_trace_fds(&access_trace::named_fds(sysno, raw_syscall_args(args)));
+        thread.traced_call.begin(fds);
+    }
+
+    /// What a syscall's posthook event adds to the access trace: the result
+    /// and what [`access_trace::accesses`] finds. It reads guest memory the
+    /// way `--detlog-io-buffers` reads a syscall's buffers, and nothing that
+    /// a scheduling decision reads. `None` unless the call was traced.
+    fn access_trace_exit<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        call: &Syscall,
+        result: Option<i64>,
+        rng_output: Option<&[io_buffers::BufferExtent]>,
+    ) -> Option<access_trace::AccessPayload> {
+        let state = guest.thread_state().traced_call.take()?;
+        let result = result?;
+        let (sysno, args) = call.into_parts();
+        let args = raw_syscall_args(args);
+        let memory = guest.memory();
+        let written = access_trace::read_written(&memory, sysno, args, result);
+        let moved = io_buffers::access_trace_buffers(&memory, call, result, rng_output);
+        let thread = guest.thread_state();
+        let futex_id = |address: u64, private: bool| thread.futex_id(address as usize, private);
+        let accesses = access_trace::accesses(&access_trace::CallFacts {
+            sysno,
+            args,
+            result,
+            pid: thread.detpid.expect("detpid unset"),
+            tid: thread.dettid,
+            files: thread.files_id(),
+            mm: thread.mm_id,
+            fds: &state.fds,
+            notes: &state.notes,
+            buffers: &moved.buffers,
+            written: &written,
+            futex_id: &futex_id,
+        });
+        Some(access_trace::AccessPayload::SyscallExit(Box::new(
+            access_trace::SyscallOutcome {
+                result,
+                accesses,
+                returned: moved.returned,
+                out_bytes: moved.out_bytes,
+            },
+        )))
+    }
+
+    /// What a signal's delivery event adds to the access trace: its siginfo
+    /// and whether a handler runs. `None` unless the run records one.
+    fn access_trace_signal<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        signal: SigWrapper,
+    ) -> Option<access_trace::AccessPayload> {
+        self.cfg.access_trace.as_ref()?;
+        let siginfo = guest.signal_info();
+        Some(access_trace::AccessPayload::Signal(
+            access_trace::signal_note(
+                signal.raw(),
+                siginfo.as_ref().map(|info| &info[..]),
+                traced_delivery(guest, signal.raw()),
+            ),
+        ))
+    }
+
     /// Detcore's handling of an inbound signal, for both of Reverie's signal
     /// hooks (`Tool::handle_signal_event`, and `Tool::handle_raw_signal_event`
     /// for a realtime signal): a signal-delivery stop, the delivery of
@@ -1874,7 +2001,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let nanos = time.as_nanos();
 
         if delivery && self.cfg.sequentialize_threads && self.cfg.observes_schedevents() {
-            trace_schedevent(
+            let access = self.access_trace_signal(guest, signal);
+            trace_schedevent_with_access(
                 guest,
                 SchedEvent {
                     dettid,
@@ -1885,6 +2013,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     end_time: Some(nanos),
                 },
                 true,
+                access,
             )
             .await;
         }
@@ -1966,7 +2095,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         if self.cfg.sequentialize_threads && self.cfg.observes_schedevents() {
             let dettid = guest.thread_state().dettid;
             let nanos = guest.thread_state().thread_logical_time.as_nanos();
-            trace_schedevent(
+            let access = self.access_trace_signal(guest, signal);
+            trace_schedevent_with_access(
                 guest,
                 SchedEvent {
                     dettid,
@@ -1977,6 +2107,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     end_time: Some(nanos),
                 },
                 true,
+                access,
             )
             .await;
         }
@@ -3387,6 +3518,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
+/// A syscall's six argument registers as the access trace records them.
+fn raw_syscall_args(args: reverie::syscalls::SyscallArgs) -> [u64; 6] {
+    [
+        args.arg0 as u64,
+        args.arg1 as u64,
+        args.arg2 as u64,
+        args.arg3 as u64,
+        args.arg4 as u64,
+        args.arg5 as u64,
+    ]
+}
+
 /// Render a finished syscall for the `finish syscall` DETLOG line.
 ///
 /// Output pointers are dereferenced only when the kernel can have written
@@ -4607,6 +4750,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     open_file_creator: None,
                     receive_geometry: None,
                     send_inspection: None,
+                    traced_call: Default::default(),
                     mm_id: MmId::for_clone(
                         pts.1.mm_id,
                         dettid,
@@ -5305,15 +5449,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         };
 
         if sequentialize_threads && self.cfg.observes_schedevents() {
-            trace_schedevent(
+            let access = self.access_trace_entry(guest, &call);
+            trace_schedevent_with_access(
                 guest,
                 with_guest_time(
                     guest,
                     SchedEvent::syscall(dettid, call.number(), SyscallPhase::Prehook),
                 ),
                 true,
+                access,
             )
             .await;
+            // Its descriptors as the call reaches them: after this thread's
+            // turn at its prehook event.
+            self.begin_traced_call(guest, &call);
         }
 
         let syscall_cost_ns = syscall_time::cost_ns(call.number());
@@ -6759,13 +6908,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         }
 
         if sequentialize_threads && self.cfg.observes_schedevents() {
-            trace_schedevent(
+            let access =
+                self.access_trace_exit(guest, &call, finished, rng_readv_output.as_deref());
+            trace_schedevent_with_access(
                 guest,
                 with_guest_time(
                     guest,
                     SchedEvent::syscall(dettid, call.number(), SyscallPhase::Posthook),
                 ),
                 true,
+                access,
             )
             .await;
         }

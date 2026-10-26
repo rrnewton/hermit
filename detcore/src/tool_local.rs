@@ -1855,6 +1855,45 @@ impl FileMetadata {
         Ok(())
     }
 
+    /// The access trace's note of descriptor `fd` changing by `op`: the
+    /// open file it names now, and for an open, the path it was opened by.
+    fn slot_note(&self, fd: RawFd, op: FdNoteOp) -> crate::access_trace::FdNote {
+        use detcore_model::access_trace::FdOp;
+        let detfd = self.file_handles.get(&fd);
+        let op = match op {
+            FdNoteOp::Open => FdOp::Open {
+                path: detfd
+                    .and_then(DetFd::path)
+                    .map(|path| path.to_string_lossy().into_owned()),
+            },
+            FdNoteOp::Dup(source) => FdOp::Dup { source },
+        };
+        crate::access_trace::FdNote {
+            slot: detcore_model::fd::FdSlot {
+                files: self.files_id,
+                fd,
+            },
+            open_file: detfd.map(DetFd::open_file_id),
+            op,
+            released: None,
+        }
+    }
+
+    /// The access trace's note that `fd` is about to be released, with what
+    /// it named; `None` when it names nothing Detcore models.
+    fn close_note(&self, fd: RawFd) -> Option<crate::access_trace::FdNote> {
+        let detfd = self.file_handles.get(&fd)?;
+        Some(crate::access_trace::FdNote {
+            slot: detcore_model::fd::FdSlot {
+                files: self.files_id,
+                fd,
+            },
+            open_file: Some(detfd.open_file_id()),
+            op: detcore_model::access_trace::FdOp::Close,
+            released: Some(crate::access_trace::FdInfo::of(detfd)),
+        })
+    }
+
     /// remove a rawfd
     fn remove_fd(&mut self, fd: RawFd) -> Option<OpenFileId> {
         self.present_unmodelled.remove(&fd);
@@ -1958,6 +1997,13 @@ impl FileMetadata {
         drop(captured);
         release
     }
+}
+
+/// How a descriptor slot changed, for [`FileMetadata::slot_note`].
+#[derive(Clone, Copy)]
+enum FdNoteOp {
+    Open,
+    Dup(RawFd),
 }
 
 fn stdio_resource(fd: RawFd) -> Option<ResourceID> {
@@ -4548,6 +4594,11 @@ pub struct ThreadState<T> {
     /// Never carried across a fork or a migration.
     #[serde(skip)]
     pub(crate) send_inspection: Option<crate::syscalls::SendInspection>,
+    /// The syscall in progress, while the run records an access trace: the
+    /// descriptors it named and the slot changes it made
+    /// (`crate::access_trace`). Never carried across a fork or a migration.
+    #[serde(skip)]
+    pub(crate) traced_call: crate::access_trace::TracedCall,
 
     /// Linux memory address space shared by tasks created with `CLONE_VM`.
     pub mm_id: MmId,
@@ -5740,6 +5791,7 @@ impl<T> ThreadState<T> {
             open_file_creator: None,
             receive_geometry: None,
             send_inspection: None,
+            traced_call: Default::default(),
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
             pedigree: Pedigree::new(), // Root thread.
@@ -6419,13 +6471,19 @@ impl<T> ThreadState<T> {
         ty: FdType,
         stat: Option<DetStat>,
     ) -> Result<(), Errno> {
-        self.metadata().add_fd(
+        let mut metadata = self.metadata();
+        metadata.add_fd(
             self.open_file_creator.unwrap_or(self.dettid),
             fd,
             flags,
             ty,
             stat,
-        )
+        )?;
+        if self.traced_call.is_active() {
+            self.traced_call
+                .note(metadata.slot_note(fd, FdNoteOp::Open));
+        }
+        Ok(())
     }
 
     /// Record descriptor `fd`, which Linux installed by a route Detcore did not
@@ -6440,14 +6498,20 @@ impl<T> ThreadState<T> {
         raw_stat: &libc::stat,
         link: Option<&[u8]>,
     ) -> Result<(), Errno> {
-        self.metadata().add_discovered_fd(
+        let mut metadata = self.metadata();
+        metadata.add_discovered_fd(
             self.open_file_creator.unwrap_or(self.dettid),
             fd,
             fd_flags,
             status_flags,
             raw_stat,
             link,
-        )
+        )?;
+        if self.traced_call.is_active() {
+            self.traced_call
+                .note(metadata.slot_note(fd, FdNoteOp::Open));
+        }
+        Ok(())
     }
 
     /// Make `fd`, which this thread just opened, a random device
@@ -6740,12 +6804,34 @@ impl<T> ThreadState<T> {
 
     /// remove a rawfd
     pub fn remove_fd(&self, fd: RawFd) -> Option<OpenFileId> {
-        self.metadata().remove_fd(fd)
+        let mut metadata = self.metadata();
+        if self.traced_call.is_active()
+            && let Some(note) = metadata.close_note(fd)
+        {
+            self.traced_call.note(note);
+        }
+        metadata.remove_fd(fd)
     }
 
     /// Remove every modeled descriptor in an inclusive close_range interval.
     pub(crate) fn remove_fd_range(&self, first: u32, last: u32) -> Vec<OpenFileId> {
-        self.metadata().remove_fd_range(first, last)
+        let mut metadata = self.metadata();
+        if self.traced_call.is_active() {
+            let mut released: Vec<RawFd> = metadata
+                .file_handles
+                .keys()
+                .copied()
+                .filter(|fd| *fd >= 0 && first <= *fd as u32 && *fd as u32 <= last)
+                .collect();
+            released.sort_unstable();
+            for note in released
+                .into_iter()
+                .filter_map(|fd| metadata.close_note(fd))
+            {
+                self.traced_call.note(note);
+            }
+        }
+        metadata.remove_fd_range(first, last)
     }
 
     /// How many slots of this thread's table name the open file description
@@ -6820,7 +6906,18 @@ impl<T> ThreadState<T> {
                 oldfd,
             )?;
         }
-        metadata.dup_fd(oldfd, newfd, flags)
+        let replaced = (self.traced_call.is_active() && oldfd != newfd)
+            .then(|| metadata.close_note(newfd))
+            .flatten();
+        let released = metadata.dup_fd(oldfd, newfd, flags)?;
+        if self.traced_call.is_active() && oldfd != newfd {
+            if let Some(note) = replaced {
+                self.traced_call.note(note);
+            }
+            self.traced_call
+                .note(metadata.slot_note(newfd, FdNoteOp::Dup(oldfd)));
+        }
+        Ok(released)
     }
 
     /// Atomically validate a pidfd target and capture its source descriptor.
@@ -6868,7 +6965,21 @@ impl<T> ThreadState<T> {
         newfd: RawFd,
         flags: OFlag,
     ) -> Result<Option<OpenFileId>, CapturedDetFdInstallError> {
-        self.metadata().install_captured_fd(captured, newfd, flags)
+        let mut metadata = self.metadata();
+        let replaced = self
+            .traced_call
+            .is_active()
+            .then(|| metadata.close_note(newfd))
+            .flatten();
+        let released = metadata.install_captured_fd(captured, newfd, flags)?;
+        if self.traced_call.is_active() {
+            if let Some(note) = replaced {
+                self.traced_call.note(note);
+            }
+            self.traced_call
+                .note(metadata.slot_note(newfd, FdNoteOp::Open));
+        }
+        Ok(released)
     }
 
     /// Install `detfd`, which refers to an open file description Detcore
@@ -6877,7 +6988,30 @@ impl<T> ThreadState<T> {
     /// when it is received (`Detcore::record_received_descriptors`) or when
     /// the guest first names it (`Detcore::adopt_received_placeholders`).
     pub(crate) fn install_alias(&self, detfd: DetFd) {
-        self.metadata().add_detfd(detfd);
+        let fd = detfd.fd;
+        let mut metadata = self.metadata();
+        metadata.add_detfd(detfd);
+        if self.traced_call.is_active() {
+            self.traced_call
+                .note(metadata.slot_note(fd, FdNoteOp::Open));
+        }
+    }
+
+    /// The descriptors among `fds` this thread's table names, as the access
+    /// trace needs them (`crate::access_trace::FdInfo`).
+    pub(crate) fn access_trace_fds(
+        &self,
+        fds: &[RawFd],
+    ) -> BTreeMap<RawFd, crate::access_trace::FdInfo> {
+        let metadata = self.metadata();
+        fds.iter()
+            .filter_map(|fd| {
+                metadata
+                    .file_handles
+                    .get(fd)
+                    .map(|detfd| (*fd, crate::access_trace::FdInfo::of(detfd)))
+            })
+            .collect()
     }
 
     /// Abandon an uninstalled capture and identify a deferred final-OFD release.
@@ -7451,6 +7585,67 @@ fn next_edited_slice(
             }
             Some(_) => skipped += 1,
         }
+    }
+}
+
+#[cfg(test)]
+mod traced_call_tests {
+    use detcore_model::access_trace::FdOp;
+
+    use super::*;
+
+    /// While a traced call is in progress, the descriptor table notes each
+    /// slot it opens, dups onto and closes, in order: a dup2 onto an open
+    /// number closes it first, and a close_range lists every slot it
+    /// releases with the open file it held. Without a traced call nothing is
+    /// noted.
+    #[test]
+    fn a_traced_call_notes_the_slots_it_changes() {
+        let mut state = ThreadState::<()>::new(DetTid::from_raw(3), &Config::default(), ());
+        for fd in [10, 11] {
+            state.add_fd(fd, OFlag::O_RDWR, FdType::Pipe, None).unwrap();
+        }
+        let id = |state: &ThreadState<()>, fd| state.with_detfd(fd, |d| d.open_file_id()).unwrap();
+        let (ten, eleven) = (id(&state, 10), id(&state, 11));
+        state.remove_fd(12);
+        assert!(
+            state.traced_call.take().is_none(),
+            "no traced call, no notes"
+        );
+
+        state.traced_call.begin(BTreeMap::new());
+        state.dup_fd(10, 11, OFlag::empty()).unwrap();
+        state.remove_fd_range(10, u32::MAX);
+        let notes = state.traced_call.take().expect("a traced call").notes;
+        let slot = |fd| detcore_model::fd::FdSlot {
+            files: state.files_id(),
+            fd,
+        };
+        let summary: Vec<_> = notes
+            .iter()
+            .map(|note| {
+                (
+                    note.slot,
+                    note.open_file,
+                    note.op.clone(),
+                    note.released.as_ref().map(|r| (r.open_file, r.ty)),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    slot(11),
+                    Some(eleven),
+                    FdOp::Close,
+                    Some((eleven, FdType::Pipe))
+                ),
+                (slot(11), Some(ten), FdOp::Dup { source: 10 }, None),
+                (slot(10), Some(ten), FdOp::Close, Some((ten, FdType::Pipe))),
+                (slot(11), Some(ten), FdOp::Close, Some((ten, FdType::Pipe))),
+            ]
+        );
     }
 }
 

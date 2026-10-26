@@ -30,6 +30,9 @@ use skid_overshoot::SKID_OVERSHOOT_REFUSAL_PREFIX;
 use skid_overshoot::retry_typed_skid_refusal;
 use skid_overshoot::skid_overshoot_refusal;
 
+#[path = "common/access_trace.rs"]
+mod access_trace;
+
 #[path = "common/kvm_cancellation.rs"]
 mod kvm_cancellation;
 

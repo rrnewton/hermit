@@ -2278,6 +2278,10 @@ pub struct Scheduler {
     /// was specified in the Config, otherwise this remains empty.
     pub preemption_writer: Option<PreemptionWriter>,
 
+    /// The access trace (`--record-access-trace-to`), written as events are
+    /// recorded ([`Self::record_access`]). It never feeds a decision.
+    pub access_trace: Option<crate::access_trace::AccessTraceWriter>,
+
     /// An instance of replayer that is responsible for replaying events in case --replay-preemptions-from is specified
     pub replayer: Option<Replayer>,
     /// Fixed by recording configuration or the loaded legacy annotations,
@@ -2601,6 +2605,23 @@ pub(crate) const OUTSIDE_NAMESPACE: DetPid = DetPid::from_raw(0);
 
 use self::replayer::DesyncStats;
 use self::replayer::Replayer;
+
+impl crate::access_trace::ProcessGroups for ThreadTree {
+    fn group_of(&self, pid: DetPid) -> Option<DetPid> {
+        self.process_group(pid)
+    }
+
+    fn members(&self, group: DetPid) -> Vec<DetPid> {
+        let mut members: Vec<DetPid> = self
+            .process_wait
+            .iter()
+            .filter(|(_, metadata)| metadata.process_group == group)
+            .map(|(pid, _)| *pid)
+            .collect();
+        members.sort_unstable();
+        members
+    }
+}
 
 impl ThreadTree {
     /// The run's root process: the one thread added without a parent.
@@ -4542,9 +4563,34 @@ impl Scheduler {
             v.into_iter().peekable()
         });
 
+        // The CLI requires a recorded schedule for the trace, whose positions
+        // its records name, and checks that the container can see the path.
+        // A file that still cannot be created ends the run before any guest
+        // turn, rather than run without the trace that was asked for.
+        let access_trace = cfg.access_trace.as_ref().map(|path| {
+            assert!(
+                cfg.record_preemptions,
+                "an access trace needs a recorded schedule"
+            );
+            crate::access_trace::AccessTraceWriter::create(
+                path,
+                cfg.access_trace_from,
+                cfg.access_trace_max_records,
+            )
+            .unwrap_or_else(|error| {
+                exit_on_scheduler_refusal(&format!(
+                    "hermit: cannot create the access trace {}: {error}. Pass \
+                         --record-access-trace-to a path in an existing directory the run \
+                         can write.",
+                    path.display()
+                ))
+            })
+        });
+
         let (backend_failure_sender, backend_failure_wake) = oneshot::channel();
         Self {
             preemption_writer,
+            access_trace,
             callback_history_active: crate::preemptions::callback_history::recording_enabled(cfg)
                 || cfg.annotated_priority_replay
                 || callback_checkpoints
@@ -18483,6 +18529,24 @@ impl Scheduler {
             .unwrap();
         }
         buf
+    }
+
+    /// Hand the access trace what the event [`Self::record_event`] just
+    /// recorded adds to it. The trace reads the process table to resolve a
+    /// group signal and changes nothing.
+    pub(crate) fn record_access(
+        &mut self,
+        ev: &SchedEvent,
+        access: Option<Box<crate::access_trace::AccessPayload>>,
+    ) {
+        let (Some(writer), Some(access)) = (self.access_trace.as_mut(), access) else {
+            return;
+        };
+        let index = self
+            .recorded_event_count
+            .checked_sub(1)
+            .expect("record_event recorded this event");
+        writer.observe(index, ev, *access, &self.thread_tree);
     }
 
     // Return whether we should print the stacktrace after recording this event.
