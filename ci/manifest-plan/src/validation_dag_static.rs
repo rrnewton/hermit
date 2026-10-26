@@ -5502,7 +5502,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same schedule-prefix unit: 2789, listed.
     // And the same normalize test: 2790.
     // And the same seventeen access-trace tests as test.detcore_unit: 2807.
-    ("test.detcore_unit_on_host", 2807),
+    // And the same fifteen sync-edge tests as test.detcore_unit: 2822.
+    ("test.detcore_unit_on_host", 2822),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
