@@ -2778,8 +2778,19 @@ fi
 # so the inventory, SDK and native inputs, calibrated budget, job width and
 # limits carry unchanged from the 4fc34896 entry. The reverie-dbt Rust changes
 # remain build-relevant and need fresh validation.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 1d6df11f748837bfb3342b7106fefb55e4e1c4b9 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 1d6df11f748837bfb3342b7106fefb55e4e1c4b9 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO a32b6494c83750f21560cd3db565dc2da8a200a6 (2026-10-26):
+# LinuxEmu executor split into gVisor-named subsystem modules (pure move inside
+# reverie-linuxemu). Rebased onto 1d6df11f; the interval touches only
+# reverie-linuxemu/, adds no reverie-dbt file (inventory 1009) and leaves the
+# root Cargo.toml, Cargo.lock, rust-toolchain.toml and third-party/ unchanged;
+# both repository inputs to the DynamoRIO content key are byte-identical by git
+# object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory, SDK and native inputs, calibrated budget, job width and
+# limits carry unchanged from the 1d6df11f entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a32b6494c83750f21560cd3db565dc2da8a200a6 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a32b6494c83750f21560cd3db565dc2da8a200a6 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
