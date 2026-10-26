@@ -503,10 +503,12 @@ impl RunData {
         ro.det_opts.det_config.chaos = true;
         if ro.det_opts.det_config.chaos_timed_wait_spread.is_some() {
             bail!(
-                "hermit analyze cannot replay --chaos-timed-wait-spread yet: its bisect and \
-                 minimize replays mix schedules found under different seeds, and the spread's \
-                 wake times are drawn from the seed. Find the failure with hermit run --chaos \
-                 --chaos-timed-wait-spread=R --seed=N, or drop --chaos-timed-wait-spread"
+                "hermit analyze cannot bisect or minimize --chaos-timed-wait-spread runs: their \
+                 trials replay schedules found under different scheduler seeds, and the \
+                 spread's wake factors are keyed on the seed, so a mixed schedule would wake \
+                 its sleepers at times neither run had. Find the failure with hermit run \
+                 --chaos --chaos-timed-wait-spread=R --seed=N and replay it with \
+                 --replay-schedule-from, or drop --chaos-timed-wait-spread"
             );
         }
 

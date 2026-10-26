@@ -6361,7 +6361,7 @@ fn a_replay_under_another_cap_preemption_charge_is_refused() {
 /// and round-trips. It is refused below 1 or non-finite, on a fresh run
 /// without `--chaos`, with `--namespace-only`, with `--replay-schedule-from`
 /// (which cannot reproduce its sleep draws), and on a backend other than
-/// ptrace; a preemption replay may carry it without `--chaos`. (`--chaos`
+/// ptrace; a preemption or schedule replay may carry it without `--chaos`. (`--chaos`
 /// already keeps threads sequentialized and conflicts with `--strace-only`.)
 #[test]
 fn chaos_timed_wait_spread_parses_round_trips_and_is_refused_where_inert() {
@@ -6399,21 +6399,20 @@ fn chaos_timed_wait_spread_parses_round_trips_and_is_refused_where_inert() {
         "fakeprog",
     ]);
     replay.validate_args_with_perf_support(true).unwrap();
+    let mut schedule_replay = RunOpts::parse_from([
+        "fakehermit",
+        "--replay-schedule-from=schedule.json",
+        "--chaos-timed-wait-spread=10",
+        "fakeprog",
+    ]);
+    schedule_replay
+        .validate_args_with_perf_support(true)
+        .unwrap();
 
     for (argv, expected) in [
         (
             vec!["hermit", "run", "--chaos-timed-wait-spread=10", "fakeprog"],
             "add --chaos",
-        ),
-        (
-            vec![
-                "hermit",
-                "run",
-                "--replay-schedule-from=schedule.json",
-                "--chaos-timed-wait-spread=10",
-                "fakeprog",
-            ],
-            "Replay the recording with --replay-preemptions-from",
         ),
         (
             vec![
@@ -6509,12 +6508,51 @@ fn a_replay_under_another_timed_wait_spread_is_refused() {
         format!("{error:#}").contains("Replay with --sched-seed=7"),
         "{error:#}"
     );
+    // A schedule replay of a record whose sleeps were registered when chosen
+    // is refused whatever it gives, naming the registration to record with.
     let schedule = format!("--replay-schedule-from={}", path.display());
-    let error = RunOpts::parse_from(["fakehermit", schedule.as_str(), "fakeprog"])
-        .refuse_replay_under_another_timed_wait_spread()
-        .unwrap_err();
+    for extra in [
+        &[][..],
+        &["--chaos-timed-wait-spread=10", "--sched-seed=7"][..],
+    ] {
+        let mut argv = vec!["fakehermit", schedule.as_str()];
+        argv.extend_from_slice(extra);
+        argv.push("fakeprog");
+        let error = RunOpts::parse_from(argv)
+            .refuse_replay_under_another_timed_wait_spread()
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("Record with --sleep-registration=first-pass"),
+            "{error:#}"
+        );
+    }
+    // One registered at the first pass is accepted under the recorded spread
+    // and seed, and refused under others as a preemption replay is.
+    let first_pass = dir.path().join("first-pass.json");
+    let record = detcore::preemptions::PreemptionWriter::new(None)
+        .with_timed_wait_spread(Some(detcore::preemptions::RecordedTimedWaitSpread {
+            spread: 10.0,
+            seed: Some(7),
+        }))
+        .with_queued_sleeps_registered_at_first_pass(true)
+        .into_string();
+    std::fs::write(&first_pass, record).unwrap();
+    let schedule = format!("--replay-schedule-from={}", first_pass.display());
+    let replay = |extra: &[&str]| {
+        let mut argv = vec!["fakehermit", schedule.as_str()];
+        argv.extend_from_slice(extra);
+        argv.push("fakeprog");
+        RunOpts::parse_from(argv).refuse_replay_under_another_timed_wait_spread()
+    };
+    replay(&["--chaos-timed-wait-spread=10", "--sched-seed=7"]).unwrap();
+    let error = replay(&["--sched-seed=7"]).unwrap_err();
     assert!(
-        format!("{error:#}").contains("Replay the recording with --replay-preemptions-from"),
+        format!("{error:#}").contains("Replay with --chaos-timed-wait-spread=10"),
+        "{error:#}"
+    );
+    let error = replay(&["--chaos-timed-wait-spread=10", "--sched-seed=8"]).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("Replay with --sched-seed=7"),
         "{error:#}"
     );
 }
@@ -9447,16 +9485,26 @@ impl RunOpts {
             };
             let recorded =
                 detcore::preemptions::read_recorded_timed_wait_spread(path).map_err(Error::msg)?;
+            // A schedule replay reproduces a spread sleep's wake time only
+            // when the recording registered the sleep at the first pass, as
+            // the replay does: a sleep registered when its thread was chosen
+            // drew its wake time from a committed time that the schedule does
+            // not record, since it records the thread's next turn only after
+            // the wake.
             if option == "--replay-schedule-from"
                 && let Some(recorded) = recorded
+                && !detcore::preemptions::read_recorded_queued_sleeps_registered_at_first_pass(path)
+                    .map_err(Error::msg)?
             {
-                // Refused with or without the option (see `validate_args`).
                 return Err(Error::new(PolicyRefusal).context(format!(
-                    "{option} {} was recorded with --chaos-timed-wait-spread={}, which a \
-                     schedule replay cannot reproduce: it evaluates a sleep when its schedule \
-                     next runs the thread, later than the recording did. Replay the recording \
-                     with --replay-preemptions-from, --chaos and its --chaos-timed-wait-spread \
-                     and --seed",
+                    "{option} {} was recorded with --chaos-timed-wait-spread={} and registered \
+                     its sleeps when chosen (--sleep-registration=when-chosen), which a schedule \
+                     replay cannot reproduce: it evaluates such a sleep when its schedule next \
+                     runs the thread, later than the recording did, and would draw the sleep's \
+                     wake time from another clock. Record with --sleep-registration=first-pass \
+                     (the default with --chaos-timed-wait-spread), or replay this recording with \
+                     --replay-preemptions-from, --chaos and its --chaos-timed-wait-spread and \
+                     --seed",
                     path.display(),
                     recorded.spread
                 )));
@@ -11470,21 +11518,14 @@ impl RunOpts {
                      --chaos-timed-wait-spread"
                 );
             }
-            // A schedule replay evaluates a sleep's request when its
-            // schedule next runs the thread, not when the recording did, so
-            // it would draw the sleep's threshold from another committed
-            // time and run another schedule. A preemption replay repeats the
-            // recording's passes and reproduces the draws.
-            if config.replay_schedule_from.is_some() {
-                anyhow::bail!(
-                    "--replay-schedule-from cannot reproduce --chaos-timed-wait-spread: it \
-                     evaluates a sleep when its schedule next runs the thread, later than the \
-                     recording did, so the sleep's wake time is drawn from another clock. \
-                     Replay the recording with --replay-preemptions-from, --chaos and its \
-                     --chaos-timed-wait-spread and --seed"
-                );
-            }
-            if !config.chaos && config.replay_preemptions_from.is_none() {
+            // A replay of a schedule recorded with the spread may carry it
+            // without --chaos, as a preemption replay may; whether the record
+            // is one a schedule replay can reproduce is
+            // `refuse_replay_under_another_timed_wait_spread`'s to decide.
+            if !config.chaos
+                && config.replay_preemptions_from.is_none()
+                && config.replay_schedule_from.is_none()
+            {
                 anyhow::bail!(
                     "--chaos-timed-wait-spread perturbs a chaos run's timed waits; add --chaos \
                      (or replay preemptions recorded with it)"
