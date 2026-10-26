@@ -407,6 +407,16 @@ impl<'de> Deserialize<'de> for SyscallHistogram {
     }
 }
 
+/// Every syscall the pinned x86-64 table names, as `(number, name)` by
+/// ascending number. A coverage report takes its never-exercised list from
+/// this, so it names exactly the syscalls a histogram can count.
+pub fn pinned_syscall_table() -> Vec<(i32, &'static str)> {
+    (0..SYSCALL_TABLE_SIZE)
+        .filter_map(|slot| Sysno::new(slot + Sysno::first().id() as usize))
+        .map(|sysno| (sysno.id(), sysno.name()))
+        .collect()
+}
+
 fn syscall_name(nr: i32) -> String {
     usize::try_from(nr)
         .ok()
@@ -533,6 +543,16 @@ mod tests {
         assert!(serde_json::from_str::<SyscallHistogram>(&out_of_table).is_err());
         let unordered = r#"[[1,{"calls":1,"detcore":0,"backend":0,"refused":0}],[0,{"calls":1,"detcore":0,"backend":0,"refused":0}]]"#;
         assert!(serde_json::from_str::<SyscallHistogram>(unordered).is_err());
+    }
+
+    #[test]
+    fn the_pinned_table_names_every_countable_syscall_once() {
+        let table = pinned_syscall_table();
+        assert_eq!(table.len(), Sysno::count());
+        assert_eq!(table.first(), Some(&(0, "read")));
+        assert!(table.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        let names: std::collections::BTreeSet<_> = table.iter().map(|(_, name)| name).collect();
+        assert_eq!(names.len(), table.len());
     }
 
     #[test]
