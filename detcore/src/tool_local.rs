@@ -9896,6 +9896,8 @@ mod timeslice_tests {
         assert!(state.timeslice_expired());
     }
 
+    // x86_64 only: instruction traps (CPUID, RDTSC) exist only there.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn instruction_trap_ends_an_expired_target_only_at_the_pmu_maximum() {
         let config = Config {
@@ -9917,6 +9919,8 @@ mod timeslice_tests {
         assert!(state.instruction_trap_ends_timeslice(&config));
     }
 
+    // x86_64 only: instruction traps (CPUID, RDTSC) exist only there.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn instruction_trap_ends_an_expired_target_by_default() {
         let config = Config {
@@ -9933,6 +9937,8 @@ mod timeslice_tests {
         assert!(state.instruction_trap_ends_timeslice(&config));
     }
 
+    // x86_64 only: instruction traps (CPUID, RDTSC) exist only there.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn instruction_trap_ends_an_expired_target_without_a_pmu_maximum() {
         // With PMU preemption disabled nothing else can break a busy-wait on
@@ -9954,6 +9960,8 @@ mod timeslice_tests {
         assert!(state.instruction_trap_ends_timeslice(&config));
     }
 
+    // x86_64 only: instruction traps (CPUID, RDTSC) exist only there.
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn instruction_trap_keeps_replayed_and_untargeted_boundaries() {
         // Without a target the slice end is the PMU maximum itself, and a
@@ -10288,8 +10296,15 @@ mod native_exec_cut_tests {
                     thread.restart_block = Some(crate::syscalls::helpers::RestartBlock {
                         rip: 0x1234,
                         deadline: None,
+                        // Any call with a restart block will do; aarch64 has
+                        // no poll.
+                        #[cfg(target_arch = "x86_64")]
                         call: crate::syscalls::helpers::RestartCall::Poll(
                             reverie::syscalls::Poll::new(),
+                        ),
+                        #[cfg(not(target_arch = "x86_64"))]
+                        call: crate::syscalls::helpers::RestartCall::Futex(
+                            reverie::syscalls::Futex::new(),
                         ),
                     })
                 }
