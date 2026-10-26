@@ -1243,7 +1243,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // interpolation unit: 1958 + 3 = 1961.
     // And detcore-model's two config::tests of --chaos-timed-wait-spread
     // (legacy form, round trip): 1963.
-    ("test.regular_crates", 1963),
+    // And detcore-model's config::tests::
+    // a_timed_wait_spread_registers_sleeps_at_the_first_pass_by_default: 1964.
+    ("test.regular_crates", 1964),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3193,7 +3195,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 3279 + 16 = 3295.
     // And --chaos-timed-wait-spread: three scheduler::timed_wait_spread::tests, one
     // timed_waiters test, two scheduler tests and one preemptions test: 3302.
-    ("test.detcore_unit", 3302),
+    // And scheduler::test::a_schedule_replay_spreads_no_wait_filed_past_its_schedule: 3303.
+    ("test.detcore_unit", 3303),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4539,7 +4542,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_ignored_or_blocked_sigchld_does_not_end_a_sleep and
     // a_signal_after_a_sleeps_deadline_does_not_interrupt_it: 763 + 2 = 765.
     // And chaos_timed_wait_spread_reorders_a_wait_against_work_and_keeps_the_clock_honest: 766.
-    ("test.cli", 766),
+    // And a_schedule_replay_of_a_timed_wait_spread_recording_follows_it: 767.
+    ("test.cli", 767),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5130,11 +5134,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same eighteen integrated-chain cli cases: 664 + 18 = 682.
     // And the same two #4682 re-land tests: 682 + 2 = 684.
     // And the same --chaos-timed-wait-spread guest test: 685.
-    ("test.cli_on_host", 685),
+    // And the same spread schedule-replay test: 686.
+    ("test.cli_on_host", 686),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1958 - 14 = 1944, re-measured 2026-10-31.
-    // Kept equal to the second test.regular_crates_on_host entry below: 1949.
-    ("test.regular_crates_on_host", 1949),
+    // Kept equal to the second test.regular_crates_on_host entry below: 1950.
+    ("test.regular_crates_on_host", 1950),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5649,7 +5654,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same thirty-seven NR units: 3242 + 37 = 3279.
     // And the same sixteen #4682 re-land units: 3279 + 16 = 3295.
     // And the same seven --chaos-timed-wait-spread tests: 3302.
-    ("test.detcore_unit_on_host", 3302),
+    // And the same spread past-the-schedule unit: 3303.
+    ("test.detcore_unit_on_host", 3303),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6281,7 +6287,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same twenty known_gaps units, none of them hosted-excluded: 1958 - 14 = 1944.
     // And the same three #4682 re-land units: 1944 + 3 = 1947.
     // And the same two --chaos-timed-wait-spread config tests: 1949.
-    ("test.regular_crates_on_host", 1949),
+    // And the same spread registration config test: 1950.
+    ("test.regular_crates_on_host", 1950),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
