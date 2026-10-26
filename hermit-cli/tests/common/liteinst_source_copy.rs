@@ -20,15 +20,20 @@ const CHILD_ROOT: &str = "HERMIT_SOURCE_COPY_TEST_CHILD";
 const TEST_NAME: &str = "source_copy::gitless_standalone_compiler_sources";
 const TRANSACTION_TEST_NAME: &str =
     "source_copy::compiled_source_transaction_closes_both_result_paths";
-const SOURCE_FILES: [&str; 9] = [
+const SOURCE_FILES: [&str; 13] = [
     "liteinst-runtime-build/Cargo.toml",
     "liteinst-runtime-build/Cargo.lock",
     "liteinst-runtime-build/runtime/Cargo.toml",
     "liteinst-runtime-build/runtime/src/lib.rs",
     "liteinst-runtime-build/build.rs",
     "liteinst-runtime-build/artifact.rs",
+    "liteinst-runtime-build/native_bundle.rs",
+    "liteinst-runtime-build/protected_copy.rs",
     // Cargo still requires the build-only library's declared target to exist.
     "liteinst-runtime-build/src/lib.rs",
+    // The workspace member and dev dependency are resolved by Cargo metadata.
+    "liteinst-runtime-build/test-support/Cargo.toml",
+    "liteinst-runtime-build/test-support/src/lib.rs",
     // Cargo metadata validates optional local dependencies even with native-exec
     // disabled. Retain the real manifest and declared target, not a stub crate.
     "detcore-model/Cargo.toml",

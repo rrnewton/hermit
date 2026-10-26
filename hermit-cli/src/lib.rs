@@ -14,7 +14,7 @@
 // This host library retains LiteInst code without becoming an in-guest Tool
 // image. Declare its historical backing explicitly and keep the host allocator;
 // LiteInst's allocation preflight still refuses non-Tool allocations.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 reverie_liteinst::declare_legacy_tool_backing!();
 
 mod backend_stats;
@@ -32,10 +32,10 @@ use hermit_record_format::event_stream;
 pub mod happens_before;
 pub mod host_input_change;
 mod id;
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 pub mod in_guest_exits;
 pub mod instruction_map;
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 use hermit_record_format::interp;
 pub mod liteinst_bootstrap;
 mod liteinst_constructor;
@@ -383,11 +383,11 @@ use std::io::Write;
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
-#[cfg(any(feature = "sabre", all(test, feature = "liteinst")))]
+#[cfg(any(feature = "sabre", all(test, feature = "in-guest-trap")))]
 use std::os::unix::ffi::OsStrExt;
 #[cfg(feature = "sabre")]
 use std::os::unix::fs::OpenOptionsExt;
-#[cfg(any(feature = "sabre", feature = "liteinst"))]
+#[cfg(any(feature = "sabre", feature = "in-guest-trap"))]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -438,6 +438,9 @@ pub use error::Context;
 pub use error::Error;
 pub use error::FailureKind;
 pub use error::SerializableError;
+#[cfg(all(feature = "in-guest-trap", not(feature = "liteinst")))]
+#[doc(hidden)]
+pub use error::VerificationDeterminismLoss;
 use goblin::elf::Elf;
 use goblin::elf::header;
 use goblin::elf::section_header;
@@ -1117,7 +1120,7 @@ impl std::error::Error for LiteinstInGuestRefusal {}
 /// executes the same path this check inspected. For `in-guest-trap` it then
 /// sets `REVERIE_LITEINST_SITE_PATCHING=0` on `command`
 /// ([`force_in_guest_site_patching`]).
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn refuse_in_guest_liteinst_run(
     command: &mut Command,
     config: &DetConfig,
@@ -1151,8 +1154,9 @@ fn refuse_in_guest_liteinst_run(
 /// The value of `REVERIE_LITEINST_SITE_PATCHING` (`reverie_liteinst::SITE_PATCHING_ENV`)
 /// that the guest sees under `backend`, when Hermit decides it: `0` for
 /// `in-guest-trap`, which exists to run with no syscall site patched, and
-/// `None` for `liteinst`, which leaves the variable to the guest environment
-/// (unset means patching on).
+/// `None` for `liteinst`, which preserves explicit guest selectors. When its
+/// selector is unset, the runtime retains its environment fallback. The sealed
+/// tool-data record separately requires the LiteInst runtime feature.
 pub fn forced_site_patching_value(backend: Backend) -> Option<&'static str> {
     match backend {
         Backend::InGuestTrap => Some("0"),
@@ -1251,7 +1255,7 @@ pub fn scheduler_owns_guest_pid_namespace() -> bool {
 /// under the gate (its runtime mask, final-read loop and predicted deaths,
 /// A5 step 3c.1e). Not yet: until the flip (3c.1f), the gate stays off on
 /// every route, whatever [`in_guest_signal_delivery_gate`] answers.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 const IN_GUEST_RUNTIME_DELIVERS_SIGNALS: bool = false;
 
 /// The in-guest delivery gate (`detcore::Config::in_guest_signal_delivery`,
@@ -1279,7 +1283,7 @@ pub fn in_guest_signal_delivery_gate(
 
 /// `RLIMIT_CPU`'s value as Hermit's log and refusal print it: `unlimited`, or
 /// a number of seconds.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn rlimit_seconds(value: libc::rlim_t) -> String {
     if value == libc::RLIM_INFINITY {
         "unlimited".to_owned()
@@ -1291,7 +1295,7 @@ fn rlimit_seconds(value: libc::rlim_t) -> String {
 /// The INFO line for the physical `RLIMIT_CPU` the guest's own check found,
 /// `old`, just before its program started, and set to unlimited, the value
 /// Detcore reports (`syscalls/sysinfo.rs`): D25 of A5 step 3c.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn rlimit_cpu_report_line(old: libc::rlimit) -> String {
     if old.rlim_cur == libc::RLIM_INFINITY && old.rlim_max == libc::RLIM_INFINITY {
         format!(
@@ -1318,7 +1322,7 @@ fn rlimit_cpu_report_line(old: libc::rlimit) -> String {
 /// `do_prlimit`, which Hermit's container never has). A finite limit would
 /// make the kernel send SIGXCPU at the soft limit and SIGKILL at the hard
 /// one, at moments host CPU time decides.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn rlimit_cpu_refusal(old: libc::rlimit, errno: nix::errno::Errno) -> String {
     format!(
         "the guest would inherit a finite physical RLIMIT_CPU (soft {}, hard {}), and Hermit \
@@ -1338,7 +1342,7 @@ fn rlimit_cpu_refusal(old: libc::rlimit, errno: nix::errno::Errno) -> String {
 /// events, and cannot be read back (there is no `F_GETNOTIFY`, and fdinfo
 /// does not show dnotify), so any owner fails closed. `None` when it has
 /// none of these.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn inherited_producer_refusal(
     fd: std::os::fd::RawFd,
     state: detcore::host_timed_producers::ProducerState,
@@ -1365,7 +1369,7 @@ fn inherited_producer_refusal(
 
 /// Why descriptor `fd`, which the guest would inherit and whose state cannot
 /// be read (`errno`), is not inherited unchecked.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn unreadable_descriptor_refusal(fd: std::os::fd::RawFd, errno: nix::errno::Errno) -> String {
     format!(
         "the guest would inherit descriptor {fd}, whose signal owner and flags cannot be read \
@@ -1376,7 +1380,7 @@ fn unreadable_descriptor_refusal(fd: std::os::fd::RawFd, errno: nix::errno::Errn
 
 /// Why the guest's descriptor table could not be listed (`errno`), so is not
 /// inherited unchecked.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn unlisted_descriptors_refusal(errno: nix::errno::Errno) -> String {
     format!(
         "the guest's descriptor table could not be listed from /proc/self/fd ({errno}), so \
@@ -1405,20 +1409,20 @@ fn unlisted_descriptors_refusal(errno: nix::errno::Errno) -> String {
 /// a failure's reason, from which the caller makes the named refusal, or the
 /// limit the check found, which is logged at INFO at the end of the run, on
 /// every exit path (`detcore::host_timed_producers::defer_run_end_log`).
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 struct LaunchAudit {
     pipe: std::sync::Arc<LaunchPipe>,
 }
 
 /// The pipe the guest's check reports through, and its report once read.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 struct LaunchPipe {
     read: std::os::fd::OwnedFd,
     _write: std::os::fd::OwnedFd,
     report: std::sync::OnceLock<Option<LaunchReport>>,
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 impl LaunchPipe {
     /// The next report in the pipe, if the check wrote one.
     fn read_report(&self) -> Option<LaunchReport> {
@@ -1450,7 +1454,7 @@ impl LaunchPipe {
 }
 
 /// The report's kinds and state bits.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 mod audit_bits {
     /// The check passed; the report carries the limit it found.
     pub const PASSED: u8 = 0;
@@ -1472,7 +1476,7 @@ mod audit_bits {
 /// What the guest's check reports ([`LaunchAudit`]): its kind
 /// ([`audit_bits`]), state bits, errno, descriptor, and the `RLIMIT_CPU` it
 /// found, in 24 native-endian bytes.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LaunchReport {
     kind: u8,
@@ -1482,7 +1486,7 @@ struct LaunchReport {
     rlimit: (libc::rlim_t, libc::rlim_t),
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 impl LaunchReport {
     const SIZE: usize = 24;
 
@@ -1544,7 +1548,7 @@ impl LaunchReport {
 /// not inherit it, `None` if it may: one with close-on-exec, which it does
 /// not inherit, or `report`, the audit's own pipe, are skipped.
 /// Async-signal-safe: fcntl and fstat only, no allocation.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn check_inherited_descriptor(fd: libc::c_int, report: libc::c_int) -> Option<LaunchReport> {
     // SAFETY: F_GETFD reads a descriptor flag and writes no memory.
     let fd_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
@@ -1583,7 +1587,7 @@ fn check_inherited_descriptor(fd: libc::c_int, report: libc::c_int) -> Option<La
 /// (`UNLISTED`, with the errno): no number-range scan stands in for it, since
 /// no bound below the largest open descriptor is sure. Async-signal-safe:
 /// open, getdents64, close, fcntl and fstat only, no allocation.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn audit_inherited_descriptors(report: libc::c_int) -> Option<LaunchReport> {
     let unlisted = || LaunchReport {
         kind: audit_bits::UNLISTED,
@@ -1656,7 +1660,7 @@ fn audit_inherited_descriptors(report: libc::c_int) -> Option<LaunchReport> {
 /// The guest's whole check ([`LaunchAudit`]), in its process: the descriptor
 /// table, then `RLIMIT_CPU`, which it sets to unlimited. Every outcome is a
 /// report; a failing one fails the launch. Async-signal-safe.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn launch_check(report: libc::c_int) -> LaunchReport {
     if let Some(failed) = audit_inherited_descriptors(report) {
         return failed;
@@ -1694,7 +1698,7 @@ fn launch_check(report: libc::c_int) -> LaunchReport {
     }
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 impl LaunchAudit {
     /// Installs the check on `command`, after every `pre_exec` callback
     /// already installed on it, so a library caller's own run first. It is
@@ -1760,7 +1764,7 @@ impl LaunchAudit {
 /// passed one's limit is logged at INFO at the end of the run, on every exit
 /// path. `None` for a backend
 /// that does not refuse host-timed producers.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn neutralize_inherited_signal_producers(
     command: &mut Command,
     backend: Backend,
@@ -1779,7 +1783,7 @@ fn neutralize_inherited_signal_producers(
 /// patching (or a value the runtime would reject) and the backend that exists
 /// to run without it. A value equal to the forced one is accepted. `None`
 /// for every other backend.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn in_guest_trap_site_patching_conflict(command: &Command, backend: Backend) -> Option<String> {
     let forced = forced_site_patching_value(backend)?;
     let name = reverie_liteinst::SITE_PATCHING_ENV;
@@ -1795,23 +1799,28 @@ fn in_guest_trap_site_patching_conflict(command: &Command, backend: Backend) -> 
     })
 }
 
-/// Sets the guest's `REVERIE_LITEINST_SITE_PATCHING` to the value Hermit
-/// forces for `backend` ([`forced_site_patching_value`]), leaving the
-/// environment unchanged for a backend that forces none. The guest's
-/// descendants inherit it unless the guest changes its own environment; a
-/// descendant that turns patching back on shows in the run's dispatch record
-/// as patched sites.
-#[cfg(feature = "liteinst")]
+/// Forces only the Trap selector. LiteInst preserves the caller's absence or value;
+/// an absent LiteInst selection requires its runtime feature through sealed tool data.
+#[cfg(feature = "in-guest-trap")]
 fn force_in_guest_site_patching(command: &mut Command, backend: Backend) {
     if let Some(value) = forced_site_patching_value(backend) {
         command.env(reverie_liteinst::SITE_PATCHING_ENV, value);
     }
 }
 
+#[cfg(feature = "in-guest-trap")]
+fn requires_liteinst_default(command: &Command, backend: Backend) -> bool {
+    backend == Backend::Liteinst
+        && command
+            .get_captured_envs()
+            .remove(std::ffi::OsStr::new(reverie_liteinst::SITE_PATCHING_ENV))
+            .is_none()
+}
+
 /// Whether every in-guest Tool image of a `backend` run checks that its runtime
 /// captured site patching off and statistics on
 /// (`detcore::Config::in_guest_site_patching_off`): true for `in-guest-trap`.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn in_guest_site_patching_off(backend: Backend) -> bool {
     forced_site_patching_value(backend) == Some("0")
 }
@@ -1820,7 +1829,7 @@ fn in_guest_site_patching_off(backend: Backend) -> bool {
 /// something reads them ([`backend_stats::request`]), and on every
 /// `in-guest-trap` run, whose result is checked against them
 /// ([`in_guest_trap_patching_evidence`]).
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn in_guest_stats_request(
     backend: Backend,
     summary_json: &Option<PathBuf>,
@@ -1839,7 +1848,7 @@ fn in_guest_stats_request(
 /// this the run ended with that as the guest's exit status and no reason, or
 /// with whatever postcondition the early exit then tripped (an unregistered
 /// exit, or in-guest-trap's missing statistics). Checked before those.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn refuse_in_guest_policy(backend: Backend, refusal: Option<String>) -> Result<(), Error> {
     match refusal {
         Some(reason) => Err(Error::new(LiteinstInGuestRefusal::for_backend(
@@ -1868,7 +1877,7 @@ fn refuse_in_guest_policy(backend: Backend, refusal: Option<String>) -> Result<(
 /// which no process reported; it does not detect a run in which some did and
 /// others did not. Each image's own check covers that: an image whose runtime
 /// is not collecting statistics refuses to run its program.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn in_guest_trap_patching_evidence(
     backend: Backend,
     dispatch: Option<&reverie::DispatchStats>,
@@ -1908,14 +1917,22 @@ fn in_guest_trap_patching_evidence(
 /// patching ([`in_guest_trap_patching_evidence`]): records a determinism loss,
 /// so verification refuses to compare it, and returns the typed in-guest
 /// refusal (exit 122).
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn refuse_in_guest_trap_patching(backend: Backend, evidence: Option<String>) -> Result<(), Error> {
     match evidence {
         Some(reason) => {
+            // This postcondition also sets the latch. Preserve only a loss
+            // that preceded it, so a missing measurement alone stays a refusal.
+            #[cfg(not(feature = "liteinst"))]
+            let prior_loss = detcore::detlog::determinism_loss();
             detcore::detlog::record_determinism_loss(&reason);
-            Err(Error::new(LiteinstInGuestRefusal::for_backend(
-                backend, reason,
-            )))
+            let refusal = Error::new(LiteinstInGuestRefusal::for_backend(backend, reason));
+            #[cfg(not(feature = "liteinst"))]
+            let refusal = match prior_loss {
+                Some(reason) => VerificationDeterminismLoss::attach(refusal, reason),
+                None => refusal,
+            };
+            Err(refusal)
         }
         None => Ok(()),
     }
@@ -1925,7 +1942,7 @@ fn refuse_in_guest_trap_patching(backend: Backend, evidence: Option<String>) -> 
 /// shared native path. Call inside the same verification tracing scope.
 #[cfg(any(
     feature = "native-exec",
-    all(feature = "exec-stop-launcher", feature = "liteinst")
+    all(feature = "exec-stop-launcher", feature = "in-guest-trap")
 ))]
 #[doc(hidden)]
 pub fn in_guest_detlog_forward_policy_for_native() -> detcore::detlog::ForwardPolicy {
@@ -1935,7 +1952,7 @@ pub fn in_guest_detlog_forward_policy_for_native() -> detcore::detlog::ForwardPo
 /// Report the shared native trap runtime through the existing statistics
 /// comparator and require a real guest report with site patching disabled.
 /// This never converts a patching-off execution into LiteInst evidence.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 #[doc(hidden)]
 pub fn native_trap_dispatch_stats(
     source: &reverie_liteinst::LiteinstBackendStatsSource,
@@ -1955,11 +1972,11 @@ pub fn native_trap_dispatch_stats(
 /// added `SO_PEERPIDFD`: the coordinator admits each guest process through the
 /// pidfd of the socket's peer and watches that pidfd for the process's exit
 /// (`in_guest_exits`). On an older kernel every admission would fail.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 const IN_GUEST_LITEINST_KERNEL_FLOOR: (u32, u32) = (6, 5);
 
 /// The running kernel's release string (`uname -r`), or empty if unreadable.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn running_kernel_release() -> String {
     let mut name: libc::utsname = unsafe { std::mem::zeroed() };
     // SAFETY: uname fills the struct it is given.
@@ -1975,7 +1992,7 @@ fn running_kernel_release() -> String {
 /// Why kernel `release` cannot run in-guest LiteInst, or `None` when it is at
 /// least [`IN_GUEST_LITEINST_KERNEL_FLOOR`]. A release whose version cannot be
 /// read is refused.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn in_guest_liteinst_kernel_gap(release: &str) -> Option<String> {
     let mut numbers = release
         .split(|c: char| !c.is_ascii_digit())
@@ -1998,7 +2015,7 @@ fn in_guest_liteinst_kernel_gap(release: &str) -> Option<String> {
 /// it refuses the program. The kernel has its own small limit (`exec_binprm` in
 /// `fs/exec.c`); a chain this check stops following is refused, not run, so the
 /// check fails closed whichever limit is lower.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 const MAX_INTERPRETER_DEPTH: usize = 4;
 
 /// Why the guest program would run code before, or without, the in-guest
@@ -2041,7 +2058,7 @@ const MAX_INTERPRETER_DEPTH: usize = 4;
 ///   the root directory: the check resolves paths against the working
 ///   directory `command` is configured with, in Hermit's root, before any
 ///   such callback runs.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn in_guest_liteinst_program_gap(command: &mut Command) -> Result<Option<String>, Error> {
     use std::io::Read;
     use std::os::unix::fs::OpenOptionsExt;
@@ -2146,7 +2163,7 @@ fn in_guest_liteinst_program_gap(command: &mut Command) -> Result<Option<String>
 /// path, not its contents: a file replaced at that path in between is not
 /// checked again (see [`in_guest_liteinst_program_gap`]). A program the launch
 /// could not find is an error here, as it would be at launch.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn pin_spawn_program(command: &mut Command) -> Result<PathBuf, Error> {
     let arg0 = command.get_arg0().to_owned();
     let program = command.find_program().with_context(|| {
@@ -2162,7 +2179,7 @@ fn pin_spawn_program(command: &mut Command) -> Result<PathBuf, Error> {
 /// Whether executing `file` (shown as `shown`) puts the kernel in
 /// secure-execution mode (`AT_SECURE`): set-user-ID, set-group-ID (with group
 /// execute, as the kernel requires), or a `security.capability` attribute.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn is_secure_execution_image(file: &fs::File, shown: &str) -> Result<bool, Error> {
     let mode = file
         .metadata()
@@ -2196,7 +2213,7 @@ fn is_secure_execution_image(file: &fs::File, shown: &str) -> Result<bool, Error
 /// Refuses a wall-clock bound on an in-guest LiteInst run. The bound drops the
 /// run's future, and dropping it neither kills the guest nor stops the
 /// blocking task that waits for it.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn refuse_in_guest_liteinst_timeout(
     backend: Backend,
     timeout: Option<Duration>,
@@ -2211,7 +2228,7 @@ fn refuse_in_guest_liteinst_timeout(
     Ok(())
 }
 
-#[cfg(not(feature = "liteinst"))]
+#[cfg(not(feature = "in-guest-trap"))]
 fn refuse_in_guest_liteinst_timeout(
     _backend: Backend,
     _timeout: Option<Duration>,
@@ -2225,19 +2242,33 @@ fn liteinst_unavailable_reason() -> Option<String> {
 }
 
 // LiteInst is an experimental backend whose architecture is not settled, so the
-// published crate leaves it out: `reverie-liteinst` (and through it `liteinst2`)
-// is an optional dependency behind the `liteinst` feature, which
-// `third-party-backends` enables for every validation build.
+// published crate leaves it out. The `liteinst` extension adds `liteinst2` to
+// the shared `in-guest-trap` runtime; `third-party-backends` selects it too.
 #[cfg(not(feature = "liteinst"))]
 fn liteinst_unavailable_reason() -> Option<String> {
     Some("this build was compiled without the liteinst backend: the `liteinst` feature is not enabled; rebuild with `--features liteinst` (or `--features third-party-backends`). This says nothing about whether LiteInst works on this machine -- it has not been checked".to_owned())
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
+fn in_guest_trap_unavailable_reason() -> Option<String> {
+    liteinst_runtime_unavailable_reason()
+}
+
+#[cfg(not(feature = "in-guest-trap"))]
+fn in_guest_trap_unavailable_reason() -> Option<String> {
+    Some("this build was compiled without the in-guest-trap backend: the `in-guest-trap` feature is not enabled; rebuild with `--features in-guest-trap`. This says nothing about whether the in-guest runtime works on this machine -- it has not been checked".to_owned())
+}
+
+#[cfg(feature = "in-guest-trap")]
 fn liteinst_runtime_unavailable_reason() -> Option<String> {
     liteinst_tool_runtime_library_path().err().map(|error| {
+        let build = if cfg!(feature = "liteinst") {
+            "cargo build -p detcore-liteinst"
+        } else {
+            "cargo build -p detcore-liteinst --no-default-features"
+        };
         format!(
-            "the in-guest Detcore runtime is unavailable: {error}; build it with `cargo build -p detcore-liteinst` in the target directory of this hermit binary, install it as rsrcs/libdetcore_liteinst.so, or name it with {LITEINST_TOOL_RUNTIME_ENV}"
+            "the in-guest Detcore runtime is unavailable: {error}; build it with `{build}` in the target directory of this hermit binary, install it as rsrcs/libdetcore_liteinst.so, or name it with {LITEINST_TOOL_RUNTIME_ENV}"
         )
     })
 }
@@ -2418,8 +2449,8 @@ impl Backend {
                 .err()
                 .map(|error| error.to_string()),
             Self::Dbt => dbt_unavailable_reason(),
-            // The same runtime, so the same prerequisites and the same reason.
-            Self::Liteinst | Self::InGuestTrap => liteinst_unavailable_reason(),
+            Self::Liteinst => liteinst_unavailable_reason(),
+            Self::InGuestTrap => in_guest_trap_unavailable_reason(),
             // TODO-HUMAN-REVIEW(#589): Review SaBRe backend availability reporting.
             Self::Sabre => sabre_unavailable_reason(),
             Self::Kvm => kvm_device_unavailable_reason(Path::new("/dev/kvm")),
@@ -2682,10 +2713,10 @@ const SABRE_DETLOG_FORWARD_ENV: &str = "REVERIE_SABRE_HERMIT_FORWARD_DETLOG";
 const SABRE_TOOL_OUTPUT_ENV: &str = "REVERIE_SABRE_TOOL_OUTPUT_FD";
 /// `detcore_liteinst::DETLOG_FORWARD_ENV`; that crate is a preload `cdylib`, so
 /// Hermit cannot import the constant.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 const LITEINST_DETLOG_FORWARD_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG";
 /// `detcore_liteinst::DETLOG_FORWARD_POLICY_ENV`, for the same reason.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 const LITEINST_DETLOG_FORWARD_POLICY_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG_POLICY";
 
 /// Where in-guest LiteInst and SaBRe runs in this process forward Detcore's
@@ -2722,7 +2753,7 @@ pub fn forward_in_guest_detlogs_to(socket: std::os::fd::OwnedFd) {
 /// The caller keeps the returned duplicate open until the guest has started.
 /// Hermit's own variable names are removed from `command`, so a stale value
 /// cannot reach a runtime that falls back to the environment.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn in_guest_liteinst_launch(
     command: &mut Command,
     policy: &detcore::detlog::ForwardPolicy,
@@ -2761,7 +2792,7 @@ fn in_guest_liteinst_launch(
 /// [`forward_in_guest_detlogs_to`], or `None` when none was chosen. The
 /// caller passes its number to the guest and keeps it open until the guest
 /// has started.
-#[cfg(any(feature = "sabre", feature = "liteinst"))]
+#[cfg(any(feature = "sabre", feature = "in-guest-trap"))]
 fn inheritable_in_guest_detlog_socket() -> Result<Option<std::os::fd::OwnedFd>, Error> {
     let sink = IN_GUEST_DETLOG_SINK.lock().unwrap();
     let Some(socket) = sink.as_ref() else {
@@ -2786,7 +2817,7 @@ const SABRE_PATH_EVIDENCE_ENV: &str = "HERMIT_SABRE_PATH_EVIDENCE";
 /// target the CLI's `RUST_LOG` names (the text
 /// `EffectiveFilter::from_default_env` builds every CLI subscriber from) and
 /// for any other target.
-#[cfg(any(feature = "sabre", feature = "liteinst"))]
+#[cfg(any(feature = "sabre", feature = "in-guest-trap"))]
 fn in_guest_detlog_forward_policy() -> detcore::detlog::ForwardPolicy {
     let directives = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).unwrap_or_default();
     detcore::detlog::ForwardPolicy::from_current_subscriber(&directives)
@@ -4514,7 +4545,7 @@ pub fn backend_delivers_preemption_timer(backend: Backend) -> bool {
 /// A failed drain, a fired watchdog or a refused admission fails the run:
 /// it records a determinism loss, so verification refuses to compare it, and
 /// returns the failure, after the barriers are released.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 async fn settle_in_guest_exits(
     exits: &in_guest_exits::InGuestExitAdmission,
     global_state: &detcore::GlobalState,
@@ -4570,7 +4601,7 @@ async fn settle_in_guest_exits(
 // signal half is protected from drift. Do not "simplify" this by assuming the
 // two agree; the `122..=127` bound here is still hard-coded and still needs a
 // human to widen it if the reserved set grows again.
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
     match status {
         // A real signal death: the process never chose a status at all.
@@ -4713,16 +4744,21 @@ async fn dispatch_backend(
         .status);
     }
     if backend.is_in_guest_liteinst() {
-        #[cfg(feature = "liteinst")]
+        #[cfg(not(feature = "liteinst"))]
+        if backend == Backend::Liteinst {
+            backend.ensure_available()?;
+        }
+        #[cfg(feature = "in-guest-trap")]
         {
             let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
             let mut command = command;
             refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
-            let (launch, _detlog_descriptor) =
+            let (mut launch, _detlog_descriptor) =
                 in_guest_liteinst_launch(&mut command, &in_guest_detlog_forward_policy())?;
             // After Hermit's other callbacks, so the guest's own check is the
             // last one that can change what it checks (`LaunchAudit::install`).
             let audit = neutralize_inherited_signal_producers(&mut command, backend)?;
+            launch.require_liteinst = requires_liteinst_default(&command, backend);
             let tool_data = launch.encode();
             // Every Tool image must forward on that socket, by that policy;
             // see detcore::Config::in_guest_detlog_forward_policy.
@@ -4810,7 +4846,7 @@ async fn dispatch_backend(
             detcore::combine_finalization(result, finalized)?;
             return Ok(exit_status);
         }
-        #[cfg(not(feature = "liteinst"))]
+        #[cfg(not(feature = "in-guest-trap"))]
         {
             backend.ensure_available()?;
             unreachable!("LiteInst availability must fail when the feature is disabled");
@@ -5060,16 +5096,21 @@ async fn dispatch_output_backend(
         .await;
     }
     if backend.is_in_guest_liteinst() {
-        #[cfg(feature = "liteinst")]
+        #[cfg(not(feature = "liteinst"))]
+        if backend == Backend::Liteinst {
+            backend.ensure_available()?;
+        }
+        #[cfg(feature = "in-guest-trap")]
         {
             command.stdin(output_backend_stdin()?);
             let stats_request = in_guest_stats_request(backend, print_summary_to_json_file);
             refuse_in_guest_liteinst_run(&mut command, &config, backend)?;
-            let (launch, _detlog_descriptor) =
+            let (mut launch, _detlog_descriptor) =
                 in_guest_liteinst_launch(&mut command, &in_guest_detlog_forward_policy())?;
             // After Hermit's other callbacks, so the guest's own check is the
             // last one that can change what it checks (`LaunchAudit::install`).
             let audit = neutralize_inherited_signal_producers(&mut command, backend)?;
+            launch.require_liteinst = requires_liteinst_default(&command, backend);
             let tool_data = launch.encode();
             // Every Tool image must forward on that socket, by that policy;
             // see detcore::Config::in_guest_detlog_forward_policy.
@@ -5158,7 +5199,7 @@ async fn dispatch_output_backend(
                 stderr: output.stderr,
             });
         }
-        #[cfg(not(feature = "liteinst"))]
+        #[cfg(not(feature = "in-guest-trap"))]
         {
             backend.ensure_available()?;
             unreachable!("LiteInst availability must fail when the feature is disabled");
@@ -6822,7 +6863,7 @@ mod tests {
         assert!(!Backend::InGuestTrap.uses_ptrace_pmu_timers());
     }
 
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn write_guest_program(directory: &Path, name: &str, bytes: &[u8], mode: u32) -> PathBuf {
         let path = directory.join(name);
         fs::write(&path, bytes).unwrap();
@@ -6838,7 +6879,7 @@ mod tests {
         path
     }
 
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn shebang_to(interpreter: &Path) -> Vec<u8> {
         let mut script = b"#!".to_vec();
         script.extend_from_slice(interpreter.as_os_str().as_bytes());
@@ -6847,7 +6888,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn in_guest_liteinst_runs_a_dynamically_linked_x86_64_program() {
         use interp::startup_fixtures::dynamic_executable;
 
@@ -6865,7 +6906,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn in_guest_liteinst_refuses_programs_that_start_before_the_runtime() {
         use interp::startup_fixtures::*;
 
@@ -6908,7 +6949,7 @@ mod tests {
     /// latches a determinism loss, so verification refuses the run (Codex
     /// implementation review, HIGH 3 and 4).
     #[tokio::test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     async fn a_recorded_in_guest_failure_fails_the_run_and_latches_a_loss() {
         use std::os::fd::FromRawFd;
 
@@ -6955,7 +6996,8 @@ mod tests {
         assert_eq!(Backend::InGuestTrap.as_str(), "in-guest-trap");
         assert_eq!(Backend::InGuestTrap.runtime_name(), "liteinst");
         assert_eq!(Backend::Liteinst.runtime_name(), "liteinst");
-        // liteinst leaves the variable to the guest environment.
+        // LiteInst preserves explicit selectors; its unset default is bound
+        // separately before the authenticated bootstrap is constructed.
         assert_eq!(forced_site_patching_value(Backend::Liteinst), None);
         assert_eq!(forced_site_patching_value(Backend::InGuestTrap), Some("0"));
         // The CLI spelling parses to the variant and back.
@@ -6975,10 +7017,10 @@ mod tests {
     /// in-guest-trap sets `REVERIE_LITEINST_SITE_PATCHING=0` on the guest
     /// command when the guest environment leaves it unset or already `0`, and
     /// refuses, before anything starts, an environment that sets any other
-    /// value; the refusal names the value and both ways out. liteinst neither
-    /// refuses nor changes the variable.
+    /// value; the refusal names the value and both ways out. LiteInst preserves
+    /// every explicit selector.
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn in_guest_trap_refuses_a_guest_environment_that_turns_site_patching_on() {
         use std::ffi::OsStr;
 
@@ -7039,13 +7081,92 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(feature = "in-guest-trap")]
+    fn liteinst_binds_its_unset_default_but_preserves_explicit_selectors() {
+        use std::ffi::OsStr;
+
+        let name = reverie_liteinst::SITE_PATCHING_ENV;
+        // As in the existing isolated diagnostics tests, inherit into a fresh
+        // copy of this test process instead of changing global environment.
+        const CHILD: &str = "HERMIT_TEST_LITEINST_CAPTURED_ENV_CHILD";
+        if let Some(inherited) = std::env::var_os(CHILD) {
+            assert!(inherited == "0" || inherited == "1");
+            assert_eq!(
+                std::env::var_os(name).as_deref(),
+                Some(inherited.as_os_str())
+            );
+            let command = Command::new("/bin/true");
+            assert_eq!(
+                command
+                    .get_captured_envs()
+                    .remove(OsStr::new(name))
+                    .as_deref(),
+                Some(inherited.as_os_str())
+            );
+            assert!(!requires_liteinst_default(&command, Backend::Liteinst));
+        } else {
+            for inherited in ["0", "1"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "tests::liteinst_binds_its_unset_default_but_preserves_explicit_selectors",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, inherited)
+                    .env(name, inherited)
+                    .output()
+                    .expect("run isolated captured-selector checks");
+                assert!(output.status.success(), "{output:?}");
+                assert!(
+                    String::from_utf8_lossy(&output.stdout)
+                        .contains("captured selector checks complete"),
+                    "{output:?}"
+                );
+            }
+        }
+        for clear_environment in [false, true] {
+            let mut command = Command::new("/bin/true");
+            if clear_environment {
+                command.env_clear();
+            }
+            command.env_remove(name);
+            force_in_guest_site_patching(&mut command, Backend::Liteinst);
+            assert_eq!(
+                command
+                    .get_captured_envs()
+                    .remove(OsStr::new(name))
+                    .as_deref(),
+                None
+            );
+            assert!(requires_liteinst_default(&command, Backend::Liteinst));
+            assert!(!requires_liteinst_default(&command, Backend::InGuestTrap));
+        }
+        for value in ["0", "1", "", "invalid"] {
+            let mut command = Command::new("/bin/true");
+            command.env(name, value);
+            force_in_guest_site_patching(&mut command, Backend::Liteinst);
+            assert_eq!(
+                command
+                    .get_captured_envs()
+                    .remove(OsStr::new(name))
+                    .as_deref(),
+                Some(OsStr::new(value))
+            );
+            assert!(!requires_liteinst_default(&command, Backend::Liteinst));
+        }
+        if std::env::var_os(CHILD).is_some() {
+            println!("captured selector checks complete");
+        }
+    }
+
     /// The coordinator's postcondition for an in-guest-trap run: a record
     /// with no patched and no candidate site passes; a patched site, a
     /// candidate, an unmeasured count or a missing record is refused, with a
     /// typed in-guest refusal and a determinism loss. Other backends are not
     /// held to it.
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn an_in_guest_trap_run_that_patched_a_site_is_refused_after_it_ends() {
         let record = |candidates: Option<u64>, patched: Option<u64>| {
             reverie::DispatchStats::new(
@@ -7121,7 +7242,7 @@ mod tests {
     /// its runtime captured, and that run always collects the statistics the
     /// check requires.
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn only_in_guest_trap_asks_tool_images_to_check_their_runtime() {
         for backend in Backend::ALL {
             let checks = in_guest_site_patching_off(backend);
@@ -7362,7 +7483,7 @@ mod tests {
     /// the configuration; and until the in-guest runtime takes the gate
     /// (3c.1f), no launch sets it at all, owned or not.
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn no_launch_outside_a_new_pid_namespace_and_no_3c1a_launch_turns_the_gate_on() {
         for backend in Backend::ALL {
             let ready = gate_ready(backend);
@@ -7388,7 +7509,7 @@ mod tests {
     /// already unlimited and raised otherwise, and a limit it could not raise
     /// refuses the run, naming both values and the errno.
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn an_in_guest_launch_logs_the_cpu_limit_it_found_and_refuses_one_it_cannot_raise() {
         let limit = |rlim_cur, rlim_max| libc::rlimit { rlim_cur, rlim_max };
         let unchanged = rlimit_cpu_report_line(limit(libc::RLIM_INFINITY, libc::RLIM_INFINITY));
@@ -7423,7 +7544,7 @@ mod tests {
     /// its values), or, for a check that passed, the limit to log; an empty
     /// pipe (the check never ran) names nothing.
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn the_launch_audit_reports_what_the_guest_check_found() {
         use std::os::fd::AsRawFd;
         let mut command = Command::new("/bin/true");
@@ -7509,7 +7630,7 @@ mod tests {
     /// with O_ASYNC and an owner is reported only once its close-on-exec is
     /// cleared, by number and state, and the table scan reports exactly it.
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn the_inherited_descriptor_scan_finds_a_producer_without_close_on_exec() {
         use std::os::fd::AsRawFd;
         let (read, write) = nix::unistd::pipe2(nix::fcntl::OFlag::O_CLOEXEC).unwrap();
@@ -7551,7 +7672,7 @@ mod tests {
     /// notification, which cannot be read back, would signal it); one with
     /// only O_ASYNC, or an unowned socket, does not.
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn an_inherited_signal_producer_is_refused_by_descriptor() {
         use detcore::host_timed_producers::ProducerState;
         let state = |o_async, owner, socket| ProducerState {
@@ -7657,7 +7778,7 @@ mod tests {
     /// sends to an in-guest-trap guest is delivered as on Linux, while SIGSYS
     /// and SIGSEGV stay reserved on both (A5 step 3c slice 0c).
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn the_default_route_reserves_sigtrap_only_with_site_patching_on() {
         let bit = |signal: libc::c_int| 1_u64 << (signal - 1);
         for backend in Backend::ALL {
@@ -7679,7 +7800,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn in_guest_liteinst_refuses_a_kernel_older_than_6_5() {
         for release in [
             "6.5.0",
@@ -7708,7 +7829,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn in_guest_liteinst_refuses_secure_execution_images() {
         use interp::startup_fixtures::dynamic_executable;
 
@@ -7728,7 +7849,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn in_guest_liteinst_checks_scripts_through_their_interpreter() {
         use interp::startup_fixtures::*;
 
@@ -7833,7 +7954,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn in_guest_liteinst_refuses_a_fifo_without_blocking() {
         let directory = tempfile::tempdir().unwrap();
         let fifo = directory.path().join("fifo");
@@ -7889,7 +8010,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn in_guest_liteinst_pins_the_program_the_launch_resolves() {
         use interp::startup_fixtures::*;
 
@@ -8035,7 +8156,7 @@ mod tests {
     /// The 130 and 143 rows are the ones with teeth: revert the predicate to the
     /// bare range and they fail.
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn liteinst_forced_shutdown_covers_every_status_hermit_reserves() {
         // The signal band. Not `Signaled`: hermit CHOSE these codes, because a
         // namespace init cannot produce a genuine signalled wait status.
@@ -8182,9 +8303,8 @@ mod tests {
             (Backend::E9patch, "e9patch"),
             #[cfg(not(feature = "liteinst"))]
             (Backend::Liteinst, "liteinst"),
-            // in-guest-trap is the same runtime behind the same feature.
-            #[cfg(not(feature = "liteinst"))]
-            (Backend::InGuestTrap, "liteinst"),
+            #[cfg(not(feature = "in-guest-trap"))]
+            (Backend::InGuestTrap, "in-guest-trap"),
         ];
 
         for &(backend, feature) in feature_disabled_backends {
@@ -8281,7 +8401,7 @@ mod tests {
     use std::time::Duration;
 
     use super::Backend;
-    #[cfg(any(feature = "sabre", feature = "liteinst"))]
+    #[cfg(any(feature = "sabre", feature = "in-guest-trap"))]
     use super::ExitStatus;
     use super::HermitData;
     use super::Id;
@@ -8298,7 +8418,7 @@ mod tests {
     #[cfg(feature = "dbt")]
     use super::is_dynamorio_sdk;
     use super::kvm_device_unavailable_reason;
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     use super::liteinst_requires_forced_shutdown;
     #[cfg(feature = "dbt")]
     use super::liteinst_unavailable_reason;
@@ -8463,7 +8583,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     fn liteinst_reserved_failures_require_scheduler_cancellation() {
         for status in 122..=127 {
             assert!(liteinst_requires_forced_shutdown(ExitStatus::Exited(
@@ -8820,7 +8940,7 @@ mod tests {
             super::backend_capabilities(Backend::Kvm),
             reverie_kvm::KvmBackend::capabilities()
         );
-        #[cfg(feature = "liteinst")]
+        #[cfg(feature = "in-guest-trap")]
         {
             // SAFETY: the strong immutable declaration above has the public
             // repr(C), two-u64 descriptor ABI. This reads the real linked
@@ -9229,10 +9349,9 @@ mod tests {
             available.contains(&Backend::Liteinst),
             liteinst_unavailable_reason().is_none()
         );
-        // The same runtime, so available exactly when liteinst is.
         assert_eq!(
             available.contains(&Backend::InGuestTrap),
-            available.contains(&Backend::Liteinst)
+            in_guest_trap_unavailable_reason().is_none()
         );
         assert_eq!(
             available.contains(&Backend::Sabre),
@@ -9469,7 +9588,7 @@ mod tests {
         );
         assert_eq!(
             Backend::InGuestTrap.ensure_available().is_ok(),
-            liteinst_unavailable_reason().is_none()
+            in_guest_trap_unavailable_reason().is_none()
         );
 
         match Backend::Kvm.ensure_available() {
@@ -9969,7 +10088,7 @@ mod tests {
     /// forwarding descriptor, and this build's fingerprint, in the launch
     /// record, with none of Hermit's variables left on the command; a policy
     /// that forwards nothing requests no forwarding.
-    #[cfg(feature = "liteinst")]
+    #[cfg(feature = "in-guest-trap")]
     #[test]
     fn liteinst_launch_hands_the_guest_its_per_target_policy() {
         use std::os::fd::AsRawFd;

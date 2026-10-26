@@ -298,7 +298,7 @@ impl Observer {
         }))
     }
     /// Failure diagnostics only; does not establish completion or a valid cut.
-    #[cfg(all(feature = "exec-stop-launcher", feature = "liteinst"))]
+    #[cfg(all(feature = "exec-stop-launcher", feature = "in-guest-trap"))]
     pub(super) fn observed_bytes(&self) -> io::Result<Vec<u8>> {
         let state = self
             .stream

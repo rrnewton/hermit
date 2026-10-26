@@ -1,11 +1,7 @@
 use std::env;
 use std::fs;
-use std::fs::File;
-use std::fs::OpenOptions;
-use std::io;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
@@ -14,6 +10,14 @@ use reverie_liteinst_artifact as qualifier;
 use serde_json::Value;
 
 mod artifact;
+
+#[cfg(not(feature = "native-exec"))]
+mod protected_copy;
+
+#[cfg(feature = "native-exec")]
+use artifact::native_bundle::copy_into_protected_stage;
+#[cfg(not(feature = "native-exec"))]
+use protected_copy::copy_into_protected_stage;
 
 fn constructor_evidence_directory(out_dir: &Path) -> PathBuf {
     let serial = SystemTime::now()
@@ -26,24 +30,6 @@ fn constructor_evidence_directory(out_dir: &Path) -> PathBuf {
     ));
     fs::create_dir(&directory).expect("failed to create fresh constructor evidence directory");
     directory
-}
-
-fn copy_into_protected_stage(source: &Path, destination: &Path) -> io::Result<()> {
-    let mut source_file = File::open(source)?;
-    let source_permissions = source_file.metadata()?.permissions();
-    let mut destination_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(destination)?;
-    if !destination_file.metadata()?.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "LiteInst stage is not a regular file",
-        ));
-    }
-    io::copy(&mut source_file, &mut destination_file)?;
-    destination_file.set_permissions(source_permissions)?;
-    destination_file.sync_all()
 }
 
 fn main() {
@@ -59,12 +45,16 @@ fn main() {
     println!("cargo:rerun-if-env-changed=HERMIT_LITEINST_STAGE");
     println!("cargo:rerun-if-env-changed=HERMIT_LITEINST_REVERIE_PIN");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ALLOCATOR_FIXTURE");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LITEINST");
     println!("cargo:rerun-if-env-changed=PROFILE");
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-changed=artifact.rs");
+    println!("cargo:rerun-if-changed=native_bundle.rs");
+    println!("cargo:rerun-if-changed=protected_copy.rs");
     println!("cargo:rerun-if-changed=runtime/Cargo.toml");
     println!("cargo:rerun-if-changed=runtime/src/lib.rs");
     let allocator_fixture = env::var_os("CARGO_FEATURE_ALLOCATOR_FIXTURE").is_some();
+    let liteinst = env::var_os("CARGO_FEATURE_LITEINST").is_some();
     let destination = PathBuf::from(
         env::var_os("HERMIT_LITEINST_STAGE")
             .expect("HERMIT_LITEINST_STAGE must name a unique runtime output path"),
@@ -96,6 +86,8 @@ fn main() {
         manifest_dir, trusted_manifest_dir,
         "current nested workspace differs from the compiled source root"
     );
+    let producer_modules = artifact::CompiledProducerModules::resolve(&trusted_manifest_dir)
+        .expect("standalone producer modules differ from compiled inputs");
     let source_root = trusted_manifest_dir
         .parent()
         .expect("nested workspace has no trusted Hermit root");
@@ -215,52 +207,70 @@ fn main() {
         "compiled constructor qualifier differs from the resolved shared proof source"
     );
     println!("cargo:rerun-if-changed={}", qualifier_source.display());
-    let mut command = Command::new(&cargo);
-    command
-        .args([
-            "build",
-            "--locked",
-            "--manifest-path",
-            "Cargo.toml",
-            "-p",
-            "reverie-liteinst-preload",
-            "--lib",
-            "--profile",
-            profile,
-            "--target-dir",
-        ])
-        .arg(&nested_target)
-        .arg("--message-format=json-render-diagnostics")
-        .current_dir(&manifest_dir)
-        .env_remove("HERMIT_LITEINST_STAGE");
+    let mut cargo_args: Vec<String> = [
+        "build",
+        "--locked",
+        "--no-default-features",
+        "--manifest-path",
+        "Cargo.toml",
+        // Cargo applies feature selection to workspace members. Select
+        // this dependency wrapper in OFF mode too, retaining the actual
+        // preload leaf as the current cdylib output.
+        "-p",
+        "hermit-liteinst-runtime-artifact",
+        "-p",
+        "reverie-liteinst-preload",
+        "--lib",
+        "--profile",
+        profile,
+        "--target-dir",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    cargo_args.extend([
+        nested_target
+            .to_str()
+            .expect("nested runtime target is not UTF-8")
+            .into(),
+        "--message-format=json-render-diagnostics".into(),
+    ]);
+    let mut features = Vec::new();
     if allocator_fixture {
-        // Enable the exact leaf feature through the selected workspace member.
-        // Keep the leaf selected too so current artifact qualification applies.
-        command.args([
-            "-p",
-            "hermit-liteinst-runtime-artifact",
-            "--features",
-            "allocator-fixture",
-        ]);
+        features.push("allocator-fixture");
     }
-    let output = command
-        .output()
-        .expect("failed to invoke Cargo for the isolated LiteInst runtime build");
-    if !output.status.success() {
-        panic!(
-            "isolated LiteInst runtime build failed with {}\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+    if liteinst {
+        features.push("liteinst");
     }
-    let messages = String::from_utf8(output.stdout)
-        .expect("isolated LiteInst runtime Cargo output was not UTF-8");
+    if !features.is_empty() {
+        cargo_args.extend(["--features".into(), features.join(",")]);
+    }
+    let mut build_runner = qualifier::Runner::new(
+        evidence.join("build-logs"),
+        Duration::from_secs(1200),
+        64 * 1024 * 1024,
+    )
+    .expect("failed to create bounded runtime build runner");
+    let output = build_runner
+        .run(
+            cargo.to_str().expect("Cargo path is not UTF-8"),
+            &cargo_args,
+            &manifest_dir,
+        )
+        .unwrap_or_else(|error| panic!("isolated LiteInst runtime build failed: {error}"));
+    let build_command = build_runner
+        .commands
+        .last()
+        .expect("successful runtime build command was not retained")
+        .clone();
+    let messages =
+        String::from_utf8(output).expect("isolated LiteInst runtime Cargo output was not UTF-8");
     let candidate = artifact::liteinst_cdylib_from_cargo_messages(
         &messages,
         package_id,
         &package_manifest,
         allocator_fixture,
+        liteinst,
     )
     .unwrap_or_else(|error| panic!("failed to parse isolated Cargo output: {error}"));
     assert!(
@@ -273,8 +283,24 @@ fn main() {
         .expect("failed to retain constructor package metadata");
     qualifier::write_new(&evidence.join("cargo-build.stdout"), messages.as_bytes())
         .expect("failed to retain current runtime Cargo artifact evidence");
-    qualifier::write_new(&evidence.join("cargo-build.stderr"), &output.stderr)
+    let build_stderr = fs::read(&build_command.stderr.path)
+        .expect("failed to read retained runtime Cargo diagnostics");
+    qualifier::write_new(&evidence.join("cargo-build.stderr"), &build_stderr)
         .expect("failed to retain runtime Cargo diagnostics");
+    let compiled_sources = if !liteinst && !allocator_fixture {
+        // Only this measured mode has no compiled installation-scope callers.
+        // Enabled and diagnostic leaves retain their complete TLS proof.
+        compiled_sources
+            .with_standalone_current_build(
+                &build_command,
+                &candidate,
+                &nested_target,
+                &mut build_runner,
+            )
+            .unwrap_or_else(|error| panic!("actual standalone compiler evidence refused: {error}"))
+    } else {
+        compiled_sources
+    };
     let mut runner = qualifier::Runner::new(
         evidence.join("logs"),
         Duration::from_secs(60),
@@ -284,33 +310,47 @@ fn main() {
     compiled_sources
         .verify_unchanged(&mut runner)
         .expect("compiled sources changed during the runtime build");
+    producer_modules
+        .verify_unchanged()
+        .expect("producer modules changed: compiled sources changed during the runtime build");
     let qualification =
         qualifier::qualify_constructor_with_sources(&candidate, &mut runner, &compiled_sources)
             .unwrap_or_else(|error| panic!("current LiteInst constructor is unqualified: {error}"));
     compiled_sources
         .verify_unchanged(&mut runner)
         .expect("compiled sources changed during constructor qualification");
+    producer_modules.verify_unchanged().expect(
+        "producer modules changed: compiled sources changed during constructor qualification",
+    );
     assert_eq!(
         qualification.artifact.path,
         fs::canonicalize(&candidate).expect("failed to canonicalize current runtime artifact"),
         "constructor proof identifies a different runtime artifact"
     );
+    let mut qualification_record = serde_json::json!({
+        "reverie_revision": revision,
+        "preload_package_id": package_id,
+        "qualifier_source": qualifier_source_identity,
+        "compiled_qualifier_source_sha256": qualifier::qualifier_source_sha256(),
+        "profile": profile,
+        "allocator_fixture": allocator_fixture,
+        "liteinst": liteinst,
+        "qualification": qualification,
+        "compiled_sources": Some(compiled_sources.record()),
+        "compiled_producer_modules": producer_modules.identities(),
+        "compiled_source_commands": source_runner.commands,
+        "commands": runner.commands,
+        "executed_tests": 0,
+    });
+    if !liteinst && !allocator_fixture {
+        // Retain the original Cargo command and the standalone source closure.
+        qualification_record["build_commands"] = serde_json::to_value(&build_runner.commands)
+            .expect("failed to serialize standalone source closure commands");
+    }
     qualifier::write_new(
         &evidence.join("qualification.json"),
-        &serde_json::to_vec_pretty(&serde_json::json!({
-            "reverie_revision": revision,
-            "preload_package_id": package_id,
-            "qualifier_source": qualifier_source_identity,
-            "compiled_qualifier_source_sha256": qualifier::qualifier_source_sha256(),
-            "profile": profile,
-            "allocator_fixture": allocator_fixture,
-            "qualification": qualification,
-            "compiled_sources": Some(compiled_sources.record()),
-            "compiled_source_commands": source_runner.commands,
-            "commands": runner.commands,
-            "executed_tests": 0,
-        }))
-        .expect("failed to serialize actual constructor qualification"),
+        &serde_json::to_vec_pretty(&qualification_record)
+            .expect("failed to serialize actual constructor qualification"),
     )
     .expect("failed to retain actual constructor qualification");
     qualifier_source_identity
@@ -349,6 +389,9 @@ fn main() {
     compiled_sources
         .verify_unchanged(&mut runner)
         .expect("compiled sources changed during protected staging");
+    producer_modules
+        .verify_unchanged()
+        .expect("producer modules changed: compiled sources changed during protected staging");
     qualifier_source_identity
         .verify()
         .expect("constructor proof source changed during protected staging");
@@ -356,6 +399,7 @@ fn main() {
         &evidence.join("compiled-sources-readback.json"),
         &serde_json::to_vec_pretty(&serde_json::json!({
             "compiled_sources": compiled_sources.record(),
+            "compiled_producer_modules": producer_modules.identities(),
             "commands": runner.commands,
         }))
         .expect("failed to serialize final compiled-source readback"),

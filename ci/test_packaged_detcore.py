@@ -14,7 +14,7 @@ verifier = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verifier)
 
 
-def fixture_receipt(install, pin):
+def fixture_receipt(install, pin, liteinst=True):
     resources = Path(install) / "rsrcs"
     runtime = resources / "libdetcore_liteinst.so"
     digest = hashlib.sha256(runtime.read_bytes()).hexdigest()
@@ -22,9 +22,12 @@ def fixture_receipt(install, pin):
     package = {"name": "detcore-liteinst", "target": "detcore_liteinst", "source": None,
                "kind": ["cdylib"], "crate_types": ["cdylib"]}
     artifact = "/fixture/target/liteinst-runtime/libdetcore_liteinst.so"
-    args = ["build", "--locked", "--offline", "--manifest-path", source["path"],
+    features = ["liteinst"] if liteinst else []
+    args = ["build", "--locked", "--offline", "--no-default-features", "--manifest-path", source["path"],
             "-p", "detcore-liteinst", "--lib", "--profile", "liteinst-runtime",
             "--target-dir", "/fixture/target", "--message-format=json-render-diagnostics"]
+    if features:
+        args += ["--features", ",".join(features)]
     # Shape-only transport fixtures, not actual emitted machine-code evidence.
     backing = {name: {"fixture": True} for name in ("descriptor", "fixed_backing_record", "tls_boundary", "compiler_routes")}
     backing["function_sha256"] = {"fixture": "3" * 64}
@@ -34,7 +37,7 @@ def fixture_receipt(install, pin):
         "schema": "hermit-packaged-detcore/v1", "reverie_pin": pin,
         "profile_name": "liteinst-runtime", "profile_inputs": source,
         "profile_objects": {"liteinst-runtime": {"inherits": "validate", "lto": False}},
-        "cargo_artifact": {"features": [], "profile": {"opt_level": "3", "debuginfo": 0,
+        "cargo_artifact": {"features": features, "profile": {"opt_level": "3", "debuginfo": 0,
             "debug_assertions": True, "overflow_checks": True, "test": False},
             "package": package, "reported_path": artifact},
         "compiled_sources": {"image_kind": "Detcore", "reverie_pin": pin,
@@ -52,6 +55,31 @@ def fixture_receipt(install, pin):
 
 
 class ReceiptControls(unittest.TestCase):
+    def test_feature_mode_and_command_are_independently_exact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            install = Path(tmp)
+            resources = install / "rsrcs"
+            resources.mkdir()
+            (resources / "libdetcore_liteinst.so").write_bytes(b"synthetic reader fixture, not an ELF proof")
+            receipt = resources / "libdetcore_liteinst.package.json"
+            for liteinst in (False, True):
+                with self.subTest(liteinst=liteinst):
+                    good = fixture_receipt(install, "a" * 40, liteinst=liteinst)
+                    verifier.verify(install, liteinst=liteinst)
+                    with self.assertRaises(ValueError):
+                        verifier.verify(install, liteinst=not liteinst)
+                    for extra in (["--all-features"], ["--features", "allocator-fixture"], ["-F", "liteinst"]):
+                        bad = copy.deepcopy(good)
+                        bad["cargo_argv"] += extra
+                        receipt.write_text(json.dumps(bad))
+                        with self.assertRaises(ValueError):
+                            verifier.verify(install, liteinst=liteinst)
+                    bad = copy.deepcopy(good)
+                    bad["cargo_argv"].remove("--no-default-features")
+                    receipt.write_text(json.dumps(bad))
+                    with self.assertRaises(ValueError):
+                        verifier.verify(install, liteinst=liteinst)
+
     def test_receipt_binds_profile_feature_artifact_source_close_and_installed_bytes(self):
         with tempfile.TemporaryDirectory() as tmp:
             install = Path(tmp)

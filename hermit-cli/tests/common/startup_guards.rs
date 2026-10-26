@@ -151,7 +151,7 @@ fn liteinst_startup_guards_derive_from_at_random_and_repeat() {
     assert_startup_guards("liteinst");
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 #[test]
 #[ignore = "known failure: https://github.com/rrnewton/dev-hermit/blob/main/ai_docs/issue-drafts/2026-10-17-in-guest-trap-canary-pointer-guard-host-entropy.md"]
 fn in_guest_trap_startup_guards_derive_from_at_random_and_repeat() {

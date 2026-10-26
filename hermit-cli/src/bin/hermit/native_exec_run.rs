@@ -509,6 +509,82 @@ async fn serve_provider(listener: OwnedFd, owner: Arc<NativeRunOwner>) -> io::Re
     }
 }
 
+/// Actual pinned GNU utilities and their explicit loader search inputs for
+/// native controls. Ordinary host tests retain their original inputs. A
+/// configured fixture never falls back when it is absent or malformed.
+#[cfg(test)]
+pub(super) struct NativeTestInputs {
+    pub nice: PathBuf,
+    pub echo: PathBuf,
+    pub library_directories: Vec<PathBuf>,
+}
+
+#[cfg(test)]
+pub(super) fn native_test_inputs() -> Result<NativeTestInputs> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Prepared {
+        version: u32,
+        nice: PathBuf,
+        echo: PathBuf,
+        library_directories: Vec<PathBuf>,
+    }
+    match std::env::var_os("HERMIT_NATIVE_EXEC_TEST_INPUTS") {
+        None => Ok(NativeTestInputs {
+            nice: PathBuf::from("/usr/bin/nice"),
+            echo: PathBuf::from("/bin/echo"),
+            library_directories: [
+                "/lib64",
+                "/usr/lib64",
+                "/lib/x86_64-linux-gnu",
+                "/usr/lib/x86_64-linux-gnu",
+            ]
+            .map(PathBuf::from)
+            .to_vec(),
+        }),
+        Some(path) => {
+            use std::io::Read;
+            let path = PathBuf::from(path);
+            ensure!(
+                path.is_absolute(),
+                "native fixture manifest is not absolute"
+            );
+            let file = std::fs::File::open(&path)?;
+            ensure!(
+                file.metadata()?.is_file() && file.metadata()?.len() <= 65536,
+                "native fixture manifest is not a bounded regular file"
+            );
+            let mut bytes = Vec::new();
+            file.take(65537).read_to_end(&mut bytes)?;
+            ensure!(bytes.len() <= 65536, "native fixture manifest grew");
+            let prepared: Prepared = serde_json::from_slice(&bytes)?;
+            ensure!(prepared.version == 1, "unsupported native fixture manifest");
+            ensure!(
+                prepared.nice.is_absolute()
+                    && prepared.echo.is_absolute()
+                    && prepared.nice != prepared.echo
+                    && !prepared.library_directories.is_empty()
+                    && prepared.library_directories.iter().all(|p| p.is_absolute()),
+                "native fixture paths are incomplete or not absolute"
+            );
+            for executable in [&prepared.nice, &prepared.echo] {
+                ensure!(executable.is_file(), "native fixture executable is absent");
+            }
+            for directory in &prepared.library_directories {
+                ensure!(
+                    directory.is_dir(),
+                    "native fixture library directory is absent"
+                );
+            }
+            Ok(NativeTestInputs {
+                nice: prepared.nice,
+                echo: prepared.echo,
+                library_directories: prepared.library_directories,
+            })
+        }
+    }
+}
+
 /// Test-only reuse of the existing real ELF/dependency discovery fixture.
 #[cfg(test)]
 pub(super) fn shared_input_declaration_fixture() -> Result<serde_json::Value> {
@@ -577,7 +653,8 @@ mod tests {
             bail!("input symlink traversal exceeds discovery bound")
         }
 
-        let executables = [PathBuf::from("/usr/bin/nice"), PathBuf::from("/bin/echo")];
+        let fixture = super::native_test_inputs()?;
+        let executables = [fixture.nice, fixture.echo];
         let mut aliases = BTreeMap::new();
         let mut images = Vec::new();
         let mut interpreters = BTreeSet::new();
@@ -614,15 +691,7 @@ mod tests {
             .iter()
             .map(|path| path.parent().unwrap().to_path_buf())
             .collect();
-        directories.extend(
-            [
-                "/lib64",
-                "/usr/lib64",
-                "/lib/x86_64-linux-gnu",
-                "/usr/lib/x86_64-linux-gnu",
-            ]
-            .map(PathBuf::from),
-        );
+        directories.extend(fixture.library_directories);
         let locate = |name: &str| -> Result<PathBuf> {
             ensure!(
                 !name.as_bytes().contains(&b'/'),
@@ -700,10 +769,16 @@ mod tests {
             !cwd.starts_with("/tmp"),
             "physical native Capture requires a caller-owned uncovered cwd"
         );
+        let test_output = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("target/ci/native-exec-tests");
+        std::fs::create_dir_all(&test_output).unwrap();
         let staging = tempfile::Builder::new()
             .prefix(".bootstrap-rpc-test-")
-            .tempdir_in(&cwd)
+            .tempdir_in(&test_output)
             .unwrap();
+        let native_inputs = super::native_test_inputs().unwrap();
         let declaration = staging.path().join("inputs.json");
         std::fs::write(
             &declaration,
@@ -767,10 +842,14 @@ mod tests {
                     argv.push(option.into());
                     argv.push(path.into_os_string());
                 }
-                argv.extend(
-                    ["--", "/usr/bin/nice", "-n", "1", "/bin/echo", "nice-ok"]
-                        .map(std::ffi::OsString::from),
-                );
+                argv.extend([
+                    std::ffi::OsString::from("--"),
+                    native_inputs.nice.clone().into_os_string(),
+                    std::ffi::OsString::from("-n"),
+                    std::ffi::OsString::from("1"),
+                    native_inputs.echo.clone().into_os_string(),
+                    std::ffi::OsString::from("nice-ok"),
+                ]);
                 let matches = crate::Args::command().try_get_matches_from(argv).unwrap();
                 let mut args = crate::args_from_matches_with_clock(&matches, || {
                     panic!("explicit epoch must not capture host time")

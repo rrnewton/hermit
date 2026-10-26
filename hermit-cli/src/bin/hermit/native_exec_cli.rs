@@ -526,9 +526,10 @@ mod shared_tests {
             assert_eq!(held.read_bytes().unwrap(), b"captured shared data");
             assert!(held.path.as_bytes().contains(&0xff));
             assert_eq!(held.resolved_path.as_path(), data);
-            adopted
-                .require_initial(&Command::new("/usr/bin/nice"))
-                .unwrap();
+            let nice = super::super::native_exec_run::native_test_inputs()
+                .unwrap()
+                .nice;
+            adopted.require_initial(&Command::new(nice)).unwrap();
             assert!(
                 adopted
                     .require_initial(&Command::new("/undeclared"))

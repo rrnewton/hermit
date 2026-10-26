@@ -398,6 +398,7 @@ lint-check-buck-e2e-stages:
 lint-check-guest-preload-gate:
 	python3 ./ci/test_guest_preload_gate.py
 	python3 ./ci/test_packaged_detcore.py
+	python3 ./ci/test-verify-native-packaged-detcore.py
 
 lint-check-reverie-dbt-budget:
 	./ci/run-with-reverie-dbt-budget-test.sh

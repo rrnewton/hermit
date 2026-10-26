@@ -554,12 +554,16 @@ fn paired_verify_runs_report_what_run_verify_reports_on_kvm() {
     assert_backend_pairs_like_run_verify("kvm", &["--backend=kvm"], &["--strict"]);
 }
 
-#[cfg(feature = "liteinst")]
+#[cfg(feature = "in-guest-trap")]
 #[test]
 fn paired_verify_runs_report_what_run_verify_reports_in_guest() {
     // The in-guest Tool host cannot deliver the preemption timer yet, and
     // refuses a run with a timeslice.
-    for backend in ["liteinst", "in-guest-trap"] {
+    for backend in [
+        #[cfg(feature = "liteinst")]
+        "liteinst",
+        "in-guest-trap",
+    ] {
         let flag = format!("--backend={backend}");
         assert_backend_pairs_like_run_verify(
             backend,

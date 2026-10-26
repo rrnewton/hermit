@@ -252,12 +252,19 @@ pub fn emit_native_exec_bundle(pin: &str) {
     };
     let manifest = root.join("liteinst-runtime-build/Cargo.toml");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_LITEINST");
+    let features = if std::env::var_os("CARGO_FEATURE_LITEINST").is_some() {
+        "liteinst,native-exec"
+    } else {
+        "native-exec"
+    };
     let status = Command::new(cargo)
         .args(["build", "--locked", "--offline", "--manifest-path"])
         .arg(&manifest)
         .args([
+            "--no-default-features",
             "--features",
-            "native-exec",
+            features,
             "--profile",
             profile,
             "--target-dir",
@@ -308,6 +315,8 @@ pub fn emit_native_exec_bundle(pin: &str) {
     for relative in [
         "liteinst-runtime-build/build.rs",
         "liteinst-runtime-build/artifact.rs",
+        "liteinst-runtime-build/native_bundle.rs",
+        "liteinst-runtime-build/protected_copy.rs",
         "liteinst-runtime-build/Cargo.toml",
         "detcore-liteinst/src/lib.rs",
         "detcore-liteinst/src/exec_initial.rs",

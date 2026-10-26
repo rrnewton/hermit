@@ -260,6 +260,7 @@ pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
 pub(super) const ENVELOPE_RESULT_PRODUCERS: &[&str] = &[
     "test.envelope_levels",
     "test.envelope_levels_on_host",
+    "test.in_guest_trap_no_liteinst",
     "superstress.ptrace_strict_verify",
     "superstress.ptrace_pipeline",
     "superstress.ptrace_record_replay",
@@ -1792,7 +1793,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_adopted_ld_so_cache_role_becomes_the_runs_snapshot; and verify_inputs'
     // the_pair_program_follows_the_options_with_or_without_a_separator; and
     // a_misspelled_holder_option_is_refused_not_run: 1102, listed.
-    ("test.hermit_unit", 1102),
+    // Also retain the prerequisite selector-default model unit, absent from main.
+    // This source union expects 1103 identities; it is not an executed count.
+    ("test.hermit_unit", 1103),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2926,7 +2929,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and guest_mask_publication_tests'
     // rejoins_and_withdrawals_decide_the_mark_a_child_is_seeded_from: 2603,
     // listed.
-    ("test.detcore_unit", 2603),
+    // Also retain the prerequisite sealed LiteInst intent model unit, absent from main.
+    // This source union expects 2604 identities; it is not an executed count.
+    ("test.detcore_unit", 2604),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4160,7 +4165,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // /proc status descriptor in an in-guest process or its fork child): 610.
     // And verify_inputs::a_verify_run_binds_the_ld_so_cache_its_holder_sealed
     // (https://github.com/rrnewton/hermit/issues/4693): 611.
-    ("test.cli", 611),
+    // Also retain the nine prerequisite run_in_guest_trap_timerfd_virtual_* cases.
+    // The verify-log echo test is already counted above, so it adds no duplicate.
+    // This source union expects 620 identities; it is not an executed count.
+    ("test.cli", 620),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4661,7 +4669,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And signal_state_reads_leave_no_status_descriptor_in_the_guest (no
     // /proc status descriptor in an in-guest process or its fork child): 529.
     // And the same ld.so.cache holder test, not excluded: 530.
-    ("test.cli_on_host", 530),
+    // Also retain the nine prerequisite run_in_guest_trap_timerfd_virtual_* cases.
+    // The verify-log echo test is already counted above, so it adds no duplicate.
+    // This source union expects 539 identities; it is not an executed count.
+    ("test.cli_on_host", 539),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5104,7 +5115,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three 3c.1e A review round 1 units: 2598, listed.
     // And the same three 3c.1e A review round 2 units: 2601, listed.
     // And the same two 3c.1e A review round 3 units: 2603, listed.
-    ("test.detcore_unit_on_host", 2603),
+    // Also retain the prerequisite sealed LiteInst intent model unit, absent from main.
+    // This source union expects 2604 identities; it is not an executed count.
+    ("test.detcore_unit_on_host", 2604),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5454,7 +5467,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same three bisect search-input regressions: 1094, listed.
     // And the same HERMIT_CPU_PROFILE record_start test (848214c0): 1095, listed.
     // And the same seven ld.so.cache-sharing units: 1102, listed.
-    ("test.hermit_unit_on_host", 1102),
+    // Also retain the prerequisite selector-default model unit, absent from main.
+    // This source union expects 1103 identities; it is not an executed count.
+    ("test.hermit_unit_on_host", 1103),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6872,9 +6887,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"build"########,
         job: r########"liteinst_runtime"########,
         desc: r########"Build the ordinary in-guest Detcore runtime in the liteinst-runtime profile ahead of its packaging finalizer"########,
-        description: r########"PREBUILD 2026-10-18 (liteinst contract, temp/liteinst-status.md "Packaging prebuild contract", 1:51 AM ET). Runs exactly the Cargo command the packaged-LiteInst finalizer (hermit-install/src/bin/stage-detcore-liteinst.rs) runs, `cargo build --locked --offline --manifest-path Cargo.toml -p detcore-liteinst --lib --profile liteinst-runtime --target-dir target`, so that its pinned-root twin compiles the ordinary runtime beside build.workspace_compile_in_pinned_root instead of after it. The finalizer is unchanged: it still runs after every producer, invokes the same command (which Cargo then answers from these artifacts, and the receipt records cargo_artifact.fresh), selects Cargo's reported artifact, and performs every qualification, identity, source-close and receipt step. Only build.workspace_in_pinned_root, which runs the finalizer, depends on the twin. The allocator fixtures keep their own dedicated target (build.liteinst_allocator_fixtures). WHY: the cold liteinst-runtime build is the finalizer's cost. At main 359ab376, eight CPUs (CPUQuota 800%, CARGO_BUILD_JOBS=8), the finalizer took 107 s and 456 CPU-s with target/liteinst-runtime absent (cargo build 97 s), 81 s and 195 CPU-s with only the path crates stale (cargo build 71 s; a warm seed leaves them so), and 9.8 s and 5.7 CPU-s when the runtime was already built; all three qualified the same bytes. In the full validations of 4dc66c9c and 359ab376 the finalizer lengthened build.workspace_in_pinned_root from 38-40 s to 135-153 s on the critical path. LOCKS: Cargo locks each profile directory (target/validate/.cargo-lock, target/liteinst-runtime/.cargo-lock); a validate-profile build and this command started together in one target directory logged no `Blocking waiting for file lock` line. MEMORY: cold peak 2.65 GiB (cgroup memory.peak) at eight jobs, so rss_baseline 3 GiB and the hard cap 5 GiB. The build is a chain of path crates (detcore-model, detcore, detcore-liteinst with ThinLTO), 2.7 cores busy on average when only they rebuild, so eight jobs are enough."########,
+        description: r########"PREBUILD 2026-10-18 (liteinst contract, temp/liteinst-status.md "Packaging prebuild contract", 1:51 AM ET). Runs exactly the Cargo command the packaged-LiteInst finalizer (hermit-install/src/bin/stage-detcore-liteinst.rs) runs, `cargo build --locked --offline --no-default-features --features liteinst --manifest-path Cargo.toml -p detcore-liteinst --lib --profile liteinst-runtime --target-dir target`, so that its pinned-root twin compiles the ordinary runtime beside build.workspace_compile_in_pinned_root instead of after it. The finalizer is unchanged: it still runs after every producer, invokes the same command (which Cargo then answers from these artifacts, and the receipt records cargo_artifact.fresh), selects Cargo's reported artifact, and performs every qualification, identity, source-close and receipt step. Only build.workspace_in_pinned_root, which runs the finalizer, depends on the twin. The allocator fixtures keep their own dedicated target (build.liteinst_allocator_fixtures). WHY: the cold liteinst-runtime build is the finalizer's cost. At main 359ab376, eight CPUs (CPUQuota 800%, CARGO_BUILD_JOBS=8), the finalizer took 107 s and 456 CPU-s with target/liteinst-runtime absent (cargo build 97 s), 81 s and 195 CPU-s with only the path crates stale (cargo build 71 s; a warm seed leaves them so), and 9.8 s and 5.7 CPU-s when the runtime was already built; all three qualified the same bytes. In the full validations of 4dc66c9c and 359ab376 the finalizer lengthened build.workspace_in_pinned_root from 38-40 s to 135-153 s on the critical path. LOCKS: Cargo locks each profile directory (target/validate/.cargo-lock, target/liteinst-runtime/.cargo-lock); a validate-profile build and this command started together in one target directory logged no `Blocking waiting for file lock` line. MEMORY: cold peak 2.65 GiB (cgroup memory.peak) at eight jobs, so rss_baseline 3 GiB and the hard cap 5 GiB. The build is a chain of path crates (detcore-model, detcore, detcore-liteinst with ThinLTO), 2.7 cores busy on average when only they rebuild, so eight jobs are enough."########,
         labels: &[r########"full"########, r########"portable"########],
-        cmd: r########"cargo build --locked --offline --manifest-path Cargo.toml -p detcore-liteinst --lib --profile liteinst-runtime --target-dir target"########,
+        cmd: r########"cargo build --locked --offline --no-default-features --features liteinst --manifest-path Cargo.toml -p detcore-liteinst --lib --profile liteinst-runtime --target-dir target"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -8656,6 +8671,58 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         cpu_timeout: 900,
         jobs_flag: Some(r########""########),
         jobs_env: Some(r########"NEXTEST_TEST_THREADS"########),
+    },
+    StaticStepSpec {
+        group: r########"test"########,
+        job: r########"in_guest_trap_no_liteinst"########,
+        desc: r########"Run the shared trap backend with liteinst2 absent from every producer graph"########,
+        description: r########"Additive LiteInst OFF cohort. The Rust producer exclusively locks one reusable OFF work root for Cargo targets, installation and E2E builds; per-run command/result evidence stays under ignored/ outside target. Wall seconds and reuse flags are retained on success and failure. Existing fresh source-qualified allocator fixture targets and their original qualification inputs remain separately retained; the reusable work root does not bound all qualification evidence or caches. The added full/portable critical-path time remains to be measured; a measurement above 180 seconds requires restructuring rather than dropping cases. Ordinary enabled producers and their assertions are unchanged. Locked offline normal/build/dev dependency graphs for the base CLI, native CLI, Detcore preload, install finalizer and standalone producer must contain no liteinst2. Build the native-capable base CLI, finalize and verify the ordinary source-qualified Detcore preload, stage the genuine standalone runtime, and produce separate source-qualified allocator/stack/constructor bundles without LiteInst. One counted Nextest call runs the existing portable CLI selection with four dead LiteInst skips removed, exact sets of four allocator and nine stack identities, library and binary unit tests including native observer tests, and separate trap-only proc-fd alias, socket receive-timestamp and socket ioctl-timestamp entrypoints retaining the original guest assertions, epoch and exact run parity. Select only those trap entrypoints in the three mixed-backend integration binaries without enabling DBT. Refuse any filtered nonignored shared trap/native identity and require the complete selected Nextest identity set to equal its terminal result set, keeping library and binary identities distinct. It retains all shared program tests and every explicit trap case. The three standalone legacy Strace allocation and active-stack positive controls remain enabled-only; OFF runs distinctly named typed Strace/Compat API refusals and grants no child execution, allocation, continuation or stack-placement credit for them. Installed Detcore, inert preload, cold constructor, source-copy and observer controls keep their original positive or negative assertions in both builds. Patch-specific cases remain in the existing enabled cohort. One host coordinator holds the original work lock and one 2300-second monotonic deadline. Its explicit pinned-root phase builds the same isolated official test-harness and sibling planner and runs all 241 required non-compatibility in-guest-trap manifest cells. The host then runs the remaining 62 required compatibility cells with the exact pinned-produced OFF Hermit and installation and the maintained real compatibility fixtures. The disjoint union must equal every one of the original 303 required cells; both actual runner statuses and the complete terminal population remain mandatory. Run all 150 in-guest-trap isolation cells through the existing conformance producer with its original full assertion scope and expected-mismatches.tsv ledger. Within the pinned phase, after its OFF executions, a distinct fixed ON Cargo target selects only liteinst_mixed_runtime with liteinst and the empty mixed-runtime-test-support marker. Its one counted case consumes the verified OFF installation: unset and explicit-1 requests must refuse with no guest output, while explicit 0 must execute the same genuine runtime successfully. The marker prevents ordinary enabled all-target test selections from requiring this extra input. Retain its separately named structured report and exact listed/terminal identity; never count it as an OFF CLI case. Merge all four exact schema-2 reports without changing identities, terminal verdicts or attempts; require every population nonempty and nonzero runner status propagation even when terminal rows pass. Initial resource bounds are conservative estimates, not a measured speed claim: width 8 through CARGO_BUILD_JOBS, Nextest and E2E widths capped at the admitted width, 6-GiB accounting and 8-GiB hard memory cap from the existing dual-leaf producer's bounds, 2400-second outer wall and 14400 CPU seconds for the sequential cold build, qualification and test phases. The script adds a 2300-second deadline, process-group cleanup and 64-MiB command stream caps without limiting Cargo object-file sizes."########,
+        labels: &[r########"full"########, r########"portable"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./scripts/test-in-guest-trap-no-liteinst.rs --results-writer ./ci/write-structured-test-counts.sh"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: Some(&[
+            r########"cli"########,
+            r########"liteinst_allocator"########,
+            r########"liteinst_stacks"########,
+            r########"proc_fd_link_determinism"########,
+            r########"socket_timestamp_determinism"########,
+            r########"socket_ioctl_timestamp_determinism"########,
+            r########"liteinst_mixed_runtime"########,
+        ]),
+        deps: &[
+            r########"pre.reverie_pin"########,
+            r########"build.rust_scripts"########,
+            r########"build.rust_scripts_in_pinned_root"########,
+            r########"setup.pinned_root_fetch"########,
+        ],
+        env: &[
+            (
+                r########"HERMIT_E2E_EMPTY_WORKDIR"########,
+                r########"/test"########,
+            ),
+            (r########"HERMIT_REQUIRE_DAP"########, r########"1"########),
+            (
+                r########"HERMIT_REQUIRE_DAP_GDB"########,
+                r########"1"########,
+            ),
+        ],
+        hint: HintSpec {
+            resources: &[(r########"manifest_guest"########, 8)],
+            est_duration_s: 1200.0,
+            rss_baseline_bytes: Some(6442450944),
+            hard_mem_max_bytes: Some(8589934592),
+            classification: StepClass::CpuBound,
+            preferred_inner_jobs: Some(8),
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 2400,
+        cpu_timeout: 14400,
+        jobs_flag: Some(""),
+        jobs_env: Some("CARGO_BUILD_JOBS"),
     },
     StaticStepSpec {
         group: r########"test"########,

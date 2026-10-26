@@ -1,6 +1,8 @@
-//! Required scope-free allocation matrices for both actual preload leaves.
+//! Required scope-free allocation matrices for the actual Detcore preload and
+//! the enabled standalone legacy runtime. OFF has a distinct API refusal control.
 //! Fixture exports never select an allocator. Missing qualification, bootstrap,
-//! reproducible placement or exact Q/W comparisons fail; no cases are skipped.
+//! reproducible placement or exact Q/W comparisons fail. All installed Detcore
+//! allocation cases remain required in both builds.
 
 // Import the library without registering its unit tests in this integration binary.
 pub use reverie_liteinst_artifact as artifact;
@@ -10,6 +12,9 @@ mod contract;
 #[allow(dead_code)]
 #[path = "common/hermit_binary.rs"]
 mod hermit_binary;
+#[cfg(not(feature = "liteinst"))]
+#[path = "common/liteinst_legacy_refusal.rs"]
+mod legacy_refusal;
 #[path = "common/m1_bundle.rs"]
 mod m1_bundle;
 #[path = "common/liteinst_source_copy.rs"]
@@ -220,7 +225,10 @@ fn qualify(
                 leaf.profile_name == profile_name && leaf.cargo_profile == expected_profile,
                 "leaf profile differs from required diagnostic producer",
             )?;
-            let features = vec!["allocator-fixture".into()];
+            let mut features = vec!["allocator-fixture".into()];
+            if cfg!(feature = "liteinst") {
+                features.push("liteinst".into());
+            }
             let expected = ConsumerExpectation {
                 package: &package,
                 features: &features,
@@ -544,9 +552,16 @@ fn matrix(standalone: bool) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "liteinst")]
 #[test]
 fn genuine_standalone_leaf_keeps_scope_free_work_private() -> Result<()> {
     matrix(true)
+}
+
+#[cfg(not(feature = "liteinst"))]
+#[test]
+fn standalone_legacy_tools_refuse_before_allocator_child_configuration() -> Result<()> {
+    legacy_refusal::require_legacy_refusal("M1 standalone legacy API control", None)
 }
 
 #[test]

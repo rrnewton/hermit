@@ -319,15 +319,20 @@ fn build_liteinst_runtime(
     // root, so cache invalidation has the same source of truth as the pin gate.
     let target = build_root.join("liteinst-runtime");
     let runtime = profile_dir.join("libreverie_liteinst.so");
+    let mut command = Command::new(repository.join("scripts/stage-liteinst-runtime.sh"));
+    command
+        .current_dir(repository)
+        // This caller derives the pin through the pin gate; an exported
+        // test override must not choose its marker.
+        .env_remove("HERMIT_LITEINST_REVERIE_PIN")
+        .arg("release")
+        .arg(&runtime)
+        .arg(&target);
+    if !cfg!(feature = "liteinst") {
+        command.arg("--without-liteinst");
+    }
     run(
-        Command::new(repository.join("scripts/stage-liteinst-runtime.sh"))
-            .current_dir(repository)
-            // This caller derives the pin through the pin gate; an exported
-            // test override must not choose its marker.
-            .env_remove("HERMIT_LITEINST_REVERIE_PIN")
-            .arg("release")
-            .arg(&runtime)
-            .arg(&target),
+        &mut command,
         "build the constructor-enabled LiteInst runtime",
     );
     assert!(
@@ -383,6 +388,8 @@ fn main() {
     println!("cargo:rerun-if-changed=../liteinst-runtime-build/Cargo.toml");
     println!("cargo:rerun-if-changed=../liteinst-runtime-build/build.rs");
     println!("cargo:rerun-if-changed=../liteinst-runtime-build/artifact.rs");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/native_bundle.rs");
+    println!("cargo:rerun-if-changed=../liteinst-runtime-build/protected_copy.rs");
     println!("cargo:rerun-if-changed=../liteinst-runtime-build/runtime/Cargo.toml");
     println!("cargo:rerun-if-changed=../liteinst-runtime-build/runtime/src/lib.rs");
 

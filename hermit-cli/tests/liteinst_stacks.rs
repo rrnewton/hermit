@@ -13,6 +13,9 @@ mod contract;
 #[allow(dead_code)]
 #[path = "common/hermit_binary.rs"]
 mod hermit_binary;
+#[cfg(not(feature = "liteinst"))]
+#[path = "common/liteinst_legacy_refusal.rs"]
+mod legacy_refusal;
 #[path = "common/m1_bundle.rs"]
 mod m1_bundle;
 #[path = "common/m2_bundle.rs"]
@@ -258,7 +261,10 @@ fn qualify(
                 leaf.profile_name == profile_name && leaf.cargo_profile == expected_profile,
                 "leaf profile differs from required diagnostic producer",
             )?;
-            let features = vec!["allocator-fixture".into()];
+            let mut features = vec!["allocator-fixture".into()];
+            if cfg!(feature = "liteinst") {
+                features.push("liteinst".into());
+            }
             let receipt = artifact::verify_runtime_receipt(
                 &leaf.receipt,
                 &leaf.runtime,
@@ -482,7 +488,10 @@ fn actual_stack(case: Case) -> Result<()> {
                     "public standalone launcher did not select exactly the qualified DSO",
                 )?;
             }
-            environment.insert("REVERIE_LITEINST_SITE_PATCHING".into(), "1".into());
+            environment.insert(
+                "REVERIE_LITEINST_SITE_PATCHING".into(),
+                if cfg!(feature = "liteinst") { "1" } else { "0" }.into(),
+            );
             environment.insert(
                 "REVERIE_LITEINST_ALT_STACK".into(),
                 if case.alt_stack { "1" } else { "0" }.into(),
@@ -530,7 +539,7 @@ fn actual_stack(case: Case) -> Result<()> {
         let held = HeldInputs {
             environment: environment.into_iter().collect(),
             policy: serde_json::to_vec(&json!({"case":case.label,"mode":mode,"alt_stack":case.alt_stack,
-                "site_patching":case.standalone,"continuation":if case.standalone {"absent"} else {"required"},
+                "site_patching":case.standalone && cfg!(feature = "liteinst"),"continuation":if case.standalone {"absent"} else {"required"},
                 "runtime_sha256":receipt.artifact.sha256,"guest_sha256":guest.sha256,"executable_sha256":executable.sha256,
                 "epoch":EPOCH,"seed":0,"sched_seed":0,"fixed_region_required":case.alt_stack,
                 "full_entry_isolation_claimed":false,"interior_write_protection_claimed":false})).map_err(|e| e.to_string())?,
@@ -612,6 +621,7 @@ fn actual_stack(case: Case) -> Result<()> {
     result.map_err(|error| format!("{error}; M2 raw evidence {}", evidence.display()))
 }
 
+#[cfg(feature = "liteinst")]
 #[test]
 fn genuine_standalone_registers_fixed_guarded_altstack_without_continuation() -> Result<()> {
     actual_stack(Case {
@@ -622,6 +632,7 @@ fn genuine_standalone_registers_fixed_guarded_altstack_without_continuation() ->
     })
 }
 
+#[cfg(feature = "liteinst")]
 #[test]
 fn standalone_altstack_disabled_receives_no_owned_stack_credit() -> Result<()> {
     actual_stack(Case {
@@ -630,6 +641,21 @@ fn standalone_altstack_disabled_receives_no_owned_stack_credit() -> Result<()> {
         alt_stack: false,
         inert: false,
     })
+}
+
+#[cfg(not(feature = "liteinst"))]
+#[test]
+fn standalone_legacy_tools_refuse_before_altstack_enabled_child_configuration() -> Result<()> {
+    legacy_refusal::require_legacy_refusal("M2 standalone altstack enabled API control", Some(true))
+}
+
+#[cfg(not(feature = "liteinst"))]
+#[test]
+fn standalone_legacy_tools_refuse_before_altstack_disabled_child_configuration() -> Result<()> {
+    legacy_refusal::require_legacy_refusal(
+        "M2 standalone altstack disabled API control",
+        Some(false),
+    )
 }
 
 #[test]

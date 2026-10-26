@@ -22,8 +22,10 @@ if [[ ${1:-} == --self-test ]]; then
     shift
 fi
 
-mkdir -p target/ci
-compile_dir=$(mktemp -d "$ROOT_DIR/target/ci/check-reverie-pin.XXXXXX")
+# Keep this direct-rustc helper inside the caller's selected Cargo target root.
+ci_target_dir="${CARGO_TARGET_DIR:-$ROOT_DIR/target}/ci"
+mkdir -p -- "$ci_target_dir"
+compile_dir=$(mktemp -d "$ci_target_dir/check-reverie-pin.XXXXXX")
 checker="$compile_dir/checker"
 trap 'rm -rf -- "$compile_dir"' EXIT
 if [[ $mode == test ]]; then
