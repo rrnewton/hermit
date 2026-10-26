@@ -2744,7 +2744,18 @@ fi
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory (1009), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the fbd29608 entry.
-expected_pin=2459e33e501a8610a7f806303ef558800b2f1b34
+# CARRY TO 54e0dc05dd870ad368ae4a09665af66f19d0ce04 (2026-10-26): from
+# 2459e33e501a8610a7f806303ef558800b2f1b34. One commit (linuxemu lane, S4): the guest inherits
+# its launcher's credentials (capabilities through Linux's exec rule,
+# supplementary groups, umask). It changes reverie-linuxemu/src only. git diff
+# is empty under reverie-dbt/ and third-party/ and for the root Cargo.toml,
+# Cargo.lock and rust-toolchain.toml; both repository inputs to the DynamoRIO
+# content key are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory (1009), SDK and native inputs, calibrated budget, job width
+# and limits carry unchanged from the 2459e33e entry.
+expected_pin=54e0dc05dd870ad368ae4a09665af66f19d0ce04
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
