@@ -5411,7 +5411,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +6 from 82cbd684: 2747.
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // And the same seventeen access-trace tests as test.detcore_unit: 2805.
-    ("test.detcore_unit_on_host", 2805),
+    // And the same fifteen sync-edge tests as test.detcore_unit: 2820.
+    ("test.detcore_unit_on_host", 2820),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
