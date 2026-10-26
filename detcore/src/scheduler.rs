@@ -4416,9 +4416,15 @@ impl Drop for GuestDeadlockUnwindGuard {
 /// `HERMIT_GUEST_DEADLOCK_EXIT`.
 fn unwind_guest_deadlock(sched: &Mutex<Scheduler>) -> Option<bool> {
     let unwind = GUEST_DEADLOCK_UNWIND.with(|slot| slot.borrow_mut().take())?;
-    // Set before the request, whose teardown reports to the scheduler
-    // synchronously (`report_backend_failure_location`).
-    sched.lock().unwrap().guest_deadlocked = true;
+    {
+        let mut sched = sched.lock().unwrap();
+        // Set before the request, whose teardown reports to the scheduler
+        // synchronously (`report_backend_failure_location`).
+        sched.guest_deadlocked = true;
+        // The request kills every remaining guest thread, and their deaths
+        // arrive in host order: retire them now, in DetTid order.
+        sched.retire_threads_at_unwind();
+    }
     let won = unwind();
     sched.lock().unwrap().guest_deadlocked = won;
     Some(won)
@@ -36257,6 +36263,60 @@ mod test {
             panic!("a removed unwind must not run")
         })));
         assert_eq!(unwind_guest_deadlock(&sched), None);
+    }
+
+    /// The unwind of a deadlocked guest kills every remaining thread, and the
+    /// host reports their deaths in any order. They are retired before the
+    /// unwind's request, in DetTid order, as committed victims: each death
+    /// report that follows, in whatever order, is only accounted. On a backend
+    /// that does not retire a kill's victims at the kill turn (DBT), nothing
+    /// is retired early.
+    #[test]
+    fn a_deadlock_unwind_retires_the_remaining_threads_in_tid_order() {
+        use sigkill_retirement::SigkillReceipt;
+
+        let threads = [3, 5, 7].map(DetTid::from_raw);
+        let deadlocked = |config: &Config| {
+            let mut sched = Scheduler::new(config);
+            let leader = threads[0];
+            for tid in threads {
+                sched.thread_tree.add_child(leader, tid, tid == leader);
+                register_known_thread(&mut sched, tid);
+                sched.record_thread_mm(tid, MmId::initial(leader));
+            }
+            Mutex::new(sched)
+        };
+        let unwound = |sched: &Mutex<Scheduler>| {
+            let guard = GuestDeadlockUnwindGuard::install(Box::new(|| true));
+            assert_eq!(unwind_guest_deadlock(sched), Some(true));
+            drop(guard);
+        };
+
+        let sched = deadlocked(&Config::default());
+        unwound(&sched);
+        let mut sched = sched.into_inner().unwrap();
+        assert!(sched.next_turns.is_empty());
+        assert!(sched.thread_tree.granted_exits.contains(&threads[0]));
+        assert!(sched.sigkill_fence_holds());
+        for tid in [threads[2], threads[0], threads[1]] {
+            assert!(sched.is_unaccounted_sigkill_victim(tid), "{tid}");
+            assert_eq!(sched.route_sigkill_receipt(tid), SigkillReceipt::Committed);
+        }
+        assert!(!sched.sigkill_fence_holds());
+
+        let mut direct = deadlocked(&Config::default()).into_inner().unwrap();
+        assert_eq!(direct.retire_threads_at_unwind(), threads);
+
+        let dbt = Config::default().with_backend(|backend| {
+            *backend = reverie::BackendCapabilities::DBT;
+        });
+        let sched = deadlocked(&dbt);
+        unwound(&sched);
+        let mut sched = sched.into_inner().unwrap();
+        assert_eq!(sched.next_turns.len(), 3);
+        for tid in threads {
+            assert_eq!(sched.route_sigkill_receipt(tid), SigkillReceipt::Ordinary);
+        }
     }
 
     /// A process forked into the namespace after its init's Exit grant, but

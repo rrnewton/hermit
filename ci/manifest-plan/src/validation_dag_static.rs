@@ -3087,7 +3087,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the TracerPid unit (32e9ef22f60): 2897 + 1 = 2898.
     // And scheduler::test::terminal_verdicts_carry_the_kind_that_decides_the_status
     // (the guest-deadlock outcome): 2899, listed.
-    ("test.detcore_unit", 2899),
+    // And scheduler::test::
+    // a_deadlock_unwind_retires_the_remaining_threads_in_tid_order:
+    // 2900, listed.
+    ("test.detcore_unit", 2900),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4397,7 +4400,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_guest_deadlock_verifies_as_the_same_outcome_in_both_runs and
     // a_recorded_guest_deadlock_replays_to_the_same_outcome (the guest-deadlock
     // outcome, tests/c/condvar_join_deadlock.c): 706, listed.
-    ("test.cli", 706),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
+    // And a_guest_deadlock_that_kills_several_threads_verifies_at_parity: 707,
+    // listed.
+    ("test.cli", 707),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
     // sabre_reports_a_replaced_host_file_without_naming_it_the_cause,
@@ -4948,7 +4953,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two TracerPid cli tests: 619 + 2 = 621.
     // And the same two 11c35a504a6 tests: 621 + 2 = 623.
     // And the same three guest-deadlock outcome tests: 625, listed.
-    ("test.cli_on_host", 625),
+    // And the same several-thread guest-deadlock parity test: 626, listed.
+    ("test.cli_on_host", 626),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5425,7 +5431,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured with `cargo nextest list` at this head.
     // And the same TracerPid unit: 2898.
     // And the same guest-deadlock terminal-verdict unit: 2899, listed.
-    ("test.detcore_unit_on_host", 2899),
+    // And the same unwind retirement unit: 2900, listed.
+    ("test.detcore_unit_on_host", 2900),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
