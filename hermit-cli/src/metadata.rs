@@ -1300,6 +1300,8 @@ fn record_or_replay_config_with_timer_support(
         notice_host_network_abstract_binds: false,
         // A recording runs in a PID namespace of its own.
         guest_ids: detcore::GuestIds::Namespace,
+        // A recording replays nothing, so it adopts no seeds.
+        replay_adopted_seeds: None,
         // The path to the directory where syscalls will be recorded.
         replay_data: Some(data.to_path_buf()),
         clock_multiplier: None,

@@ -120,9 +120,10 @@ fn random_sources_repeat_across_runs_and_change_with_seed() {
 
 /// A schedule replay hands the guest the random values its recording read.
 /// `--seed` seeds the guest's randomness as well as the scheduler, so a
-/// preemption record stores the run's `--rng-seed`. A replay that omits
-/// `--rng-seed` adopts it, under either replay flag, and a different explicit
-/// one is refused before the guest runs.
+/// preemption record stores the run's `--rng-seed` and `--sched-seed`. A
+/// replay that omits them adopts them, under either replay flag, and its
+/// summary says so; a different explicit one, by its own option or by
+/// `--seed`, is refused before the guest runs.
 #[test]
 fn a_schedule_replay_hands_the_guest_the_recorded_random_values() {
     let guest = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
@@ -147,12 +148,26 @@ fn a_schedule_replay_hands_the_guest_the_recorded_random_values() {
     );
 
     for flag in ["--replay-preemptions-from", "--replay-schedule-from"] {
-        let replayed = hermit_run(&guest, &[format!("{flag}={}", schedule.display())]);
+        let replayed = hermit_run(
+            &guest,
+            &[
+                format!("{flag}={}", schedule.display()),
+                "--summary".to_owned(),
+            ],
+        );
         assert_success(&replayed, flag);
         assert_eq!(
             String::from_utf8_lossy(&replayed.stdout),
             String::from_utf8_lossy(&recorded.stdout),
             "{flag} handed the guest other random values than the recording"
+        );
+        // Both seeds came from the recording, and the summary says so.
+        let stderr = String::from_utf8_lossy(&replayed.stderr);
+        assert!(
+            stderr.contains(
+                "Seeds adopted from the replayed recording: guest random seed 17, scheduler seed 17"
+            ),
+            "{stderr}"
         );
     }
 
@@ -179,6 +194,24 @@ fn a_schedule_replay_hands_the_guest_the_recorded_random_values() {
         "the guest ran despite the refusal: {}",
         String::from_utf8_lossy(&refused.stdout)
     );
+
+    // An explicit --seed that contradicts the recording is refused too,
+    // rather than silently replaced.
+    let refused = hermit_run(
+        &guest,
+        &[
+            "--seed=18".to_owned(),
+            format!("--replay-preemptions-from={}", schedule.display()),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    // EXIT-CLASS: hermit
+    assert_eq!(refused.status.code(), Some(122), "{stderr}");
+    assert!(
+        stderr.contains("--seed=18 differs from the seed 17"),
+        "{stderr}"
+    );
+    assert!(refused.stdout.is_empty());
 }
 
 #[test]
