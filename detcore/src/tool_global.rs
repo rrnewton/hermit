@@ -7652,7 +7652,7 @@ impl GlobalState {
 
         // Yield this guest thread if needed to follow schedule.
         let result = if self.cfg.replay_schedule_from.is_some() {
-            let (consumed, print_stack2) = {
+            let (consumed, print_stack2, backstop) = {
                 let mut sched = self.lock_rpc_scheduler(false).await;
                 if sched.thread_is_logically_killed(ev.dettid)
                     || !sched.rpc_incarnation_matches(ev.dettid, request_mm)
@@ -7667,7 +7667,7 @@ impl GlobalState {
                 } else {
                     None
                 };
-                (consumed, print_stack2)
+                (consumed, print_stack2, sched.uncapped_backstop())
             };
             let ConsumeResult {
                 keep_running,
@@ -7721,6 +7721,7 @@ impl GlobalState {
                 timeslice: end_of_timeslice,
                 schedule_released,
                 schedule_over,
+                backstop,
             }
         } else {
             let print_stack_strace = {
@@ -7743,6 +7744,7 @@ impl GlobalState {
                 timeslice: None,
                 schedule_released: false,
                 schedule_over: false,
+                backstop: None,
             }
         };
 
@@ -11760,6 +11762,10 @@ pub struct TraceSchedEventResponse {
     /// Whether the replayed schedule is over: it ran out or was released
     /// (`Scheduler::schedule_replay_over`).
     schedule_over: bool,
+    /// The slice length that replaces `--max-timeslice` while the thread
+    /// replays a record whose slices ran without it
+    /// (`Scheduler::uncapped_backstop`).
+    backstop: Option<LogicalTime>,
 }
 
 struct SchedEventForLog<'a> {
@@ -11882,6 +11888,7 @@ pub async fn trace_schedevent_with_access<G, T>(
                 timeslice,
                 schedule_released,
                 schedule_over,
+                backstop,
             }),
         ) => {
             if schedule_released {
@@ -11890,6 +11897,11 @@ pub async fn trace_schedevent_with_access<G, T>(
             if schedule_over {
                 guest.thread_state_mut().schedule_replay_over = true;
             }
+            let bound = guest.config().max_timeslice;
+            let schedule_replay = guest.config().replay_schedule_from.is_some();
+            guest
+                .thread_state_mut()
+                .learn_uncapped_backstop(backstop, bound, schedule_replay);
             if let Some(m_path) = print_stack_strace {
                 trace!("[trace_schedevent] writing stacktrace via Reverie...");
                 write_backtrace(guest, m_path.as_ref());
