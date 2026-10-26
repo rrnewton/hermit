@@ -15,8 +15,10 @@
 //!
 //! The file is JSON Lines: one [`TraceRecord`] per line, tagged by `"kind"`. The
 //! first line is a [`TraceHeader`]. A run that finishes cleanly ends with a
-//! [`TraceEnd`]; a trace without one was cut short. Records follow the order in
-//! which their last schedule event was recorded.
+//! [`TraceEnd`]; a trace without one was cut short. A record is written when
+//! its last schedule event is recorded, so syscall records follow `post`; a
+//! call that never returned is written when its thread enters its next call,
+//! or at the end of the run. Readers sort by the index they need.
 //!
 //! Every event index here is a position in the recorded schedule: the index the
 //! scheduler gave the event when it recorded it. Syscall records carry the
@@ -510,8 +512,9 @@ pub enum Task {
     Process(DetPid),
     /// Every process of a process group, named by its group id. A
     /// signal to a group (kill with 0 or a negative pid) also lists one
-    /// `process` target per member Detcore's process table holds at the
-    /// call; kill(-1), every process the caller may signal, lists none.
+    /// `process` target per member Detcore's process table holds when the
+    /// call's posthook is recorded; kill(-1), every process the caller may
+    /// signal, lists none.
     ProcessGroup(DetPid),
 }
 

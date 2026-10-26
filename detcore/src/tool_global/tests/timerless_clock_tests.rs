@@ -63,7 +63,7 @@ impl GlobalRPC<GlobalState> for ClockGuest {
             serde_json::to_value(&self.thread.thread_logical_time).unwrap(),
         );
         match request {
-            GlobalRequest::TraceSchedEvent(event, pid, bootstrap) => {
+            GlobalRequest::TraceSchedEvent(event, pid, bootstrap, access) => {
                 assert_eq!(pid, TID);
                 self.records.lock().unwrap().push(event.clone());
                 if let Some(state) = &self.rpc_state {
@@ -73,7 +73,7 @@ impl GlobalRPC<GlobalState> for ClockGuest {
                             (
                                 time,
                                 mm,
-                                GlobalRequest::TraceSchedEvent(event, pid, bootstrap),
+                                GlobalRequest::TraceSchedEvent(event, pid, bootstrap, access),
                             ),
                         )
                         .await;

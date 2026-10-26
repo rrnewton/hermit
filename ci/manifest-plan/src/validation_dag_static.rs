@@ -1198,7 +1198,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's six access_trace::tests (record round trip, on-disk
     // spelling, out_bytes hex, returned_digest, reader refusals, conflict
     // rules), the access trace's record types: 1905.
-    ("test.regular_crates", 1905),
+    // config::tests::access_trace_never_enters_the_legacy_form_and_round_trips
+    // (--record-access-trace-to): 1906.
+    ("test.regular_crates", 1906),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1936,7 +1938,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_weak_nap_ranks_after_the_evidenced_pairs}: 1265.
     // And analyze::races::tests::
     // a_nearer_wait_of_similar_length_ranks_before_a_long_nap: 1266.
-    ("test.hermit_unit", 1266),
+    // And run::access_trace_is_refused_where_its_records_would_name_nothing
+    // and run::a_manifest_leaves_out_the_access_trace: 1268.
+    ("test.hermit_unit", 1268),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3156,7 +3160,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (a replay of a schedule's first events keeps their callback
     // checkpoints): 2789, listed.
     // And preemptions::tests::a_record_too_varied_to_renumber_keeps_its_priorities: 2790.
-    ("test.detcore_unit", 2790),
+    // And fourteen access_trace::tests of the access trace's writer and
+    // resource extraction, tool_local's
+    // traced_call_tests::a_traced_call_notes_the_slots_it_changes, and
+    // access_trace's clock_and_timer_reads_carry_what_they_returned and
+    // a_capped_trace_stops_without_its_end_line
+    // (--record-access-trace-to): 2807, listed.
+    ("test.detcore_unit", 2807),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4452,7 +4462,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 654 + 5 = 659, listed.
     // And +1 from 82cbd684: 660.
     // Train 6 recount (measured on 21f770f6 base): 666.
-    ("test.cli", 666),
+    // And access_trace's an_access_trace_leaves_a_replayed_run_unchanged,
+    // access_trace_indices_name_the_runs_own_events and
+    // access_trace_from_leaves_out_only_earlier_records: 669.
+    ("test.cli", 669),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4995,7 +5008,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 5 = 578, listed.
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
-    ("test.cli_on_host", 585),
+    // And the same three access trace tests, not excluded: 588.
+    ("test.cli_on_host", 588),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
