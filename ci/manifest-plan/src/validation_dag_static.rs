@@ -3203,7 +3203,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // detcore units, measured at its base (3279 + 27 = 3306, listed) and
     // re-measured at this landing by cargo nextest run -p hermit-detcore
     // --lib (3348 passed): 3321 + 27 = 3348.
-    ("test.detcore_unit", 3348),
+    // And a_binder_call_blocks_when_it_waits_for_another_process: 3349.
+    ("test.detcore_unit", 3349),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4557,7 +4558,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // passing.
     // N3 adds twelve cli cases, measured at its base (763 + 12 = 775 in
     // its tight loop): 764 + 12 = 776.
-    ("test.cli", 776),
+    // And a_blocking_binder_read_does_not_hold_the_guests_turn, which skips
+    // the same way: 777.
+    ("test.cli", 777),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5171,7 +5174,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same eighteen integrated-chain cli cases: 664 + 18 = 682.
     // The same recount at bc48233db5 as test.cli: 682 + 1 = 683.
     // The same twelve N3 cli cases: 683 + 12 = 695.
-    ("test.cli_on_host", 695),
+    // And the same blocking binder read test: 696.
+    ("test.cli_on_host", 696),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5702,7 +5706,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same thirty-seven NR units: 3242 + 37 = 3279.
     // The same recount at 4e916633ca as test.detcore_unit: 3279 + 42 = 3321.
     // The same twenty-seven N3 detcore units: 3321 + 27 = 3348.
-    ("test.detcore_unit_on_host", 3348),
+    // And the same blocking-classification unit: 3349.
+    ("test.detcore_unit_on_host", 3349),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
