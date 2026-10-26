@@ -1197,6 +1197,10 @@ pub struct GlobalState {
     // Open file description to bound port.
     open_file_to_port: Mutex<HashMap<OpenFileId, u16>>,
 
+    /// Inotify rename cookies renumbered by first observation across the run
+    /// (`GlobalRequest::VirtualInotifyCookies`, `crate::syscalls::inotify`).
+    inotify_cookies: Mutex<crate::syscalls::inotify::CookieTable>,
+
     port_start_range: AtomicU16,
     port_end_range: AtomicU16,
 
@@ -1750,6 +1754,7 @@ impl GlobalState {
             port_start_range: AtomicU16::new(range[0]),
             port_end_range: AtomicU16::new(range[1]),
             open_file_to_port: Mutex::new(HashMap::new()),
+            inotify_cookies: Mutex::new(Default::default()),
             past_first_execve: AtomicBool::new(false),
             initial_descriptor_image_complete: AtomicBool::new(false),
             inherited_input: Mutex::new(None),
@@ -3807,6 +3812,17 @@ impl GlobalState {
                     .await
                     .temporary_mask_control(dtid, control),
             ),
+            GlobalRequest::VirtualInotifyCookies(host) => {
+                let mut table = self
+                    .inotify_cookies
+                    .lock()
+                    .expect("inotify cookie table lock poisoned");
+                R::VirtualInotifyCookies(
+                    host.into_iter()
+                        .map(|cookie| table.virtualize(cookie))
+                        .collect(),
+                )
+            }
             GlobalRequest::InPidNamespaceInit(thread) => {
                 let scheduler = self.lock_rpc_scheduler(false).await;
                 R::InPidNamespaceInit(
@@ -6317,6 +6333,17 @@ pub enum SignalScope {
     Thread,
 }
 
+/// The revision of the global RPC, [`GlobalRequest`] and [`GlobalResponse`],
+/// which [`crate::config_wire_fingerprint`] includes: a runtime embedding
+/// Detcore and a coordinator built at different revisions refuse each other
+/// before either decodes the other's messages. A change to either enum
+/// appends a revision (`config::tests::the_global_rpc_revision_matches_its_definitions`
+/// fails until it does). That test digests the two enums' bodies only: a
+/// change to a payload type defined elsewhere (`Resources`,
+/// `CommittedSendWindow`, ...) changes what is on the wire without changing
+/// the digest, and needs a revision appended by hand.
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 1;
+
 /// This is public only so it can be used in the `GlobalTool` trait.
 /// It should NOT be used by any client outside of this file.
 #[derive(PartialEq, Debug, Eq, Clone, Serialize, Deserialize)]
@@ -6990,6 +7017,10 @@ pub enum GlobalRequest {
     /// `Config::in_guest_signal_delivery` before a two-phase delivery's
     /// announcement and a predicted death. Appended last.
     InPidNamespaceInit(DetTid),
+    /// The virtual cookie for each host inotify rename cookie of one read, in
+    /// order (`crate::syscalls::inotify`). Answered in the sender's own turn
+    /// with no scheduling decision. Appended last.
+    VirtualInotifyCookies(Vec<u32>),
 }
 
 /// Responses from the global object
@@ -7270,6 +7301,9 @@ pub enum GlobalResponse {
     PublishTemporaryMask(Option<crate::scheduler::guest_mask_publication::CommittedSendWindow>),
     /// The answer to `GlobalRequest::InPidNamespaceInit`. Appended last.
     InPidNamespaceInit(bool),
+    /// The answer to `GlobalRequest::VirtualInotifyCookies`: one virtual
+    /// cookie per host cookie, in order. Appended last.
+    VirtualInotifyCookies(Vec<u32>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -7807,6 +7841,24 @@ where
         GlobalResponse::InPidNamespaceInit(init) => init,
         GlobalResponse::ThreadExited => false,
         other => panic!("unexpected response to InPidNamespaceInit: {other:?}"),
+    }
+}
+
+/// The run-wide virtual cookie for each host inotify rename cookie of one
+/// read, in order (`GlobalRequest::VirtualInotifyCookies`). The
+/// `ThreadExited` arm, kept as in its siblings, is never taken:
+/// `send_and_update_time` retires an exited thread instead of returning.
+pub(crate) async fn virtual_inotify_cookies<G, T>(guest: &mut G, host: Vec<u32>) -> Vec<u32>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::VirtualInotifyCookies(host.clone())).await;
+    match response {
+        GlobalResponse::VirtualInotifyCookies(cookies) => cookies,
+        GlobalResponse::ThreadExited => host,
+        other => panic!("unexpected response to VirtualInotifyCookies: {other:?}"),
     }
 }
 
