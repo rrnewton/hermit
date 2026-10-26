@@ -1190,7 +1190,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's
     // syscall_histogram::tests::the_finished_form_keeps_only_nonzero_slots_and_sums_back_exactly
     // (finished threads keep sparse histograms): 1867, listed.
-    ("test.regular_crates", 1880),
+    // And detcore-model's
+    // a_reused_thread_id_starts_its_own_clock_and_keeps_the_old_work: 1881.
+    ("test.regular_crates", 1881),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3033,7 +3035,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And A5 slice 3c.1e B's unit: threads' disposition_mask_tests::
     // a_gated_managed_wait_reads_the_guest_mask_without_replacing_it: 2682,
     // listed.
-    ("test.detcore_unit", 2682),
+    // And tool_global's reused-thread-ID clock units
+    // a_child_on_a_reused_id_starts_its_own_clock,
+    // an_early_start_on_a_reused_id_waits_for_its_registration,
+    // an_early_start_on_an_id_whose_holder_never_ran_keeps_its_clock,
+    // a_child_on_the_id_of_a_child_that_ran_and_exited_starts_its_own_clock
+    // and a_vfork_child_on_a_reused_id_starts_its_own_clock: 2687, listed.
+    ("test.detcore_unit", 2687),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5260,7 +5268,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five shared runtime-FD readlink regressions: 2667, listed.
     // Fixed 0.5.4 rebase recount also retains the priority-history regressions.
     // And the same 3c.1e B unit: 2682, listed.
-    ("test.detcore_unit_on_host", 2682),
+    // And the same five reused-thread-ID clock units: 2687, listed.
+    ("test.detcore_unit_on_host", 2687),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5831,7 +5840,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same native-client publication regression is included on the host.
     // And the same detcore-dbt fingerprint test: 1852, listed.
     // And the same finished-thread sparse histogram unit: 1853, listed.
-    ("test.regular_crates_on_host", 1866),
+    // And the same reused-thread-ID detcore-model test: 1867.
+    ("test.regular_crates_on_host", 1867),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

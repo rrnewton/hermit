@@ -3075,14 +3075,31 @@ impl GlobalState {
         // callback registers it. A former exec worker's reused Linux TID must
         // wait for that authenticated registration, not inherit the old
         // incarnation or turn a premature refusal into a silent exit(0).
+        // So must any other reused TID (`id_awaits_new_registration`): its
+        // registration retires the earlier thread's clock, and a clock this
+        // start published first would be retired with it.
         // No clock or scheduler request is published while it waits.
-        if matches!(&request, GlobalRequest::StartNewThread(child, ..) if *child == dtid) {
+        if let GlobalRequest::StartNewThread(child, detpid, ..) = &request
+            && *child == dtid
+        {
             loop {
                 {
                     let sched = self.lock_rpc_scheduler(false).await;
-                    if !sched.transferred_exec_tid_requires_registration(dtid)
-                        || sched.thread_is_logically_killed(dtid)
-                    {
+                    let awaits_registration = sched
+                        .transferred_exec_tid_requires_registration(dtid)
+                        || id_awaits_new_registration(&sched, dtid);
+                    // These starts end without a registration, answered below
+                    // or by `recv_start_new_thread` as before. An exec
+                    // worker's reused TID mismatches its incarnation until its
+                    // registration rebinds it, so only another mismatch ends
+                    // the wait.
+                    let ends_unregistered = sched.thread_is_logically_killed(dtid)
+                        || sched.is_unaccounted_sigkill_victim(dtid)
+                        || (!sched.rpc_incarnation_matches(dtid, request_mm)
+                            && !sched.transferred_exec_tid_requires_registration(dtid))
+                        || (self.cfg.backend.process_exits_complete_asynchronously
+                            && sched.process_physically_gone(*detpid));
+                    if !awaits_registration || ends_unregistered {
                         break;
                     }
                 }
@@ -3217,6 +3234,14 @@ impl GlobalState {
                 &request,
                 GlobalRequest::StartNewThread(child_dettid, ..) if *child_dettid == dtid
             ) && self.global_time.lock().unwrap().contains_thread(dtid);
+
+            // A vfork child registers itself, so this message is its
+            // registration and the first to carry its clock.
+            if matches!(&request, GlobalRequest::CreateVforkChildThread(_, _, child, ..) if *child == dtid)
+                && self.clock_belongs_to_earlier_thread(&sched, dtid)
+            {
+                self.global_time.lock().unwrap().retire_thread(dtid);
+            }
 
             // This portion of the time updates "asynchronously", and we can tick it on every rpc:
             // TODO: eventually the vector clock should be in shared memory, and
@@ -5042,6 +5067,15 @@ impl GlobalState {
         trace!("[detcore] All resources held by pid {} released", from);
     }
 
+    /// Whether `dtid`'s clock component belongs to an earlier thread that had
+    /// the same ID (`id_awaits_new_registration`), rather than to the new
+    /// thread now being registered under it. Caller holds the scheduler,
+    /// which nests outside the clock.
+    fn clock_belongs_to_earlier_thread(&self, sched: &Scheduler, dtid: DetTid) -> bool {
+        id_awaits_new_registration(sched, dtid)
+            && self.global_time.lock().unwrap().contains_thread(dtid)
+    }
+
     /// Global portion of parent-forking-child protocol.  Called by the parent
     /// thread for an ordinary clone, or by the child itself for a vfork whose
     /// parent is blocked inside the kernel (`parent_is_kernel_blocked`).
@@ -5192,6 +5226,14 @@ impl GlobalState {
             if !initial_current_root {
                 sched.register_reused_transferred_exec_tid(child_dettid, child_mm);
                 sched.record_thread_mm(child_dettid, child_mm);
+            }
+            // A parent registers its child before the child's own first
+            // message publishes a clock (an early start waits for this), so a
+            // clock already under a reused ID is the earlier thread's. A vfork
+            // child, which registers itself, retired it before publishing.
+            if sender != child_dettid && self.clock_belongs_to_earlier_thread(&sched, child_dettid)
+            {
+                self.global_time.lock().unwrap().retire_thread(child_dettid);
             }
             // The guest's procfs paths name a task by its thread ID in the
             // guest's PID namespace, which is the raw value of its DetTid.
@@ -8834,6 +8876,19 @@ pub async fn create_vfork_child_thread<G, T>(
         GlobalResponse::CreateChildThread(_) => (),
         _ => unreachable!(),
     }
+}
+
+/// Whether `dtid` names a thread the scheduler registered and has since
+/// retired, with no new registration under it yet. Linux gives an ID to a new
+/// task only once its last holder is gone, and without a PID namespace IDs
+/// wrap at the host's `pid_max` (32768 on many devices), so a run that keeps
+/// starting threads gets IDs it used before. Registrations are never removed;
+/// retirement removes a thread's turn state and a new registration inserts
+/// it. A message from such an ID therefore comes from a new thread that is
+/// not registered yet (a vfork child's own registration is one); a live
+/// thread has turn state.
+fn id_awaits_new_registration(sched: &Scheduler, dtid: DetTid) -> bool {
+    sched.thread_was_registered(dtid) && !sched.next_turns.contains_key(&dtid)
 }
 
 /// Remove the thread from the scheduler.
@@ -15953,6 +16008,424 @@ mod tests {
         assert_eq!(
             startup.await,
             (None, granted(GlobalResponse::StartNewThread(None)))
+        );
+        assert_eq!(state.global_time.lock().unwrap().as_nanos(), before_child);
+    }
+
+    /// The state an earlier holder of `id` leaves behind under the ptrace
+    /// backend once it is gone: its scheduler registration (never removed)
+    /// and no turn state (`logically_kill_thread` removed it). A holder that
+    /// ran also leaves its clock component, which nothing retires at exit; one
+    /// killed before its first message never published a clock.
+    fn leave_earlier_thread_behind(
+        state: &GlobalState,
+        parent: DetTid,
+        id: DetTid,
+        clock: Option<&DetTime>,
+    ) {
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .thread_tree
+            .add_child(parent, id, true);
+        if let Some(clock) = clock {
+            state.global_time.lock().unwrap().update_global_time(
+                id,
+                clock.as_nanos(),
+                clock.inherited_nanos(),
+            );
+        }
+    }
+
+    /// A parent at virtual time 1_001 ns whose earlier child with ID
+    /// `parent + 1` is gone, after running 500 ns when `earlier_ran`; the
+    /// parent then ran on to 600_000 ns. Returns the parent's clock, ready to
+    /// create the next child.
+    fn reused_id_state(earlier_ran: bool) -> (GlobalState, DetTid, DetPid, DetTid, DetTime) {
+        let config = Config {
+            sequentialize_threads: true,
+            runs_post_fork: RunsPostFork::Child,
+            ..Config::default()
+        };
+        let (config, state, parent, parent_pid) = cancellation_test_state_with_config(config);
+        let reused = DetTid::from_raw(parent.as_raw() + 1);
+        install_test_registration(&state, parent, Ivar::new());
+        let mut parent_clock = DetTime::new(&config);
+        let epoch = parent_clock.as_nanos();
+        parent_clock.advance_to(epoch + LogicalTime::from_nanos(1_001));
+        let mut first_holder = parent_clock.clone_for_child();
+        first_holder.advance_to(first_holder.as_nanos() + LogicalTime::from_nanos(500));
+        leave_earlier_thread_behind(&state, parent, reused, earlier_ran.then_some(&first_holder));
+        parent_clock.advance_to(epoch + LogicalTime::from_nanos(600_000));
+        (state, parent, parent_pid, reused, parent_clock)
+    }
+
+    fn fork_registration(child: DetTid, parent_pid: DetPid) -> GlobalRequest {
+        GlobalRequest::CreateChildThread(
+            child,
+            parent_pid,
+            0,
+            Some(CloneFlags::empty()),
+            libc::SIGCHLD,
+            None,
+            Some(DEFAULT_PRIORITY),
+        )
+    }
+
+    /// Linux gave a new child the ID of a child that already exited, as it
+    /// does once IDs wrap at `pid_max` without a PID namespace. The new
+    /// child's startup is a new thread, not a reconnect of the old one: it
+    /// publishes its own clock, inherited from its parent, and none of that
+    /// inherited history is charged to global time.
+    #[tokio::test]
+    async fn a_child_on_a_reused_id_starts_its_own_clock() {
+        let (state, parent, parent_pid, child, parent_clock) = reused_id_state(true);
+        let parent_mm = MmId::initial(parent_pid);
+        let child_mm = MmId::for_clone(parent_mm, child, false);
+        let child_clock = parent_clock.clone_for_child();
+        let mut registration = Box::pin(state.receive_rpc(
+            Tid::from_raw(parent.as_raw()),
+            (
+                parent_clock,
+                parent_mm,
+                fork_registration(child, parent_pid),
+            ),
+        ));
+        assert!(futures::poll!(&mut registration).is_pending());
+        let before_child = state.global_time.lock().unwrap().as_nanos();
+
+        let mut startup = Box::pin(state.receive_rpc(
+            Tid::from_raw(child.as_raw()),
+            (
+                child_clock.clone(),
+                child_mm,
+                GlobalRequest::StartNewThread(child, child, None, None),
+            ),
+        ));
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert_eq!(
+            state.global_time.lock().unwrap().threads_time(child),
+            child_clock.as_nanos()
+        );
+        assert_eq!(state.global_time.lock().unwrap().as_nanos(), before_child);
+
+        let first = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await
+        .expect("the new child must receive its first turn");
+        assert_eq!(first.tid, child);
+        assert_eq!(
+            startup.await,
+            (None, granted(GlobalResponse::StartNewThread(None)))
+        );
+    }
+
+    /// Ptrace can deliver the new child's startup before its parent's clone
+    /// callback registers it. On a reused ID, the clock there is still the
+    /// earlier child's, so the startup publishes nothing until the
+    /// registration has retired it.
+    #[tokio::test]
+    async fn an_early_start_on_a_reused_id_waits_for_its_registration() {
+        let (state, parent, parent_pid, child, parent_clock) = reused_id_state(true);
+        let parent_mm = MmId::initial(parent_pid);
+        let child_mm = MmId::for_clone(parent_mm, child, false);
+        let child_clock = parent_clock.clone_for_child();
+        let earlier = state.global_time.lock().unwrap().threads_time(child);
+
+        let mut startup = Box::pin(state.receive_rpc(
+            Tid::from_raw(child.as_raw()),
+            (
+                child_clock.clone(),
+                child_mm,
+                GlobalRequest::StartNewThread(child, child, None, None),
+            ),
+        ));
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert_eq!(
+            state.global_time.lock().unwrap().threads_time(child),
+            earlier,
+            "no clock is published before the registration"
+        );
+
+        let mut registration = Box::pin(state.receive_rpc(
+            Tid::from_raw(parent.as_raw()),
+            (
+                parent_clock,
+                parent_mm,
+                fork_registration(child, parent_pid),
+            ),
+        ));
+        assert!(futures::poll!(&mut registration).is_pending());
+        assert!(!state.global_time.lock().unwrap().contains_thread(child));
+        let before_child = state.global_time.lock().unwrap().as_nanos();
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert_eq!(
+            state.global_time.lock().unwrap().threads_time(child),
+            child_clock.as_nanos()
+        );
+        assert_eq!(state.global_time.lock().unwrap().as_nanos(), before_child);
+
+        let first = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await
+        .expect("the new child must receive its first turn");
+        assert_eq!(first.tid, child);
+        assert_eq!(
+            startup.await,
+            (None, granted(GlobalResponse::StartNewThread(None)))
+        );
+    }
+
+    /// An earlier holder killed before its first message left no clock. A
+    /// new child's early start on its ID still waits for the registration:
+    /// a clock it published first would be taken for the earlier holder's
+    /// and retired by that registration.
+    #[tokio::test]
+    async fn an_early_start_on_an_id_whose_holder_never_ran_keeps_its_clock() {
+        let (state, parent, parent_pid, child, parent_clock) = reused_id_state(false);
+        let parent_mm = MmId::initial(parent_pid);
+        let child_mm = MmId::for_clone(parent_mm, child, false);
+        let child_clock = parent_clock.clone_for_child();
+        let mut startup = Box::pin(state.receive_rpc(
+            Tid::from_raw(child.as_raw()),
+            (
+                child_clock.clone(),
+                child_mm,
+                GlobalRequest::StartNewThread(child, child, None, None),
+            ),
+        ));
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert!(!state.global_time.lock().unwrap().contains_thread(child));
+
+        let mut registration = Box::pin(state.receive_rpc(
+            Tid::from_raw(parent.as_raw()),
+            (
+                parent_clock,
+                parent_mm,
+                fork_registration(child, parent_pid),
+            ),
+        ));
+        assert!(futures::poll!(&mut registration).is_pending());
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert_eq!(
+            state.global_time.lock().unwrap().threads_time(child),
+            child_clock.as_nanos()
+        );
+        let first = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await
+        .expect("the new child must receive its first turn");
+        assert_eq!(first.tid, child);
+        assert_eq!(
+            startup.await,
+            (None, granted(GlobalResponse::StartNewThread(None)))
+        );
+    }
+
+    /// The whole sequence through real messages: a child registers, starts,
+    /// runs and deregisters, and the parent's next child gets the same ID.
+    #[tokio::test]
+    async fn a_child_on_the_id_of_a_child_that_ran_and_exited_starts_its_own_clock() {
+        let config = Config {
+            sequentialize_threads: true,
+            runs_post_fork: RunsPostFork::Child,
+            ..Config::default()
+        };
+        let (config, state, parent, parent_pid) = cancellation_test_state_with_config(config);
+        let child = DetTid::from_raw(parent.as_raw() + 1);
+        let parent_mm = MmId::initial(parent_pid);
+        let child_mm = MmId::for_clone(parent_mm, child, false);
+        install_test_registration(&state, parent, Ivar::new());
+        let mut parent_clock = DetTime::new(&config);
+        let epoch = parent_clock.as_nanos();
+        parent_clock.advance_to(epoch + LogicalTime::from_nanos(1_001));
+
+        let mut first_registration = Box::pin(state.receive_rpc(
+            Tid::from_raw(parent.as_raw()),
+            (
+                parent_clock.clone(),
+                parent_mm,
+                fork_registration(child, parent_pid),
+            ),
+        ));
+        assert!(futures::poll!(&mut first_registration).is_pending());
+        let mut first_holder = parent_clock.clone_for_child();
+        let mut first_start = Box::pin(state.receive_rpc(
+            Tid::from_raw(child.as_raw()),
+            (
+                first_holder.clone(),
+                child_mm,
+                GlobalRequest::StartNewThread(child, child, None, None),
+            ),
+        ));
+        assert!(futures::poll!(&mut first_start).is_pending());
+        assert!(futures::poll!(&mut first_start).is_pending());
+        let first_turn = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await
+        .expect("the first child must receive its first turn");
+        assert_eq!(first_turn.tid, child);
+        assert_eq!(
+            first_start.await,
+            (None, granted(GlobalResponse::StartNewThread(None)))
+        );
+        first_holder.advance_to(first_holder.as_nanos() + LogicalTime::from_nanos(500));
+        let deregistered = state
+            .receive_rpc(
+                Tid::from_raw(child.as_raw()),
+                (
+                    first_holder,
+                    child_mm,
+                    GlobalRequest::DeregisterThread(ThreadDeregistration {
+                        dettid: child,
+                        detpid: child,
+                        mm: child_mm,
+                        thread_start_entered: true,
+                        vfork_origin: None,
+                        timeslice_stats: TimesliceStats::default(),
+                        syscall_count: 0,
+                        syscall_histogram: Default::default(),
+                        chaos_epochs: Vec::new(),
+                    }),
+                ),
+            )
+            .await;
+        assert_eq!(deregistered, (None, GlobalResponse::DeregisterThread(())));
+        let parent_turn = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &Ok(first_turn),
+        )
+        .await
+        .expect("the parent must continue after the clone");
+        assert_eq!(parent_turn.tid, parent);
+        assert_eq!(
+            first_registration.await,
+            (None, granted(GlobalResponse::CreateChildThread(None)))
+        );
+
+        // Linux gives the parent's next child the same ID.
+        parent_clock.advance_to(epoch + LogicalTime::from_nanos(600_000));
+        let second_holder = parent_clock.clone_for_child();
+        let mut registration = Box::pin(state.receive_rpc(
+            Tid::from_raw(parent.as_raw()),
+            (
+                parent_clock,
+                parent_mm,
+                fork_registration(child, parent_pid),
+            ),
+        ));
+        assert!(futures::poll!(&mut registration).is_pending());
+        let before_child = state.global_time.lock().unwrap().as_nanos();
+        let mut startup = Box::pin(state.receive_rpc(
+            Tid::from_raw(child.as_raw()),
+            (
+                second_holder.clone(),
+                child_mm,
+                GlobalRequest::StartNewThread(child, child, None, None),
+            ),
+        ));
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert!(futures::poll!(&mut startup).is_pending());
+        assert_eq!(
+            state.global_time.lock().unwrap().threads_time(child),
+            second_holder.as_nanos()
+        );
+        assert_eq!(state.global_time.lock().unwrap().as_nanos(), before_child);
+        let second_turn = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &Ok(parent_turn),
+        )
+        .await
+        .expect("the new child must receive its first turn");
+        assert_eq!(second_turn.tid, child);
+        assert_eq!(
+            startup.await,
+            (None, granted(GlobalResponse::StartNewThread(None)))
+        );
+    }
+
+    /// A vfork child registers itself. On a reused ID its registration
+    /// starts its own clock rather than advancing the earlier child's, which
+    /// would charge the vfork child's whole inherited history.
+    #[tokio::test]
+    async fn a_vfork_child_on_a_reused_id_starts_its_own_clock() {
+        let (state, parent, parent_pid, child, parent_clock) = reused_id_state(true);
+        let mm = MmId::initial(parent_pid);
+        let child_clock = parent_clock.clone_for_child();
+        // The parent's vfork, which the kernel blocks until the child execs
+        // or exits.
+        let mut resources = Resources::new(parent);
+        resources.insert(
+            ResourceID::BlockingVfork(ExternalOpId::new(parent, 1)),
+            Permission::RW,
+        );
+        let mut blocking = Box::pin(state.receive_rpc(
+            Tid::from_raw(parent.as_raw()),
+            (
+                parent_clock,
+                mm,
+                GlobalRequest::RequestResources(resources, parent_pid),
+            ),
+        ));
+        assert!(futures::poll!(&mut blocking).is_pending());
+        let background = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &Err(crate::scheduler::SkipTurn),
+        )
+        .await;
+        assert!(background.is_err());
+        assert_eq!(
+            blocking.await,
+            (
+                None,
+                granted(GlobalResponse::RequestResources(ResumeStatus::Normal))
+            )
+        );
+        let before_child = state.global_time.lock().unwrap().as_nanos();
+
+        let created = state
+            .receive_rpc(
+                Tid::from_raw(child.as_raw()),
+                (
+                    child_clock.clone(),
+                    mm,
+                    GlobalRequest::CreateVforkChildThread(
+                        parent,
+                        parent_pid,
+                        child,
+                        0,
+                        CloneFlags::CLONE_VFORK | CloneFlags::CLONE_VM,
+                        libc::SIGCHLD,
+                        Some(DEFAULT_PRIORITY - 1),
+                    ),
+                ),
+            )
+            .await;
+        assert_eq!(created, (None, GlobalResponse::CreateChildThread(None)));
+        assert_eq!(
+            state.global_time.lock().unwrap().threads_time(child),
+            child_clock.as_nanos()
         );
         assert_eq!(state.global_time.lock().unwrap().as_nanos(), before_child);
     }
