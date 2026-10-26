@@ -2376,7 +2376,11 @@ impl fmt::Display for RunOpts {
         if self.rewrite_exclusives {
             write!(f, " --rewrite-exclusives")?;
             for also in &self.rewrite_exclusives_also {
-                write!(f, " --rewrite-exclusives-also={}", also.display())?;
+                write!(
+                    f,
+                    " --rewrite-exclusives-also={}",
+                    shell_words::quote(&also.to_string_lossy())
+                )?;
             }
         }
         let mut dop = self.det_opts.det_config.clone();
@@ -3066,6 +3070,31 @@ fn pending_exec_stop_epoch_cannot_be_admitted_by_later_package_appearance() {
         assert!(options.exec_stop_epoch_refused);
         assert!(!options.epoch_captured_from_host);
     }
+}
+
+/// A reproducer that drops the rewrite flags reproduces a different program,
+/// because the guest's instructions are not the same ones.
+#[test]
+fn the_exclusive_rewrite_is_retained_in_reproducers() {
+    let mut plain = run_opts_for(&["hermit", "run", "--", "/nonexistent/guest"]);
+    plain.validate_args_with_perf_support(true).unwrap();
+    assert!(!plain.to_string().contains("--rewrite-exclusives"));
+
+    let mut rewritten = run_opts_for(&[
+        "hermit",
+        "run",
+        "--rewrite-exclusives",
+        "--rewrite-exclusives-also=/lib/a space.so",
+        "--",
+        "/nonexistent/guest",
+    ]);
+    rewritten.validate_args_with_perf_support(true).unwrap();
+    let rendered = rewritten.to_string();
+    assert!(rendered.contains(" --rewrite-exclusives"), "{rendered}");
+    assert!(
+        rendered.contains(" --rewrite-exclusives-also='/lib/a space.so'"),
+        "a path with a space must come back shell-quoted: {rendered}"
+    );
 }
 
 #[test]
