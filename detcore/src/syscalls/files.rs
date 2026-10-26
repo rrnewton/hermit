@@ -7071,13 +7071,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let result = self.execute_nonblockable_fd_syscall(guest, call).await;
                 crate::syscalls::timerfd::finish_read(guest, call.fd(), call.buf(), result)
             }
-            FdType::Eventfd | FdType::Inotify => {
+            FdType::Eventfd => {
                 trace!(
                     "Possibly blocking read call on notification fd {}, type {:?}",
                     call.fd(),
                     fd_type
                 );
                 self.execute_nonblockable_fd_syscall(guest, call).await
+            }
+            FdType::Inotify => {
+                trace!(
+                    "Possibly blocking read call on notification fd {}, type {:?}",
+                    call.fd(),
+                    fd_type
+                );
+                let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+                crate::syscalls::inotify::finish_read(
+                    guest,
+                    call.buf().map_or(0, |buf| buf.as_raw()),
+                    result,
+                )
+                .await
             }
             FdType::Memfd | FdType::Pidfd | FdType::Userfaultfd | FdType::Epoll => {
                 trace!("Read call on unusual fd {}, type {:?}", call.fd(), fd_type);
@@ -8564,6 +8578,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.iov().map_or(0, |iov| iov.as_raw()),
                 call.len(),
                 rng_output,
+            )
+            .await
+        } else if fd_type == FdType::Inotify {
+            let result = self
+                .record_or_replay_preserving_tool_errors(guest, call)
+                .await;
+            crate::syscalls::inotify::finish_readv(
+                guest,
+                call.iov().map_or(0, |iov| iov.as_raw()),
+                call.len(),
+                result,
             )
             .await
         } else {
