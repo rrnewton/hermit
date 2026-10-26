@@ -3033,7 +3033,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And A5 slice 3c.1e B's unit: threads' disposition_mask_tests::
     // a_gated_managed_wait_reads_the_guest_mask_without_replacing_it: 2682,
     // listed.
-    ("test.detcore_unit", 2682),
+    // And syscalls::misc::tests::set_ptracer_reaches_the_kernel: 2683.
+    ("test.detcore_unit", 2683),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4286,7 +4287,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none
     // (the placeholder is mounted only for KVM), are run_kvm_ tests, which this
     // node skips and privileged-test.cli_kvm runs.
-    ("test.cli", 622),
+    // And prctl_set_ptracer_answers_as_the_host_kernel_does: 623.
+    ("test.cli", 623),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4802,7 +4804,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two tests split out of the discarded-at-send test, not
     // excluded: 535.
     // And the same four P1 placeholder tests, not excluded: 539.
-    ("test.cli_on_host", 541),
+    // And prctl_set_ptracer_answers_as_the_host_kernel_does: 542.
+    ("test.cli_on_host", 542),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5260,7 +5263,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five shared runtime-FD readlink regressions: 2667, listed.
     // Fixed 0.5.4 rebase recount also retains the priority-history regressions.
     // And the same 3c.1e B unit: 2682, listed.
-    ("test.detcore_unit_on_host", 2682),
+    // And syscalls::misc::tests::set_ptracer_reaches_the_kernel: 2683.
+    ("test.detcore_unit_on_host", 2683),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

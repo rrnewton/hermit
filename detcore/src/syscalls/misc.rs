@@ -217,6 +217,22 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
             // ENOSYS everywhere else.
             | libc::PR_CAPBSET_DROP
             | libc::PR_CAP_AMBIENT
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-NUMBER)
+            //
+            // PR_SET_PTRACER names which process may ptrace the caller's
+            // process under the Yama LSM's ptrace scope 1, or any process
+            // (PR_SET_PTRACER_ANY), or none (0). It changes only that
+            // per-process exception, and the answer is a function of the
+            // argument and the host kernel: 0 with Yama, EINVAL for a pid
+            // that names no process, and EINVAL without Yama, where the option
+            // reaches prctl's default case. Android's crash handler (bionic's
+            // debuggerd) calls it with PR_SET_PTRACER_ANY on every fatal
+            // signal and treats EINVAL as "no Yama", but any other error as
+            // fatal: with ENOSYS from here, every crashing guest on Android
+            // exited 1 from inside its own signal handler instead of dying of
+            // the signal.
+            | libc::PR_SET_PTRACER
     )
 }
 
@@ -1944,6 +1960,15 @@ mod tests {
             assert!(is_supported_prctl_option(option));
         }
         assert!(!is_supported_prctl_option(libc::PR_SET_SECUREBITS));
+    }
+
+    /// PR_SET_PTRACER reaches the kernel, which answers as Linux does: 0 with
+    /// Yama, EINVAL without it. Before, Detcore answered ENOSYS, which
+    /// bionic's crash handler takes as fatal.
+    #[test]
+    fn set_ptracer_reaches_the_kernel() {
+        assert_eq!(libc::PR_SET_PTRACER, 0x5961_6d61);
+        assert!(is_supported_prctl_option(libc::PR_SET_PTRACER));
     }
 
     #[test]
