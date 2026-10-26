@@ -37,6 +37,7 @@ use reverie::syscalls::Timespec;
 use reverie::syscalls::linux_abi::Cmsghdr;
 use reverie::syscalls::linux_abi::Mmsghdr;
 use reverie::syscalls::linux_abi::Msghdr;
+#[cfg(target_arch = "x86_64")]
 use tracing::debug;
 use tracing::trace;
 
@@ -54,9 +55,11 @@ use crate::syscalls::helpers::KernelSignalWait;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::PublishedWaitMask;
 use crate::syscalls::helpers::REAL_TIME_SIGNALS;
+#[cfg(target_arch = "x86_64")]
 use crate::syscalls::helpers::RestartCall;
 use crate::syscalls::helpers::act_on_pending_real_time;
 use crate::syscalls::helpers::is_accepted_connection;
+#[cfg(target_arch = "x86_64")]
 use crate::syscalls::helpers::keep_restart_block;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::observe_under_mask;
@@ -86,6 +89,7 @@ mod temporary_mask_forms;
 
 // Printing helper
 // TODO: this should be subsumed by better syscall printing.
+#[cfg(target_arch = "x86_64")]
 fn print_poll(call: &syscalls::Poll) {
     let len = call.nfds();
     debug!("POLL: on {} fds, timeout {}", len, call.timeout());
@@ -314,7 +318,7 @@ where
         Err(Errno::EFAULT) => {}
         Err(errno) => return Err(errno),
     }
-    let rsp = guest.regs().await.rsp as usize;
+    let rsp = crate::arch::stack_pointer(&guest.regs().await) as usize;
     let Some(top) = rsp.checked_sub(len).map(|top| top & !7) else {
         return Ok(None);
     };
@@ -453,7 +457,7 @@ where
         Ok(argument) if argument.sigmask != 0 => {}
         _ => return true,
     }
-    let rsp = guest.regs().await.rsp as usize;
+    let rsp = crate::arch::stack_pointer(&guest.regs().await) as usize;
     let mut cells = [0u8; MAX_PRIVATE_CELLS_LEN];
     rsp.checked_sub(MAX_PRIVATE_CELLS_LEN)
         .and_then(|top| AddrMut::<u8>::from_raw(top & !7))
@@ -698,6 +702,7 @@ async fn read_ppoll_mask<G: Guest<Detcore<T>>, T: RecordOrReplay>(
 /// the check because the signed sum could wrap a negative timeout into a
 /// valid one. This follows v7.1, the measured host behaviour.) A sum that
 /// would overflow the signed seconds is `EINVAL` here.
+#[cfg(target_arch = "x86_64")]
 pub(super) fn select_timeout_duration(timeout: libc::timeval) -> Result<Duration, Errno> {
     if timeout.tv_sec < 0 || timeout.tv_usec < 0 {
         return Err(Errno::EINVAL);
@@ -1082,6 +1087,7 @@ fn remaining_poll_millis(now: Instant, end: Instant) -> i32 {
 impl<T: RecordOrReplay> Detcore<T> {
     /// poll syscall (MAYHANG)
     // TODO-HUMAN-REVIEW(PR-1023): Review zero-timeout poll scheduling across backends.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1124,6 +1130,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// may wait in the kernel, so it runs as a blocking external operation. The
     /// recorder captures the descriptor sets and remaining time, so replay never
     /// asks the kernel about descriptors it did not recreate.
+    #[cfg(target_arch = "x86_64")]
     async fn record_or_replay_select_family<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2034,6 +2041,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// slept) and carries no signal mask.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#800): Review select determinization mirroring pselect6.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_select<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2085,6 +2093,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.handle_internal_select(guest, call, timeout).await
     }
 
+    #[cfg(target_arch = "x86_64")]
     async fn handle_internal_select<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2320,6 +2329,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         refuse_held_signal_loss(guest, Sysno::select, result).await
     }
 
+    #[cfg(target_arch = "x86_64")]
     fn copy_select_results<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2332,6 +2342,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         copy_pselect6_fd_set(guest, probe.exceptfds(), call.exceptfds(), len)
     }
 
+    #[cfg(target_arch = "x86_64")]
     pub(super) async fn write_select_remaining<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2843,6 +2854,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Handle a guest-internal poll call that can be fully determinized.
     // TODO-HUMAN-REVIEW(PR-1052): Review scheduler fairness for zero-timeout poll.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_internal_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2873,6 +2885,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `restart_syscall` resumes an interrupted `poll` here with the deadline the
     /// wait kept, as Linux's `do_restart_poll` does
     /// (`Detcore::handle_restart_syscall`).
+    #[cfg(target_arch = "x86_64")]
     pub(crate) async fn handle_internal_poll_until<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2890,6 +2903,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Handle a poll syscall that deponds on external, nondeterminstic IO.
     ///
     /// `deadline` is the end of a positive timeout (`kernel_poll_deadline`).
+    #[cfg(target_arch = "x86_64")]
     pub(crate) async fn handle_external_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3586,6 +3600,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// epoll_wait syscall (MAYHANG)
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_epoll_wait<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3606,6 +3621,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Handle a guest-internal `epoll_wait` call that can be fully determinized.
+    #[cfg(target_arch = "x86_64")]
     pub async fn handle_internal_epoll_wait<G: Guest<Self>>(
         &self,
         guest: &mut G,

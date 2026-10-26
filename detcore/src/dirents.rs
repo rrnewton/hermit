@@ -207,6 +207,10 @@ pub(crate) enum DirentFormat {
     Dirent64,
     /// `struct linux_dirent`, returned by the legacy `getdents`: `d_type` is
     /// the last byte of the record.
+    #[cfg_attr(
+        not(target_arch = "x86_64"),
+        allow(dead_code, reason = "only x86_64 has the legacy getdents")
+    )]
     Legacy,
 }
 
