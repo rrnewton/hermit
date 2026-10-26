@@ -13777,12 +13777,17 @@ static int roundtrip(int flags) {
     return strcmp(buffer, "ok") != 0;
 }
 
+static gid_t groups[65536];
+
 int main(void) {
-    gid_t groups[1] = {0};
     if (roundtrip(-1) || roundtrip(O_CLOEXEC | O_NONBLOCK)) return 1;
-    if (getgroups(0, NULL) != 1) return 5;
-    if (getgroups(1, groups) != 1 || groups[0] != 65534) return 6;
-    puts("kvm-syscalls-ok");
+    int count = getgroups(0, NULL);
+    if (count < 0) return 5;
+    if (getgroups(count, groups) != count) return 6;
+    if (count > 0 && getgroups(count - 1, groups) != -1) return 7;
+    printf("groups=%d:", count);
+    for (int i = 0; i < count; i++) printf(" %u", (unsigned)groups[i]);
+    puts("\nkvm-syscalls-ok");
     return 0;
 }
 "#,
@@ -13801,20 +13806,27 @@ int main(void) {
     );
 
     let program = binary.to_str().expect("pipe guest path should be UTF-8");
-    let args = [
-        "--backend",
-        "kvm",
-        "run",
-        "--strict",
-        "--verify",
-        "--tmp=/tmp",
-        "--base-env=minimal",
-        "--",
-        program,
-    ];
-    let output = hermit(&args);
-    assert_success(&output, &args);
-    assert_eq!(stdout(&output), "kvm-syscalls-ok\n");
+    // The guest has its launcher's supplementary groups, so KVM reports
+    // what a traced guest of the same launcher does.
+    let run = |backend| {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--verify",
+            "--tmp=/tmp",
+            "--base-env=minimal",
+            "--",
+            program,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        stdout(&output)
+    };
+    let kvm = run("kvm");
+    assert!(kvm.ends_with("\nkvm-syscalls-ok\n"), "{kvm}");
+    assert_eq!(kvm, run("ptrace"));
 }
 
 #[test]
@@ -13987,30 +13999,36 @@ int main(int argc, char **argv) {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#544): Confirm 65534 remains the fixed container overflow group.
+// The guest's groups are its launcher's, as the container maps them, so KVM
+// reports what a traced guest does.
 #[test]
-fn run_kvm_reports_fixed_supplementary_groups() {
+fn run_kvm_reports_the_launcher_s_supplementary_groups() {
     if !Path::new("/dev/kvm").exists() {
         return;
     }
 
-    let kvm_args = [
-        "--backend",
-        "kvm",
-        "run",
-        "--strict",
-        "--verify",
-        "--base-env=minimal",
-        "--",
-        "id",
-        "-G",
-    ];
-    let kvm_output = hermit(&kvm_args);
-    assert_success(&kvm_output, &kvm_args);
-    assert_eq!(
-        stdout(&kvm_output),
-        "0 65534\n",
-        "KVM must report its root-plus-overflow-group credential persona"
+    let groups = |backend| {
+        let args = [
+            "--backend",
+            backend,
+            "run",
+            "--strict",
+            "--verify",
+            "--base-env=minimal",
+            "--",
+            "id",
+            "-G",
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        stdout(&output)
+    };
+    let kvm = groups("kvm");
+    assert!(
+        kvm.starts_with("0"),
+        "the container's root group first: {kvm}"
     );
+    assert_eq!(kvm, groups("ptrace"));
 }
 
 #[test]
