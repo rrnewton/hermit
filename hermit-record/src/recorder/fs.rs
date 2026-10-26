@@ -30,6 +30,7 @@ use reverie::syscalls::Read;
 use reverie::syscalls::ReadAddr;
 #[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Readlink;
+use reverie::syscalls::Readlinkat;
 use reverie::syscalls::Sendfile;
 use reverie::syscalls::Statx;
 use reverie::syscalls::Syscall;
@@ -1332,6 +1333,30 @@ impl Recorder {
         &self,
         guest: &mut G,
         syscall: Readlink,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(syscall).await;
+
+        self.record_event(
+            guest,
+            result.and_then(|length| {
+                let mut buf = vec![0; length as usize];
+                let addr = syscall.buf().ok_or(Errno::EFAULT)?.cast::<u8>();
+                guest.memory().read_exact(addr, &mut buf)?;
+                Ok(SyscallEvent::Bytes(buf))
+            }),
+        );
+
+        result
+    }
+
+    /// Records the link target `readlinkat` copied out, as `handle_readlink`
+    /// does for `readlink`. aarch64 has only `readlinkat`, so its C library
+    /// reads every link this way, and a replay that ran the call again would
+    /// resolve `dirfd` and the path in the replay's own namespace.
+    pub(super) async fn handle_readlinkat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Readlinkat,
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
 

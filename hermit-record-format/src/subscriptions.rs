@@ -137,6 +137,7 @@ pub fn record_and_replay() -> Subscription {
         Sysno::select,
         Sysno::epoll_wait,
         Sysno::readlink,
+        Sysno::readlinkat,
         Sysno::mkdir,
         Sysno::unlink,
     ]);

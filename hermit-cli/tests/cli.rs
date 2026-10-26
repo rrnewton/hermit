@@ -7297,8 +7297,7 @@ fn detcore_refuses_removing_the_procfs_names_outside_the_level_on_kvm() {
 /// pathname on an `O_PATH` descriptor of the `/proc/self` link, which KVM's
 /// own /proc cannot open and which DBT's kernel answers with its own pid
 /// (named as not checked). Record and replay on ptrace give the same output
-/// and match (but for that empty pathname: the recorder does not record
-/// readlinkat). Every backend that runs Detcore is compared
+/// and match, that empty pathname included. Every backend that runs Detcore is compared
 /// (`procfs_backends`), but one not available here, named as not compared, and
 /// one `PROCFS_NOT_YET` lists, named with its issue.
 #[test]
@@ -7373,20 +7372,14 @@ fn detcore_answers_its_procfs_links_on_every_backend() {
             .map(|line| format!("{line}\n"))
             .collect::<String>()
     };
-    // Record and replay on ptrace give the guest the same answers. The
-    // recorder does not record readlinkat, so a replayed readlinkat of a
-    // descriptor that replay could not recreate (the O_PATH link) is not
-    // checked.
-    eprintln!(
-        "{test}: record: NOT CHECKED: readlinkat on an O_PATH descriptor of the \
-         /proc/self link"
-    );
+    // Record and replay on ptrace give the guest the same answers, including
+    // readlinkat on the O_PATH descriptor of the /proc/self link, which replay
+    // serves from the recording because it cannot recreate that descriptor.
     let args = [
         "record",
         "--verify",
         "--",
         guest.to_str().expect("guest path is UTF-8"),
-        "--no-link-descriptor",
     ];
     let recorded = hermit(&args);
     assert_success(&recorded, &args);

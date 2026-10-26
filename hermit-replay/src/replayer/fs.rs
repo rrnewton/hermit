@@ -32,6 +32,7 @@ use reverie::syscalls::Pread64;
 use reverie::syscalls::Read;
 #[cfg(target_arch = "x86_64")]
 use reverie::syscalls::Readlink;
+use reverie::syscalls::Readlinkat;
 use reverie::syscalls::RtSigtimedwait;
 use reverie::syscalls::RtTgsigqueueinfo;
 use reverie::syscalls::Sendfile;
@@ -1323,6 +1324,30 @@ impl Replayer {
         guest
             .memory()
             .write_exact(syscall.buf().unwrap().cast::<u8>(), &buf)?;
+        Ok(buf.len() as i64)
+    }
+
+    /// Replays `readlinkat` from the recorded link target, as `handle_readlink`
+    /// does for `readlink`, without running it: `dirfd` may be a placeholder
+    /// and the path lives in the replay's namespace.
+    pub(super) async fn handle_readlinkat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        syscall: Readlinkat,
+    ) -> Result<i64, Errno> {
+        let buf = next_event!(guest, Bytes)?;
+
+        debug_assert!(buf.len() <= syscall.buf_len());
+
+        if !buf.is_empty() {
+            guest.memory().write_exact(
+                syscall
+                    .buf()
+                    .expect("a recorded non-empty link target had an output buffer")
+                    .cast::<u8>(),
+                &buf,
+            )?;
+        }
         Ok(buf.len() as i64)
     }
 
