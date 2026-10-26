@@ -5428,7 +5428,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same fourteen train-12 detcore units: 2883 + 14 = 2897,
     // measured with `cargo nextest list` at this head.
     // And the same TracerPid unit: 2898.
-    ("test.detcore_unit_on_host", 2898),
+    // And the same seventeen access-trace tests as test.detcore_unit: 2915.
+    ("test.detcore_unit_on_host", 2915),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5800,7 +5801,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1166.
     // Train 6 recount (measured on 21f770f6 base): 1181.
     // The same 23, keeping the six local-only cases: 1196 + 23 = 1219.
-    ("test.hermit_unit_on_host", 1215),
+    // And the same two access-trace run:: tests as test.hermit_unit: 1217.
+    ("test.hermit_unit_on_host", 1217),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6014,7 +6016,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1892 + 2 = 1894 (the local twin's fourteen hosted exclusions are
     // unchanged, so 1894 + 14 = 1908).
     // And the same four since: 1898.
-    ("test.regular_crates_on_host", 1898),
+    // And the same access-trace tests as test.regular_crates: 1905.
+    ("test.regular_crates_on_host", 1905),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
