@@ -2723,8 +2723,8 @@ fi
 # reverie-dbt/vendor/dynamorio, and third-party/dynamorio. Existing budget
 # values and limits are unchanged. This is source-identity carry only;
 # it supplies no new calibration, build, runtime, or landing evidence.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 9a9b6ab1824ecee1d1a1285a59ca94c0035bef9c ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 9a9b6ab1824ecee1d1a1285a59ca94c0035bef9c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 09dc3a7d0da265e7144d749ef0107ac5d3b4cf71 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 09dc3a7d0da265e7144d749ef0107ac5d3b4cf71 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
