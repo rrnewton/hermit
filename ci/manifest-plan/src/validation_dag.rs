@@ -566,6 +566,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.isolation_matrix_dbt_in_guest",
     "test.isolated_detcore_workdir",
     "test.sabre_examples",
+    "sabrecompat.sabre_examples",
     "test.hermit_modes",
     "test.app_strict_verify",
     "test.command_strict_verify",
@@ -771,8 +772,8 @@ const PROFILES: [Profile; 11] = [
         // Its closure gained build.liteinst_runtime_in_pinned_root through
         // build.workspace_in_pinned_root: 2/14 before.
         label: "sabre-compat-only",
-        direct_steps: 2,
-        selected_steps: 15,
+        direct_steps: 3,
+        selected_steps: 16,
     },
     // The rr run type: the same shape again.
     Profile {
@@ -3044,9 +3045,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // test.pmu_integration_cases_2, the second PMU integration shard, adds one.
     // 145 since the isolation matrix's three nodes joined as Conformance
     // producers (2026-10-17).
-    if expected.len() != 145 {
+    // 146 with sabrecompat.sabre_examples, the archived SaBRe suite's tests
+    // outside the per-commit smoke pair (2026-10-26).
+    if expected.len() != 146 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 145",
+            "structured result producer registry has {} entries, expected 146",
             expected.len()
         ));
     }
@@ -3068,9 +3071,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // privileged-cpuid.cpu_profile_v3 adds one more
     // (https://github.com/rrnewton/hermit/issues/4243).
     // The second PMU integration shard adds one.
-    if expected_counts.len() != 50 {
+    // sabrecompat.sabre_examples, the archived SaBRe suite outside the smoke
+    // pair, adds one.
+    if expected_counts.len() != 51 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 50",
+            "Nextest expected-count registry has {} entries, expected 51",
             expected_counts.len()
         ));
     }
@@ -3222,7 +3227,8 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // (https://github.com/rrnewton/hermit/issues/4243).
     // The second PMU integration shard adds the 77th Nextest writer.
     // Conformance 3: the three isolation-matrix nodes (2026-10-17).
-    if actual_group_counts != [77, 56, 7, 2, 3] {
+    // sabrecompat.sabre_examples adds the 78th Nextest writer (2026-10-26).
+    if actual_group_counts != [78, 56, 7, 2, 3] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -4430,9 +4436,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // Detcore runtime's prebuild ahead of its packaging finalizer; its host
     // original has no hosted label and no local consumer, so it is retired
     // (441 + 1).
-    if cfg.steps.len() != 442 {
+    // 443 with sabrecompat.sabre_examples, the archived SaBRe suite's tests
+    // outside the per-commit smoke pair, in the SaBRe run type (442 + 1).
+    if cfg.steps.len() != 443 {
         return Err(format!(
-            "superset has {} steps, expected 442",
+            "superset has {} steps, expected 443",
             cfg.steps.len()
         ));
     }
@@ -4605,7 +4613,8 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
                 .map(|value| (*value).to_string())
                 .collect::<Vec<_>>()
         || focused_release.timeout != 420
-        || focused_release.cpu_timeout != 840
+        // 2400 since 2026-10-26: a cold build measured 1,155 CPU-s.
+        || focused_release.cpu_timeout != 2400
         || focused_release.hint.hard_mem_max_bytes != Some(16 * 1024 * 1024 * 1024)
         || focused_release.hint.preferred_inner_jobs != Some(8)
     {

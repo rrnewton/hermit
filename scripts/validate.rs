@@ -1276,7 +1276,8 @@ fn usage() -> &'static str {
      Focused gates (run one matrix/lane and exit):\n\
      \x20 --portable-strict-compat-only Only the strict compatibility bucket (compat.yaml), release Hermit.\n\
      \x20 --rr-compat-only              Only the compat bucket's record/replay cells (label rr-compat-only).\n\
-     \x20 --sabre-compat-only           Only the compat bucket's SaBRe cells (label sabre-compat-only).\n\
+     \x20 --sabre-compat-only           Only the SaBRe run type (label sabre-compat-only): the compat\n\
+     \x20                               bucket's SaBRe cells and the archived sabre_examples tests.\n\
      \x20 --e9patch-compat-only         Gate core + installed e9patch legacy stripped apps.\n\
      \x20 --qemu-l2-only                Run the heavyweight QEMU L2 boot.\n\
      \x20 --portable-only               No PMU/CPUID hardware required.\n\

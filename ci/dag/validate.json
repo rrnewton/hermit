@@ -25727,6 +25727,55 @@
       "fail_fast_family": "test.sabre_examples"
     },
     {
+      "group": "sabrecompat",
+      "job": "sabre_examples",
+      "desc": "SaBRe run type: the sabre_examples tests outside the per-commit smoke pair (archived backend)",
+      "description": "SaBRe is archived (owner, 2026-10-25: no feature work, tests nightly only; ci/manifest-plan/src/archived.rs). test.sabre_examples keeps two tests of hermit-cli/tests/sabre_examples.rs per commit; this node runs the other 34 non-ignored ones, its count pinned by NEXTEST_EXPECTED_EXECUTED, in the SaBRe run type that `scripts/validate.rs --sabre-compat-only` selects and the nightly pressure sweep's sabre-examples part runs. Same environment as test.sabre_examples: one test at a time in the pinned root, against an explicitly configured SaBRe loader, so a missing loader, libdetcore_sabre.so or revision file fails rather than skips. It covers time repeatability (examples/date.sh and a clock-progress guest over three runs per backend), getrandom parity, the plugin's DETLOG forwarding and its refusals (a guest that closes or dup2s onto the forwarding socket, a guest stderr file or socket at the passed number), guest RDTSC before and after the plugin starts and in a signal handler, Detcore's stack limit at guest start-up, the program break and heap records, exe links, the timerfd refusal and a readied pipe poller across exec. A failure here is a SaBRe regression on an archived backend: it does not block a landing, and the nightly report names it.\"",
+      "labels": [
+        "sabre-compat-only"
+      ],
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env RUST_MIN_STACK --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_SABRE_TEST_BINARY=$PWD/target/ci/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test sabre_examples -j 1 -E '\\''not (test(=sabre_root_pid_matches_ptrace) | test(=sabre_and_ptrace_detlogs_agree_through_post_exec))'\\'''",
+      "result_manifests": [
+        {
+          "kind": "structured-test-results",
+          "schema": 2,
+          "path_env": "DAGRUN_TEST_COUNTS_PATH",
+          "owner": "sabrecompat.sabre_examples"
+        }
+      ],
+      "integration_test_binaries": [
+        "sabre_examples"
+      ],
+      "deps": [
+        "build.e2e_artifact_in_pinned_root",
+        "build.rust_scripts_in_pinned_root",
+        "setup.pinned_root_fetch"
+      ],
+      "env": {
+        "HERMIT_E2E_EMPTY_WORKDIR": "/test",
+        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
+        "NEXTEST_EXPECTED_EXECUTED": "34",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends\",\"--test\",\"sabre_examples\"]"
+      },
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 900,
+      "cpu_timeout": 7200,
+      "jobs_flag": null,
+      "jobs_env": null,
+      "hint": {
+        "resources": {},
+        "est_duration_s": 90.0,
+        "rss_baseline_bytes": 1073741824,
+        "hard_mem_max_bytes": 3221225472,
+        "classification": "latency-bound",
+        "preferred_inner_jobs": null,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "sabrecompat.sabre_examples"
+    },
+    {
       "group": "test",
       "job": "hermit_modes",
       "desc": "Portable Hermit mode cases (skips default_ and chaos_buck_)",
@@ -31854,7 +31903,7 @@
       "group": "compatprep",
       "job": "hermit_release",
       "desc": "Release Hermit for compatibility",
-      "description": "Dedicated release build for the focused compatibility profiles that still run per-program probes (e9patch; the corpus-only profile builds its twin in the pinned root); it preserves their pre-cutover command, budgets, memory cap, and eight-job CPU allocation without selecting the broader full-profile runtime build. The sabre-compat-only, strict-compat-only and rr-compat-only profiles do not take it: their buckets run the validation's one build, the e2e artifact.",
+      "description": "Dedicated release build for the focused compatibility profiles that still run per-program probes (e9patch; the corpus-only profile builds its twin in the pinned root); it preserves their pre-cutover command, budgets, memory cap, and eight-job CPU allocation without selecting the broader full-profile runtime build. The sabre-compat-only, strict-compat-only and rr-compat-only profiles do not take it: their buckets run the validation's one build, the e2e artifact. CPU 2400 s since 2026-10-26: a cold build of the same command at -j 8 measured 148 s of wall and 1,155 CPU-s (1,117 user, 38 sys) with a 2.3-GiB peak, and the former 840 CPU-s cap, sized for a warm target, killed the first e9patch-compat-only run in a fresh checkout after 111 s; the nightly e9patch-corpus part runs this lane in a fresh checkout every night.",
       "labels": [
         "e9patch-compat-only"
       ],
@@ -31867,7 +31916,7 @@
       "networkonly": false,
       "engine_only": false,
       "timeout": 420,
-      "cpu_timeout": 840,
+      "cpu_timeout": 2400,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {
@@ -41864,15 +41913,15 @@
       "engine_only": false,
       "timeout": 1200,
       "cpu_timeout": 7200,
-      "jobs_flag": null,
-      "jobs_env": null,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
         "est_duration_s": 0.0,
-        "rss_baseline_bytes": 9663676416,
-        "hard_mem_max_bytes": 9663676416,
-        "classification": "light",
-        "preferred_inner_jobs": null,
+        "rss_baseline_bytes": 17179869184,
+        "hard_mem_max_bytes": 17179869184,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 8,
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
@@ -66131,7 +66180,7 @@
       "group": "compatprep",
       "job": "hermit_release_in_pinned_root",
       "desc": "Release Hermit for compatibility",
-      "description": "Dedicated release build for the focused compatibility profiles that still run per-program probes (e9patch; the corpus-only profile builds its twin in the pinned root); it preserves their pre-cutover command, budgets, memory cap, and eight-job CPU allocation without selecting the broader full-profile runtime build. The sabre-compat-only, strict-compat-only and rr-compat-only profiles do not take it: their buckets run the validation's one build, the e2e artifact.",
+      "description": "Dedicated release build for the focused compatibility profiles that still run per-program probes (e9patch; the corpus-only profile builds its twin in the pinned root); it preserves their pre-cutover command, budgets, memory cap, and eight-job CPU allocation without selecting the broader full-profile runtime build. The sabre-compat-only, strict-compat-only and rr-compat-only profiles do not take it: their buckets run the validation's one build, the e2e artifact. CPU 2400 s since 2026-10-26: a cold build of the same command at -j 8 measured 148 s of wall and 1,155 CPU-s (1,117 user, 38 sys) with a 2.3-GiB peak, and the former 840 CPU-s cap, sized for a warm target, killed the first e9patch-compat-only run in a fresh checkout after 111 s; the nightly e9patch-corpus part runs this lane in a fresh checkout every night.",
       "labels": [
         "portable-strict-compat-only"
       ],
@@ -66148,7 +66197,7 @@
       "networkonly": false,
       "engine_only": false,
       "timeout": 420,
-      "cpu_timeout": 840,
+      "cpu_timeout": 2400,
       "jobs_flag": null,
       "jobs_env": null,
       "hint": {

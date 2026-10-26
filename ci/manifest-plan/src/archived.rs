@@ -26,8 +26,8 @@ pub enum ArchivedKind {
     /// A Reverie backend running `Detcore<XxxGuest>`, named by manifest cells.
     Backend,
     /// Preprocessing whose output runs on the ptrace backend. It has no
-    /// manifest cells; its corpus is `ci/compat/corpus-e9patch.json`, run only
-    /// by `scripts/validate.rs --e9patch-compat-only`.
+    /// manifest cells; its corpus is `ci/compat/corpus-e9patch.json`, run by
+    /// `scripts/validate.rs --e9patch-compat-only`.
     PreprocessingWithPtrace,
 }
 
@@ -60,21 +60,23 @@ pub const ARCHIVED: &[Archived] = &[
                    test.sabre_examples smoke test (ptrace and SaBRe parity and a \
                    canonical --verify-strict run of one shell guest, and DETLOG \
                    agreement through post-exec). Nightly: every \
-                   manifest cell, in the pressure sweep. On demand: the rest of \
-                   hermit-cli/tests/sabre_examples.rs (34 tests) and the \
-                   sabre-compat-only run type.",
+                   manifest cell, in the pressure sweep, and the SaBRe run type \
+                   (scripts/validate.rs --sabre-compat-only: its compat cells and \
+                   sabrecompat.sabre_examples, the other 34 tests of \
+                   hermit-cli/tests/sabre_examples.rs), in the sweep's \
+                   sabre-examples part.",
     },
     Archived {
         name: "e9patch",
         kind: ArchivedKind::PreprocessingWithPtrace,
         since: "2026-10-25",
-        // Its corpus never ran per commit and no scheduled run invokes
-        // --e9patch-compat-only, which also needs e9tool on the host.
-        schedule: "on demand only",
+        schedule: "nightly only",
         coverage: "Per commit: the e9patch feature build, the e9patch corpus driver \
                    contract (check.e9patch_corpus) and the e9patch legs of the CLI \
-                   tests. On demand: the corpus itself (scripts/validate.rs \
-                   --e9patch-compat-only); it has no manifest cells.",
+                   tests. Nightly: the corpus itself (scripts/validate.rs \
+                   --e9patch-compat-only, which builds e9patch and e9tool through \
+                   hermit-install), in the sweep's e9patch-corpus part; it has no \
+                   manifest cells.",
     },
 ];
 
