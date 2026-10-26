@@ -2656,7 +2656,21 @@ fi
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory (1009), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the ec5de39f entry.
-expected_pin=e5e0eff4e69b066932b431ce6f846ca1b437717c
+# CARRY TO 1880c4e4656c79b1df3a1d1d9ef501013361c607 (2026-10-25): from
+# e5e0eff4e69b066932b431ce6f846ca1b437717c. One commit (syscov lane): a Guest::injected_syscalls
+# counter implemented on every backend. It changes reverie/src/guest.rs, the
+# backends' guest handles (reverie-ptrace, reverie-kvm, reverie-inguest,
+# reverie-e9patch, reverie-sabre and reverie-dbt/src/lib.rs), three
+# reverie-liteinst-artifact catalog rows and adds one reverie-ptrace test. It
+# adds no reverie-dbt file (inventory 1009) and leaves the root Cargo.toml,
+# Cargo.lock, rust-toolchain.toml and third-party/ unchanged; both repository
+# inputs to the DynamoRIO content key are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory, SDK and native inputs, calibrated budget, job width and
+# limits carry unchanged from the e5e0eff4 entry. The reverie-dbt/src/lib.rs
+# change remains build-relevant and needs fresh validation.
+expected_pin=1880c4e4656c79b1df3a1d1d9ef501013361c607
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

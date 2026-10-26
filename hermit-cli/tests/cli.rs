@@ -54,8 +54,9 @@ mod kvm_waitid_copyout;
 mod liteinst_runtime;
 
 // The LiteInst dispatch record and backend statistics are checked against
-// in-guest runs in this binary.
-#[cfg(feature = "liteinst")]
+// in-guest runs in this binary; every backend's syscall histogram is checked
+// with the same harness.
+#[cfg_attr(not(feature = "liteinst"), allow(dead_code))]
 #[path = "common/dispatch_stats.rs"]
 mod dispatch_stats;
 
@@ -108,6 +109,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
+use detcore_model::summary::RunSummary;
 // The one definition of hermit's own failure status, imported rather than
 // written out. Copying the number here is what let eight tests keep asserting
 // `1` for months after the product moved to `125`.
@@ -5310,7 +5312,18 @@ fn assert_timerless_default_and_disabled_maximum_run(backend: &str) {
     ] {
         let saved = directory.path().join(format!("{backend}-{label}.yaml"));
         let save_arg = format!("--save-config={}", saved.display());
-        let mut args = vec!["--backend", backend, "run", "--summary", save_arg.as_str()];
+        let summary = directory
+            .path()
+            .join(format!("{backend}-{label}-summary.json"));
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let mut args = vec![
+            "--backend",
+            backend,
+            "run",
+            "--summary",
+            save_arg.as_str(),
+            summary_arg.as_str(),
+        ];
         if let Some(maximum) = maximum {
             args.push(maximum);
         }
@@ -5330,6 +5343,19 @@ fn assert_timerless_default_and_disabled_maximum_run(backend: &str) {
             "{backend} {label}: {}",
             stderr(&output)
         );
+        // The same per-run syscall histogram as on the other backends. DBT's
+        // launcher writes no summary JSON: its scheduler runs inside the
+        // DynamoRIO client and returns no run summary to the launcher.
+        if backend == "dbt" {
+            assert!(!summary.exists(), "DBT now writes {}", summary.display());
+        } else {
+            let summary: RunSummary = serde_json::from_slice(&fs::read(summary).unwrap()).unwrap();
+            dispatch_stats::checked_syscall_histogram(
+                backend,
+                &summary,
+                &[("write", 1), ("exit_group", 1)],
+            );
+        }
         let saved: serde_yaml::Value = serde_yaml::from_slice(&fs::read(saved).unwrap()).unwrap();
         if maximum.is_some() {
             assert_eq!(saved["run"]["max-timeslice"].as_str(), Some("disabled"));

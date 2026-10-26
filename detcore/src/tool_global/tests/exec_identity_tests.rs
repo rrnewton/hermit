@@ -436,6 +436,7 @@ fn deregistration(thread: &ThreadState<()>) -> ThreadDeregistration {
         thread_start_entered: thread.thread_start_entered,
         timeslice_stats: thread.stats.timeslice_stats,
         syscall_count: thread.stats.syscall_count,
+        syscall_histogram: Default::default(),
         chaos_epochs: Vec::new(),
     }
 }

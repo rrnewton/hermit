@@ -205,6 +205,10 @@ pub struct RuntimeStats {
     /// a backend without one (KVM) and in reports written before the record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch: Option<detcore_model::summary::DispatchStats>,
+    /// The run's syscall histogram and its observation scope, copied from its
+    /// summary. Absent in reports written before the histogram existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub syscall_histogram: Option<detcore_model::syscall_histogram::SyscallHistogramSummary>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

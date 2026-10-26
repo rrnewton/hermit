@@ -3295,6 +3295,9 @@ async fn run_sabre(
         backend_stats::request(print_summary_to_json_file),
         &stats,
     );
+    // SaBRe's plugin starts after the guest's dynamic loader, whose syscalls
+    // the histogram therefore misses.
+    global.note_syscall_observation_gap(detcore::SyscallObservationGap::InProcessRuntimeStart);
     let finalized = global
         .clean_up_with_dispatch_stats(print_summary, print_summary_to_json_file, dispatch_stats)
         .await;
@@ -4791,6 +4794,11 @@ async fn dispatch_backend(
                 global_state.force_shutdown_with_error();
                 global_state.cancel_internal_scheduler().await;
             }
+            // The in-guest runtime starts after the guest's dynamic loader,
+            // whose syscalls the histogram therefore misses.
+            global_state.note_syscall_observation_gap(
+                detcore::SyscallObservationGap::InProcessRuntimeStart,
+            );
             let finalized = global_state
                 .clean_up_with_dispatch_stats(
                     print_summary,
@@ -5135,6 +5143,11 @@ async fn dispatch_output_backend(
                 global_state.force_shutdown_with_error();
                 global_state.cancel_internal_scheduler().await;
             }
+            // The in-guest runtime starts after the guest's dynamic loader,
+            // whose syscalls the histogram therefore misses.
+            global_state.note_syscall_observation_gap(
+                detcore::SyscallObservationGap::InProcessRuntimeStart,
+            );
             let finalized = global_state
                 .clean_up_with_dispatch_stats(
                     print_summary,

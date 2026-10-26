@@ -505,6 +505,7 @@ fn runtime_stats(summary: &RunSummary) -> RuntimeStats {
         virtual_nanoseconds: summary.virttime_elapsed,
         syscalls: summary.syscalls,
         dispatch: summary.dispatch_stats.clone(),
+        syscall_histogram: summary.syscall_histogram.clone(),
     }
 }
 
