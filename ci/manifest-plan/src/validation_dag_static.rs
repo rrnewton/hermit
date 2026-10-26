@@ -1851,7 +1851,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1172.
     // Train 6 recount (measured on 21f770f6 base): 1187.
     // And guest_ids' six --pid-base resolution units: 1193, listed.
-    ("test.hermit_unit", 1193),
+    // And the --no-namespace replay units
+    // a_replayed_base_is_required_and_named_by_its_record and
+    // no_namespace_replays_follow_only_records_whose_ids_were_chosen_alike: 1195.
+    ("test.hermit_unit", 1195),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4369,7 +4372,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // no_namespace_reports_its_guest_numbering, no_namespace_refuses_a_taken_chosen_id_only_when_asked,
     // no_namespace_refuses_a_held_pid_base) and
     // no_namespace_concurrent_runs_take_different_windows: 671.
-    ("test.cli", 671),
+    // And no_namespace_preemption_records_replay_under_their_base: 672.
+    ("test.cli", 672),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4913,7 +4917,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
     // And the same five --no-namespace chosen-ID tests, not excluded: 590.
-    ("test.cli_on_host", 590),
+    // And the same --no-namespace replay test: 591.
+    ("test.cli_on_host", 591),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5757,7 +5762,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1166.
     // Train 6 recount (measured on 21f770f6 base): 1181.
     // And the same six --pid-base resolution units: 1187.
-    ("test.hermit_unit_on_host", 1187),
+    // And the same two --no-namespace replay units: 1189.
+    ("test.hermit_unit_on_host", 1189),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
