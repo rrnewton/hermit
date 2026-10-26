@@ -13,6 +13,10 @@ mod hermit_test;
 mod readonly_proc;
 
 #[cfg(feature = "dbt")]
+#[path = "common/dbt_placement_probe.rs"]
+mod dbt_placement_probe;
+
+#[cfg(feature = "dbt")]
 #[path = "common/mapping_capture_live.rs"]
 mod mapping_capture_live;
 

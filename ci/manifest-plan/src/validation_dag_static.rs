@@ -1782,7 +1782,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured with the existing selection and exclusions unchanged.
     // Caller-selected DBT environment privacy adds one library regression,
     // listed with the existing feature selection and exclusions unchanged.
-    ("test.hermit_unit", 1093),
+    // Caller-owned DBT private placement adds one library launch regression,
+    // measured with the existing feature selection and exclusions unchanged.
+    ("test.hermit_unit", 1094),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4051,7 +4053,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Hermit bbcd2f3e without a count: 609 (validate at 285a61ae saw 609).
     // Caller-selected DBT environment privacy adds one CLI regression,
     // listed with the existing feature selection and exclusions unchanged.
-    ("test.cli", 610),
+    // Caller-owned DBT private placement adds two CLI launch regressions,
+    // measured with the existing feature selection and exclusions unchanged.
+    ("test.cli", 612),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4551,7 +4555,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 528.
     // Caller-selected DBT environment privacy adds one CLI regression,
     // listed with the existing feature selection and exclusions unchanged.
-    ("test.cli_on_host", 529),
+    // The same two private-placement regressions remain in the hosted selection,
+    // measured with its existing exclusions unchanged.
+    ("test.cli_on_host", 531),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5325,7 +5331,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured with the existing selection and exclusions unchanged.
     // Caller-selected DBT environment privacy adds one library regression,
     // listed with the existing feature selection and exclusions unchanged.
-    ("test.hermit_unit_on_host", 1093),
+    // The same private-placement library regression remains in the hosted
+    // selection, measured with its existing exclusions unchanged.
+    ("test.hermit_unit_on_host", 1094),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

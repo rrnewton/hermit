@@ -2620,7 +2620,20 @@ fi
 # Carry the existing SDK budget/job limits on those unchanged cold-build inputs;
 # a warm cache hit is not a new cold-build calibration. Fresh Rust/caller checks
 # remain separate, and this pin requires the Hermit-owned privacy selection.
-expected_pin=c0b6687fb4f9c3d3b9e378fababd111ced15f0b6
+# CARRY TO 064dc06f57d9daf45ee2802547f85662dc86e58b (2026-10-26):
+# Private placement is now selected by the caller. Hermit explicitly requests
+# zero offset; generic runners use the SDK default. The complete DynamoRIO
+# tree, build.rs, native client and native CMakeLists.txt are byte-identical to
+# c0b6687f. With CMAKE=cmake, CMAKE_GENERATOR unset and SOURCE_DATE_EPOCH=0,
+# SDK recipe a0f4981c and its calibrated cold-build budget/job limits carry.
+# The reused SDK is not a new cold-build calibration; fresh Rust, real option
+# queries and all three Hermit constructor controls are checked separately.
+# CARRY TO 044c53d71e34c093d48f33347105013ee642ea28 (2026-10-26):
+# The review correction changes only the option-probe test environment and
+# commit metadata in Reverie. Production, native/SDK recipe and budget logic
+# are byte-identical to the preceding 064dc06 binding. Keep its numeric
+# calibration; this source-recipe carry is not a new timing measurement.
+expected_pin=044c53d71e34c093d48f33347105013ee642ea28
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
