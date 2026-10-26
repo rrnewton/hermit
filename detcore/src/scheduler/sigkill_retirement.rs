@@ -645,9 +645,9 @@ impl Scheduler {
 
     /// Retire every thread still registered, in DetTid order, as a committed
     /// victim of a kill the scheduler does not send itself: the termination
-    /// that unwinds a deadlocked guest (`unwind_terminal_outcome`) kills every
-    /// guest thread, and their deaths reach the scheduler as deregistrations
-    /// in the order the host reports them. Retired here, each death is then
+    /// that unwinds the guest at a terminal outcome (`unwind_terminal_outcome`)
+    /// kills every guest thread, and their deaths reach the scheduler as
+    /// deregistrations in the order the host reports them. Retired here, each death is then
     /// only accounted ([`Self::route_sigkill_receipt`]), so the log the run
     /// ends with, and the scheduler's state, do not depend on that order. The
     /// scheduler grants no turn after this. As for a committed SIGKILL
@@ -673,7 +673,7 @@ impl Scheduler {
             let (Some(process), Some(mm)) = (self.registered_process(tid), self.thread_mm(tid))
             else {
                 crate::detlog::write_loss_notice(&format!(
-                    "thread {tid}, killed by the unwind of a deadlocked guest, has no recorded process or address-space identity, so its death is retired at its host-timed deregistration"
+                    "thread {tid}, killed by the unwind of a terminal outcome, has no recorded process or address-space identity, so its death is retired at its host-timed deregistration"
                 ));
                 continue;
             };
