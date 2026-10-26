@@ -18,9 +18,9 @@ mod artifact;
 
 #[test]
 fn finalizer_tests_use_the_pinned_qualifier_source() {
-    // Independently fixed from the selected a20b091f commit's lib.rs, not the test reexport.
+    // Independently fixed from the selected 55d215b3 commit's lib.rs, not the test reexport.
     assert_eq!(
         reverie_liteinst_artifact::qualifier_source_sha256(),
-        "170a4d5add28aba72695e806829d5a633e4b82fbbc723cced3fff79aefb84475"
+        "22c116ba09e2268feb8f0b88090cd683775553d8d558e91e58aaa4bab6fb2172"
     );
 }

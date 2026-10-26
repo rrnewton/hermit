@@ -2734,7 +2734,11 @@ fi
 # leaves the eight calibrated DBT source/recipe/toolchain/dependency Git
 # inputs above byte-identical. Preserve all inventory, calibration, job
 # widths and limits; this supplies no new timing or runtime evidence.
-expected_pin=a20b091f26856b202f87757ef515e7d62e0e8161
+# CARRY TO 55d215b305d68a6cc7899a6930c255be21df0740 (2026-10-26): from
+# a20b091f26856b202f87757ef515e7d62e0e8161. The Native1a8 qualifier addition leaves
+# all eight calibrated DBT inputs above identical. Preserve the existing
+# inventory, calibration, job widths and limits; no new timing or runtime claim.
+expected_pin=55d215b305d68a6cc7899a6930c255be21df0740
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
