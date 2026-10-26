@@ -2789,8 +2789,18 @@ fi
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory, SDK and native inputs, calibrated budget, job width and
 # limits carry unchanged from the 1d6df11f entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a32b6494c83750f21560cd3db565dc2da8a200a6 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a32b6494c83750f21560cd3db565dc2da8a200a6 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO bbac9b4748ff5b96960c15c809978468aec3a26b (2026-10-26): from
+# a32b6494c83750f21560cd3db565dc2da8a200a6. One commit (linuxemu lane, S1): getsockopt's TCP_INFO
+# and socket cookies go to the host. It changes reverie-linuxemu/src only. git
+# diff is empty under reverie-dbt/ and third-party/ and for the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml; both repository inputs to
+# the DynamoRIO content key are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory (1009), SDK and native inputs, calibrated budget, job width
+# and limits carry unchanged from the a32b6494 entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bbac9b4748ff5b96960c15c809978468aec3a26b ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie bbac9b4748ff5b96960c15c809978468aec3a26b (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
