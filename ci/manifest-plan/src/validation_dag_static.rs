@@ -3115,7 +3115,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And preemptions::tests::a_record_too_varied_to_renumber_keeps_its_priorities: 2790.
     // And scheduler::test::terminal_verdicts_carry_the_kind_that_decides_the_status
     // (the guest-deadlock outcome): 2791, listed.
-    ("test.detcore_unit", 2791),
+    // And scheduler::test::
+    // a_deadlock_unwind_retires_the_remaining_threads_in_tid_order:
+    // 2792, listed.
+    ("test.detcore_unit", 2792),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4415,7 +4418,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_guest_deadlock_verifies_as_the_same_outcome_in_both_runs and
     // a_recorded_guest_deadlock_replays_to_the_same_outcome (the guest-deadlock
     // outcome, tests/c/condvar_join_deadlock.c): 669, listed.
-    ("test.cli", 669),
+    // And a_guest_deadlock_that_kills_several_threads_verifies_at_parity: 670,
+    // listed.
+    ("test.cli", 670),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4959,7 +4964,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
     // And the same three guest-deadlock outcome tests: 588, listed.
-    ("test.cli_on_host", 588),
+    // And the same several-thread guest-deadlock parity test: 589, listed.
+    ("test.cli_on_host", 589),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5433,7 +5439,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same schedule-prefix unit: 2789, listed.
     // And the same normalize test: 2790.
     // And the same guest-deadlock terminal-verdict unit: 2791, listed.
-    ("test.detcore_unit_on_host", 2791),
+    // And the same unwind retirement unit: 2792, listed.
+    ("test.detcore_unit_on_host", 2792),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

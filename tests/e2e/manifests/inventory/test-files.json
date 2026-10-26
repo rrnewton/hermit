@@ -244,7 +244,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/condvar_join_deadlock.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/condvar_join_deadlock.c is owned by hermit-cli/tests/cli.rs: main prints a marker and joins a thread waiting on a condition variable nobody signals, so the run must end with the guest-deadlock outcome (exit 121 and HERMIT_GUEST_DEADLOCK class=guest-deadlock after Detcore's deadlock report) with the marker kept, never as an internal failure. It remains a fixture because the integration test checks the exit code, the class line's place after the report, and stdout, which a generic manifest cell cannot express."
+      "why": "tests/c/condvar_join_deadlock.c is owned by hermit-cli/tests/cli.rs: main prints a marker and joins a thread waiting on a condition variable nobody signals (with a count argument, the first of that many waiters), so the run must end with the guest-deadlock outcome (exit 121 and HERMIT_GUEST_DEADLOCK class=guest-deadlock after Detcore's deadlock report) with the marker kept, never as an internal failure, and with four waiters must still verify at bitwise parity. It remains a fixture because the integration test checks the exit code, the class line's place after the report, and stdout, which a generic manifest cell cannot express."
     },
     {
       "disposition": "guest-fixture",
