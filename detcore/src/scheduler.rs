@@ -16196,8 +16196,9 @@ impl Scheduler {
     /// recording (`release_replay_priorities_if_exhausted`) every thread has
     /// the default priority, so a new one does too: at the deferred priority
     /// it could wait for ever behind a parent that never blocks. Returns
-    /// whether a thread other than the root took its starting priority
-    /// unguided, a sign that the replay has left its recording.
+    /// whether the thread took its starting priority unguided, which, for any
+    /// thread but the guest's first (`tool_global::is_replay_root`), is a sign
+    /// that the replay has left its recording.
     pub(crate) fn replay_registration_priority(
         &mut self,
         dettid: DetTid,
@@ -16210,7 +16211,7 @@ impl Scheduler {
         match self.priorities.entry(dettid) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(starting);
-                dettid != crate::consts::ROOT_DETPID
+                true
             }
             std::collections::btree_map::Entry::Occupied(_) => false,
         }
