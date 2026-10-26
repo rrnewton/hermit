@@ -43,6 +43,7 @@ use crate::analyze::types::TRIAL_LOG_FLOOR;
 use crate::analyze::types::TRIAL_TIMEOUT_FACTOR;
 use crate::analyze::types::TRIAL_TIMEOUT_FLOOR;
 use crate::analyze::types::TrialTimeout;
+use crate::analyze::verdict::TimingSetting;
 use crate::container::RunTimeoutMarker;
 use crate::global_opts::GlobalOpts;
 use crate::run::RunOpts;
@@ -1157,6 +1158,42 @@ impl AnalyzeOpts {
             .det_opts
             .det_config
             .pipe_wake_latency
+    }
+
+    /// The timing settings every trial keeps from the run arguments: the
+    /// recording's timing semantics, under which a prefix search's
+    /// scheduler-alone continuation runs too, each with the other value a
+    /// run can take. `--pipe-wake-latency` is also stamped on each record;
+    /// `--scheduler-turn-cost` changes how far virtual time moves per
+    /// scheduler turn. Settings that change no thread's timing (the
+    /// signal-state copy) are left out.
+    pub fn continuation_timing(&self) -> Vec<TimingSetting> {
+        let latency = self.trial_pipe_wake_latency().map(|nanos| TimingSetting {
+            option: format!("--pipe-wake-latency={nanos}"),
+            alternative: "no --pipe-wake-latency".to_owned(),
+            drops: "--pipe-wake-latency",
+            adds: None,
+        });
+        // A turn cost equal to the default charge times nothing differently.
+        let turn_cost = self
+            .trial_scheduler_turn_cost()
+            .filter(|cost| cost.get() as f64 != detcore_model::time::NANOS_PER_SCHED)
+            .map(|cost| TimingSetting {
+                option: format!("--scheduler-turn-cost={cost}"),
+                alternative: "no --scheduler-turn-cost".to_owned(),
+                drops: "--scheduler-turn-cost",
+                adds: None,
+            });
+        latency.into_iter().chain(turn_cost).collect()
+    }
+
+    /// The trials' `--scheduler-turn-cost`, from their run arguments (`None`
+    /// for the default charge).
+    pub fn trial_scheduler_turn_cost(&self) -> Option<std::num::NonZeroU64> {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .scheduler_turn_cost
     }
 
     /// Whether the trials keep the signal-state copy (off with

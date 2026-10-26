@@ -22,6 +22,7 @@ use serde::Serialize;
 use tracing::metadata::LevelFilter;
 
 use crate::analyze::verdict::Verdict;
+use crate::analyze::verdict::VerdictReason;
 
 /// Repeat a run multiple times in a controlled search to find concurrency bugs.
 ///
@@ -510,6 +511,14 @@ pub struct Report {
     /// from before it, names the critical events.
     #[serde(default)]
     pub verdict: Verdict,
+
+    /// Why the verdict names no event: `{"cause": "scheduler_alone"}`, or,
+    /// when the scheduler alone meets the target under timing settings the
+    /// recording carries and every trial keeps, `{"cause":
+    /// "timing_semantics", "options": [...]}` with those settings. Absent
+    /// when the verdict names the critical events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict_reason: Option<VerdictReason>,
 
     /// A header containing some contextual information, to go at the beginning of the report.
     pub header: String,
