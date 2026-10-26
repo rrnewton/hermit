@@ -774,14 +774,49 @@ async fn under_the_gate_a_zero_timeout_masked_pselect6_follows_linux_order() {
     }
 }
 
+/// Runs the calling test's body alone in a child copy of this test binary
+/// (`--exact`, one test thread), and requires the child to pass it; returns
+/// whether this is the child, which runs the body. For a test that reads
+/// process-shared `/proc` state of the real test thread (its descriptor
+/// table's `FDSize`, its `smaps`), which other tests of the same process
+/// change concurrently under a plain `cargo test` (IR-31 (a)): in the child
+/// nothing else runs, so the test reads only its own state, with every
+/// assertion unchanged.
+fn alone_in_child_process(name: &str) -> bool {
+    const CHILD: &str = "HERMIT_TEST_ALONE_CHILD";
+    let test = format!("{}::{name}", module_path!().split_once("::").unwrap().1);
+    if std::env::var(CHILD).as_deref() == Ok(test.as_str()) {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+        .env(CHILD, &test)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "{test} in its own process: {:?}\n{stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 /// D39: a masked `pselect6` with more than 64 descriptors and a nonzero
 /// timeout gets `ENOSYS` by name once its first poll finds nothing ready and
 /// no signal ends it, and returns at once a count Linux returns without
 /// waiting; it never parks. The descriptor table's size is read from the
-/// real test thread's `/proc` status (`FDSize`).
+/// real test thread's `/proc` status (`FDSize`), and the sets' writability
+/// from its `smaps`, so the body runs alone in its own process.
 #[tokio::test]
 async fn under_the_gate_a_masked_pselect6_with_more_than_64_descriptors_that_would_wait_is_enosys()
 {
+    if !alone_in_child_process(
+        "under_the_gate_a_masked_pselect6_with_more_than_64_descriptors_that_would_wait_is_enosys",
+    ) {
+        return;
+    }
     let term = bit(libc::SIGTERM);
     for (probe, expected) in [(Ok(0), Err(Errno::ENOSYS)), (Ok(2), Ok(2))] {
         let memory = FormMemory::new(Some(1_000_000_000), term);
