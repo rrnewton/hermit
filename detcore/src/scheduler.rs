@@ -21927,6 +21927,9 @@ impl Scheduler {
                 virtual_timeout_ns,
                 // GlobalState counts binder calls (`syscalls::binder`).
                 binder_external_calls: None,
+                // The backend's precise timers count these.
+                skid_overshoots: None,
+                seed_reproducible: None,
             },
             info_reprio_descrip,
         ))
