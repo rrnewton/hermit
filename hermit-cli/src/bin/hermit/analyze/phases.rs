@@ -1342,7 +1342,8 @@ impl AnalyzeOpts {
         self.adopt_sleep_registration(run1.as_deref())?;
         // Every trial runs under the timeslice its recordings drew.
         self.adopt_recorded_timeslice(&recordings)?;
-        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
+        self.refuse_recordings_under_another_pipe_wake_latency(&recordings)?;
+        self.refuse_instruction_offsets(&recordings)
     }
 
     /// Take the settings `analyze` inherits from the global options: every

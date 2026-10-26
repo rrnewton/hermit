@@ -1275,7 +1275,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the same pull request's review): 1951 + 1 = 1952.
     // Rebased onto main c1f3085da: 1955 + 1 = 1956.
     // Rebased onto main fcd62385f: 1956 + 1 = 1957.
-    ("test.regular_crates", 1957),
+    // And detcore-model's
+    // only_a_chaos_instruction_offset_needs_a_stop_at_every_slice_end
+    // (--chaos-instruction-offset): 1958.
+    ("test.regular_crates", 1958),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2001,7 +2004,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main ffe313b16: 1213 + 1 = 1214.
     // Rebased onto main fbf9d5f0c: 1214 + 1 = 1215.
     // Rebased onto main c1f3085da: 1222 + 1 = 1223.
-    ("test.hermit_unit", 1223),
+    // And run's chaos_instruction_offset_round_trips_and_is_refused_where_inert
+    // and replay_of_instruction_offsets_is_refused_where_unsupported
+    // (--chaos-instruction-offset): 1225.
+    ("test.hermit_unit", 1225),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3305,7 +3311,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the same pull request's review): 3446 + 2 = 3448.
     // Rebased onto main c1f3085da: 3471 + 2 = 3473.
     // Rebased onto main fcd62385f: 3472 + 2 = 3474.
-    ("test.detcore_unit", 3474),
+    // And eight --chaos-instruction-offset units: tool_local's draw, its own
+    // stream and its record/replay hand-off, preemptions' offset rows, the
+    // kept timer, the replay target, a scheduler-recorded offset, and the
+    // hooks arming, recording and replaying one offset slice: 3482.
+    ("test.detcore_unit", 3482),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4679,7 +4689,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on landed batch main: 789 + 5 = 794 (Train 5 delta +5 over 787).
-    ("test.cli", 794),
+    // And chaos_instruction_offset_splits_a_branch_free_window and
+    // a_chaos_instruction_offset_run_verifies_and_replays_at_its_offsets
+    // (tests/c/branch_free_race.c, x86_64 only): 796.
+    ("test.cli", 796),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5311,7 +5324,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 recount (measured by the 216dbc929a full validate, same
     // growth as test.cli): 699 + 7 = 706.
     // Train 5 recount (same growth as test.cli), composed on landed batch main: 708 + 5 = 713.
-    ("test.cli_on_host", 713),
+    // And the same two --chaos-instruction-offset tests, not excluded: 715.
+    ("test.cli_on_host", 715),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5331,7 +5345,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same detcore-model builder unit: 1937 + 1 = 1938.
     // Rebased onto main c1f3085da: 1941 + 1 = 1942.
     // Rebased onto main fcd62385f: 1942 + 1 = 1943.
-    ("test.regular_crates_on_host", 1943),
+    // And the cases added since, as this twin's entry further down counts: 1944.
+    ("test.regular_crates_on_host", 1944),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5892,7 +5907,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two stopless-mark refusal units: 3446 + 2 = 3448.
     // Rebased onto main c1f3085da: 3471 + 2 = 3473.
     // Rebased onto main fcd62385f: 3472 + 2 = 3474.
-    ("test.detcore_unit_on_host", 3474),
+    // And the same eight --chaos-instruction-offset units: 3482.
+    ("test.detcore_unit_on_host", 3482),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6322,7 +6338,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main ffe313b16: 1207 + 1 = 1208.
     // Rebased onto main fbf9d5f0c: 1208 + 1 = 1209.
     // Rebased onto main c1f3085da: 1216 + 1 = 1217.
-    ("test.hermit_unit_on_host", 1217),
+    // And the same two --chaos-instruction-offset run units: 1219.
+    ("test.hermit_unit_on_host", 1219),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6569,7 +6586,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same detcore-model builder unit: 1937 + 1 = 1938.
     // Rebased onto main c1f3085da: 1941 + 1 = 1942.
     // Rebased onto main fcd62385f: 1942 + 1 = 1943.
-    ("test.regular_crates_on_host", 1943),
+    // And the same --chaos-instruction-offset detcore-model unit: 1944.
+    ("test.regular_crates_on_host", 1944),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
