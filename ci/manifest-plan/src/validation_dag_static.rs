@@ -1924,7 +1924,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_first_stop_signal_is_the_one_reported,
     // a_stop_signal_reaches_the_children_and_only_them,
     // the_handler_stops_what_analyze_started_and_nothing_else}: 1315.
-    ("test.hermit_unit", 1315),
+    // And analyze's trial log level: rundata::tests::{a_verbose_trial_keeps_the_default_log_level,
+    // trial_log_debug_writes_each_trials_debug_log, trial_log_sets_the_level_and_the_file,
+    // selfcheck_logs_the_runs_it_compares_at_debug, every_trial_log_level_keeps_errors},
+    // phases::tests::a_workspace_kept_for_the_guest_log_level_names_its_source and
+    // tests::analyze_notes_a_guest_log_level_from_the_environment: 1322.
+    ("test.hermit_unit", 1322),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5995,7 +6000,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two minimize tests: 1299.
     // And the same two --minimize tests: 1301.
     // And the same eight workspace-cleanup tests: 1309.
-    ("test.hermit_unit_on_host", 1309),
+    // And the same seven trial-log-level tests: 1316.
+    ("test.hermit_unit_on_host", 1316),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
