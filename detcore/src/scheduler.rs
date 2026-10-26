@@ -4889,7 +4889,8 @@ impl Scheduler {
                 .with_expired_wait_runs_charged_once(expired_wait_runs_charged_once)
                 .with_cap_preemption_charge(cfg.cap_preemption_charge)
                 .with_chaos_timeslice(cfg.chaos_timeslice)
-                .with_guest_ids(cfg.guest_ids);
+                .with_guest_ids(cfg.guest_ids)
+                .with_sched_seed(cfg.sched_seed());
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -19007,6 +19008,7 @@ impl Scheduler {
                 guest_ids: None,
                 host_id_tasks: 0,
                 virtual_timeout_ns,
+                adopted_seeds: None,
             },
             info_reprio_descrip,
         ))
@@ -43025,6 +43027,36 @@ mod test {
                 crate::preemptions::read_recorded_rng_seed(&path),
                 Ok(Some(stored)),
                 "strict_schedule_boundaries={strict_schedule_boundaries}, rng_seed={rng_seed:?}"
+            );
+        }
+    }
+
+    /// A recording scheduler stores the scheduler seed beside the guest
+    /// random seed, explicit or implied by `--seed`, in both formats.
+    #[test]
+    fn a_recorded_schedule_stores_the_scheduler_seed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("schedule.json");
+        for (strict_schedule_boundaries, sched_seed, stored) in [
+            (false, None, 3),
+            (false, Some(11), 11),
+            (true, Some(11), 11),
+        ] {
+            let config = Config {
+                sequentialize_threads: true,
+                record_preemptions: true,
+                strict_schedule_boundaries,
+                seed: 3,
+                sched_seed,
+                ..Config::default()
+            };
+            let mut scheduler = Scheduler::new(&config);
+            let record = scheduler.preemption_writer.take().unwrap().into_string();
+            std::fs::write(&path, record).unwrap();
+            assert_eq!(
+                crate::preemptions::read_recorded_sched_seed(&path),
+                Ok(Some(stored)),
+                "strict_schedule_boundaries={strict_schedule_boundaries}, sched_seed={sched_seed:?}"
             );
         }
     }

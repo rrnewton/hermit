@@ -2582,6 +2582,7 @@ impl GlobalState {
         // Record configuration and the runtime's timer mechanism, not whether
         // a timer is currently armed or has delivered an event. This metadata
         // stays separate from the INFO guest-behavior view.
+        summary.adopted_seeds = self.cfg.replay_adopted_seeds.filter(|seeds| seeds.any());
         summary.preemption = Some(PreemptionSummary {
             max_timeslice_ns: self.cfg.max_timeslice.map(|maximum| maximum.get()),
             timer_enabled: Some(self.cfg.use_preemption_timer()),

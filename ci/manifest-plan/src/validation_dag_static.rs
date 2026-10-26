@@ -1905,7 +1905,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and analyze::phases::tests::analyze_replays_records_with_the_guest_random_seed_they_were_recorded_under
     // and analyze::phases::tests::analyze_trials_of_a_seeded_target_take_its_guest_random_seed
     // (https://github.com/rrnewton/hermit/issues/4868): 1292.
-    ("test.hermit_unit", 1292),
+    // And run::replay_takes_the_recorded_seeds_and_refuses_a_contradicting_seed
+    // (the scheduler seed too, and an explicit --seed checked): 1293, listed.
+    ("test.hermit_unit", 1293),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3152,7 +3154,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4897 adds two detcore units: 2979 + 2 = 2981, re-measured at this integration head.
     // The 4843 overshoot fix adds eighteen detcore units: 2981 + 18 = 2999, re-measured at this integration head.
     // The socketpair readiness increment adds one detcore unit: 2999 + 1 = 3000, re-measured at this integration head.
-    ("test.detcore_unit", 3000),
+    // And scheduler::test::a_recorded_schedule_stores_the_scheduler_seed: 3001,
+    // listed.
+    ("test.detcore_unit", 3001),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5541,7 +5545,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4897 units: 2979 + 2 = 2981.
     // The same eighteen 4843 overshoot fix units: 2981 + 18 = 2999.
     // The same socketpair readiness unit: 2999 + 1 = 3000.
-    ("test.detcore_unit_on_host", 3000),
+    // And the same recorded scheduler-seed unit: 3001, listed.
+    ("test.detcore_unit_on_host", 3001),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5935,7 +5940,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same detlog correction unit: 1281 + 1 = 1282.
     // The same PR 4912 unit: 1282 + 1 = 1283.
     // And the same three trial-guest-random-seed units: 1286.
-    ("test.hermit_unit_on_host", 1286),
+    // And the same recorded-seeds replay test: 1287, listed.
+    ("test.hermit_unit_on_host", 1287),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
