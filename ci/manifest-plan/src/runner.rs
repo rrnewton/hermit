@@ -21455,6 +21455,13 @@ exit "$(cat "$PWD/exit-status")"
                  8192), so its guest prints F_GETPIPE_SZ without asserting Detcore's pin",
             ),
             (
+                "c-programs/proc-fd-directory",
+                "kvm",
+                "`--no-private-tables` and `--no-fifo-threads` skip the two checks KVM cannot \
+                 run: it gives no thread a descriptor table of its own, and its executor holds \
+                 the turn in a blocking FIFO open",
+            ),
+            (
                 "c-programs/scm-rights-received-descriptors",
                 "in-guest-trap",
                 "`--no-exec` skips the exec check: in-guest LiteInst refuses execve",

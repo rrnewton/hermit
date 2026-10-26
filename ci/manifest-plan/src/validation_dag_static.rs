@@ -2896,6 +2896,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And without_keeping_a_read_leaves_no_descriptor_open (status files are
     // kept only in Hermit's own process, never where Detcore runs in the
     // guest): 2579, listed.
+<<<<<<< ffbcf012
     // And A5 slice 3c.1e A's sixteen units: scheduler::guest_mask_publication_tests'
     // four (a restored rejoin that publishes nothing leaves the mask unknown;
     // a new task starts with its creator's published mask; a temporary-mask
@@ -2927,6 +2928,20 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // rejoins_and_withdrawals_decide_the_mark_a_child_is_seeded_from: 2603,
     // listed.
     ("test.detcore_unit", 2603),
+=======
+    // And package K slice F1's nineteen units: procfs::fd_directory's nine
+    // (the own directories classified, the entries at Linux positions, the
+    // end at the table's capacity, a leader without a table, the capacity's
+    // powers of two, paging, lseek, tags, the lookup base of a bound
+    // directory), syscalls::files::descriptor_directory's six (a name below
+    // a directory, a path through a descriptor link, the bytes of the rest
+    // of such a path, the links before a descriptor link, a procfs root told
+    // without opening anything, the respelled operands) and tool_local's
+    // four (the descriptor capacity, an unmodelled descriptor, a failed
+    // dup's growth, an unmodelled descriptor's close-on-exec changes): 2598,
+    // listed.
+    ("test.detcore_unit", 2598),
+>>>>>>> 0c0edad8
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5100,11 +5115,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And without_keeping_a_read_leaves_no_descriptor_open (status files are
     // kept only in Hermit's own process, never where Detcore runs in the
     // guest): 2579, listed.
+<<<<<<< ffbcf012
     // And the same sixteen A5 slice 3c.1e A units: 2595, listed.
     // And the same three 3c.1e A review round 1 units: 2598, listed.
     // And the same three 3c.1e A review round 2 units: 2601, listed.
     // And the same two 3c.1e A review round 3 units: 2603, listed.
     ("test.detcore_unit_on_host", 2603),
+=======
+    // And the same nineteen F1 units: 2598, listed.
+    ("test.detcore_unit_on_host", 2598),
+>>>>>>> 0c0edad8
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
