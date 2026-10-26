@@ -541,22 +541,68 @@ mod tests {
         }
     }
 
-    fn require_root_independent_exports(exports: &[String], roots: &[&Path]) -> Result<(), String> {
-        let first = exports.first().ok_or("missing exported metadata")?;
-        if exports.iter().any(|export| export != first) {
-            return Err("exports differ across repository roots".into());
-        }
-        let value: Value = serde_json::from_str(first).unwrap();
-        for root in roots {
-            assert!(root.is_absolute());
-            if contains_absolute_root_reference(&value, root.to_str().unwrap()) {
-                return Err(format!(
-                    "absolute checkout-root reference: {}",
-                    root.display()
-                ));
+    struct CheckedExports<'a> {
+        // Keep the proved encoded input immutable while its parsed value is reused.
+        _encoded: &'a [String],
+        value: Value,
+    }
+
+    impl<'a> CheckedExports<'a> {
+        fn parse(exports: &'a [String]) -> Result<Self, String> {
+            let first = exports.first().ok_or("missing exported metadata")?;
+            if exports.iter().any(|export| export != first) {
+                return Err("exports differ across repository roots".into());
             }
+            // Check encoded bytes before parsing; equal JSON values are insufficient.
+            let value = serde_json::from_str(first).unwrap();
+            Ok(Self {
+                _encoded: exports,
+                value,
+            })
         }
-        Ok(())
+
+        fn require_root_independent(&self, roots: &[&Path]) -> Result<(), String> {
+            for root in roots {
+                assert!(root.is_absolute());
+                if contains_absolute_root_reference(&self.value, root.to_str().unwrap()) {
+                    return Err(format!(
+                        "absolute checkout-root reference: {}",
+                        root.display()
+                    ));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn require_root_independent_exports(exports: &[String], roots: &[&Path]) -> Result<(), String> {
+        CheckedExports::parse(exports)?.require_root_independent(roots)
+    }
+
+    #[test]
+    fn checked_exports_preserve_encoded_equality_and_rescan_roots() {
+        let encoded = r#"{"path":"/checkout/file"}"#.to_string();
+        let spaced = r#"{ "path": "/checkout/file" }"#.to_string();
+        assert_eq!(
+            serde_json::from_str::<Value>(&encoded).unwrap(),
+            serde_json::from_str::<Value>(&spaced).unwrap()
+        );
+        let error = require_root_independent_exports(
+            &[encoded.clone(), spaced],
+            &[Path::new("/elsewhere")],
+        )
+        .unwrap_err();
+        assert_eq!(error, "exports differ across repository roots");
+
+        let exports = vec![encoded; 2];
+        let checked = CheckedExports::parse(&exports).unwrap();
+        checked
+            .require_root_independent(&[Path::new("/elsewhere")])
+            .unwrap();
+        let error = checked
+            .require_root_independent(&[Path::new("/checkout")])
+            .unwrap_err();
+        assert_eq!(error, "absolute checkout-root reference: /checkout");
     }
 
     #[test]
@@ -1240,7 +1286,8 @@ test:
             let exported = build_export(alias.path()).unwrap();
             exports.push(serde_json::to_string(&exported).unwrap());
         }
-        require_root_independent_exports(&exports, &roots).unwrap();
+        let checked_exports = CheckedExports::parse(&exports).unwrap();
+        checked_exports.require_root_independent(&roots).unwrap();
         let cited = exports
             .iter()
             .map(|export| {
@@ -1259,7 +1306,8 @@ test:
             })
             .collect::<Vec<_>>();
         assert!(cited.iter().all(|export| export.contains(citation)));
-        require_root_independent_exports(&cited, &roots).unwrap();
+        let checked_cited = CheckedExports::parse(&cited).unwrap();
+        checked_cited.require_root_independent(&roots).unwrap();
 
         // Run the same oracle against a leak shared by every variant: alias
         // equality alone would miss a canonicalized or compile-time real root.
@@ -1271,8 +1319,12 @@ test:
                 second_alias.path(),
                 leaked_root,
             ];
-            require_root_independent_exports(&exports, &checked_roots).unwrap();
-            require_root_independent_exports(&cited, &checked_roots).unwrap();
+            checked_exports
+                .require_root_independent(&checked_roots)
+                .unwrap();
+            checked_cited
+                .require_root_independent(&checked_roots)
+                .unwrap();
 
             // Exercise each exported flag/argument surface through the same
             // oracle, including uniform leaks that root equality cannot catch.
