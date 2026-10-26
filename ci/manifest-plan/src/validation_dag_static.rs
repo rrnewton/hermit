@@ -2974,7 +2974,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and config's two units for the global RPC revision in the runtimes'
     // fingerprint (https://github.com/rrnewton/hermit/issues/4765): 2622,
     // listed.
-    ("test.detcore_unit", 2622),
+    // And syscalls::inotify's two units for a read that faults (each buffer's
+    // first bytes kept before the call, and a faulted buffer compared with
+    // them): 2624, listed.
+    ("test.detcore_unit", 2624),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5171,7 +5174,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five syscall_histogram units: 2611, listed.
     // And the same nine syscalls::inotify and two config units: 2622,
     // listed.
-    ("test.detcore_unit_on_host", 2622),
+    // And the same two units for a read that faults: 2624, listed.
+    ("test.detcore_unit_on_host", 2624),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
