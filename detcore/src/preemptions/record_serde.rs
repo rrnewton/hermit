@@ -67,6 +67,8 @@ struct RawRecord {
     host_inputs: Option<HostInputSet>,
     #[serde(default, skip_serializing_if = "HostObservedCount::is_zero")]
     store_exclusive_failures: HostObservedCount,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rejoins: Vec<crate::scheduler::rejoin_log::Rejoin>,
 }
 
 struct LegacyFields<'a>(&'a PreemptionRecord);

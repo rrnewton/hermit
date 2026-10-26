@@ -3152,7 +3152,22 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The kconc/4966 V4c replay-priority transplant adds fourteen detcore units: 3003 + 14 = 3017, re-measured at this integration head.
     // The in-flight SCM_RIGHTS queue (https://github.com/rrnewton/hermit/issues/4930) adds seventeen detcore units: 3017 + 17 = 3034, listed.
     // And a_binder_call_blocks_when_it_waits_for_another_process: 3035.
-    ("test.detcore_unit", 3035),
+    // And the eleven scheduler units for readmissions in a `hermit run`
+    // preemption record and their replay:
+    // a_preemption_record_carries_the_readmissions_a_replay_follows,
+    // a_record_whose_readmissions_go_backwards_is_refused,
+    // recording_preemptions_logs_hermit_runs_readmissions_without_changing_them,
+    // a_preemption_replay_readmits_at_the_recorded_point,
+    // a_preemption_replay_that_leaves_its_record_goes_on_as_a_fresh_run,
+    // a_preemption_replay_waits_where_its_recording_spun_and_goes_on_where_it_went_on,
+    // a_preemption_replay_off_its_record_leaves_it_where_nothing_else_moves,
+    // a_preemption_replay_readmits_a_vfork_child_at_its_recorded_turn,
+    // a_preemption_replay_off_its_record_at_step2a_rejoins_the_vfork_parent,
+    // a_preemption_replay_off_its_record_does_not_freeze_on_a_gated_vfork_child
+    // and
+    // a_preemption_replay_past_its_last_readmission_parks_a_finished_call_only_up_to_the_valve:
+    // 3046.
+    ("test.detcore_unit", 3046),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4487,7 +4502,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scm_rights_exited_receivers_queue_goes_with_its_exit (https://github.com/rrnewton/hermit/issues/4930): 742 + 2 = 744.
     // And a_blocking_binder_read_does_not_hold_the_guests_turn, which skips
     // the same way: 745.
-    ("test.cli", 745),
+    // And a_preemption_replay_readmits_a_backgrounded_call_where_its_recording_did
+    // (readmissions in a `hermit run` preemption record, replayed under a race
+    // probe): 746.
+    ("test.cli", 746),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5060,7 +5078,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4912 cases: 659 + 2 = 661.
     // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
     // And the same blocking binder read test: 664.
-    ("test.cli_on_host", 664),
+    // And the same preemption-replay readmission test: 665.
+    ("test.cli_on_host", 665),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5564,7 +5583,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same fourteen kconc/4966 V4c replay-priority units: 3003 + 14 = 3017.
     // The same seventeen SCM_RIGHTS queue units: 3017 + 17 = 3034.
     // And the same blocking-classification unit: 3035.
-    ("test.detcore_unit_on_host", 3035),
+    // And the same eleven readmission units: 3046.
+    ("test.detcore_unit_on_host", 3046),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
