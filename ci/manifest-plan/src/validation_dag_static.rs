@@ -1168,7 +1168,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's eight syscall_histogram::tests units for
     // the per-run syscall histogram (dh-te7ep): 1854, listed.
     // And +8 from c6a4199e: 1854.
-    ("test.regular_crates", 1854),
+    // And +3 from 1ba21b89: 1857.
+    ("test.regular_crates", 1857),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5668,7 +5669,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same ld.so.cache-sharing runner test: 1832, listed.
     // And the same eight syscall_histogram units: 1840, listed.
     // And +8 from c6a4199e: 1840.
-    ("test.regular_crates_on_host", 1840),
+    // And +3 from 1ba21b89: 1843.
+    ("test.regular_crates_on_host", 1843),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
