@@ -6026,8 +6026,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         len: usize,
         offset: Option<u64>,
     ) -> Result<i64, Error> {
-        // Linux's MAX_RW_COUNT: INT_MAX rounded down to a page.
-        const MAX_RW_COUNT: usize = 0x7fff_f000;
         let status = guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.status_flags())?;
@@ -6057,7 +6055,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let destination = buf.map_or(0, |buf| buf.as_raw());
         let copied = self
-            .read_rendered_cmdline(guest, fd, destination, len.min(MAX_RW_COUNT), pos)
+            .read_rendered_cmdline(
+                guest,
+                fd,
+                destination,
+                len.min(crate::page::max_rw_count()),
+                pos,
+            )
             .await?;
         if offset.is_none() {
             guest.thread_state().with_detfd(fd, |detfd| {

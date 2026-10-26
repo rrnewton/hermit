@@ -68,6 +68,7 @@ mod memory;
 pub mod native_exec;
 pub mod netlink_route;
 pub mod nonwaiting_write;
+mod page;
 mod pipe_wake;
 #[cfg(test)]
 mod predicted_death_tests;
@@ -2788,7 +2789,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         end: u64,
     ) -> Result<(), reverie::Error> {
         // The page brk(2) rounds the break up to.
-        let end = end.checked_add(4095).map_or(end, |end| end & !4095);
+        let page_mask = crate::page::page_size() - 1;
+        let end = end
+            .checked_add(page_mask)
+            .map_or(end, |end| end & !page_mask);
         let pieces = procmaps::from_pid(guest.pid(), |map| {
             matches!(map.pathname, procmaps::MMapPath::Anonymous)
                 && map.address.0 < end

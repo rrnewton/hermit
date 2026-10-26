@@ -356,11 +356,9 @@ pub(crate) fn validate_getrandom_flags(flags: usize) -> Result<(), Errno> {
     }
 }
 
-// Linux's import_ubuf clamps getrandom requests to MAX_RW_COUNT on x86_64.
-pub(crate) const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
-
+/// Linux's import_ubuf clamps a getrandom request to MAX_RW_COUNT.
 pub(crate) fn getrandom_request_len(requested: usize) -> usize {
-    requested.min(GETRANDOM_MAX_BYTES)
+    requested.min(crate::page::max_rw_count())
 }
 
 pub(crate) fn write_random_chunk(

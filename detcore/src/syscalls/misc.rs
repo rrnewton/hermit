@@ -24,8 +24,6 @@ use reverie::syscalls::Sysno;
 
 use crate::consts::DEFAULT_HOSTNAME;
 use crate::detlog;
-#[cfg(test)]
-use crate::random::GETRANDOM_MAX_BYTES;
 use crate::random::RANDOM_FILL_CHUNK_BYTES;
 #[cfg(test)]
 use crate::random::getrandom_request_len;
@@ -1252,7 +1250,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         const MPOL_F_NODE: u64 = 1;
         const MPOL_F_ADDR: u64 = 2;
         const MPOL_F_MEMS_ALLOWED: u64 = 4;
-        const PAGE: u64 = 4096;
+        // `copy_nodes_to_user` refuses a mask longer than a page.
+        let page = crate::page::page_size();
         let mask = call.nodemask();
         if mask.is_some() && call.maxnode() < 1 {
             return Err(Errno::EINVAL.into());
@@ -1276,7 +1275,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         if let Some(mask) = mask {
             let bytes = (call.maxnode() - 1).div_ceil(64) * 8;
-            if bytes > PAGE.max(8) {
+            if bytes > page.max(8) {
                 return Err(Errno::EINVAL.into());
             }
             let mut words = vec![0u8; bytes as usize];
@@ -1978,7 +1977,10 @@ mod tests {
     #[test]
     fn getrandom_caps_requests_at_linux_max_rw_count() {
         assert_eq!(getrandom_request_len(16), 16);
-        assert_eq!(getrandom_request_len(usize::MAX), GETRANDOM_MAX_BYTES);
+        assert_eq!(
+            getrandom_request_len(usize::MAX),
+            crate::page::max_rw_count()
+        );
     }
 
     #[test]

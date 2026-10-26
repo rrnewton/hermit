@@ -78,7 +78,13 @@ use crate::config::FatalCoreCapture;
 
 /// Uncompressed bytes per zstd frame.
 const CHUNK: usize = 1 << 20;
-const PAGE: u64 = 4096;
+/// The page size a core's file note and segments are laid out in:
+/// `PAGE_SIZE` in `fill_files_note` and `ELF_EXEC_PAGESIZE` in
+/// `elf_core_dump` (fs/binfmt_elf.c), which is the host's page size on
+/// x86_64 and arm64 alike.
+fn core_page() -> u64 {
+    crate::page::page_size()
+}
 static ZEROS: [u8; CHUNK] = [0; CHUNK];
 
 /// What one [`capture`] did.
@@ -501,7 +507,7 @@ impl Snapshot {
                 let filesz = if all {
                     len
                 } else if elf_header {
-                    len.min(PAGE)
+                    len.min(core_page())
                 } else {
                     0
                 };
@@ -703,11 +709,11 @@ fn nt_file(maps: &[MemoryMap]) -> Vec<u8> {
         .collect();
     let mut out = Vec::new();
     out.extend_from_slice(&(files.len() as u64).to_le_bytes());
-    out.extend_from_slice(&PAGE.to_le_bytes());
+    out.extend_from_slice(&core_page().to_le_bytes());
     for (map, _) in &files {
         out.extend_from_slice(&map.address.0.to_le_bytes());
         out.extend_from_slice(&map.address.1.to_le_bytes());
-        out.extend_from_slice(&(map.offset / PAGE).to_le_bytes());
+        out.extend_from_slice(&(map.offset / core_page()).to_le_bytes());
     }
     for (_, path) in &files {
         use std::os::unix::ffi::OsStrExt;
@@ -832,7 +838,7 @@ impl Compressed {
 fn headers(notes_len: u64, segments: &[Segment]) -> (Vec<u8>, u64) {
     let phnum = 1 + segments.len() as u64;
     let notes_offset = EHDR_SIZE + PHDR_SIZE * phnum;
-    let data_offset = (notes_offset + notes_len).next_multiple_of(PAGE);
+    let data_offset = (notes_offset + notes_len).next_multiple_of(core_page());
     let mut out = Vec::with_capacity(notes_offset as usize);
     out.extend_from_slice(b"\x7fELF\x02\x01\x01");
     out.resize(16, 0);
@@ -868,9 +874,9 @@ fn headers(notes_len: u64, segments: &[Segment]) -> (Vec<u8>, u64) {
             segment.vaddr,
             segment.filesz,
             segment.memsz,
-            PAGE,
+            core_page(),
         );
-        offset += segment.filesz.next_multiple_of(PAGE);
+        offset += segment.filesz.next_multiple_of(core_page());
     }
     (out, data_offset)
 }
@@ -906,7 +912,7 @@ fn write_core(
             Some(mem) => copy_memory(&mut out, mem, segment.vaddr, segment.filesz, &mut page)?,
             None => out.push_zeros(segment.filesz)?,
         }
-        out.push_zeros(segment.filesz.next_multiple_of(PAGE) - segment.filesz)?;
+        out.push_zeros(segment.filesz.next_multiple_of(core_page()) - segment.filesz)?;
     }
     out.flush()?;
     Ok(out.written)
@@ -927,7 +933,7 @@ fn copy_memory(
         match read_fully(mem, &mut buf[..want], addr) {
             Ok(()) => out.push(&buf[..want])?,
             Err(_) => {
-                for page in buf[..want].chunks_mut(PAGE as usize) {
+                for page in buf[..want].chunks_mut(core_page() as usize) {
                     let page_addr = addr;
                     addr += page.len() as u64;
                     if read_fully(mem, page, page_addr).is_err() {
@@ -988,7 +994,7 @@ mod tests {
         ];
         let (bytes, data_offset) = headers(100, &segments);
         assert_eq!(bytes.len() as u64, EHDR_SIZE + 4 * PHDR_SIZE);
-        assert_eq!(data_offset, PAGE);
+        assert_eq!(data_offset, core_page());
         assert_eq!(&bytes[..4], b"\x7fELF");
         let u16_at = |at: usize| u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap());
         assert_eq!(u16_at(16), 4, "e_type is ET_CORE");
@@ -1000,9 +1006,9 @@ mod tests {
         assert_eq!(u64_at(phdr(0) + 32), 100);
         // Stored segments follow each other at page granularity; an empty
         // one takes no file space.
-        assert_eq!(u64_at(phdr(1) + 8), PAGE);
-        assert_eq!(u64_at(phdr(2) + 8), PAGE + 0x3000);
-        assert_eq!(u64_at(phdr(3) + 8), PAGE + 0x3000);
+        assert_eq!(u64_at(phdr(1) + 8), core_page());
+        assert_eq!(u64_at(phdr(2) + 8), core_page() + 0x3000);
+        assert_eq!(u64_at(phdr(3) + 8), core_page() + 0x3000);
         assert_eq!(u64_at(phdr(3) + 32), 0x1000);
         assert_eq!(u64_at(phdr(3) + 40), 0x5000);
     }
@@ -1221,16 +1227,17 @@ mod tests {
             MMPermissions::READ | MMPermissions::WRITE | MMPermissions::PRIVATE,
             0,
         );
-        heap.address = (PAGE, 2 * PAGE);
+        heap.address = (core_page(), 2 * core_page());
         let mut stack = heap.clone();
         stack.pathname = MMapPath::Stack;
-        stack.address = (2 * PAGE, 3 * PAGE);
-        mem.write_all_at(&vec![0x5a; PAGE as usize], PAGE).unwrap();
-        mem.write_all_at(&vec![0xa5; PAGE as usize], 2 * PAGE)
+        stack.address = (2 * core_page(), 3 * core_page());
+        mem.write_all_at(&vec![0x5a; core_page() as usize], core_page())
+            .unwrap();
+        mem.write_all_at(&vec![0xa5; core_page() as usize], 2 * core_page())
             .unwrap();
         let snapshot = Snapshot {
             tgid: 1,
-            stack_pointer: 2 * PAGE,
+            stack_pointer: 2 * core_page(),
             notes: Vec::new(),
             maps: vec![heap, stack],
             rules: vec![
@@ -1284,7 +1291,7 @@ mod tests {
         assert_eq!(tier, Tier::Full, "the reference core fell back");
         assert_eq!(attempted, [Tier::Full]);
         assert!(!fresh.load(Ordering::Relaxed));
-        assert_eq!(stored_memory(&big), 2 * PAGE);
+        assert_eq!(stored_memory(&big), 2 * core_page());
 
         let flag = AtomicBool::new(false);
         let (_, tier, attempted) = capture("timed-out", &flag, Some(WriteError::Deadline));
@@ -1297,7 +1304,7 @@ mod tests {
         let (small, tier, attempted) = capture("after-timeout", &flag, None);
         assert_eq!(tier, Tier::Stack);
         assert_eq!(attempted, [Tier::Stack], "a later capture retried Full");
-        assert_eq!(stored_memory(&small), PAGE);
+        assert_eq!(stored_memory(&small), core_page());
         assert!(
             stored_memory(&small) < stored_memory(&big),
             "the core after a timeout was not smaller"

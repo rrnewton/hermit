@@ -122,9 +122,11 @@ const SCHED_ATTR_SIZE_VER1: u32 = 56; // adds sched_util_{min,max}
 /// or beyond this offset must be zero, and it is the value written back into
 /// `uattr->size` when the request is refused with E2BIG.
 const SCHED_ATTR_KERNEL_SIZE: u32 = SCHED_ATTR_SIZE_VER1;
-/// `sched_copy_attr` refuses a buffer larger than one page. Hermit is x86-64
-/// only, where PAGE_SIZE is 4096.
-const SCHED_ATTR_MAX_SIZE: u32 = 4096;
+/// `sched_copy_attr` and `sched_getattr` refuse a buffer larger than one page
+/// (kernel/sched/syscalls.c).
+fn sched_attr_max_size() -> u32 {
+    u32::try_from(crate::page::page_size()).expect("the page size fits in u32")
+}
 
 /// The scheduling policy Detcore presents as every thread's current one.
 ///
@@ -313,7 +315,7 @@ fn sched_attr_effective_size(declared: u32) -> Result<u32, ()> {
     } else {
         declared
     };
-    if !(SCHED_ATTR_SIZE_VER0..=SCHED_ATTR_MAX_SIZE).contains(&size) {
+    if !(SCHED_ATTR_SIZE_VER0..=sched_attr_max_size()).contains(&size) {
         return Err(());
     }
     Ok(size)
@@ -7460,7 +7462,10 @@ mod tests {
         // Measured native: size 1, 47 and 4097 all give E2BIG.
         assert_eq!(sched_attr_effective_size(1), Err(()));
         assert_eq!(sched_attr_effective_size(SCHED_ATTR_SIZE_VER0 - 1), Err(()));
-        assert_eq!(sched_attr_effective_size(SCHED_ATTR_MAX_SIZE + 1), Err(()));
+        assert_eq!(
+            sched_attr_effective_size(sched_attr_max_size() + 1),
+            Err(())
+        );
     }
 
     #[test]
@@ -7470,7 +7475,7 @@ mod tests {
             SCHED_ATTR_SIZE_VER0,
             SCHED_ATTR_SIZE_VER1,
             SCHED_ATTR_SIZE_VER1 + 1,
-            SCHED_ATTR_MAX_SIZE,
+            sched_attr_max_size(),
         ] {
             assert_eq!(sched_attr_effective_size(size), Ok(size), "size {}", size);
         }
