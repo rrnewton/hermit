@@ -158,6 +158,7 @@ fn run_with_containment(
         .expect("normal DBT runner")
         .private_environment_prefix(detcore_dbt::PRIVATE_ENV_PREFIX)
         .expect("valid Hermit environment prefix")
+        .private_placement(detcore_dbt::PRIVATE_PLACEMENT)
         .isolated_process_group(isolated)
         .terminate_process_group_on_exit(terminate)
         .tool_answers_brk(true)
@@ -549,6 +550,26 @@ fn dbt_mapping_capture_extra_helper_exit_does_not_restore_eligibility() {
 
 #[test]
 fn dbt_mapping_capture_preserves_legitimate_nonzero_guest_exits() {
+    const CHILD: &str = "HERMIT_TEST_DBT_PLACEMENT_MAPPING_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let probe = super::dbt_placement_probe::Probe::new(false);
+        let (install, bind) = probe.launch();
+        assert!(bind.is_none());
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "mapping_capture_live::dbt_mapping_capture_preserves_legitimate_nonzero_guest_exits",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("HERMIT_INSTALL_DIR", install)
+            .output()
+            .expect("run isolated mapping placement controls");
+        assert!(output.status.success(), "{output:?}");
+        probe.assert_zero(6, false);
+        return;
+    }
     for (isolated, terminate) in [(true, false), (false, false), (false, true)] {
         for status in [101, 125] {
             let script = format!("exit {status}");

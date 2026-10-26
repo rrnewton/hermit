@@ -2771,7 +2771,31 @@ fi
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory (1009), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the fa47603e entry.
-expected_pin=013008c319f9679f337b693713f095db191fc83f
+# CARRY TO ab898f0512fb93516a049e8a94faa9b1f54b0c42 (2026-10-26): from
+# 013008c319f9679f337b693713f095db191fc83f. One commit (DBT lane, dh-xev2x;
+# 0f8c4e4c rebased onto 013008c3, patch-id identical): the branch-facts
+# mutant's bootstrap header is preserved. It changes the
+# reverie-dbt/tests/original_branch_facts.rs fixture only.
+# CARRY TO cac18db225ca059db61305cbb1446dc834203745 (2026-10-26): from
+# ab898f0512fb93516a049e8a94faa9b1f54b0c42. One commit (DBT lane, dh-xev2x;
+# 044c53d7 rebased onto ab898f05, patch-id identical): private placement is
+# now selected by the caller. Hermit explicitly requests zero offset; generic
+# runners use the SDK default. It changes reverie-dbt/src (launcher.rs,
+# lib.rs), README.md and tests, and adds three test/fixture files
+# (tests/private_placement_live.rs, tests/fixtures/private_placement/
+# CMakeLists.txt and client.c), so the inventory moves 1009 -> 1012. git diff
+# is empty under third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml; both repository inputs to the DynamoRIO content key are
+# byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# The native client and native CMakeLists.txt are unchanged. With CMAKE=cmake,
+# CMAKE_GENERATOR unset and SOURCE_DATE_EPOCH=0, SDK recipe a0f4981c and its
+# calibrated cold-build budget/job limits carry unchanged from the 013008c3
+# entry. The reused SDK is not a new cold-build calibration; fresh Rust, real
+# option queries and all three Hermit constructor controls are checked
+# separately.
+expected_pin=cac18db225ca059db61305cbb1446dc834203745
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

@@ -9,6 +9,10 @@
 #[path = "common/exec_posix_timers.rs"]
 mod exec_posix_timers;
 
+#[cfg(feature = "dbt")]
+#[path = "common/dbt_placement_probe.rs"]
+mod dbt_placement_probe;
+
 #[path = "common/fault_sites.rs"]
 mod fault_sites;
 
@@ -10198,6 +10202,112 @@ fn run_dbt_verify_returns_with_blocked_stdin_source_after_both_runs() {
     );
     assert_eq!(report["comparison"]["strictness"], "canonical");
     assert_eq!(report["comparison"]["compare_io_buffers"], true);
+}
+
+#[test]
+#[cfg(feature = "dbt")]
+fn run_dbt_private_placement_preserves_cli_echo() {
+    assert!(!dbt_unavailable(
+        "run_dbt_private_placement_preserves_cli_echo"
+    ));
+    let _guard = hermit_run_guard();
+    let probe = dbt_placement_probe::Probe::new(true);
+    let (install, bind) = probe.launch();
+    let bind = bind.expect("CLI observation needs its explicit writable bind");
+    let args = [
+        "--backend=dbt",
+        "run",
+        bind.as_str(),
+        "--",
+        "/bin/echo",
+        "hello",
+    ];
+    let mut command = hermit_command(&args);
+    command
+        .env("HERMIT_INSTALL_DIR", install)
+        .env("HERMIT_REQUIRE_DBT", "1");
+    let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+    assert_success(&output, &args);
+    assert_eq!(output.stdout, b"hello\n");
+    probe.assert_zero(1, false);
+}
+
+#[test]
+#[cfg(feature = "dbt")]
+fn run_dbt_private_placement_preserves_stdin_verification() {
+    assert!(!dbt_unavailable(
+        "run_dbt_private_placement_preserves_stdin_verification"
+    ));
+    let _guard = hermit_run_guard();
+    let probe = dbt_placement_probe::Probe::new(true);
+    let (install, bind) = probe.launch();
+    let bind = bind.expect("CLI observation needs its explicit writable bind");
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report_path = root.path().join("verdict.json");
+    let args = [
+        "--backend=dbt",
+        "run",
+        bind.as_str(),
+        "--strict",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        report_path.to_str().unwrap(),
+        "--",
+        "/bin/cat",
+    ];
+    // The existing pipe helper closes its writer after these bytes. Cat must
+    // read that EOF in both executions; output must be emitted only once.
+    let input = b"first\0line\nlast-without-newline\xff";
+    // Same pipe/EOF ownership as hermit_with_stdin, with only child-local staging.
+    let output = hermit_test::hermit_output_with(&format!("hermit {args:?}"), || {
+        let mut command = hermit_command(&args);
+        let mut child = command
+            .env("HERMIT_INSTALL_DIR", install)
+            .env("HERMIT_REQUIRE_DBT", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+        child
+            .stdin
+            .take()
+            .expect("hermit stdin should be piped")
+            .write_all(input)
+            .expect("failed to write hermit stdin");
+        let output = child
+            .wait_with_output()
+            .unwrap_or_else(|error| panic!("failed to wait for hermit with {args:?}: {error}"));
+        (output, ())
+    })
+    .0;
+    assert_success(&output, &args);
+    assert_eq!(output.stdout, input);
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(report_path).unwrap()).unwrap();
+    assert_eq!(report["verdict"], "matched", "{report}");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+    assert_eq!(report["comparison"]["strictness"], "canonical");
+    assert_eq!(report["comparison"]["compare_io_buffers"], true);
+    for side in ["left", "right"] {
+        assert_eq!(report["compared_outputs"][side]["exit_code"], 0, "{report}");
+        assert_eq!(
+            report["compared_outputs"][side]["stdout_bytes"],
+            input.len(),
+            "{report}"
+        );
+        assert_eq!(
+            report["compared_outputs"][side]["stdout_sha256"],
+            detcore::Digest::new(input).to_string(),
+            "{report}"
+        );
+        assert!(
+            report["compared_log_messages"][side].as_u64().unwrap() > 0,
+            "{report}"
+        );
+    }
+    probe.assert_zero(2, true);
 }
 
 #[test]

@@ -17,6 +17,10 @@
 #[cfg(feature = "liteinst")]
 reverie_liteinst::declare_legacy_tool_backing!();
 
+#[cfg(all(test, feature = "dbt"))]
+#[path = "../tests/common/dbt_placement_probe.rs"]
+mod dbt_placement_probe;
+
 mod backend_stats;
 pub mod build_info;
 pub mod canonical_verdict;
@@ -4186,6 +4190,7 @@ async fn run_dbt(
             )
         })?
         .private_environment_prefix(detcore_dbt::PRIVATE_ENV_PREFIX)?
+        .private_placement(detcore_dbt::PRIVATE_PLACEMENT)
         .summary(print_summary)
         .isolated_process_group(panic_on_unsupported_syscalls)
         .tool_answers_brk(true)
@@ -9669,6 +9674,77 @@ mod tests {
             );
             assert_eq!(printed, "HERMIT_APP_VISIBLE=known\n");
         }
+    }
+
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn dbt_private_placement_preserves_library_dispatch() {
+        use clap::Parser;
+
+        Backend::Dbt
+            .ensure_available()
+            .expect("DBT placement control requires the real packaged runtime");
+        const CHILD: &str = "HERMIT_TEST_DBT_PLACEMENT_LIBRARY_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let probe = super::dbt_placement_probe::Probe::new(false);
+            let (install, bind) = probe.launch();
+            assert!(bind.is_none());
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::dbt_private_placement_preserves_library_dispatch",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("HERMIT_INSTALL_DIR", install)
+                .env("HERMIT_REQUIRE_DBT", "1")
+                .output()
+                .expect("run isolated DBT library placement and output checks");
+            let diagnostics = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{output:?}");
+            assert!(
+                diagnostics
+                    .lines()
+                    .filter(|line| line.starts_with("reverie-dbt: tool=Detcore "))
+                    .count()
+                    >= 2,
+                "DBT native summaries did not prove both Detcore dispatches: {diagnostics}"
+            );
+            assert!(!diagnostics.contains("guest-stderr"), "{diagnostics}");
+            probe.assert_zero(2, false);
+            return;
+        }
+
+        let mut command = super::Command::new("/bin/echo");
+        command.arg("hello");
+        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
+        config.sequentialize_threads = true;
+        config.validate();
+        let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
+            .expect("run /bin/echo through DbtGuest<Detcore>");
+
+        // Include captured output so a failed backend launch reports its diagnostics.
+        assert_eq!(
+            output.status,
+            super::ExitStatus::Exited(0),
+            "guest did not exit 0.\n--- guest stderr ---\n{}\n--- guest stdout ---\n{}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout),
+        );
+        assert_eq!(output.stdout, b"hello\n");
+        assert_eq!(output.stderr, b"");
+
+        let mut command = super::Command::new("/bin/sh");
+        command.args(["-c", "printf 'guest-stderr\\n' >&2"]);
+        let mut config = super::DetConfig::parse_from(["hermit-dbt-test"]);
+        config.sequentialize_threads = true;
+        config.validate();
+        let output = super::run_with_output_backend(command, config, true, &None, Backend::Dbt)
+            .expect("capture nonempty guest stderr through DbtGuest<Detcore>");
+        assert_eq!(output.status, super::ExitStatus::Exited(0), "{output:?}");
+        assert_eq!(output.stdout, b"");
+        assert_eq!(output.stderr, b"guest-stderr\n");
     }
 
     #[test]

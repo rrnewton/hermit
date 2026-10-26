@@ -440,6 +440,14 @@ pub const DETCONFIG_ENV: &str = "HERMIT_DBT_DETCONFIG";
 /// This policy does not hide the broader `HERMIT_` namespace.
 pub const PRIVATE_ENV_PREFIX: &str = "HERMIT_DBT_";
 
+/// Hermit's private runtime placement policy for DBT launches.
+///
+/// Preserve the historical zero-offset request without making it the generic
+/// runner default. DynamoRIO still owns reservation, relocation and failure
+/// handling; this choice does not promise a fixed address.
+pub const PRIVATE_PLACEMENT: reverie_dbt::DbtPrivatePlacement =
+    reverie_dbt::DbtPrivatePlacement::NoRandomOffset;
+
 /// Where the effective Detcore [`Config`] came from, for native diagnostics.
 enum ConfigSource {
     /// Received from the coordinator through its existing first Config frame.
