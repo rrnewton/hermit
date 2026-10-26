@@ -77,6 +77,12 @@ pub(crate) struct MemoryMetadata {
     /// A fork copies the address space, keys included; an exec replaces it.
     #[serde(default)]
     pub(crate) protection_keys: bool,
+    /// aarch64: the file-backed ranges `crate::store_exclusive` has seen in
+    /// this address space, and whether each was scanned for exclusive pairs.
+    /// Not part of the serialized model.
+    #[cfg(target_arch = "aarch64")]
+    #[serde(skip)]
+    pub(crate) exclusive_scan: crate::store_exclusive::ScannedRanges,
 }
 
 /// Detcore's model of a process's program break: where Linux starts it for

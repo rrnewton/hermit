@@ -8,6 +8,7 @@
 
 //! Summaries of complete hermit runs.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -216,6 +217,78 @@ pub struct RunSummary {
     /// the run replayed nothing. Not part of the human-readable summary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_inputs_changed: Vec<HostInputChange>,
+    /// aarch64: the load/store exclusive pairs (LL/SC retry loops) in the
+    /// guest's executable file mappings, by guest path. A function of the
+    /// files' bytes, so it is in the INFO view. Empty elsewhere.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exclusive_pairs: BTreeMap<String, u64>,
+
+    /// **Nondeterministic:** aarch64, in runs that record or replay
+    /// preemptions: the store-exclusives the guest failed, each of which
+    /// retried its loop and added retired branches, and those it executed.
+    /// Host interrupts decide them, so they are shown in the full report but
+    /// not in the INFO view `--verify` compares. Absent where not counted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_exclusives: Option<StoreExclusiveCounts>,
+
+    /// aarch64: why `store_exclusives` could not be counted in a run that
+    /// records or replays preemptions. Full report only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_exclusives_unavailable: Option<String>,
+}
+
+/// The store-exclusives a run's guest speculatively executed that failed,
+/// and all it executed (aarch64 `STREX_FAIL_SPEC` and `STREX_SPEC`).
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct StoreExclusiveCounts {
+    /// Store-exclusives that failed.
+    pub failed: u64,
+    /// Store-exclusives executed, where the core counts them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executed: Option<u64>,
+    /// Whether the counters were on a PMU counter for the whole run: not
+    /// when the PMU multiplexed them, or the guest ran on CPUs whose PMU
+    /// does not count these events. Then the counts cover only part of it.
+    pub fully_counted: bool,
+}
+
+impl fmt::Display for StoreExclusiveCounts {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let StoreExclusiveCounts {
+            failed,
+            executed,
+            fully_counted,
+        } = self;
+        let executed = executed.map(|executed| counted(executed, "store-exclusive"));
+        match (*failed, executed) {
+            (0, Some(executed)) => write!(f, "{executed} executed, none failed")?,
+            (0, None) => write!(f, "No store-exclusive failed")?,
+            (failed, executed) => {
+                let failed = counted(failed, "store-exclusive failure");
+                write!(f, "{failed}; replay may diverge")?;
+                if let Some(executed) = executed {
+                    write!(f, " ({executed} executed)")?;
+                }
+            }
+        }
+        if !fully_counted {
+            write!(
+                f,
+                "; not counted for the whole run (multiplexed, or the task ran on CPUs whose \
+                 PMU does not carry these events)"
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// `count` and `noun`, plural unless the count is 1.
+fn counted(count: u64, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
 }
 
 /// The full human-readable report, including recorded launch configuration.
@@ -281,6 +354,9 @@ impl RunSummary {
             syscall_histogram: _,
             host_inputs: _,
             host_inputs_changed: _,
+            exclusive_pairs,
+            store_exclusives,
+            store_exclusives_unavailable,
         } = self;
         writeln!(f, "Final thread-tree was: {}", threads_descrip)?;
         writeln!(
@@ -307,6 +383,25 @@ impl RunSummary {
 
         if include_report_metadata && let Some(preemption) = preemption {
             writeln!(f, "{preemption}")?;
+        }
+
+        if include_report_metadata {
+            if let Some(counts) = store_exclusives {
+                writeln!(f, "{counts}")?;
+            }
+            if let Some(reason) = store_exclusives_unavailable {
+                writeln!(f, "Store-exclusives were not counted: {reason}")?;
+            }
+        }
+        if !exclusive_pairs.is_empty() {
+            writeln!(
+                f,
+                "Store-exclusive (LL/SC) pairs in executable mappings of {} file(s):",
+                exclusive_pairs.len()
+            )?;
+            for (path, pairs) in exclusive_pairs {
+                writeln!(f, "  {path}: {pairs}")?;
+            }
         }
 
         if let Some(txt) = desync_descrip {
@@ -379,9 +474,12 @@ Timeslice stats: min=199999995ns max=200000000ns mean=199999998ns count=4
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::PathEvidence;
     use super::PreemptionSummary;
     use super::RunSummary;
+    use super::StoreExclusiveCounts;
     use super::TimesliceStats;
 
     #[test]
@@ -593,5 +691,120 @@ mod tests {
             assert!(summary.to_string().contains(expected));
             assert_eq!(summary.info(None).to_string(), baseline_info);
         }
+    }
+
+    #[test]
+    fn store_exclusive_pairs_are_in_both_views_and_counts_only_in_the_full_report() {
+        let baseline = RunSummary {
+            syscalls: Some(7),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&baseline).unwrap();
+        for key in [
+            "exclusive_pairs",
+            "store_exclusives",
+            "store_exclusives_unavailable",
+        ] {
+            assert!(value.get(key).is_none(), "{key}");
+        }
+        assert!(!baseline.to_string().contains("tore-exclusive"));
+
+        let pairs = RunSummary {
+            exclusive_pairs: BTreeMap::from([
+                ("/lib64/libc.so.6".to_owned(), 38),
+                ("/bin/guest".to_owned(), 2),
+            ]),
+            ..baseline.clone()
+        };
+        let listing = "Store-exclusive (LL/SC) pairs in executable mappings of 2 file(s):\n  \
+                       /bin/guest: 2\n  /lib64/libc.so.6: 38\n";
+        assert!(pairs.info(None).to_string().contains(listing));
+        assert!(pairs.to_string().contains(listing));
+
+        for (counts, line, json) in [
+            (
+                StoreExclusiveCounts {
+                    failed: 20,
+                    executed: Some(10_000_020),
+                    fully_counted: true,
+                },
+                "20 store-exclusive failures; replay may diverge (10000020 store-exclusives \
+                 executed)\n",
+                serde_json::json!({"failed": 20, "executed": 10_000_020, "fully_counted": true}),
+            ),
+            (
+                StoreExclusiveCounts {
+                    failed: 0,
+                    executed: Some(2),
+                    fully_counted: true,
+                },
+                "2 store-exclusives executed, none failed\n",
+                serde_json::json!({"failed": 0, "executed": 2, "fully_counted": true}),
+            ),
+            (
+                StoreExclusiveCounts {
+                    failed: 0,
+                    executed: Some(1),
+                    fully_counted: true,
+                },
+                "1 store-exclusive executed, none failed\n",
+                serde_json::json!({"failed": 0, "executed": 1, "fully_counted": true}),
+            ),
+            (
+                StoreExclusiveCounts {
+                    failed: 3,
+                    executed: None,
+                    fully_counted: true,
+                },
+                "3 store-exclusive failures; replay may diverge\n",
+                serde_json::json!({"failed": 3, "fully_counted": true}),
+            ),
+            (
+                StoreExclusiveCounts {
+                    failed: 0,
+                    executed: None,
+                    fully_counted: true,
+                },
+                "No store-exclusive failed\n",
+                serde_json::json!({"failed": 0, "fully_counted": true}),
+            ),
+            (
+                StoreExclusiveCounts {
+                    failed: 1,
+                    executed: Some(9),
+                    fully_counted: false,
+                },
+                "1 store-exclusive failure; replay may diverge (9 store-exclusives executed); \
+                 not counted for the whole run (multiplexed, or the task ran on CPUs whose PMU \
+                 does not carry these events)\n",
+                serde_json::json!({"failed": 1, "executed": 9, "fully_counted": false}),
+            ),
+        ] {
+            let counted = RunSummary {
+                store_exclusives: Some(counts),
+                ..pairs.clone()
+            };
+            assert!(counted.to_string().contains(line), "{counted}");
+            assert_eq!(counted.info(None).to_string(), pairs.info(None).to_string());
+            let value = serde_json::to_value(&counted).unwrap();
+            assert_eq!(value["store_exclusives"], json);
+            let parsed: RunSummary = serde_json::from_value(value).unwrap();
+            assert_eq!(parsed.store_exclusives, Some(counts));
+            assert_eq!(parsed.exclusive_pairs, pairs.exclusive_pairs);
+        }
+
+        let unavailable = RunSummary {
+            store_exclusives_unavailable: Some("no PMU".to_owned()),
+            ..pairs.clone()
+        };
+        assert!(
+            unavailable
+                .to_string()
+                .contains("Store-exclusives were not counted: no PMU\n")
+        );
+        assert_eq!(
+            unavailable.info(None).to_string(),
+            pairs.info(None).to_string()
+        );
     }
 }

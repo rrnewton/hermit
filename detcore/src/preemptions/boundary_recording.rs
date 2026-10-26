@@ -284,6 +284,12 @@ impl HistoryReader {
     {
         self.0.metadata().callback_checkpoints()
     }
+
+    /// The store-exclusives that failed in the recorded run.
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) fn store_exclusive_failures(&self) -> u64 {
+        self.0.metadata().store_exclusive_failures()
+    }
 }
 
 impl std::fmt::Display for HistoryReader {

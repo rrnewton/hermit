@@ -108,6 +108,39 @@ pub struct PreemptionRecord {
     /// records synthesized in memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     host_inputs: Option<HostInputSet>,
+    /// The store-exclusives that failed in the run that produced this record
+    /// (aarch64, `STREX_FAIL_SPEC`). Each retried a load/store exclusive loop
+    /// and so added retired branches the run's preemption points count, so a
+    /// replay of this record may diverge; a replay warns at its start when it
+    /// is nonzero. Zero, and absent, for a run that counted none, for other
+    /// architectures, and for records written before the field existed.
+    #[serde(default, skip_serializing_if = "HostObservedCount::is_zero")]
+    store_exclusive_failures: HostObservedCount,
+}
+
+/// A count a record's run observed on its host rather than decided: it is
+/// kept in the record but compares and hashes as equal whatever its value,
+/// so that records of two runs of one schedule stay equal.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+struct HostObservedCount(u64);
+
+impl HostObservedCount {
+    fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl PartialEq for HostObservedCount {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for HostObservedCount {}
+
+impl std::hash::Hash for HostObservedCount {
+    fn hash<H: std::hash::Hasher>(&self, _: &mut H) {}
 }
 
 impl std::fmt::Display for PreemptionRecord {
@@ -131,6 +164,7 @@ impl PreemptionRecord {
             rng_seed: None,
             expired_wait_runs_charged_once: false,
             host_inputs: None,
+            store_exclusive_failures: HostObservedCount::default(),
         }
     }
 
@@ -176,6 +210,12 @@ impl PreemptionRecord {
     /// The host files the recorded run's guest opened, if the record says.
     pub fn host_inputs(&self) -> Option<&HostInputSet> {
         self.host_inputs.as_ref()
+    }
+
+    /// The store-exclusives that failed in the run this record came from
+    /// (zero where none were counted).
+    pub fn store_exclusive_failures(&self) -> u64 {
+        self.store_exclusive_failures.0
     }
 
     /// The same record, stating whether the copy was on in the trials it
@@ -270,6 +310,8 @@ impl PreemptionRecord {
             rng_seed: self.rng_seed,
             expired_wait_runs_charged_once: self.expired_wait_runs_charged_once,
             host_inputs: self.host_inputs.clone(),
+            // A count of this run's host, not part of the preemptions.
+            store_exclusive_failures: HostObservedCount::default(),
         }
     }
 
@@ -334,6 +376,7 @@ impl PreemptionRecord {
             rng_seed: None,
             expired_wait_runs_charged_once: false,
             host_inputs: None,
+            store_exclusive_failures: HostObservedCount::default(),
         }
     }
 
@@ -965,6 +1008,48 @@ mod tests {
         }
     }
 
+    /// The run's failed store-exclusives ride in a record so that a replay
+    /// can label a divergence: written only when nonzero, so a record of a
+    /// run without failures is byte-for-byte what it was before the field,
+    /// and read as zero from records that lack it. The count is the host's,
+    /// so it never makes two records unequal, and a copy of the preemptions
+    /// alone does not carry it.
+    #[test]
+    fn store_exclusive_failures_round_trip_and_legacy_records_have_none() {
+        let none = PreemptionWriter::new(None).with_signal_state_copy(true);
+        let legacy = none.into_string();
+        assert!(!legacy.contains("store_exclusive_failures"), "{legacy}");
+        let back: PreemptionRecord = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(back.store_exclusive_failures(), 0);
+
+        let mut zero = PreemptionWriter::new(None).with_signal_state_copy(true);
+        zero.record_store_exclusive_failures(0);
+        assert_eq!(zero.into_string(), legacy);
+
+        let mut writer = PreemptionWriter::new(None).with_signal_state_copy(true);
+        writer.record_store_exclusive_failures(20);
+        let written = writer.into_string();
+        assert!(
+            written.contains("\"store_exclusive_failures\":20"),
+            "{written}"
+        );
+        let back: PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert_eq!(back.store_exclusive_failures(), 20);
+        assert_eq!(back.to_string(), written);
+        assert_eq!(back.clone_preemptions_only().store_exclusive_failures(), 0);
+
+        let without: PreemptionRecord = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(back, without);
+        let hash = |record: &PreemptionRecord| {
+            use std::hash::Hash;
+            use std::hash::Hasher;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            record.hash(&mut hasher);
+            hasher.finish()
+        };
+        assert_eq!(hash(&back), hash(&without));
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1151)
     #[test]
@@ -1479,6 +1564,12 @@ impl PreemptionWriter {
     /// and before the record is flushed.
     pub fn set_host_inputs(&mut self, inputs: HostInputSet) {
         self.inner.host_inputs = Some(inputs);
+    }
+
+    /// Store the store-exclusives that failed in the run (aarch64), counted
+    /// once every thread has exited.
+    pub fn record_store_exclusive_failures(&mut self, failures: u64) {
+        self.inner.store_exclusive_failures = HostObservedCount(failures);
     }
 
     /// Does the record have zero entries?
