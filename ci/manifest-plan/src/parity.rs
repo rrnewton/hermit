@@ -3390,10 +3390,13 @@ fn evaluate_history(
         ObservedResult::Oom => Some(UnavailableClass::Oom),
         ObservedResult::InfrastructureError => Some(UnavailableClass::InfrastructureError),
         ObservedResult::SandboxDenied => Some(UnavailableClass::SandboxDenied),
+        // A chaos-floor failure is a chaos cell's result; a verify row never
+        // carries one.
         ObservedResult::Pass
         | ObservedResult::DeterminismFailure
         | ObservedResult::ParityFailure
-        | ObservedResult::ReplayFailure => None,
+        | ObservedResult::ReplayFailure
+        | ObservedResult::ChaosFloorFailure => None,
     });
     let result = row.result.map_or_else(
         || "no typed result".to_string(),
