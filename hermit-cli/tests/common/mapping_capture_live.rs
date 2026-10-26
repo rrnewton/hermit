@@ -132,6 +132,12 @@ fn run_with_containment(
         ("LANG".into(), "C".into()),
         ("LC_ALL".into(), "C".into()),
         ("HERMIT_LOG".into(), "error".into()),
+        // As every Hermit DBT launch announces it: the runtime refuses a
+        // coordinator that does not.
+        (
+            detcore_dbt::CONFIG_FINGERPRINT_ENV.into(),
+            detcore::config_wire_fingerprint().into(),
+        ),
     ]);
     // Pending-completion errors can be returned after captured guest output
     // was collected. Keep native records in the runner's separate real channel.

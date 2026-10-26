@@ -926,9 +926,21 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/inotify_rename_cookies.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on every backend; ci=true)",
+      "why": "tests/c/inotify_rename_cookies.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: a readv with overlapping iovecs must leave exactly Linux's bytes; five inotify instances, two created later and one in a forked child that sees a rename before the parent, read with read (a pair split over two reads among them), readv over three iovecs and preadv2 at offset -1, must see each rename's IN_MOVED_FROM and IN_MOVED_TO share one nonzero cookie, four renames get four cookies, every instance agrees, and the cookie values must repeat in every run (https://github.com/rrnewton/hermit/issues/4765)"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/inotify_watch.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/inotify_watch.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/c/inotify_write_only_buffer.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and kvm; ci=true)",
+      "why": "tests/c/inotify_write_only_buffer.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: an inotify read into a write-only page must succeed and carry the same rename cookie as another instance's read into an ordinary buffer, with values that repeat in every run (https://github.com/rrnewton/hermit/issues/4765)"
     },
     {
       "disposition": "manifest-test",

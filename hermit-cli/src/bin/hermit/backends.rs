@@ -956,6 +956,11 @@ impl DbtInvocation {
                 "failed to prepare the Detcore DynamoRIO client: {error}"
             ))
         })?;
+        let runtime = detcore_dbt::runtime_library_path().map_err(|error| {
+            Error::msg(format!("failed to find the Detcore DBT runtime: {error}"))
+        })?;
+        hermit::require_dbt_runtime_fingerprint_check(&runtime)
+            .map_err(|error| Error::msg(format!("{error:#}")))?;
         let mut config = config.clone();
         hermit::declare_dbt_launcher(&mut config, &drrun)
             .map_err(|error| Error::msg(format!("{error:#}")))?;
@@ -1041,6 +1046,13 @@ impl DbtInvocation {
 
         let mut guest = StdCommand::new(program);
         environment.remove(OsStr::new("HERMIT_LOG_FILE"));
+        // The runtime checks this against its own build before it reads the
+        // configuration frame (`detcore_dbt::CONFIG_FINGERPRINT_ENV`); the
+        // runner's private prefix keeps it from the guest.
+        environment.insert(
+            detcore_dbt::CONFIG_FINGERPRINT_ENV.into(),
+            detcore::config_wire_fingerprint().into(),
+        );
         apply_exact_environment(&mut guest, &environment);
         guest.args(args);
         apply_dbt_workdir(&mut guest, workdir);
