@@ -27,7 +27,8 @@
 //! too: writable text is either a loader quirk or a runtime that rewrites
 //! itself, and rewriting it would race whatever writes it.
 //!
-//! A sequence any relocation points into is refused as well. A relocation is
+//! A sequence any relocation points into is refused as well. Relocations are
+//! read as 64-bit little-endian, the only aarch64 ELF this rewriter handles. A relocation is
 //! the loader's licence to change those bytes at load time, which would
 //! overwrite part of a rewritten sequence with something computed for the
 //! original one.
@@ -133,51 +134,9 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
             })
             .map(|ph| (ph.p_vaddr, ph.p_vaddr.saturating_add(ph.p_memsz)))
             .collect();
-        // SHT_RELR = 19: packed relative relocations, which the ELF reader
-        // does not report. The format is its own: an even entry is an
-        // address, and each odd entry that follows is a bitmap of the next
-        // 63 words after it. Decode them rather than refuse the image, since
-        // every aarch64 system binary now uses them.
-        for sh in &elf.section_headers {
-            if sh.sh_type != 19 || sh.sh_size == 0 {
-                continue;
-            }
-            let (start, end) = (sh.sh_offset as usize, (sh.sh_offset + sh.sh_size) as usize);
-            if end > bytes.len() {
-                relr_unreadable = true;
-                continue;
-            }
-            let mut where_ = 0u64;
-            for entry in bytes[start..end].as_chunks::<8>().0 {
-                let entry = u64::from_le_bytes(*entry);
-                if entry & 1 == 0 {
-                    relocated.push((entry, entry + 8));
-                    where_ = entry + 8;
-                    continue;
-                }
-                let mut bits = entry >> 1;
-                let mut at = where_;
-                while bits != 0 {
-                    if bits & 1 == 1 {
-                        relocated.push((at, at + 8));
-                    }
-                    bits >>= 1;
-                    at += 8;
-                }
-                where_ += 63 * 8;
-            }
-        }
-        if elf.section_headers.is_empty() {
-            let mut report = FileReport::default();
-            report
-                .skipped_segments
-                .push("the file has no section headers, so code cannot be told from data".into());
-            return Ok(Some(report));
-        }
         // A relocation's own width is not in the entry, so take the widest
         // aarch64 relocation (8 bytes): any sequence those bytes touch is
-        // refused. DT_RELR entries are not in goblin's lists, so an image
-        // that has a .relr.dyn section is refused wholesale further down.
+        // refused.
         relocated = elf
             .shdr_relocs
             .iter()
@@ -187,6 +146,35 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
             .chain(elf.pltrelocs.iter().map(|reloc| reloc.r_offset))
             .map(|offset| (offset, offset + 8))
             .collect();
+        // SHT_RELR = 19: packed relative relocations, which the ELF reader
+        // does not report, so they are decoded here and ADDED to that list.
+        // The format is its own: an even entry is an address, and each odd
+        // entry after it is a bitmap of the 63 words that follow. Decoding
+        // them keeps the images that use them (every current aarch64 system
+        // binary) rewritable instead of refusing them whole.
+        for sh in &elf.section_headers {
+            if sh.sh_type != 19 || sh.sh_size == 0 {
+                continue;
+            }
+            let Some(end) = sh
+                .sh_offset
+                .checked_add(sh.sh_size)
+                .and_then(|end| usize::try_from(end).ok())
+                .filter(|end| *end <= bytes.len())
+            else {
+                relr_unreadable = true;
+                continue;
+            };
+            let start = sh.sh_offset as usize;
+            relocated.extend(decode_relr(&bytes[start..end]));
+        }
+        if elf.section_headers.is_empty() {
+            let mut report = FileReport::default();
+            report
+                .skipped_segments
+                .push("the file has no section headers, so code cannot be told from data".into());
+            return Ok(Some(report));
+        }
         elf.section_headers
             .iter()
             .filter(|sh| {
@@ -209,10 +197,14 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
     let section_targets: Vec<std::collections::HashSet<u64>> = sections
         .iter()
         .map(|(offset, filesz, vaddr, _)| {
-            let (start, end) = (*offset as usize, (*offset + *filesz) as usize);
-            if end > bytes.len() || !start.is_multiple_of(4) {
+            let start = *offset as usize;
+            let Some(end) = offset
+                .checked_add(*filesz)
+                .and_then(|end| usize::try_from(end).ok())
+                .filter(|end| *end <= bytes.len() && start.is_multiple_of(4))
+            else {
                 return std::collections::HashSet::new();
-            }
+            };
             let words: Vec<u32> = (0..(end - start) / 4)
                 .map(|i| {
                     let at = start + 4 * i;
@@ -300,6 +292,35 @@ pub fn rewrite_bytes(bytes: &mut [u8]) -> Result<Option<FileReport>, goblin::err
     Ok(Some(report))
 }
 
+/// The byte ranges a packed relative relocation section covers.
+///
+/// An even entry is an address and covers its own eight bytes; each odd
+/// entry after it is a bitmap whose set bits name the words following that
+/// address, 63 at a time.
+fn decode_relr(section: &[u8]) -> Vec<(u64, u64)> {
+    let mut covered = Vec::new();
+    let mut next = 0u64;
+    for entry in section.as_chunks::<8>().0 {
+        let entry = u64::from_le_bytes(*entry);
+        if entry & 1 == 0 {
+            covered.push((entry, entry.saturating_add(8)));
+            next = entry.saturating_add(8);
+            continue;
+        }
+        let mut bits = entry >> 1;
+        let mut at = next;
+        while bits != 0 {
+            if bits & 1 == 1 {
+                covered.push((at, at.saturating_add(8)));
+            }
+            bits >>= 1;
+            at = at.saturating_add(8);
+        }
+        next = next.saturating_add(63 * 8);
+    }
+    covered
+}
+
 /// Write already-rewritten bytes to `output`, with `source`'s permissions.
 ///
 /// The file is written whole under a temporary name the filesystem
@@ -333,4 +354,33 @@ pub fn rewrite_file(
     };
     write_rewritten(output.as_ref(), &bytes, input)?;
     Ok(Some(report))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A relocation section's entries must be seen, including the packed
+    /// relative ones the ELF reader does not report. The check here is on
+    /// the decoder itself rather than a whole synthetic ELF: an address
+    /// entry names its own eight bytes, and the odd entry after it is a
+    /// bitmap of the 63 words that follow.
+    #[test]
+    fn packed_relative_relocations_decode_to_the_bytes_they_cover() {
+        let section: Vec<u8> = [0x1000u64, (0b1011 << 1) | 1]
+            .iter()
+            .flat_map(|entry| entry.to_le_bytes())
+            .collect();
+        assert_eq!(
+            decode_relr(&section),
+            vec![
+                (0x1000, 0x1008),
+                // The bitmap starts at the word after the address, and its
+                // set bits are words 0, 1 and 3 from there.
+                (0x1008, 0x1010),
+                (0x1010, 0x1018),
+                (0x1020, 0x1028),
+            ]
+        );
+    }
 }
