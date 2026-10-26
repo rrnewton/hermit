@@ -13261,16 +13261,17 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
             ))
             .is_some_and(|budget| budget.attempts.is_some())
     };
-    // SaBRe has disabled, red and green verify cells. This fixture used
+    // DBT has disabled, red and green verify cells. This fixture used
     // liteinst until every liteinst cell was switched off for the in-guest
-    // reset (https://github.com/rrnewton/hermit/issues/3520).
+    // reset (https://github.com/rrnewton/hermit/issues/3520), then SaBRe until
+    // SaBRe was archived on 2026-10-25 and kept no green cell.
     let mut ids: Vec<_> = tracked
         .cells
         .iter()
         .filter(|cell| {
             !cell.is_applicable()
                 && cell.status == "not-applicable"
-                && cell.id.backend == "sabre"
+                && cell.id.backend == "dbt"
                 && cell.id.mode == "verify"
                 && executable(cell)
         })
@@ -13278,7 +13279,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         .map(|cell| cell.id.clone())
         .collect();
     if ids.len() != 2 {
-        return Err("disabled cells-file self-test needs two executable SaBRe verify cells".into());
+        return Err("disabled cells-file self-test needs two executable DBT verify cells".into());
     }
     ids.sort();
     let path = scratch.join("disabled-cells.jsonl");
@@ -13293,7 +13294,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         path.to_string_lossy().into_owned(),
         "--probe-disabled".into(),
         "--backend".into(),
-        "sabre".into(),
+        "dbt".into(),
         "--repetitions".into(),
         "10".into(),
         "--jobs".into(),
@@ -13373,13 +13374,13 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
             && executable(cell)
     })?;
     let red = fixture_id(&|cell| {
-        cell.id.backend == "sabre" && cell.status == "red" && cell.is_applicable()
+        cell.id.backend == "dbt" && cell.status == "red" && cell.is_applicable()
     })?;
     let green = fixture_id(&|cell| {
-        cell.id.backend == "sabre" && cell.status == "green" && cell.is_applicable()
+        cell.id.backend == "dbt" && cell.status == "green" && cell.is_applicable()
     })?;
     let unavailable = fixture_id(&|cell| {
-        cell.id.backend == "sabre"
+        cell.id.backend == "dbt"
             && cell.status == "not-applicable"
             && !cell.is_applicable()
             && !executable(cell)
@@ -13390,7 +13391,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         (
             "wrong backend",
             wrong_backend,
-            "does not match --probe-disabled --backend sabre",
+            "does not match --probe-disabled --backend dbt",
         ),
         (
             "not selected by full",
@@ -13491,7 +13492,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         || metadata.unavailable_cells != 0
         || !metadata.probe_disabled
         || metadata.green
-        || metadata.backend.as_deref() != Some("sabre")
+        || metadata.backend.as_deref() != Some("dbt")
         || metadata.cells_file.as_deref() != Some(path.to_string_lossy().as_ref())
         || metadata.cells_file_sha256.as_deref() != Some(file_digest.as_str())
         || metadata.selected_population_sha256.as_deref() != Some(population_digest.as_str())
@@ -13508,11 +13509,11 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         || dag.resource_caps.get("manifest_guest") != Some(&2)
         || cell_steps.iter().any(|step| {
             !step.cmd.contains("--probe-disabled")
-                || !step.cmd.contains("--backend 'sabre'")
+                || !step.cmd.contains("--backend 'dbt'")
                 || step.cmd.contains("--include-manual")
                 || !step.cmd.contains("--require-install")
                 || !step.cmd.contains("E2E_KEEP_VERIFY_LOGS=1")
-                // The SaBRe runtime is staged by build.workspace and
+                // The DBT runtime is staged by build.workspace and
                 // published with the one Hermit binary by build.e2e_artifact.
                 || !step.deps.contains(&"build.e2e_artifact".to_string())
         })

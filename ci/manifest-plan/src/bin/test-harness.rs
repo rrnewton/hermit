@@ -4819,8 +4819,16 @@ rundir.mkdir()
                 "--junit".into(),
                 out.join("junit.xml").display().to_string(),
             ];
-            if fs::read_to_string(fixture.join("scenario")).unwrap() == "skid-no-retry" {
+            let scenario = fs::read_to_string(fixture.join("scenario")).unwrap();
+            if scenario == "skid-no-retry" {
                 values.push("--no-retry".into());
+            }
+            // SaBRe is archived: its cells are the archived run type's, not full's.
+            if scenario == "skid-then-match-sabre" {
+                values.extend([
+                    "--label".into(),
+                    hermit_manifest_plan::archived::ARCHIVED_RUN_TYPE.into(),
+                ]);
             }
             let args = parse(values.into_iter());
             validate_args("run", &args);

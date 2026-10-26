@@ -4869,6 +4869,38 @@ fn derive(root: &Path) -> Result<Derived, String> {
     })
 }
 
+/// The archived execution paths ([`hermit_manifest_plan::archived::ARCHIVED`]),
+/// so the scorecard says why an archived backend has no cell selected by full.
+fn archived_paragraph() -> String {
+    use hermit_manifest_plan::archived::ARCHIVED;
+    use hermit_manifest_plan::archived::ARCHIVED_RUN_TYPE;
+    use hermit_manifest_plan::archived::ArchivedKind;
+    let entries: Vec<String> = ARCHIVED
+        .iter()
+        .map(|entry| {
+            let kind = match entry.kind {
+                ArchivedKind::Backend => "backend",
+                ArchivedKind::PreprocessingWithPtrace => "preprocessing with ptrace, not a backend",
+            };
+            format!(
+                "`{}` ({kind}, archived {}, {})",
+                entry.name, entry.since, entry.schedule
+            )
+        })
+        .collect();
+    if entries.is_empty() {
+        return String::new();
+    }
+    format!(
+        "**Archived:** {}. They get no feature work and their tests left per-commit validation. \
+An archived backend's cells that would be selected by full belong to the `{ARCHIVED_RUN_TYPE}` \
+run type instead, so the table counts them as not selected by full, and the nightly pressure \
+sweep runs them as red cells. `ci/manifest-plan/src/archived.rs` records what still runs per \
+commit.\n\n",
+        entries.join(" and ")
+    )
+}
+
 /// How many selected verify cells declare the stripped comparator, by
 /// category and backend: they are selected, but below L2 and never canonical.
 fn stripped_selected_sentence(derived: &Derived) -> String {
@@ -5392,6 +5424,7 @@ cross-backend parity.\n\n\
         "| **Total** | **{selected_total}** | **{}** | **{na_total}** | **{total}** |\n\n",
         total - selected_total - na_total
     ));
+    out.push_str(&archived_paragraph());
     // DENOMINATOR PROVENANCE. Emitted from the derived population, never
     // hand-written, so it cannot go stale and cannot be forgotten.
     //

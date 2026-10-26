@@ -669,7 +669,9 @@ pub const DEFAULT_RUN_TYPE: &str = "full";
 /// empty. A selection keeps a cell when the cell's run types meet the
 /// selection's `--label`s, and a selection without `--label` selects the
 /// default run type, so a cell labelled only with a focused run type (such as
-/// `sabre-compat-only`) is required there and nowhere else.
+/// `sabre-compat-only`) is required there and nowhere else. On an archived
+/// backend ([`crate::archived`]) the default run type is
+/// [`crate::archived::ARCHIVED_RUN_TYPE`] instead.
 pub fn cell_labels<'a>(
     test: &'a TestRecipe,
     recipe: &'a ModeRecipe,
@@ -681,6 +683,10 @@ pub fn cell_labels<'a>(
     }
     if labels.is_empty() {
         labels.insert(DEFAULT_RUN_TYPE);
+    }
+    if backend.is_some_and(crate::archived::is_archived_backend) && labels.remove(DEFAULT_RUN_TYPE)
+    {
+        labels.insert(crate::archived::ARCHIVED_RUN_TYPE);
     }
     labels
 }
@@ -11846,6 +11852,59 @@ corpus:
         }
     }
 
+    /// A cell on an archived backend (crate::archived) that names no focused
+    /// run type belongs to the archived run type instead of full, so neither
+    /// full validation nor its required plan selects it; a focused label it
+    /// carries is kept, and other backends' cells stay full's.
+    #[test]
+    fn an_archived_backends_cell_leaves_full_for_the_archived_run_type() {
+        use crate::archived::ARCHIVED_RUN_TYPE;
+        let mut test = recipe(true);
+        let mode = test.modes.get_mut("verify").unwrap();
+        mode.backends_enabled.push("sabre".into());
+        mode.backends_disabled.remove("sabre");
+        let mode = &test.modes["verify"];
+        assert_eq!(
+            cell_labels(&test, mode, Some("sabre")),
+            BTreeSet::from([ARCHIVED_RUN_TYPE])
+        );
+        assert_eq!(
+            cell_labels(&test, mode, Some("ptrace")),
+            BTreeSet::from([DEFAULT_RUN_TYPE])
+        );
+        assert!(
+            focused_run_type_reason(&test, mode, Some("sabre"))
+                .is_some_and(|reason| reason.contains(ARCHIVED_RUN_TYPE))
+        );
+        let mut labelled = test.clone();
+        labelled.modes.get_mut("verify").unwrap().labels =
+            BTreeMap::from([("sabre".into(), vec!["sabre-compat-only".into()])]);
+        assert_eq!(
+            cell_labels(&labelled, &labelled.modes["verify"], Some("sabre")),
+            BTreeSet::from(["sabre-compat-only"])
+        );
+        let set = ManifestSet {
+            documents: Vec::new(),
+            tests: BTreeMap::from([(
+                test.id.clone(),
+                ("fixture".into(), 15, DEFAULT_TEST_CPU_TIMEOUT_SECONDS, test),
+            )]),
+        };
+        let backends = |labels: &[&str]| {
+            set.select(&Selection {
+                population: Some(Population::Required),
+                labels: labels.iter().map(|l| l.to_string()).collect(),
+                ..Selection::default()
+            })
+            .unwrap()
+            .into_iter()
+            .map(|cell| cell.id.backend.unwrap())
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(backends(&[]), ["ptrace"]);
+        assert_eq!(backends(&[ARCHIVED_RUN_TYPE]), ["sabre"]);
+    }
+
     #[test]
     fn labels_select_only_the_tests_that_carry_them() {
         let mut strict = recipe(true);
@@ -14949,7 +15008,8 @@ fi
         // Its liteinst and in-guest-trap verify cells join the same day too,
         // from ten clean in-guest verify runs each with the maximum timeslice
         // disabled (https://github.com/rrnewton/hermit/issues/3745), again with
-        // the default timeouts.
+        // the default timeouts. Its SaBRe verify cell left the required
+        // population when SaBRe was archived on 2026-10-25 (crate::archived).
         assert_eq!(
             regular_sink,
             BTreeSet::from([
@@ -14958,7 +15018,6 @@ fi
                 ("verify", Some("kvm")),
                 ("verify", Some("liteinst")),
                 ("verify", Some("ptrace")),
-                ("verify", Some("sabre"))
             ])
         );
         // https://github.com/rrnewton/hermit/pull/3231 qualifies three new
@@ -15010,7 +15069,9 @@ fi
         // (https://github.com/rrnewton/hermit/issues/3606). The checks here
         // are of the named batches' bounds.
         // The SaBRe verify selections of 2026-10-03 have the ordinary bounds,
-        // and the ones that were enabled with ci:false are now required.
+        // and the ones that were enabled with ci:false became required. Since
+        // SaBRe was archived on 2026-10-25 (crate::archived) they are required
+        // by the archived run type instead of full.
         fn sabre_verify<'a>(
             population: &'a [SelectedCell],
             test: &str,
@@ -15021,8 +15082,19 @@ fi
                     && cell.id.backend.as_deref() == Some("sabre")
             })
         }
+        let archived = manifests
+            .select(&Selection {
+                population: Some(Population::Required),
+                labels: vec![crate::archived::ARCHIVED_RUN_TYPE.into()],
+                ..Selection::default()
+            })
+            .unwrap();
         for test in SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS {
-            let cell = sabre_verify(&required, test)
+            assert!(
+                sabre_verify(&required, test).is_none(),
+                "{test} verify/sabre is required by full though SaBRe is archived"
+            );
+            let cell = sabre_verify(&archived, test)
                 .unwrap_or_else(|| panic!("{test} verify/sabre is not required"));
             assert_eq!(cell.cpu_timeout_seconds, DEFAULT_TEST_CPU_TIMEOUT_SECONDS);
             assert_eq!(cell.timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
@@ -21464,12 +21536,6 @@ exit "$(cat "$PWD/exit-status")"
                 "liteinst",
                 "`--no-exec` skips the exec check: in-guest LiteInst refuses execve",
             ),
-            (
-                "c-programs/scm-rights-received-descriptors",
-                "sabre",
-                "`--no-exec` skips the exec check: SaBRe's path evidence does not admit \
-                 the exec'd image's libc sites",
-            ),
         ];
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let manifests = ManifestSet::load(&root).unwrap();
@@ -21498,11 +21564,14 @@ exit "$(cat "$PWD/exit-status")"
             .filter_map(|cell| cell.id.backend.as_deref())
             .collect::<BTreeSet<_>>();
         assert!(
-            ["dbt", "kvm", "sabre"]
+            ["dbt", "kvm"]
                 .iter()
                 .all(|backend| backends.contains(backend)),
             "{backends:?}"
         );
+        // SaBRe is archived (crate::archived): full validation selects none
+        // of its cells, so none is a selected candidate.
+        assert!(!backends.contains("sabre"), "{backends:?}");
         assert!(
             candidates
                 .iter()
