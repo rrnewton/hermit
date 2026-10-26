@@ -926,6 +926,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/inotify_rename_cookies.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on every backend; ci=true)",
+      "why": "tests/c/inotify_rename_cookies.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: two inotify instances, read with read and readv, must see each rename's IN_MOVED_FROM and IN_MOVED_TO share one nonzero cookie, the two renames differ, and the cookie values must repeat in every run (https://github.com/rrnewton/hermit/issues/4765)"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/inotify_watch.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/inotify_watch.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
