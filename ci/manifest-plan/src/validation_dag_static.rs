@@ -1227,7 +1227,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_timed_wait_spread_registers_sleeps_at_the_first_pass_by_default: 1935.
     // And detcore-model's three schedule_replay_options::tests (the
     // expected rows, their consistency, the user guide's copy): 1938.
-    ("test.regular_crates", 1938),
+    // And detcore-model's four schedule_replay_options::tests (the
+    // expected rows, their consistency, the rows code reads, the user
+    // guide's copy): 1939.
+    ("test.regular_crates", 1939),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -6201,7 +6204,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two --chaos-timed-wait-spread config tests: 1920.
     // And the same spread registration config test: 1921.
     // And the same three schedule replay options tests: 1924.
-    ("test.regular_crates_on_host", 1924),
+    // And the same four schedule replay options tests: 1925.
+    ("test.regular_crates_on_host", 1925),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
