@@ -1252,6 +1252,10 @@ pub struct GlobalState {
     // refused (`GlobalRequest::PolicyRefusal`); the first report is kept.
     policy_refusal: Mutex<Option<String>>,
 
+    // The first self-sentinel `pidfd_send_signal` a Tool image refused as
+    // unqualified (`GlobalRequest::PidfdSelfQualificationRefusal`).
+    pidfd_self_qualification_refusal: Mutex<Option<crate::PidfdSelfQualificationRefusal>>,
+
     // The host identity of each file the guest opened in this run, in the
     // order the opens were reported, when `Config::record_host_inputs` is set
     // (see `detcore_model::host_input`). Written to `Config::host_input_log`
@@ -1947,6 +1951,7 @@ impl GlobalState {
             host_diskstats: std::sync::OnceLock::new(),
             procfs_sequences: Mutex::new(BTreeMap::new()),
             policy_refusal: Mutex::new(None),
+            pidfd_self_qualification_refusal: Mutex::new(None),
             host_inputs: Mutex::new(Vec::new()),
             host_mutations: Mutex::new(BTreeSet::new()),
             replay_host_inputs,
@@ -2240,6 +2245,15 @@ impl GlobalState {
     /// it before exiting (`GlobalRequest::PolicyRefusal`).
     pub fn policy_refusal(&self) -> Option<String> {
         self.policy_refusal.lock().unwrap().clone()
+    }
+
+    /// The first self-sentinel `pidfd_send_signal` a Tool image refused
+    /// because its backend could not qualify the sentinel's physical spelling
+    /// (`GlobalRequest::PidfdSelfQualificationRefusal`), taken once.
+    pub fn take_pidfd_self_qualification_refusal(
+        &self,
+    ) -> Option<crate::PidfdSelfQualificationRefusal> {
+        self.pidfd_self_qualification_refusal.lock().unwrap().take()
     }
 
     /// Unrecoverable fatal erorr. Bring things to a close cleanly, but as quickly as
@@ -3911,6 +3925,7 @@ impl GlobalState {
                 GlobalRequest::ParkedProtocolFailure(_)
                     | GlobalRequest::UnrecoverableShutdown
                     | GlobalRequest::PolicyRefusal(_)
+                    | GlobalRequest::PidfdSelfQualificationRefusal(_)
                     | GlobalRequest::StoppingRefusal(_)
             );
 
@@ -4242,6 +4257,17 @@ impl GlobalState {
             }
             GlobalRequest::PolicyRefusal(reason) => {
                 self.policy_refusal.lock().unwrap().get_or_insert(reason);
+                R::PolicyRefusal(())
+            }
+            GlobalRequest::PidfdSelfQualificationRefusal(refusal) => {
+                self.policy_refusal
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(|| refusal.to_string());
+                self.pidfd_self_qualification_refusal
+                    .lock()
+                    .unwrap()
+                    .get_or_insert(refusal);
                 R::PolicyRefusal(())
             }
             // Acted on even from a committed SIGKILL victim (it is in the
@@ -8375,20 +8401,17 @@ pub enum GlobalRequest {
     PlaceholderWriteHint(crate::procfs::fd_directory::PlaceholderLockKey, Option<u64>),
     /// A change to the copies of placeholder descriptions in flight over
     /// `SCM_RIGHTS` (`procfs::locks::LockLedger::placeholder_copies`).
-    /// Appended last.
     PlaceholderCopies(crate::procfs::locks::PlaceholderCopies),
     /// A live task's CPU affinity under `--virtual-cpus`
     /// (`Scheduler::cpu_affinity`). Appended last.
     CpuAffinity(DetTid),
     /// Record a live task's CPU affinity under `--virtual-cpus`, in the turn
     /// of the `sched_setaffinity` that set it (`Scheduler::set_cpu_affinity`).
-    /// Appended last.
     SetCpuAffinity(DetTid, crate::cpu_set::CpuSet),
     /// aarch64: a report of the exclusive pairs in executable mappings, or
     /// the root guest task's first image, where the run's store-exclusive
     /// counters start (`crate::store_exclusive`). It carries no time and changes no scheduler
     /// state, so it is answered before any grant or clock accounting.
-    /// Appended last.
     #[cfg(target_arch = "aarch64")]
     StoreExclusive(crate::store_exclusive::Report),
     /// The threads the send of SIGKILL reservation `token` kills, asked by its
@@ -8405,14 +8428,12 @@ pub enum GlobalRequest {
             MmId,
             crate::syscalls::robust_list::RobustListSnapshot,
         )>,
-    ),
     /// A thread a SIGKILL ended takes the robust list its sender recorded for
     /// it, in its exit callback (`Scheduler::take_sigkill_robust_list`).
     /// Answered before clock accounting. Appended last.
     TakeSigkillRobustList,
     /// Take the ID for the task a clone-family call is about to create, when
     /// Detcore chooses the IDs (`GuestIds::Chosen`), in the caller's turn.
-    /// Appended last.
     NextGuestId,
     /// Report a host-ID outcome or a conservative pre-vfork attempt while
     /// Detcore chooses IDs (`GlobalState::host_id_tasks`). Appended last.
@@ -8437,12 +8458,9 @@ pub enum GlobalRequest {
     /// table (`procfs::locks::LedgerIdentity`,
     /// `procfs::locks::LockLedger::note_locks_taken`). Appended last.
     DescriptionLocksTaken(
-        OpenFileId,
-        Vec<crate::procfs::locks::HeldLock>,
         Vec<crate::procfs::locks::HeldLock>,
         u32,
         crate::procfs::locks::LedgerIdentity,
-    ),
     /// The owner each of these locks, held through this description, shows
     /// on a lock line of a rendered fdinfo
     /// (`procfs::locks::LockLedger::owners`). Appended last.
@@ -8456,27 +8474,23 @@ pub enum GlobalRequest {
     /// call of its own that took no lock: one the sender recorded on reception
     /// as a description of its own
     /// (`procfs::locks::LockLedger::note_second_identity_locks`). Appended
-    /// last.
     SecondIdentityLocks(OpenFileId, Vec<crate::procfs::locks::HeldLock>, u32),
     /// The descriptor table the sender holds, at its start or after an exec
     /// gave it a new one, for the terminal receipt of a death by a fatal
     /// signal to let go of (`GlobalState::held_tables`,
     /// `Detcore::name_table_for_death`). Sent only where the tool runs in this
     /// process (`HeldTable`). Answered at once, outside the scheduler.
-    /// Appended last.
     HoldTable(HeldTable),
     /// A guest's record-lock request (`F_SETLK`, `F_SETLKW`) succeeded, where
     /// the ledger takes the backend's fact, and the backend holds the lock it
     /// took as an OFD lock, on these files (`MAJOR:MINOR:INODE`), or on a file
     /// the fact could not name (`None`)
     /// (`procfs::locks::LockLedger::note_record_locks_held_as_ofd`). Appended
-    /// last.
     RecordLocksHeldAsOfd(Option<Vec<String>>),
     /// The host's `/proc/diskstats` as the run first read it, which every
     /// `/proc/diskstats` Detcore renders starts from
     /// (`GlobalState::host_diskstats`). A fact of the host, not of the
     /// guest's state: answered before any clock accounting, with no time.
-    /// Appended last.
     HostDiskstats,
     /// Where the user namespace of the process of task `.1` is from that of
     /// the process of thread `.0`, and whether the namespace whose owner
@@ -8500,6 +8514,13 @@ pub enum GlobalRequest {
     /// after a read, positioned read or seek of it
     /// (`Detcore::store_procfs_sequence`). Appended last.
     StoreProcfsSequence(OpenFileId, crate::procfs::ProcfsSequence),
+    /// The Tool image is refusing a self-sentinel `pidfd_send_signal` whose
+    /// physical spelling its backend could not qualify. Recorded as a policy
+    /// refusal, as `PolicyRefusal` is, and kept as this type
+    /// (`GlobalState::take_pidfd_self_qualification_refusal`) for a launcher
+    /// that learns of the refusal only from the coordinator (DBT). Answered
+    /// with `PolicyRefusal`. Appended last.
+    PidfdSelfQualificationRefusal(crate::PidfdSelfQualificationRefusal),
 }
 
 /// Responses from the global object
@@ -9376,6 +9397,27 @@ where
     assert_eq!(
         response,
         GlobalResponse::AnnounceSignalHandlerNotInstalled(())
+    );
+}
+
+/// Files a self-sentinel `pidfd_send_signal` refusal with the coordinator
+/// before the Tool error that ends this image is returned
+/// (`GlobalRequest::PidfdSelfQualificationRefusal`).
+pub(crate) async fn report_pidfd_self_qualification_refusal<G, T>(
+    guest: &mut G,
+    refusal: crate::PidfdSelfQualificationRefusal,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (_, response) =
+        send_and_update_time(guest, GlobalRequest::PidfdSelfQualificationRefusal(refusal)).await;
+    assert!(
+        matches!(
+            response,
+            GlobalResponse::PolicyRefusal(()) | GlobalResponse::ThreadExited
+        ),
+        "unexpected response to PidfdSelfQualificationRefusal: {response:?}"
     );
 }
 

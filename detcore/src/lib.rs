@@ -75,6 +75,9 @@ pub mod native_exec;
 pub mod netlink_route;
 pub mod nonwaiting_write;
 mod page;
+mod pidfd_self;
+#[cfg(test)]
+mod pidfd_self_tests;
 mod pipe_wake;
 #[cfg(test)]
 mod predicted_death_tests;
@@ -169,6 +172,7 @@ pub use finalization::PriorityHistoryRefusal;
 pub use finalization::ReplayDepartureError;
 pub use finalization::TerminalReplayRefusal;
 pub use finalization::combine_finalization;
+pub use pidfd_self::PidfdSelfQualificationRefusal;
 #[cfg(test)]
 use rand::RngExt as _;
 #[cfg(target_arch = "x86_64")]
@@ -5196,6 +5200,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     delivery_interruption: None,
                     // A new thread has no wait in progress.
                     wait_signal_end: None,
+                    // A new thread is in no `pidfd_send_signal` handler.
+                    pidfd_respelling: None,
                     delivery_frame_handler: 0,
                     delivery_frame_signal: 0,
                     delivery_frame_orig_ax: 0,
@@ -5431,6 +5437,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // under the identity they were taken under, and the new image counts
         // afresh.
         guest.thread_state_mut().delivery_interruption = None;
+        // The new image is in no `pidfd_send_signal` handler.
+        guest.thread_state_mut().pidfd_respelling = None;
         let dettid = guest.thread_state().dettid;
         let counters = std::mem::take(&mut guest.thread_state_mut().delivery_counters);
         counters.log(dettid);
