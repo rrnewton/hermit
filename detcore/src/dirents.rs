@@ -427,12 +427,13 @@ impl DirectoryOrder {
 /// A descriptor Detcore does not track (one received through `SCM_RIGHTS` and
 /// not recorded, `Detcore::record_received_descriptors`) can alias the same
 /// open file and read it from the kernel position. A received descriptor
-/// that names an open file the receiving table models joins it, and shares
-/// its stream, where the kernel answers `kcmp` (ptrace,
-/// `Detcore::record_received_descriptors`). Any other that Detcore records or
-/// discovers is a second model of the open file, with a stream and position
-/// of its own, even where the receiving process holds the original (KVM and
-/// the in-guest backends, <https://github.com/rrnewton/hermit/issues/4670>).
+/// whose send Detcore queued joins the open file its sender's table modeled,
+/// and shares its stream (ptrace and KVM, `crate::syscalls::scm_rights`). Any
+/// other that Detcore records or discovers is a second model of the open
+/// file, with a stream and position of its own, even where the receiving
+/// process holds the original (one received through a socket whose peer
+/// Detcore does not know, and the in-guest backends,
+/// <https://github.com/rrnewton/hermit/issues/4670>).
 /// The stream keeps that position where such a reader gets every entry the
 /// stream has not returned (see [`DirectoryStream::kernel_target`]). Such a
 /// reader can also get entries the stream already returned, which Linux never
