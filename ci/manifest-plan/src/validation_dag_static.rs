@@ -2035,7 +2035,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_verdict_under_timing_settings_says_what_the_trial_showed and
     // analyze::phases::tests::a_trial_under_another_setting_drops_the_option and
     // the_alternative_timing_trial_decides_the_cause_by_how_it_ends: 1295.
-    ("test.hermit_unit", 1295),
+    // And analyze's budget and resume: five budget::tests, four
+    // checkpoint::tests, seven rundata::tests (journaled runs, budget bounds,
+    // a cut run, the key's input digest, the reproducer's own bound), nine
+    // phases::tests (budget-ended prefix search and its resume, bracket,
+    // partial reports, resume refusal, restart from a whole interval, the
+    // kept workspace, a resume through the journal) and two
+    // schedule_search::tests (a stopped search's closest pair and its resume,
+    // a search started from an observed interval): 1322.
+    // And phases::tests::{a_resume_or_a_budget_is_refused_with_an_image,
+    // an_image_guest_takes_no_host_file_for_its_program}: 1324.
+    ("test.hermit_unit", 1324),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6370,7 +6380,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Less the same empty-prefix verdict test: 1285.
     // And the same scoped-verdict test: 1286.
     // And the same three timing-semantics verdict tests: 1289.
-    ("test.hermit_unit_on_host", 1289),
+    // And the same twenty-seven budget-and-resume tests: 1316.
+    // And the same two --image refusal tests: 1318.
+    ("test.hermit_unit_on_host", 1318),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
