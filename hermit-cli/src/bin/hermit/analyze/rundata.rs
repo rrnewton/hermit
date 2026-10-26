@@ -144,6 +144,43 @@ impl RunData {
         self.sched_path_in.as_ref().unwrap()
     }
 
+    /// Remove the schedules a bisection trial wrote in the workspace (the one
+    /// it replayed, the one it recorded, and that recording with event
+    /// times), once its outcome and realized schedule are read, unless
+    /// --keep-tmp keeps them. A bisection runs dozens of trials, each with
+    /// schedules as large as the endpoints' (hundreds of MB for a few million
+    /// events), which would otherwise stay until analyze exits. Only the
+    /// workspace's own names are removed, never a path from the run arguments
+    /// such as `--replay-schedule-from`, and a file the trial did not write
+    /// (an unfinished trial records no schedule) is skipped.
+    pub fn discard_schedules(&self) {
+        if self.analyze_opts.keep_tmp {
+            return;
+        }
+        for path in [
+            self.root_path().with_extension(PREEMPTS_EXT),
+            self.out_path().with_extension(PREEMPTS_EXT),
+        ] {
+            let _ = std::fs::remove_file(path);
+        }
+        self.discard_timed_recording();
+    }
+
+    /// Remove the recording with event times that a run makes and analyze
+    /// rewrites without them ([`Self::post_process_events_file`]), unless
+    /// --keep-tmp keeps it: analyze reads only the rewritten one.
+    fn discard_timed_recording(&self) {
+        if !self.analyze_opts.keep_tmp {
+            let _ = std::fs::remove_file(self.timed_recording_path());
+        }
+    }
+
+    /// Where a run records its schedule with event times, which analyze then
+    /// rewrites without them to the path the run options name.
+    fn timed_recording_path(&self) -> PathBuf {
+        self.root_path().with_extension(PREEMPTS_EXT_PRESTRIPPED)
+    }
+
     /// Convenience function
     pub fn sched_out_file_name(&mut self) -> String {
         self.sched_path_out()
@@ -279,7 +316,7 @@ impl RunData {
 
         // Some last-minute sleight-of-hand to record to a temporary location instead.
         if final_record_path.is_some() {
-            let temp_path = root.with_extension(PREEMPTS_EXT_PRESTRIPPED);
+            let temp_path = self.timed_recording_path();
             self.runopts.det_opts.det_config.record_preemptions_to = Some(temp_path);
         }
 
@@ -314,6 +351,7 @@ impl RunData {
             .take();
         if let Some(temp_path) = temp_path {
             Self::post_process_events_file(&temp_path, final_record_path.as_ref().unwrap())?;
+            self.discard_timed_recording();
             // Restore the setting:
             self.runopts.det_opts.det_config.record_preemptions_to = final_record_path;
         }
@@ -3336,6 +3374,61 @@ mod tests {
         ])
         .unwrap();
         refusal(&["--"]).unwrap();
+    }
+
+    /// A bisection trial's schedules are removed once read, unless --keep-tmp
+    /// keeps them: the workspace's names only, so a schedule the run arguments
+    /// name (`--replay-schedule-from`) stays, and so does the reproducer.
+    #[test]
+    fn a_trials_schedules_are_discarded_unless_kept() {
+        for keep_tmp in [false, true] {
+            let outside = tempfile::tempdir().unwrap();
+            let user_schedule = outside.path().join("mine.preempts");
+            let replay = format!("--replay-schedule-from={}", user_schedule.display());
+            let mut options =
+                AnalyzeOpts::try_parse_from(["analyze", "--", replay.as_str(), "/bin/true"])
+                    .unwrap();
+            options.keep_tmp = keep_tmp;
+            let workspace = tempfile::tempdir().unwrap();
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            let run = RunData::new_baseline(&options, "bisect_round_001".to_owned()).unwrap();
+            let root = run.root_path();
+            let written = [
+                root.with_extension(PREEMPTS_EXT),
+                run.out_path().with_extension(PREEMPTS_EXT),
+                run.timed_recording_path(),
+            ];
+            // They are the names a trial built as the bisection builds one,
+            // without a schedule in its run arguments, replays and records.
+            let mut plain = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+            plain.tmp_dir = options.tmp_dir.clone();
+            let mut trial = RunData::new_baseline(&plain, "bisect_round_001".to_owned())
+                .unwrap()
+                .with_schedule_replay()
+                .with_schedule_recording();
+            assert_eq!(trial.sched_path_in(), written[0]);
+            assert_eq!(trial.sched_path_out(), written[1]);
+            let kept = [root.with_extension("repro"), user_schedule.clone()];
+            for path in written.iter().chain(&kept) {
+                std::fs::write(path, "{}").unwrap();
+            }
+            run.discard_schedules();
+            for path in &written {
+                assert_eq!(
+                    path.exists(),
+                    keep_tmp,
+                    "{} with keep_tmp={keep_tmp}",
+                    path.display()
+                );
+            }
+            for path in &kept {
+                assert!(path.exists(), "{} was removed", path.display());
+            }
+            // An unfinished trial recorded no schedule: what it wrote goes.
+            std::fs::write(&written[2], "{}").unwrap();
+            run.discard_schedules();
+            assert_eq!(written[2].exists(), keep_tmp);
+        }
     }
 
     /// The normalized copy of a run's preemption record is written beside it

@@ -1924,7 +1924,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_first_stop_signal_is_the_one_reported,
     // a_stop_signal_reaches_the_children_and_only_them,
     // the_handler_stops_what_analyze_started_and_nothing_else}: 1315.
-    ("test.hermit_unit", 1315),
+    // And rundata::tests::a_trials_schedules_are_discarded_unless_kept (a
+    // bisection trial's schedules are removed once read): 1316, listed.
+    ("test.hermit_unit", 1316),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5995,7 +5997,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two minimize tests: 1299.
     // And the same two --minimize tests: 1301.
     // And the same eight workspace-cleanup tests: 1309.
-    ("test.hermit_unit_on_host", 1309),
+    // And the same trial-schedule discard test: 1310, listed.
+    ("test.hermit_unit_on_host", 1310),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

@@ -1859,10 +1859,15 @@ impl AnalyzeOpts {
 
             if self.verbose {
                 eprintln!(
-                    ":: {}, repro command:\n    {}",
+                    ":: {}, repro command{}:\n    {}",
                     format!("Testing execution during search (#{})", i)
                         .yellow()
                         .bold(),
+                    if self.keep_tmp {
+                        ""
+                    } else {
+                        " (its schedules are removed after the trial; --keep-tmp keeps them)"
+                    },
                     newrun.to_repro(),
                 );
             }
@@ -1875,10 +1880,12 @@ impl AnalyzeOpts {
             RunData::require_complete_record(&record, &path)?;
             // Only a completed trial contributes its realized schedule and jumps.
             self.time_skip_sources.lock().unwrap().remember(&record);
-            Ok(CompletedScheduleTrial {
+            let completed = CompletedScheduleTrial {
                 target_met: newrun.is_a_match(),
                 schedule: record.into_global(),
-            })
+            };
+            newrun.discard_schedules();
+            Ok(completed)
         })
     }
 

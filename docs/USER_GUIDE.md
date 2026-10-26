@@ -878,6 +878,13 @@ keep the workspace, for example to rerun a reproducer; `--verbose` keeps it
 too, since the per-run logs it adds are written there. The report file
 (`--report-file`) and the `--tmp-dir` directory itself are never removed.
 
+While analyze runs, a bisection trial's schedules, as large as the endpoints'
+(hundreds of MB for a few million events), are removed as soon as the trial's
+outcome is read, and every run's recording with event times once analyze has
+written it without them. `--keep-tmp` keeps them as well; `--verbose` does
+not, so the reproducer it prints for each trial needs `--keep-tmp` to run
+afterwards. `hermit bisect` keeps them.
+
 Analyze cannot clean up after SIGKILL, nor after a stop signal it does not
 handle: a signal it inherits as ignored stays ignored (SIGINT in a shell's
 background job, SIGHUP under `nohup`), and an analyze that is PID 1 of its PID
