@@ -39961,6 +39961,84 @@ fn a_guest_deadlock_verifies_as_the_same_outcome_in_both_runs() {
     }
 }
 
+/// The deadlock's teardown kills several threads at once when four waiters
+/// are blocked, and the host reports their deaths in any order (the leader's
+/// last). They are retired at the deadlock in DetTid order instead: the
+/// log's `logically_kill` records name the five threads in rising order, and
+/// repeated runs verify at bitwise parity (ptrace, `--strict`). Before, those
+/// records followed the host's death reports, ended with the leader's, and
+/// their order differed between runs.
+#[test]
+fn a_guest_deadlock_that_kills_several_threads_verifies_at_parity() {
+    let _guard = hermit_run_guard();
+    let guest = condvar_join_deadlock_guest().to_str().unwrap().to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let strict = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+    ];
+
+    let log_path = directory.path().join("hermit.log");
+    let log_arg = format!("--log-file={}", log_path.display());
+    let mut args = vec!["--log=info", log_arg.as_str()];
+    args.extend(strict);
+    args.extend(["--", guest.as_str(), "4"]);
+    let output = hermit(&args);
+    assert_eq!(
+        output.status.code(),
+        Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+        "{}",
+        stderr(&output)
+    );
+    let log = fs::read_to_string(&log_path).unwrap();
+    let marker = "logically_kill: Scheduler removing all knowledge of [det]tid ";
+    let retired: Vec<u32> = log
+        .lines()
+        .filter_map(|line| line.split_once(marker))
+        .map(|(_, rest)| rest.split(' ').next().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(retired.len(), 5, "{retired:?}");
+    assert!(
+        retired.windows(2).all(|pair| pair[0] < pair[1]),
+        "{retired:?}"
+    );
+
+    for attempt in 0..3 {
+        let report_path = directory.path().join(format!("verify{attempt}.json"));
+        let mut args = strict.to_vec();
+        args.extend([
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_path.to_str().unwrap(),
+            "--",
+            guest.as_str(),
+            "4",
+        ]);
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(detcore_model::HERMIT_GUEST_DEADLOCK_EXIT),
+            "attempt {attempt}: {log}"
+        );
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+        let compared = &report["compared_log_messages"];
+        assert_eq!(
+            report["bitwise_parity"], true,
+            "attempt {attempt}: {report}"
+        );
+        assert!(
+            compared["left"].as_u64().is_some_and(|left| left > 0)
+                && compared["left"] == compared["right"],
+            "attempt {attempt}: {report}"
+        );
+    }
+}
+
 /// A recording of a guest that deadlocks is kept, ends with the guest's
 /// outcome, and replays to the same deadlock; `record start --verify
 /// --verify-strict` finds the recording and its replay identical (ptrace,

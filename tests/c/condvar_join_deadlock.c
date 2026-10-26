@@ -11,8 +11,13 @@
 // forever; under Hermit the scheduler proves the hang and the run ends with
 // the guest-deadlock outcome. The marker shows the output written before the
 // deadlock is kept.
+//
+// An optional argument, a count from 1 to 16, starts that many waiters (main
+// joins the first), so that the deadlock's teardown kills several threads at
+// once.
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t never_signaled = PTHREAD_COND_INITIALIZER;
@@ -28,14 +33,20 @@ static void* waiter(void* arg) {
   return NULL;
 }
 
-int main(void) {
-  pthread_t thread;
-  if (pthread_create(&thread, NULL, waiter, NULL) != 0) {
-    return 2;
+int main(int argc, char** argv) {
+  pthread_t threads[16];
+  int count = argc > 1 ? atoi(argv[1]) : 1;
+  if (count < 1 || count > 16) {
+    return 64;
+  }
+  for (int i = 0; i < count; i++) {
+    if (pthread_create(&threads[i], NULL, waiter, NULL) != 0) {
+      return 2;
+    }
   }
   printf("main: joining a thread that waits forever\n");
   fflush(stdout);
-  pthread_join(thread, NULL);
+  pthread_join(threads[0], NULL);
   printf("UNREACHABLE: the condition variable was signaled\n");
   return 0;
 }
