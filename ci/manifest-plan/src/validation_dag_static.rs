@@ -1209,7 +1209,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // matching the full validate at c00dc58e0cd, which ran 1910 in this
     // selection (1909 passed; the one failure was the hosted-pin
     // assertion for the twin below, not a count refusal on this node).
-    ("test.regular_crates", 1910),
+    ("test.regular_crates", 1911),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3101,7 +3101,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 2891 + 2 = 2893, re-measured with `cargo nextest list
     // -p hermit-detcore --lib --bins` at this integration head (the PR's
     // own 2899 was measured on its pre-revert base and does not apply here).
-    ("test.detcore_unit", 2893),
+    ("test.detcore_unit", 2898),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5437,7 +5437,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same P0 revert (7322689fae2) removes the same seven units here:
     // 2898 - 7 = 2891, matching the local twin's recount at c00dc58e0cd.
     // And the same two PR 4942 units: 2891 + 2 = 2893.
-    ("test.detcore_unit_on_host", 2893),
+    ("test.detcore_unit_on_host", 2898),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6030,7 +6030,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // so the hosted twin executes 1910 - 14 = 1896. Two of the four added
     // since 1894 are themselves hosted-excluded, so this twin gains only
     // two, not four: 1894 + 2 = 1896.
-    ("test.regular_crates_on_host", 1896),
+    ("test.regular_crates_on_host", 1897),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
