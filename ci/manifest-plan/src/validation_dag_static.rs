@@ -1981,7 +1981,32 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR #4609 (rebased onto post-split main) adds ten hermit-run units
     // (nine in app::analyze::phases, one in app::analyze::rundata):
     // 1239 + 10 = 1249, measured by nextest list.
-    ("test.hermit_unit", 1252),
+    // And analyze's racing-access finder, races::tests::{
+    // close_against_a_use_that_fails_with_ebadf,
+    // stale_fd_after_reuse_reaches_another_open_file,
+    // double_close_pairs_the_two_closes,
+    // lost_futex_wake_pairs_the_wake_with_the_wait,
+    // kill_against_a_futex_return_is_a_lifetime_conflict,
+    // pipe_bytes_order_the_write_before_the_read,
+    // futex_wake_edge_orders_a_pair_on_another_resource,
+    // timed_waits_whose_returns_flip_make_a_timing_pair,
+    // a_cut_short_trace_marks_the_window_truncated, none_found_says_why,
+    // also_reordered_lists_three_and_counts_the_rest,
+    // failed_calls_stay_out_of_the_fd_history,
+    // the_last_difference_before_a_control_flow_change_is_the_victim,
+    // a_partner_whose_thread_changed_course_has_no_matching_call,
+    // channels_whose_data_gives_no_edge_are_named,
+    // an_fd_access_is_ordered_at_its_entry,
+    // backward_edges_are_ignored_with_a_note, renders_the_fdsan_case,
+    // json_form_names_status_pair_order_and_verdicts,
+    // traces_that_cannot_answer_are_unavailable,
+    // the_close_that_released_the_victims_file_outranks_a_later_dup,
+    // calls_before_the_decision_align_whatever_their_arguments,
+    // a_kill_that_ends_a_thread_before_its_next_call_is_a_lifetime_pair,
+    // a_clock_read_victim_times_the_flip,
+    // a_wait_entered_before_the_decision_aligns_whatever_its_arguments,
+    // a_thread_whose_calls_already_split_gives_no_lifetime_pair}: 1278.
+    ("test.hermit_unit", 1278),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6290,7 +6315,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the hosted CPUID-faulting skip set): 1327 + 2 = 1329.
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
-    ("test.hermit_unit_on_host", 1246),
+    // And the same twenty-six racing-access finder tests: 1272.
+    ("test.hermit_unit_on_host", 1272),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
