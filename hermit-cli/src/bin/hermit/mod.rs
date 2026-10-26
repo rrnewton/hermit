@@ -81,6 +81,7 @@ mod record_envelope;
 mod record_start;
 mod remove;
 mod replay;
+mod rewrite_exclusives;
 #[cfg(test)]
 mod replay_departure_classification_tests;
 // The library root owns the shared fixture module; the app is now a module of
@@ -234,6 +235,7 @@ use hermit::HERMIT_INTERNAL_FAILURE_EXIT;
 
 use self::analyze::AnalyzeOpts;
 use self::bisect::BisectOpts;
+use self::rewrite_exclusives::RewriteExclusivesOpts;
 use self::container::ContainerChildExit;
 use self::container::ContainerChildPanic;
 use self::container::LogCapExceeded;
@@ -571,6 +573,11 @@ enum Subcommand {
     #[clap(name = "instruction-map")]
     InstructionMap(InstructionMapOpts),
 
+    /// Report, and optionally write, the LSE rewrite of an aarch64 ELF file's
+    /// exclusive retry loops.
+    #[clap(name = "rewrite-exclusives")]
+    RewriteExclusives(RewriteExclusivesOpts),
+
     /// Discover and run OCI images from the local image store.
     #[clap(name = "oci")]
     Oci(Box<OciOpts>),
@@ -668,7 +675,8 @@ impl Subcommand {
             | Subcommand::Version(_)
             | Subcommand::LogDiff(_)
             | Subcommand::InstructionMap(_)
-            | Subcommand::VerifyInputs(_) => false,
+            | Subcommand::VerifyInputs(_)
+            | Subcommand::RewriteExclusives(_) => false,
         }
     }
 
@@ -781,6 +789,7 @@ impl Subcommand {
             Subcommand::InstructionMap(x) => x.main(global),
             Subcommand::Oci(x) => x.main(global),
             Subcommand::VerifyInputs(x) => x.main(),
+            Subcommand::RewriteExclusives(x) => x.main(),
         }
     }
 }
