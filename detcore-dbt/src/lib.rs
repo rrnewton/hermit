@@ -16,6 +16,8 @@
 mod evidence;
 #[cfg(test)]
 mod first_instruction_observer;
+#[cfg(test)]
+mod native_client_publication_test;
 mod ofd_channel;
 
 use std::collections::HashMap;
@@ -1276,19 +1278,34 @@ pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
     let runtime = runtime_library_path()?;
     let source = fs::canonicalize(reverie_dbt::native_client_source_dir())?;
     let directory = native_client_build_directory(&runtime, &source);
-    fs::create_dir_all(&directory)?;
-    let _build_lock = lock_native_client_build(&directory)?;
+    let client = build_native_client(
+        &source,
+        &directory,
+        reverie_dbt::bundled_dynamorio_cmake_dir(),
+        &runtime,
+    )?;
+    Ok((reverie_dbt::bundled_drrun_path().to_path_buf(), client))
+}
+
+fn build_native_client(
+    source: &Path,
+    directory: &Path,
+    dynamorio: &Path,
+    runtime: &Path,
+) -> io::Result<PathBuf> {
+    fs::create_dir_all(directory)?;
+    let _build_lock = lock_native_client_build(directory)?;
+    // Readers keep using the published inode while CMake relinks its private
+    // output. The writer lock must cover both the build and publication.
+    let build_directory = directory.join("build");
 
     let configure = Command::new("cmake")
         .arg("-S")
-        .arg(&source)
+        .arg(source)
         .arg("-B")
-        .arg(&directory)
+        .arg(&build_directory)
         .arg("-DCMAKE_BUILD_TYPE=Release")
-        .arg(format!(
-            "-DDynamoRIO_DIR={}",
-            reverie_dbt::bundled_dynamorio_cmake_dir().display()
-        ))
+        .arg(format!("-DDynamoRIO_DIR={}", dynamorio.display()))
         .arg(format!("-DREVERIE_DBT_RUNTIME={}", runtime.display()))
         .output()?;
     if !configure.status.success() {
@@ -1300,7 +1317,7 @@ pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
 
     let build = Command::new("cmake")
         .arg("--build")
-        .arg(&directory)
+        .arg(&build_directory)
         .arg("--parallel")
         .output()?;
     if !build.status.success() {
@@ -1310,14 +1327,40 @@ pub fn prepare_native_client() -> io::Result<(PathBuf, PathBuf)> {
         )));
     }
 
-    let client = directory.join("libreverie_dbt_client.so");
-    if !client.is_file() {
+    let built_client = build_directory.join("libreverie_dbt_client.so");
+    if !built_client.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("Detcore DBT client was not built at {}", client.display()),
+            format!(
+                "Detcore DBT client was not built at {}",
+                built_client.display()
+            ),
         ));
     }
-    Ok((reverie_dbt::bundled_drrun_path().to_path_buf(), client))
+    let client = directory.join("libreverie_dbt_client.so");
+    let temporary = directory.join(format!(
+        ".libreverie_dbt_client-{}-{:016x}.tmp",
+        std::process::id(),
+        rand::random::<u64>()
+    ));
+    let mut input = fs::File::open(&built_client)?;
+    let mut output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    // Copy, never hardlink: a subsequent linker may truncate its output inode.
+    // The temporary is on the publication filesystem, so rename is atomic.
+    let copied = (|| {
+        io::copy(&mut input, &mut output)?;
+        output.set_permissions(input.metadata()?.permissions())
+    })();
+    drop(output);
+    let published = copied.and_then(|()| fs::rename(&temporary, &client));
+    if published.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    published?;
+    Ok(client)
 }
 
 /// Begins a new DynamoRIO application image and returns its generation.
