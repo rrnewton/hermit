@@ -390,13 +390,15 @@ struct OpenFileDescription {
     /// name is below it (ENOTDIR), whatever its recorded `path` spells.
     #[serde(default)]
     procfs_link_itself: bool,
-    /// This open file is a task's descriptor directory, `/proc/<pid>/fd`,
-    /// which Detcore lists from its own table (`procfs::fd_directory`): the
-    /// task it is bound to, its position, and whether it was opened with
-    /// `O_PATH`. The kernel's descriptor is on `/proc` itself. Shared by
-    /// descriptor aliases and a fork's copies, as Linux shares the position.
+    /// This open file is a `/proc` directory Detcore serves itself, `/proc`
+    /// or a task's descriptor directory, `/proc/<pid>/fd`
+    /// (`procfs::fd_directory::PlaceholderDirectory`): which directory, its
+    /// position, and whether it was opened with `O_PATH`. The kernel's
+    /// descriptor is on the placeholder directory, an empty read-only tmpfs
+    /// (`DetConfig::directory_placeholder`). Shared by descriptor aliases and
+    /// a fork's copies, as Linux shares the position.
     #[serde(default)]
-    descriptor_directory: Option<DescriptorDirectoryState>,
+    placeholder: Option<PlaceholderState>,
     /// File status flags shared by dup and fork aliases.
     status_flags: i32,
     /// File path associated with fd.
@@ -627,8 +629,8 @@ impl std::fmt::Debug for OpenFileDescription {
         debug.field("inherited_external_read", &self.inherited_external_read);
         debug.field("pidfd_target", &self.pidfd_target);
         debug.field("procfs_reached", &self.procfs_reached);
-        if let Some(directory) = &self.descriptor_directory {
-            debug.field("descriptor_directory", directory);
+        if let Some(placeholder) = &self.placeholder {
+            debug.field("placeholder", placeholder);
         }
         debug.field("status_flags", &self.status_flags);
         debug.field("path", &self.path);
@@ -667,16 +669,18 @@ impl std::fmt::Debug for OpenFileDescription {
     }
 }
 
-/// What Detcore keeps of an open file that is a task's descriptor directory
-/// (`procfs::fd_directory`).
+/// What Detcore keeps of an open file that is a `/proc` directory it serves
+/// on a placeholder descriptor (`procfs::fd_directory::PlaceholderDirectory`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DescriptorDirectoryState {
-    /// The task the directory is bound to.
-    pub(crate) binding: crate::procfs::fd_directory::DescriptorDirectoryBinding,
+pub(crate) struct PlaceholderState {
+    /// Which directory: `/proc`, or a descriptor directory and the task it
+    /// is bound to.
+    pub(crate) directory: crate::procfs::fd_directory::PlaceholderDirectory,
     /// The kernel position that tags the descriptor
     /// (`procfs::fd_directory::tag`), if it has one.
     pub(crate) tag: Option<u64>,
-    /// The guest's position in the directory, as Linux numbers it.
+    /// The guest's position in a descriptor directory, as Linux numbers it.
+    /// `/proc`'s position is its directory stream's (`DirectoryStream`).
     pub(crate) position: u64,
     /// Opened with `O_PATH`: it lists nothing, and reads and seeks fail with
     /// `EBADF`.
@@ -886,7 +890,7 @@ impl DetFd {
                 pidfd_target: None,
                 procfs_reached: None,
                 procfs_link_itself: false,
-                descriptor_directory: None,
+                placeholder: None,
                 inherited_external_read: None,
                 status_flags: bits & !OFlag::O_CLOEXEC.bits(),
                 path: None,
@@ -1069,6 +1073,22 @@ impl DetFd {
         }
     }
 
+    /// Give this open file description the identity `id` of the one it is a
+    /// copy of in Linux: a placeholder descriptor received over `SCM_RIGHTS`,
+    /// whose sender's description Linux shares, so that the locks Detcore
+    /// follows by description (`procfs::locks::LockLedger`) are that one's.
+    /// Its other state stays its own, as for every received descriptor
+    /// (<https://github.com/rrnewton/hermit/issues/4670>). A shared
+    /// description (one promoted to Detcore's global state) keeps its
+    /// identity; placeholders are never promoted.
+    pub(crate) fn adopt_open_file_id(&self, id: OpenFileId) {
+        if let OpenFileState::Local(description) =
+            &mut *self.open_file.lock().expect("open file mutex poisoned")
+        {
+            description.id = id;
+        }
+    }
+
     /// Number of modeled descriptor slots that retain this open file description.
     pub(crate) fn open_file_alias_count(&self) -> usize {
         Arc::strong_count(&self.open_file)
@@ -1129,15 +1149,15 @@ impl DetFd {
         self.with_description(|d| d.procfs_link_itself)
     }
 
-    /// The descriptor directory this open file is, if it is one
-    /// (`OpenFileDescription::descriptor_directory`).
-    pub(crate) fn descriptor_directory(&self) -> Option<DescriptorDirectoryState> {
-        self.with_description(|d| d.descriptor_directory)
+    /// The placeholder directory this open file is, if it is one
+    /// (`OpenFileDescription::placeholder`).
+    pub(crate) fn placeholder(&self) -> Option<PlaceholderState> {
+        self.with_description(|d| d.placeholder)
     }
 
-    /// Make this open file a descriptor directory, or change its state.
-    pub(crate) fn set_descriptor_directory(&self, state: DescriptorDirectoryState) {
-        self.with_description(|d| d.descriptor_directory = Some(state))
+    /// Make this open file a placeholder directory, or change its state.
+    pub(crate) fn set_placeholder(&self, state: PlaceholderState) {
+        self.with_description(|d| d.placeholder = Some(state))
     }
 
     /// The task directory this open file is, if Detcore knows it
@@ -1720,6 +1740,24 @@ impl DetFd {
         f: impl FnOnce(&mut DirectoryStream) -> R,
     ) -> Result<R, Errno> {
         self.with_description(|d| d.directory.as_mut().map(f).ok_or(Errno::EBADF))
+    }
+
+    /// The position of this open file's directory stream, 0 before it has
+    /// one.
+    pub(crate) fn directory_stream_position(&self) -> u64 {
+        self.with_description(|d| d.directory.as_ref().map_or(0, DirectoryStream::position))
+    }
+
+    /// Move this open file's directory stream to `position`, creating the
+    /// stream, without a snapshot, if it has none (`DirectoryStream::seek`):
+    /// for a directory Detcore lists from its model alone, whose stream a
+    /// seek may come before.
+    pub(crate) fn seek_directory_stream(&self, position: u64) {
+        self.with_description(|d| {
+            d.directory
+                .get_or_insert_with(DirectoryStream::default)
+                .seek(position)
+        })
     }
 
     /// Return the shared procfs cursor and initialized snapshot length.

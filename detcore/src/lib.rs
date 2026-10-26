@@ -110,6 +110,16 @@ pub use tool_global::initial_mm_probe;
 pub fn keep_host_status_files_open() {
     crate::syscalls::keep_status_files_open();
 }
+
+/// Whether a run on the backend whose capabilities are `backend` needs the
+/// placeholder directory hermit-cli mounts for Detcore
+/// (`Config::directory_placeholder`): where the guest's procfs is not the
+/// kernel's, as one capability says (`procfs_inode::tool_can_name_guest_descriptors`).
+/// Where it is the kernel's, Detcore's served `/proc` directories are open on
+/// that procfs's root, and hermit-cli mounts nothing for them.
+pub fn needs_directory_placeholder(backend: &reverie::BackendCapabilities) -> bool {
+    !procfs_inode::tool_can_name_guest_descriptors(backend)
+}
 mod tool_local;
 pub mod util;
 mod wait_signal_end;
@@ -3988,6 +3998,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     signal_task_identity: None,
                     open_file_creator: None,
                     receive_geometry: None,
+                    send_inspection: None,
                     mm_id: MmId::for_clone(
                         pts.1.mm_id,
                         dettid,
@@ -4445,12 +4456,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         if let Some(comm) = self.execfn_comm(guest) {
             tool_global::set_task_comm(guest, DetTid::from_raw(detpid.as_raw()), comm).await;
         }
-        // That request also took the process out of its old descriptor table
-        // in `procfs::locks::LockLedger`; name the descriptions whose locks
-        // Detcore follows that survived the exec (its close-on-exec slots are
-        // gone from this table). A failed exec reaches neither.
+        // That request took the process out of its old descriptor table in
+        // `procfs::locks::LockLedger`, whose descriptions that hold a
+        // placeholder `flock` its new table references until now; name the
+        // descriptions whose locks Detcore follows that survived the exec (its
+        // close-on-exec slots are gone from this table): also none, where the
+        // exec closed one it follows, so that the ledger releases a
+        // placeholder lock the exec closed. A process that followed none has
+        // nothing to name. A failed exec reaches neither.
         let surviving = guest.thread_state().lock_tracked_slots();
-        if !surviving.is_empty() {
+        if !surviving.is_empty() || guest.thread_state().exec_dropped_lock_tracked() {
             tool_global::note_table_exec(guest, surviving).await;
         }
         // The new image's auxiliary vector, as it finds it on its initial
@@ -4977,14 +4992,21 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         };
         let rendered_procfs_answer = if let Err(error) = adoption {
             Some(Err(error))
+        } else if sigalrm_refusal.is_none()
+            && Self::looks_up_below_placeholders(&call)
+            && let Some(refusal) =
+                Box::pin(self.refuse_lookup_below_placeholder(guest, &call)).await
+        {
+            // An exec or an `AF_UNIX` address below a `/proc` directory
+            // Detcore serves on a placeholder (`descriptor_directory`).
+            Some(refusal)
         } else if sigalrm_refusal.is_none() && !may_name_files {
             // The `/proc` device is still taken where the level check would
             // have taken it first.
             crate::syscalls::take_proc_device();
             None
         } else if sigalrm_refusal.is_none()
-            && let Some(answer) =
-                Box::pin(self.answer_descriptor_directory_call(guest, &call)).await
+            && let Some(answer) = Box::pin(self.answer_placeholder_call(guest, &call)).await
         {
             Some(answer)
         } else if sigalrm_refusal.is_none() {
