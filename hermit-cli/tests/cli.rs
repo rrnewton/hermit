@@ -14925,6 +14925,9 @@ fn incompatible_run_modes_fail_during_argument_parsing() {
     );
 }
 
+/// `--replay-schedule-from` and `--replay-preemptions-from` are not among
+/// these: a `--no-namespace` replay follows a record whose guest IDs Hermit
+/// chose, and is refused at run time otherwise (`replay_guest_ids_refusal`).
 #[test]
 fn no_namespace_rejects_container_only_options() {
     let cases = [
@@ -14935,8 +14938,6 @@ fn no_namespace_rejects_container_only_options() {
         "--network=local",
         "--network=host",
         "--tmp=/tmp/custom",
-        "--replay-schedule-from=/tmp/schedule.json",
-        "--replay-preemptions-from=/tmp/preemptions.json",
     ];
 
     for incompatible in cases {
