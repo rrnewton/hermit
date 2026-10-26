@@ -166,12 +166,19 @@ pub struct PreemptionRecord {
     /// recording readmits it at the first scheduler pass that finds it
     /// finished. That turn is host-timed, so a replay that readmits "when
     /// finished" can leave the schedule it replays. With these entries the
+<<<<<<< HEAD
     /// replay readmits each call at the turn the recording did. A record a
     /// run writes always has them, empty when no call went to the background
     /// (`PreemptionWriter::new`); one written before the field existed, and
     /// one synthesized or edited in memory, has `None`. Either kind with no
     /// entry replays as before.
     rejoins: Option<Vec<crate::scheduler::rejoin_log::Rejoin>>,
+=======
+    /// replay readmits each call at the turn the recording did. Empty for
+    /// records written before the field existed, for runs with no such call,
+    /// and for records synthesized in memory, which replay as before.
+    rejoins: Vec<crate::scheduler::rejoin_log::Rejoin>,
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
 }
 
 /// A count a record's run observed on its host rather than decided: it is
@@ -281,6 +288,7 @@ pub struct TimeSkip {
 }
 
 /// Read only the readmissions stored in a preemption record file, as
+<<<<<<< HEAD
 /// [`read_recorded_rng_seed`] reads the guest random seed. `Some` list,
 /// possibly empty, comes from a record whose run logged its readmissions;
 /// `None` means the record predates the field, was synthesized or edited in
@@ -304,6 +312,28 @@ pub(crate) fn read_recorded_rejoins(
         crate::scheduler::rejoin_log::ordered(rejoins)
             .map_err(|why| format!("{}: {why}", path.display()))?;
     }
+=======
+/// [`read_recorded_rng_seed`] reads the guest random seed. An empty list
+/// means the record predates the field, or its run had no backgrounded call,
+/// or the file cannot be read at all: a replay that cannot read its record
+/// is refused by the reader that needs the whole record, with a message
+/// about the record rather than about one field. A record whose
+/// readmissions are out of order is refused here, because replay walks them
+/// once and could not follow them.
+pub(crate) fn read_recorded_rejoins(
+    path: &Path,
+) -> Result<Vec<crate::scheduler::rejoin_log::Rejoin>, String> {
+    #[derive(Deserialize)]
+    struct RejoinsOnly {
+        #[serde(default)]
+        rejoins: Vec<crate::scheduler::rejoin_log::Rejoin>,
+    }
+    let Ok(read) = boundary_recording::read_settings::<RejoinsOnly>(path) else {
+        return Ok(Vec::new());
+    };
+    crate::scheduler::rejoin_log::ordered(&read.rejoins)
+        .map_err(|why| format!("{}: {why}", path.display()))?;
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
     Ok(read.rejoins)
 }
 
@@ -335,7 +365,11 @@ impl PreemptionRecord {
             store_exclusive_failures: HostObservedCount::default(),
             format_version: None,
             time_skips: None,
+<<<<<<< HEAD
             rejoins: None,
+=======
+            rejoins: Vec::new(),
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
         }
     }
 
@@ -756,7 +790,11 @@ impl PreemptionRecord {
     /// schedule it no longer follows.
     fn forget_run_points(&mut self) {
         self.callback_checkpoints.clear();
+<<<<<<< HEAD
         self.rejoins = None;
+=======
+        self.rejoins.clear();
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
     }
 
     /// TODO: provide a better way to create an empty PreemptionRecord but with entries for a given set of tids.
@@ -826,7 +864,11 @@ impl PreemptionRecord {
             store_exclusive_failures: HostObservedCount::default(),
             format_version: None,
             time_skips: None,
+<<<<<<< HEAD
             rejoins: None,
+=======
+            rejoins: Vec::new(),
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
         }
     }
 
@@ -898,7 +940,11 @@ impl PreemptionRecord {
             store_exclusive_failures: HostObservedCount::default(),
             format_version: None,
             time_skips: None,
+<<<<<<< HEAD
             rejoins: None,
+=======
+            rejoins: Vec::new(),
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
         }
     }
 
@@ -2362,6 +2408,7 @@ mod tests {
             },
         };
         record.callback_checkpoints.insert(tid, vec![point.clone()]);
+<<<<<<< HEAD
         record
             .rejoins
             .get_or_insert_with(Vec::new)
@@ -2371,6 +2418,13 @@ mod tests {
                 calls: vec![(tid, 1)],
                 popped: None,
             });
+=======
+        record.rejoins.push(crate::scheduler::rejoin_log::Rejoin {
+            turn: 4,
+            wakes: 0,
+            calls: vec![(tid, 1)],
+        });
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
         record.validate().unwrap();
         let mut stripped = record.clone();
         stripped.strip_event_times();
@@ -2386,11 +2440,16 @@ mod tests {
             record.with_latest_preempt_removed(),
         ] {
             assert!(edited.callback_checkpoints.is_empty());
+<<<<<<< HEAD
             assert!(edited.rejoins.is_none());
+=======
+            assert!(edited.rejoins.is_empty());
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
         }
         let mut edited = record.clone();
         edited.split_map(|event, _| [event]);
         assert!(edited.callback_checkpoints.is_empty());
+<<<<<<< HEAD
         assert!(edited.rejoins.is_none());
         let mut edited = record.clone();
         let _ = edited.schedevents_iter_mut();
@@ -2400,6 +2459,17 @@ mod tests {
         edited.preemptions_only();
         assert!(edited.callback_checkpoints.is_empty());
         assert!(edited.rejoins.is_none());
+=======
+        assert!(edited.rejoins.is_empty());
+        let mut edited = record.clone();
+        let _ = edited.schedevents_iter_mut();
+        assert!(edited.callback_checkpoints.is_empty());
+        assert!(edited.rejoins.is_empty());
+        let mut edited = record.clone();
+        edited.preemptions_only();
+        assert!(edited.callback_checkpoints.is_empty());
+        assert!(edited.rejoins.is_empty());
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
         for field in ["history_index", "progress", "time", "rcbs"] {
             let mut bad = record.clone();
             let point = &mut bad.callback_checkpoints.get_mut(&tid).unwrap()[0];
@@ -2690,7 +2760,11 @@ impl PreemptionWriter {
     /// Store where a backgrounded call rejoined the run queue, so a replay
     /// can readmit it at the same turn (`crate::scheduler::rejoin_log`).
     pub(crate) fn push_rejoin(&mut self, rejoin: crate::scheduler::rejoin_log::Rejoin) {
+<<<<<<< HEAD
         self.inner.rejoins.get_or_insert_with(Vec::new).push(rejoin);
+=======
+        self.inner.rejoins.push(rejoin);
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
     }
 
     /// Does the record have zero entries?

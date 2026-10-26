@@ -5132,6 +5132,7 @@ fn validate_strict_boundary_config(cfg: &Config) -> Result<(), &'static str> {
     Ok(())
 }
 
+<<<<<<< HEAD
 /// Where a replay stands relative to the next readmission its log names
 /// (`Scheduler::rejoin_place`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5159,6 +5160,12 @@ fn describe_rejoin_calls(rejoin: &Rejoin) -> String {
 /// first when both name a record). `None` when the run replays no record, or
 /// the record stores no entry (an empty list, or none at all), which replays
 /// as before.
+=======
+/// The readmissions a replayed preemption record carries, for a run that
+/// replays one (`--replay-preemptions-from`, `--replay-schedule-from`; the
+/// first when both name a record). `None` when the run replays no record, or
+/// the record stores none, which replays as before.
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
 fn replayed_rejoins(cfg: &Config) -> Option<std::collections::VecDeque<Rejoin>> {
     let path = cfg
         .replay_preemptions_from
@@ -5169,9 +5176,13 @@ fn replayed_rejoins(cfg: &Config) -> Option<std::collections::VecDeque<Rejoin>> 
             reason: format!("the record's readmissions cannot be read ({err})"),
         })
     });
+<<<<<<< HEAD
     rejoins
         .filter(|rejoins| !rejoins.is_empty())
         .map(Into::into)
+=======
+    (!rejoins.is_empty()).then(|| rejoins.into())
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
 }
 
 impl Scheduler {
@@ -11065,6 +11076,7 @@ impl Scheduler {
         let Some(op_id) = self.blocked.external_io_blockers.get(&parent).copied() else {
             return;
         };
+<<<<<<< HEAD
         if self.rejoin_replay.is_some() {
             // A recorded vfork readmission names no popped events: the passes
             // of its turn wait at the barrier above until the continuation
@@ -11082,6 +11094,15 @@ impl Scheduler {
                 if let Some(rejoins) = self.rejoin_replay.as_mut() {
                     rejoins.pop_front();
                 }
+=======
+        if let Some(rejoins) = self.rejoin_replay.as_mut() {
+            let point = (self.turn, self.empty_queue_wakes);
+            let due_here = rejoins.front().is_some_and(|next| {
+                next.point() == point && next.calls == [(parent, op_id.sequence)]
+            });
+            if due_here {
+                rejoins.pop_front();
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
                 self.rejoin_stalled_since = None;
             } else if self.rejoin_from_preemption_record {
                 // This readmission's point is fixed by the child's release
@@ -30345,12 +30366,20 @@ mod test {
 
         assert_eq!(
             crate::preemptions::read_recorded_rejoins(&path).unwrap(),
+<<<<<<< HEAD
             Some(vec![Rejoin {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(op_id.tid, 9)],
                 popped: Some(Vec::new()),
             }])
+=======
+            vec![Rejoin {
+                turn: 12,
+                wakes: 0,
+                calls: vec![(op_id.tid, 9)],
+            }]
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
         );
 
         // A replay of that record has the readmission due, and keeps the
@@ -30427,7 +30456,10 @@ mod test {
                         turn: 7,
                         wakes: 0,
                         calls: vec![(op_id.tid, 9)],
+<<<<<<< HEAD
                         popped: Some(Vec::new()),
+=======
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
                     });
                     assert_eq!(
                         rejoins,
@@ -30451,7 +30483,10 @@ mod test {
             turn: 12,
             wakes: 0,
             calls: vec![(op_id.tid, 9)],
+<<<<<<< HEAD
             popped: None,
+=======
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
         };
         let replay = |finished: bool| {
             let mut scheduler = run_rejoin_fixture(op_id, true, finished);
@@ -30501,7 +30536,10 @@ mod test {
             turn: 12,
             wakes: 0,
             calls: vec![(op_id.tid, 9)],
+<<<<<<< HEAD
             popped: None,
+=======
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
         };
         replaying(&mut scheduler, std::slice::from_ref(&logged));
         assert!(scheduler.unreplayed_rejoins().is_some());
@@ -30526,7 +30564,10 @@ mod test {
                 turn: 20,
                 wakes: 0,
                 calls: vec![(op_id.tid, 9)],
+<<<<<<< HEAD
                 popped: None,
+=======
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
             }],
         );
         scheduler.turn = 12;
@@ -30605,7 +30646,10 @@ mod test {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(child.tid, 4)],
+<<<<<<< HEAD
                 popped: None,
+=======
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
             }],
         );
         assert_eq!(scheduler.vfork_gated_background_child(), Some(child.tid));
@@ -30639,7 +30683,10 @@ mod test {
                 turn: 12,
                 wakes: 0,
                 calls: vec![(op_id.tid, 7)],
+<<<<<<< HEAD
                 popped: None,
+=======
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
             }],
         );
         scheduler.turn = 11;
@@ -30658,7 +30705,10 @@ mod test {
                 turn: 11,
                 wakes: 0,
                 calls: vec![(op_id.tid, 7)],
+<<<<<<< HEAD
                 popped: Some(Vec::new()),
+=======
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
             }]
         );
     }
@@ -30679,7 +30729,10 @@ mod test {
                 turn: 20,
                 wakes: 0,
                 calls: vec![(child.tid, 4)],
+<<<<<<< HEAD
                 popped: None,
+=======
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
             }],
             vec![],
         ] {

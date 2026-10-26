@@ -75,8 +75,13 @@ struct RawRecord {
     format_version: Option<u32>,
     #[serde(default, skip_serializing_if = "super::lists_no_time_skips")]
     time_skips: Option<Vec<TimeSkip>>,
+<<<<<<< HEAD
     #[serde(default, skip_serializing_if = "Option::is_none")]
     rejoins: Option<Vec<crate::scheduler::rejoin_log::Rejoin>>,
+=======
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    rejoins: Vec<crate::scheduler::rejoin_log::Rejoin>,
+>>>>>>> ed5120432a (Store where each backgrounded call rejoined in the preemption record, and replay at those turns)
 }
 
 struct LegacyFields<'a>(&'a PreemptionRecord);
