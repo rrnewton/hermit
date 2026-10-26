@@ -6142,6 +6142,7 @@ impl GlobalState {
                 }
                 FutexAction::RequeueRequest(to, nr_wake, nr_requeue) => {
                     let (woken, moved) = sched.requeue_futex_waiters(
+                        dettid,
                         futexid,
                         to,
                         nr_wake as usize,

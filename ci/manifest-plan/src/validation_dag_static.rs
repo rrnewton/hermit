@@ -3166,7 +3166,23 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // access_trace's clock_and_timer_reads_carry_what_they_returned and
     // a_capped_trace_stops_without_its_end_line
     // (--record-access-trace-to): 2807, listed.
-    ("test.detcore_unit", 2807),
+    // And the access trace's synchronization edges: access_trace's
+    // a_clone_starts_its_child_whichever_runs_first,
+    // an_exit_wake_ends_at_the_joiners_wait_return,
+    // a_reaped_childs_exit_orders_the_wait,
+    // a_failed_send_orders_no_delivery,
+    // two_sends_from_one_sender_order_two_deliveries_in_send_order,
+    // a_process_send_and_a_thread_send_each_order_one_delivery,
+    // overlapping_sends_from_two_threads_order_nothing,
+    // realtime_signal_deliveries_take_their_sends_in_order,
+    // a_timer_expiry_takes_its_oldest_live_arm,
+    // the_cap_evicts_sends_before_a_live_timers_arm,
+    // a_group_send_reaches_each_member_once and
+    // reaping_forgets_the_sends_waiting_for_the_child, and scheduler's
+    // a_futex_wake_edge_names_the_waiter_the_wake_took,
+    // a_requeue_edge_waits_for_the_moved_waiters_return and
+    // a_clear_child_tid_wake_is_a_join_edge: 2822, listed.
+    ("test.detcore_unit", 2822),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4465,7 +4481,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And access_trace's an_access_trace_leaves_a_replayed_run_unchanged,
     // access_trace_indices_name_the_runs_own_events and
     // access_trace_from_leaves_out_only_earlier_records: 669.
-    ("test.cli", 669),
+    // And access_trace's a_futex_ping_pong_yields_alternating_wake_edges and
+    // signal_child_exit_and_join_edges_name_their_events: 671.
+    ("test.cli", 671),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5009,7 +5027,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And +1 from 82cbd684: 579.
     // Train 6 recount (measured on 21f770f6 base): 585.
     // And the same three access trace tests, not excluded: 588.
-    ("test.cli_on_host", 588),
+    // And the same two synchronization edge tests, not excluded: 590.
+    ("test.cli_on_host", 590),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
