@@ -1074,9 +1074,11 @@ fn rendered_mmap_address_checks(
     offset: libc::off_t,
     flags: MapFlags,
 ) -> Result<usize, Errno> {
+    let page = crate::page::page_size() as usize;
     // `ksys_mmap_pgoff` refuses MAP_HUGETLB for a file that is not on
-    // hugetlbfs before `do_mmap` looks at anything.
-    if flags.contains(MapFlags::MAP_HUGETLB) || len == 0 || offset & 4095 != 0 {
+    // hugetlbfs before `do_mmap` looks at anything, and the offset must be
+    // page aligned (`offset_in_page`).
+    if flags.contains(MapFlags::MAP_HUGETLB) || len == 0 || offset as usize & (page - 1) != 0 {
         return Err(Errno::EINVAL);
     }
     // A length that cannot fit the address space fails before the file is
@@ -1085,7 +1087,7 @@ fn rendered_mmap_address_checks(
     // Hermit assumes: on a host with LA57, Linux would take a higher fixed
     // address and answer ENODEV where this answers ENOMEM.
     const TASK_SIZE: usize = 0x7fff_ffff_f000;
-    let Some(len) = len.checked_add(4095).map(|length| length & !4095) else {
+    let Some(len) = len.checked_add(page - 1).map(|length| length & !(page - 1)) else {
         return Err(Errno::ENOMEM);
     };
     if len > TASK_SIZE {
@@ -1098,7 +1100,7 @@ fn rendered_mmap_address_checks(
         if addr > TASK_SIZE - len {
             return Err(Errno::ENOMEM);
         }
-        if addr & 4095 != 0 {
+        if addr & (page - 1) != 0 {
             return Err(Errno::EINVAL);
         }
         // `security_mmap_addr`: below `vm.mmap_min_addr` (the machine's, which
@@ -1136,7 +1138,8 @@ fn rendered_mmap_file_checks(
     // `file_mmap_ok`: the mapping must end within the largest offset a
     // regular file can have (`MAX_LFS_FILESIZE`), the offset taken unsigned.
     const MAX_LFS_FILESIZE: u64 = i64::MAX as u64;
-    if offset as u64 / 4096 > (MAX_LFS_FILESIZE - len as u64) >> 12 {
+    let page = crate::page::page_size();
+    if offset as u64 / page > (MAX_LFS_FILESIZE - len as u64) >> page.trailing_zeros() {
         return Errno::EOVERFLOW;
     }
     let map_type = flags.bits() & libc::MAP_TYPE;

@@ -500,7 +500,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         const MAX_IOVECS: usize = 1024;
         // Linux limits a single vectored transfer to INT_MAX rounded down to a page.
-        const MAX_RW_COUNT: usize = 0x7fff_f000;
+        let max_rw_count = crate::page::max_rw_count();
         // Linux guarantees pipe writes through this size are atomic.
         const PIPE_BUF: usize = 4096;
         // Every backend provides at least 512 bytes of tool scratch. Linux's
@@ -534,7 +534,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if requested > isize::MAX as usize {
             return Err(Errno::EINVAL.into());
         }
-        let target = requested.min(MAX_RW_COUNT);
+        let target = requested.min(max_rw_count);
         if target == 0 {
             return self.execute_nonblockable_fd_syscall(guest, call).await;
         }
@@ -860,9 +860,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Write,
         expected_open_file: OpenFileId,
     ) -> Result<i64, Error> {
-        const MAX_RW_COUNT: usize = 0x7fff_f000;
+        let max_rw_count = crate::page::max_rw_count();
 
-        let target = call.len().min(MAX_RW_COUNT);
+        let target = call.len().min(max_rw_count);
         if target == 0 {
             return self.execute_nonblockable_fd_syscall(guest, call).await;
         }

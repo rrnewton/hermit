@@ -19,7 +19,6 @@ use tracing::warn;
 use crate::Detcore;
 use crate::RecordOrReplay;
 
-const PAGE_SIZE: usize = 4096;
 // Added in Linux 6.13 and not yet exposed by the pinned libc crate.
 const MADV_GUARD_INSTALL: i32 = 102;
 const MADV_GUARD_REMOVE: i32 = 103;
@@ -86,8 +85,9 @@ const fn madvise_action(advice: i32) -> MadviseAction {
 }
 
 fn validate_common_args(call: syscalls::Madvise) -> Result<(), Error> {
+    let page = crate::page::page_size() as usize;
     let start = call.addr().map(AddrMut::as_raw).unwrap_or(0);
-    if !start.is_multiple_of(PAGE_SIZE) {
+    if !start.is_multiple_of(page) {
         return Err(Errno::EINVAL.into());
     }
     if call.len() == 0 {
@@ -95,7 +95,7 @@ fn validate_common_args(call: syscalls::Madvise) -> Result<(), Error> {
     }
 
     let end = start.checked_add(call.len()).ok_or(Errno::EINVAL)?;
-    end.checked_add(PAGE_SIZE - 1).ok_or(Errno::EINVAL)?;
+    end.checked_add(page - 1).ok_or(Errno::EINVAL)?;
     Ok(())
 }
 
@@ -202,8 +202,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Mincore,
     ) -> Result<i64, Error> {
         // Linux rejects a start address that is not page-aligned with EINVAL.
+        let page = crate::page::page_size() as usize;
         let start = call.addr().map(AddrMut::as_raw).unwrap_or(0);
-        if !start.is_multiple_of(PAGE_SIZE) {
+        if !start.is_multiple_of(page) {
             return Err(Errno::EINVAL.into());
         }
         let len = call.len();
@@ -212,7 +213,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         // Match madvise's overflow guard on the requested range.
         start.checked_add(len).ok_or(Errno::EINVAL)?;
-        let page_count = len.div_ceil(PAGE_SIZE);
+        let page_count = len.div_ceil(page);
         let vec = call.vec().ok_or(Errno::EFAULT)?;
         guest.inject(syscalls::Syscall::from(call)).await?;
         let residency = vec![1u8; page_count];
@@ -221,16 +222,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 }
 
-/// The page size `brk(2)` rounds the break to.
-const BRK_PAGE: u64 = 4096;
-
-fn brk_page_align(address: u64) -> Option<u64> {
-    Some(address.checked_add(BRK_PAGE - 1)? & !(BRK_PAGE - 1))
+/// `address` rounded up to a `page`-byte boundary, as `brk(2)` rounds the
+/// break (`PAGE_ALIGN`).
+fn brk_page_align(address: u64, page: u64) -> Option<u64> {
+    Some(address.checked_add(page - 1)? & !(page - 1))
 }
 
-/// Linux's default `stack_guard_gap`: 256 pages kept free below a mapping
-/// that grows down.
-const STACK_GUARD_GAP: u64 = 256 * BRK_PAGE;
+/// Linux's default `stack_guard_gap` with `page`-byte pages: 256 pages kept
+/// free below a mapping that grows down.
+fn stack_guard_gap(page: u64) -> u64 {
+    256 * page
+}
 
 /// One mapping of a `/proc/<pid>/smaps` text: its range, and the gap Linux
 /// keeps free below it (`stack_guard_start_gap`): `stack_guard_gap` below a
@@ -247,13 +249,15 @@ struct Vma {
 /// they are asked for: nothing is allocated, so where the tool shares the
 /// guest's process its allocator maps nothing between the read and the
 /// injected call that relies on it.
-fn smaps_vmas(smaps: &[u8]) -> SmapsVmas<'_> {
-    SmapsVmas { rest: smaps }
+fn smaps_vmas(smaps: &[u8], page: u64) -> SmapsVmas<'_> {
+    SmapsVmas { rest: smaps, page }
 }
 
 #[derive(Clone)]
 struct SmapsVmas<'a> {
     rest: &'a [u8],
+    /// The host's page size, which sizes the guard gaps.
+    page: u64,
 }
 
 impl<'a> SmapsVmas<'a> {
@@ -312,9 +316,9 @@ impl Iterator for SmapsVmas<'_> {
             if let Some(flags) = line.strip_prefix(b"VmFlags:") {
                 let mut flags = flags.split(|byte| byte.is_ascii_whitespace());
                 vma.start_gap = if flags.clone().any(|flag| flag == b"gd") {
-                    STACK_GUARD_GAP
+                    stack_guard_gap(self.page)
                 } else if flags.any(|flag| flag == b"ss") {
-                    BRK_PAGE
+                    self.page
                 } else {
                     0
                 };
@@ -329,11 +333,16 @@ impl Iterator for SmapsVmas<'_> {
 /// mapping that grows down have its guard gap there
 /// (`vma_find(&vmi, newbrk + PAGE_SIZE + stack_guard_gap)` and
 /// `vm_start_gap`).
-fn brk_may_grow(mut vmas: impl Iterator<Item = Vma>, old_end: u64, new_end: u64) -> bool {
-    let Some(limit) = new_end.checked_add(BRK_PAGE) else {
+fn brk_may_grow(
+    mut vmas: impl Iterator<Item = Vma>,
+    old_end: u64,
+    new_end: u64,
+    page: u64,
+) -> bool {
+    let Some(limit) = new_end.checked_add(page) else {
         return false;
     };
-    let search_end = limit.saturating_add(STACK_GUARD_GAP);
+    let search_end = limit.saturating_add(stack_guard_gap(page));
     let Some(next) = vmas.find(|vma| vma.end > old_end && vma.start < search_end) else {
         return true;
     };
@@ -446,10 +455,17 @@ pub enum BrkMappingCheck {
 
 impl BrkMappingCheck {
     pub(crate) fn allows(self, smaps: &[u8]) -> bool {
+        self.allows_with_page(smaps, crate::page::page_size())
+    }
+
+    /// [`Self::allows`] on a host whose pages are `page` bytes.
+    fn allows_with_page(self, smaps: &[u8], page: u64) -> bool {
         match self {
-            Self::Grow { old_end, new_end } => brk_may_grow(smaps_vmas(smaps), old_end, new_end),
+            Self::Grow { old_end, new_end } => {
+                brk_may_grow(smaps_vmas(smaps, page), old_end, new_end, page)
+            }
             Self::Shrink { new_end, old_end } => {
-                brk_may_shrink(smaps_vmas(smaps), new_end, old_end)
+                brk_may_shrink(smaps_vmas(smaps, page), new_end, old_end)
             }
         }
     }
@@ -556,8 +572,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             diagnostic.rejected("rlimit_data", Some(limit), None, &"not_injected");
             return Ok(current);
         }
-        let (Some(new_end), Some(old_end)) = (brk_page_align(requested), brk_page_align(current))
-        else {
+        let page = crate::page::page_size();
+        let (Some(new_end), Some(old_end)) = (
+            brk_page_align(requested, page),
+            brk_page_align(current, page),
+        ) else {
             diagnostic.rejected("page_overflow", Some(limit), None, &"not_injected");
             return Ok(current);
         };
@@ -673,6 +692,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 mod tests {
     use super::*;
 
+    /// The page size the fixtures below are written for.
+    const PAGE: u64 = 4096;
+
     #[test]
     fn a_shared_brk_check_uses_the_existing_mapping_policy() {
         let smaps = b"00500000-00501000 rw-p 00000000 00:00 0\nVmFlags: rd wr\n";
@@ -680,30 +702,30 @@ mod tests {
             old_end: 0x400000,
             new_end,
         };
-        assert!(grow(0x4ff000).allows(smaps));
-        assert!(!grow(0x500000).allows(smaps));
-        assert!(!grow(u64::MAX - BRK_PAGE + 1).allows(smaps));
+        assert!(grow(0x4ff000).allows_with_page(smaps, PAGE));
+        assert!(!grow(0x500000).allows_with_page(smaps, PAGE));
+        assert!(!grow(u64::MAX - PAGE + 1).allows_with_page(smaps, PAGE));
         assert!(
             BrkMappingCheck::Shrink {
                 new_end: 0x500000,
                 old_end: 0x501000,
             }
-            .allows(smaps)
+            .allows_with_page(smaps, PAGE)
         );
         assert!(
             !BrkMappingCheck::Shrink {
                 new_end: 0x400000,
                 old_end: 0x500000,
             }
-            .allows(smaps)
+            .allows_with_page(smaps, PAGE)
         );
-        assert!(grow(0x500000).allows(b""));
+        assert!(grow(0x500000).allows_with_page(b"", PAGE));
         assert!(
             !BrkMappingCheck::Shrink {
                 new_end: 0x500000,
                 old_end: 0x501000,
             }
-            .allows(b"")
+            .allows_with_page(b"", PAGE)
         );
     }
 
@@ -718,13 +740,13 @@ VmFlags: rd mr mw me
 7ffffff00000-7ffffffff000 rw-p 00000000 00:00 0 [stack]
 VmFlags: rd wr mr mw me gd ac
 ";
-        let vmas: Vec<Vma> = smaps_vmas(smaps.as_bytes()).collect();
+        let vmas: Vec<Vma> = smaps_vmas(smaps.as_bytes(), PAGE).collect();
         assert_eq!(vmas.len(), 3);
         // A pathname that is not UTF-8 does not hide the mappings.
         let mut named =
             b"00500000-00501000 r--p 00000000 00:20 42 /n\xffme\nVmFlags: rd\n".to_vec();
         named.extend_from_slice(smaps.as_bytes());
-        let named: Vec<Vma> = smaps_vmas(&named).collect();
+        let named: Vec<Vma> = smaps_vmas(&named, PAGE).collect();
         assert_eq!(named.len(), 4);
         assert_eq!(named[1..], vmas[..]);
         assert_eq!(
@@ -732,31 +754,111 @@ VmFlags: rd wr mr mw me gd ac
             Vma {
                 start: 0x7ffffff00000,
                 end: 0x7ffffffff000,
-                start_gap: STACK_GUARD_GAP
+                start_gap: stack_guard_gap(PAGE)
             }
         );
         // A mapping at 0x406000: growth to 0x405000 needs 0x405000-0x406000
         // free above it, which it is; growth to 0x406000 meets the mapping.
-        assert!(brk_may_grow(vmas.iter().copied(), 0x401000, 0x405000));
-        assert!(!brk_may_grow(vmas.iter().copied(), 0x401000, 0x406000));
+        assert!(brk_may_grow(vmas.iter().copied(), 0x401000, 0x405000, PAGE));
+        assert!(!brk_may_grow(
+            vmas.iter().copied(),
+            0x401000,
+            0x406000,
+            PAGE
+        ));
         // Below a stack, the guard gap is kept as well.
-        let below_stack = 0x7ffffff00000 - STACK_GUARD_GAP;
+        let below_stack = 0x7ffffff00000 - stack_guard_gap(PAGE);
         assert!(brk_may_grow(
             vmas.iter().copied(),
             0x500000,
-            below_stack - BRK_PAGE
+            below_stack - PAGE,
+            PAGE
         ));
-        assert!(!brk_may_grow(vmas.iter().copied(), 0x500000, below_stack));
+        assert!(!brk_may_grow(
+            vmas.iter().copied(),
+            0x500000,
+            below_stack,
+            PAGE
+        ));
         // Below a shadow stack, one page.
-        let shadow: Vec<Vma> =
-            smaps_vmas(b"00410000-00411000 rw-p 00000000 00:00 0\nVmFlags: rd wr mr mw me ss\n")
-                .collect();
-        assert_eq!(shadow[0].start_gap, BRK_PAGE);
-        assert!(brk_may_grow(shadow.iter().copied(), 0x401000, 0x40e000));
-        assert!(!brk_may_grow(shadow.iter().copied(), 0x401000, 0x40f000));
+        let shadow: Vec<Vma> = smaps_vmas(
+            b"00410000-00411000 rw-p 00000000 00:00 0\nVmFlags: rd wr mr mw me ss\n",
+            PAGE,
+        )
+        .collect();
+        assert_eq!(shadow[0].start_gap, PAGE);
+        assert!(brk_may_grow(
+            shadow.iter().copied(),
+            0x401000,
+            0x40e000,
+            PAGE
+        ));
+        assert!(!brk_may_grow(
+            shadow.iter().copied(),
+            0x401000,
+            0x40f000,
+            PAGE
+        ));
         // Shrinking needs a mapping to unmap in the range.
         assert!(brk_may_shrink(vmas.iter().copied(), 0x405000, 0x407000));
         assert!(!brk_may_shrink(vmas.iter().copied(), 0x402000, 0x406000));
+    }
+
+    /// With 64 KiB pages the break, the page above it and the stack guard
+    /// gap are each counted in 64 KiB pages.
+    #[test]
+    fn a_break_on_a_host_with_large_pages_keeps_large_page_gaps() {
+        const LARGE: u64 = 0x10000;
+        let smaps = "\
+00400000-00410000 r-xp 00000000 00:20 1234 /image
+VmFlags: rd ex mr mw me
+00460000-00470000 r--p 00000000 00:00 0
+VmFlags: rd mr mw me
+7ffffff00000-7fffffff0000 rw-p 00000000 00:00 0 [stack]
+VmFlags: rd wr mr mw me gd ac
+";
+        let vmas: Vec<Vma> = smaps_vmas(smaps.as_bytes(), LARGE).collect();
+        assert_eq!(vmas[2].start_gap, 256 * LARGE);
+        // The page above the new break must be free as well: growth to
+        // 0x450000 leaves 0x450000-0x460000 free, growth to 0x460000 does not.
+        assert!(brk_may_grow(
+            vmas.iter().copied(),
+            0x410000,
+            0x450000,
+            LARGE
+        ));
+        assert!(!brk_may_grow(
+            vmas.iter().copied(),
+            0x410000,
+            0x460000,
+            LARGE
+        ));
+        // A break requested at 0x45f000: with 4 KiB pages it ends there and
+        // fits; with 64 KiB pages it rounds up to 0x460000 and meets the
+        // mapping's page.
+        let requested = 0x45f000;
+        let small = brk_page_align(requested, PAGE).unwrap();
+        let large = brk_page_align(requested, LARGE).unwrap();
+        assert_eq!((small, large), (0x45f000, 0x460000));
+        assert!(brk_may_grow(vmas.iter().copied(), 0x410000, small, PAGE));
+        assert!(!brk_may_grow(vmas.iter().copied(), 0x410000, large, LARGE));
+        // Below the stack, the guard gap is 256 large pages.
+        let below_stack = 0x7ffffff00000 - 256 * LARGE;
+        assert!(brk_may_grow(
+            vmas.iter().copied(),
+            0x500000,
+            below_stack - LARGE,
+            LARGE
+        ));
+        assert!(!brk_may_grow(
+            vmas.iter().copied(),
+            0x500000,
+            below_stack,
+            LARGE
+        ));
+        assert_eq!(brk_page_align(0x421001, LARGE), Some(0x430000));
+        assert_eq!(brk_page_align(0x430000, LARGE), Some(0x430000));
+        assert_eq!(brk_page_align(0x421001, PAGE), Some(0x422000));
     }
 
     #[test]
@@ -835,13 +937,14 @@ VmFlags: rd wr mr mw me gd ac
             .is_err()
         );
 
+        let page = crate::page::page_size() as usize;
         let near_end =
-            unsafe { AddrMut::<libc::c_void>::from_raw_unchecked(usize::MAX & !(PAGE_SIZE - 1)) };
+            unsafe { AddrMut::<libc::c_void>::from_raw_unchecked(usize::MAX & !(page - 1)) };
         assert!(
             validate_common_args(
                 syscalls::Madvise::new()
                     .with_addr(Some(near_end))
-                    .with_len(PAGE_SIZE)
+                    .with_len(page)
                     .with_advice(libc::MADV_FREE),
             )
             .is_err()

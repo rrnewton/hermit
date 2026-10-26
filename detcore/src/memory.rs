@@ -17,15 +17,15 @@ use crate::types::FutexID;
 use crate::types::MmId;
 use crate::types::SharedMemoryObjectId;
 
-const PAGE_SIZE: usize = 4096;
-
+/// A mapping's length as the kernel records it: rounded up to the host's page.
 fn page_aligned_len(len: usize) -> usize {
     if len == 0 {
         return 0;
     }
-    len.checked_add(PAGE_SIZE - 1)
+    let page = usize::try_from(crate::page::page_size()).expect("the page size fits in usize");
+    len.checked_add(page - 1)
         .expect("a successful memory range must fit in the address space")
-        & !(PAGE_SIZE - 1)
+        & !(page - 1)
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

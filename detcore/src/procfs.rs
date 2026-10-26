@@ -460,12 +460,21 @@ pub struct CmdlineArea {
 }
 
 /// The most bytes one argument or environment string takes, its NUL
-/// included: Linux's `MAX_ARG_STRLEN` (32 pages), past which an exec fails.
-const MAX_ARG_STRLEN: u64 = 32 * 4096;
+/// included: Linux's `MAX_ARG_STRLEN` (32 pages, include/uapi/linux/binfmts.h),
+/// past which an exec fails.
+fn max_arg_strlen() -> u64 {
+    32 * crate::page::page_size()
+}
 
 /// The page size `get_mm_cmdline` reads in, and which bounds a
-/// `setproctitle` title (`get_mm_proctitle`).
-const CMDLINE_PAGE: u64 = 4096;
+/// `setproctitle` title (`get_mm_proctitle`): the host's.
+fn cmdline_page() -> u64 {
+    crate::page::page_size()
+}
+
+/// How much [`string_length`] reads at a time. 4096 divides every page
+/// size, so a read never crosses a page boundary.
+const STRING_CHUNK: u64 = 4096;
 
 /// The argument and environment areas of a new image whose initial stack
 /// pointer is `stack`, found as `create_elf_tables` makes them: from
@@ -539,12 +548,13 @@ pub(crate) fn initial_stack_cmdline_area(
 /// be read or no NUL comes within that bound.
 fn string_length(at: u64, read: &mut impl FnMut(u64, &mut [u8]) -> usize) -> Option<u64> {
     let mut length = 0;
-    let mut chunk = [0_u8; CMDLINE_PAGE as usize];
-    while length < MAX_ARG_STRLEN {
+    let mut chunk = [0_u8; STRING_CHUNK as usize];
+    let max_arg_strlen = max_arg_strlen();
+    while length < max_arg_strlen {
         let address = at.checked_add(length)?;
         // Up to the next page boundary, so that a read stops where the
         // mapped bytes do.
-        let size = (CMDLINE_PAGE - address % CMDLINE_PAGE).min(MAX_ARG_STRLEN - length) as usize;
+        let size = (STRING_CHUNK - address % STRING_CHUNK).min(max_arg_strlen - length) as usize;
         let got = read(address, &mut chunk[..size]);
         if got == 0 {
             return None;
@@ -629,10 +639,10 @@ pub(crate) fn read_cmdline(
     }
     let mut last = [0_u8];
     if memory.read(arg_end - 1, &mut last) == 1 && last[0] != 0 {
-        if pos >= CMDLINE_PAGE {
+        if pos >= cmdline_page() {
             return Ok(0);
         }
-        let mut page = vec![0_u8; CMDLINE_PAGE as usize];
+        let mut page = vec![0_u8; cmdline_page() as usize];
         let got = memory.read(arg_start, &mut page);
         if got == 0 {
             return Ok(0);
@@ -660,9 +670,9 @@ pub(crate) fn read_cmdline(
     };
     let mut remaining = count.min(arg_end - at);
     let mut copied = 0;
-    let mut page = vec![0_u8; CMDLINE_PAGE as usize];
+    let mut page = vec![0_u8; cmdline_page() as usize];
     while remaining > 0 {
-        let size = remaining.min(CMDLINE_PAGE) as usize;
+        let size = remaining.min(cmdline_page()) as usize;
         let got = memory.read(at, &mut page[..size]);
         if got == 0 {
             break;
