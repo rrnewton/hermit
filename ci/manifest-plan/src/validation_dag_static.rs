@@ -1984,7 +1984,18 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // analyze::phases::tests::a_check_keeps_the_checkpoints_of_its_own_runs_prefix: 1365.
     // And analyze::races::tests::a_changed_course_is_ordered_by_its_baseline_counterpart: 1366.
     // And analyze::races::tests::candidates_none_of_which_decides_say_what_that_means: 1367.
-    ("test.hermit_unit", 1367),
+    // And analyze's verdict and precondition exits: verdict::tests::{a_verdict_is_written_in_snake_case,
+    // the_search_ends_that_no_swap_separates_are_a_precondition},
+    // schedule_search::tests::the_searches_ends_are_typed,
+    // phases::tests::{an_empty_prefix_that_meets_the_target_is_a_verdict,
+    // a_verdict_is_reported_and_ends_analyze_successfully,
+    // a_first_run_that_misses_ends_the_analysis_or_searches,
+    // bisection_ends_are_answered_by_their_kind,
+    // analyze_own_bisection_points_endpoint_misses_at_replay,
+    // a_selfcheck_difference_is_replay_not_reproducing,
+    // a_success_exit_code_that_means_something_else_is_refused} and
+    // tests::analyze_conclusions_have_their_own_exit_codes_and_class_lines: 1378.
+    ("test.hermit_unit", 1378),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6096,7 +6107,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same eight race-candidate check tests: 1359.
     // And the same changed-course order test: 1360.
     // And the same undecided-candidates test: 1361.
-    ("test.hermit_unit_on_host", 1361),
+    // And the same eleven verdict and precondition tests: 1372.
+    ("test.hermit_unit_on_host", 1372),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
