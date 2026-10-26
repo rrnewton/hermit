@@ -8093,6 +8093,29 @@ fn reconcile_recorded_result(
             return Ok(recorded_result.as_str());
         }
     }
+    // The consistency check cannot see a chaos cell's population floor, so it
+    // takes a FAIL whose harness exited nonzero for a crash. The runner names
+    // that FAIL a chaos-floor failure only when every attempt matched, and so
+    // does this check.
+    if recorded_result == ObservedResult::ChaosFloorFailure {
+        let every_attempt_matched = !captured_attempts.is_empty()
+            && captured_attempts.iter().all(|attempt| {
+                attempt
+                    .verification_report
+                    .as_ref()
+                    .and_then(|raw| {
+                        VerificationReport::from_current_json_slice(raw.as_bytes()).ok()
+                    })
+                    .is_some_and(|report| report.verdict == Verdict::Matched)
+            });
+        return if derived_result == "crash-error" && every_attempt_matched {
+            Ok(recorded_result.as_str())
+        } else {
+            Err(format!(
+                "framework result chaos-floor-failure needs a crash-error consistency check over attempts that all matched, got {derived_result} (every attempt matched: {every_attempt_matched})"
+            ))
+        };
+    }
     if recorded_result.as_str() != derived_result {
         return Err(format!(
             "framework result {} disagrees with pressure consistency check {derived_result}",
@@ -10791,10 +10814,10 @@ fn summarize(
         println!();
     }
     println!(
-        "| Backend | Pass | Determinism failure | Replay failure | Crash/error | Timeout | OOM | Sandbox denied | Infrastructure error | Total |"
+        "| Backend | Pass | Determinism failure | Replay failure | Crash/error | Chaos floor | Timeout | OOM | Sandbox denied | Infrastructure error | Total |"
     );
-    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
-    let mut totals = [0usize; 9];
+    println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+    let mut totals = [0usize; 10];
     for backend in [
         "ptrace",
         "dbt",
@@ -10809,6 +10832,7 @@ fn summarize(
         let determinism = counts.get("determinism-failure").copied().unwrap_or(0);
         let replay = counts.get("replay-failure").copied().unwrap_or(0);
         let crash_error = counts.get("crash-error").copied().unwrap_or(0);
+        let chaos_floor = counts.get("chaos-floor-failure").copied().unwrap_or(0);
         let timeout = counts.get("timeout").copied().unwrap_or(0);
         let oom = counts.get("oom").copied().unwrap_or(0);
         let sandbox_denied = counts.get("sandbox-denied").copied().unwrap_or(0);
@@ -10817,6 +10841,7 @@ fn summarize(
             + determinism
             + replay
             + crash_error
+            + chaos_floor
             + timeout
             + oom
             + sandbox_denied
@@ -10825,17 +10850,18 @@ fn summarize(
         totals[1] += determinism;
         totals[2] += replay;
         totals[3] += crash_error;
-        totals[4] += timeout;
-        totals[5] += oom;
-        totals[6] += sandbox_denied;
-        totals[7] += infrastructure;
-        totals[8] += total;
+        totals[4] += chaos_floor;
+        totals[5] += timeout;
+        totals[6] += oom;
+        totals[7] += sandbox_denied;
+        totals[8] += infrastructure;
+        totals[9] += total;
         println!(
-            "| `{backend}` | {pass} | {determinism} | {replay} | {crash_error} | {timeout} | {oom} | {sandbox_denied} | {infrastructure} | {total} |"
+            "| `{backend}` | {pass} | {determinism} | {replay} | {crash_error} | {chaos_floor} | {timeout} | {oom} | {sandbox_denied} | {infrastructure} | {total} |"
         );
     }
     println!(
-        "| **Total** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** |",
+        "| **Total** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** | **{}** |",
         totals[0],
         totals[1],
         totals[2],
@@ -10844,7 +10870,8 @@ fn summarize(
         totals[5],
         totals[6],
         totals[7],
-        totals[8]
+        totals[8],
+        totals[9]
     );
     println!();
     println!(
@@ -11064,16 +11091,17 @@ fn summarize(
         &mut std::io::stdout(),
         &mut std::io::stderr(),
     );
-    if totals[6] > 0 {
-        return Err(format!(
-            "{} selected cell run(s) were sandbox-denied before the requested operation completed; retained stdout/stderr names the BPFJailer denial",
-            totals[6]
-        ));
-    }
+    // Indices as the summary table's columns: 7 sandbox denied, 8 infrastructure error.
     if totals[7] > 0 {
         return Err(format!(
-            "{} selected cell run(s) produced no trustworthy result; these are harness/infrastructure errors, not compatibility evidence",
+            "{} selected cell run(s) were sandbox-denied before the requested operation completed; retained stdout/stderr names the BPFJailer denial",
             totals[7]
+        ));
+    }
+    if totals[8] > 0 {
+        return Err(format!(
+            "{} selected cell run(s) produced no trustworthy result; these are harness/infrastructure errors, not compatibility evidence",
+            totals[8]
         ));
     }
     let repeated_red = metadata.repetitions.is_some() && !metadata.green;
@@ -24945,6 +24973,58 @@ mod pressure_sample_tests {
                 "infrastructure-error"
             );
         }
+    }
+
+    /// The consistency check takes a chaos-floor failure's FAIL for a crash;
+    /// the framework's chaos-floor-failure reconciles with that only when
+    /// every captured attempt matched, as the runner assigns it.
+    #[test]
+    fn a_chaos_floor_failure_reconciles_only_over_matched_attempts() {
+        let floor = ObservedResult::ChaosFloorFailure;
+        let matched = [
+            comparison_attempt("chaos", 0),
+            comparison_attempt("chaos", 0),
+        ];
+        assert_eq!(
+            reconcile_recorded_result(Some(floor), floor.failure_class(), "crash-error", &matched)
+                .unwrap(),
+            "chaos-floor-failure"
+        );
+        for derived in [
+            "pass",
+            "determinism-failure",
+            "timeout",
+            "infrastructure-error",
+        ] {
+            assert!(
+                reconcile_recorded_result(Some(floor), floor.failure_class(), derived, &matched)
+                    .is_err(),
+                "{derived}"
+            );
+        }
+        let mut unmatched = matched.clone();
+        unmatched[1].verification_report = None;
+        assert!(
+            reconcile_recorded_result(
+                Some(floor),
+                floor.failure_class(),
+                "crash-error",
+                &unmatched
+            )
+            .is_err()
+        );
+        assert!(
+            reconcile_recorded_result(Some(floor), floor.failure_class(), "crash-error", &[])
+                .is_err()
+        );
+        let error = reconcile_recorded_result(
+            Some(floor),
+            Some(FailureClass::NoResult),
+            "crash-error",
+            &matched,
+        )
+        .unwrap_err();
+        assert!(error.contains("carries failure_class"), "{error}");
     }
 
     #[test]

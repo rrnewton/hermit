@@ -1862,10 +1862,12 @@ impl SeriesRow {
 
     fn require_current_no_verdict_evidence(&self) -> Result<(), String> {
         let mode = self.series.cell.rsplit('/').nth(1).unwrap_or_default();
+        // A chaos-floor failure has a verdict on every attempt (each
+        // matched); the population floor, not an attempt, failed it.
         let requires_evidence = matches!(
             self.series.outcome,
             SeriesOutcome::NoResult | SeriesOutcome::Timeout | SeriesOutcome::Errored
-        );
+        ) && self.series.result != Some(ObservedResult::ChaosFloorFailure);
         if matches!(mode, "verify" | "replay" | "chaos")
             && requires_evidence
             && self.series.no_verdict_evidence.is_none()
@@ -1949,6 +1951,11 @@ impl SeriesRow {
                     Some(FailureClass::ProductFailure)
                 )
                 | (
+                    SeriesOutcome::Errored,
+                    Some(ObservedResult::ChaosFloorFailure),
+                    Some(FailureClass::ProductFailure)
+                )
+                | (
                     SeriesOutcome::Timeout,
                     Some(ObservedResult::Timeout),
                     Some(FailureClass::NoResult)
@@ -1971,6 +1978,12 @@ impl SeriesRow {
                 )
                 | (SeriesOutcome::NoResult, None, Some(FailureClass::NoResult))
         );
+        let mode = self.series.cell.rsplit('/').nth(1).unwrap_or_default();
+        if self.series.result == Some(ObservedResult::ChaosFloorFailure) && mode != "chaos" {
+            return Err(format!(
+                "result chaos-floor-failure is a chaos cell's, not a {mode:?} cell's"
+            ));
+        }
         if valid {
             Ok(())
         } else {
@@ -2243,6 +2256,36 @@ mod tests {
         // Rows without a declaration are unchanged on the wire.
         let plain = serde_json::to_string(&row(SeriesSchema::V3)).unwrap();
         assert!(!plain.contains("declared_guest_exit"));
+    }
+
+    /// A chaos cell that its population floor failed while every attempt
+    /// matched is classified chaos-floor-failure (errored, a product
+    /// failure), never on another mode's cell.
+    #[test]
+    fn a_chaos_floor_failure_is_an_errored_product_failure_of_a_chaos_cell() {
+        let mut floor = row(SeriesSchema::V3);
+        floor.series.cell = "fixture/test/chaos/ptrace".into();
+        floor.series.outcome = SeriesOutcome::Errored;
+        floor.series.result = Some(ObservedResult::ChaosFloorFailure);
+        floor.series.failure_class = Some(FailureClass::ProductFailure);
+        floor
+            .validate_for_write()
+            .unwrap_or_else(|error| panic!("chaos: {error}"));
+        let mut verify = floor.clone();
+        verify.series.cell = "fixture/test/verify/ptrace".into();
+        let error = verify.validate_for_write().unwrap_err();
+        assert!(error.contains("chaos-floor-failure"), "{error}");
+        let mut not_errored = floor.clone();
+        not_errored.series.outcome = SeriesOutcome::Diverged;
+        assert!(not_errored.validate_for_write().is_err());
+        assert_eq!(
+            ObservedResult::parse("chaos-floor-failure"),
+            Ok(ObservedResult::ChaosFloorFailure)
+        );
+        assert_eq!(
+            ObservedResult::ChaosFloorFailure.as_str(),
+            "chaos-floor-failure"
+        );
     }
 
     fn declared(fixture: &mut SeriesRow) -> &mut SeriesDeclaredGuestExit {
