@@ -456,6 +456,115 @@ fn ptrace_wakes_after_guest_observed_fatal_signal_and_exit_group_cleanup() {
     }
 }
 
+/// The lifecycle guest's SIGKILL modes, each with the number of robust
+/// mutexes whose owner it kills. Another process kills the owner's process
+/// while a waiter waits: with `kill` (`sigkill`), with a `tgkill` naming a
+/// thread that is not the owner (`sigkill-thread`), with `pidfd_send_signal`
+/// (`sigkill-pidfd`), with `kill(-pgid)` (`sigkill-group`), while the owner
+/// holds the mutex only through its pending slot (`sigkill-pending`), while
+/// the waiter is a thread of the killing process (`sigkill-killer-waits`), or
+/// while two of the process's threads each own a mutex with a waiter
+/// (`sigkill-two-owners`). Or the owner's process kills itself, from a thread
+/// that is not the owner (`sigkill-self`), from the owner
+/// (`sigkill-self-owner`), or from a thread that owns one mutex while a
+/// sibling owns the other (`sigkill-self-both`).
+const SIGKILL_MODES: [(&str, usize); 10] = [
+    ("sigkill", 1),
+    ("sigkill-thread", 1),
+    ("sigkill-pidfd", 1),
+    ("sigkill-group", 1),
+    ("sigkill-pending", 1),
+    ("sigkill-killer-waits", 1),
+    ("sigkill-two-owners", 2),
+    ("sigkill-self", 1),
+    ("sigkill-self-owner", 1),
+    ("sigkill-self-both", 2),
+];
+
+/// Linux walks a robust-mutex owner's list however the owner dies, a SIGKILL
+/// included: the waiter's lock returns `EOWNERDEAD` in every SIGKILL mode.
+#[test]
+fn linux_wakes_the_waiter_when_a_sigkill_ends_the_owner() {
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-sigkill-native-{}",
+        std::process::id()
+    ));
+    let guest = build_lifecycle_guest(&build_root);
+    for (mode, owners) in SIGKILL_MODES {
+        let mut native = Command::new("timeout");
+        native
+            .args(["--kill-after", "5s", "30s"])
+            .arg(&guest)
+            .arg(mode);
+        let captured = run_captured(
+            native,
+            &format!("native robust-futex {mode} control"),
+            &build_root.join(format!("native-{mode}.out")),
+            &build_root.join(format!("native-{mode}.err")),
+            true,
+        );
+        assert!(
+            captured.stdout.contains("PASS: waiter received EOWNERDEAD")
+                && (owners == 1
+                    || captured
+                        .stdout
+                        .contains("PASS: second waiter received EOWNERDEAD")),
+            "native {mode} control did not wake its waiters\nstdout:\n{}\nstderr:\n{}",
+            captured.stdout,
+            captured.stderr,
+        );
+    }
+}
+
+/// A SIGKILL ends its victims without a stop at which Detcore could read their
+/// robust lists, so the sender records them before the send and each victim's
+/// exit callback replays Linux's walk over its record. Each SIGKILL mode
+/// passes at L2 on ptrace, and a strict run records one modeled wake of one
+/// waiter per killed owner after its physical exit; L2 pins their order.
+/// Before that, the waiters stayed parked in the precise futex model and the
+/// run ended in a deadlock report.
+#[test]
+fn ptrace_wakes_the_waiter_when_a_sigkill_ends_the_owner() {
+    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "robust-futex-sigkill-ptrace-{}",
+        std::process::id()
+    ));
+    let guest = build_lifecycle_guest(&build_root);
+    for (mode, owners) in SIGKILL_MODES {
+        let run = run_lifecycle_mode("ptrace", &build_root, &guest, mode, false);
+        assert!(
+            run.stdout.contains("PASS: waiter received EOWNERDEAD")
+                && (owners == 1
+                    || run
+                        .stdout
+                        .contains("PASS: second waiter received EOWNERDEAD")),
+            "ptrace {mode}: the waiter did not get EOWNERDEAD\nstdout:\n{}\nstderr:\n{}",
+            run.stdout,
+            run.stderr,
+        );
+        let wakes: Vec<&str> = run
+            .stderr
+            .lines()
+            .filter(|line| line.contains("robust-list owner death woke"))
+            .collect();
+        assert!(
+            wakes.len() == owners
+                && wakes.iter().all(|wake| {
+                    wake.contains("woke 1 waiter(s)") && wake.contains("after physical exit")
+                }),
+            "ptrace {mode}: expected {owners} modeled wake(s) of one waiter each after the owners' exits, got {wakes:#?}\nstderr:\n{}",
+            run.stderr,
+        );
+        let verified = run_lifecycle_mode("ptrace", &build_root, &guest, mode, true);
+        assert!(
+            verified.stdout.contains("PASS: waiter received EOWNERDEAD"),
+            "ptrace {mode} verification did not make progress after owner death\nstdout:\n{}\nstderr:\n{}",
+            verified.stdout,
+            verified.stderr,
+        );
+    }
+}
+
 /// A successful execve ends robust-mutex owners too. Past exec's point of no
 /// return, `de_thread` kills every other thread, whose exits run
 /// `futex_exit_release`, and `exec_mm_release` runs `futex_exec_release` for

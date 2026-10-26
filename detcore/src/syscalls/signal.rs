@@ -3483,6 +3483,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: impl Into<syscalls::Syscall> + Copy,
     ) -> Result<i64, Error> {
         if !reservation.includes_sender {
+            self.record_sigkill_robust_lists(guest, reservation.token)
+                .await;
             let result = self.record_or_replay(guest, call).await;
             commit_sigkill(guest, reservation.token, result.is_ok()).await;
             return Ok(result?);
@@ -3509,6 +3511,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             Permission::RW,
         );
         resource_request(guest, request).await;
+        // After the grant: from filing the request until it is granted, other
+        // threads may still run and change their lists.
+        self.record_sigkill_robust_lists(guest, reservation.token)
+            .await;
         commit_sigkill(guest, reservation.token, true).await;
         Ok(self.record_or_replay(guest, call).await?)
     }

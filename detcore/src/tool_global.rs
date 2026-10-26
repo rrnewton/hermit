@@ -3105,6 +3105,20 @@ impl GlobalState {
             crate::guest_log::emit(record.as_ref(), *unsent_before);
             return (None, GlobalResponse::GuestLog(()));
         }
+        // A thread a SIGKILL ended asks, from its exit callback, for the
+        // robust list its sender recorded for it. The thread is retired and
+        // its request is no turn: like a warning, it carries no logical time,
+        // touches no ordering state and is answered before the forwarded-record
+        // drain, and a committed victim's request is answered here, before the
+        // gate that leaves its other requests unanswered.
+        if let GlobalRequest::TakeSigkillRobustList = &gr.2 {
+            let list = self
+                .sched
+                .lock()
+                .unwrap()
+                .take_sigkill_robust_list(DetTid::from_raw(from.as_raw()), gr.1);
+            return (None, GlobalResponse::TakeSigkillRobustList(list));
+        }
         // Signal controls an in-guest runtime refused
         // (`crate::refused_signal_controls`): announced once per run, and,
         // like a warning, answered before the forwarded-record drain, with no
@@ -3624,6 +3638,20 @@ impl GlobalState {
             }
             GlobalRequest::GuestLog(..) => {
                 unreachable!("a guest log record is answered before clock accounting")
+            }
+            GlobalRequest::TakeSigkillRobustList => {
+                unreachable!("a SIGKILL victim's robust list is taken before clock accounting")
+            }
+            GlobalRequest::SigkillDyingThreads(token) => R::SigkillDyingThreads(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .sigkill_dying_threads(token),
+            ),
+            GlobalRequest::RecordSigkillRobustLists(token, lists) => {
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .record_sigkill_robust_lists(token, lists);
+                R::RecordSigkillRobustLists(())
             }
             GlobalRequest::AnnounceRefusedSignalControls(..) => {
                 unreachable!(
@@ -7665,6 +7693,25 @@ pub enum GlobalRequest {
     /// Appended last.
     #[cfg(target_arch = "aarch64")]
     StoreExclusive(crate::store_exclusive::Report),
+    /// The threads the send of SIGKILL reservation `token` kills, asked by its
+    /// sender before the send so it can record their robust lists
+    /// (`Scheduler::sigkill_dying_threads`). Appended last.
+    SigkillDyingThreads(u64),
+    /// The robust lists the sender of SIGKILL reservation `token` recorded
+    /// before its send, for the threads it kills
+    /// (`Scheduler::record_sigkill_robust_lists`). Appended last.
+    RecordSigkillRobustLists(
+        u64,
+        Vec<(
+            DetTid,
+            MmId,
+            crate::syscalls::robust_list::RobustListSnapshot,
+        )>,
+    ),
+    /// A thread a SIGKILL ended takes the robust list its sender recorded for
+    /// it, in its exit callback (`Scheduler::take_sigkill_robust_list`).
+    /// Answered before clock accounting. Appended last.
+    TakeSigkillRobustList,
 }
 
 /// Responses from the global object
@@ -7981,6 +8028,13 @@ pub enum GlobalResponse {
     /// The answer to `GlobalRequest::StoreExclusive`. Appended last.
     #[cfg(target_arch = "aarch64")]
     StoreExclusive(()),
+    /// The answer to `GlobalRequest::SigkillDyingThreads`: each thread and its
+    /// address space, in tid order. Appended last.
+    SigkillDyingThreads(Vec<(DetTid, MmId)>),
+    /// Appended last.
+    RecordSigkillRobustLists(()),
+    /// The answer to `GlobalRequest::TakeSigkillRobustList`. Appended last.
+    TakeSigkillRobustList(Option<crate::syscalls::robust_list::RobustListSnapshot>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -11450,6 +11504,61 @@ where
         send_and_update_time(guest, GlobalRequest::ReserveSigkillGroup(sender, pgid, uid)).await;
     match response.1 {
         GlobalResponse::ReserveSigkill(token) => token,
+        _ => unreachable!(),
+    }
+}
+
+/// The threads the send of SIGKILL reservation `token` kills, with their
+/// address spaces (`Scheduler::sigkill_dying_threads`).
+pub(crate) async fn sigkill_dying_threads<G, T>(guest: &mut G, token: u64) -> Vec<(DetTid, MmId)>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response = send_and_update_time(guest, GlobalRequest::SigkillDyingThreads(token)).await;
+    match response.1 {
+        GlobalResponse::SigkillDyingThreads(dying) => dying,
+        _ => unreachable!(),
+    }
+}
+
+/// Hand the scheduler the robust lists recorded before the send of SIGKILL
+/// reservation `token` (`Scheduler::record_sigkill_robust_lists`).
+pub(crate) async fn record_sigkill_robust_lists<G, T>(
+    guest: &mut G,
+    token: u64,
+    lists: Vec<(
+        DetTid,
+        MmId,
+        crate::syscalls::robust_list::RobustListSnapshot,
+    )>,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let response =
+        send_and_update_time(guest, GlobalRequest::RecordSigkillRobustLists(token, lists)).await;
+    match response.1 {
+        GlobalResponse::RecordSigkillRobustLists(()) => {}
+        _ => unreachable!(),
+    }
+}
+
+/// From the exit callback of a thread a SIGKILL ended: take the robust list
+/// the SIGKILL's sender recorded for it (`Scheduler::take_sigkill_robust_list`).
+pub(crate) async fn take_sigkill_robust_list<R>(
+    threads_time: DetTime,
+    reverie: &R,
+    mm: MmId,
+) -> Option<crate::syscalls::robust_list::RobustListSnapshot>
+where
+    R: GlobalRPC<GlobalState>,
+{
+    let response = reverie
+        .send_rpc((threads_time, mm, GlobalRequest::TakeSigkillRobustList))
+        .await;
+    match response.1 {
+        GlobalResponse::TakeSigkillRobustList(list) => list,
         _ => unreachable!(),
     }
 }
@@ -21632,6 +21741,9 @@ mod robust_exit_clock_tests {
                 GlobalRequest::RobustListWakes(wakes) if wakes.is_empty() => "empty-wake",
                 GlobalRequest::RobustListWakes(_) => "wake",
                 GlobalRequest::DeregisterThread(_) => "deregister",
+                // A SIGKILLed thread asks for a robust list its sender may have
+                // recorded (`Detcore::sigkill_robust_list_wakes`).
+                GlobalRequest::TakeSigkillRobustList => "take-sigkill-list",
                 _ => panic!("unexpected exit RPC: {:?}", request.2),
             };
             let wakes = match &request.2 {

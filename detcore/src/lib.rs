@@ -6907,6 +6907,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 );
             }
         }
+        // A SIGKILL sent by a guest thread ended this one without a stop where
+        // its robust list could be read: its sender recorded the list.
+        if !transferred_exec {
+            self.sigkill_robust_list_wakes(global_state, &thread_state, exit_signal)
+                .await;
+        }
         // Warnings this address space could not send, this hook's own among
         // them, go out while the hook's connection still serves it
         // (`crate::guest_log`).
