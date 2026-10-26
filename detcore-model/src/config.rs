@@ -638,6 +638,18 @@ pub struct Config {
     #[clap(long)]
     pub passthru_opt: bool,
 
+    /// Leave to the kernel, without a stop, the few syscalls that Detcore always passes
+    /// through unchanged and that never wait for another thread: getppid, umask, getgroups,
+    /// capget, sched_get_priority_max, sched_get_priority_min and get_robust_list. Each such
+    /// call then costs no tracer round trip, but it also charges no virtual time, logs no
+    /// DETLOG line, is not counted in the run summary, and is not a point where the thread's
+    /// timeslice can end, so the run's virtual clock, schedule and log differ from a run
+    /// without this flag, the same in every run with it. Off by default; refused under
+    /// --strict, which promises that Detcore observes every syscall, and without RCB time.
+    #[serde(default)]
+    #[clap(long)]
+    pub untrap_passthrough_syscalls: bool,
+
     /// In chaos mode, uses much cheaper approximate preemption timers.  Only makes sense
     /// when recording preemptions for later (precise) replay.
     #[clap(long)]
@@ -2303,6 +2315,9 @@ impl fmt::Display for Config {
         if self.passthru_opt {
             write!(f, " --passthru-opt")?;
         }
+        if self.untrap_passthrough_syscalls {
+            write!(f, " --untrap-passthrough-syscalls")?;
+        }
         match self.runs_post_fork {
             RunsPostFork::Child => {}
             RunsPostFork::Parent => write!(f, " --runs-post-fork=parent")?,
@@ -3962,7 +3977,9 @@ mod legacy_backend_json {
     /// as well, so it is never written and reads as off.
     /// `stacktrace_at_schedule_positions` came after it too. It is never
     /// written and reads as false: the DBT runtime takes no stack traces.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 52] = [
+    /// `untrap_passthrough_syscalls` came after it too. `hermit run` refuses it
+    /// on every backend but ptrace, so it is never written and reads as false.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 53] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -4015,6 +4032,7 @@ mod legacy_backend_json {
         "rewrite_exclusives_in_memory",
         "count_store_exclusives",
         "stacktrace_at_schedule_positions",
+        "untrap_passthrough_syscalls",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -4165,7 +4183,8 @@ mod legacy_backend_json {
                     | "strict_binder"
                     | "rewrite_exclusives_in_memory"
                     | "count_store_exclusives"
-                    | "stacktrace_at_schedule_positions",
+                    | "stacktrace_at_schedule_positions"
+                    | "untrap_passthrough_syscalls",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is; and 0, the default.
                 Some("in_guest_reserved_signals" | "access_trace_from") => {
@@ -4526,7 +4545,8 @@ mod legacy_backend_json {
                 | "access_trace_max_bytes"
                 | "rewrite_exclusives_in_memory"
                 | "count_store_exclusives"
-                | "stacktrace_at_schedule_positions" => Ok(()),
+                | "stacktrace_at_schedule_positions"
+                | "untrap_passthrough_syscalls" => Ok(()),
                 "replay_continue_fairly" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
@@ -5509,7 +5529,8 @@ mod tests {
                 | "access_trace_max_bytes"
                 | "rewrite_exclusives_in_memory"
                 | "count_store_exclusives"
-                | "stacktrace_at_schedule_positions" => {}
+                | "stacktrace_at_schedule_positions"
+                | "untrap_passthrough_syscalls" => {}
                 "replay_continue_fairly" => {}
                 other => expected.push(other.to_owned()),
             }
@@ -5548,11 +5569,11 @@ mod tests {
         // `access_trace_max_bytes`, `replay_continue_fairly`,
         // `standard_stream_aliases`, `sleep_registration`, `strict_binder`,
         // `post_crash_timeslice`, `rewrite_exclusives_in_memory`,
-        // `stacktrace_at_schedule_positions`
+        // `stacktrace_at_schedule_positions`, `untrap_passthrough_syscalls`
         // and `strict_schedule_boundaries` none: fourteen more keys and
-        // fifty-one fewer, so thirty-seven keys fewer than fields.
+        // fifty-two fewer, so thirty-eight keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 37);
+        assert_eq!(fields.len(), keys.len() + 38);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -6179,6 +6200,39 @@ mod tests {
             !from_legacy_backend_json(&array)
                 .unwrap()
                 .count_store_exclusives
+        );
+    }
+
+    /// `untrap_passthrough_syscalls` never enters the legacy form, whatever its
+    /// value: the legacy string keeps its bytes, and it reads
+    /// back as false from both the object and the array form.
+    #[test]
+    fn untrap_passthrough_syscalls_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            untrap_passthrough_syscalls: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("untrap_passthrough_syscalls"), "{json}");
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .untrap_passthrough_syscalls
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .untrap_passthrough_syscalls
         );
     }
 
@@ -7827,6 +7881,19 @@ mod tests {
         );
         assert!(Config::try_parse_from(["detcore", "--proc=host"]).is_err());
         assert!(ProcLevel::Minimal < ProcLevel::Standard);
+    }
+
+    #[test]
+    fn untrap_passthrough_syscalls_is_opt_in_and_round_trips() {
+        assert!(!Config::default().untrap_passthrough_syscalls);
+        let config = Config::parse_from(["detcore", "--untrap-passthrough-syscalls"]);
+        assert!(config.untrap_passthrough_syscalls);
+        assert!(
+            config
+                .to_string()
+                .contains(" --untrap-passthrough-syscalls")
+        );
+        assert!(!Config::default().to_string().contains("untrap"));
     }
 
     #[test]
