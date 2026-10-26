@@ -644,6 +644,7 @@ fn origin_pidfd_and_primary_serialization_refuse_false_proofs() {
             let serialized = crate::SerializableError::from(
                 Error::new(diagnostic.clone()).context(GuestTimedOut {
                     limit: Duration::from_secs(1),
+                    survivors: None,
                 }),
             );
             assert_eq!(serialized.kind(), FailureKind::Error);

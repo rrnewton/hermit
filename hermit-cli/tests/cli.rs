@@ -31962,6 +31962,15 @@ fn run_timeout_names_the_guest_process_left_running_after_its_root_exited() {
     let _ = std::fs::remove_file(&fifo);
     let script = format!("mkfifo {fifo} && exec cat {fifo} & exit 0");
     let child = spawn_timed_run(RUN_TIMEOUT_SECS, &["/bin/sh", "-c", &script]);
+    // shell that started it in the background exits at once.
+    let child = spawn_timed_run(
+        RUN_TIMEOUT_SECS,
+        &[
+            "/bin/sh",
+            "-c",
+            "mkfifo /tmp/never-written && exec cat /tmp/never-written & exit 0",
+        ],
+    );
     let session = child.id() as i32;
     let output = child
         .wait_with_output()
