@@ -1,5 +1,13 @@
 # SaBRe backend compatibility
 
+> **Archived (nightly only) since 2026-10-25.** The owner archived the SaBRe
+> backend: it gets no feature work, and its tests left per-commit validation.
+> Its code still builds in every validation, `test.sabre_examples` runs two of
+> its tests as a smoke check, and its manifest cells belong to the
+> `archived-nightly` run type, which the nightly pressure sweep runs instead of
+> full validation (`ci/manifest-plan/src/archived.rs`). The measurements below
+> predate the archival.
+
 [SaBRe](https://github.com/srg-imperial/SaBRe) is a load-time selective binary
 rewriter that intercepts a program's system calls from inside the process,
 rather than through the kernel-mediated tracing that `ptrace` uses. Hermit can

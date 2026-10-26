@@ -4207,7 +4207,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // sabre_program_break_of_a_pie_starts_at_linuxs_rule and
     // sabre_refuses_brk_it_cannot_model_by_name: 36.
     // And sabre_heap_records_are_ptraces: 37.
-    ("test.sabre_examples", 36),
+    // SaBRe was archived on 2026-10-25 (ci/manifest-plan/src/archived.rs): the
+    // node runs only its smoke pair, sabre_root_pid_matches_ptrace and
+    // sabre_and_ptrace_detlogs_agree_through_post_exec: 2.
+    ("test.sabre_examples", 2),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -5674,7 +5677,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // sigstkflt_handler_not_installed_is_announced_once_per_run: 32.
     // sabre_guest_close_of_stderr_closes_it: 33.
     // And the same three program-break tests: 36, and the heap-record test: 37.
-    ("test.sabre_examples_on_host", 36),
+    // The smoke pair of the archived SaBRe backend, as test.sabre_examples.
+    ("test.sabre_examples_on_host", 2),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
@@ -8746,14 +8750,14 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
     StaticStepSpec {
         group: r########"test"########,
         job: r########"sabre_examples"########,
-        desc: r########"SaBRe non-racy examples: per-backend time determinism and non-time ptrace parity"########,
-        description: r########"Holds the SaBRe backend to ptrace's results on non-racy examples: hermit-cli/tests/sabre_examples.rs runs one test at a time, its count pinned by NEXTEST_EXPECTED_EXECUTED, against an explicitly configured SaBRe loader, so a missing loader, libdetcore_sabre.so or revision file fails rather than skips. examples/devrand.sh, a root-PID shell probe and a glibc getrandom caller must give identical status, stdout and stderr under ptrace and --backend sabre; examples/date.sh and a clock-progress guest must repeat across three runs on each backend; and every SaBRe guest must pass `--verify --verify-strict` with bitwise_parity true. A guest that points its stderr at a pipe and forks a child that only exits must, at --log=warn, read nothing from that pipe on either backend (at --log=info the plugin's DETLOG forwarding still writes there, and that run is only checked for repeatability). Under --verify the plugin sends its DETLOG records on a socket reverie-sabre keeps from the guest, so the run log must match ptrace's through the post-exec AT_RANDOM record, and a guest that dup2s onto every descriptor from 1024 to 1039 must still run to the end with its records in the log. SaBRe letting getrandom return host entropy, a controller line leaking into guest stderr, the plugin's fingerprint warning reaching a forked child's guest stderr, the in-guest records appended after the run instead of interleaved, a run whose forwarded records went missing (a guest that closes the socket before the plugin adopts it) being compared instead of refused, the plugin writing its records into a file the guest made its own stderr after the socket it was given could not be adopted, or the plugin adopting a socket of the guest's own that guest code put at the passed number before the plugin ran, is caught."########,
+        desc: r########"SaBRe smoke test (archived backend): ptrace parity and canonical verify of one guest"########,
+        description: r########"SaBRe is archived (owner, 2026-10-25: no feature work, tests nightly only; ci/manifest-plan/src/archived.rs), so per commit this node is its smoke test, beside the third-party-backends build and Clippy that keep its code compiling. It runs two tests of hermit-cli/tests/sabre_examples.rs, its count pinned by NEXTEST_EXPECTED_EXECUTED, against an explicitly configured SaBRe loader, so a missing loader, libdetcore_sabre.so or revision file fails rather than skips: sabre_root_pid_matches_ptrace requires a root-PID shell probe to give identical status, stdout and stderr under ptrace and --backend sabre, the SaBRe controller's diagnostics to stay out of guest stderr, and the SaBRe run to pass `--verify --verify-strict` with bitwise_parity true; sabre_and_ptrace_detlogs_agree_through_post_exec requires the DETLOG records the SaBRe plugin forwards for /bin/true to equal ptrace's through the post-exec AT_RANDOM record. A SaBRe build that cannot start a guest, leaks a controller line into guest stderr, loses determinism under strict verify or stops forwarding Detcore's records is caught. The suite's other tests (time repeatability, getrandom, forwarding-socket refusals, RDTSC, stack limits, program break, exe links) left the per-commit graph with the archival: run them on demand with the same environment and no -E filter. Until 2026-10-25 this node ran all 36."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_SABRE_TEST_BINARY=$PWD/target/ci/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test sabre_examples -j 1"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_SABRE_TEST_BINARY=$PWD/target/ci/hermit HERMIT_SABRE_BINARY=$PWD/target/install_pkg/rsrcs/sabre ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends --test sabre_examples -j 1 -E 'test(=sabre_root_pid_matches_ptrace) | test(=sabre_and_ptrace_detlogs_agree_through_post_exec)'"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"sabre_examples"########]),

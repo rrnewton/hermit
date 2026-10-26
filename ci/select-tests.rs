@@ -1432,7 +1432,10 @@ fn self_test() {
         rp_dbt.cells.len() < total_cells,
     );
 
-    // SaBRe backend change: only sabre cells + sabre shard.
+    // SaBRe backend change: only sabre cells + sabre shard. SaBRe is archived
+    // (ci/manifest-plan/src/archived.rs), so the committed plan has no SaBRe
+    // cell and the change selects none of its cells; the fixture plan keeps
+    // the backend affinity positive.
     let sabre = select(&fp, &dag, &["detcore-sabre/src/lib.rs".into()]);
     let rp_sabre = derive_run_plan(&sabre, &shards, &plan, &dag);
     check(
@@ -1440,8 +1443,17 @@ fn self_test() {
         rp_sabre.shards.contains(&"sabre".to_string()),
     );
     check(
-        "sabre ⇒ only sabre cells",
-        !rp_sabre.cells.is_empty() && rp_sabre.cells.iter().all(|c| c.backend == "sabre"),
+        "sabre ⇒ no e2e cells while SaBRe is archived",
+        !plan.cells.iter().any(|c| c.backend == "sabre") && rp_sabre.cells.is_empty(),
+    );
+    check(
+        "sabre fixture ⇒ only the SaBRe identity",
+        derive_run_plan(&sabre, &shards, &mixed_backend_fixture, &dag)
+            .cells
+            .iter()
+            .map(Plan::slug)
+            .collect::<Vec<_>>()
+            == vec!["fixture-b__verify__sabre".to_string()],
     );
     check(
         "sabre ⇒ build_dbt, not aux",
