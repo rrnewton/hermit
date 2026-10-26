@@ -1362,6 +1362,10 @@ pub struct GlobalState {
     /// trace mode is configured. Every operation reads global time under this
     /// lock, so an input's release point is fixed by the schedule alone.
     network: Option<Mutex<NetworkEngine>>,
+
+    /// `--watch`: the run summary's watch part, taken from the access trace
+    /// when it is finished.
+    watch_summary: Option<detcore_model::summary::WatchRunSummary>,
 }
 
 /// The stores a process's physical exit must clean up, shared with the
@@ -1968,6 +1972,7 @@ impl GlobalState {
             global_time,
             preemptions_to_replay,
             network,
+            watch_summary: None,
         }
     }
 
@@ -2002,6 +2007,25 @@ impl GlobalState {
             let mut sched = self.sched.lock().unwrap();
             (sched.access_trace.take(), sched.recorded_event_count)
         };
+        self.watch_summary = writer
+            .as_ref()
+            .and_then(crate::access_trace::AccessTraceWriter::watch_run_summary);
+        if let Some(watch) = &self.watch_summary
+            && !watch.unarmed.is_empty()
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                crate::util::RetryingStderr,
+                "hermit: --watch: some threads never armed their watches, so their accesses are \
+                 missing from the trace: {}",
+                watch
+                    .unarmed
+                    .iter()
+                    .map(|(tid, why)| format!("thread {tid} ({why:?})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
         // Output I/O runs without the scheduler mutex.
         if let Some(writer) = writer
             && let Err(error) = writer.finish(events)
@@ -2377,10 +2401,12 @@ impl GlobalState {
         for warning in self.store_exclusive.lock().unwrap().warnings(&self.cfg) {
             warn!("{}", warning);
         }
+        let watch_summary = self.watch_summary.take();
         let summary_result = self
             .finalize_run_summary()
             .and_then(|(mut summary, description)| {
                 summary.dispatch_stats = dispatch_stats;
+                summary.watch = watch_summary;
                 // No summary is published unless terminal validation and recording
                 // output both succeeded. Output errors retain their ordinary class.
                 if let Some(path) = print_summary_to_json_file {
@@ -2984,6 +3010,15 @@ impl GlobalTool for GlobalState {
             .collect()
     }
 
+    /// `--watch`: a hit only appends to the access trace. It sends no
+    /// request, records no event and charges no time (`crate::watch`).
+    fn on_watchpoint_hit(&self, hit: &reverie::WatchHit) {
+        if let Some(refusal) = crate::watch::hit_refusal(hit) {
+            crate::scheduler::exit_on_scheduler_refusal(&refusal);
+        }
+        self.sched.lock().unwrap().record_watch_hit(hit);
+    }
+
     fn on_fatal_signal_exit(&self, exit: &reverie::FatalSignalExit) {
         if let Some(capture) = &self.cfg.fatal_core_capture {
             crate::fatal_core::capture_and_log(capture, exit);
@@ -3148,6 +3183,11 @@ impl GlobalTool for GlobalState {
             && response != GlobalResponse::ThreadExited
             && response != GlobalResponse::Retired
         {
+            let watch = self.sched.lock().unwrap().watch_order();
+            let response = match watch {
+                Some(order) => GlobalResponse::WithWatchOrder(order, Box::new(response)),
+                None => response,
+            };
             let response = GlobalResponse::Granted(Box::new(response));
             if lone {
                 (time, GlobalResponse::WithLoneGrant(Box::new(response)))
@@ -4688,9 +4728,9 @@ impl GlobalState {
                 let ns = self.global_time.lock().unwrap().as_nanos();
                 R::GlobalTimeLowerBound(ns)
             }
-            GlobalRequest::TraceSchedEvent(ev, detpid, command_bootstrap, access) => {
+            GlobalRequest::TraceSchedEvent(ev, detpid, command_bootstrap, access, watch) => {
                 match self
-                    .recv_trace_schedevent(ev, detpid, request_mm, command_bootstrap, access)
+                    .recv_trace_schedevent(ev, detpid, request_mm, command_bootstrap, access, watch)
                     .await
                 {
                     SchedulerRpcResult::Continue(response) => R::TraceSchedEvent(response),
@@ -6881,6 +6921,7 @@ impl GlobalState {
         request_mm: MmId,
         command_bootstrap: bool,
         access: Option<Box<crate::access_trace::AccessPayload>>,
+        watch: Option<crate::watch::WatchStatus>,
     ) -> SchedulerRpcResult<TraceSchedEventResponse> {
         let ev = {
             let mut sched = self.lock_rpc_scheduler(false).await;
@@ -6933,6 +6974,7 @@ impl GlobalState {
                 let print_stack2 = if self.cfg.record_preemptions {
                     let stack = sched.record_event(&ev);
                     sched.record_access(&ev, access);
+                    sched.note_watch(&ev, watch);
                     stack
                 } else {
                     None
@@ -6991,28 +7033,33 @@ impl GlobalState {
                 timeslice: end_of_timeslice,
                 schedule_released,
                 schedule_over,
+                // After any wait above: the order the thread resumes with.
+                watch: self.sched.lock().unwrap().watch_order(),
             }
         } else {
-            let print_stack_strace = {
+            let (print_stack_strace, watch) = {
                 let mut sched = self.lock_rpc_scheduler(false).await;
                 if sched.thread_is_logically_killed(ev.dettid)
                     || !sched.rpc_incarnation_matches(ev.dettid, request_mm)
                 {
                     return SchedulerRpcResult::ThreadExited;
                 }
-                if self.cfg.record_preemptions {
+                let stack = if self.cfg.record_preemptions {
                     let stack = sched.record_event(&ev);
                     sched.record_access(&ev, access);
+                    sched.note_watch(&ev, watch);
                     stack
                 } else {
                     None
-                }
+                };
+                (stack, sched.watch_order())
             };
             TraceSchedEventResponse {
                 print_stack_strace,
                 timeslice: None,
                 schedule_released: false,
                 schedule_over: false,
+                watch,
             }
         };
 
@@ -7516,15 +7563,17 @@ pub enum GlobalRequest {
     /// Retrieve global time.
     GlobalTimeLowerBound,
 
-    /// Record scheduling event in a total order. The last field is what the
+    /// Record scheduling event in a total order. The fourth field is what the
     /// event adds to the access trace (`--record-access-trace-to`); `None`
-    /// without one.
+    /// without one. The last is the thread's watch state (`--watch`), `None`
+    /// without watches.
     // Logging provenance only; never serialized into a schedule artifact.
     TraceSchedEvent(
         SchedEvent,
         DetPid,
         bool,
         Option<Box<crate::access_trace::AccessPayload>>,
+        Option<crate::watch::WatchStatus>,
     ),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -8062,6 +8111,10 @@ pub enum GlobalResponse {
     /// sent. Unwrapped by `send_and_update_time`, which notes the hand-off
     /// (`ThreadState::note_scheduler_handoff`).
     Granted(Box<GlobalResponse>),
+    /// `--watch`: whether the thread's watches are due, on a reply after a
+    /// wait (inside `Granted`), so a thread arms before it runs guest code
+    /// again (`crate::watch`). Unwrapped by `send_and_update_time`.
+    WithWatchOrder(crate::watch::WatchOrder, Box<GlobalResponse>),
     RequestResources(ResumeStatus),
     ParkedRequest(ResourceReply),
     ResumeParkedRequest(ResourceReply),
@@ -9230,6 +9283,13 @@ where
             .thread_state_mut()
             .note_scheduler_handoff(continues_sigreturn);
     }
+    let watch_order = match resp.1 {
+        GlobalResponse::WithWatchOrder(order, response) => {
+            resp.1 = *response;
+            Some(order)
+        }
+        _ => None,
+    };
     if let GlobalResponse::WithSliceBoundaryOwner(owner, response) = resp.1 {
         resp.1 = *response;
         crate::slice_boundary::adopt_owner(guest.thread_state_mut(), owner, starts_thread)
@@ -9267,6 +9327,9 @@ where
     }
     guest.thread_state_mut().last_grant_deadline = deadline;
     cap_timeslice_at_deadline(guest, deadline);
+    if let Some(order) = watch_order {
+        crate::watch::adopt(guest, order);
+    }
     if resp.1 == GlobalResponse::Retired {
         // A committed SIGKILL victim (`Scheduler::is_unaccounted_sigkill_victim`):
         // this callback never resumes. No error, errno or injection reaches
@@ -10591,6 +10654,8 @@ pub struct TraceSchedEventResponse {
     /// Whether the replayed schedule is over: it ran out or was released
     /// (`Scheduler::schedule_replay_over`).
     schedule_over: bool,
+    /// `--watch`: whether the thread's watches are due (`crate::watch`).
+    watch: Option<crate::watch::WatchOrder>,
 }
 
 struct SchedEventForLog<'a> {
@@ -10698,9 +10763,17 @@ pub async fn trace_schedevent_with_access<G, T>(
     {
         guest.thread_state_mut().callback_history.observe_event(&ev);
     }
+    let watch_status =
+        (!guest.config().watch.is_empty()).then(|| guest.thread_state().watch.status());
     let resp = send_and_update_time(
         guest,
-        GlobalRequest::TraceSchedEvent(ev, detpid, command_bootstrap, access.map(Box::new)),
+        GlobalRequest::TraceSchedEvent(
+            ev,
+            detpid,
+            command_bootstrap,
+            access.map(Box::new),
+            watch_status,
+        ),
     )
     .await;
 
@@ -10713,6 +10786,7 @@ pub async fn trace_schedevent_with_access<G, T>(
                 timeslice,
                 schedule_released,
                 schedule_over,
+                watch,
             }),
         ) => {
             if schedule_released {
@@ -10720,6 +10794,9 @@ pub async fn trace_schedevent_with_access<G, T>(
             }
             if schedule_over {
                 guest.thread_state_mut().schedule_replay_over = true;
+            }
+            if let Some(order) = watch {
+                crate::watch::adopt(guest, order);
             }
             if let Some(m_path) = print_stack_strace {
                 trace!("[trace_schedevent] writing stacktrace via Reverie...");
@@ -13189,6 +13266,7 @@ mod tests {
     mod stopping_refusal_tests;
     mod temporary_mask_publication_tests;
     mod timerless_clock_tests;
+    mod watch_arming_tests;
     use std::collections::BTreeSet;
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
@@ -20888,7 +20966,8 @@ mod tests {
         install_test_registration(&state, dettid, request_seen.clone());
         install_test_registration(&state, next_tid, Ivar::new());
 
-        let replay = state.recv_trace_schedevent(event, detpid, MmId::initial(detpid), false, None);
+        let replay =
+            state.recv_trace_schedevent(event, detpid, MmId::initial(detpid), false, None, None);
         let kill_after_replay_yield = async {
             while request_seen.try_read().is_none() {
                 tokio::task::yield_now().await;

@@ -4882,6 +4882,11 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) traced_call: crate::access_trace::TracedCall,
 
+    /// The thread's hardware watchpoints (`--watch`, `crate::watch`). Never
+    /// carried to another thread: debug registers are not inherited.
+    #[serde(skip)]
+    pub(crate) watch: crate::watch::WatchThread,
+
     /// Linux memory address space shared by tasks created with `CLONE_VM`.
     pub mm_id: MmId,
 
@@ -6113,6 +6118,7 @@ impl<T> ThreadState<T> {
             entry_import: None,
             send_inspection: None,
             traced_call: Default::default(),
+            watch: Default::default(),
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
             pedigree: Pedigree::new(), // Root thread.
