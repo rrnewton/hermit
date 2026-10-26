@@ -1,4 +1,3 @@
-pub mod archived;
 pub mod bundle_record;
 #[path = "../../../hermit-cli/src/canonical_verdict.rs"]
 pub mod canonical_verdict;
