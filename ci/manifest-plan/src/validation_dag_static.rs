@@ -1225,7 +1225,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (legacy form, round trip): 1934.
     // And detcore-model's config::tests::
     // a_timed_wait_spread_registers_sleeps_at_the_first_pass_by_default: 1935.
-    ("test.regular_crates", 1935),
+    // And detcore-model's three schedule_replay_options::tests (the
+    // expected rows, their consistency, the user guide's copy): 1938.
+    ("test.regular_crates", 1938),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3171,7 +3173,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // for main's prefix records: 3026.
     // And record_serde::tests::
     // the_timed_wait_spread_survives_the_raw_record_and_the_envelope: 3027.
-    ("test.detcore_unit", 3027),
+    // And scheduler::test::consuming_the_last_legacy_event_stops_the_spread
+    // and scheduler::boundary_controller::tests::
+    // consuming_the_last_boundary_record_stops_the_spread: 3029.
+    ("test.detcore_unit", 3029),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5571,7 +5576,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same spread replay-wait unit: 3025.
     // And the same prefix-record unit: 3026.
     // And the same raw-record unit: 3027.
-    ("test.detcore_unit_on_host", 3027),
+    // And the same two spread transition tests: 3029.
+    ("test.detcore_unit_on_host", 3029),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6194,7 +6200,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three #4682 re-land units: 1915 + 3 = 1918.
     // And the same two --chaos-timed-wait-spread config tests: 1920.
     // And the same spread registration config test: 1921.
-    ("test.regular_crates_on_host", 1921),
+    // And the same three schedule replay options tests: 1924.
+    ("test.regular_crates_on_host", 1924),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

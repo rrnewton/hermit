@@ -64,6 +64,7 @@ use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::Position;
 use detcore_model::happens_before::Strength;
 use detcore_model::happens_before::ThreadRef;
+use detcore_model::schedule_replay_options::ReplayOption;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
 use detcore_model::syscall_histogram::SparseSyscallHistogram;
@@ -8595,14 +8596,11 @@ impl Scheduler {
     fn file_timed_wait(&mut self, dettid: DetTid, deadline: LogicalTime) {
         // A schedule replay spreads the waits its schedule covers, as its
         // recording did, and no wait filed after the schedule has run out:
-        // the run then continues without chaos decisions, as `hermit analyze`
-        // continues a replayed prefix, and the spread is one of them.
-        let past_the_schedule = self.replayer.as_ref().is_some_and(|r| r.ran_out());
-        let Some(spread) = self
-            .timed_wait_spread
-            .as_mut()
-            .filter(|_| !past_the_schedule)
-        else {
+        // the spread is a chaos decision (`schedule_replay_options`), and a
+        // replay draws no new wake times past its schedule.
+        let spread_applies =
+            ReplayOption::ChaosTimedWaitSpread.applies(self.past_the_schedule(), self.chaos);
+        let Some(spread) = self.timed_wait_spread.as_mut().filter(|_| spread_applies) else {
             self.blocked.timed_waiters.insert(deadline, dettid);
             return;
         };
@@ -18193,10 +18191,7 @@ impl Scheduler {
     /// it (`Replayer::release_schedule`). Either is a scheduled event of a
     /// running thread, so it is the same in every run.
     fn release_replay_priorities_if_exhausted(&mut self) {
-        if self.replay_priorities_released
-            || !self.has_schedule_replay()
-            || self.replay_has_records_left()
-        {
+        if self.replay_priorities_released || !self.past_the_schedule() {
             return;
         }
         self.replay_priorities_released = true;
@@ -27933,21 +27928,55 @@ mod test {
 
     /// A schedule replay spreads a wait it files while recorded events
     /// remain, as its recording did, and files one at its deadline once its
-    /// schedule has run out: the run then continues without chaos decisions,
-    /// as `hermit analyze` continues a replayed prefix.
+    /// schedule has run out: a replay draws no new wake times past its
+    /// schedule (`schedule_replay_options`). Both replay formats stop at the
+    /// same point: a slice-boundary replay used to keep drawing for a wait
+    /// filed after its last record.
     #[test]
     fn a_schedule_replay_spreads_no_wait_filed_past_its_schedule() {
+        use detcore_model::schedule::boundary::Record;
+        use detcore_model::schedule::boundary::Schedule;
         let sleeper = DetTid::from_raw(5);
         let (seed, factor) = spread_seed(sleeper, |factor| factor < 0.5);
         let event = SchedEvent::syscall(sleeper, Sysno::nanosleep, SyscallPhase::Posthook);
-        for (events, spread) in [(vec![event], true), (vec![], false)] {
+        let legacy = |events: Vec<SchedEvent>| {
+            move |scheduler: &mut Scheduler| scheduler.replayer = Some(Replayer::new(events))
+        };
+        let boundary = |records: Vec<Record>| {
+            move |scheduler: &mut Scheduler| {
+                scheduler.boundary_replayer = Some(boundary_replayer::BoundaryReplayer::new(
+                    Schedule::new(records).unwrap(),
+                ))
+            }
+        };
+        type Install = Box<dyn FnOnce(&mut Scheduler)>;
+        let cases: [(&str, Install, bool); 4] = [
+            (
+                "legacy, events left",
+                Box::new(legacy(vec![event.clone()])),
+                true,
+            ),
+            ("legacy, ran out", Box::new(legacy(vec![])), false),
+            (
+                "slice boundaries, records left",
+                Box::new(boundary(vec![Record::Event(event.clone())])),
+                true,
+            ),
+            (
+                "slice boundaries, ran out",
+                Box::new(boundary(vec![])),
+                false,
+            ),
+        ];
+        for (case, install, spread) in cases {
             let config = Config {
                 chaos_timed_wait_spread: Some(10.0),
                 sched_seed: Some(seed),
                 ..Config::default()
             };
             let mut scheduler = Scheduler::new(&config);
-            scheduler.replayer = Some(Replayer::new(events));
+            install(&mut scheduler);
+            assert_eq!(scheduler.past_the_schedule(), !spread, "{case}");
             let start = scheduler.committed_time;
             let deadline = start + LogicalTime::from_nanos(1_000_000);
             scheduler.file_timed_wait(sleeper, deadline);
@@ -27959,9 +27988,46 @@ mod test {
             assert_eq!(
                 scheduler.blocked.timed_waiters.thread_deadline(sleeper),
                 Some(expected),
-                "recorded events left: {spread}"
+                "{case}"
             );
         }
+    }
+
+    /// The spread stops exactly at the consumption of a legacy schedule's
+    /// last event: a wait filed while that event is still ahead is spread,
+    /// one filed after it is queued at its deadline.
+    #[test]
+    fn consuming_the_last_legacy_event_stops_the_spread() {
+        let sleeper = DetTid::from_raw(5);
+        let other = DetTid::from_raw(7);
+        let (seed, factor) = spread_seed(sleeper, |factor| factor < 0.5);
+        let first = SchedEvent::syscall(sleeper, Sysno::getpid, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(10_000));
+        let last = SchedEvent::syscall(sleeper, Sysno::nanosleep, SyscallPhase::Prehook)
+            .with_time(LogicalTime::from_nanos(20_000));
+        let config = Config {
+            chaos_timed_wait_spread: Some(10.0),
+            sched_seed: Some(seed),
+            ..Config::default()
+        };
+        let mut scheduler = Scheduler::new(&config);
+        scheduler.replayer = Some(Replayer::new(vec![first.clone(), last.clone()]));
+        let _ = scheduler.consume_schedevent(&first);
+        assert!(!scheduler.past_the_schedule());
+        let start = scheduler.committed_time;
+        let deadline = start + LogicalTime::from_nanos(1_000_000);
+        scheduler.file_timed_wait(sleeper, deadline);
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+            Some(start + LogicalTime::from_nanos((1_000_000.0 * factor).round() as u64))
+        );
+        let _ = scheduler.consume_schedevent(&last);
+        assert!(scheduler.past_the_schedule());
+        scheduler.file_timed_wait(other, deadline);
+        assert_eq!(
+            scheduler.blocked.timed_waiters.thread_deadline(other),
+            Some(deadline)
+        );
     }
 
     /// A schedule replay whose next event is a spread sleeper's waits, in a
