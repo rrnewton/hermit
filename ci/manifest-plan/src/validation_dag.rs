@@ -2208,8 +2208,11 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
     // it builds in a fixed directory: six full validations on 2026-10-08/09
     // measured 172.6 to 181.2 s wall and 2438 to 2561 CPU-s.
     // The CPU bound was the next 300-s bucket above 1.5 x 2561 (3842), 3900.
-    // Every stage is cold (the fixed directory is wiped before and after), so a
-    // core-crate change costs no more than any other run. The work grew by
+    // Until 2026-10-26 every stage was cold (the fixed directory was wiped
+    // before and after). It is now kept and refreshed by content, so most stages
+    // rebuild only what changed, but a stage is still cold when its directory is
+    // new, at least once a day and over its size bound, so the bounds below stay
+    // those of a cold stage. The work grew by
     // about 500 CPU-s when d4594afa (2026-10-17) added a cold build of the
     // liteinst-runtime profile to the stage, which b42f1992 then ran beside the
     // other builds (its throttled time doubled, its CPU did not change). Across
