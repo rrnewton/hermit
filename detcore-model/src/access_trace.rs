@@ -1074,7 +1074,7 @@ mod tests {
                 tid: tid(7),
                 pid: DetPid::from_raw(3),
                 nth: 390,
-                sysno: Sysno::dup2,
+                sysno: Sysno::dup3,
                 args: [6, 5, 0, 0, 0, 0],
                 result: Some(5),
                 accesses: vec![
