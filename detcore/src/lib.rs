@@ -5219,6 +5219,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     claimed_sigchld: false,
                     pending_chaos_epochs: Vec::new(),
                     max_timeslice_end: None,
+                    // A new thread's first slice begins before it traces an
+                    // event of its own, so it starts from its parent's.
+                    uncapped_backstop: pts.1.uncapped_backstop,
                     last_grant_deadline: None,
                     published_runtime_private_memory: None,
                     last_rcb_timer: None,
