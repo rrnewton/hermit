@@ -694,7 +694,7 @@ fn read_extent<M: MemoryAccess>(
 /// depends only on the guest's page protections, so it is the same in every
 /// run. The words are a fallback, not the first choice, because they cost one
 /// trap per eight bytes.
-fn read_written<M: MemoryAccess>(
+pub(crate) fn read_written<M: MemoryAccess>(
     memory: &M,
     start: AddrMut<'_, u8>,
     buf: &mut [u8],

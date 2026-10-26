@@ -3116,7 +3116,7 @@ async fn run_sabre(
     // The plugin is a separate artifact in the same target directory, so it can
     // be stale without looking it. Its check before connecting names the mismatch
     // instead of failing to decode Config or a later DetTime request field.
-    // See detcore_model::config_wire_fingerprint.
+    // See detcore::config_wire_fingerprint.
     setting(
         detcore::CONFIG_FINGERPRINT_ENV,
         OsStr::new(&detcore::config_wire_fingerprint()),
@@ -4044,6 +4044,40 @@ pub fn record_dbt_launched_image(
         .exe = exe;
 }
 
+/// Refuses the DBT runtime at `runtime` unless it exports
+/// [`detcore_dbt::FINGERPRINT_CHECK_SYMBOL`], so unless it refuses a
+/// coordinator from another tree itself
+/// (`detcore_dbt::CONFIG_FINGERPRINT_ENV`). A runtime built before that check
+/// takes this Hermit's configuration whatever its own build, and with the
+/// global RPC changed since, it would keep a host value Detcore now replaces
+/// (an inotify rename cookie, for one) rather than be refused by name.
+#[cfg(feature = "dbt")]
+pub fn require_dbt_runtime_fingerprint_check(runtime: &std::path::Path) -> Result<(), Error> {
+    let bytes = std::fs::read(runtime).map_err(|error| {
+        anyhow!(
+            "failed to read the DBT runtime {}: {error}",
+            runtime.display()
+        )
+    })?;
+    let elf = Elf::parse(&bytes)
+        .map_err(|error| anyhow!("the DBT runtime {} is not ELF: {error}", runtime.display()))?;
+    let checks = elf.dynsyms.iter().any(|symbol| {
+        symbol.st_value != 0
+            && elf.dynstrtab.get_at(symbol.st_name) == Some(detcore_dbt::FINGERPRINT_CHECK_SYMBOL)
+    });
+    if checks {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "the Detcore DBT runtime {} predates its check of the coordinator's fingerprint (it \
+             exports no {}), so it would run with this hermit whatever tree it was built from. \
+             Rebuild it from Hermit's tree (`cargo build -p detcore-dbt-cdylib`)",
+            runtime.display(),
+            detcore_dbt::FINGERPRINT_CHECK_SYMBOL
+        ))
+    }
+}
+
 /// Declares, for a DBT run through `drrun`, the image the kernel execs in the
 /// guest's place: DynamoRIO's library (`lib64/release/libdynamorio.so` beside
 /// `drrun`'s `bin64`), which loads the guest itself. So the kernel's `exe`
@@ -4109,6 +4143,10 @@ async fn run_dbt(
     // guest's environment, which carries only what the guest was given.
     let (drrun, client) = detcore_dbt::prepare_native_client()
         .map_err(|error| anyhow!("failed to prepare the Detcore DynamoRIO client: {error}"))?;
+    require_dbt_runtime_fingerprint_check(
+        &detcore_dbt::runtime_library_path()
+            .map_err(|error| anyhow!("failed to find the Detcore DBT runtime: {error}"))?,
+    )?;
     let mut config = config;
     declare_dbt_launcher(&mut config, &drrun)?;
     record_dbt_launched_image(
@@ -4154,7 +4192,14 @@ async fn run_dbt(
     }
 
     let program = command.get_program().to_owned();
-    let environment = command.get_captured_envs();
+    let mut environment = command.get_captured_envs();
+    // The runtime checks this against its own build before it reads the
+    // configuration frame (`detcore_dbt::CONFIG_FINGERPRINT_ENV`); the
+    // runner's private prefix keeps it from the guest.
+    environment.insert(
+        detcore_dbt::CONFIG_FINGERPRINT_ENV.into(),
+        detcore::config_wire_fingerprint().into(),
+    );
     let guest = command.into_std_lossy();
     tracing::info!(
         target: "hermit::dbt",
@@ -8287,6 +8332,29 @@ mod tests {
         assert!(reason.contains("build the hermit binary and cdylib"));
         assert!(!reason.contains("not enabled in this build"));
         assert!(!reason.contains("has not been checked"));
+    }
+
+    /// A DBT runtime that does not export the fingerprint check's symbol, as
+    /// one built before the check does not, is refused before DBT starts
+    /// (this test's own executable exports no such symbol), and so is a file
+    /// that is not ELF.
+    #[test]
+    #[cfg(feature = "dbt")]
+    fn a_dbt_runtime_without_the_fingerprint_check_is_refused() {
+        let image = std::env::current_exe().unwrap();
+        let refusal = super::require_dbt_runtime_fingerprint_check(&image)
+            .expect_err("an image without the symbol is refused");
+        let message = format!("{refusal:#}");
+        assert!(
+            message.contains("predates its check of the coordinator's fingerprint")
+                && message.contains(detcore_dbt::FINGERPRINT_CHECK_SYMBOL),
+            "{message}"
+        );
+        let refusal = super::require_dbt_runtime_fingerprint_check(std::path::Path::new(
+            "/proc/self/cmdline",
+        ))
+        .expect_err("a file that is not ELF is refused");
+        assert!(format!("{refusal:#}").contains("is not ELF"), "{refusal:#}");
     }
     #[cfg(feature = "sabre")]
     use std::ffi::OsStr;

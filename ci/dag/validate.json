@@ -3317,6 +3317,41 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/inotify-rename-cookies",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-rename-cookies",
+          "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-rename-cookies",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-rename-cookies",
+          "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-rename-cookies",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/inotify-watch",
           "mode": "verify",
           "backend": "dbt"
@@ -3346,6 +3381,20 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/inotify-watch",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-write-only-buffer",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-write-only-buffer",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -24403,7 +24452,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1865",
+        "NEXTEST_EXPECTED_EXECUTED": "1866",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit-detcore-tests\",\"--exclude\",\"hermit-run\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -24452,7 +24501,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1105",
+        "NEXTEST_EXPECTED_EXECUTED": "1106",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -24501,7 +24550,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "2611",
+        "NEXTEST_EXPECTED_EXECUTED": "2622",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -27930,7 +27979,21 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/inotify-rename-cookies",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/inotify-watch",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-write-only-buffer",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -33635,6 +33698,20 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/inotify-rename-cookies",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-rename-cookies",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/inotify-watch",
           "mode": "verify",
           "backend": "dbt"
@@ -33643,6 +33720,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/inotify-watch",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-write-only-buffer",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -48110,7 +48194,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1851",
+        "NEXTEST_EXPECTED_EXECUTED": "1852",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit-detcore-tests\",\"--exclude\",\"hermit-run\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -48156,7 +48240,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1105",
+        "NEXTEST_EXPECTED_EXECUTED": "1106",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -48202,7 +48286,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "2611",
+        "NEXTEST_EXPECTED_EXECUTED": "2622",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -51311,6 +51395,41 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/inotify-rename-cookies",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-rename-cookies",
+          "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-rename-cookies",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-rename-cookies",
+          "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-rename-cookies",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/inotify-watch",
           "mode": "verify",
           "backend": "dbt"
@@ -51340,6 +51459,20 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/inotify-watch",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-write-only-buffer",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-write-only-buffer",
           "mode": "verify",
           "backend": "ptrace"
         },

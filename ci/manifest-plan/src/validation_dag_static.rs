@@ -1184,7 +1184,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and stress_series::tests::a_chaos_floor_failure_is_an_errored_product_failure_of_a_chaos_cell
     // (a chaos floor failed over matched attempts is chaos-floor-failure): 1864, listed.
     // Atomic native-client publication adds one real linker/loader overlap test.
-    ("test.regular_crates", 1865),
+    // And detcore-dbt's
+    // tests::startup_refuses_another_trees_coordinator_before_reading_its_frame
+    // (the DBT runtime checks the coordinator's fingerprint): 1866, listed.
+    ("test.regular_crates", 1866),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1818,7 +1821,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Caller-owned DBT private placement adds one library launch regression,
     // measured with the existing feature selection and exclusions unchanged:
     // 1105 (A5 3c.1e B's seven harness units were reverted with that slice).
-    ("test.hermit_unit", 1105),
+    // And tests::a_dbt_runtime_without_the_fingerprint_check_is_refused (Hermit
+    // refuses a DBT runtime built before its coordinator fingerprint check):
+    // 1106, listed.
+    ("test.hermit_unit", 1106),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -2961,7 +2967,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4710): 2606, listed.
     // And detcore's five syscall_histogram::tests outcome units for
     // the per-run syscall histogram (dh-te7ep): 2611, listed.
-    ("test.detcore_unit", 2611),
+    // And syscalls::inotify's nine cookie units (the numbering by first
+    // observation, a half and an instance read after 70,000 other renames,
+    // the event offsets, buffer filling, overlapping iovecs found, the
+    // iovecs read before the call, concatenated offsets mapped to guest
+    // addresses, only changed cookies written, and a write-only destination)
+    // and config's two units for the global RPC revision in the runtimes'
+    // fingerprint (https://github.com/rrnewton/hermit/issues/4765): 2622,
+    // listed.
+    ("test.detcore_unit", 2622),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5163,7 +5177,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two capability slice 5 units: 2605, listed.
     // And the same issue 4710 scheduler unit: 2606, listed.
     // And the same five syscall_histogram units: 2611, listed.
-    ("test.detcore_unit_on_host", 2611),
+    // And the same nine syscalls::inotify and two config units: 2622,
+    // listed.
+    ("test.detcore_unit_on_host", 2622),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5521,7 +5537,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same private-placement library regression remains in the hosted
     // selection, measured with its existing exclusions unchanged: 1105 (A5
     // 3c.1e B's harness unit was reverted with that slice).
-    ("test.hermit_unit_on_host", 1105),
+    // And the same DBT runtime fingerprint-check unit: 1106, listed.
+    ("test.hermit_unit_on_host", 1106),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5724,7 +5741,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same inherited-declaration runner test: 1848, listed.
     // And the same two chaos-floor-failure tests: 1850, listed.
     // The same native-client publication regression is included on the host.
-    ("test.regular_crates_on_host", 1851),
+    // And the same detcore-dbt fingerprint test: 1852, listed.
+    ("test.regular_crates_on_host", 1852),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

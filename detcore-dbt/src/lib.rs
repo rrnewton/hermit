@@ -434,6 +434,28 @@ fn protected_evidence_capture_ready(protected_level: i32, tracing_active: bool) 
 /// environment carries only what the guest was given.
 pub const DETCONFIG_ENV: &str = "HERMIT_DBT_DETCONFIG";
 
+/// The coordinator's [`detcore::config_wire_fingerprint`], which this runtime
+/// compares with its own before it decodes the coordinator's first frame
+/// (`initial_dbt_config`). Detcore's configuration and its global RPC
+/// travel as positional bincode, so a runtime built from another tree would
+/// decode either wrongly, or fail partway through a run, instead of being
+/// refused by name. Hermit sets it in every DBT launch; [`PRIVATE_ENV_PREFIX`]
+/// hides it from the guest and keeps it across instrumented execs.
+pub const CONFIG_FINGERPRINT_ENV: &str = "HERMIT_DBT_CONFIG_FINGERPRINT";
+
+/// The symbol a runtime exports when it refuses a coordinator that does not
+/// announce this build's fingerprint ([`CONFIG_FINGERPRINT_ENV`]). Hermit looks
+/// for it before it launches DBT, and refuses a runtime built before the
+/// check: that runtime takes any coordinator, and its global RPC may differ
+/// from this Hermit's.
+pub const FINGERPRINT_CHECK_SYMBOL: &str = "detcore_dbt_checks_coordinator_fingerprint";
+
+/// Exported as [`FINGERPRINT_CHECK_SYMBOL`]; nothing calls it.
+#[unsafe(no_mangle)]
+pub extern "C" fn detcore_dbt_checks_coordinator_fingerprint() -> u32 {
+    1
+}
+
 /// Hermit's legacy private environment namespace for DBT launches.
 ///
 /// Every Hermit DBT runner selects this prefix explicitly. Reverie's generic
@@ -515,16 +537,39 @@ fn dbt_config_from(value: Option<&str>) -> (Config, ConfigSource) {
 
 /// Selects the complete coordinator frame or the admitted standalone fallback.
 /// A present control remains authoritative even in native Standalone mode.
+/// Before its frame is read, a coordinator is refused unless it announced
+/// this build's fingerprint ([`CONFIG_FINGERPRINT_ENV`]): every Hermit that
+/// sets the variable sets it in every launch, so one that announced none was
+/// built before the check, and its global RPC may differ from this
+/// runtime's.
 fn initial_dbt_config(
     mode: reverie_dbt::DbtStartupMode,
     control: Option<&OsStr>,
+    coordinator_fingerprint: Option<&OsStr>,
 ) -> Result<(Config, ConfigSource), String> {
     let (mut config, source) = match control {
-        Some(path) => (
-            reverie_dbt::sync_rpc::read_initial_config::<Config>(Path::new(path))
-                .map_err(|error| error.to_string())?,
-            ConfigSource::RpcHandshake,
-        ),
+        Some(path) => {
+            let Some(expected) = coordinator_fingerprint else {
+                return Err(format!(
+                    "this Detcore DBT runtime was started by a coordinator that announced no \
+                     fingerprint ({CONFIG_FINGERPRINT_ENV}), so a hermit built before this \
+                     runtime's check, whose global RPC may differ from this runtime's. Run it \
+                     with the hermit built from its tree"
+                ));
+            };
+            if let Some(mismatch) = detcore::config_fingerprint_mismatch(expected) {
+                return Err(format!(
+                    "this Detcore DBT runtime was built from a different tree than the hermit \
+                     running it: {mismatch}. Rebuild it from Hermit's tree \
+                     (`cargo build -p detcore-dbt-cdylib`)"
+                ));
+            }
+            (
+                reverie_dbt::sync_rpc::read_initial_config::<Config>(Path::new(path))
+                    .map_err(|error| error.to_string())?,
+                ConfigSource::RpcHandshake,
+            )
+        }
         None if mode == reverie_dbt::DbtStartupMode::Coordinated => {
             return Err("coordinated startup requires a coordinator socket".into());
         }
@@ -1417,9 +1462,11 @@ unsafe fn runtime_background_init(
                 b"detcore-dbt: constructing Detcore Config\n",
             );
             let control = std::env::var_os(reverie_dbt::sync_rpc::RPC_SOCKET_ENV);
+            let fingerprint = std::env::var_os(CONFIG_FINGERPRINT_ENV);
             // The reader consumes its temporary owner before returning here,
             // before GlobalState/Runtime/READY. Application RPC is unchanged.
-            let (mut config, source) = initial_dbt_config(mode, control.as_deref())?;
+            let (mut config, source) =
+                initial_dbt_config(mode, control.as_deref(), fingerprint.as_deref())?;
             match source {
                 ConfigSource::RpcHandshake => emit_lifecycle_marker(
                     emit_diagnostic,
@@ -3774,12 +3821,61 @@ mod tests {
     fn startup_authority_refuses_missing_or_invalid_control_without_fallback() {
         use reverie_dbt::DbtStartupMode;
 
-        assert!(initial_dbt_config(DbtStartupMode::Coordinated, None).is_err());
+        assert!(initial_dbt_config(DbtStartupMode::Coordinated, None, None).is_err());
+        let ours = detcore::config_wire_fingerprint();
         for mode in [DbtStartupMode::Standalone, DbtStartupMode::Coordinated] {
             // A present control is authoritative even in standalone mode.
             // An invalid address must not become a successful JSON/default path.
-            assert!(initial_dbt_config(mode, Some(OsStr::new(""))).is_err());
+            assert!(
+                initial_dbt_config(mode, Some(OsStr::new("")), Some(OsStr::new(&ours))).is_err()
+            );
         }
+    }
+
+    /// A coordinator whose fingerprint is not this build's is refused, naming
+    /// both, before its frame is read: the control here is an address nothing
+    /// listens on, so a check made after the read would report that instead.
+    /// So is one that announced none: a Hermit from before the check (the
+    /// parent coordinator of a new runtime). Only this build's own goes on to
+    /// the read, in either startup mode.
+    #[test]
+    fn startup_refuses_another_trees_coordinator_before_reading_its_frame() {
+        use reverie_dbt::DbtStartupMode;
+
+        let control = Some(OsStr::new("/nonexistent/coordinator.sock"));
+        let ours = detcore::config_wire_fingerprint();
+        for mode in [DbtStartupMode::Standalone, DbtStartupMode::Coordinated] {
+            let refusal = initial_dbt_config(mode, control, Some(OsStr::new("0000000000000000")))
+                .err()
+                .expect("another tree's coordinator is refused");
+            assert!(
+                refusal.contains("built from a different tree than the hermit running it")
+                    && refusal.contains(&format!(
+                        "fingerprint is {ours}, Hermit's is 0000000000000000"
+                    )),
+                "{refusal}"
+            );
+            let unannounced = initial_dbt_config(mode, control, None)
+                .err()
+                .expect("a coordinator that announced nothing is refused");
+            assert!(
+                unannounced.contains("announced no fingerprint (HERMIT_DBT_CONFIG_FINGERPRINT)"),
+                "{unannounced}"
+            );
+            let error = initial_dbt_config(mode, control, Some(OsStr::new(&ours)))
+                .err()
+                .expect("nothing listens at the control");
+            assert!(
+                !error.contains("different tree") && !error.contains("announced no"),
+                "{error}"
+            );
+        }
+        // The symbol Hermit looks for names the function this crate exports.
+        assert_eq!(
+            FINGERPRINT_CHECK_SYMBOL,
+            "detcore_dbt_checks_coordinator_fingerprint"
+        );
+        assert_eq!(detcore_dbt_checks_coordinator_fingerprint(), 1);
     }
 
     #[test]

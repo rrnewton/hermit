@@ -63,6 +63,8 @@ pub(crate) use signal::sleep_signal;
 pub(crate) use signal::take_claim_fault;
 pub(crate) use signal::take_pending_signal;
 pub(crate) use signal::virtual_sigalrm_blocked;
+/// Rename cookies in inotify events, renumbered by first observation.
+pub(crate) mod inotify;
 pub(crate) mod socket_timestamp_ioctl;
 pub(crate) mod sysinfo;
 mod threads;

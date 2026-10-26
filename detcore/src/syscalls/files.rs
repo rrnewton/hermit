@@ -7071,13 +7071,26 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let result = self.execute_nonblockable_fd_syscall(guest, call).await;
                 crate::syscalls::timerfd::finish_read(guest, call.fd(), call.buf(), result)
             }
-            FdType::Eventfd | FdType::Inotify => {
+            FdType::Eventfd => {
                 trace!(
                     "Possibly blocking read call on notification fd {}, type {:?}",
                     call.fd(),
                     fd_type
                 );
                 self.execute_nonblockable_fd_syscall(guest, call).await
+            }
+            FdType::Inotify => {
+                trace!(
+                    "Possibly blocking read call on notification fd {}, type {:?}",
+                    call.fd(),
+                    fd_type
+                );
+                let destination = crate::syscalls::inotify::Destination::buffer(
+                    call.buf().map_or(0, |buf| buf.as_raw()),
+                    call.len(),
+                );
+                let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+                crate::syscalls::inotify::finish(guest, Some(destination), result).await
             }
             FdType::Memfd | FdType::Pidfd | FdType::Userfaultfd | FdType::Epoll => {
                 trace!("Read call on unusual fd {}, type {:?}", call.fd(), fd_type);
@@ -8566,6 +8579,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 rng_output,
             )
             .await
+        } else if fd_type == FdType::Inotify {
+            let destination = crate::syscalls::inotify::Destination::iovecs(
+                &guest.memory(),
+                call.iov().map_or(0, |iov| iov.as_raw()),
+                call.len(),
+            );
+            let result = self
+                .record_or_replay_preserving_tool_errors(guest, call)
+                .await;
+            crate::syscalls::inotify::finish(guest, destination, result).await
         } else {
             self.record_or_replay_preserving_tool_errors(guest, call)
                 .await
@@ -8758,6 +8781,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 rng_output,
             )
             .await
+        } else if detfd.ty() == FdType::Inotify && offset == -1 {
+            // At the current offset (-1) an inotify descriptor reads as
+            // `readv` does (`do_preadv2` calls `do_readv`), so its rename
+            // cookies are renumbered as `readv`'s are. At any other offset
+            // the kernel fails with ESPIPE (an anonymous inode has no
+            // FMODE_PREAD), so that call goes to it unchanged below.
+            let destination = crate::syscalls::inotify::Destination::iovecs(
+                &guest.memory(),
+                call.iov().map_or(0, |iov| iov.as_raw()),
+                call.iov_len() as usize,
+            );
+            let result = self
+                .record_or_replay_preserving_tool_errors(guest, call)
+                .await;
+            crate::syscalls::inotify::finish(guest, destination, result).await
         } else {
             self.record_or_replay_preserving_tool_errors(guest, call)
                 .await
