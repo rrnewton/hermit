@@ -4380,9 +4380,22 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) changed_root: Arc<std::sync::atomic::AtomicBool>,
 
+    /// This thread's working and root directories may not be its
+    /// thread-group leader's: it, or the thread it was created by, was
+    /// created as a thread without `CLONE_FS`, so it holds filesystem
+    /// information of its own. Its process's `/proc/<pid>/cwd` and
+    /// `/proc/<pid>/root` links, which Linux reads from the leader, are then
+    /// not the thread's own `getcwd` (`Detcore::readlink_own_task_link`). A
+    /// leader, a new process, and a thread after its exec (which makes it
+    /// the leader) hold their own.
+    #[serde(default)]
+    pub(crate) fs_apart_from_leader: bool,
+
     /// The image this thread's process executes ([`crate::exec_record`]),
-    /// which answers the process's `/proc/<pid>/exe` link; `None` leaves the
-    /// link to the kernel. A new task starts with its creator's, and a
+    /// which answers the process's `/proc/<pid>/exe` link on KVM while it
+    /// names the image exactly (`Detcore::readlink_own_task_link`), and in a
+    /// launched run (`Detcore::launched_exe`); `None` leaves the link to the
+    /// path it took before. A new task starts with its creator's, and a
     /// successful exec replaces it (`tool_global::mark_past_first_execve`).
     #[serde(default)]
     pub(crate) exe: Option<Arc<crate::exec_record::ExecRecord>>,
@@ -5397,6 +5410,7 @@ impl<T> ThreadState<T> {
             default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             nested_pid_namespace: false,
             changed_root: Default::default(),
+            fs_apart_from_leader: false,
             exe: None,
             process_files,
             posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
