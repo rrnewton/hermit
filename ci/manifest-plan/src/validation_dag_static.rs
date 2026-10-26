@@ -2956,7 +2956,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4710): 2606, listed.
     // And detcore's five syscall_histogram::tests outcome units for
     // the per-run syscall histogram (dh-te7ep): 2611, listed.
-    ("test.detcore_unit", 2611),
+    // And A5 slice 3c.1e B's unit: threads' disposition_mask_tests::
+    // a_gated_managed_wait_reads_the_guest_mask_without_replacing_it: 2612,
+    // listed.
+    ("test.detcore_unit", 2612),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5146,7 +5149,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two capability slice 5 units: 2605, listed.
     // And the same issue 4710 scheduler unit: 2606, listed.
     // And the same five syscall_histogram units: 2611, listed.
-    ("test.detcore_unit_on_host", 2611),
+    // And the same 3c.1e B unit: 2612, listed.
+    ("test.detcore_unit_on_host", 2612),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
