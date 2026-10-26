@@ -652,17 +652,24 @@ mod runtime {
             .collect())
     }
 
-    /// Run the calling thread on `cpu` only.
-    fn pin(cpu: usize) -> std::io::Result<()> {
+    /// Run the calling thread on `cpus` only.
+    fn set_affinity(cpus: &[usize]) -> std::io::Result<()> {
         // SAFETY: an all-zero `cpu_set_t` is an empty set.
         let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
-        // SAFETY: the caller's CPU number came from the kernel's CPU list.
-        unsafe { libc::CPU_SET(cpu, &mut set) };
+        for &cpu in cpus {
+            // SAFETY: the caller's CPU numbers came from the kernel's CPU list.
+            unsafe { libc::CPU_SET(cpu, &mut set) };
+        }
         // SAFETY: `set` is a `cpu_set_t` of the size passed.
         if unsafe { libc::sched_setaffinity(0, std::mem::size_of_val(&set), &set) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Run the calling thread on `cpu` only.
+    fn pin(cpu: usize) -> std::io::Result<()> {
+        set_affinity(&[cpu])
     }
 
     /// What a PMU counted of the probe's store-exclusives.
@@ -677,17 +684,37 @@ mod runtime {
 
     const PROBE_LOOPS: u64 = 1000;
 
-    /// Check what `pmu` counts, on a thread of this (tracer) process pinned
-    /// to `cpu`, one of its CPUs: [`PROBE_LOOPS`] store-exclusives that fail
-    /// (`LDXR`; `CLREX`, which clears the exclusive monitor; `STXR`), then as
-    /// many exclusive increments that succeed.
+    /// Check what `pmu` counts, on the calling thread of this (tracer)
+    /// process pinned to `cpu`, one of its CPUs, and given back its own CPUs
+    /// after: [`PROBE_LOOPS`] store-exclusives that fail (`LDXR`; `CLREX`,
+    /// which clears the exclusive monitor; `STXR`), then as many exclusive
+    /// increments that succeed.
+    ///
+    /// Not on a new thread: the tracer runs in the guest's PID namespace, so
+    /// a thread it starts takes the next PID there, and every guest thread
+    /// started after it would get another ID than in a run that does not
+    /// probe. Runs that record preemptions (`--record-preemptions-to`) or
+    /// replay them (`--replay-preemptions-from`) probe; a replay of such a
+    /// run's schedule (`--replay-schedule-from`) does not, so it would lose
+    /// its threads at their first clone.
     fn probe(pmu: &CpuPmu, cpu: usize) -> Result<Probe, String> {
-        std::thread::scope(|scope| {
-            scope
-                .spawn(|| probe_on(pmu, cpu))
-                .join()
-                .unwrap_or_else(|_| Err("the store-exclusive probe thread panicked".to_owned()))
-        })
+        /// Gives the calling thread back its CPUs when the probe ends, also
+        /// when it unwinds.
+        struct Restore(Vec<usize>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                if let Err(error) = set_affinity(&self.0) {
+                    warn!(
+                        "[store-exclusive] cannot give the tracer thread back its CPUs after \
+                         the probe, so it stays on one CPU: {error}"
+                    );
+                }
+            }
+        }
+        let own = affinity(0)
+            .map_err(|error| format!("cannot read the tracer thread's CPU affinity: {error}"))?;
+        let _restore = Restore(own);
+        probe_on(pmu, cpu)
     }
 
     fn probe_on(pmu: &CpuPmu, cpu: usize) -> Result<Probe, String> {
