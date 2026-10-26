@@ -4917,21 +4917,16 @@ pub struct ConsumeResult {
     pub event_ix: u64,
 }
 
-/// A slice length that no slice of `events` exceeds, for the schedule replay
-/// of a record whose slices ran without the `--max-timeslice` bound: the
-/// latest logical time any thread reached at a recorded event, plus the bound.
-/// A recorded slice begins and ends within the record, so a backstop this long
-/// never ends one early. A slice's end is not marked as such in the event
-/// stream (a thread also traces its branch count before each syscall), so
-/// nothing shorter is known to be safe. Once the record has run out the
-/// replay goes back to the bound (`Scheduler::uncapped_backstop`).
-fn uncapped_replay_backstop_for(events: &[SchedEvent], cfg: &Config) -> LogicalTime {
-    let latest = events
-        .iter()
-        .filter_map(|event| event.end_time)
-        .map(|end| end.as_nanos())
-        .max()
-        .unwrap_or(0);
+/// A slice length that no recorded slice exceeds, for the schedule replay of
+/// a record whose slices ran without the `--max-timeslice` bound: `latest`,
+/// the latest logical time the recorded run reached at an event
+/// (`PreemptionRecord::uncapped_slices`), plus the bound. A recorded slice
+/// begins and ends within the record, so a backstop this long never ends one
+/// early. A slice's end is not marked as such in the event stream (a thread
+/// also traces its branch count before each syscall), so nothing shorter is
+/// known to be safe. Once the record has run out the replay goes back to the
+/// bound (`Scheduler::uncapped_backstop`).
+fn uncapped_replay_backstop_for(latest: u64, cfg: &Config) -> LogicalTime {
     let bound = cfg.max_timeslice.map_or(0, std::num::NonZeroU64::get);
     LogicalTime::from_nanos(latest.saturating_add(bound))
 }
@@ -5109,7 +5104,7 @@ impl Scheduler {
                     Recording::Legacy(record) => {
                         uncapped_replay_backstop = record
                             .uncapped_slices()
-                            .then(|| uncapped_replay_backstop_for(record.schedevents(), cfg));
+                            .map(|latest| uncapped_replay_backstop_for(latest, cfg));
                         callback_checkpoints = record
                             .callback_checkpoints()
                             .iter()
@@ -21115,34 +21110,20 @@ mod test {
     use crate::tool_local::ThreadState;
 
     /// The backstop for an uncapped record outlasts every recorded slice: it
-    /// runs from a thread's start past the latest logical time any thread
-    /// reached at a recorded event, by the configured bound.
+    /// runs from a thread's start past the latest logical time the record
+    /// states, by the configured bound.
     #[test]
     fn an_uncapped_records_backstop_outlasts_its_latest_event() {
-        let event = |dettid: i32, end: Option<u64>| SchedEvent {
-            dettid: DetTid::from_raw(dettid),
-            op: detcore_model::schedule::Op::Branch,
-            count: 1,
-            start_rip: None,
-            end_rip: None,
-            end_time: end.map(LogicalTime::from_nanos),
-        };
         let config = Config {
             max_timeslice: std::num::NonZeroU64::new(100_000),
             ..Default::default()
         };
-        let events = [
-            event(3, Some(250_000)),
-            event(5, Some(9_400_000)),
-            event(3, None),
-            event(3, Some(1_200_000)),
-        ];
         assert_eq!(
-            uncapped_replay_backstop_for(&events, &config),
+            uncapped_replay_backstop_for(9_400_000, &config),
             LogicalTime::from_nanos(9_500_000)
         );
         assert_eq!(
-            uncapped_replay_backstop_for(&[], &config),
+            uncapped_replay_backstop_for(0, &config),
             LogicalTime::from_nanos(100_000)
         );
     }

@@ -291,6 +291,13 @@ pub struct AnalyzeOpts {
     /// (`crate::time_skip_carry`). Shared by every copy of these options.
     #[clap(skip)]
     pub time_skip_sources: crate::time_skip_carry::SharedTimeSkipSources,
+
+    /// The uncapped-slices mark the trials' schedules carry
+    /// (`PreemptionRecord::uncapped_slices`): set from the schedules they are
+    /// made from when those carry it, so that a trial's schedule replay
+    /// keeps their long slices (`Self::stamp_trial_record`).
+    #[clap(skip)]
+    pub trial_schedules_uncapped: std::cell::Cell<Option<u64>>,
 }
 
 /// `--trial-timeout`.

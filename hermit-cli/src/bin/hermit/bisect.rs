@@ -144,6 +144,7 @@ impl BisectOpts {
             trial_timeout: crate::analyze::TrialTimeout::Off,
             endpoints: Default::default(),
             time_skip_sources: Default::default(),
+            trial_schedules_uncapped: Default::default(),
         };
         // Before the schedules are read: a refused cap or counter reads and
         // starts nothing.
@@ -183,6 +184,7 @@ impl BisectOpts {
             sources.trial_format()?;
             sources.validate_reserved_inputs()?;
         }
+        analyzer.adopt_uncapped_slices(&[self.good.as_path(), self.bad.as_path()])?;
         let mut good = good.into_global();
         let mut bad = bad.into_global();
         // Analyze's trial outputs omit optional event timestamps. Put these
