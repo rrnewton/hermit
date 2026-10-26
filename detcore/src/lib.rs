@@ -1342,6 +1342,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
 
                 if delta_rcbs > 0 {
+                    // The store-exclusives this segment failed, each of which
+                    // added branches to it (aarch64, recording or replaying
+                    // preemptions). Taken only for a segment that is kept, so
+                    // none is lost to an empty one.
+                    #[cfg(target_arch = "aarch64")]
+                    let ev = SchedEvent {
+                        strex_fails: detcore_model::schedule::HostObserved(
+                            crate::store_exclusive::take_segment_failures(guest.tid().as_raw()),
+                        ),
+                        ..ev
+                    };
                     // We don't fill the end_rip here, because the current rip is NOT precisely the
                     // end of this block of branch events.  Other instructions may have occured
                     // since the last branch.
@@ -1363,6 +1374,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             start_rip: None,
                             end_rip: None,
                             end_time: None,
+                            strex_fails: Default::default(),
                         },
                     );
                     // Fill in end_rip because current rip represents the end of this event.
@@ -1630,6 +1642,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     start_rip: None,
                     end_rip: None,
                     end_time: Some(nanos),
+                    strex_fails: Default::default(),
                 },
                 true,
             )
@@ -1722,6 +1735,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     start_rip: None,
                     end_rip: None,
                     end_time: Some(nanos),
+                    strex_fails: Default::default(),
                 },
                 true,
             )
@@ -3649,6 +3663,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         start_rip: None,
                         end_rip: None,
                         end_time: Some(nanos),
+                        strex_fails: Default::default(),
                     },
                     true,
                 )
@@ -3720,6 +3735,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         start_rip: None,
                         end_rip: None,
                         end_time: None,
+                        strex_fails: Default::default(),
                     },
                 );
                 trace_schedevent(guest, ev, true).await;
@@ -4518,6 +4534,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             detpid
         );
 
+        // A new thread counts the store-exclusives of its segments from its
+        // first instruction (aarch64, in a run that counts them).
+        #[cfg(target_arch = "aarch64")]
+        crate::store_exclusive::open_segment_counter(&self.cfg, guest.tid().as_raw());
+
         // Delayed initialization of thread_state for this new thread:
         let thread_state = guest.thread_state_mut();
         thread_state.detpid = Some(detpid);
@@ -4906,6 +4927,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         start_rip: None,
                         end_rip: None,
                         end_time: None,
+                        strex_fails: Default::default(),
                     },
                 );
                 let ev = with_guest_rip(guest, ev).await;
@@ -6521,6 +6543,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         thread_state.delivery_counters.log(dettid);
         // Its kept /proc status file reads only ESRCH from now on.
         crate::syscalls::forget_thread_status(Pid::from_raw(tid.as_raw()));
+        // A later thread may reuse its ID; that one opens its own counter.
+        #[cfg(target_arch = "aarch64")]
+        crate::store_exclusive::close_segment_counter(tid.as_raw());
         // Cancellation can consume the backend's transferred state before the
         // successful-exec callback has rebound its logical identity.
         let current = DetTid::from_raw(tid.as_raw());
