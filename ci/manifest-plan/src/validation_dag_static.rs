@@ -1949,7 +1949,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_clock_read_victim_times_the_flip,
     // a_wait_entered_before_the_decision_aligns_whatever_its_arguments,
     // a_thread_whose_calls_already_split_gives_no_lifetime_pair}: 1341.
-    ("test.hermit_unit", 1341),
+    // And seven ranked-candidate finder tests,
+    // analyze::races::tests::{
+    // a_wait_in_flight_across_the_decision_is_the_first_candidate_unless_corroborated,
+    // a_watchdog_asleep_across_the_decision_is_not_singled_out,
+    // a_long_wait_flipping_around_a_later_clock_read_ranks_first,
+    // a_wait_that_never_returns_in_the_baseline_feeds_no_flip,
+    // a_reader_fed_by_a_thread_that_changed_course_is_no_race,
+    // partners_are_singled_out_on_the_outcomes_causal_path,
+    // the_pair_that_released_what_its_victim_used_stands_for_its_partner}: 1348.
+    ("test.hermit_unit", 1348),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6021,7 +6030,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two --minimize tests: 1301.
     // And the same eight workspace-cleanup tests: 1309.
     // And the same twenty-six racing-access finder tests: 1335.
-    ("test.hermit_unit_on_host", 1335),
+    // And the same seven ranked-candidate finder tests: 1342.
+    ("test.hermit_unit_on_host", 1342),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6249,6 +6259,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 4843 overshoot fix: the same one added case: 1928 - 14 = 1914.
     // Its detlog correction: the same one added case: 1929 - 14 = 1915.
     // The retry stack: the same three added cases: 1932 - 14 = 1918.
+    // Six regular-crate tests the pin missed, as cargo nextest list counts
+    // the cell at this head: 1921.
     ("test.regular_crates_on_host", 1918),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
