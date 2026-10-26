@@ -14,6 +14,311 @@ calibration_launch=
 calibration_host=false
 nextest_budget_map=
 nextest_budget_sha=
+retain_evidence=
+retention_status=0
+retention_io_failed=0
+retention_capture_closed=0
+retention_stage=admission
+retention_config_serial=0
+retention_list_status=not-run
+retention_run_status=not-run
+retention_parser_status=not-run
+retention_map_status=not-run
+retention_config_status=not-run
+retention_budget_status=not-run
+retention_budget_context_status=not-run
+retention_cpu_wrapper_status=not-run
+retention_original_argv=("$@")
+
+function retention_note_failure {
+    retention_status=2
+    retention_io_failed=1
+    printf 'run-nextest-counted: evidence capture incomplete: %s; fix the I/O problem and retry with a NEW destination\n' "$*" >&2
+    if [[ -n $retain_evidence && -d $retain_evidence && ! -L $retain_evidence ]]; then
+        printf '%s\n' "$*" >>"$retain_evidence/capture-errors.txt" || :
+    fi
+}
+
+# Destination names below are internal constants. Never follow evidence-source
+# symlinks, and never overwrite a file from this or an earlier invocation.
+function retention_copy {
+    local source=$1 name=$2
+    [[ -n $retain_evidence ]] || return 0
+    if [[ -L $source || ( -e $source && ! -f $source ) ]]; then
+        retention_note_failure "non-regular source for $name: $source"
+        return 2
+    fi
+    if [[ ! -e $source ]]; then
+        (set -o noclobber; printf '%s\n' "$source" >"$retain_evidence/$name.absent") || {
+            retention_note_failure "cannot record absence of $name"; return 2;
+        }
+        return 0
+    fi
+    (set -o noclobber; cat -- "$source" >"$retain_evidence/$name") || {
+        retention_note_failure "cannot copy $name"; return 2;
+    }
+    # Require the retained bytes to match the still-existing source before cleanup.
+    cmp -s -- "$source" "$retain_evidence/$name" || {
+        retention_note_failure "source changed or copy incomplete for $name"; return 2;
+    }
+}
+
+function retention_capture_config {
+    [[ -n $retain_evidence && -n $nextest_config && $retention_capture_closed == 0 ]] || return 0
+    [[ -f $nextest_config ]] || retention_note_failure 'generated config missing before cleanup'
+    retention_config_serial=$((retention_config_serial + 1))
+    retention_copy "$nextest_config" "config-$retention_config_serial.toml" || :
+}
+
+# Compare publication locations, not executable identities. Atomic result
+# writers rename a sibling temporary over the final entry, so canonicalize the
+# parent and retain the final name (do not dereference a final symlink). CPU
+# sidecars use the same caller-relative spelling. No publication path is changed.
+function retention_check_publication_overlap {
+    local destination=$1 count_path=${DAGRUN_TEST_COUNTS_PATH:--} resolved_cpu
+    local publication parent leaf canonical_parent location
+    local -a publications=()
+    resolved_cpu=$(configured_cpu_report_path) || return $?
+    if [[ $count_path != - ]]; then
+        publications+=("$count_path" "$count_path.publication-recovery")
+    fi
+    if [[ $resolved_cpu != - ]]; then
+        publications+=("$resolved_cpu" "$resolved_cpu.launch.json" "$resolved_cpu.budgets.json")
+    fi
+    for publication in "${publications[@]}"; do
+        # Keep shell metacharacters and newlines literal. The dot sentinel keeps
+        # command substitution from stripping a newline in a directory name.
+        case $publication in
+            */*) parent=${publication%/*}; leaf=${publication##*/}; [[ -n $parent ]] || parent=/ ;;
+            *) parent=.; leaf=$publication ;;
+        esac
+        canonical_parent=$(realpath -m -- "$parent" && printf '.') || {
+            printf 'run-nextest-counted: cannot resolve publication parent %q; choose a usable output path outside the capture directory; see --help\n' "$parent" >&2
+            return 2
+        }
+        canonical_parent=${canonical_parent%$'\n.'}
+        location=${canonical_parent%/}/$leaf
+        if [[ $canonical_parent == "$destination" || $canonical_parent == "$destination/"* ||
+            $location == "$destination" || $location == "$destination/"* ||
+            $destination == "${location%/}/"* ]]; then
+            printf 'run-nextest-counted: output publication %q overlaps capture directory %q; choose a NEW capture directory separate from DAGRUN_TEST_COUNTS_PATH, its recovery sibling, HERMIT_NEXTEST_CPU_REPORT_PATH (or its default), and CPU sidecars; see --help\n' "$publication" "$destination" >&2
+            return 2
+        fi
+    done
+}
+
+function retention_begin {
+    local destination=$1
+    shift
+    # mkdir is the exclusive claim, including refusal of dangling symlinks.
+    # Require canonical parent and final name; never manufacture parent paths.
+    if [[ $destination != /* || $destination == */ || $destination == *$'\n'* ]] ||
+        [[ $(realpath -m -- "$destination") != "$destination" ]]; then
+        printf 'run-nextest-counted: invalid capture destination %q; use a canonical absolute path without trailing slash or newline, under an existing parent; see --help\n' "$destination" >&2
+        return 2
+    fi
+    # Refuse before claiming the directory, installing EXIT capture, allocating
+    # temporary files, or invoking any helper/runner. Caller publications survive.
+    retention_check_publication_overlap "$destination" || return $?
+    if ! (umask 077; mkdir -- "$destination"); then
+        printf 'run-nextest-counted: cannot exclusively create capture destination %q; choose a NEW nonexistent directory under an existing writable parent; existing files/directories/symlinks are never reused\n' "$destination" >&2
+        return 2
+    fi
+    retain_evidence=$destination
+    retention_status=0
+    retention_io_failed=0
+    retention_capture_closed=0
+    retention_config_serial=0
+    retention_list_status=not-run
+    retention_run_status=not-run
+    retention_parser_status=not-run
+    retention_map_status=not-run
+    retention_config_status=not-run
+    retention_budget_status=not-run
+    retention_budget_context_status=not-run
+    retention_cpu_wrapper_status=not-run
+    retention_stage=setup
+    # Install before the first temporary allocation, so early failures retain
+    # absence/status and still use the existing ordinary cleanup functions.
+    trap 'retention_exit "$?"' EXIT
+    (set -o noclobber; { if ((${#retention_original_argv[@]})); then printf '%s\0' "${retention_original_argv[@]}"; fi; } >"$retain_evidence/invocation.argv0") || return 2
+    (set -o noclobber; { if (($#)); then printf '%s\0' "$@"; fi; } >"$retain_evidence/nextest-selection.argv0") || return 2
+    (set -o noclobber; printf '%s\n' "$PWD" >"$retain_evidence/cwd.txt") || return 2
+    # This allowlist is selection/configuration evidence, not a credential dump.
+    local key
+    for key in NEXTEST_PREPARED_BUILD_SELECTION HERMIT_PREPARED_NEXTEST_REQUIRED \
+        HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED HERMIT_RUST_SCRIPT_ARTIFACT_ROOT \
+        NEXTEST_EXPECTED_EXECUTED NEXTEST_PROFILE NEXTEST_TEST_THREADS \
+        HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER \
+        DAGRUN_TEST_COUNTS_PATH HERMIT_NEXTEST_CPU_REPORT_PATH \
+        CARGO_TARGET_DIR CARGO_BUILD_TARGET RUSTFLAGS CARGO_ENCODED_RUSTFLAGS; do
+        if [[ -v $key ]]; then
+            printf '%s\0%s\0' "$key" "${!key}"
+        fi
+    done >"$retain_evidence/selection-environment.argv0" || return 2
+    retention_copy "$SCRIPT_DIR/run-nextest-counted.sh" wrapper.sh || return 2
+    retention_copy "$RESULT_WRITER" parser.rs || return 2
+    retention_copy "$TIMEOUT_CONFIG_WRITER" timeout-config.rs || return 2
+    retention_copy "$SCRIPT_DIR/nextest-binaries.rs" nextest-binaries.rs || return 2
+    retention_copy "$SCRIPT_DIR/../.config/nextest.toml" original-nextest.toml || return 2
+    retention_copy "$SCRIPT_DIR/../.config/nextest-budgets.json" original-budgets.json || return 2
+    retention_copy "$SCRIPT_DIR/../target/ci/nextest-binaries/current.json" prepared-record.before.observed.json || return 2
+    # Ordinary observed publications may predate this invocation. Preserve the
+    # baseline and never relabel a stale file as parser success.
+    local published=${DAGRUN_TEST_COUNTS_PATH:--}
+    [[ $published == - ]] && published=
+    retention_copy "$published" typed-result.before.observed.json || return 2
+    # Capture does not observe or attest the actual producer executable. Existing
+    # launch/admission policy is unchanged; no PATH/version probe supplies proof.
+    printf '%s\n' '{"state":"unattested","reason":"capture saves bytes only; actual list/run producer identity is unavailable","list":null,"run":null}' \
+        >"$retain_evidence/producer-identity.json" || return 2
+}
+
+function retention_finish {
+    local original=$1 source name
+    [[ -n $retain_evidence ]] || return "$original"
+    retention_stage=${retention_stage:-unknown}
+    if [[ -n ${events_log:-} && ! -f $events_log ]]; then
+        retention_note_failure 'allocated raw event file is missing'
+    fi
+    if [[ $retention_list_status != not-run && ! -f ${cpu_inventory:-} ]]; then
+        retention_note_failure 'attempted inventory output is missing'
+    fi
+    if [[ $retention_map_status == 0 && ! -f ${cpu_binary_map:-} ]]; then
+        retention_note_failure 'successful binary map output is missing'
+    fi
+    retention_copy "${events_log:-}" events.jsonl || :
+    retention_copy "${cpu_inventory:-}" inventory.json || :
+    retention_copy "${cpu_binary_map:-}" binary-map.json || :
+    retention_copy "${skid_retry_record:-}" skid-retries.log || :
+    source=; [[ -z ${cpu_measurement_dir:-} ]] || source="$cpu_measurement_dir/budget-context.json"
+    retention_copy "$source" budget-context.json || :
+    source=; [[ -z ${cpu_measurement_dir:-} ]] || source="$cpu_measurement_dir/resolved-budgets.json"
+    retention_copy "$source" resolved-budgets.json || :
+    if [[ -n $calibration_launch ]]; then
+        retention_copy "$calibration_launch" launch.json || :
+    else
+        retention_copy '' launch.json || :
+    fi
+    retention_copy "$SCRIPT_DIR/../target/ci/nextest-binaries/current.json" prepared-record.after.observed.json || :
+    retention_copy "$SCRIPT_DIR/run-nextest-counted.sh" wrapper.after.sh || :
+    retention_copy "$RESULT_WRITER" parser.after.rs || :
+    local count_path=${DAGRUN_TEST_COUNTS_PATH:--}
+    [[ $count_path == - ]] && count_path=
+    retention_copy "$count_path" typed-result.observed.json || :
+    [[ ${cpu_report:-} == - ]] && source= || source=${cpu_report:-}
+    retention_copy "$source" cpu-report.observed.json || :
+    if [[ -n $source ]]; then
+        retention_copy "$source.launch.json" launch-publication.observed.json || :
+        retention_copy "$source.budgets.json" budget-publication.observed.json || :
+    fi
+    # Names deliberately say observed: a pre-existing publication is never
+    # credited as this invocation's result on a parser/publication refusal.
+    if [[ -n ${cpu_attempt_records:-} && -d $cpu_attempt_records && ! -L $cpu_attempt_records ]]; then
+        mkdir -- "$retain_evidence/attempts" || retention_note_failure 'cannot create retained attempts'
+        # Keep and compare the complete listing, including dotfiles and raw
+        # incomplete records. Enumeration errors must not look like zero attempts.
+        if find "$cpu_attempt_records" -mindepth 1 -maxdepth 1 -print0 \
+            | LC_ALL=C sort -z >"$retain_evidence/attempt-paths.before.argv0"; then
+            while IFS= read -r -d '' source; do
+                if [[ ! -e $source && ! -L $source ]]; then
+                    retention_note_failure "attempt disappeared before capture: $source"
+                    continue
+                fi
+                name=${source##*/}
+                retention_copy "$source" "attempts/$name" || :
+            done <"$retain_evidence/attempt-paths.before.argv0"
+            if ! find "$cpu_attempt_records" -mindepth 1 -maxdepth 1 -print0 \
+                | LC_ALL=C sort -z >"$retain_evidence/attempt-paths.after.argv0"; then
+                retention_note_failure 'cannot re-enumerate attempts'
+            elif ! cmp -s -- "$retain_evidence/attempt-paths.before.argv0" "$retain_evidence/attempt-paths.after.argv0"; then
+                retention_note_failure 'attempt population changed during capture'
+            fi
+        else
+            retention_note_failure 'cannot enumerate attempts'
+        fi
+    elif [[ -n ${cpu_attempt_records:-} && ( -e $cpu_attempt_records || -L $cpu_attempt_records ) ]]; then
+        retention_note_failure 'attempt directory is not a normal directory'
+    else
+        if [[ $retention_run_status != not-run ]]; then
+            retention_note_failure 'attempt directory missing after runner invocation'
+        fi
+        retention_copy '' attempts || :
+    fi
+    # Retention is only byte capture. The original wrapper has already selected
+    # runner/parser precedence; preserve that status unless it was successful.
+    if ((retention_io_failed != 0)); then
+        retention_incomplete "$original"
+        return $?
+    fi
+    if ! retention_write_status "$original"; then
+        retention_note_failure 'cannot write status.json'
+        retention_incomplete "$original"
+        return $?
+    fi
+    # Complete bytes, status, and absence observations are checksummed before
+    # publishing the completion marker. A late error must not return zero.
+    if ! (cd -- "$retain_evidence" && find . -type f ! -path ./SHA256SUMS \
+        ! -path ./CAPTURED ! -path ./.CAPTURED.pending -print0 \
+        | LC_ALL=C sort -z | xargs -0 -r sha256sum -- >SHA256SUMS &&
+        sha256sum --check SHA256SUMS >/dev/null); then
+        retention_note_failure 'cannot hash or verify captured evidence'
+        retention_incomplete "$original"
+        return $?
+    fi
+    if ! (set -o noclobber; printf 'Bytes captured; verify SHA256SUMS. This does not qualify tests or attest the producer.\n' \
+        >"$retain_evidence/.CAPTURED.pending") ||
+        ! mv -T -- "$retain_evidence/.CAPTURED.pending" "$retain_evidence/CAPTURED"; then
+        retention_note_failure 'cannot publish capture completion marker'
+        retention_incomplete "$original"
+        return $?
+    fi
+    return "$original"
+}
+
+function retention_write_status {
+    local original=$1 final=$1
+    ((original != 0 || retention_io_failed == 0)) || final=2
+    jq -n --arg stage "$retention_stage" --arg list "$retention_list_status" \
+        --arg run "$retention_run_status" --arg parser "$retention_parser_status" \
+        --arg map "$retention_map_status" --arg config "$retention_config_status" \
+        --arg budget "$retention_budget_status" --arg budget_context "$retention_budget_context_status" \
+        --arg cpu_wrapper "$retention_cpu_wrapper_status" --argjson runner "$original" \
+        --argjson capture "$retention_status" --argjson io_failed "$retention_io_failed" --argjson final "$final" \
+        '{schema:1,stage:$stage,list_status:$list,nextest_status:$run,parser_status:$parser,
+          map_status:$map,config_status:$config,budget_status:$budget,budget_context_status:$budget_context,cpu_wrapper_status:$cpu_wrapper,
+          runner_status:$runner,capture_status:$capture,capture_io_failed:$io_failed,final_status:$final,
+          producer_identity:"unattested",capture_means:"bytes saved only",
+          completion_requires_marker_and_valid_checksums:true,observed_publications_are_not_validation:true}' \
+        >"$retain_evidence/status.json"
+}
+
+function retention_incomplete {
+    local original=$1
+    # Best effort diagnostic only: I/O failure can prevent even status.json from
+    # being written. No completion marker is created on any error path.
+    rm -f -- "$retain_evidence/.CAPTURED.pending" || :
+    retention_write_status "$original" || :
+    ((original != 0)) && return "$original"
+    return 2
+}
+
+function retention_exit {
+    local original=$1 final=$1
+    trap - EXIT
+    # EXIT can be reached with errexit set by run_nextest; retention errors must
+    # never skip ordinary cleanup or replace a failing Nextest exit status.
+    set +e
+    retention_capture_config
+    retention_finish "$original"
+    final=$?
+    retention_capture_closed=1
+    cleanup_nextest_config
+    cleanup_cpu_measurement_dir
+    [[ -z ${events_log:-} ]] || rm -f -- "$events_log"
+    exit "$final"
+}
+
 
 # Do not rely on a nested `/usr/bin/env rust-script` shebang resolving the
 # repository wrapper after validation has entered its hosted namespace.  The
@@ -35,6 +340,7 @@ function run_rust_script {
 
 function cleanup_nextest_config {
     if [[ -n $nextest_config ]]; then
+        retention_capture_config
         rm -f -- "$nextest_config"
         nextest_config=
     fi
@@ -66,8 +372,14 @@ function invoke_nextest {
         if [[ $operation == run && -n $nextest_budget_map ]]; then
             context_args+=(--budget-map "$nextest_budget_map" "$nextest_budget_sha")
         fi
+        if [[ -n $retain_evidence ]]; then
+            printf '%s\0' run_rust_script "$SCRIPT_DIR/nextest-binaries.rs" "$operation" "${context_args[@]}" --config-file "$nextest_config" "$@" >"$retain_evidence/$operation.dispatch.argv0" || retention_note_failure 'cannot record prepared dispatch'
+        fi
         run_rust_script "$SCRIPT_DIR/nextest-binaries.rs" "$operation" "${context_args[@]}" --config-file "$nextest_config" "$@"
     else
+        if [[ -n $retain_evidence ]]; then
+            printf '%s\0' cargo nextest --config-file "$nextest_config" "$operation" "$@" >"$retain_evidence/$operation.dispatch.argv0" || retention_note_failure 'cannot record cargo dispatch'
+        fi
         cargo nextest --config-file "$nextest_config" "$operation" "$@"
     fi
 }
@@ -129,9 +441,10 @@ function nextest_inventory_args {
 
 function emit_libtest_count {
     local events=$1 status=${2:-0} path=${DAGRUN_TEST_COUNTS_PATH:--}
-    local attempts=${3-} binary_map=${4-} cpu_report=${5-}
+    local attempts=${3-} binary_map=${4-} cpu_report=${5-} inventory=${6-}
     local writer_status=0
-    local -a cpu_args=()
+    [[ -z $retain_evidence ]] || retention_stage=parser
+    local -a cpu_args=() inventory_args=()
     if [[ ! -s $events ]]; then
         printf 'run-nextest-counted: typed nextest event stream is empty\n' >&2
         return 2
@@ -143,7 +456,11 @@ function emit_libtest_count {
         fi
         cpu_args=("$attempts" "$binary_map" "$cpu_report")
     fi
-    run_rust_script "$RESULT_WRITER" "$events" "$status" "$path" "${cpu_args[@]}" || writer_status=$?
+    if [[ -n $inventory ]]; then
+        inventory_args=(--inventory "$inventory")
+    fi
+    run_rust_script "$RESULT_WRITER" "${inventory_args[@]}" "$events" "$status" "$path" "${cpu_args[@]}" || writer_status=$?
+    retention_parser_status=$writer_status
     if ((writer_status != 0)); then
         printf 'run-nextest-counted: cannot derive typed test results from %s\n' "$events" >&2
         return "$writer_status"
@@ -164,24 +481,40 @@ function run_nextest {
         return 2
     fi
 
+    [[ -z $retain_evidence ]] || retention_stage=config
     cleanup_nextest_config
     nextest_budget_map=
     nextest_budget_sha=
     nextest_config=$(mktemp "${TMPDIR:-/tmp}/hermit-nextest-config.XXXXXX.toml") || return $?
-    if ! HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" run_rust_script "$TIMEOUT_CONFIG_WRITER" \
+    if HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" run_rust_script "$TIMEOUT_CONFIG_WRITER" \
         "$SCRIPT_DIR/../.config/nextest.toml" "$wall_multiplier" "$nextest_config"; then
+        retention_config_status=0
+    else
+        retention_config_status=$?
         cleanup_nextest_config
         return 2
     fi
 
     nextest_inventory_args inventory_arguments "$@" || return $?
-    if ! HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" invoke_nextest list --color never \
+    if [[ -n $retain_evidence ]]; then
+        retention_stage=list
+        printf '%s\0' --color never --message-format json "${inventory_arguments[@]}" >"$retain_evidence/list-selection.argv0" || retention_note_failure 'cannot record list argv'
+        retention_capture_config
+    fi
+    if HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" invoke_nextest list --color never \
         --message-format json "${inventory_arguments[@]}" >"$inventory"; then
+        retention_list_status=0
+    else
+        retention_list_status=$?
         printf 'run-nextest-counted: cannot obtain typed nextest binary inventory\n' >&2
         cleanup_nextest_config
         return 2
     fi
-    if ! run_rust_script "$RESULT_WRITER" --write-binary-map "$inventory" "$binary_map"; then
+    [[ -z $retain_evidence ]] || retention_stage=binary-map
+    if run_rust_script "$RESULT_WRITER" --write-binary-map "$inventory" "$binary_map"; then
+        retention_map_status=0
+    else
+        retention_map_status=$?
         printf 'run-nextest-counted: cannot validate typed nextest binary inventory\n' >&2
         cleanup_nextest_config
         return 2
@@ -191,16 +524,23 @@ function run_nextest {
     # selected inventory. Standalone/unsupported populations keep the existing
     # path. Never infer a calibration context from unchecked executable names.
     if [[ ${HERMIT_PREPARED_NEXTEST_REQUIRED:-0} == 1 && $cpu_report != - ]]; then
+        [[ -z $retain_evidence ]] || retention_stage=budget
         [[ -z $calibration_launch ]] || launch_arguments+=(--launch-proof "$calibration_launch")
-        if ! run_rust_script "$SCRIPT_DIR/nextest-binaries.rs" budget-context \
+        if run_rust_script "$SCRIPT_DIR/nextest-binaries.rs" budget-context \
             "${launch_arguments[@]}" "${inventory_arguments[@]}" >"$budget_context"; then
+            retention_budget_context_status=0
+        else
+            retention_budget_context_status=$?
             cleanup_nextest_config
             return 2
         fi
-        if ! HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" run_rust_script "$TIMEOUT_CONFIG_WRITER" \
+        if HERMIT_NEXTEST_CPU_WRAPPER_BIN="$cpu_wrapper" run_rust_script "$TIMEOUT_CONFIG_WRITER" \
             --resolve "$SCRIPT_DIR/../.config/nextest.toml" "$wall_multiplier" "$nextest_config" \
             "$inventory" "$budget_context" "$budget_map" "$SCRIPT_DIR/../.config/nextest-budgets.json" \
             -- "$@"; then
+            retention_budget_status=0
+        else
+            retention_budget_status=$?
             cleanup_nextest_config
             return 2
         fi
@@ -219,6 +559,11 @@ function run_nextest {
         fi
     fi
 
+    if [[ -n $retain_evidence ]]; then
+        retention_stage=run
+        printf '%s\0' --color never --message-format libtest-json-plus --message-format-version 0.1 "$@" >"$retain_evidence/run-selection.argv0" || retention_note_failure 'cannot record run argv'
+        retention_capture_config
+    fi
     set +e
     # nextest's stderr remains presentation. The versioned stdout event stream
     # is the only input to the aggregate count and per-test result adapter.
@@ -229,11 +574,14 @@ function run_nextest {
         --color never --message-format libtest-json-plus --message-format-version 0.1 \
         "$@" >"$events_log"
     status=$?
+    retention_run_status=$status
     set -e
     cleanup_nextest_config
 
     emit_libtest_count "$events_log" "$status" "$attempts" "$binary_map" \
-        "$cpu_report" || count_status=$?
+        "$cpu_report" "$inventory" || count_status=$?
+    retention_parser_status=$count_status
+    [[ -z $retain_evidence ]] || retention_stage=results-processed
     # Publication cannot erase a failure that the actual test runner observed.
     if ((status != 0)); then
         return "$status"
@@ -243,7 +591,7 @@ function run_nextest {
 
 function self_test {
     local scratch got expected status=0 wall_multiplier cpu_wrapper fixture_binary attempts
-    local binary_map inventory launch_failure=0 ordinary_attempts
+    local binary_map inventory launch_failure=0 inventory_wrong_name=0 ordinary_attempts
     scratch=$(mktemp -d)
     trap 'rm -rf "$scratch"' RETURN
 
@@ -353,14 +701,19 @@ PYEOF
         shift 4
         if [[ $operation == list ]]; then
             printf '%s\n' "$@" >"$scratch/list-arguments"
-            jq -nc --arg executable "$fixture_binary" '{
+            jq -nc --arg executable "$fixture_binary" --argjson launch_failure "$launch_failure" \
+                --argjson inventory_wrong_name "$inventory_wrong_name" '{
                 "rust-suites": {
                     "suite": {
                         "package-name": "suite",
                         "binary-id": "suite",
                         "binary-name": "suite",
                         "kind": "lib",
-                        "binary-path": $executable
+                        "binary-path": $executable,
+                        "testcases": (if $launch_failure == 1 then {} else {
+                            (if $inventory_wrong_name == 1 then "substituted" else "failure" end):
+                                {"ignored":false,"filter-match":{"status":"matches"}}
+                        } end)
                     }
                 }
             }'
@@ -429,6 +782,22 @@ PYEOF
         return 1
     fi
 
+    # Synthetic mutation: the map and counts still agree, but inventory names
+    # do not. This must reach the result writer through run_nextest and refuse;
+    # omitting --inventory would wrongly publish the ordinary failed result.
+    inventory_wrong_name=1
+    mkdir "$scratch/attribution-attempts"
+    status=0
+    TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/attribution-counts.json" \
+        run_nextest "$scratch/attribution-events" "$wall_multiplier" "$cpu_wrapper" \
+        "$scratch/attribution-attempts" "$binary_map" "$inventory" "$scratch/attribution-cpu.json" \
+        --profile ci -p suite -j 1 --retries 2 -- --skip skipme \
+        >"$scratch/attribution.stdout" 2>"$scratch/attribution.stderr" || status=$?
+    [[ $status == 100 ]] || return 1
+    [[ ! -e $scratch/attribution-counts.json && ! -e $scratch/attribution-cpu.json ]] || return 1
+    grep -q '0 eligible matches' "$scratch/attribution.stderr" || return 1
+    inventory_wrong_name=0
+
     # Preserve the original zero-terminal launch failure separately from the
     # executed exit23 control above. Stderr's twelve failures are not test rows.
     launch_failure=1
@@ -492,11 +861,268 @@ PYEOF
     printf 'run-nextest-counted: self-test PASS (typed counts, executed failure, zero-terminal launch failure, CPU reconciliation, refusal controls)\n'
 }
 
+function retention_self_test {
+    (
+        local scratch fault case_dir status expected original
+        scratch=$(mktemp -d) || exit $?
+        trap 'rm -rf -- "$scratch"' EXIT
+        for fault in config list binary-map budget-context budget-resolve runner runner126 runner127 parser success; do
+            case_dir="$scratch/$fault"
+            mkdir -- "$case_dir" || exit $?
+            status=0
+            (
+                events_log="$case_dir/raw"
+                cpu_measurement_dir="$case_dir/cpu"
+                cpu_attempt_records="$cpu_measurement_dir/attempts"
+                cpu_inventory="$cpu_measurement_dir/inventory.json"
+                cpu_binary_map="$cpu_measurement_dir/binary-map.json"
+                skid_retry_record="$cpu_measurement_dir/skid-retries.log"
+                cpu_report="$case_dir/cpu-report.json"
+                DAGRUN_TEST_COUNTS_PATH="$case_dir/counts.json"
+                calibration_launch=
+                nextest_config=
+                TMPDIR="$case_dir"
+                HERMIT_PREPARED_NEXTEST_REQUIRED=1
+                mkdir -p -- "$cpu_attempt_records" || exit $?
+                : >"$events_log"
+                printf 'partial raw attempt; not a valid producer fixture\n' >"$cpu_attempt_records/.partial"
+                printf 'synthetic marker-name attempt\n' >"$cpu_attempt_records/CAPTURED"
+                function run_rust_script {
+                    local source=$1
+                    shift
+                    if [[ $source == "$TIMEOUT_CONFIG_WRITER" ]]; then
+                        if [[ ${1:-} == --resolve ]]; then
+                            [[ $fault != budget-resolve ]] || return 35
+                            printf 'synthetic resolved config\n' >"$4"
+                        else
+                            printf 'synthetic config\n' >"$3"
+                            [[ $fault != config ]] || return 31
+                        fi
+                    elif [[ $source == "$RESULT_WRITER" ]]; then
+                        if [[ ${1:-} == --write-binary-map ]]; then
+                            [[ $fault != binary-map ]] || return 33
+                            printf 'synthetic binary map\n' >"$3"
+                        else
+                            [[ $fault != parser ]] || return 7
+                            # No fake typed result is published by the stub.
+                        fi
+                    elif [[ $source == "$SCRIPT_DIR/nextest-binaries.rs" && ${1:-} == budget-context ]]; then
+                        [[ $fault != budget-context ]] || return 34
+                        printf 'null\n'
+                    else
+                        return 99
+                    fi
+                }
+                function invoke_nextest {
+                    if [[ $1 == list ]]; then
+                        printf 'partial synthetic inventory\n'
+                        [[ $fault != list ]] || return 32
+                    else
+                        printf 'raw synthetic events, not valid libtest JSON\n'
+                        case $fault in runner) return 100 ;; runner126) return 126 ;; runner127) return 127 ;; esac
+                    fi
+                }
+                retention_begin "$case_dir/evidence" --profile ci -p synthetic || exit $?
+                status=0
+                run_nextest "$events_log" 1 synthetic-wrapper "$cpu_attempt_records" \
+                    "$cpu_binary_map" "$cpu_inventory" "$cpu_report" \
+                    --profile ci -p synthetic || status=$?
+                exit "$status" # exercise the real retention EXIT and ordinary cleanup
+            ) || status=$?
+            case $fault in runner) expected=100 ;; runner126) expected=126 ;; runner127) expected=127 ;; parser) expected=7 ;; success) expected=0 ;; *) expected=2 ;; esac
+            [[ $status == "$expected" ]] || exit 1
+            [[ ! -e $case_dir/raw && ! -e $case_dir/cpu ]] || exit 1
+            # Every raw attempt survives, even incomplete/malformed bytes.
+            [[ $(cat "$case_dir/evidence/attempts/.partial") == 'partial raw attempt; not a valid producer fixture' ]] || exit 1
+            [[ -f $case_dir/evidence/typed-result.observed.json.absent ]] || exit 1
+            jq -e --argjson expected "$expected" '.final_status==$expected and .producer_identity=="unattested" and .capture_status==0' \
+                "$case_dir/evidence/status.json" >/dev/null || exit 1
+            case $fault in
+                config) jq -e '.config_status=="31" and .nextest_status=="not-run"' "$case_dir/evidence/status.json" >/dev/null || exit 1 ;;
+                list) jq -e '.list_status=="32" and .nextest_status=="not-run"' "$case_dir/evidence/status.json" >/dev/null || exit 1 ;;
+                binary-map) jq -e '.map_status=="33" and .nextest_status=="not-run"' "$case_dir/evidence/status.json" >/dev/null || exit 1 ;;
+                budget-context) jq -e '.budget_context_status=="34" and .nextest_status=="not-run"' "$case_dir/evidence/status.json" >/dev/null || exit 1 ;;
+                budget-resolve) jq -e '.budget_status=="35" and .nextest_status=="not-run"' "$case_dir/evidence/status.json" >/dev/null || exit 1 ;;
+                runner) jq -e '.nextest_status=="100" and .parser_status=="0"' "$case_dir/evidence/status.json" >/dev/null || exit 1 ;;
+                parser) jq -e '.nextest_status=="0" and .parser_status=="7"' "$case_dir/evidence/status.json" >/dev/null || exit 1 ;;
+                success) jq -e '.nextest_status=="0" and .parser_status=="0" and .capture_io_failed==0' "$case_dir/evidence/status.json" >/dev/null || exit 1 ;;
+            esac
+            [[ -f $case_dir/evidence/CAPTURED ]] || exit 1
+            grep -q '  ./attempts/CAPTURED$' "$case_dir/evidence/SHA256SUMS" || exit 1
+            if [[ $fault == success ]]; then
+                printf 'raw synthetic events, not valid libtest JSON\n' >"$case_dir/expected-raw"
+                cmp -s -- "$case_dir/expected-raw" "$case_dir/evidence/events.jsonl" || exit 1
+            fi
+            (cd -- "$case_dir/evidence" && sha256sum --check SHA256SUMS >/dev/null) || exit 1
+            if compgen -G "$case_dir/hermit-nextest-config.*.toml" >/dev/null; then exit 1; fi
+        done
+        mkdir "$scratch/occupied" || exit $?
+        printf sentinel >"$scratch/occupied/sentinel"
+        ln -s occupied "$scratch/alias" || exit $?
+        printf sentinel >"$scratch/occupied-file"
+        ln -s missing "$scratch/dangling" || exit $?
+        for case_dir in "$scratch/occupied" "$scratch/occupied-file" "$scratch/alias" \
+            "$scratch/dangling" "$scratch/missing-parent/new" "$scratch/trailing/" relative; do
+            (retention_begin "$case_dir") >/dev/null 2>&1 && exit 1
+        done
+        [[ $(cat "$scratch/occupied/sentinel") == sentinel ]] || exit 1
+        for expected in 2 7 100 126 127; do
+            (
+                events_log="$scratch/io-raw-$expected"
+                printf real-bytes >"$events_log"
+                cpu_measurement_dir="$scratch/io-cpu-$expected"
+                cpu_attempt_records="$cpu_measurement_dir/attempts"
+                mkdir -p "$cpu_attempt_records" || exit $?
+                cpu_inventory= cpu_binary_map= skid_retry_record=
+                cpu_report=- DAGRUN_TEST_COUNTS_PATH=- calibration_launch= nextest_config=
+                retention_begin "$scratch/io-$expected" || exit $?
+                trap - EXIT
+                mkdir "$scratch/io-$expected/events.jsonl" || exit $?
+                retention_run_status=$expected
+                [[ $expected != 2 ]] || retention_run_status=0
+                status=0
+                retention_finish "$retention_run_status" || status=$?
+                [[ $status == "$expected" && ! -e $scratch/io-$expected/CAPTURED ]] || exit 1
+                jq -e --argjson expected "$expected" '.capture_status==2 and .final_status==$expected' \
+                    "$scratch/io-$expected/status.json" >/dev/null || exit 1
+            ) || exit $?
+        done
+        # Synthetic late-I/O and missing-evidence controls exercise the actual
+        # EXIT path. Stubs/bytes here are not a producer qualification fixture.
+        for fault in status checksum marker missing-raw missing-attempts; do
+            for original in 0 100; do
+                case_dir="$scratch/late-$fault-$original"
+                mkdir "$case_dir" || exit $?
+                status=0
+                (
+                    events_log="$case_dir/raw"
+                    cpu_measurement_dir="$case_dir/cpu"
+                    cpu_attempt_records="$cpu_measurement_dir/attempts"
+                    cpu_inventory= cpu_binary_map= skid_retry_record=
+                    cpu_report=- DAGRUN_TEST_COUNTS_PATH=- calibration_launch= nextest_config=
+                    mkdir -p "$cpu_attempt_records" || exit $?
+                    printf 'synthetic raw bytes\n' >"$events_log"
+                    # Names that resemble top-level markers must still be hashed.
+                    printf 'synthetic attempt\n' >"$cpu_attempt_records/CAPTURED"
+                    retention_begin "$case_dir/evidence" || exit $?
+                    retention_run_status=$original
+                    case $fault in
+                        status) mkdir "$case_dir/evidence/status.json" ;;
+                        checksum) mkdir "$case_dir/evidence/SHA256SUMS" ;;
+                        marker) mkdir "$case_dir/evidence/.CAPTURED.pending" ;;
+                        missing-raw) rm "$events_log" ;;
+                        missing-attempts) rm -rf "$cpu_attempt_records" ;;
+                    esac
+                    exit "$original"
+                ) || status=$?
+                expected=$original
+                ((expected != 0)) || expected=2
+                [[ $status == "$expected" && ! -e $case_dir/evidence/CAPTURED ]] || exit 1
+                [[ ! -e $case_dir/raw && ! -e $case_dir/cpu ]] || exit 1
+            done
+        done
+        printf 'run-nextest-counted: synthetic capture controls passed (bytes, cleanup, and status only)\n'
+    )
+}
+
+# Synthetic admission controls: the real CLI must refuse before any helper.
+# Fake PATH tools only detect an accidental launch; they never qualify a producer.
+function retention_overlap_self_test {
+    (
+        local scratch case_name case_dir destination count_path cpu_path status
+        scratch=$(mktemp -d) || exit $?
+        trap 'rm -rf -- "$scratch"' EXIT
+        mkdir "$scratch/tools" || exit $?
+        printf '#!/usr/bin/env bash\nprintf "unexpected helper\\n" >>"$CAPTURE_LAUNCH_SENTINEL"\nexit 99\n' >"$scratch/tools/rust-script"
+        cp "$scratch/tools/rust-script" "$scratch/tools/cargo" || exit $?
+        chmod +x "$scratch/tools/rust-script" "$scratch/tools/cargo" || exit $?
+        for case_name in count-status count-marker count-equal cpu-status cpu-marker cpu-equal default-cpu \
+            counts-recovery cpu-launch cpu-budgets relative symlink-parent ancestor-output existing; do
+            case_dir="$scratch/$case_name"
+            mkdir "$case_dir" || exit $?
+            destination="$case_dir/capture"
+            count_path="$case_dir/counts.json"
+            cpu_path="$case_dir/cpu.json"
+            printf 'caller counts\n' >"$count_path"
+            printf 'caller CPU\n' >"$cpu_path"
+            case $case_name in
+                count-status) count_path="$destination/status.json" ;;
+                count-marker) count_path="$destination/CAPTURED" ;;
+                count-equal) count_path="$destination" ;;
+                cpu-status) cpu_path="$destination/status.json" ;;
+                cpu-marker) cpu_path="$destination/CAPTURED" ;;
+                cpu-equal) cpu_path="$destination" ;;
+                default-cpu) destination="$count_path.cpu.json" ;;
+                counts-recovery) destination="$count_path.publication-recovery" ;;
+                cpu-launch) destination="$cpu_path.launch.json" ;;
+                cpu-budgets) destination="$cpu_path.budgets.json" ;;
+                relative) count_path='./capture/../capture/status.json' ;;
+                symlink-parent)
+                    ln -s "$case_dir" "$case_dir/alias" || exit $?
+                    count_path='alias/capture/status.json'
+                    ;;
+                ancestor-output) count_path="$case_dir" ;;
+                existing)
+                    mkdir "$destination" || exit $?
+                    printf 'caller status\n' >"$destination/status.json"
+                    printf 'caller marker\n' >"$destination/CAPTURED"
+                    count_path="$destination/status.json"
+                    ;;
+            esac
+            status=0
+            (
+                cd "$case_dir" || exit $?
+                export DAGRUN_TEST_COUNTS_PATH="$count_path"
+                export HERMIT_NEXTEST_CPU_REPORT_PATH="$cpu_path"
+                [[ $case_name != default-cpu ]] || unset HERMIT_NEXTEST_CPU_REPORT_PATH
+                export HERMIT_PREPARED_NEXTEST_REQUIRED=0 HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=0
+                export PATH="$scratch/tools:$PATH" CAPTURE_LAUNCH_SENTINEL="$case_dir/launched"
+                bash "$SCRIPT_DIR/run-nextest-counted.sh" --capture-evidence "$destination" --profile ci
+            ) >"$case_dir/stdout" 2>"$case_dir/stderr" || status=$?
+            [[ $status == 2 && ! -e $case_dir/launched ]] || exit 1
+            grep -q 'output publication .* overlaps capture directory' "$case_dir/stderr" || exit 1
+            [[ $(cat "$case_dir/counts.json") == 'caller counts' ]] || exit 1
+            [[ $(cat "$case_dir/cpu.json") == 'caller CPU' ]] || exit 1
+            if [[ $case_name == existing ]]; then
+                [[ $(cat "$destination/status.json") == 'caller status' &&
+                    $(cat "$destination/CAPTURED") == 'caller marker' ]] || exit 1
+                [[ $(find "$destination" -mindepth 1 -maxdepth 1 -type f | wc -l) == 2 ]] || exit 1
+            else
+                [[ ! -e $destination && ! -L $destination ]] || exit 1
+            fi
+        done
+        # An adjacent output with a shared string prefix is not containment.
+        # Relative output parents may be created by the existing CPU writer.
+        (
+            cd "$scratch" || exit $?
+            DAGRUN_TEST_COUNTS_PATH=./capture-sibling/status.json \
+                HERMIT_NEXTEST_CPU_REPORT_PATH=./new-output-parent/cpu.json \
+                retention_check_publication_overlap "$scratch/capture" || exit $?
+            DAGRUN_TEST_COUNTS_PATH=- HERMIT_NEXTEST_CPU_REPORT_PATH=- \
+                retention_check_publication_overlap "$scratch/capture" || exit $?
+            [[ ! -e $scratch/capture ]] || exit 1
+        ) || exit $?
+        printf 'run-nextest-counted: synthetic capture publication-overlap controls passed\n'
+    )
+}
+
+# Opt-in only; parse before calibration options. All original arguments are kept.
+retention_destination=
+if [[ ${1:-} == --capture-evidence ]]; then
+    [[ $# -ge 2 && $2 == /* ]] || { printf 'run-nextest-counted: --capture-evidence requires a NEW canonical absolute directory under an existing writable parent; use --help\n' >&2; exit 2; }
+    retention_destination=$2
+    shift 2
+fi
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then
-    printf '%s\n' 'usage: ci/run-nextest-counted.sh [--calibration-host | --calibration-launch-proof PATH] NEXTEST_ARGS...' \
+    printf '%s\n' 'usage: ci/run-nextest-counted.sh [--capture-evidence NEW_ABSOLUTE_DIRECTORY] [--calibration-host | --calibration-launch-proof PATH] NEXTEST_ARGS...' \
+        '--capture-evidence saves exact available bytes and explicit absences before normal cleanup into a NEW canonical absolute directory (parent must exist).' \
+        'Capture success preserves runner status, including 0; it does not qualify tests or attest list/run producer identity.' \
+        'Capture I/O/integrity failure makes an otherwise-successful run return 2; an existing failure keeps its status. CAPTURED plus valid SHA256SUMS means bytes saved only.' \
+        'Place --capture-evidence before calibration and Nextest arguments; capture is not supported with --self-test.' \
+        'Capture must be separate from counts/recovery outputs and the configured or default CPU output plus .launch.json/.budgets.json sidecars; relative output paths use the current directory.' \
         'The maintained native host boundary may capture actual resources with --calibration-host.' \
         'Pinned callers use the existing wrapper-provided read-only launch proof.' \
-        'Missing evidence keeps defaults; malformed or changed evidence refuses. Capture never compiles.'
+        'Missing evidence keeps defaults; malformed or changed evidence refuses. Launch observation never compiles.'
     exit 0
 fi
 if [[ ${1:-} == --calibration-host ]]; then
@@ -508,19 +1134,47 @@ elif [[ ${1:-} == --calibration-launch-proof ]]; then
     shift 2
 fi
 if [[ ${1:-} == --self-test ]]; then
-    self_test
+    [[ -z $retention_destination ]] || { printf 'run-nextest-counted: --capture-evidence cannot wrap --self-test; omit capture for synthetic controls, or supply normal Nextest arguments; use --help\n' >&2; exit 2; }
+    self_test || exit $?
+    retention_self_test
+    retention_self_test_status=$?
+    ((retention_self_test_status == 0)) || exit "$retention_self_test_status"
+    retention_overlap_self_test
     exit
 fi
 
+events_log=
+cpu_report=
+if [[ -n $retention_destination ]]; then
+    retention_begin "$retention_destination" "$@" || {
+        retention_init_status=$?
+        retention_note_failure "initialization refused or failed: status $retention_init_status"
+        exit "$retention_init_status"
+    }
+fi
 events_log=$(mktemp) || exit $?
 cpu_measurement_dir=$(mktemp -d "${TMPDIR:-/tmp}/hermit-nextest-cpu.XXXXXX") || exit $?
 cpu_attempt_records="$cpu_measurement_dir/attempts"
 cpu_inventory="$cpu_measurement_dir/inventory.json"
 cpu_binary_map="$cpu_measurement_dir/binary-map.json"
 mkdir "$cpu_attempt_records" || exit $?
-trap 'cleanup_nextest_config; cleanup_cpu_measurement_dir; rm -f "$events_log"' EXIT
-cpu_wrapper=$(build_cpu_wrapper) || exit $?
+if [[ -z $retain_evidence ]]; then
+    trap 'cleanup_nextest_config; cleanup_cpu_measurement_dir; rm -f "$events_log"' EXIT
+fi
+retention_stage=cpu-wrapper
+if cpu_wrapper=$(build_cpu_wrapper); then
+    retention_cpu_wrapper_status=0
+else
+    retention_cpu_wrapper_status=$?
+    exit "$retention_cpu_wrapper_status"
+fi
+retention_stage=launch
 cpu_report=$(configured_cpu_report_path) || exit $?
+if [[ -n $retain_evidence && $cpu_report != - ]]; then
+    retention_copy "$cpu_report" cpu-report.before.observed.json || :
+    retention_copy "$cpu_report.launch.json" launch-publication.before.observed.json || :
+    retention_copy "$cpu_report.budgets.json" budget-publication.before.observed.json || :
+fi
 if "$calibration_host"; then
     capture_manifest=${HERMIT_RUST_SCRIPT_ARTIFACT_ROOT:-$SCRIPT_DIR/../target/ci/rust-scripts}/manifest.tsv
     if [[ -e $capture_manifest || -L $capture_manifest ]]; then
