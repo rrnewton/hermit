@@ -1136,6 +1136,20 @@ fn kernel_poll_deadline(
     })
 }
 
+/// Whether `restart`, a `restart_syscall` at the interrupted poll's address,
+/// still holds `call`'s pollfd array and length in its argument registers.
+/// Linux's restart leaves the registers as the poll left them (it sets only
+/// the syscall number and moves the instruction pointer back,
+/// `arch_do_signal_or_restart`), so the kernel's restart block and the
+/// registers describe the same poll.
+#[cfg(target_arch = "x86_64")]
+fn restart_names_poll(restart: &Syscall, call: &syscalls::Poll) -> bool {
+    let (number, args) = restart.into_parts();
+    number == Sysno::restart_syscall
+        && args.arg0 == call.fds().map_or(0, |fds| fds.as_raw())
+        && args.arg1 == call.nfds() as usize
+}
+
 /// The timeout, in whole milliseconds rounded up, that a restarted kernel-run
 /// `poll` waits from `now` until `end`: 0 once `end` has passed.
 #[cfg(target_arch = "x86_64")]
@@ -3056,12 +3070,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Poll,
         deadline: Option<KernelPollDeadline>,
     ) -> Result<i64, Error> {
+        self.run_kernel_poll_as(guest, call, deadline, Syscall::Poll(call))
+            .await
+    }
+
+    /// `run_kernel_poll`, with `run` the call that runs for `call` (or that
+    /// replay serves): the poll itself, or the guest's own `restart_syscall`
+    /// that restarts it (`resume_kernel_poll`).
+    #[cfg(target_arch = "x86_64")]
+    async fn run_kernel_poll_as<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Poll,
+        deadline: Option<KernelPollDeadline>,
+        run: Syscall,
+    ) -> Result<i64, Error> {
         debug_assert!(
             polls_in_kernel(self.cfg.sequentialize_threads, self.cfg.recordreplay_modes),
             "a plain or strict run emulates poll; it never runs one in the kernel"
         );
         let raw = self
-            .record_or_replay_blocking(guest, Syscall::Poll(call))
+            .record_or_replay_blocking_as(guest, Syscall::Poll(call), run)
             .await;
         let before_run = poll_stopped_before_it_ran(&raw);
         let result = kernel_poll_result(&call, raw, deadline.is_some());
@@ -3078,23 +3107,37 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// The kernel's restart of a `poll` with a positive timeout that a signal
-    /// ended in the kernel (`RestartCall::KernelPoll`): the same poll with the
-    /// time left until `deadline`, as `do_restart_poll` reruns it until the
-    /// end time it kept. The time left is rounded up to whole milliseconds, so
-    /// the poll never ends before its deadline, and is 0 once the deadline has
-    /// passed: the poll then reports what is ready without waiting. Under
-    /// record and replay the poll keeps the timeout it was issued with
-    /// (`KernelPollDeadline`). It always
-    /// runs the recorded kernel call, never the zero-length sleep
-    /// `handle_external_poll` makes of a poll of no descriptors, so replay
-    /// serves it from the Poll event the recording holds.
+    /// ended in the kernel (`RestartCall::KernelPoll`). `restart` is the
+    /// guest's own `restart_syscall`. It runs in place: the poll ran in the
+    /// kernel, so the thread's restart block describes it, and Linux's
+    /// `do_restart_poll` waits until the end time the poll kept and writes its
+    /// `revents`. Nothing runs in its stead, so no signal is taken off the queue
+    /// before the restart runs, as the single step of a poll injected for it
+    /// did: the kernel delivers pending signals in its own order when the
+    /// restart returns. Record keeps the restart's outputs as the poll's, and
+    /// replay serves them (`hermit_record_format::event::InterruptedPoll`).
+    ///
+    /// The restart names the poll in its argument registers, which Linux
+    /// leaves as the poll left them (`restart_names_poll`). If it does not,
+    /// the poll runs again with the time left until `deadline`, as before:
+    /// rounded up to whole milliseconds, so the poll never ends before its
+    /// deadline, and 0 once the deadline has passed. Under record and replay
+    /// that poll keeps the timeout it was issued with (`KernelPollDeadline`).
+    /// Either way it runs the recorded kernel call, never the zero-length
+    /// sleep `handle_external_poll` makes of a poll of no descriptors.
     #[cfg(target_arch = "x86_64")]
     pub(crate) async fn resume_kernel_poll<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Poll,
         deadline: KernelPollDeadline,
+        restart: Syscall,
     ) -> Result<i64, Error> {
+        if restart_names_poll(&restart, &call) {
+            return self
+                .run_kernel_poll_as(guest, call, Some(deadline), restart)
+                .await;
+        }
         let call = match deadline.0 {
             Some(end) => call.with_timeout(remaining_poll_millis(Instant::now(), end)),
             None => call,

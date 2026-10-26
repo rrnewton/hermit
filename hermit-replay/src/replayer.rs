@@ -387,6 +387,7 @@ fn remember_materialized_path(
 }
 
 use crate::desync::DesyncError;
+use crate::event::InterruptedPoll;
 use crate::event::OpenMaterialization;
 use crate::event_stream::ChildEventStreamIds;
 use crate::event_stream::DebugEvent;
@@ -397,6 +398,10 @@ use crate::event_stream::normalize_unused_args;
 #[derive(Serialize, Deserialize)]
 pub struct ReplayerThreadState {
     events: EventReader,
+    /// The poll the recording says a signal just ended in the kernel, until
+    /// this thread's next syscall (`InterruptedPoll`).
+    #[serde(default)]
+    interrupted_poll: Option<InterruptedPoll>,
     stream_id: EventStreamId,
     child_stream_ids: ChildEventStreamIds,
     bootstrapped: bool,
@@ -519,6 +524,7 @@ impl Tool for Replayer {
             }),
             stream_id,
             child_stream_ids: ChildEventStreamIds::default(),
+            interrupted_poll: None,
             bootstrapped: parent.is_some_and(|(_, state)| state.bootstrapped),
             outputs: match parent {
                 None => self.outputs.clone(),
@@ -538,6 +544,14 @@ impl Tool for Replayer {
         syscall: Syscall,
     ) -> Result<i64, Error> {
         self.expect_syscall(guest, syscall);
+
+        // As the recorder does: the kernel's restart of a poll a signal ended
+        // there is served from the poll's recorded outputs.
+        if let Some(poll) = guest.thread_state_mut().interrupted_poll.take()
+            && poll.restarted_by(&syscall)
+        {
+            return Ok(self.handle_restarted_poll(guest, poll).await?);
+        }
 
         // NOTE: This match statement should be identical to the one in the
         // recorder. Otherwise, our recorder and replayer will disagree about

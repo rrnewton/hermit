@@ -480,6 +480,51 @@ pub struct PollEvent {
     pub fds: Option<Vec<PollFd>>,
 }
 
+/// A `poll` that a signal ended in the kernel with `ERESTART_RESTARTBLOCK`: its
+/// pollfd array and length. With no handler to run, Linux restarts such a poll
+/// through the guest's own `restart_syscall` (`do_restart_poll`), which writes
+/// the array's `revents` and returns as the poll would. The recorder runs that
+/// `restart_syscall` in place and records its outputs as a [`PollEvent`];
+/// replay serves them back. Each thread keeps one until its next syscall.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InterruptedPoll {
+    /// The guest's pollfd array address, 0 for none.
+    pub fds: u64,
+    /// Its length.
+    pub nfds: u64,
+}
+
+impl InterruptedPoll {
+    /// The poll `fds`/`nfds` ended with `result`, if a signal ended it in the
+    /// kernel with `ERESTART_RESTARTBLOCK`.
+    pub fn after(
+        fds: Option<AddrMut<'_, PollFd>>,
+        nfds: u64,
+        result: &Result<i64, Errno>,
+    ) -> Option<Self> {
+        matches!(result, Err(Errno::ERESTART_RESTARTBLOCK)).then(|| Self {
+            fds: fds.map_or(0, |fds| fds.as_raw() as u64),
+            nfds,
+        })
+    }
+
+    /// Whether `syscall` is the kernel's restart of this poll: a
+    /// `restart_syscall` whose argument registers still hold the poll's
+    /// array and length, as Linux leaves them when it restarts a call.
+    pub fn restarted_by(&self, syscall: &Syscall) -> bool {
+        use reverie::syscalls::SyscallInfo;
+        let (number, args) = syscall.into_parts();
+        number == reverie::syscalls::Sysno::restart_syscall
+            && args.arg0 as u64 == self.fds
+            && args.arg1 as u64 == self.nfds
+    }
+
+    /// The pollfd array address.
+    pub fn fds_address(&self) -> Option<AddrMut<'static, PollFd>> {
+        AddrMut::from_raw(self.fds as usize)
+    }
+}
+
 /// Records every guest-visible output of a raw `ppoll` call.
 ///
 /// Unlike `poll`, Linux treats the timeout as an in-out parameter. The pollfd
@@ -562,6 +607,40 @@ pub struct SockOptEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a poll a signal ended with `ERESTART_RESTARTBLOCK` is kept, and
+    /// only a `restart_syscall` that still names its array and length is its
+    /// restart.
+    #[test]
+    fn only_a_restart_naming_an_interrupted_poll_restarts_it() {
+        use reverie::syscalls::SyscallArgs;
+        use reverie::syscalls::Sysno;
+        let fds = AddrMut::<PollFd>::from_raw(0x7000);
+        assert_eq!(InterruptedPoll::after(fds, 2, &Ok(1)), None);
+        assert_eq!(InterruptedPoll::after(fds, 2, &Err(Errno::EINTR)), None);
+        let poll = InterruptedPoll::after(fds, 2, &Err(Errno::ERESTART_RESTARTBLOCK))
+            .expect("an interrupted poll is kept");
+        assert_eq!(
+            poll,
+            InterruptedPoll {
+                fds: 0x7000,
+                nfds: 2
+            }
+        );
+        assert_eq!(poll.fds_address().map(|fds| fds.as_raw()), Some(0x7000));
+        let call = |number, fds, nfds| {
+            Syscall::from_raw(number, SyscallArgs::new(fds, nfds, 300, 0, 0, 0))
+        };
+        assert!(poll.restarted_by(&call(Sysno::restart_syscall, 0x7000, 2)));
+        assert!(!poll.restarted_by(&call(Sysno::restart_syscall, 0x7000, 3)));
+        assert!(!poll.restarted_by(&call(Sysno::restart_syscall, 0x8000, 2)));
+        assert!(!poll.restarted_by(&call(Sysno::poll, 0x7000, 2)));
+        // A poll of no array keeps 0 for it.
+        let none = InterruptedPoll::after(None, 0, &Err(Errno::ERESTART_RESTARTBLOCK))
+            .expect("an interrupted poll is kept");
+        assert!(none.restarted_by(&call(Sysno::restart_syscall, 0, 0)));
+        assert_eq!(none.fds_address(), None);
+    }
 
     #[test]
     fn siocethtool_has_a_deterministic_error() {

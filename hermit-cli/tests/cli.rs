@@ -178,6 +178,7 @@ static HB_PIPE_READ_HELD_WRITER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_TIMEOUT_VS_SPINNER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_ZERO_TIMEOUT_RESTART_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_TIMEOUT_RESTART_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static POLL_RESTART_STOP_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_PARENT_KILLED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_KILL_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static VFORK_EXEC_RESUME_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -36360,6 +36361,79 @@ fn a_kernel_run_poll_a_signal_ends_restarts_until_its_deadline() {
     }
 }
 
+/// A job-control stop ends a kernel-run `poll` with `ERESTART_RESTARTBLOCK`,
+/// and with no handler to run Linux restarts it through `restart_syscall`
+/// (`do_restart_poll`). Detcore ran that restart as a poll it injected in the
+/// guest's stead, whose single step can take a signal off the queue before the
+/// poll runs; with another signal pending, the backend passed the taken one on
+/// unreported, so record delivered the guest's two caught signals in another
+/// order than replay, which serves the restart from the log, and the replay
+/// diverged or refused. The restart now runs as the guest's own
+/// `restart_syscall`, in place. In the guest (`tests/c/poll_restart_stop_signals.c`)
+/// a child stops and continues its parent while it polls, then sends SIGUSR1
+/// and SIGUSR2 around the restart; race probes start each backgrounded call
+/// up to 10 ms late (docs/RACE_PROBES.md), so the signals reach the restart
+/// before it runs. Before, 10 of 12 such recordings failed their replay and
+/// these four seeds all did. A `--no-sequentialize-threads` run, which runs
+/// the restart in the kernel too, prints native's lines.
+#[test]
+fn a_kernel_run_polls_restart_runs_in_place() {
+    let _lock = hermit_run_guard();
+    let guest = compiled_c_guest(
+        &POLL_RESTART_STOP_SIGNALS_GUEST,
+        "poll_restart_stop_signals",
+    );
+    let guest = guest.to_str().unwrap();
+    let expected = "round 0: poll=0 revents=0 interrupted=1\n\
+                    round 1: poll=0 revents=0 interrupted=1\n\
+                    round 2: poll=0 revents=0 interrupted=1\n\
+                    usr1=3 usr2=3\n";
+    let native = Command::new(guest)
+        .args(["3", "1"])
+        .output()
+        .expect("failed to run the guest natively");
+    assert_eq!(String::from_utf8_lossy(&native.stdout), expected, "native");
+    let args = [
+        "run",
+        "--timeout",
+        "120",
+        "--base-env=minimal",
+        "--no-sequentialize-threads",
+        "--",
+        guest,
+        "3",
+        "1",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), expected, "{args:?}");
+    for seed in ["3", "4", "5", "6"] {
+        let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create the recording data dir");
+        let data_dir_arg = format!("--data-dir={}", data_dir.path().display());
+        let args = [
+            "record",
+            "start",
+            "--verify",
+            "--verify-strict",
+            "--record-timeout",
+            "120",
+            &data_dir_arg,
+            "--",
+            guest,
+            "3",
+            "1",
+        ];
+        let mut command = hermit_command(&args);
+        command
+            .env("HERMIT_RACE_PROBE", "bg_pre_call=0-10")
+            .env("HERMIT_RACE_PROBE_SEED", seed);
+        let output = hermit_test::hermit_output(&format!("hermit {args:?}"), &mut command);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?} (probe seed {seed})");
+    }
+}
+
 /// A `ppoll` with a timeout returns on time while another thread spins without
 /// syscalls (https://github.com/rrnewton/hermit/issues/3952). The guest waits
 /// five times for 50 ms each; every wait must return 0 after at least 50 ms and
@@ -38034,7 +38108,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x193, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x195, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];

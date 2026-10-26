@@ -29,8 +29,7 @@ use reverie::syscalls::Timespec;
 use reverie::syscalls::family::SockOptFamily;
 
 use super::Replayer;
-#[cfg(target_arch = "x86_64")]
-use crate::event::PollEvent;
+#[cfg(target_arch = "x86_64")]use crate::event::InterruptedPoll;use crate::event::PollEvent;
 use crate::event::PpollEvent;
 use crate::event::SelectEvent;
 use crate::event::fd_set_bytes;
@@ -340,12 +339,34 @@ impl Replayer {
         syscall: Poll,
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, Poll)?;
-        replay_poll_event(
+        let result = replay_poll_event(
             &mut guest.memory(),
             syscall.fds(),
             syscall.nfds() as usize,
             event,
-        )
+        );
+        guest.thread_state_mut().interrupted_poll =
+            InterruptedPoll::after(syscall.fds(), syscall.nfds(), &result);
+        result
+    }
+
+    /// The kernel's restart of `poll` (`InterruptedPoll`), served from the
+    /// outputs the recorder recorded for it.
+    pub(super) async fn handle_restarted_poll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        poll: InterruptedPoll,
+    ) -> Result<i64, Errno> {
+        let event = next_event!(guest, Poll)?;
+        let result = replay_poll_event(
+            &mut guest.memory(),
+            poll.fds_address(),
+            poll.nfds as usize,
+            event,
+        );
+        guest.thread_state_mut().interrupted_poll =
+            InterruptedPoll::after(poll.fds_address(), poll.nfds, &result);
+        result
     }
 
     pub(super) async fn handle_ppoll<G: Guest<Self>>(

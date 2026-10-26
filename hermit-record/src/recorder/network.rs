@@ -40,8 +40,7 @@ use reverie::syscalls::family::SockOptFamily;
 use super::Recorder;
 use crate::event::AcceptEvent;
 use crate::event::EpollWaitEvent;
-#[cfg(target_arch = "x86_64")]
-use crate::event::PollEvent;
+#[cfg(target_arch = "x86_64")]use crate::event::InterruptedPoll;use crate::event::PollEvent;
 use crate::event::PpollEvent;
 use crate::event::RecvmsgEvent;
 use crate::event::SelectEvent;
@@ -614,7 +613,35 @@ impl Recorder {
             capture_poll_event(&guest.memory(), syscall.fds(), len, result).map(SyscallEvent::Poll);
 
         self.record_event(guest, event);
+        guest.thread_state_mut().interrupted_poll =
+            InterruptedPoll::after(syscall.fds(), syscall.nfds(), &result);
 
+        result
+    }
+
+    /// The kernel's restart of `poll`, which a signal ended in the kernel
+    /// (`InterruptedPoll`): `restart`, the guest's own `restart_syscall`, runs
+    /// in place, so Linux's `do_restart_poll` waits until the end time the
+    /// poll kept and writes the poll's `revents`, and no signal is taken off
+    /// the queue before it runs, as a poll injected in its stead would. Its
+    /// outputs are recorded as the poll's.
+    pub(super) async fn handle_restarted_poll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        restart: Syscall,
+        poll: InterruptedPoll,
+    ) -> Result<i64, Errno> {
+        let result = guest.inject(restart).await;
+        let event = capture_poll_event(
+            &guest.memory(),
+            poll.fds_address(),
+            poll.nfds as usize,
+            result,
+        )
+        .map(SyscallEvent::Poll);
+        self.record_event(guest, event);
+        guest.thread_state_mut().interrupted_poll =
+            InterruptedPoll::after(poll.fds_address(), poll.nfds, &result);
         result
     }
 
