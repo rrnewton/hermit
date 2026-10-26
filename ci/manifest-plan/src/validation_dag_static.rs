@@ -2015,7 +2015,18 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And analyze::races::tests::an_output_{imported_over_scm_rights,taken_with_pidfd_getfd,
     // alias_from_before_the_trace,alias_a_child_inherited,reopened_by_path}_is_a_gap: 1280.
     // And analyze::races::tests::an_open_of_a_regular_file_read_only_device_or_new_pipe_is_no_gap: 1281.
-    ("test.hermit_unit", 1281),
+    // And analyze's verdict and precondition exits: verdict::tests::{a_verdict_is_written_in_snake_case,
+    // the_search_ends_that_no_swap_separates_are_a_precondition},
+    // schedule_search::tests::the_searches_ends_are_typed,
+    // phases::tests::{an_empty_prefix_that_meets_the_target_is_a_verdict,
+    // a_verdict_is_reported_and_ends_analyze_successfully,
+    // a_first_run_that_misses_ends_the_analysis_or_searches,
+    // bisection_ends_are_answered_by_their_kind,
+    // analyze_own_bisection_points_endpoint_misses_at_replay,
+    // a_selfcheck_difference_is_replay_not_reproducing,
+    // a_success_exit_code_that_means_something_else_is_refused} and
+    // tests::analyze_conclusions_have_their_own_exit_codes_and_class_lines: 1292.
+    ("test.hermit_unit", 1292),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6346,7 +6357,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same output-redirect test: 1269.
     // And the same five output-alias tests: 1274.
     // And the same no-gap open test: 1275.
-    ("test.hermit_unit_on_host", 1275),
+    // And the same eleven verdict and precondition tests: 1286.
+    ("test.hermit_unit_on_host", 1286),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
