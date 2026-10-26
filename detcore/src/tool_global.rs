@@ -6562,6 +6562,7 @@ impl GlobalState {
                     priority_row: None,
                     slice_expired: false,
                     zero_length_sleep: false,
+                    instruction_offset: None,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {
@@ -13976,7 +13977,14 @@ mod tests {
         let path = directory.path().join("recording");
         let mut writer = crate::preemptions::PreemptionWriter::new(Some(path.clone()));
         writer.register_thread(tid, DEFAULT_PRIORITY);
-        writer.insert_reprioritization(tid, LogicalTime::from_nanos(100), 10, DEFAULT_PRIORITY, 20);
+        writer.insert_reprioritization(
+            tid,
+            LogicalTime::from_nanos(100),
+            10,
+            DEFAULT_PRIORITY,
+            20,
+            None,
+        );
         let mut scheduler = state.sched.lock().unwrap();
         scheduler.preemption_writer = Some(writer);
         let (summary, info_description) = scheduler

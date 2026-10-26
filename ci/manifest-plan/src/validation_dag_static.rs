@@ -1255,7 +1255,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nextest list.
     // Full validate at 85b8cec25a executed 1973, all passed, against the
     // 1971 pin: 1971 + 2 = 1973, measured by that run.
-    ("test.regular_crates", 1973),
+    // And detcore-model's
+    // only_a_chaos_instruction_offset_needs_a_stop_at_every_slice_end
+    // (--chaos-instruction-offset): 1974.
+    ("test.regular_crates", 1974),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1963,7 +1966,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and lock_wait_refuses_once_the_budget_is_spent): 1333 + 2 = 1335,
     // measured by musetrain's cd856249a9 full validate (1343 executed
     // against the 1341 the old pin expected; both new units PASS).
-    ("test.hermit_unit", 1335),
+    // And run's chaos_instruction_offset_round_trips_and_is_refused_where_inert
+    // and replay_of_instruction_offsets_is_refused_where_unsupported
+    // (--chaos-instruction-offset): 1337.
+    ("test.hermit_unit", 1337),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3242,7 +3248,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds 21
     // sync-edge and access-trace units: 3363 + 21 = 3384, measured by the
     // 216dbc929a full validate.
-    ("test.detcore_unit", 3384),
+    // And eight --chaos-instruction-offset units: tool_local's draw, its own
+    // stream and its record/replay hand-off, preemptions' offset rows, the
+    // kept timer, the replay target, a scheduler-recorded offset, and the
+    // hooks arming, recording and replaying one offset slice: 3392.
+    ("test.detcore_unit", 3392),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4610,7 +4620,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // = 780, measured by nextest list.
     // Train 1 (https://github.com/rrnewton/hermit/pull/5057) adds seven cli
     // cases: 780 + 7 = 787, measured by the 216dbc929a full validate.
-    ("test.cli", 787),
+    // And chaos_instruction_offset_splits_a_branch_free_window and
+    // a_chaos_instruction_offset_run_verifies_and_replays_at_its_offsets
+    // (tests/c/branch_free_race.c, x86_64 only): 789.
+    ("test.cli", 789),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5238,7 +5251,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same K8-d cli case: 698 + 1 = 699, measured by nextest list.
     // Train 1 recount (measured by the 216dbc929a full validate, same
     // growth as test.cli): 699 + 7 = 706.
-    ("test.cli_on_host", 706),
+    // And the same two --chaos-instruction-offset tests, not excluded: 708.
+    ("test.cli_on_host", 708),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5248,7 +5262,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // exclusions are present exactly once: 1971 - 14 = 1957, by nextest list.
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a): 1957 + 2 = 1959 (1973 - 14).
-    ("test.regular_crates_on_host", 1959),
+    // And the cases added since, as this twin's entry further down counts: 1960.
+    ("test.regular_crates_on_host", 1960),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5791,7 +5806,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The pipe retry identity regression adds one unit: 3362 + 1 = 3363,
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
-    ("test.detcore_unit_on_host", 3384),
+    // And the same eight --chaos-instruction-offset units: 3392.
+    ("test.detcore_unit_on_host", 3392),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6204,7 +6220,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 1 recount (same growth as test.hermit_unit): 1325 + 2 = 1327.
     // The same two podman lock-wait units as test.hermit_unit (neither is
     // in the hosted CPUID-faulting skip set): 1327 + 2 = 1329.
-    ("test.hermit_unit_on_host", 1329),
+    // And the same two --chaos-instruction-offset run units: 1331.
+    ("test.hermit_unit_on_host", 1331),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6442,7 +6459,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nextest list.
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a), none hosted-excluded: 1957 + 2 = 1959 (1973 - 14).
-    ("test.regular_crates_on_host", 1959),
+    // And the same --chaos-instruction-offset detcore-model unit: 1960.
+    ("test.regular_crates_on_host", 1960),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
