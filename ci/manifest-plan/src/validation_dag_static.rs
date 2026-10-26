@@ -1264,7 +1264,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1971 pin: 1971 + 2 = 1973, measured by that run.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 1944 + 2 = 1946 (Train 5 delta +2).
-    ("test.regular_crates", 1951),
+    // And detcore-model's five schedule::sched_event_tests (the stopless mark's
+    // JSON, binary encoding, Debug form, RIP refusal and same_operations): 1973 + 5 = 1978.
+    // Rebased onto main ffe313b16: 1944 + 5 = 1949.
+    // Rebased onto main fbf9d5f0c: 1946 + 5 = 1951.
+    // Rebased onto main c1f3085da: 1950 + 5 = 1955.
+    // Rebased onto main fcd62385f: 1951 + 5 = 1956.
+    ("test.regular_crates", 1956),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1975,7 +1981,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The split retains nine additional core identities: 1335 + 9 = 1344.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 1212 + 1 = 1213 (Train 5 delta +1).
-    ("test.hermit_unit", 1221),
+    // Composed source count; re-measure with the compiled inventory.
+    // Batch 1 (PRs 4539/4677/4561/4707) adds two hermit-run units:
+    // 1344 + 2 = 1346, from the batch1 validate at 9baea420 carried
+    // through the split rebase.
+    // And schedule_search::tests::schedules_align_however_their_slice_ends_were_taken: 1335 + 1 = 1336.
+    // Rebased onto main e8e0f9a1c: 1348 + 1 = 1349.
+    // Rebased onto main ffe313b16: 1212 + 1 = 1213.
+    // Rebased onto main fbf9d5f0c: 1213 + 1 = 1214.
+    // Rebased onto main c1f3085da: 1221 + 1 = 1222.
+    ("test.hermit_unit", 1222),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3256,7 +3271,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 216dbc929a full validate.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 3395 + 44 = 3439 (Train 5 delta +44).
-    ("test.detcore_unit", 3465),
+    // And the three replayer::tests units of recorded stopless slice ends: 3384 + 3 = 3387.
+    // Rebased onto main e8e0f9a1c: 3386 + 3 = 3389.
+    // Rebased onto main ffe313b16: 3395 + 3 = 3398.
+    // Rebased onto main fbf9d5f0c: 3439 + 3 = 3442.
+    // Rebased onto main c1f3085da: 3464 + 3 = 3467.
+    // Rebased onto main fcd62385f: 3465 + 3 = 3468.
+    ("test.detcore_unit", 3468),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4774,7 +4795,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 2026-10-17 test audit deleted
     // itimer_syscall_heavy_timer_delivers_each_5_ms_period, the 2 ms case's
     // function, guest and bound at a second period in the same regime: 36.
-    ("test.pmu_integration_cases", 41),
+    // And the two deadline_slice_cap cases of recorded and replayed slice ends
+    // taken without a stop (a_recording_keeps_lone_slice_ends_and_marks_them,
+    // replays_take_recorded_lone_slice_ends_the_same_way): 43.
+    ("test.pmu_integration_cases", 43),
     // And signal_determinism's
     // ptrace_delivery_check_approves_a_signal_to_a_thread_in_user_code: its
     // spinning guest takes the signal only at a PMU timer preemption (A5 step
@@ -5270,7 +5294,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a): 1957 + 2 = 1959 (1973 - 14).
     // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
-    ("test.regular_crates_on_host", 1937),
+    // And the same five units of https://github.com/rrnewton/hermit/pull/4728
+    // as the second entry below: 1959 + 5 = 1964.
+    // Rebased onto main ffe313b16: 1930 + 5 = 1935.
+    // Rebased onto main fbf9d5f0c: 1932 + 5 = 1937.
+    // Rebased onto main c1f3085da: 1936 + 5 = 1941.
+    // Rebased onto main fcd62385f: 1937 + 5 = 1942.
+    ("test.regular_crates_on_host", 1942),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5814,7 +5844,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
     // Train 5 recount (same growth as test.detcore_unit), composed on measured main: 3395 + 44 = 3439.
-    ("test.detcore_unit_on_host", 3465),
+    // And the same three replayer units: 3384 + 3 = 3387.
+    // Rebased onto main e8e0f9a1c: 3386 + 3 = 3389.
+    // Rebased onto main ffe313b16: 3395 + 3 = 3398.
+    // Rebased onto main fbf9d5f0c: 3439 + 3 = 3442.
+    // Rebased onto main c1f3085da: 3464 + 3 = 3467.
+    // Rebased onto main fcd62385f: 3465 + 3 = 3468.
+    ("test.detcore_unit_on_host", 3468),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6232,7 +6268,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in the hosted CPUID-faulting skip set): 1327 + 2 = 1329.
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
-    ("test.hermit_unit_on_host", 1215),
+    // Composed source count; re-measure with the compiled inventory.
+    // Batch 1 recount (same growth as test.hermit_unit): 1338 + 2 = 1340.
+    // And the same schedule_search alignment test: 1329 + 1 = 1330.
+    // Rebased onto main e8e0f9a1c: 1342 + 1 = 1343.
+    // Rebased onto main ffe313b16: 1206 + 1 = 1207.
+    // Rebased onto main fbf9d5f0c: 1207 + 1 = 1208.
+    // Rebased onto main c1f3085da: 1215 + 1 = 1216.
+    ("test.hermit_unit_on_host", 1216),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6471,7 +6514,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two added units as the local selection (1973 measured at
     // 85b8cec25a), none hosted-excluded: 1957 + 2 = 1959 (1973 - 14).
     // Train 5 recount (same growth as test.regular_crates), composed on measured main: 1930 + 2 = 1932.
-    ("test.regular_crates_on_host", 1937),
+    // And the same five schedule::sched_event_tests: 1959 + 5 = 1964.
+    // Rebased onto main ffe313b16: 1930 + 5 = 1935.
+    // Rebased onto main fbf9d5f0c: 1932 + 5 = 1937.
+    // Rebased onto main c1f3085da: 1936 + 5 = 1941.
+    // Rebased onto main fcd62385f: 1937 + 5 = 1942.
+    ("test.regular_crates_on_host", 1942),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
