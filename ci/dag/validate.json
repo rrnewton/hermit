@@ -3317,6 +3317,41 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/inotify-faults-and-received",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-faults-and-received",
+          "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-faults-and-received",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-faults-and-received",
+          "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-faults-and-received",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/inotify-rename-cookies",
           "mode": "verify",
           "backend": "dbt"
@@ -24550,7 +24585,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "2622",
+        "NEXTEST_EXPECTED_EXECUTED": "2624",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -27973,6 +28008,13 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/inline-syscall-sites",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-faults-and-received",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -33692,6 +33734,20 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/inline-syscall-sites",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-faults-and-received",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-faults-and-received",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -48286,7 +48342,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "2622",
+        "NEXTEST_EXPECTED_EXECUTED": "2624",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -51389,6 +51445,41 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/inline-syscall-sites",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-faults-and-received",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-faults-and-received",
+          "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-faults-and-received",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-faults-and-received",
+          "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-faults-and-received",
           "mode": "verify",
           "backend": "ptrace"
         },
