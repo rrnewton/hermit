@@ -3068,7 +3068,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (replay stack positions and the unguided-child warning): 2745, listed.
     // And scheduler::test::a_replay_resuming_a_sleeper_moves_time_to_its_deadline
     // (a replay wakes a sleeper where its recording did): 2746, listed.
-    ("test.detcore_unit", 2746),
+    // And preemptions::tests::poll_skips_are_recorded_after_their_events_and_version_the_record
+    // and replayer::tests::a_recorded_poll_skip_is_the_next_decision_after_the_events_it_follows: 2748.
+    ("test.detcore_unit", 2748),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4351,7 +4353,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests: 632 + 2 = 634.
     // And in_guest_runtime_survives_a_guest_dup2_onto_each_of_its_descriptors
     // (https://github.com/rrnewton/hermit/issues/4689): 645.
-    ("test.cli", 654),
+    // And a_schedule_replay_takes_a_pollers_skipped_turns_where_its_recording_did: 655.
+    ("test.cli", 655),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4883,7 +4886,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 551 + 2 = 553.
     // And the same in-guest dup2-onto-runtime-descriptors test, not excluded:
     // 564.
-    ("test.cli_on_host", 573),
+    // And the same poll-skip replay test: 574.
+    ("test.cli_on_host", 574),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5352,7 +5356,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three schedule-replay units: 2741, listed.
     // And the same four replay-diagnostics units: 2745, listed.
     // And the same recorded-wake unit: 2746, listed.
-    ("test.detcore_unit_on_host", 2746),
+    // And the same two poll-skip units: 2748.
+    ("test.detcore_unit_on_host", 2748),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

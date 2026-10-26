@@ -7,6 +7,7 @@
  */
 
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::ops::Add;
 
 use detcore_model::collections::ReplayCursor;
@@ -48,6 +49,12 @@ pub struct Replayer {
     /// The traced index of the first event observed after the schedule ran
     /// out.
     exhausted_from: Option<u64>,
+    /// The recorded poll skips not yet due, by how many events they follow
+    /// (`crate::preemptions::PollSkip`).
+    poll_skips: BTreeMap<u64, VecDeque<DetTid>>,
+    /// The recorded poll skips due now, in order: those after the events
+    /// consumed so far, until the scheduler takes them (`take_poll_skip`).
+    pending_skips: VecDeque<DetTid>,
 }
 
 /// The count of desyncs for a particular thread.
@@ -213,6 +220,46 @@ impl Replayer {
             replay_exhausted_panic: false,
             traced_event_count: 0,
             events_popped: 0,
+            poll_skips: BTreeMap::new(),
+            pending_skips: VecDeque::new(),
+        }
+    }
+
+    /// The same replayer, with the poll skips its record holds
+    /// (`crate::preemptions::PollSkip`): each becomes due once the events it
+    /// follows are consumed.
+    pub fn with_poll_skips(mut self, skips: &[crate::preemptions::PollSkip]) -> Self {
+        for skip in skips {
+            self.poll_skips
+                .entry(skip.after)
+                .or_default()
+                .push_back(skip.thread);
+        }
+        self.queue_poll_skips();
+        self
+    }
+
+    /// Make the poll skips recorded after the events consumed so far due.
+    fn queue_poll_skips(&mut self) {
+        if let Some(threads) = self.poll_skips.remove(&self.events_popped) {
+            self.pending_skips.extend(threads);
+        }
+    }
+
+    /// The thread the recording skipped next as a poller, if a recorded skip
+    /// is due: the schedule's next decision, before its next event.
+    pub(super) fn pending_poll_skip(&self) -> Option<DetTid> {
+        self.pending_skips.front().copied()
+    }
+
+    /// The scheduler skipped the polling thread `tid`. Whether that was the
+    /// recorded skip due next, which it then retires.
+    pub(super) fn take_poll_skip(&mut self, tid: DetTid) -> bool {
+        if self.pending_skips.front() == Some(&tid) {
+            self.pending_skips.pop_front();
+            true
+        } else {
+            false
         }
     }
 
@@ -262,7 +309,9 @@ impl Replayer {
     fn pop_next(&mut self) -> Option<SchedEvent> {
         self.events_popped += 1;
         self.last_consumed = Some(self.schedule_len - self.cursor.len() as u64);
-        self.cursor.next()
+        let next = self.cursor.next();
+        self.queue_poll_skips();
+        next
     }
 
     /// The schedule position of the event just observed (at traced index
@@ -289,7 +338,14 @@ impl Replayer {
     /// The next task and its relative duration, without consuming a replay
     /// event. A successful exec can replace that task's scheduler registration
     /// after its prehook already selected it as the replay foreground task.
+    ///
+    /// A recorded poll skip due now comes first: the recording took it before
+    /// its next event, and the skipped thread runs no guest code, so it has no
+    /// slice length.
     pub(super) fn next_resume(&self) -> Option<(DetTid, Option<LogicalTime>)> {
+        if let Some(tid) = self.pending_poll_skip() {
+            return Some((tid, None));
+        }
         self.cursor
             .peek()
             .map(|next| (next.dettid, self.resolve_time_to_run(next)))
@@ -334,6 +390,16 @@ impl Replayer {
         let current_ix = self.traced_event_count;
         self.traced_event_count += 1;
         self.last_consumed = None;
+        // The recording took its due poll skips before this event. A skip
+        // still due was not taken, because the replay has left its recording
+        // (its thread is not polling here), and it will not be.
+        if !self.pending_skips.is_empty() {
+            info!(
+                "[detcore, dtid {}] the recorded poll skips of {:?} before event #{} were not taken",
+                mytid, self.pending_skips, current_ix
+            );
+            self.pending_skips.clear();
+        }
         if self.cursor.is_empty() && self.exhausted_from.is_none() {
             self.exhausted_from = Some(current_ix);
         }
@@ -497,9 +563,17 @@ impl Replayer {
             let time = observed.end_time.expect("timestamps required for now");
             let is_prehook = matches!(observed.op, Op::Syscall(_, SyscallPhase::Prehook));
 
-            let next_tid = next_ev.dettid;
+            // A recorded poll skip due now is the schedule's next decision: its
+            // thread runs next only to be skipped (`take_poll_skip`), so the
+            // next event's slice length waits until then.
+            let pending_skip = self.pending_poll_skip();
+            let next_tid = pending_skip.unwrap_or(next_ev.dettid);
             // Checking for an optional timeslice in case of RCB
-            let timeslice = self.resolve_time_to_run(next_ev);
+            let timeslice = if pending_skip.is_some() {
+                None
+            } else {
+                self.resolve_time_to_run(next_ev)
+            };
 
             if next_tid != observed.dettid {
                 if is_prehook {
@@ -861,6 +935,46 @@ mod tests {
             replayer.observe_event(&schedule[0]),
             ReplayAction::ContextSwitch(true, tid(3), None)
         );
+    }
+
+    /// A recorded poll skip is the schedule's next decision once the events it
+    /// follows are consumed: the replay hands the turn to the skipped thread,
+    /// with no slice length, until the scheduler takes the skip, and then to
+    /// the next event's thread. A skip of the thread that just ran keeps it
+    /// running, since its next attempt blocks it. A skip still due when the
+    /// next event arrives was not taken, and is dropped.
+    #[test]
+    fn a_recorded_poll_skip_is_the_next_decision_after_the_events_it_follows() {
+        use crate::preemptions::PollSkip;
+        let mut b = builder::SchedTestBuilder::new();
+        let schedule = vec![
+            b.syscall_post(Sysno::read, SOME_RIP, tid(3)),
+            b.syscall_post(Sysno::write, SOME_RIP, tid(5)),
+            b.syscall_post(Sysno::write, SOME_RIP, tid(5)),
+        ];
+        let skip = |after, raw| PollSkip {
+            after,
+            thread: tid(raw),
+        };
+        let mut replayer =
+            Replayer::new(schedule.clone()).with_poll_skips(&[skip(1, 7), skip(2, 5), skip(2, 9)]);
+        assert_eq!(replayer.pending_poll_skip(), None);
+        assert_eq!(
+            replayer.observe_event(&schedule[0]),
+            ReplayAction::ContextSwitch(true, tid(7), None)
+        );
+        assert_eq!(replayer.next_resume(), Some((tid(7), None)));
+        assert!(!replayer.take_poll_skip(tid(5)));
+        assert!(replayer.take_poll_skip(tid(7)));
+        assert_eq!(replayer.next_resume().map(|(next, _)| next), Some(tid(5)));
+        assert_eq!(
+            replayer.observe_event(&schedule[1]),
+            ReplayAction::Continue(None)
+        );
+        assert!(replayer.take_poll_skip(tid(5)));
+        assert_eq!(replayer.pending_poll_skip(), Some(tid(9)));
+        let _ = replayer.observe_event(&schedule[2]);
+        assert_eq!(replayer.pending_poll_skip(), None);
     }
 
     #[test]

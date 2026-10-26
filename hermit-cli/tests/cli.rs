@@ -129,6 +129,7 @@ use hermit::canonical_verdict::InfrastructureError;
 use hermit::canonical_verdict::Verdict;
 use hermit::canonical_verdict::VerificationReport;
 
+static PIPE_READER_REPLAY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_EXECVEAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -791,6 +792,32 @@ fn exec_clock_continuity_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "exec-clock-continuity guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn pipe_reader_replay_guest() -> &'static Path {
+    PIPE_READER_REPLAY_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("pipe-reader-replay");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create pipe-reader-replay guest directory");
+        let guest = build_root.join("pipe_reader_replay");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/pipe_reader_replay.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile pipe-reader-replay guest");
+        assert!(
+            output.status.success(),
+            "pipe-reader-replay guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -17397,6 +17424,58 @@ fn run_ptrace_virtual_clock_advances_across_execve() {
     let output = hermit(&args);
     assert_success(&output, &args);
     assert_eq!(stdout(&output), "exec-clock-continuity-ok\n");
+}
+
+/// A recording notes each turn the scheduler gave a polling thread only to
+/// skip it, and a schedule replay takes those skips where its recording did.
+/// The guest's pipe reader retries as a poller; seeds 1, 5, 6 and 7, recorded
+/// under `--chaos`, each skip it right after a failed attempt and before a
+/// writer runs. Each record must hold its skips, as format 2, and each replay
+/// must print the recording's line with no desync. This guest replays
+/// faithfully without the skips too: the replay takes such a skip one pass
+/// late, which here moves nothing. The test pins the record and the replay of
+/// skips, whose loss desynced replays of programs where that pass moved the
+/// clock.
+#[test]
+fn a_schedule_replay_takes_a_pollers_skipped_turns_where_its_recording_did() {
+    let program = pipe_reader_replay_guest()
+        .to_str()
+        .expect("pipe-reader-replay guest path should be UTF-8");
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for seed in [1, 5, 6, 7] {
+        let record = dir.path().join(format!("seed-{seed}.json"));
+        let summary = dir.path().join(format!("seed-{seed}.summary.json"));
+        let seed_arg = format!("--seed={seed}");
+        let record_arg = format!("--record-preemptions-to={}", record.display());
+        let replay_arg = format!("--replay-schedule-from={}", record.display());
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let run = |extra: &[&str]| {
+            let mut args = vec!["run", "--strict", "--epoch=2026-01-01T00:00:00Z"];
+            args.extend_from_slice(extra);
+            args.extend(["--", program]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            stdout(&output)
+        };
+        let recorded = run(&["--chaos", seed_arg.as_str(), record_arg.as_str()]);
+        let record_json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+        assert!(
+            record_json["poll_skips"]
+                .as_array()
+                .is_some_and(|skips| !skips.is_empty()),
+            "seed {seed}: no poll skip recorded"
+        );
+        assert_eq!(record_json["format_version"], 2, "seed {seed}");
+        assert_eq!(
+            run(&[replay_arg.as_str(), summary_arg.as_str()]),
+            recorded,
+            "seed {seed}"
+        );
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+        assert_eq!(summary["schedevent_desynced"], 0, "seed {seed}: {summary}");
+    }
 }
 
 /// The same exec-boundary clock trajectory must also be reproducible, so the

@@ -4266,6 +4266,7 @@ impl Scheduler {
                             .iter()
                             .map(|(tid, points)| (*tid, points.clone().into()))
                             .collect();
+                        let poll_skips = record.poll_skips().to_vec();
                         let vec = record.into_global();
                         trace!("Trace loaded, length {}", vec.len());
                         // Indices are schedule positions (`Replayer::stacktrace_position`),
@@ -4277,7 +4278,7 @@ impl Scheduler {
                             .iter()
                             .map(|(ix, path)| (*ix, None, path.clone()))
                             .collect();
-                        let mut replayer = Replayer::new(vec);
+                        let mut replayer = Replayer::new(vec).with_poll_skips(&poll_skips);
                         replayer.replay_exhausted_panic = cfg.replay_exhausted_panic;
                         replayer.die_on_desync = cfg.die_on_desync;
                         (Some(replayer), Some(toprint))
@@ -14125,6 +14126,35 @@ impl Scheduler {
         Err(SkipTurn)
     }
 
+    /// The scheduler just skipped the polling thread `dettid`
+    /// (`step4_resource_block`). A recording notes the skip after the events
+    /// recorded so far (`PreemptionWriter::insert_poll_skip`). A schedule
+    /// replay retires it if it is the recorded skip due next, and then hands
+    /// the foreground to the thread the schedule runs next, as a context
+    /// switch at an event does (`consume_schedevent`): the recording took the
+    /// skip there, and its next event follows it.
+    fn record_or_replay_poll_skip(&mut self, dettid: DetTid) {
+        if !self.has_schedule_replay()
+            && let Some(writer) = &mut self.preemption_writer
+        {
+            writer.insert_poll_skip(dettid);
+        }
+        let Some(replayer) = self.replayer.as_mut() else {
+            return;
+        };
+        if !replayer.take_poll_skip(dettid) {
+            return;
+        }
+        debug!("[dtid {}] took the recorded poll skip", dettid);
+        if let Some((next_tid, timeslice)) = replayer.next_resume()
+            && next_tid != dettid
+        {
+            self.requeue_with_new_priority(dettid, REPLAY_DEFERRED_PRIORITY);
+            self.requeue_with_new_priority(next_tid, REPLAY_FOREGROUND_PRIORITY);
+            self.timeslices.insert(next_tid, timeslice);
+        }
+    }
+
     /// Simply advance the turn. This does NOT remove any threads from the
     /// runqueue; callers must maintain `run_queue`/`blocking` invariants.
     fn skip_turn(&mut self) -> Result<(), SkipTurn> {
@@ -14247,6 +14277,7 @@ impl Scheduler {
             );
             self.upgrade_polled_to_runnable(dettid, rs); // Indicate the thread gets to run next time
             self.note_poll_deadline(dettid, rs);
+            self.record_or_replay_poll_skip(dettid);
             self.skip_turn()
         } else {
             match rs.resources.len() {
