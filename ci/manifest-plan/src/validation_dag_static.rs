@@ -1167,7 +1167,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/4693): 1846, listed.
     // And detcore-model's eight syscall_histogram::tests units for
     // the per-run syscall histogram (dh-te7ep): 1854, listed.
-    // And +8 from c6a4199e: 1854.
+    // And detcore-model's eight syscall_histogram::tests units for
+    // the per-run syscall histogram (dh-te7ep): 1854, listed.
     ("test.regular_crates", 1854),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
@@ -2936,7 +2937,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the scheduler unit
     // a_thread_directed_child_exit_sigchld_stands_for_the_exit_without_publication
     // (https://github.com/rrnewton/hermit/issues/4710): 2606, listed.
-    // And +5 from c6a4199e: 2611.
+    // And detcore's five syscall_histogram::tests outcome units for
+    // the per-run syscall histogram (dh-te7ep): 2611, listed.
     ("test.detcore_unit", 2611),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
@@ -5119,7 +5121,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two 3c.1e A review round 3 units: 2603, listed.
     // And the same two capability slice 5 units: 2605, listed.
     // And the same issue 4710 scheduler unit: 2606, listed.
-    // And +5 from c6a4199e: 2611.
+    // And the same five syscall_histogram units: 2611, listed.
     ("test.detcore_unit_on_host", 2611),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
@@ -5234,7 +5236,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And two pure declared-Redis input controls in redis_strict: 691, listed.
     // Name the optional e9patch consumer leg separately; all ten legs remain (+1): 692.
     // And the same two-run syscall-histogram test: 693, listed.
-    // And +1 from c6a4199e: 693.
+    // And the same two-run syscall-histogram test: 693, listed.
     ("test.hermit_integration_on_host", 693),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
@@ -5667,7 +5669,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same HERMIT_CPU_PROFILE detcore-model test (848214c0): 1831, listed.
     // And the same ld.so.cache-sharing runner test: 1832, listed.
     // And the same eight syscall_histogram units: 1840, listed.
-    // And +8 from c6a4199e: 1840.
+    // And the same eight syscall_histogram units: 1840, listed.
     ("test.regular_crates_on_host", 1840),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
