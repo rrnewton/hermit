@@ -29,9 +29,13 @@ Both classes above stage in place (HERMIT_BUCK_STAGE_REPRODUCIBLE=0): the check 
 builds are the same code under reproducible staging, which only re-runs stage from a
 copy. StageReproducibleTest covers that wrapper, with the same fake cargo. The builds
 run in the fixed directory's copy of the checkout, with CARGO_HOME reached through the
-fixed directory's symlink and SOURCE_DATE_EPOCH at HEAD's commit time, and the copy, the
-symlink and the holder note are removed afterwards; a failed build keeps the previous
-staging and returns its status; a stage that cannot take the lock within
+fixed directory's symlink and SOURCE_DATE_EPOCH at HEAD's commit time; the symlink and
+the holder note are removed afterwards, and the copy and its target are kept for the next
+stage, which refreshes the copy by content (an unchanged file keeps its time, a changed
+or new file is written anew, a removed one goes) unless the copy is older than
+HERMIT_BUCK_STAGE_MAX_AGE_SECONDS or larger than HERMIT_BUCK_STAGE_MAX_BYTES, when it is
+wiped and the stage is cold; a failed build keeps the previous staging and returns its
+status; a stage that cannot take the lock within
 HERMIT_BUCK_STAGE_LOCK_TIMEOUT fails naming the holder, runs no build and leaves the
 holder's note alone; a missing host package is refused before the lock; and an
 uncommitted change is refused even when the copy cannot read a submodule whose .git file
@@ -46,6 +50,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -57,7 +62,7 @@ LIBS = ("libunwind.so.8", "libunwind-x86_64.so.8")
 # Commands stage runs on its way to the check and just after it.
 HOST_COMMANDS = ("dirname", "realpath", "rm", "mkdir", "git", "cp", "python3", "du", "cut", "cat")
 # And the reproducible-staging wrapper's own.
-WRAPPER_COMMANDS = ("flock", "ln", "date")
+WRAPPER_COMMANDS = ("flock", "ln", "date", "rsync", "stat")
 DOC = '(docs/BUCK2_OSS.md, "Host prerequisites for Buck validation")'
 
 
@@ -574,9 +579,62 @@ class StageReproducibleTest(unittest.TestCase):
                               text=True, timeout=60)
 
     def assert_cleaned_up_and_previous_staging_kept(self, proc: subprocess.CompletedProcess) -> None:
-        for leftover in (self.fixed / "src", self.fixed / "cargo", Path(f"{self.fixed}.holder")):
+        # The copy and its target stay for the next stage (warm staging); the
+        # CARGO_HOME symlink and the holder note do not.
+        for leftover in (self.fixed / "cargo", Path(f"{self.fixed}.holder")):
             self.assertFalse(leftover.exists() or leftover.is_symlink(), f"{leftover} left behind: {proc.stderr}")
+        self.assertTrue((self.fixed / "src" / ".stage-born").is_file(), proc.stderr)
         self.assertEqual(self.sentinel.read_text(), "previous staging\n", proc.stderr)
+
+    def commit_tree(self, message: str) -> None:
+        git = ["git", "-C", str(self.tree), "-c", "user.email=t@example.invalid", "-c", "user.name=t",
+               "-c", "commit.gpgsign=false"]
+        subprocess.run(git + ["add", "-A"], check=True)
+        subprocess.run(git + ["commit", "-qm", message], check=True)
+
+    def test_a_later_stage_refreshes_the_kept_copy_by_content_and_keeps_its_target(self) -> None:
+        for name in ("keep.txt", "change.txt", "gone.txt"):
+            (self.tree / name).write_text(f"{name} 1\n")
+        self.commit_tree("files")
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        src = self.fixed / "src"
+        # As the earlier stage left them: copied long ago, and a build output.
+        for name in ("keep.txt", "change.txt"):
+            os.utime(src / name, (1000, 1000))
+        (src / "target").mkdir(exist_ok=True)
+        (src / "target" / "built").write_text("object\n")
+        (self.tree / "change.txt").write_text("change.txt 2\n")
+        (self.tree / "gone.txt").unlink()
+        (self.tree / "new.txt").write_text("new.txt 1\n")
+        self.commit_tree("change")
+        before = time.time() - 1
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertEqual((src / "keep.txt").stat().st_mtime, 1000, "an unchanged file was rewritten")
+        self.assertEqual((src / "change.txt").read_text(), "change.txt 2\n")
+        # Written now, newer than any build, whatever the checkout's own time.
+        self.assertGreaterEqual((src / "change.txt").stat().st_mtime, before)
+        self.assertGreaterEqual((src / "new.txt").stat().st_mtime, before)
+        self.assertFalse((src / "gone.txt").exists())
+        self.assertEqual((src / "target" / "built").read_text(), "object\n")
+        self.assertNotIn("this stage is cold", proc.stderr)
+
+    def test_an_old_or_large_kept_copy_is_wiped_and_that_stage_is_cold(self) -> None:
+        for bound, value in (("HERMIT_BUCK_STAGE_MAX_AGE_SECONDS", "86400"), ("HERMIT_BUCK_STAGE_MAX_BYTES", "1")):
+            proc = self.run_stage(FAKE_CARGO_FAIL="release")
+            self.assertEqual(proc.returncode, 3, proc.stderr)
+            src = self.fixed / "src"
+            (src / "target").mkdir(exist_ok=True)
+            (src / "target" / "built").write_text("object\n")
+            if bound == "HERMIT_BUCK_STAGE_MAX_AGE_SECONDS":
+                old = time.time() - 2 * 86400
+                os.utime(src / ".stage-born", (old, old))
+            proc = self.run_stage(FAKE_CARGO_FAIL="release", **{bound: value})
+            self.assertEqual(proc.returncode, 3, proc.stderr)
+            self.assertIn("this stage is cold", proc.stderr, bound)
+            self.assertFalse((src / "target" / "built").exists(), bound)
+            self.assertTrue((src / ".stage-born").is_file(), bound)
 
     def test_builds_run_in_the_fixed_copy_with_a_fixed_cargo_home_and_epoch(self) -> None:
         proc = self.run_stage(FAKE_CARGO_FAIL="detcore-dbt+detcore-dbt-cdylib",
