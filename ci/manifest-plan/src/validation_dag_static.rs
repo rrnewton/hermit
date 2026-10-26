@@ -3262,7 +3262,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 216dbc929a full validate.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 3395 + 44 = 3439 (Train 5 delta +44).
-    ("test.detcore_unit", 3465),
+    // And skid overshoots counted as events: skid_overshoots::tests' six
+    // units (one_event_reported_by_both_sites_counts_once,
+    // a_detection_by_one_site_counts_once, two_events_count_twice,
+    // reverie_reports_without_a_detail_take_up_unmatched_detcore_reports,
+    // inconsistent_inputs_never_lose_every_event,
+    // detcore_keeps_a_bounded_number_of_reports) and rcb_overshoot_tests'
+    // three (both_sites_reporting_one_event_count_one_event,
+    // a_detection_only_detcore_made_counts_one_event,
+    // two_events_reported_by_both_sites_count_two_events): 3465 + 9 = 3474, listed.
+    ("test.detcore_unit", 3474),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5823,7 +5832,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
     // Train 5 recount (same growth as test.detcore_unit), composed on measured main: 3395 + 44 = 3439.
-    ("test.detcore_unit_on_host", 3465),
+    // And the same nine skid-overshoot event units: 3465 + 9 = 3474, listed.
+    ("test.detcore_unit_on_host", 3474),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
