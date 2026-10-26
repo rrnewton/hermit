@@ -12489,7 +12489,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             if guest.config().notice_host_network_abstract_binds {
                 let mut name = [0u8; UNIX_AUTOBIND_NAME_LEN - 1];
                 for (byte, source) in name.iter_mut().zip(&autobind_address.sun_path[1..]) {
-                    *byte = *source as u8;
+                    // `c_char` is `i8` on x86_64 and `u8` on aarch64; take its bits.
+                    [*byte] = source.to_ne_bytes();
                 }
                 notice_host_network_abstract_bind(&name, &result);
             }
