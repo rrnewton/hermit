@@ -2692,7 +2692,17 @@ fi
 # so the inventory, SDK and native inputs, calibrated budget, job width and
 # limits carry unchanged from the b9eee018 entry. The reverie-dbt Rust changes
 # remain build-relevant and need fresh validation.
-expected_pin=4fc34896de8740dd5e28667ed99b9e8f96d128be
+# CARRY TO 1d6df11f748837bfb3342b7106fefb55e4e1c4b9 (2026-10-26):
+# Caller-owned DBT environment privacy (dh-aenmc) lets DBT callers select private environment inputs; Rust-only. Rebased onto 4fc34896; the interval adds no reverie-dbt file
+# (inventory 1009) and leaves the root Cargo.toml, Cargo.lock,
+# rust-toolchain.toml and third-party/ unchanged; both repository inputs to the
+# DynamoRIO content key are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory, SDK and native inputs, calibrated budget, job width and
+# limits carry unchanged from the 4fc34896 entry. The reverie-dbt Rust changes
+# remain build-relevant and need fresh validation.
+expected_pin=1d6df11f748837bfb3342b7106fefb55e4e1c4b9
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

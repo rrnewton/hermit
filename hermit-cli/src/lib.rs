@@ -4137,6 +4137,7 @@ async fn run_dbt(
                 client.display()
             )
         })?
+        .private_environment_prefix(detcore_dbt::PRIVATE_ENV_PREFIX)?
         .summary(print_summary)
         .isolated_process_group(panic_on_unsupported_syscalls)
         .tool_answers_brk(true)
@@ -9558,6 +9559,61 @@ mod tests {
                 .contains("dbt backend requires sequentialized threads"),
             "unexpected error: {error}"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn dbt_library_environment_privacy_is_caller_selected() {
+        #[cfg(not(feature = "dbt"))]
+        {
+            assert!(
+                std::env::var_os("HERMIT_REQUIRE_DBT").is_none(),
+                "HERMIT_REQUIRE_DBT is set, but this test binary was built WITHOUT \
+                 the `dbt` feature; rebuild with --features dbt to exercise the \
+                 library's environment-privacy policy",
+            );
+            eprintln!(
+                "skipping dbt_library_environment_privacy_is_caller_selected: \
+                 built without the `dbt` feature",
+            );
+        }
+        #[cfg(feature = "dbt")]
+        {
+            let mut command = super::Command::new("/usr/bin/env");
+            command
+                .env_clear()
+                .env("HERMIT_DBT_PRIVACY_SENTINEL", "known")
+                .env("HERMIT_APP_VISIBLE", "known");
+            let mut config = env_free_detconfig("--epoch=2026-01-01T00:00:00Z", "--seed=0");
+            config.sequentialize_threads = true;
+            config.deterministic_io = true;
+            config.panic_on_unsupported_syscalls = true;
+            config.validate();
+            let config = super::prepare_backend_config(config, Backend::Dbt);
+            let output = super::run_dbt(command, config, false, true)
+                .await
+                .expect("run /usr/bin/env through the real DBT library constructor");
+            assert_eq!(
+                output.status,
+                super::ExitStatus::Exited(0),
+                "guest did not exit 0.\n--- guest stderr ---\n{}\n--- guest stdout ---\n{}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout),
+            );
+            let printed = String::from_utf8(output.stdout).expect("synthetic environment is UTF-8");
+            assert_eq!(
+                printed
+                    .lines()
+                    .filter(|line| *line == "HERMIT_APP_VISIBLE=known")
+                    .count(),
+                1,
+                "public sentinel missing or duplicated: {printed}",
+            );
+            assert!(
+                !printed.contains("HERMIT_DBT_PRIVACY_SENTINEL="),
+                "Hermit private environment sentinel leaked to guest: {printed}",
+            );
+            assert_eq!(printed, "HERMIT_APP_VISIBLE=known\n");
+        }
     }
 
     #[test]

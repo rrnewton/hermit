@@ -1018,6 +1018,7 @@ impl DbtInvocation {
                     client.display()
                 ))
             })?
+            .private_environment_prefix(detcore_dbt::PRIVATE_ENV_PREFIX)?
             .summary(options.summary)
             .isolated_process_group(panic_on_unsupported_syscalls)
             .tool_answers_brk(true)

@@ -156,6 +156,8 @@ fn run_with_containment(
     eprintln!("mapping capture native diagnostics: {}", path.display());
     let mut runner = DbtRunner::new(&drrun, &client)
         .expect("normal DBT runner")
+        .private_environment_prefix(detcore_dbt::PRIVATE_ENV_PREFIX)
+        .expect("valid Hermit environment prefix")
         .isolated_process_group(isolated)
         .terminate_process_group_on_exit(terminate)
         .tool_answers_brk(true)

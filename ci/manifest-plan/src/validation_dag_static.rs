@@ -1804,7 +1804,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_misspelled_holder_option_is_refused_not_run: 1102, listed.
     // Caller-owned DBT evidence validation (dh-pp7q9): one production-configuration refusal unit,
     // measured with the existing selection and exclusions unchanged.
-    ("test.hermit_unit", 1103),
+    // Caller-selected DBT environment privacy adds one library regression,
+    // listed with the existing feature selection and exclusions unchanged.
+    ("test.hermit_unit", 1104),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4183,7 +4185,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // /proc status descriptor in an in-guest process or its fork child): 610.
     // And verify_inputs::a_verify_run_binds_the_ld_so_cache_its_holder_sealed
     // (https://github.com/rrnewton/hermit/issues/4693): 611.
-    ("test.cli", 611),
+    // Caller-selected DBT environment privacy adds one CLI regression,
+    // listed with the existing feature selection and exclusions unchanged.
+    ("test.cli", 612),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4687,7 +4691,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And signal_state_reads_leave_no_status_descriptor_in_the_guest (no
     // /proc status descriptor in an in-guest process or its fork child): 529.
     // And the same ld.so.cache holder test, not excluded: 530.
-    ("test.cli_on_host", 530),
+    // Caller-selected DBT environment privacy adds one CLI regression,
+    // listed with the existing feature selection and exclusions unchanged.
+    ("test.cli_on_host", 531),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5486,7 +5492,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same seven ld.so.cache-sharing units: 1102, listed.
     // Caller-owned DBT evidence validation (dh-pp7q9): one production-configuration refusal unit,
     // measured with the existing selection and exclusions unchanged.
-    ("test.hermit_unit_on_host", 1103),
+    // Caller-selected DBT environment privacy adds one library regression,
+    // listed with the existing feature selection and exclusions unchanged.
+    ("test.hermit_unit_on_host", 1104),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

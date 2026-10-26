@@ -12104,6 +12104,46 @@ fn run_dbt_guest_sees_ptraces_environment_before_and_after_exec() {
     assert_eq!(dbt, ptrace);
 }
 
+#[test]
+fn run_dbt_uses_explicit_environment_privacy() {
+    if dbt_unavailable("run_dbt_uses_explicit_environment_privacy") {
+        return;
+    }
+    let guest = dbt_guest_environment_guest()
+        .to_str()
+        .expect("DBT guest-environment guest path should be UTF-8");
+    let args = [
+        "--backend",
+        "dbt",
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--env=HERMIT_DBT_PRIVACY_SENTINEL=known",
+        "--env=HERMIT_APP_VISIBLE=known",
+        "--",
+        guest,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    let printed = String::from_utf8(output.stdout)
+        .expect("the fixed environment fixture must emit valid UTF-8");
+    for image in ["parent", "child"] {
+        for view in ["env", "procenv"] {
+            let expected = format!("{image} {view} HERMIT_APP_VISIBLE=known");
+            assert_eq!(
+                printed.lines().filter(|line| *line == expected).count(),
+                1,
+                "public sentinel missing or duplicated in {image} {view}:\n{printed}",
+            );
+        }
+    }
+    assert!(
+        !printed.contains("HERMIT_DBT_PRIVACY_SENTINEL="),
+        "Hermit private environment sentinel leaked to guest:\n{printed}",
+    );
+}
+
 /// Hermit's configuration is not in a DBT guest's environment. DynamoRIO
 /// erases the runtime's private variables to NULs before each image it follows
 /// runs, and passes them on to the next, but the kernel's range for
