@@ -1411,7 +1411,9 @@ pub struct RunOpts {
     /// Run syscall interception directly on the host without creating Linux namespaces or
     /// mounting an isolated `/tmp`. This is not a sandbox and must only be used with trusted
     /// guests. Host process, filesystem, and network state are shared, reducing determinism.
-    /// Schedule and preemption replay require stable namespace PIDs and are not supported.
+    /// A recorded schedule or preemption record replays only where Hermit chose the guest's
+    /// IDs, both when recording and when replaying: the replay takes the record's base (see
+    /// `--pid-base`) and is refused if it cannot have those IDs.
     ///
     /// Where Hermit may choose process IDs (as root, with CAP_CHECKPOINT_RESTORE or
     /// CAP_SYS_ADMIN over the host's PID namespace), the guest's IDs do not come from the host:
@@ -1436,9 +1438,7 @@ pub struct RunOpts {
             "network",
             "tmp",
             "namespace_only",
-            "analyze_networking",
-            "replay_schedule_from",
-            "replay_preemptions_from"
+            "analyze_networking"
         ]
     )]
     no_namespace: bool,
@@ -1475,6 +1475,9 @@ pub struct RunOpts {
     /// With no window left, the guest gets host IDs and Hermit warns. A guest that creates more
     /// tasks than a window holds goes on into the next window. Needs the ptrace backend with
     /// sequentialized threads.
+    ///
+    /// A replay of a record whose IDs were chosen (`--replay-preemptions-from`,
+    /// `--replay-schedule-from`) takes its base from the record, as if given here.
     ///
     /// For tooling: the same IDs come back in every run from the same base, and a window is free
     /// for the next run as soon as one ends, so a process ID remembered from one run may name a
@@ -2431,6 +2434,66 @@ fn vmm_time_warning_silent_for_non_vmm_programs() {
             vmm_time_virtualization_warning(Path::new(program), &[], true).is_none(),
             "unexpected VMM warning for {program}"
         );
+    }
+}
+
+/// Why a `--no-namespace` replay of a record whose guest numbering is
+/// `recorded` (named by `source`, an option and a path) is refused, when this
+/// run's numbering is `replay` (`None` before it is resolved), if it is. A
+/// replay follows a record only where Hermit chooses the guest's IDs and
+/// numbers them alike: never a record whose IDs came from the host, nor on a
+/// run whose own IDs Hermit does not choose (KVM and DBT number the guest
+/// themselves; without sequentialized threads the host does).
+fn replay_guest_ids_refusal(
+    source: &str,
+    recorded: detcore_model::pid::GuestIds,
+    replay: Option<detcore_model::pid::GuestIds>,
+) -> Option<String> {
+    use detcore_model::pid::GuestIds;
+    match (recorded, replay) {
+        (GuestIds::Host, _) => Some(format!(
+            "{source} was recorded with guest process IDs {recorded}. The record names every \
+             thread by its ID, so no replay can follow it. Record the run again under \
+             --no-namespace with --pid-base or --strict, which refuse a run whose IDs come from \
+             the host"
+        )),
+        (_, None) => None,
+        (_, Some(replay @ (GuestIds::Namespace | GuestIds::Host))) => Some(format!(
+            "{source} cannot be replayed under --no-namespace here: a --no-namespace replay \
+             follows a record only where Hermit chooses the guest's process IDs (the ptrace \
+             backend with sequentialized threads), and this run's would be {replay}"
+        )),
+        (recorded, Some(replay)) => {
+            detcore::preemptions::guest_ids_mismatch(source, recorded, replay)
+        }
+    }
+}
+
+#[test]
+fn no_namespace_replays_follow_only_records_whose_ids_were_chosen_alike() {
+    use detcore_model::pid::GuestIds;
+    let chosen = |base| GuestIds::Chosen {
+        base,
+        refuse_host_ids: true,
+    };
+    let refused = |recorded, replay| replay_guest_ids_refusal("rec", recorded, replay);
+    // A host-numbered record is refused before anything is resolved, and
+    // whatever the replay would be.
+    for replay in [None, Some(GuestIds::Host), Some(chosen(5000))] {
+        let refusal = refused(GuestIds::Host, replay).expect("a host-numbered record");
+        assert!(refusal.contains("no replay can follow it"), "{refusal}");
+    }
+    assert_eq!(refused(chosen(5000), None), None);
+    assert_eq!(refused(chosen(5000), Some(chosen(5000))), None);
+    assert!(refused(chosen(5000), Some(chosen(6000))).is_some());
+    // A namespace (or older) record, under a run whose IDs Hermit chooses.
+    assert!(refused(GuestIds::Namespace, Some(chosen(5000))).is_some());
+    // Runs whose IDs Hermit does not choose follow nothing.
+    for replay in [GuestIds::Namespace, GuestIds::Host] {
+        for recorded in [GuestIds::Namespace, chosen(5000)] {
+            let refusal = refused(recorded, Some(replay)).expect("not chosen here");
+            assert!(refusal.contains("only where Hermit chooses"), "{refusal}");
+        }
     }
 }
 
@@ -9331,10 +9394,30 @@ impl RunOpts {
     /// backend can create a guest's tasks with chosen IDs; another backend
     /// without a PID namespace gives its guest host IDs.
     fn resolve_guest_ids(&mut self) -> Result<(), Error> {
+        // A replay under --no-namespace needs the record's IDs: its base,
+        // required as if given by --pid-base, so that a replay that cannot
+        // have them is refused, naming the record. A record no replay can
+        // follow is refused before anything is reserved or probed.
+        let replayed = self.no_namespace_replayed_guest_ids()?;
+        if let Some((source, recorded)) = &replayed
+            && let Some(refusal) = replay_guest_ids_refusal(source, *recorded, None)
+        {
+            return Err(Error::new(PolicyRefusal).context(refusal));
+        }
+        let required = match (&replayed, self.pid_base) {
+            (_, Some(base)) => Some(super::guest_ids::Required::PidBase(base)),
+            (Some((source, detcore_model::pid::GuestIds::Chosen { base, .. })), None) => {
+                Some(super::guest_ids::Required::Replay {
+                    source,
+                    base: *base,
+                })
+            }
+            _ => None,
+        };
         let backend = self.runtime_backend();
         let (ids, warning) =
             if backend == Backend::Ptrace && self.det_opts.det_config.sequentialize_threads {
-                super::guest_ids::resolve(self.no_namespace, self.pid_base, self.strict)?
+                super::guest_ids::resolve(self.no_namespace, required, self.strict)?
             } else if self.no_namespace
                 && matches!(
                     backend,
@@ -9348,6 +9431,11 @@ impl RunOpts {
             } else {
                 (detcore_model::pid::GuestIds::Namespace, None)
             };
+        if let Some((source, recorded)) = &replayed
+            && let Some(refusal) = replay_guest_ids_refusal(source, *recorded, Some(ids))
+        {
+            return Err(Error::new(PolicyRefusal).context(refusal));
+        }
         if let Some(warning) = warning {
             // Not `eprintln!`, which panics when stderr's reader has gone.
             use std::io::Write as _;
@@ -9355,6 +9443,28 @@ impl RunOpts {
         }
         self.det_opts.det_config.guest_ids = ids;
         Ok(())
+    }
+
+    /// Under `--no-namespace`, the replayed record (`--replay-preemptions-from`
+    /// or `--replay-schedule-from`) and the guest IDs it was recorded with.
+    fn no_namespace_replayed_guest_ids(
+        &self,
+    ) -> Result<Option<(String, detcore_model::pid::GuestIds)>, Error> {
+        if !self.no_namespace {
+            return Ok(None);
+        }
+        let config = &self.det_opts.det_config;
+        let replayed = [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ]
+        .into_iter()
+        .find_map(|(option, path)| Some((option, path.as_ref()?)));
+        let Some((option, path)) = replayed else {
+            return Ok(None);
+        };
+        let recorded = detcore::preemptions::read_recorded_guest_ids(path).map_err(Error::msg)?;
+        Ok(Some((format!("{option} {}", path.display()), recorded)))
     }
 
     fn warn_no_namespace(&self) {

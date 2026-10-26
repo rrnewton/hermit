@@ -1827,7 +1827,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // refuses a DBT runtime built before its coordinator fingerprint check):
     // 1106, listed.
     // And guest_ids' six --pid-base resolution units: 1112, listed.
-    ("test.hermit_unit", 1112),
+    // And the --no-namespace replay units
+    // a_replayed_base_is_required_and_named_by_its_record and
+    // no_namespace_replays_follow_only_records_whose_ids_were_chosen_alike: 1114.
+    ("test.hermit_unit", 1114),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4230,7 +4233,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // no_namespace_reports_its_guest_numbering, no_namespace_refuses_a_taken_chosen_id_only_when_asked,
     // no_namespace_refuses_a_held_pid_base) and
     // no_namespace_concurrent_runs_take_different_windows: 621.
-    ("test.cli", 621),
+    // And no_namespace_preemption_records_replay_under_their_base: 622.
+    ("test.cli", 622),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4741,7 +4745,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two tests split out of the discarded-at-send test, not
     // excluded: 535.
     // And the same five --no-namespace chosen-ID tests, not excluded: 540.
-    ("test.cli_on_host", 540),
+    // And the same --no-namespace replay test: 541.
+    ("test.cli_on_host", 541),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5550,7 +5555,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 3c.1e B's harness unit was reverted with that slice).
     // And the same DBT runtime fingerprint-check unit: 1106, listed.
     // And the same six --pid-base resolution units: 1112.
-    ("test.hermit_unit_on_host", 1112),
+    // And the same two --no-namespace replay units: 1114.
+    ("test.hermit_unit_on_host", 1114),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
