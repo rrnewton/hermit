@@ -1792,7 +1792,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_adopted_ld_so_cache_role_becomes_the_runs_snapshot; and verify_inputs'
     // the_pair_program_follows_the_options_with_or_without_a_separator; and
     // a_misspelled_holder_option_is_refused_not_run: 1102, listed.
-    ("test.hermit_unit", 1102),
+    // And A5 slice 3c.1e B's forced-gate harness (in_guest_delivery_harness):
+    // the_parent_runner_never_forces_the_gate and six forced_gate_* rows:
+    // 1109, listed.
+    ("test.hermit_unit", 1109),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
