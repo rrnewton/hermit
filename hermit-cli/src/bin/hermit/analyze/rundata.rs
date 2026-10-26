@@ -70,15 +70,13 @@ impl RunData {
         tmp_dir.join(self.runname.clone() + "_out")
     }
 
-    #[allow(dead_code)]
+    /// Where analyze writes a preemption record for this run to replay
+    /// ([`Self::with_preempts_in`]): the workspace, under the run's name.
+    /// Never a path from the run arguments: a `--replay-preemptions-from`
+    /// there names the user's own record, which a trial must not overwrite.
     pub fn preempts_path_in(&mut self) -> &Path {
         if self.preempts_path_in.is_none() {
-            let path = if let Some(p) = &self.runopts.det_opts.det_config.replay_preemptions_from {
-                p.to_owned()
-            } else {
-                self.root_path().with_extension(PREEMPTS_EXT)
-            };
-            self.preempts_path_in = Some(path);
+            self.preempts_path_in = Some(self.root_path().with_extension(PREEMPTS_EXT));
         }
         self.preempts_path_in.as_ref().unwrap()
     }
@@ -111,14 +109,14 @@ impl RunData {
         self.sched_path_out.as_ref().unwrap()
     }
 
+    /// Where analyze writes a schedule for this run to replay (a bisection
+    /// trial's, [`Self::with_schedule_replay`]): the workspace, under the
+    /// run's name. Never a path from the run arguments: a
+    /// `--replay-schedule-from` there names the user's own schedule, which a
+    /// trial must not overwrite.
     pub fn sched_path_in(&mut self) -> &Path {
         if self.sched_path_in.is_none() {
-            let path = if let Some(p) = &self.runopts.det_opts.det_config.replay_schedule_from {
-                p.to_owned()
-            } else {
-                self.root_path().with_extension(PREEMPTS_EXT)
-            };
-            self.sched_path_in = Some(path);
+            self.sched_path_in = Some(self.root_path().with_extension(PREEMPTS_EXT));
         }
         self.sched_path_in.as_ref().unwrap()
     }
@@ -1766,6 +1764,55 @@ mod tests {
             assert_eq!(
                 config.record_preemptions_to.as_ref(),
                 Some(&workspace.path().join("replay_out.preempts")),
+            );
+        }
+    }
+
+    /// A trial writes the schedule or the preemption record it replays into
+    /// the workspace, never into a file the run arguments name
+    /// (`--replay-schedule-from`, `--replay-preemptions-from`): that file is
+    /// the user's own and stays as it was.
+    #[test]
+    fn a_trial_writes_what_it_replays_only_into_the_workspace() {
+        for option in ["--replay-schedule-from", "--replay-preemptions-from"] {
+            let outside = tempfile::tempdir().unwrap();
+            let users = outside.path().join("users.preempts");
+            // Content no trial writes, so that a write into it shows.
+            PreemptionRecord::from_sched_events(Vec::new())
+                .with_pipe_wake_latency(Some(1))
+                .write_to_disk(&users)
+                .unwrap();
+            let before = std::fs::read(&users).unwrap();
+            let replay = format!("{option}={}", users.display());
+            let mut options =
+                AnalyzeOpts::try_parse_from(["analyze", "--", replay.as_str(), "/bin/true"])
+                    .unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            options.tmp_dir = Some(workspace.path().to_path_buf());
+            // As the bisection builds and writes a trial (`event_level_search`).
+            let mut trial = RunData::new_baseline(&options, "bisect_round_001".to_owned())
+                .unwrap()
+                .with_schedule_replay()
+                .with_schedule_recording();
+            let schedule = trial.sched_path_in().to_path_buf();
+            assert_eq!(schedule, workspace.path().join("bisect_round_001.preempts"));
+            assert_eq!(
+                trial.runopts.det_opts.det_config.replay_schedule_from,
+                Some(schedule.clone())
+            );
+            options.write_trial_schedule(Vec::new(), &schedule).unwrap();
+            // As the check of the critical preemption builds its run.
+            let check = RunData::new_baseline(&options, "verify".to_owned())
+                .unwrap()
+                .with_preempts_in(PreemptionRecord::from_sched_events(Vec::new()));
+            assert_eq!(
+                check.runopts.det_opts.det_config.replay_preemptions_from,
+                Some(workspace.path().join("verify.preempts"))
+            );
+            assert_eq!(
+                std::fs::read(&users).unwrap(),
+                before,
+                "a trial wrote into {option}'s file"
             );
         }
     }
