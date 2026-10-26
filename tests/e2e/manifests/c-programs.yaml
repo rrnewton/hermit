@@ -4046,14 +4046,22 @@ test:
       verify:
         ci:
           ptrace: true
+          liteinst: true
+          in-guest-trap: true
         backends_enabled:
           - ptrace
+          - liteinst
+          - in-guest-trap
         backends_disabled:
           dbt: userfaultfd has not been qualified on DBT
           kvm: userfaultfd has not been qualified on KVM
           sabre: userfaultfd has not been qualified on SaBRe
-          liteinst: This verify mode stays out of CI until its first validation receipts, so full validation would not run an in-guest cell here; it passed 10 of 10 verify runs with the maximum timeslice disabled in a local survey on 2026-10-08 and joins when the mode enters CI (https://github.com/rrnewton/hermit/issues/3745); in-guest LiteInst also runs this program in hermit-cli's liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered
-          in-guest-trap: This verify mode stays out of CI until its first validation receipts, so full validation would not run an in-guest cell here; it passed 10 of 10 verify runs with the maximum timeslice disabled in a local survey on 2026-10-08 and joins when the mode enters CI (https://github.com/rrnewton/hermit/issues/3745); in-guest LiteInst also runs this program in hermit-cli's liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each ran clean that way, 3 of 3, on the five nightly pressure sweeps from 2026-10-21 to 2026-10-25 (Hermit 9b30cb9a to 7903351d), after 10 of 10 in a local survey on 2026-10-08 (https://github.com/rrnewton/hermit/issues/3745)
         expected_stdout_contains:
           ptrace: "userfaultfd-"
       naked:
