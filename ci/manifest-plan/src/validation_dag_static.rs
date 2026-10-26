@@ -1994,7 +1994,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And stop::tests::a_stop_the_handler_cannot_pass_on_ends_analyze_by_its_default_action: 1280.
     // And stop::tests::a_stop_ends_analyze_even_when_its_stderr_is_full: 1281.
     // And phases::tests::the_report_says_when_the_files_it_names_are_removed: 1282.
-    ("test.hermit_unit", 1282),
+    // And rundata::tests::a_trials_schedules_are_discarded_unless_kept (a
+    // bisection trial's schedules are removed once read): 1363, listed.
+    ("test.hermit_unit", 1283),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6306,7 +6308,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same stop the handler cannot pass on: 1274.
     // And the same stop with a full stderr: 1275.
     // And the same removed-files report test: 1276.
-    ("test.hermit_unit_on_host", 1276),
+    // And the same trial-schedule discard test: 1357, listed.
+    ("test.hermit_unit_on_host", 1277),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

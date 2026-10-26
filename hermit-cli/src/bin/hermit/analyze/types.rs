@@ -277,7 +277,9 @@ pub struct AnalyzeOpts {
     /// the error can name trial files in it. A stop signal ends the run in progress and starts
     /// no other; analyze then removes the workspace and dies of that signal (a shell reports
     /// 128 plus its number, 143 for SIGTERM). --verbose keeps the workspace too. The report file
-    /// (--report-file) is never removed.
+    /// (--report-file) is never removed. Without --keep-tmp, even with --verbose, a bisection
+    /// trial's schedules are removed as soon as its outcome is read, and every run's recording
+    /// with event times once analyze has written it without them.
     ///
     /// Analyze cannot clean up after SIGKILL, nor after a stop signal it does not handle: one it
     /// inherits as ignored stays ignored, and an analyze that is PID 1 of its PID namespace
