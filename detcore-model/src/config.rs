@@ -1001,6 +1001,14 @@ pub struct Config {
     #[clap(skip)]
     pub standard_stream_aliases: Option<[u8; 3]>,
 
+    /// **Internal:** The seeds `hermit run` took from the recording a schedule
+    /// replay replays (`--replay-preemptions-from`, `--replay-schedule-from`),
+    /// because the run omitted them; the run's summary says so. The seeds
+    /// themselves are already in `rng_seed` and `sched_seed`.
+    #[serde(default)]
+    #[clap(skip)]
+    pub replay_adopted_seeds: Option<crate::summary::AdoptedSeeds>,
+
     /// **Internal:** Path to the replay data folder.
     #[clap(skip)]
     pub replay_data: Option<PathBuf>,
@@ -3619,7 +3627,9 @@ mod legacy_backend_json {
     /// it, so it is never written and reads as false.
     /// `standard_stream_aliases` came after it too, and is set only for KVM;
     /// it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 46] = [
+    /// `replay_adopted_seeds` came after it too: only the run's summary reads
+    /// it, so it is never written and reads as unset.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 47] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -3666,6 +3676,7 @@ mod legacy_backend_json {
         "access_trace_max_bytes",
         "replay_continue_fairly",
         "standard_stream_aliases",
+        "replay_adopted_seeds",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -3842,7 +3853,8 @@ mod legacy_backend_json {
                     | "access_trace"
                     | "access_trace_max_records"
                     | "access_trace_max_bytes"
-                    | "standard_stream_aliases",
+                    | "standard_stream_aliases"
+                    | "replay_adopted_seeds",
                 ) => seed
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
@@ -4161,7 +4173,8 @@ mod legacy_backend_json {
                 | "chaos_timeslice"
                 | "guest_ids"
                 | "detlog_anon"
-                | "standard_stream_aliases" => Ok(()),
+                | "standard_stream_aliases"
+                | "replay_adopted_seeds" => Ok(()),
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
@@ -5068,7 +5081,8 @@ mod tests {
                 | "chaos_timeslice"
                 | "guest_ids"
                 | "detlog_anon"
-                | "standard_stream_aliases" => {}
+                | "standard_stream_aliases"
+                | "replay_adopted_seeds" => {}
                 "access_trace"
                 | "access_trace_from"
                 | "access_trace_max_records"
@@ -5108,11 +5122,11 @@ mod tests {
         // `guest_ids`, `virtual_timeout`, `detlog_anon`,
         // `access_trace`, `access_trace_from`, `access_trace_max_records`,
         // `access_trace_max_bytes`, `replay_continue_fairly`,
-        // `standard_stream_aliases` and `strict_schedule_boundaries` none:
-        // fourteen more keys and forty-five fewer, so thirty-one keys fewer
-        // than fields.
+        // `standard_stream_aliases`, `replay_adopted_seeds` and
+        // `strict_schedule_boundaries` none: fourteen more keys and
+        // forty-six fewer, so thirty-two keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 31);
+        assert_eq!(fields.len(), keys.len() + 32);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
