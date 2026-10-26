@@ -18001,6 +18001,8 @@ fn no_namespace_rejects_container_only_options() {
         "--network=local",
         "--network=host",
         "--tmp=/tmp/custom",
+        // Its rewritten images are bind-mounted over the originals.
+        "--rewrite-exclusives",
     ];
 
     for incompatible in cases {
