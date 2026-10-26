@@ -893,8 +893,10 @@ bisect` keeps its workspace and names it when it exits.
 A replayed or spliced schedule can leave the guest spinning or waiting indefinitely.
 `--trial-timeout=SECONDS|auto|off` bounds runs after the initial target attempt.
 The default `auto` uses the initial completed run and completed target/baseline
-endpoints: max(60 seconds, 10 times the slowest measured run), rounded up to
-whole seconds. Analyze prints the bound when it changes. A shorter `--timeout`
+endpoints: max(60 seconds, 10 times the slowest measured run, 4 times the
+slowest run that finished so far), rounded up to whole seconds. The last term
+lets the bound follow a continuation without chaos, which can run far slower
+than the endpoint runs. Analyze prints the bound when it changes. A shorter `--timeout`
 in the run arguments still wins and also bounds the initial run. With
 `--run1-preemptions`, no initial run is measured, so pass an explicit
 `--trial-timeout` to bound trials before a completed replay is measured. On a
@@ -998,7 +1000,8 @@ shortened to the time left; a run the budget cuts short is thrown away rather
 than counted as not meeting the target, so the budget decides only when
 analyze stops, never what it finds. When it runs out, analyze exits **120**
 after the stderr line `HERMIT_ANALYZE_PARTIAL class=time-budget` (or
-`class=trial-budget`) and a report that says it is partial, why, and which
+`class=trial-budget`, or `class=trial-inconclusive` for a trial analyze's
+bound stopped twice) and a report that says it is partial, why, and which
 phase was running:
 
 - The default search reports the closest pair of schedules it found, a

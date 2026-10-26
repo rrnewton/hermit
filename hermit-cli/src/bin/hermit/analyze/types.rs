@@ -11,6 +11,8 @@
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use clap::Parser;
@@ -33,6 +35,7 @@ use crate::analyze::checkpoint::Progress;
 use crate::analyze::checkpoint::ProgressHandle;
 use crate::analyze::races::RacingAccesses;
 use crate::analyze::rundata::HermitRun;
+use crate::analyze::rundata::TrialInconclusive;
 use crate::analyze::rundata::TrialRunner;
 use crate::analyze::verdict::Verdict;
 use crate::analyze::verdict::VerdictReason;
@@ -278,8 +281,8 @@ pub struct AnalyzeOpts {
     /// seconds, `auto` (the default), or `off`.
     ///
     /// With `auto`, the initial run and completed target/baseline endpoint runs are measured.
-    /// Later runs are bounded at max(60 s, 10 times the slowest measured run), rounded up to
-    /// whole seconds. With `--run1-preemptions`, no initial run is made: automatic bounds wait
+    /// Later runs are bounded at max(60 s, 10 times the slowest measured run, 4 times the
+    /// slowest run that finished so far), rounded up to whole seconds. With `--run1-preemptions`, no initial run is made: automatic bounds wait
     /// for a measured replay, so use an explicit number to bound trials immediately.
     /// A trial that reaches its bound stops analysis with exit 124: it establishes no outcome
     /// and cannot support a successful report. Retry with a larger bound if the guest can
@@ -472,6 +475,34 @@ pub struct AnalyzeOpts {
     /// `run_now` and the journal without a guest.
     #[clap(skip)]
     pub hermit_run: HermitRun,
+
+    /// The slowest run that finished so far, which `--trial-timeout=auto`
+    /// bounds later runs by too ([`AnalyzeOpts::trial_bound`]); shared by
+    /// every copy of these options.
+    #[clap(skip)]
+    pub slowest_run: SlowestRun,
+}
+
+/// [`AnalyzeOpts::slowest_run`]. Cloning shares it.
+#[derive(Debug, Clone, Default)]
+pub struct SlowestRun(Arc<Mutex<Option<Duration>>>);
+
+impl SlowestRun {
+    /// The slowest run so far, if one finished.
+    pub fn get(&self) -> Option<Duration> {
+        *self.0.lock().unwrap()
+    }
+
+    /// Record a finished run that took `wall`. Returns true if it is the
+    /// slowest so far.
+    pub fn record(&self, wall: Duration) -> bool {
+        let mut slowest = self.0.lock().unwrap();
+        let slower = slowest.is_none_or(|slowest| wall > slowest);
+        if slower {
+            *slowest = Some(wall);
+        }
+        slower
+    }
 }
 
 /// `--continuation-timeslice`.
@@ -532,6 +563,13 @@ impl FromStr for TrialTimeout {
 pub const TRIAL_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
 /// How many times the slowest endpoint run `--trial-timeout=auto` gives a trial.
 pub const TRIAL_TIMEOUT_FACTOR: u32 = 10;
+/// How many times the slowest run that finished so far `--trial-timeout=auto`
+/// gives a trial.
+pub const SLOWEST_RUN_FACTOR: u32 = 4;
+/// How many times its usual `--trial-timeout` bound a search trial gets when
+/// it runs again because that bound stopped it (`decisive_trial` in
+/// phases.rs).
+pub const CONFIRM_BOUND_FACTOR: u32 = 4;
 /// The least cap on a trial's log file.
 pub const TRIAL_LOG_FLOOR: u64 = 64 << 20;
 /// How many times the largest endpoint log a trial's log file may grow to.
@@ -698,8 +736,9 @@ pub struct Report {
 /// answer so far, and how to continue it.
 #[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
 pub struct PartialReport {
-    /// The budget that ran out.
-    pub reason: BudgetKind,
+    /// Why the analysis stopped early: the budget that ran out, or a trial
+    /// that stayed inconclusive.
+    pub reason: PartialReason,
     /// The phase that was running.
     pub phase: Phase,
     /// Wall-clock seconds this invocation ran, and its budget, if any.
@@ -712,6 +751,10 @@ pub struct PartialReport {
     pub runs_from_journal: u64,
     /// The run the time budget cut short, whose outcome was not counted.
     pub cut_run: Option<String>,
+    /// The trial that analyze's wall-clock bound stopped twice, when that
+    /// ended the analysis (`reason` `trial-inconclusive`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inconclusive: Option<TrialInconclusive>,
     /// The default search's interval, if it got that far.
     pub interval: Option<BisectInterval>,
     /// `--prefix-search`'s bracket, if it got that far.
@@ -723,6 +766,40 @@ pub struct PartialReport {
     /// The kept workspace, and the command that continues the analysis.
     pub workspace: PathBuf,
     pub resume_command: String,
+}
+
+/// Why an analysis ended with a partial report ([`PartialReport::reason`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PartialReason {
+    /// `--time-budget` ran out.
+    TimeBudget,
+    /// `--trial-budget` ran out.
+    TrialBudget,
+    /// A search trial that analyze's wall-clock bound stopped was stopped
+    /// again when it ran once more with a longer bound
+    /// ([`TrialInconclusive`]).
+    TrialInconclusive,
+}
+
+impl PartialReason {
+    /// The `class=` value of the stderr class line.
+    pub fn class(self) -> &'static str {
+        match self {
+            PartialReason::TimeBudget => BudgetKind::TimeBudget.class(),
+            PartialReason::TrialBudget => BudgetKind::TrialBudget.class(),
+            PartialReason::TrialInconclusive => "trial-inconclusive",
+        }
+    }
+}
+
+impl From<BudgetKind> for PartialReason {
+    fn from(kind: BudgetKind) -> Self {
+        match kind {
+            BudgetKind::TimeBudget => PartialReason::TimeBudget,
+            BudgetKind::TrialBudget => PartialReason::TrialBudget,
+        }
+    }
 }
 
 /// Runtime context for a critical event included in the analyze report.
