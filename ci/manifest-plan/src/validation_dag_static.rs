@@ -2046,7 +2046,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And phases::tests::{a_resume_or_a_budget_is_refused_with_an_image,
     // an_image_guest_takes_no_host_file_for_its_program}: 1324.
     // And phases::tests::a_budget_hit_after_the_decision_reports_it: 1325.
-    ("test.hermit_unit", 1325),
+    // And phases::tests::a_trial_budget_that_ends_at_the_stack_trace_runs_reports_the_decision: 1326.
+    ("test.hermit_unit", 1326),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6384,7 +6385,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twenty-seven budget-and-resume tests: 1316.
     // And the same two --image refusal tests: 1318.
     // And the same decided-budget test: 1319.
-    ("test.hermit_unit_on_host", 1319),
+    // And the same cut-path decided-budget test: 1320.
+    ("test.hermit_unit_on_host", 1320),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
