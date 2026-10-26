@@ -1175,7 +1175,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed.
     // Caller-owned DBT evidence validation (dh-pp7q9): two grammar units,
     // measured with the existing selection and exclusions unchanged.
-    ("test.regular_crates", 1859),
+    // And archived.rs's two roster units (SaBRe/e9patch archived): 1861, listed.
+    ("test.regular_crates", 1861),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5693,7 +5694,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unit: 1843, listed.
     // Caller-owned DBT evidence validation (dh-pp7q9): two grammar units,
     // measured with the existing selection and exclusions unchanged.
-    ("test.regular_crates_on_host", 1845),
+    // And the same two archived.rs roster units: 1847, listed.
+    ("test.regular_crates_on_host", 1847),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
