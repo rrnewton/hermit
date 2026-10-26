@@ -2010,7 +2010,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // schedule_search::tests (a stopped search's closest pair and its resume,
     // a search started from an observed interval): 1407.
     // And phases::tests::a_budget_hit_after_the_decision_reports_it: 1408.
-    ("test.hermit_unit", 1408),
+    // And phases::tests::a_trial_budget_that_ends_at_the_stack_trace_runs_reports_the_decision: 1409.
+    ("test.hermit_unit", 1409),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6127,7 +6128,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Less the same empty-prefix verdict test: 1374.
     // And the same twenty-seven budget-and-resume tests: 1401.
     // And the same decided-budget test: 1402.
-    ("test.hermit_unit_on_host", 1402),
+    // And the same cut-path decided-budget test: 1403.
+    ("test.hermit_unit_on_host", 1403),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
