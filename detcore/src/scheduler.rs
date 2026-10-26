@@ -19043,6 +19043,7 @@ impl Scheduler {
                 // GlobalState records what the run learned of its
                 // store-exclusive sequences (aarch64).
                 exclusive_pairs: Default::default(),
+                counter_reads: Default::default(),
                 store_exclusives: None,
                 store_exclusives_unavailable: None,
                 guest_deadlock,
