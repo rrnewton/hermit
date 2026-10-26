@@ -2668,7 +2668,19 @@ fi
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory (1009), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the e5e0eff4 entry.
-expected_pin=9a3577e7ff54d63bcb009aca9812b2021fb6c5d7
+# CARRY TO d94f6bd3017ca036b4de47b45b02efdea22f2cca (2026-10-26): from
+# 9a3577e7ff54d63bcb009aca9812b2021fb6c5d7. Two commits (linuxemu lane): P2a splits
+# reverie-linuxemu/src/executor.rs into 22 child modules under
+# reverie-linuxemu/src/executor/, and S1 sends getsockopt's TCP_INFO and socket
+# cookies to the host. They change reverie-linuxemu/src only. git diff is empty
+# under reverie-dbt/ and third-party/ and for the root Cargo.toml, Cargo.lock
+# and rust-toolchain.toml; both repository inputs to the DynamoRIO content key
+# are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory (1009), SDK and native inputs, calibrated budget, job width
+# and limits carry unchanged from the 9a3577e7 entry.
+expected_pin=d94f6bd3017ca036b4de47b45b02efdea22f2cca
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
