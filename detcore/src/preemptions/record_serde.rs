@@ -75,6 +75,8 @@ struct RawRecord {
     format_version: Option<u32>,
     #[serde(default, skip_serializing_if = "super::lists_no_time_skips")]
     time_skips: Option<Vec<TimeSkip>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    rewrite_exclusives_in_memory: bool,
 }
 
 struct LegacyFields<'a>(&'a PreemptionRecord);
