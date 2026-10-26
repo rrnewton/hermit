@@ -187,6 +187,20 @@ pub const HERMIT_DEADLINE_EXIT: i32 = 124;
 /// Like 124, it must be read at the container boundary
 /// (`classify_container_result`) or it is rewritten to 125.
 pub const HERMIT_LOG_CAP_EXIT: i32 = 123;
+/// `hermit analyze` stopped at its own budget (`--time-budget`,
+/// `--trial-budget`) and reported its best answer so far: **120**.
+///
+/// The analysis neither failed (125) nor found the critical events (0, or
+/// `--success-exit-code`): its report says that it is partial, why, and how
+/// to continue it, after the stderr line `HERMIT_ANALYZE_PARTIAL
+/// class=time-budget|trial-budget`. It is not 124, the status of every
+/// deadline that kills what it bounds (`docs/TIMEOUT_LADDER.md`), because
+/// nothing is killed and the result is an answer, not a stopped run. Its row
+/// in the exit-code allocation table below carves it out of the guest's
+/// range. Like every hermit status it can collide with a guest's own, but
+/// analyze never exits with a guest's status: the class line is the
+/// discriminator.
+pub const HERMIT_ANALYZE_PARTIAL_EXIT: i32 = 120;
 
 /// The guest program could not be found at all: **127**.
 ///
@@ -237,9 +251,16 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //   0          success.
 //   1          HERMIT_VERIFICATION_DIVERGENCE_EXIT, matching `diff`; also a
 //              legal guest status. Read the verification JSON to distinguish.
-//   2 ..= 121  THE GUEST'S OWN STATUS, passed through untouched. (The range
-//              stops at 121 because 122 is reserved below; a guest may still
+//   2 ..= 119  THE GUEST'S OWN STATUS, passed through untouched. (The range
+//              stops at 119 because 120 is allocated below; a guest may still
 //              CHOOSE any value, see the caveat at the end.)
+//   120        HERMIT_ANALYZE_PARTIAL_EXIT -- `hermit analyze` only: a budget
+//              (`--time-budget`, `--trial-budget`) ended the analysis and it
+//              reported its best answer so far, after the stderr line
+//              `HERMIT_ANALYZE_PARTIAL class=time-budget|trial-budget`.
+//              Analyze never relays a guest's status; `hermit run` never
+//              emits 120 and passes a guest's 120 through like any other.
+//   121        THE GUEST'S OWN STATUS, as 2 ..= 119.
 //   122        HERMIT_POLICY_REFUSAL_EXIT -- hermit REFUSED the run under a
 //              fail-closed policy. Hermit WORKED; the run was stopped on
 //              purpose and the reason was printed. Distinct from 125 because
@@ -366,7 +387,12 @@ const _: () = assert!(
     "123 is Hermit's log-cap code, reserved for bin/safehermit's log-cap kill as well; see the allocation table"
 );
 const _: () = assert!(
+    HERMIT_ANALYZE_PARTIAL_EXIT == 120,
+    "120 is analyze's partial result, carved out of the guest's range; see the allocation table"
+);
+const _: () = assert!(
     HERMIT_LOG_CAP_EXIT != 0
+        && HERMIT_ANALYZE_PARTIAL_EXIT != 0
         && HERMIT_VERIFICATION_DIVERGENCE_EXIT != 0
         && HERMIT_INTERNAL_FAILURE_EXIT != 0
         && GUEST_PROGRAM_NOT_FOUND_EXIT != 0

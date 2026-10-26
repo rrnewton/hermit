@@ -8,6 +8,8 @@
 
 //! A mode for analyzing a hermit run to detect concurrency bugs.
 
+mod budget;
+mod checkpoint;
 mod consts;
 mod minimize;
 mod phases;
@@ -16,6 +18,8 @@ mod stop;
 mod types;
 mod workspace;
 
+pub use budget::TimeBudget;
+pub use budget::TrialBudget;
 pub use types::AnalyzeOpts;
 pub use types::ContinuationTimeslice;
 pub use types::ExitStatusConstraint;
