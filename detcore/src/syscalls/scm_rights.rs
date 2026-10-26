@@ -37,11 +37,18 @@
 //! placeholder registry instead, as `Detcore::adopt_received_placeholders`
 //! adopts one when it is first named.
 //!
-//! Not recorded, as before, each named in a warning: an anonymous inode
-//! (eventfd, signalfd, timerfd, epoll, inotify, pidfd, userfaultfd, ...),
-//! whose kind `fstat` does not tell and which an ordinary record would mishandle
-//! (<https://github.com/rrnewton/hermit/issues/4107>'s signalfd mode); a
-//! receive whose buffers overlap so that the call may have overwritten its
+//! An anonymous inode has no file type, so `fstat` does not tell its kind.
+//! Its descriptor link does: one that reads `anon_inode:inotify` (an injected
+//! `readlinkat` of `/proc/thread-self/fd/<fd>`) is recorded as an inotify
+//! instance, as the in-guest discovery records it, so its reads renumber
+//! rename cookies (`crate::syscalls::inotify`).
+//!
+//! Not recorded, as before, each named in a warning: any other anonymous
+//! inode (eventfd, signalfd, timerfd, epoll, pidfd, userfaultfd, ...), which
+//! an ordinary record would mishandle
+//! (<https://github.com/rrnewton/hermit/issues/4107>'s signalfd mode), and
+//! one whose link cannot be read; a receive whose buffers overlap so that the
+//! call may have overwritten its
 //! own inputs, whose vector cannot be read in full, or whose inputs changed
 //! before the attempt that succeeded; and every receive on the background
 //! path. Under record and replay and without sequentialized threads no
@@ -60,19 +67,32 @@ use std::os::fd::RawFd;
 
 use reverie::Error;
 use reverie::Guest;
+use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::Addr;
+use reverie::syscalls::AddrMut;
+use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::PathPtr;
+use reverie::syscalls::ProtFlags;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::linux_abi::Mmsghdr;
 use reverie::syscalls::linux_abi::Msghdr;
 use tracing::debug;
+use tracing::info;
 use tracing::warn;
 
 use crate::record_or_replay::RecordOrReplay;
 use crate::syscalls::rendered_procfs::placeholder_identity;
 use crate::syscalls::rendered_procfs::placeholders_exist;
 use crate::tool_local::Detcore;
+
+/// The bytes `received_descriptor_link` gives the path
+/// `/proc/thread-self/fd/<fd>`: 21, up to 10 digits and the terminating NUL.
+const LINK_PATH: usize = 32;
+/// The bytes it gives the link read there. A link that fills them is longer
+/// than `anon_inode:inotify` (18 bytes), so it is not read whole.
+const LINK_TARGET: usize = 64;
 
 /// The bytes of one received control buffer Detcore reads. One receive
 /// delivers at most one `SCM_RIGHTS` message, of at most `SCM_MAX_FD` (253)
@@ -544,8 +564,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// guest's result is never changed. A descriptor left out of the table, as
     /// every received descriptor was before, is named in a warning: for each
     /// receive whose layout cannot be trusted, each receive on the background
-    /// path, each number that already has a record, each anonymous inode, and
-    /// each descriptor whose facts cannot be taken. Under record and replay
+    /// path, each number that already has a record, each anonymous inode
+    /// other than an inotify instance, and each descriptor whose facts cannot
+    /// be taken. Under record and replay
     /// and without sequentialized threads none is recorded, logged at debug
     /// level only (a warning per call, or per tool process, would differ
     /// between runs that share a process). `cloexec` is whether the receive
@@ -656,18 +677,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `fstat` cannot tell which it is. Recorded as an ordinary file, its
         // reads and flag changes would take paths that are wrong for it (a
         // blocking signalfd read held in the caller's turn, an
-        // `EFD_SEMAPHORE` eventfd read twice). Left unrecorded instead, as
-        // before.
-        if stat.st_mode & libc::S_IFMT == 0 {
+        // `EFD_SEMAPHORE` eventfd read twice). Its link names an inotify
+        // instance, which is recorded as one, so its reads renumber rename
+        // cookies (`crate::syscalls::inotify`); any other is left unrecorded,
+        // as before.
+        let link = if stat.st_mode & libc::S_IFMT == 0 {
+            self.received_descriptor_link(guest, fd).await
+        } else {
+            None
+        };
+        if stat.st_mode & libc::S_IFMT == 0
+            && link.as_deref() != Some(crate::syscalls::inotify::INOTIFY_LINK)
+        {
             // Open, and listed in the table's descriptor directory, but not
             // modelled.
             guest
                 .thread_state()
                 .note_unmodelled_descriptor(fd, descriptor_flags & libc::FD_CLOEXEC != 0);
-            warn!(
-                "[detcore] descriptor {fd}, received over SCM_RIGHTS, is an anonymous inode \
-                 whose kind fstat does not tell: not recorded"
-            );
+            match &link {
+                Some(link) => warn!(
+                    "[detcore] descriptor {fd}, received over SCM_RIGHTS, is an anonymous inode \
+                     ({}) that an ordinary record would mishandle: not recorded",
+                    String::from_utf8_lossy(link)
+                ),
+                None => warn!(
+                    "[detcore] descriptor {fd}, received over SCM_RIGHTS, is an anonymous inode \
+                     whose link cannot be read, so its kind is unknown: not recorded"
+                ),
+            }
             return Ok(false);
         }
         if may_be_placeholder(&stat)
@@ -683,14 +720,166 @@ impl<T: RecordOrReplay> Detcore<T> {
         // even where it is an alias of one this process holds (see the
         // module documentation), made exactly as the in-guest discovery
         // makes it: a directory gets a sorted stream of its own.
-        guest
-            .thread_state()
-            .add_discovered_fd(fd, descriptor_flags, status_flags, &stat)?;
+        guest.thread_state().add_discovered_fd(
+            fd,
+            descriptor_flags,
+            status_flags,
+            &stat,
+            link.as_deref(),
+        )?;
         // A placeholder descriptor, which its identity and its tag tell apart
         // (`descriptor_directory`).
         self.recognize_received_placeholder(guest, fd, &stat, status_flags)
             .await;
         Ok(true)
+    }
+
+    /// What descriptor `fd` of the calling thread links to, read in the
+    /// guest (`readlinkat` of `/proc/thread-self/fd/<fd>`, injected), or
+    /// `None` where that read fails or the link is longer than any anonymous
+    /// inode's. The path and the result are staged as `inject_fstat` stages
+    /// its buffer: in the guest stack scratch, with the bytes under them put
+    /// back, or, where the scratch cannot hold them, in a transient private
+    /// page that is unmapped before the guest resumes.
+    async fn received_descriptor_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Option<Vec<u8>> {
+        let mut path = [0_u8; LINK_PATH];
+        let spelled = format!("/proc/thread-self/fd/{fd}");
+        path.get_mut(..spelled.len())?
+            .copy_from_slice(spelled.as_bytes());
+        match Self::read_link_on_stack(guest, &path).await {
+            Err(reverie::Errno::EFAULT) => {
+                info!(
+                    "Guest stack scratch cannot hold the readlinkat buffers for fd {fd}; using a \
+                     transient page instead."
+                );
+                Self::read_link_in_transient_page(guest, &path)
+                    .await
+                    .ok()
+                    .flatten()
+            }
+            result => result.ok().flatten(),
+        }
+    }
+
+    /// The fast path of [`Self::received_descriptor_link`]: `path` and the
+    /// result in the guest stack scratch. `Err(EFAULT)` when the scratch
+    /// cannot hold them.
+    async fn read_link_on_stack<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8; LINK_PATH],
+    ) -> Result<Option<Vec<u8>>, reverie::Errno> {
+        let mut stack = guest.stack().await;
+        let link = stack.reserve::<[u8; LINK_PATH]>().cast::<u8>();
+        let target = stack.reserve::<[u8; LINK_TARGET]>().cast::<u8>();
+        // Ptrace lends bytes below the guest red zone; they are put back after
+        // the call, as `inject_fstat` puts back its buffer's.
+        let mut saved_link = [0_u8; LINK_PATH];
+        let mut saved_target = [0_u8; LINK_TARGET];
+        guest.memory().read_exact(link, &mut saved_link)?;
+        guest.memory().read_exact(target, &mut saved_target)?;
+        let guard = match stack.commit() {
+            Ok(guard) => guard,
+            Err(errno) => {
+                let mut memory = guest.memory();
+                let _ = memory
+                    .write_exact(link, &saved_link)
+                    .and(memory.write_exact(target, &saved_target));
+                return Err(errno);
+            }
+        };
+        let read = match guest.memory().write_exact(link, path) {
+            Ok(()) => Self::inject_read_link(guest, link, target).await,
+            Err(errno) => Err(errno),
+        };
+        let mut memory = guest.memory();
+        let restored = memory
+            .write_exact(link, &saved_link)
+            .and(memory.write_exact(target, &saved_target));
+        drop(memory);
+        drop(guard);
+        let read = read?;
+        restored?;
+        Ok(read)
+    }
+
+    /// [`Self::received_descriptor_link`] with `path` and the result in a
+    /// transient private page, unmapped before the guest resumes.
+    async fn read_link_in_transient_page<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8; LINK_PATH],
+    ) -> Result<Option<Vec<u8>>, reverie::Errno> {
+        let len = LINK_PATH + LINK_TARGET;
+        let mapped = guest
+            .inject_with_retry(Syscall::Mmap(
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(len)
+                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                    .with_fd(-1)
+                    .with_offset(0),
+            ))
+            .await?;
+        let page = usize::try_from(mapped)
+            .ok()
+            .and_then(AddrMut::<u8>::from_raw)
+            .unwrap_or_else(|| panic!("transient readlinkat page mmap returned {mapped}"));
+        // SAFETY: the page just mapped holds LINK_PATH + LINK_TARGET bytes.
+        let target = unsafe { page.add(LINK_PATH) };
+        let read = match guest.memory().write_exact(page, path) {
+            Ok(()) => Self::inject_read_link(guest, page, target).await,
+            Err(errno) => Err(errno),
+        };
+        if let Err(errno) = guest
+            .inject_with_retry(Syscall::Munmap(
+                syscalls::Munmap::new()
+                    .with_addr(Some(page.cast::<libc::c_void>().into()))
+                    .with_len(len),
+            ))
+            .await
+        {
+            // Not expected: the page was mapped by this call and its address
+            // never reached the guest.
+            warn!("[detcore] could not unmap the transient readlinkat page: {errno}");
+        }
+        read
+    }
+
+    /// Inject `readlinkat(AT_FDCWD, link, target, LINK_TARGET)` and read back
+    /// the link: `None` when the call fails other than with EFAULT, or the
+    /// link fills the buffer.
+    async fn inject_read_link<G: Guest<Self>>(
+        guest: &mut G,
+        link: AddrMut<'_, u8>,
+        target: AddrMut<'_, u8>,
+    ) -> Result<Option<Vec<u8>>, reverie::Errno> {
+        let length = match guest
+            .inject_with_retry(
+                syscalls::Readlinkat::new()
+                    .with_dirfd(libc::AT_FDCWD)
+                    .with_path(PathPtr::from_ptr(link.as_raw() as *const libc::c_char))
+                    .with_buf(Some(target.cast::<libc::c_char>()))
+                    .with_buf_len(LINK_TARGET),
+            )
+            .await
+        {
+            Err(reverie::Errno::EFAULT) => return Err(reverie::Errno::EFAULT),
+            Err(_) => return Ok(None),
+            Ok(length) => length,
+        };
+        let Some(length) = usize::try_from(length)
+            .ok()
+            .filter(|length| *length < LINK_TARGET)
+        else {
+            return Ok(None);
+        };
+        let mut bytes = vec![0; length];
+        guest.memory().read_exact(target, &mut bytes)?;
+        Ok(Some(bytes))
     }
 }
 

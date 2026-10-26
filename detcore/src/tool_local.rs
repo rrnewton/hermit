@@ -1573,7 +1573,18 @@ impl FileMetadata {
         }
         let raw_stat =
             stat::fstat(unsafe { BorrowedFd::borrow_raw(fd) }).map_err(|_| Errno::last())?;
-        self.add_discovered_fd(owner, fd, fd_flags, status_flags, &raw_stat)?;
+        // An anonymous inode has no file type; its link names what it is.
+        let link = (raw_stat.st_mode & libc::S_IFMT == 0)
+            .then(|| own_fd_link(fd))
+            .flatten();
+        self.add_discovered_fd(
+            owner,
+            fd,
+            fd_flags,
+            status_flags,
+            &raw_stat,
+            link.as_deref(),
+        )?;
         // A placeholder for a procfs file Detcore renders, which the backend
         // rediscovers after `exec`: the file again, at the position the old
         // image left and with the snapshot it took, as a backend that keeps
@@ -1644,7 +1655,9 @@ impl FileMetadata {
     /// Record descriptor `fd`, whose creation Detcore did not see, from the
     /// kernel's facts about it: its descriptor flags `fd_flags` (`F_GETFD`),
     /// status flags `status_flags` (`F_GETFL`) and `raw_stat` (`fstat`). Its
-    /// type is the file's (pipe, socket, random device or regular), its
+    /// type is the file's (pipe, socket, random device or regular), or, for
+    /// an anonymous inode whose descriptor link (`link`) names an inotify
+    /// instance, inotify; its
     /// flags are the kernel's (an observed `O_NONBLOCK` stays guest-visible:
     /// the provenance is unknown), and its lock state is unobserved. Shared by
     /// the in-guest discovery ([`Self::discover_fd_from_current_process`])
@@ -1658,9 +1671,15 @@ impl FileMetadata {
         fd_flags: libc::c_int,
         status_flags: libc::c_int,
         raw_stat: &libc::stat,
+        link: Option<&[u8]>,
     ) -> Result<(), Errno> {
         let file_type = stat::SFlag::from_bits_truncate(raw_stat.st_mode);
-        let ty = if file_type.contains(stat::SFlag::S_IFIFO) {
+        let ty = if raw_stat.st_mode & libc::S_IFMT == 0
+            && link == Some(crate::syscalls::inotify::INOTIFY_LINK)
+        {
+            // Its reads renumber rename cookies (`crate::syscalls::inotify`).
+            FdType::Inotify
+        } else if file_type.contains(stat::SFlag::S_IFIFO) {
             FdType::Pipe
         } else if file_type.contains(stat::SFlag::S_IFSOCK) {
             FdType::Socket
@@ -2725,17 +2744,28 @@ mod file_metadata_tests {
         .unwrap();
         let file = std::fs::File::open("/proc/self/exe").unwrap();
         let random = std::fs::File::open("/dev/urandom").unwrap();
+        // SAFETY: inotify_init1 takes no pointer; the descriptor is owned here.
+        let inotify = unsafe {
+            <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(libc::inotify_init1(
+                libc::IN_NONBLOCK | libc::IN_CLOEXEC,
+            ))
+        };
         let cases = [
             (pipe_read.as_raw_fd(), FdType::Pipe),
             (socket.as_raw_fd(), FdType::Socket),
             (file.as_raw_fd(), FdType::Regular),
             (random.as_raw_fd(), FdType::Rng),
+            (inotify.as_raw_fd(), FdType::Inotify),
         ];
         for (fd, ty) in cases {
             let mut recorded = FileMetadata::new(owner);
             let (fd_flags, status, stat) = facts(fd);
+            // As the receipt reads it: only an anonymous inode's link.
+            let link = (stat.st_mode & libc::S_IFMT == 0)
+                .then(|| super::own_fd_link(fd))
+                .flatten();
             recorded
-                .add_discovered_fd(owner, fd, fd_flags, status, &stat)
+                .add_discovered_fd(owner, fd, fd_flags, status, &stat, link.as_deref())
                 .unwrap();
             let mut discovered = FileMetadata::new(owner);
             discovered
@@ -2750,7 +2780,7 @@ mod file_metadata_tests {
         let mut recorded = FileMetadata::new(owner);
         let (fd_flags, status, stat) = facts(pipe);
         recorded
-            .add_discovered_fd(owner, pipe, fd_flags, status, &stat)
+            .add_discovered_fd(owner, pipe, fd_flags, status, &stat, None)
             .unwrap();
         let detfd = &recorded.file_handles[&pipe];
         // The kernel's flags are what the record knows: O_NONBLOCK stays
@@ -6097,6 +6127,7 @@ impl<T> ThreadState<T> {
         fd_flags: libc::c_int,
         status_flags: libc::c_int,
         raw_stat: &libc::stat,
+        link: Option<&[u8]>,
     ) -> Result<(), Errno> {
         self.metadata().add_discovered_fd(
             self.open_file_creator.unwrap_or(self.dettid),
@@ -6104,6 +6135,7 @@ impl<T> ThreadState<T> {
             fd_flags,
             status_flags,
             raw_stat,
+            link,
         )
     }
 
@@ -8711,9 +8743,9 @@ fn thread_rng_from_parent_entropy_labeled(
 /// <https://github.com/rrnewton/hermit/issues/4263>). Read with raw
 /// system calls (under in-guest backends the tool shares the guest's C
 /// library).
-/// The fixed procfs file the kernel opened at `fd`, if its descriptor link
-/// names one (`ProcfsFile::snapshot_is_fixed`).
-fn fixed_procfs_behind(fd: RawFd) -> Option<crate::procfs::ProcfsFile> {
+/// What this thread's descriptor `fd` links to (`/proc/thread-self/fd/<fd>`),
+/// read with a raw `readlinkat` as the in-guest runtime must.
+fn own_fd_link(fd: RawFd) -> Option<Vec<u8>> {
     // The calling thread's own table: `/proc/self/fd` is the leader's.
     let link = std::ffi::CString::new(format!("/proc/thread-self/fd/{fd}")).ok()?;
     let mut target = [0_u8; 256];
@@ -8734,8 +8766,15 @@ fn fixed_procfs_behind(fd: RawFd) -> Option<crate::procfs::ProcfsFile> {
     let length = usize::try_from(length)
         .ok()
         .filter(|length| *length < target.len())?;
+    Some(target[..length].to_vec())
+}
+
+/// The fixed procfs file the kernel opened at `fd`, if its descriptor link
+/// names one (`ProcfsFile::snapshot_is_fixed`).
+fn fixed_procfs_behind(fd: RawFd) -> Option<crate::procfs::ProcfsFile> {
+    let target = own_fd_link(fd)?;
     let path = std::path::Path::new(
-        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&target[..length]),
+        <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&target),
     );
     crate::procfs::ProcfsFile::from_path(path).filter(crate::procfs::ProcfsFile::snapshot_is_fixed)
 }

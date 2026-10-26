@@ -1833,7 +1833,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_image_roots_table_leaves_the_placeholder_directory_out and
     // a_later_mount_covers_the_placeholder_directory_by_any_spelling: 1110,
     // listed.
-    ("test.hermit_unit", 1110),
+    // And tests::defined_dynamic_symbols_are_read_from_the_dynamic_segment_alone
+    // and tests::the_dynamic_symbol_count_comes_from_the_hash_table (that check
+    // reads only the runtime's dynamic symbols): 1112, listed.
+    ("test.hermit_unit", 1112),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3019,7 +3022,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // every_call_a_placeholder_answers_passes_the_prefilter and procfs::locks'
     // a_placeholder_lock_never_rests_on_a_copy_in_flight and
     // an_exec_never_lets_a_surviving_lock_go: 2658 + 3 = 2661, listed.
-    ("test.detcore_unit", 2661),
+    // And syscalls::inotify's a_read_into_overlapping_buffers_is_left_alone
+    // (the overlap decision, without global state): 2662, listed.
+    ("test.detcore_unit", 2662),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5242,7 +5247,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five E1 units: 2646, listed.
     // And the same twelve P1 units: 2658, listed.
     // And the same three P1 round-three units: 2661, listed.
-    ("test.detcore_unit_on_host", 2661),
+    // And the same overlap-decision unit: 2662, listed.
+    ("test.detcore_unit_on_host", 2662),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5602,7 +5608,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 3c.1e B's harness unit was reverted with that slice).
     // And the same DBT runtime fingerprint-check unit: 1106, listed.
     // And the same four P1 container units: 1110, listed.
-    ("test.hermit_unit_on_host", 1110),
+    // And the same two dynamic-symbol units: 1112, listed.
+    ("test.hermit_unit_on_host", 1112),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

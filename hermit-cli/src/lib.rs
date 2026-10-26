@@ -4053,19 +4053,12 @@ pub fn record_dbt_launched_image(
 /// (an inotify rename cookie, for one) rather than be refused by name.
 #[cfg(feature = "dbt")]
 pub fn require_dbt_runtime_fingerprint_check(runtime: &std::path::Path) -> Result<(), Error> {
-    let bytes = std::fs::read(runtime).map_err(|error| {
-        anyhow!(
-            "failed to read the DBT runtime {}: {error}",
-            runtime.display()
-        )
-    })?;
-    let elf = Elf::parse(&bytes)
-        .map_err(|error| anyhow!("the DBT runtime {} is not ELF: {error}", runtime.display()))?;
-    let checks = elf.dynsyms.iter().any(|symbol| {
-        symbol.st_value != 0
-            && elf.dynstrtab.get_at(symbol.st_name) == Some(detcore_dbt::FINGERPRINT_CHECK_SYMBOL)
-    });
-    if checks {
+    let symbols = defined_dynamic_symbols(runtime)
+        .map_err(|error| error.context("failed to read the Detcore DBT runtime's exports"))?;
+    if symbols
+        .iter()
+        .any(|symbol| symbol == detcore_dbt::FINGERPRINT_CHECK_SYMBOL)
+    {
         Ok(())
     } else {
         Err(anyhow!(
@@ -4075,6 +4068,154 @@ pub fn require_dbt_runtime_fingerprint_check(runtime: &std::path::Path) -> Resul
             runtime.display(),
             detcore_dbt::FINGERPRINT_CHECK_SYMBOL
         ))
+    }
+}
+
+/// The names of the symbols the ELF image at `path` defines in its dynamic
+/// symbol table, the table the dynamic loader binds from. This reads only the
+/// parts of the file the loader uses for them -- the ELF and program headers,
+/// the dynamic segment, the symbol hash table, and the dynamic symbol and
+/// string tables: 6,467 bytes of a 19.5 MB release DBT runtime -- and so does
+/// not need the section headers or `.symtab`, which stripping can remove.
+#[cfg(feature = "dbt")]
+fn defined_dynamic_symbols(path: &std::path::Path) -> Result<Vec<String>, Error> {
+    use std::os::unix::fs::FileExt;
+
+    use goblin::container::Ctx;
+    use goblin::elf::dynamic::Dynamic;
+    use goblin::elf::dynamic::DynamicInfo;
+    use goblin::elf::program_header::PT_DYNAMIC;
+    use goblin::elf::program_header::ProgramHeader;
+    use goblin::elf::section_header::SHN_UNDEF;
+    use goblin::elf::sym::Sym;
+    use goblin::elf::sym::Symtab;
+    use goblin::strtab::Strtab;
+
+    let file = fs::File::open(path)
+        .map_err(|error| anyhow!("failed to open {}: {error}", path.display()))?;
+    let length = file
+        .metadata()
+        .map_err(|error| anyhow!("failed to stat {}: {error}", path.display()))?
+        .len();
+    let not_elf = |error: &dyn std::fmt::Display| anyhow!("{} is not ELF: {error}", path.display());
+    let read = |offset: u64, size: usize| -> Result<Vec<u8>, Error> {
+        if offset
+            .checked_add(size as u64)
+            .is_none_or(|end| end > length)
+        {
+            return Err(not_elf(&format_args!(
+                "{size} bytes at {offset:#x} would end past its {length} bytes"
+            )));
+        }
+        let mut bytes = vec![0; size];
+        file.read_exact_at(&mut bytes, offset)
+            .map_err(|error| anyhow!("failed to read {}: {error}", path.display()))?;
+        Ok(bytes)
+    };
+
+    let header = Elf::parse_header(&read(0, goblin::elf64::header::SIZEOF_EHDR)?)
+        .map_err(|error| not_elf(&error))?;
+    let ctx = Ctx::new(
+        header.container().map_err(|error| not_elf(&error))?,
+        header.endianness().map_err(|error| not_elf(&error))?,
+    );
+    let count = usize::from(header.e_phnum);
+    let program_headers = ProgramHeader::parse(
+        &read(header.e_phoff, count * ProgramHeader::size(ctx))?,
+        0,
+        count,
+        ctx,
+    )
+    .map_err(|error| not_elf(&error))?;
+    // An image without a dynamic segment exports nothing.
+    let Some(segment) = program_headers
+        .iter()
+        .find(|header| header.p_type == PT_DYNAMIC)
+    else {
+        return Ok(Vec::new());
+    };
+    // `Dynamic::parse` reads the segment from the bytes it is given at the
+    // segment's file offset, so it is given the segment alone, at offset 0.
+    // Its addresses are then mapped to file offsets with every header.
+    let entries = read(
+        segment.p_offset,
+        usize::try_from(segment.p_filesz).map_err(|error| not_elf(&error))?,
+    )?;
+    let alone = ProgramHeader {
+        p_offset: 0,
+        ..segment.clone()
+    };
+    let Some(dynamic) = Dynamic::parse(&entries, &[alone], ctx).map_err(|error| not_elf(&error))?
+    else {
+        return Ok(Vec::new());
+    };
+    let info = DynamicInfo::new(&dynamic.dyns, &program_headers);
+    let count = dynamic_symbol_count(&read, &info, ctx)?;
+    if count == 0 || info.symtab == 0 || info.strtab == 0 {
+        return Ok(Vec::new());
+    }
+    let symbols = read(
+        info.symtab as u64,
+        count.saturating_mul(Sym::size(ctx.container)),
+    )?;
+    let symbols = Symtab::parse(&symbols, 0, count, ctx).map_err(|error| not_elf(&error))?;
+    let names = read(info.strtab as u64, info.strsz)?;
+    let names = Strtab::parse(&names, 0, info.strsz, 0).map_err(|error| not_elf(&error))?;
+    Ok(symbols
+        .iter()
+        .filter(|symbol| symbol.st_shndx != SHN_UNDEF as usize)
+        .filter_map(|symbol| names.get_at(symbol.st_name).map(str::to_owned))
+        .collect())
+}
+
+/// How many entries an ELF image's dynamic symbol table has, which only the
+/// section headers record; without them it comes from the symbol hash table,
+/// as goblin and readelf find it. A GNU hash table leaves out the first
+/// `symoffset` symbols and chains every later one, so the count is one past
+/// the end of the chain that starts last (a chain's final entry has its low
+/// bit set); a SysV hash table's chain count is the symbol count.
+#[cfg(feature = "dbt")]
+fn dynamic_symbol_count(
+    read: &dyn Fn(u64, usize) -> Result<Vec<u8>, Error>,
+    info: &goblin::elf::dynamic::DynamicInfo,
+    ctx: goblin::container::Ctx,
+) -> Result<usize, Error> {
+    let word = |bytes: &[u8], index: usize| {
+        let bytes: [u8; 4] = bytes[4 * index..4 * index + 4]
+            .try_into()
+            .expect("four bytes");
+        if ctx.is_little_endian() {
+            u32::from_le_bytes(bytes)
+        } else {
+            u32::from_be_bytes(bytes)
+        }
+    };
+    if let Some(table) = info.gnu_hash {
+        // nbuckets, symoffset, bloom_size and bloom_shift; then the bloom
+        // filter's address-sized words, the buckets, and the chains.
+        let header = read(table, 16)?;
+        let buckets = word(&header, 0) as usize;
+        let first = word(&header, 1) as usize;
+        let starts_at = table + 16 + u64::from(word(&header, 2)) * ctx.size() as u64;
+        let starts = read(starts_at, 4 * buckets)?;
+        let Some(last) = (0..buckets)
+            .map(|bucket| word(&starts, bucket) as usize)
+            .max()
+            .filter(|&last| last >= first)
+        else {
+            return Ok(first);
+        };
+        let chains_at = starts_at + 4 * buckets as u64;
+        let mut symbol = last;
+        while word(&read(chains_at + 4 * (symbol - first) as u64, 4)?, 0) & 1 == 0 {
+            symbol += 1;
+        }
+        Ok(symbol + 1)
+    } else if let Some(table) = info.hash {
+        // nbucket, then nchain.
+        Ok(word(&read(table, 8)?, 1) as usize)
+    } else {
+        Ok(0)
     }
 }
 
@@ -8355,6 +8496,100 @@ mod tests {
         ))
         .expect_err("a file that is not ELF is refused");
         assert!(format!("{refusal:#}").contains("is not ELF"), "{refusal:#}");
+    }
+
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn defined_dynamic_symbols_are_read_from_the_dynamic_segment_alone() {
+        // The libc this test runs with, against goblin's parse of all of it.
+        let maps = fs::read_to_string("/proc/self/maps").unwrap();
+        let libc = maps
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(5))
+            .find(|path| {
+                path.rsplit('/')
+                    .next()
+                    .is_some_and(|name| name.starts_with("libc.so"))
+            })
+            .expect("this test runs with a dynamically linked libc");
+        let ours = super::defined_dynamic_symbols(std::path::Path::new(libc)).unwrap();
+        let bytes = fs::read(libc).unwrap();
+        let elf = goblin::elf::Elf::parse(&bytes).unwrap();
+        let named = |symbol: &goblin::elf::sym::Sym| elf.dynstrtab.get_at(symbol.st_name);
+        assert!(
+            elf.dynsyms
+                .iter()
+                .any(|symbol| symbol.st_shndx == 0 && named(&symbol).is_some_and(|n| !n.is_empty())),
+            "{libc} imports a symbol, which is not one of its exports"
+        );
+        let theirs: Vec<String> = elf
+            .dynsyms
+            .iter()
+            .filter(|symbol| symbol.st_shndx != 0)
+            .filter_map(|symbol| named(&symbol).map(str::to_owned))
+            .collect();
+        assert!(ours.iter().any(|name| name == "malloc"), "{ours:?}");
+        assert_eq!(ours, theirs);
+    }
+
+    #[cfg(feature = "dbt")]
+    #[test]
+    fn the_dynamic_symbol_count_comes_from_the_hash_table() {
+        use goblin::container::Container;
+        use goblin::container::Ctx;
+        use goblin::container::Endian;
+        use goblin::elf::dynamic::DynamicInfo;
+
+        let ctx = Ctx::new(Container::Big, Endian::Little);
+        let image = |words: &[u32]| -> Vec<u8> {
+            words.iter().flat_map(|word| word.to_le_bytes()).collect()
+        };
+        let reader = |image: Vec<u8>| {
+            move |offset: u64, size: usize| -> Result<Vec<u8>, anyhow::Error> {
+                let start = offset as usize;
+                image
+                    .get(start..start + size)
+                    .map(<[u8]>::to_vec)
+                    .ok_or_else(|| anyhow::anyhow!("{size} bytes at {offset} are past the end"))
+            }
+        };
+        let gnu = DynamicInfo {
+            gnu_hash: Some(0),
+            ..Default::default()
+        };
+        // nbuckets 2, symoffset 1, bloom_size 1, bloom_shift 6; one 8-byte
+        // bloom word; buckets starting at symbols 1 and 3; the chains of
+        // symbols 1 to 4, where a set low bit ends a chain. Symbol 0 is not
+        // hashed, so the table has 5 symbols.
+        let table = image(&[2, 1, 1, 6, 0, 0, 1, 3, 0x10, 0x21, 0x30, 0x41]);
+        assert_eq!(
+            super::dynamic_symbol_count(&reader(table), &gnu, ctx).unwrap(),
+            5
+        );
+        // With every bucket empty, only the 3 symbols before symoffset.
+        let table = image(&[1, 3, 1, 6, 0, 0, 0]);
+        assert_eq!(
+            super::dynamic_symbol_count(&reader(table), &gnu, ctx).unwrap(),
+            3
+        );
+        // A chain that runs past the image is refused, not counted.
+        let table = image(&[1, 1, 1, 6, 0, 0, 1, 0x10]);
+        super::dynamic_symbol_count(&reader(table), &gnu, ctx).unwrap_err();
+        // A SysV table: nbucket, then nchain.
+        let sysv = DynamicInfo {
+            hash: Some(0),
+            ..Default::default()
+        };
+        let table = image(&[1, 7, 0]);
+        assert_eq!(
+            super::dynamic_symbol_count(&reader(table), &sysv, ctx).unwrap(),
+            7
+        );
+        // With neither, the loader can bind nothing.
+        assert_eq!(
+            super::dynamic_symbol_count(&reader(Vec::new()), &DynamicInfo::default(), ctx).unwrap(),
+            0
+        );
     }
     #[cfg(feature = "sabre")]
     use std::ffi::OsStr;
