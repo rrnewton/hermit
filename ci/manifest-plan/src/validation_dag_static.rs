@@ -1958,7 +1958,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_reader_fed_by_a_thread_that_changed_course_is_no_race,
     // partners_are_singled_out_on_the_outcomes_causal_path,
     // the_pair_that_released_what_its_victim_used_stands_for_its_partner}: 1348.
-    ("test.hermit_unit", 1348),
+    // And two change-of-course timing tests,
+    // analyze::races::tests::{
+    // a_poller_nap_around_a_changed_course_is_a_weak_candidate,
+    // a_weak_nap_ranks_after_the_evidenced_pairs}: 1350.
+    ("test.hermit_unit", 1350),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6031,7 +6035,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same eight workspace-cleanup tests: 1309.
     // And the same twenty-six racing-access finder tests: 1335.
     // And the same seven ranked-candidate finder tests: 1342.
-    ("test.hermit_unit_on_host", 1342),
+    // And the same two change-of-course timing tests: 1344.
+    ("test.hermit_unit_on_host", 1344),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
