@@ -61,6 +61,8 @@ use detcore_model::happens_before::Strength;
 use detcore_model::happens_before::ThreadRef;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
+use detcore_model::syscall_histogram::SyscallHistogram;
+use detcore_model::syscall_histogram::SyscallObservationScope;
 use futures::FutureExt;
 use futures::channel::oneshot;
 use futures::future::Shared;
@@ -2097,6 +2099,13 @@ pub struct Scheduler {
     /// Counts already consumed from displaced leaders before the current
     /// transferred incarnation began reporting under the same leader TID.
     transferred_exec_syscall_offsets: BTreeMap<DetTid, u64>,
+
+    /// Final syscall histogram reported by each thread when it deregisters,
+    /// kept exactly like `per_thread_syscalls`, whose counts are its totals.
+    per_thread_syscall_histograms: BTreeMap<DetTid, SyscallHistogram>,
+
+    /// The histograms behind `transferred_exec_syscall_offsets`.
+    transferred_exec_syscall_histograms: BTreeMap<DetTid, SyscallHistogram>,
 
     /// A record of which preemptions occured on each thread.  Only used IF `--record-preemptions`
     /// was specified in the Config, otherwise this remains empty.
@@ -4419,6 +4428,8 @@ impl Scheduler {
             per_thread_timeslice: Default::default(),
             per_thread_syscalls: Default::default(),
             transferred_exec_syscall_offsets: Default::default(),
+            per_thread_syscall_histograms: Default::default(),
+            transferred_exec_syscall_histograms: Default::default(),
             fuzz_futexes: cfg.fuzz_futexes,
             chaos_target_races: cfg.chaos_target_races,
             chaos: cfg.chaos,
@@ -5983,10 +5994,17 @@ impl Scheduler {
         let former = reconnect.caller;
         let leader = reconnect.new_leader;
         let consumed_syscalls = self.per_thread_syscalls.get(&leader).copied().unwrap_or(0);
+        let consumed_histogram = self
+            .per_thread_syscall_histograms
+            .get(&leader)
+            .cloned()
+            .unwrap_or_default();
         let retired = self.reconnect_exec(reconnect, replay_resume);
         self.retired_transferred_exec_callers.insert(former);
         self.transferred_exec_syscall_offsets
             .insert(leader, consumed_syscalls);
+        self.transferred_exec_syscall_histograms
+            .insert(leader, consumed_histogram);
         retired
     }
 
@@ -6564,6 +6582,7 @@ impl Scheduler {
         self.exec_incarnations.insert(tid, mm);
         self.deregistration_accounted.remove(&tid);
         self.transferred_exec_syscall_offsets.remove(&tid);
+        self.transferred_exec_syscall_histograms.remove(&tid);
         self.retired_transferred_exec_callers.remove(&tid);
     }
 
@@ -15969,8 +15988,14 @@ impl Scheduler {
             .merge(&stats);
     }
 
-    /// Record an exiting thread's final completed-syscall count.
-    pub fn record_syscall_count(&mut self, dettid: DetTid, count: u64) {
+    /// Record an exiting thread's final completed-syscall count and
+    /// histogram.
+    pub fn record_syscall_count(
+        &mut self,
+        dettid: DetTid,
+        count: u64,
+        histogram: SyscallHistogram,
+    ) {
         let consumed = self
             .transferred_exec_syscall_offsets
             .get(&dettid)
@@ -15980,6 +16005,13 @@ impl Scheduler {
             .checked_add(count)
             .expect("transferred exec syscall count overflow");
         self.per_thread_syscalls.insert(dettid, total);
+        let mut merged = self
+            .transferred_exec_syscall_histograms
+            .get(&dettid)
+            .cloned()
+            .unwrap_or_default();
+        merged.merge(&histogram);
+        self.per_thread_syscall_histograms.insert(dettid, merged);
     }
 
     /// Report a checkpoint mismatch without inserting an event or moving the
@@ -16159,6 +16191,10 @@ impl Scheduler {
             timeslice_stats.merge(st);
         }
         let syscalls = self.per_thread_syscalls.values().copied().sum();
+        let mut syscall_histogram = SyscallHistogram::default();
+        for histogram in self.per_thread_syscall_histograms.values() {
+            syscall_histogram.merge(histogram);
+        }
 
         Ok((
             RunSummary {
@@ -16182,6 +16218,11 @@ impl Scheduler {
                 dispatch_stats: None,
                 // GlobalState records the effective run configuration.
                 preemption: None,
+                // GlobalState knows what the accounting point could not see
+                // and replaces this scope (`run_summary_for_log`).
+                syscall_histogram: Some(
+                    syscall_histogram.summary(SyscallObservationScope::Complete),
+                ),
             },
             info_reprio_descrip,
         ))
@@ -18800,6 +18841,16 @@ mod test {
         }
     }
 
+    /// A histogram of `n` getpid entries, as a thread with `syscall_count` n
+    /// reports it.
+    fn entries(n: u64) -> SyscallHistogram {
+        let mut histogram = SyscallHistogram::default();
+        for _ in 0..n {
+            histogram.enter(reverie::syscalls::Sysno::getpid);
+        }
+        histogram
+    }
+
     #[test]
     fn transferred_exec_reconnect_accumulates_consumed_leader_syscalls_once() {
         let config = Config::default().with_backend(|backend| {
@@ -18811,20 +18862,22 @@ mod test {
         let second_caller = DetTid::from_raw(19);
         let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
         assert!(sched.note_deregistration_accounted(leader));
-        sched.record_syscall_count(leader, 3);
+        sched.record_syscall_count(leader, 3, entries(3));
         sched.logically_kill_thread(&leader, &detpid, pre_exec_mm);
 
         reconnect_transferred_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
         sched.drain_pending_run_queue_removals();
         sched.drain_pending_run_queue_admissions();
         assert!(sched.note_deregistration_accounted(leader));
-        sched.record_syscall_count(leader, 7);
+        sched.record_syscall_count(leader, 7, entries(7));
         assert_eq!(sched.per_thread_syscalls[&leader], 10);
+        assert_eq!(sched.per_thread_syscall_histograms[&leader], entries(10));
         assert!(!sched.note_deregistration_accounted(leader));
         // The count itself is idempotent too; do not add the previous aggregate
         // each time the current incarnation reports its final count.
-        sched.record_syscall_count(leader, 7);
+        sched.record_syscall_count(leader, 7, entries(7));
         assert_eq!(sched.per_thread_syscalls[&leader], 10);
+        assert_eq!(sched.per_thread_syscall_histograms[&leader], entries(10));
 
         sched.thread_tree.add_child(leader, second_caller, false);
         register_known_thread(&mut sched, second_caller);
@@ -18833,11 +18886,13 @@ mod test {
         sched.logically_kill_thread(&leader, &detpid, second_mm);
         reconnect_transferred_exec(&mut sched, leader, second_caller, detpid, second_mm);
         assert!(sched.note_deregistration_accounted(leader));
-        sched.record_syscall_count(leader, 11);
+        sched.record_syscall_count(leader, 11, entries(11));
         assert_eq!(sched.per_thread_syscalls[&leader], 21);
+        assert_eq!(sched.per_thread_syscall_histograms[&leader], entries(21));
         assert!(!sched.note_deregistration_accounted(leader));
         assert!(!sched.per_thread_syscalls.contains_key(&caller));
         assert!(!sched.per_thread_syscalls.contains_key(&second_caller));
+        assert!(!sched.per_thread_syscall_histograms.contains_key(&caller));
     }
 
     #[test]
@@ -18850,16 +18905,18 @@ mod test {
             let leader = DetTid::from_raw(17);
             let caller = DetTid::from_raw(18);
             let (detpid, pre_exec_mm, _) = install_runnable_exec_group(&mut sched, leader, caller);
-            sched.record_syscall_count(leader, 3);
+            sched.record_syscall_count(leader, 3, entries(3));
             if reload {
                 reconnect_nonleader_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
             }
 
             assert!(sched.note_deregistration_accounted(leader));
-            sched.record_syscall_count(leader, 7);
+            sched.record_syscall_count(leader, 7, entries(7));
             assert_eq!(sched.per_thread_syscalls[&leader], 7);
+            assert_eq!(sched.per_thread_syscall_histograms[&leader], entries(7));
             assert!(sched.note_deregistration_accounted(leader));
             assert!(sched.transferred_exec_syscall_offsets.is_empty());
+            assert!(sched.transferred_exec_syscall_histograms.is_empty());
         }
     }
 

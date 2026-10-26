@@ -940,7 +940,8 @@ mod tests {
             // a_declared_redis_pair_is_used_only_when_declared and
             // a_bad_redis_declaration_is_refused_rather_than_replaced (+2): 691.
             // Separately name the optional e9patch source-inspection leg (+1): 692.
-            assert_eq!(population, 692);
+            // And the two-run syscall-histogram test in dispatch_stats (+1): 693.
+            assert_eq!(population, 693);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

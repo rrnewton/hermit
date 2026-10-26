@@ -90,6 +90,7 @@ pub mod slice_boundary;
 mod sock_diag;
 mod stat;
 mod syscall_classification;
+mod syscall_histogram;
 #[cfg(test)]
 mod syscall_hot_path_tests;
 mod syscall_time;
@@ -182,6 +183,7 @@ pub use scheduler::runqueue::LAST_PRIORITY;
 pub use scheduler::set_terminal_deadlock_hook;
 pub use tool_global::BackendFailureCleanup;
 pub use tool_global::GlobalState;
+pub use tool_global::SyscallObservationGap;
 use tool_global::ThreadDeregistration;
 use tool_global::acknowledge_robust_list_exit_time;
 pub use tool_global::cancel_exec;
@@ -4377,7 +4379,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // only the execve's share of that gap.)
         let thread = guest.thread_state_mut();
         if !thread.past_global_first_execve && thread.stats.syscall_count == 0 {
-            thread.stats.count_syscall();
+            thread.stats.count_syscall(Sysno::execve);
             thread
                 .thread_logical_time
                 .add_syscall_with_cost(syscall_time::cost_ns(Sysno::execve));
@@ -4810,7 +4812,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let new_count = {
             // which results from not being able to borrow guest twice.
             let thread_state = guest.thread_state_mut();
-            thread_state.stats.count_syscall();
+            thread_state.stats.count_syscall(call.number());
 
             // Every intercepted syscall advances logical time, including configurations that do
             // not serialize threads. This keeps virtual clocks productive during syscall loops.
@@ -4830,6 +4832,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             thread_state.account_process_cpu_time();
             thread_state.stats.syscall_count
         };
+        // The backend's injection count at entry: the histogram's outcome
+        // compares it with the count at the result (`syscall_histogram`).
+        let injected_at_entry = guest.injected_syscalls();
 
         // Happens-before enforcement checkpoint. When the run carries a
         // happens-before program and an anchor at exactly
@@ -4974,7 +4979,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 .await
                 .transpose()
             {
-                Some(refusal) => Some(refusal),
+                Some(refusal) => {
+                    syscall_histogram::mark_refused::<T, G>(guest);
+                    Some(refusal)
+                }
                 None => match self.answer_rendered_procfs_operation(guest, &call).await {
                     Some(answer) => Some(answer),
                     None => match self.answer_rendered_procfs_mapping(guest, &call).await {
@@ -5001,7 +5009,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // moves and no arm changes behaviour. `syscall_hot_path_tests` bounds
         // the result.
         let res = match classify_syscall(call.number()) {
-            _ if sigalrm_refusal.is_some() => Err(sigalrm_refusal.expect("checked").into()),
+            _ if sigalrm_refusal.is_some() => {
+                syscall_histogram::mark_refused::<T, G>(guest);
+                Err(sigalrm_refusal.expect("checked").into())
+            }
             _ if rendered_procfs_answer.is_some() => rendered_procfs_answer.expect("checked"),
             SyscallClassification::PassThrough if call.number() == Sysno::chroot => {
                 let result = self.passthrough(guest, call).await;
@@ -5142,6 +5153,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // error and exits 2. vmsplice keeps ENOSYS.
             SyscallClassification::Determinized if is_zero_copy_pipe_syscall(call.number()) => {
                 if panic_on_unsupported_syscalls {
+                    syscall_histogram::mark_refused::<T, G>(guest);
                     if call.number() == Sysno::vmsplice {
                         Err(Error::Errno(Errno::ENOSYS))
                     } else {
@@ -5173,6 +5185,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized
                 if is_privileged_admin_refused_syscall(call.number()) =>
             {
+                syscall_histogram::mark_refused::<T, G>(guest);
                 Err(Error::Errno(Errno::EPERM))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5181,6 +5194,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized
                 if is_process_isolation_refused_syscall(call.number()) =>
             {
+                syscall_histogram::mark_refused::<T, G>(guest);
                 Err(Error::Errno(Errno::EPERM))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5197,6 +5211,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized
                 if is_privileged_observation_refused_syscall(call.number()) =>
             {
+                syscall_histogram::mark_refused::<T, G>(guest);
                 Err(Error::Errno(Errno::EPERM))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5224,6 +5239,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::Determinized
                 if is_mount_ns_admin_refused_syscall(call.number()) =>
             {
+                syscall_histogram::mark_refused::<T, G>(guest);
                 Err(Error::Errno(Errno::EPERM))
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5978,6 +5994,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // first; it is not a general guard (see
         // `fail_on_tool_decided_injection`).
         crate::syscalls::helpers::fail_on_tool_decided_injection::<T, G>(guest, call.number());
+        syscall_histogram::finish::<T, G>(guest, call.number(), &res, injected_at_entry);
 
         // A copy may already have changed guest memory before reporting a
         // terminal backend error. Do not perform even the syscall-result
@@ -6255,6 +6272,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             vfork_origin: thread_state.vfork_origin,
             timeslice_stats: thread_state.stats.timeslice_stats,
             syscall_count: thread_state.stats.syscall_count,
+            syscall_histogram: std::mem::take(&mut thread_state.stats.syscall_histogram),
             chaos_epochs: pending_chaos_epochs,
         };
         if transferred_exec {
