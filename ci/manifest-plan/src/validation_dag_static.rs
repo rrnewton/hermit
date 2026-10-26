@@ -3259,6 +3259,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 216dbc929a full validate.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 3395 + 44 = 3439 (Train 5 delta +44).
+    // And scheduler::test::a_prehook_context_switch_leaves_the_switching_thread_its_own_slice: 3464 + 1 = 3465.
     ("test.detcore_unit", 3465),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
@@ -5866,6 +5867,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
     // Train 5 recount (same growth as test.detcore_unit), composed on measured main: 3395 + 44 = 3439.
+    // And scheduler::test::a_prehook_context_switch_leaves_the_switching_thread_its_own_slice: 3464 + 1 = 3465.
     ("test.detcore_unit_on_host", 3465),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
