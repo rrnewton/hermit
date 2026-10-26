@@ -1984,7 +1984,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // units (one_event_timing_slices_report_their_own_dynamic_endpoints,
     // one_event_timing_slice_replays_must_repeat_their_own_outcomes,
     // recorded_rip_wildcards_preserve_the_replays_stack_source): 1252 + 3 = 1255.
-    ("test.hermit_unit", 1255),
+    // And the racing-accesses report's races::tests::{
+    // the_outcome_point_is_the_first_criterion_met_after_the_decision,
+    // the_block_prints_each_access_stack_and_an_unavailable_reason} and
+    // race_report::tests::{an_unreadable_realized_schedule_is_named,
+    // a_traced_replay_carries_the_record_cap}: 1259.
+    ("test.hermit_unit", 1259),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6302,7 +6307,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The split retains nine additional core identities: 1329 + 9 = 1338.
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
     // And the same three restored report-stack units: 1246 + 3 = 1249.
-    ("test.hermit_unit_on_host", 1249),
+    // And the same four racing-accesses report tests: 1253.
+    ("test.hermit_unit_on_host", 1253),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
