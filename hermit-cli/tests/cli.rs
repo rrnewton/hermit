@@ -22551,6 +22551,54 @@ fn a_replay_stuck_off_its_schedule_stops_under_replay_exhausted_panic() {
     assert_eq!(stdout(&replay), "", "the guest ran on past the release");
 }
 
+/// A schedule recorded with `--record-preemptions-to` replays with
+/// `--replay-schedule-from` under the thread IDs it recorded. On aarch64 a run
+/// that records preemptions counts store-exclusives, and the probe that checks
+/// the counters ran on a new thread of the tracer. The tracer runs in the
+/// guest's PID namespace, so that thread took a PID there and every guest
+/// thread after it got the next ID up. A replay of the schedule does not
+/// probe, so it left its schedule at the first switch to the guest's second
+/// thread (recorded as 6, running as 5). `hermit analyze` replays each trial
+/// that way and could not search on aarch64.
+#[test]
+fn a_recorded_schedule_replays_its_threads_under_their_recorded_ids() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let schedule = directory.path().join("schedule.json");
+    let guest = hb_two_threads_guest().to_str().unwrap().to_owned();
+    let record = format!("--record-preemptions-to={}", schedule.display());
+    let recorded = hermit(&[
+        "run",
+        "--strict",
+        "--max-timeslice=disabled",
+        &record,
+        "--",
+        &guest,
+    ]);
+    assert!(recorded.status.success(), "{}", stderr(&recorded));
+
+    let replay = format!("--replay-schedule-from={}", schedule.display());
+    let replayed = hermit(&[
+        "run",
+        "--strict",
+        "--max-timeslice=disabled",
+        &replay,
+        "--",
+        &guest,
+    ]);
+    let log = stderr(&replayed);
+    assert!(
+        replayed.status.success(),
+        "exit {:?}:\n{log}",
+        replayed.status.code()
+    );
+    assert!(
+        !log.contains("desynced state") && !log.contains("expected to be running thread"),
+        "the replay left its recorded schedule:\n{log}"
+    );
+    assert_eq!(stdout(&replayed), stdout(&recorded));
+}
+
 /// A gate on a vfork child before its exec can never open: while the child
 /// runs, no other thread can (https://github.com/rrnewton/hermit/issues/3930).
 /// The child of `posix_spawn` calls dup2 before execve; a spec holding it there
