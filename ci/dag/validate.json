@@ -43015,7 +43015,7 @@
       "env": {
         "HERMIT_NEXTEST_RESULTS_SCHEMA": "5",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1215",
+        "NEXTEST_EXPECTED_EXECUTED": "1230",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"liteinst,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
