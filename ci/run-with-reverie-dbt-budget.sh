@@ -2835,7 +2835,23 @@ fi
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory, SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the 394619b9 entry.
-expected_pin=f443afab11361467fdf6560171bb3f588164880e
+# CARRY TO 9be13b78aa3aa33ed23ef67c83d7ce29e7195546 (2026-10-26): from
+# f443afab11361467fdf6560171bb3f588164880e. The reviewed dh-w6bbf stack
+# serializes private-memory observer invocation and completed withdrawal,
+# resets inherited state at separate-mm fork initialization, and republishes
+# accepted child ownership. SDK and native-client inputs change; this is not
+# an unchanged-input carry. Public C signatures and Rust dependency manifests
+# are unchanged; the DBT source inventory grows from 1012 to 1029.
+# With CMAKE=cmake, CMAKE_GENERATOR unset and SOURCE_DATE_EPOCH=0, the production
+# SDK recipe is 4075826971d59995855115a9c793cc6f2b1383c09f09603c514d91bdff274deb.
+# The bounded production build completed in 29.16s with eight build jobs;
+# that was an incremental build, not a new cold-build calibration. The
+# subsequent verified installed closure is reused for the companion checks.
+# The added leaf synchronization and tests do not add SDK compilation units
+# or change build options, so the existing cold-build budget and job limits
+# are retained as an explicit build-time judgment. Runtime acceptance is
+# separate. The private witness SDK is not the shipped or budget-bound route.
+expected_pin=9be13b78aa3aa33ed23ef67c83d7ce29e7195546
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
