@@ -132,6 +132,7 @@ use hermit::canonical_verdict::InfrastructureError;
 use hermit::canonical_verdict::Verdict;
 use hermit::canonical_verdict::VerificationReport;
 
+static PIPE_READER_REPLAY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static ANON_MAPPING_WRITE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -904,6 +905,32 @@ fn binder_fd_passing_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "binder-fd-passing guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn pipe_reader_replay_guest() -> &'static Path {
+    PIPE_READER_REPLAY_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("pipe-reader-replay");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create pipe-reader-replay guest directory");
+        let guest = build_root.join("pipe_reader_replay");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/pipe_reader_replay.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile pipe-reader-replay guest");
+        assert!(
+            output.status.success(),
+            "pipe-reader-replay guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -22356,6 +22383,48 @@ fn happens_before_source_then_blocking_wait_lets_the_target_pass() {
         "the target {child}:{target} finished (line {target_done}) before the source \
          {parent}:{source} (line {source_done})"
     );
+}
+
+/// A schedule replay of a pipe reader whose writers wrote and exited after
+/// its last failed attempt is no deadlock: the reader's retry reads their
+/// bytes. In a replay the reader is held after that attempt, as the schedule
+/// runs a writer next, and its `TraceReplay` grant hands it its turn back
+/// before the retry. The idle-poller check counted that grant as the reader's
+/// latest attempt, so it judged the reader to have failed after everything
+/// the writers did, and reported a guest deadlock. Seeds 1, 5, 6 and 7,
+/// recorded under `--chaos`, each did, and must now replay to the
+/// recording's line with no desync.
+#[test]
+fn a_schedule_replay_of_a_pipe_reader_whose_writers_exited_is_no_deadlock() {
+    let program = pipe_reader_replay_guest()
+        .to_str()
+        .expect("pipe-reader-replay guest path should be UTF-8");
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    for seed in [1, 5, 6, 7] {
+        let record = dir.path().join(format!("seed-{seed}.json"));
+        let summary = dir.path().join(format!("seed-{seed}.summary.json"));
+        let seed_arg = format!("--seed={seed}");
+        let record_arg = format!("--record-preemptions-to={}", record.display());
+        let replay_arg = format!("--replay-schedule-from={}", record.display());
+        let summary_arg = format!("--summary-json={}", summary.display());
+        let run = |extra: &[&str]| {
+            let mut args = vec!["run", "--strict", "--epoch=2026-01-01T00:00:00Z"];
+            args.extend_from_slice(extra);
+            args.extend(["--", program]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            stdout(&output)
+        };
+        let recorded = run(&["--chaos", seed_arg.as_str(), record_arg.as_str()]);
+        assert_eq!(
+            run(&[replay_arg.as_str(), summary_arg.as_str()]),
+            recorded,
+            "seed {seed}"
+        );
+        let summary: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&summary).unwrap()).unwrap();
+        assert_eq!(summary["schedevent_desynced"], 0, "seed {seed}: {summary}");
+    }
 }
 
 /// A gate whose BEFORE anchor can never fire, on the only thread left, is a

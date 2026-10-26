@@ -1555,9 +1555,12 @@ pub struct Scheduler {
     /// The sequence number of each guest-state-only poller's latest grant,
     /// until the thread commits a turn of another kind.
     guest_state_polled_at: BTreeMap<DetTid, u64>,
-    /// The sequence number of each thread's latest committed turn: a poller's
-    /// failed attempt came no earlier.
-    last_commit_at: BTreeMap<DetTid, u64>,
+    /// The sequence number of each thread's latest polling grant: its latest
+    /// attempt. Another grant is no attempt, and runs no guest code before a
+    /// poller's retry: a schedule replay's `TraceReplay` grant, which only
+    /// hands a thread held after a traced event its turn back, can fall
+    /// between a poller's failed attempt and its retry.
+    last_attempt_at: BTreeMap<DetTid, u64>,
     /// Set at the commit of a FIFO open's poll when nothing else can run but
     /// a timer is due at a finite deadline: the next pass moves global time
     /// to that deadline, as an empty run queue does, rather than letting the
@@ -5038,7 +5041,7 @@ impl Scheduler {
             last_progress: 0,
             retired_at: 0,
             guest_state_polled_at: Default::default(),
-            last_commit_at: Default::default(),
+            last_attempt_at: Default::default(),
             fast_forward_for_alone_poller: false,
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
@@ -16733,6 +16736,35 @@ impl Scheduler {
         Self::retry_number(rs) > 1 && !rs.previous_attempt_made_progress
     }
 
+    /// The idle-poller bookkeeping of `dtid`'s committed turn (`unblock_guest`):
+    /// its sequence number; a polling grant's attempt (`last_attempt_at`); and
+    /// progress, which any grant but a guest-state-only poll is, and a
+    /// guest-state-only poller's previous grant is unless this request retries
+    /// after an attempt that moved nothing.
+    fn note_committed_turn(
+        &mut self,
+        dtid: DetTid,
+        polling: bool,
+        guest_state_poll: bool,
+        fruitless: bool,
+    ) {
+        self.progress_epoch += 1;
+        if polling {
+            self.last_attempt_at.insert(dtid, self.progress_epoch);
+        }
+        let previous_grant = self.guest_state_polled_at.remove(&dtid);
+        if guest_state_poll {
+            if let Some(previous) = previous_grant
+                && !fruitless
+            {
+                self.last_progress = self.last_progress.max(previous);
+            }
+            self.guest_state_polled_at.insert(dtid, self.progress_epoch);
+        } else {
+            self.last_progress = self.progress_epoch;
+        }
+    }
+
     /// Whether no guest thread other than `dtid` can make progress unless a
     /// host acts or a timer fires, judged from scheduler state alone at
     /// `dtid`'s commit (<https://github.com/rrnewton/hermit/issues/2203>).
@@ -16742,7 +16774,7 @@ impl Scheduler {
     ///   (`Resources::polls_guest_state_only`), whatever its backoff, whose
     ///   request retries after an attempt that moved nothing
     ///   (`waits_after_a_failed_attempt`), made no earlier than the latest
-    ///   progress: its latest commit (`last_commit_at`) is at or after every
+    ///   progress: its latest attempt (`last_attempt_at`) is at or after every
     ///   turn known to be progress (`last_progress`) and every other poller's
     ///   grant whose thread's request does not repeat that call without
     ///   progress (`retries_its_call_without_progress`);
@@ -16794,11 +16826,11 @@ impl Scheduler {
     /// actions (`Resources::polls_guest_state_only`), whatever its backoff,
     /// and whose request retries after an attempt that moved nothing
     /// (`waits_after_a_failed_attempt`), made no earlier than `progress`
-    /// (`latest_progress`): its latest commit (`last_commit_at`) is at or
+    /// (`latest_progress`): its latest attempt (`last_attempt_at`) is at or
     /// after it.
     fn is_idle_guest_poller(&self, tid: DetTid, progress: u64) -> bool {
         self.run_queue.contains_tid(tid)
-            && self.committed_since(tid, progress)
+            && self.attempted_since(tid, progress)
             && self.request_satisfies(tid, Self::waits_on_guest_state)
     }
 
@@ -16810,9 +16842,9 @@ impl Scheduler {
             && Self::waits_after_a_failed_attempt(rs)
     }
 
-    /// Whether `tid`'s latest commit (`last_commit_at`) is at or after `progress`.
-    fn committed_since(&self, tid: DetTid, progress: u64) -> bool {
-        self.last_commit_at
+    /// Whether `tid`'s latest attempt (`last_attempt_at`) is at or after `progress`.
+    fn attempted_since(&self, tid: DetTid, progress: u64) -> bool {
+        self.last_attempt_at
             .get(&tid)
             .is_some_and(|&commit| commit >= progress)
     }
@@ -16870,7 +16902,7 @@ impl Scheduler {
         let progress = self.latest_progress(None).max(self.retired_at);
         self.run_queue
             .tids()
-            .all(|&tid| self.committed_since(tid, progress))
+            .all(|&tid| self.attempted_since(tid, progress))
             && self.next_turns.keys().all(|&tid| {
                 (self.run_queue.contains_tid(tid) || self.is_parked(tid))
                     && !self.thread_is_doomed(tid)
@@ -17494,21 +17526,7 @@ impl Scheduler {
                     .and_then(Result::ok)
             })
             .flatten();
-        self.progress_epoch += 1;
-        self.last_commit_at.insert(dtid, self.progress_epoch);
-        let previous_grant = self.guest_state_polled_at.remove(&dtid);
-        if guest_state_poll {
-            // This thread's previous grant moved something unless this request
-            // retries after an attempt that did not.
-            if let Some(previous) = previous_grant
-                && !fruitless
-            {
-                self.last_progress = self.last_progress.max(previous);
-            }
-            self.guest_state_polled_at.insert(dtid, self.progress_epoch);
-        } else {
-            self.last_progress = self.progress_epoch;
-        }
+        self.note_committed_turn(dtid, polling_grant, guest_state_poll, fruitless);
         let mut alone = wants_alone && self.nothing_else_can_run(dtid);
         if alone
             && self
@@ -19782,7 +19800,7 @@ mod test {
 
     /// A queued polling thread whose request carries `polls_guest_state_only`
     /// as given and retries after an attempt that moved nothing, with its
-    /// latest grant recorded as the latest committed turn.
+    /// latest grant recorded as its latest attempt.
     fn queued_poller(sched: &mut Scheduler, tid: DetTid, guest_state_only: bool) {
         register_known_thread(sched, tid);
         let mut resources = Resources::new(tid);
@@ -19791,7 +19809,7 @@ mod test {
         resources.polls_guest_state_only = guest_state_only;
         sched.next_turns[&tid].req.put(Ok(resources));
         sched.run_queue.push_poller(tid, DEFAULT_PRIORITY, 1);
-        sched.last_commit_at.insert(tid, sched.progress_epoch);
+        sched.last_attempt_at.insert(tid, sched.progress_epoch);
         if guest_state_only {
             sched
                 .guest_state_polled_at
@@ -20106,6 +20124,27 @@ mod test {
         assert!(!sched.nothing_else_can_run(opener));
     }
 
+    /// A schedule replay's `TraceReplay` grant hands a thread held after a
+    /// traced event its turn back, and is no attempt. A pipe reader held that
+    /// way after its failed attempt, while the writer wrote and left, is not
+    /// idle: its retry may succeed. Before, the grant counted as the reader's
+    /// latest attempt, and a schedule replay of a reader whose writers had
+    /// exited reported a false guest deadlock. A further failed attempt makes
+    /// the reader idle again.
+    #[test]
+    fn a_trace_replay_grant_after_a_failed_attempt_is_no_attempt() {
+        let mut sched = Scheduler::new(&Config::default());
+        let reader = DetTid::from_raw(3);
+        queued_poller(&mut sched, reader, true);
+        sched.thread_tree.add_child(reader, reader, true);
+        assert!(sched.only_idle_guest_pollers_remain());
+        sched.note_committed_turn(DetTid::from_raw(7), false, false, false);
+        sched.note_committed_turn(reader, false, false, false);
+        assert!(!sched.only_idle_guest_pollers_remain());
+        sched.note_committed_turn(reader, true, true, true);
+        assert!(sched.only_idle_guest_pollers_remain());
+    }
+
     /// A partial pipe write's retry follows an attempt that moved bytes: the
     /// writer may move more (Claude review of
     /// https://github.com/rrnewton/hermit/pull/4329, F1).
@@ -20123,7 +20162,7 @@ mod test {
         resources.previous_attempt_made_progress = true;
         sched.next_turns[&writer].req.put(Ok(resources));
         sched.run_queue.push_poller(writer, DEFAULT_PRIORITY, 2);
-        sched.last_commit_at.insert(writer, sched.progress_epoch);
+        sched.last_attempt_at.insert(writer, sched.progress_epoch);
         sched
             .guest_state_polled_at
             .insert(writer, sched.progress_epoch);
@@ -20430,7 +20469,7 @@ mod test {
                 _ => {
                     fifo_open_poll(&mut sched, poller);
                     sched.run_queue.push_poller(poller, DEFAULT_PRIORITY, 1);
-                    sched.last_commit_at.insert(poller, sched.progress_epoch);
+                    sched.last_attempt_at.insert(poller, sched.progress_epoch);
                 }
             }
             let writer = DetTid::from_raw(5);
