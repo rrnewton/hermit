@@ -21,6 +21,32 @@ use serde_json::Number;
 use serde_json::Value;
 
 const MAX_INPUT_BYTES: usize = 16 << 20;
+// A complete native ExpectedGraph includes every producer's directory members.
+// The measured graph is 22,884,345 bytes; its fixed resource allowance is larger
+// than ordinary inputs, but remains below R's 64 MiB native-record limit.
+const MAX_EXPECTED_GRAPH_BYTES: usize = 32 << 20;
+
+#[derive(Clone, Copy)]
+enum SnapshotKind {
+    Ordinary,
+    ExpectedGraph,
+}
+
+impl SnapshotKind {
+    fn byte_limit(self) -> usize {
+        match self {
+            Self::Ordinary => MAX_INPUT_BYTES,
+            Self::ExpectedGraph => MAX_EXPECTED_GRAPH_BYTES,
+        }
+    }
+
+    fn limit_error(self) -> &'static str {
+        match self {
+            Self::Ordinary => "native input exceeds 16 MiB byte bound",
+            Self::ExpectedGraph => "native expected graph exceeds 32 MiB byte bound",
+        }
+    }
+}
 
 pub(crate) fn require(ok: bool, message: &str) -> proof::Result<()> {
     if ok { Ok(()) } else { Err(message.into()) }
@@ -108,7 +134,21 @@ fn same_snapshot(left: &fs::Metadata, right: &fs::Metadata) -> bool {
         && left.ctime_nsec() == right.ctime_nsec()
 }
 
-fn read_snapshot(path: &Path) -> proof::Result<(proof::FileIdentity, Vec<u8>)> {
+fn read_bounded(reader: &mut impl Read, kind: SnapshotKind) -> proof::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    // The sentinel detects growth past the bound; never parse a truncated prefix.
+    reader
+        .take((kind.byte_limit() + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    require(bytes.len() <= kind.byte_limit(), kind.limit_error())?;
+    Ok(bytes)
+}
+
+fn read_snapshot_for(
+    path: &Path,
+    kind: SnapshotKind,
+) -> proof::Result<(proof::FileIdentity, Vec<u8>)> {
     let path = proof::real_file(path)?;
     let mut file = fs::OpenOptions::new()
         .read(true)
@@ -121,21 +161,10 @@ fn read_snapshot(path: &Path) -> proof::Result<(proof::FileIdentity, Vec<u8>)> {
         same_snapshot(&before, &named),
         "native input is not the opened regular file",
     )?;
-    require(
-        before.len() <= MAX_INPUT_BYTES as u64,
-        "native input exceeds 16 MiB byte bound",
-    )?;
-    let mut bytes = Vec::new();
-    // The extra byte detects growth past the bound; never parse a truncated
-    // prefix. O_NONBLOCK also prevents a raced FIFO replacement from hanging.
-    file.by_ref()
-        .take((MAX_INPUT_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
+    require(before.len() <= kind.byte_limit() as u64, kind.limit_error())?;
+    // O_NONBLOCK also prevents a raced FIFO replacement from hanging.
+    let bytes = read_bounded(&mut file, kind)
         .map_err(|e| format!("read native input {}: {e}", path.display()))?;
-    require(
-        bytes.len() <= MAX_INPUT_BYTES,
-        "native input exceeds 16 MiB byte bound",
-    )?;
     let after = file.metadata().map_err(|e| e.to_string())?;
     let named = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
     require(
@@ -149,19 +178,29 @@ fn read_snapshot(path: &Path) -> proof::Result<(proof::FileIdentity, Vec<u8>)> {
     Ok((identity, bytes))
 }
 
-fn verify_snapshot(identity: &proof::FileIdentity) -> proof::Result<()> {
-    let (current, _) = read_snapshot(&identity.path)?;
+fn read_snapshot(path: &Path) -> proof::Result<(proof::FileIdentity, Vec<u8>)> {
+    read_snapshot_for(path, SnapshotKind::Ordinary)
+}
+
+fn verify_snapshot_for(identity: &proof::FileIdentity, kind: SnapshotKind) -> proof::Result<()> {
+    let (current, _) = read_snapshot_for(&identity.path, kind)?;
     require(current == *identity, "native input identity changed")
 }
 
-fn parse_snapshot<T: DeserializeOwned>(
+fn verify_snapshot(identity: &proof::FileIdentity) -> proof::Result<()> {
+    verify_snapshot_for(identity, SnapshotKind::Ordinary)
+}
+
+fn verify_expected_snapshot(identity: &proof::FileIdentity) -> proof::Result<()> {
+    verify_snapshot_for(identity, SnapshotKind::ExpectedGraph)
+}
+
+fn parse_snapshot_for<T: DeserializeOwned>(
     identity: &proof::FileIdentity,
     bytes: &[u8],
+    kind: SnapshotKind,
 ) -> proof::Result<T> {
-    require(
-        bytes.len() <= MAX_INPUT_BYTES,
-        "native input exceeds 16 MiB byte bound",
-    )?;
+    require(bytes.len() <= kind.byte_limit(), kind.limit_error())?;
     require(
         proof::sha256(bytes) == identity.sha256,
         "native input buffer digest differs from its file identity",
@@ -173,6 +212,23 @@ fn parse_snapshot<T: DeserializeOwned>(
         .end()
         .map_err(|e| format!("native input JSON: {e}"))?;
     serde_json::from_value(value).map_err(|e| format!("native input graph: {e}"))
+}
+
+fn parse_snapshot<T: DeserializeOwned>(
+    identity: &proof::FileIdentity,
+    bytes: &[u8],
+) -> proof::Result<T> {
+    parse_snapshot_for(identity, bytes, SnapshotKind::Ordinary)
+}
+
+// Only the ExpectedGraph entry point selects the larger fixed allowance.
+// Parsing returns data; fresh R admission still owns all qualification checks.
+fn read_expected_graph(path: &Path) -> proof::Result<(proof::FileIdentity, ExpectedGraph)> {
+    let (identity, bytes) = read_snapshot_for(path, SnapshotKind::ExpectedGraph)?;
+    let value =
+        parse_snapshot_for::<ExpectedGraph>(&identity, &bytes, SnapshotKind::ExpectedGraph)?;
+    verify_expected_snapshot(&identity)?;
+    Ok((identity, value))
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> proof::Result<(proof::FileIdentity, T)> {
@@ -205,7 +261,7 @@ pub(crate) struct Inputs {
 }
 impl Inputs {
     pub fn read(expected: &Path, declared: &Path) -> proof::Result<Self> {
-        let (expected_file, expected) = read_json(expected)?;
+        let (expected_file, expected) = read_expected_graph(expected)?;
         let (declared_file, declared) = read_json(declared)?;
         let value = Self {
             expected,
@@ -217,7 +273,7 @@ impl Inputs {
         Ok(value)
     }
     pub fn verify(&self) -> proof::Result<()> {
-        verify_snapshot(&self.expected_file)?;
+        verify_expected_snapshot(&self.expected_file)?;
         verify_snapshot(&self.declared_file)
     }
 }
@@ -586,6 +642,225 @@ mod tests {
             assert!(error.contains(message), "{error}");
             assert!(error.contains("--help"), "{error}");
         }
+    }
+
+    // Parser/resource/custody fixtures only: no owner, compiler, source or
+    // physical qualification factory is invoked.
+    fn graph_input_records(root: &Path) -> (ExpectedGraph, DeclaredGraph) {
+        use proof::native_action::DeclaredProducer;
+        use proof::native_action::ExpectedProducer;
+        use proof::native_action::Profile;
+
+        let expected = ExpectedGraph {
+            leaf: ExpectedProducer {
+                role: "detcore-liteinst".into(),
+                producer: "fixture//:runtime".into(),
+                configuration: "fixture-configuration".into(),
+                selection: "cdylib".into(),
+                crate_name: "detcore_liteinst".into(),
+                features: Vec::new(),
+                profile: Profile {
+                    opt_level: "3".into(),
+                    debuginfo: 0,
+                    debug_assertions: true,
+                    overflow_checks: true,
+                    test: false,
+                },
+                files: BTreeMap::new(),
+                external_linked_inputs: Default::default(),
+                owner_pin: None,
+                wrapper_argv: Vec::new(),
+                wrapper_environment: BTreeMap::new(),
+                wrapper_environment_contract: None,
+                compiler_argv: Vec::new(),
+                compiler_environment: BTreeMap::new(),
+                cwd: Vec::new(),
+                dependencies: BTreeMap::new(),
+                metadata_dependencies: BTreeMap::new(),
+            },
+            dependencies: BTreeMap::new(),
+        };
+        let declared = DeclaredGraph {
+            leaf: DeclaredProducer {
+                role: expected.leaf.role.clone(),
+                producer: expected.leaf.producer.clone(),
+                configuration: expected.leaf.configuration.clone(),
+                selection: expected.leaf.selection.clone(),
+                files: BTreeMap::new(),
+                declared_inputs: BTreeMap::new(),
+                input_roots: BTreeMap::new(),
+                consumed_inputs: BTreeMap::new(),
+                linked_inputs: BTreeMap::new(),
+                control_inputs: BTreeMap::from([
+                    ("owner".into(), root.join("original-owner")),
+                    ("expected".into(), root.join("original-owner-expected.json")),
+                ]),
+                source_tree: root.join("source"),
+                recipe: root.join("recipe.json"),
+                product: root.join("runtime.so"),
+                directory: root.join("output"),
+                input_inventory: root.join("output/input_inventory.json"),
+                invocation: root.join("output/invocation.json"),
+                evidence: root.join("output/evidence.json"),
+                finalization: root.join("output/finalization.json"),
+                qualified_product: Some(root.join("qualified-runtime.so")),
+                metadata_full: None,
+                dependencies: BTreeMap::new(),
+                metadata_dependencies: BTreeMap::new(),
+            },
+            dependencies: BTreeMap::new(),
+        };
+        (expected, declared)
+    }
+
+    #[test]
+    fn expected_graph_exact_32_mib_roundtrips_but_other_inputs_keep_16_mib() {
+        let root = TestDirectory::create();
+        let expected_path = root.0.join("downstream-expected.json");
+        let declared_path = root.0.join("declared.json");
+        let (expected, declared) = graph_input_records(&root.0);
+        let mut bytes = serde_json::to_vec(&expected).unwrap();
+        // Whitespace exercises the exact byte ceiling without pretending that
+        // parsing a synthetic graph establishes producer or source authority.
+        bytes.resize(32 << 20, b' ');
+        fs::write(&expected_path, &bytes).unwrap();
+        fs::write(&declared_path, serde_json::to_vec(&declared).unwrap()).unwrap();
+        let inputs = Inputs::read(&expected_path, &declared_path).unwrap();
+        assert_eq!(inputs.expected, expected);
+        assert_eq!(inputs.declared, declared);
+        assert_eq!(inputs.expected_file.sha256, proof::sha256(&bytes));
+        assert_eq!(
+            inputs.expected_file.path,
+            fs::canonicalize(&expected_path).unwrap()
+        );
+        inputs.verify().unwrap();
+        verify_expected_snapshot(&inputs.expected_file).unwrap();
+
+        let error = read_json::<ExpectedGraph>(&expected_path).unwrap_err();
+        assert!(error.contains("16 MiB byte bound"), "{error}");
+        let error = read_snapshot(&expected_path).unwrap_err();
+        assert!(error.contains("16 MiB byte bound"), "{error}");
+        #[cfg(feature = "native-exec")]
+        {
+            let error = verify_source_file_bytes(&inputs.expected_file, &bytes).unwrap_err();
+            assert!(error.contains("16 MiB byte bound"), "{error}");
+        }
+        let mut declared_bytes = serde_json::to_vec(&declared).unwrap();
+        declared_bytes.resize((16 << 20) + 1, b' ');
+        fs::write(&declared_path, declared_bytes).unwrap();
+        let error = Inputs::read(&expected_path, &declared_path).err().unwrap();
+        assert!(error.contains("16 MiB byte bound"), "{error}");
+    }
+
+    #[test]
+    fn expected_graph_one_byte_over_32_mib_refuses_buffer_and_file() {
+        let root = TestDirectory::create();
+        let path = root.0.join("expected.json");
+        let (expected, _) = graph_input_records(&root.0);
+        let mut bytes = serde_json::to_vec(&expected).unwrap();
+        bytes.resize((32 << 20) + 1, b' ');
+        let error = parse_snapshot_for::<ExpectedGraph>(
+            &identity(&bytes),
+            &bytes,
+            SnapshotKind::ExpectedGraph,
+        )
+        .unwrap_err();
+        assert!(error.contains("32 MiB byte bound"), "{error}");
+        fs::write(&path, bytes).unwrap();
+        let error = read_expected_graph(&path).unwrap_err();
+        assert!(error.contains("32 MiB byte bound"), "{error}");
+    }
+
+    #[test]
+    fn expected_graph_growth_after_metadata_is_detected_by_the_extra_byte() {
+        struct AppendOnRead {
+            file: fs::File,
+            path: PathBuf,
+            appended: bool,
+            bytes_read: usize,
+        }
+        impl Read for AppendOnRead {
+            fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+                use std::io::Write as _;
+
+                if !self.appended {
+                    fs::OpenOptions::new()
+                        .append(true)
+                        .open(&self.path)?
+                        .write_all(b" ")?;
+                    self.appended = true;
+                }
+                let size = self.file.read(output)?;
+                self.bytes_read += size;
+                Ok(size)
+            }
+        }
+        let root = TestDirectory::create();
+        let path = root.0.join("growing-expected.json");
+        let (expected, _) = graph_input_records(&root.0);
+        let mut bytes = serde_json::to_vec(&expected).unwrap();
+        bytes.resize(32 << 20, b' ');
+        fs::write(&path, bytes).unwrap();
+        let file = fs::File::open(&path).unwrap();
+        // Deterministic ordering, no thread: the initial metadata is admissible;
+        // the first production-helper read appends before returning any bytes.
+        assert_eq!(file.metadata().unwrap().len(), 32 << 20);
+        let mut reader = AppendOnRead {
+            file,
+            path,
+            appended: false,
+            bytes_read: 0,
+        };
+        let error = read_bounded(&mut reader, SnapshotKind::ExpectedGraph).unwrap_err();
+        assert!(error.contains("32 MiB byte bound"), "{error}");
+        assert!(reader.appended);
+        assert_eq!(reader.bytes_read, (32 << 20) + 1);
+        assert_eq!(reader.file.metadata().unwrap().len(), (32 << 20) + 1);
+    }
+
+    #[test]
+    fn expected_graph_path_preserves_strict_json_digest_and_identity_guards() {
+        let root = TestDirectory::create();
+        let path = root.0.join("expected.json");
+        let (mut expected, _) = graph_input_records(&root.0);
+        let bytes = serde_json::to_vec(&expected).unwrap();
+        let mut trailing = bytes.clone();
+        trailing.extend_from_slice(b" {}");
+        let mut unknown = serde_json::to_value(&expected).unwrap();
+        unknown["leaf"]["unexpected"] = serde_json::json!(true);
+        for (invalid, message) in [
+            (
+                br#"{"leaf":{"role":null,"role":false},"dependencies":{}}"#.to_vec(),
+                "duplicate JSON key: role",
+            ),
+            (trailing, "trailing characters"),
+            (serde_json::to_vec(&unknown).unwrap(), "unknown field"),
+        ] {
+            fs::write(&path, invalid).unwrap();
+            let error = read_expected_graph(&path).unwrap_err();
+            assert!(error.contains(message), "{error}");
+        }
+        let mut changed = bytes.clone();
+        changed.push(b' ');
+        let error = parse_snapshot_for::<ExpectedGraph>(
+            &identity(&bytes),
+            &changed,
+            SnapshotKind::ExpectedGraph,
+        )
+        .unwrap_err();
+        assert!(error.contains("buffer digest differs"), "{error}");
+
+        fs::write(&path, &bytes).unwrap();
+        let (retained, parsed) = read_expected_graph(&path).unwrap();
+        assert_eq!(parsed, expected);
+        verify_expected_snapshot(&retained).unwrap();
+        let alias = root.0.join("expected-link.json");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert!(read_expected_graph(&alias).is_err());
+        expected.leaf.configuration = "changed-configuration".into();
+        fs::write(&path, serde_json::to_vec(&expected).unwrap()).unwrap();
+        let error = verify_expected_snapshot(&retained).unwrap_err();
+        assert!(error.contains("identity changed"), "{error}");
     }
 }
 
