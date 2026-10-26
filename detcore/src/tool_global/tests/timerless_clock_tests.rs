@@ -86,6 +86,7 @@ impl GlobalRPC<GlobalState> for ClockGuest {
                         timeslice: None,
                         schedule_released: false,
                         schedule_over: false,
+                        backstop: None,
                     }),
                 )
             }
