@@ -27,7 +27,8 @@
 //! each received descriptor as the receive returns
 //! ([`Detcore::record_received_descriptors`]), from the facts the in-guest
 //! discovery takes (`fcntl(F_GETFD)`, `fcntl(F_GETFL)` and `fstat`, here
-//! injected), through the same `FileMetadata::add_discovered_fd`, so the
+//! taken through the recording), through the same
+//! `FileMetadata::add_discovered_fd`, so the
 //! record is the description the in-guest discovery makes: a directory, for
 //! one, gets a sorted stream of its own. Unlike that discovery, a received
 //! descriptor is never given the container's stdio resource (it is not the
@@ -51,8 +52,16 @@
 //! call may have overwritten its
 //! own inputs, whose vector cannot be read in full, or whose inputs changed
 //! before the attempt that succeeded; and every receive on the background
-//! path. Under record and replay and without sequentialized threads no
-//! receive is recorded, logged at debug level only (`ReceiptMode`).
+//! path. Without sequentialized threads no receive is recorded, logged at
+//! debug level only (`ReceiptMode`).
+//!
+//! Under record and replay every fact is taken through the recording, so
+//! replay, which serves the receive from the log and holds a stand-in in each
+//! received slot, rebuilds the table the recording built. Where the recording
+//! joined a received descriptor to an open file the receiving table holds,
+//! replay also makes the received slot name the live open file
+//! (`Detcore::install_live_alias`), and a received socket whose peer is a
+//! guest is polled in the caller's turn (`Detcore::classify_socket_peer`).
 //!
 //! Linux installs the sender's `struct file` (`receive_fd`): the received
 //! descriptor shares its status flags, directory position and lock ownership
@@ -139,12 +148,22 @@
 //! taken, or one that matched a later message than the oldest. Other files
 //! out of lockstep still join where their identities match, and two open
 //! files of one file are then told apart only by order.
+//!
+//! Under record and replay the send's `fstat` goes through the recording too,
+//! and a received descriptor joins its sender's description only where the
+//! receiving table holds a descriptor of it: replay holds a stand-in in the
+//! received slot and can put the live open file there only by duplicating a
+//! descriptor of the same table. One whose description only another
+//! process's table holds is recorded from the kernel's facts, in both runs
+//! alike.
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::os::fd::RawFd;
 use std::sync::Arc;
 
+use nix::fcntl::OFlag;
+use reverie::Errno;
 use reverie::Error;
 use reverie::Guest;
 use reverie::syscalls;
@@ -161,6 +180,7 @@ use crate::fd::FileIdentity;
 use crate::fd::OpenFileHandle;
 use crate::fd::SentDescriptor;
 use crate::record_or_replay::RecordOrReplay;
+use crate::syscalls::files::SocketRole;
 use crate::syscalls::rendered_procfs::placeholder_identity;
 use crate::syscalls::rendered_procfs::placeholders_exist;
 use crate::tool_local::Detcore;
@@ -886,19 +906,17 @@ enum ReceiptMode {
 impl<T: RecordOrReplay> Detcore<T> {
     /// How this run handles received descriptors. Recorded only where the
     /// tool does not share the guest's descriptor table (it discovers them
-    /// there), with sequentialized threads (otherwise another thread could
+    /// there), and with sequentialized threads (otherwise another thread could
     /// close a number, or `dup2` another file over it, between the receive
     /// and the facts taken here; a received rendered procfs descriptor is
     /// refused by name there when first named,
-    /// `Detcore::adopt_received_placeholders`), and not under record and
-    /// replay (replay stands in a placeholder for each received descriptor
-    /// and serves its calls from the log, so facts taken from the kernel
-    /// would differ between the two runs).
+    /// `Detcore::adopt_received_placeholders`). Under record and replay the
+    /// facts come from the recording ([`Self::probe_received`]), so replay,
+    /// which stands in a placeholder for each received descriptor, takes the
+    /// recording's.
     fn receipt_mode<G: Guest<Self>>(&self, guest: &G) -> ReceiptMode {
         if self.cfg.backend.tool_shares_guest_descriptor_table {
             ReceiptMode::Discovered
-        } else if self.cfg.recordreplay_modes {
-            ReceiptMode::Unrecorded("under record and replay")
         } else if !guest.config().sequentialize_threads {
             ReceiptMode::Unrecorded("without sequentialized threads")
         } else {
@@ -947,12 +965,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// whose layout cannot be trusted, each receive on the background path,
     /// each number that already has a record, each anonymous inode other than
     /// an inotify instance, and each descriptor whose facts cannot be taken.
-    /// Under record and replay and without sequentialized threads none is
-    /// recorded, logged at debug level only (a warning per call, or per tool
-    /// process, would differ between runs that share a process). `cloexec` is
-    /// whether the receive asked for its descriptors close-on-exec
-    /// (`MSG_CMSG_CLOEXEC`), which a descriptor listed without its facts
-    /// keeps.
+    /// Without sequentialized threads none is recorded, logged at debug level
+    /// only (a warning per call, or per tool process, would differ between
+    /// runs that share a process). `cloexec` is whether the receive asked for
+    /// its descriptors close-on-exec (`MSG_CMSG_CLOEXEC`), which a descriptor
+    /// listed without its facts keeps. A tool error, after which record and
+    /// replay could no longer follow each other, ends the run.
     pub(crate) async fn record_received_descriptors<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -960,9 +978,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         in_turn: bool,
         cloexec: bool,
         from: ReceivedFrom,
-    ) -> Vec<RawFd> {
+    ) -> Result<Vec<RawFd>, Error> {
         match self.receipt_mode(guest) {
-            ReceiptMode::Discovered => return Vec::new(),
+            ReceiptMode::Discovered => return Ok(Vec::new()),
             ReceiptMode::Unrecorded(why) => {
                 if !delivered.fds.is_empty() || delivered.refused.is_some() {
                     // A listing of this table cannot come from the model now
@@ -976,7 +994,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         delivered.fds
                     );
                 }
-                return Vec::new();
+                return Ok(Vec::new());
             }
             ReceiptMode::Recorded => {}
         }
@@ -987,7 +1005,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                  recorded: {reason}"
             );
             self.lose_lockstep_if_queued(guest, from);
-            return Vec::new();
+            return Ok(Vec::new());
         }
         if !in_turn {
             self.lose_lockstep_if_queued(guest, from);
@@ -1000,7 +1018,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     delivered.fds
                 );
             }
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let mut recorded = Vec::new();
         let mut rest = delivered.fds.as_slice();
@@ -1015,7 +1033,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             rest = after;
             let mut facts = Vec::with_capacity(fds.len());
             for &fd in fds {
-                facts.push(self.received_facts(guest, fd).await);
+                match self.received_facts(guest, fd).await {
+                    Err(Error::Tool(error)) => return Err(Error::Tool(error)),
+                    taken => facts.push(taken),
+                }
             }
             let (sent, lockstep) =
                 Self::queued_rights(guest, from, &facts, message.truncated).unzip();
@@ -1041,6 +1062,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 {
                     Ok(Receipt::New) => recorded.push(fd),
                     Ok(Receipt::Joined | Receipt::Unrecorded) => {}
+                    Err(Error::Tool(error)) => return Err(Error::Tool(error)),
                     Err(error) => {
                         // Open, but without its facts: listed, never modelled.
                         guest.thread_state().note_unmodelled_descriptor(fd, cloexec);
@@ -1052,7 +1074,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
         }
-        recorded
+        Ok(recorded)
     }
 
     /// The kernel's facts about descriptor `fd`, which Linux has just
@@ -1075,22 +1097,25 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             return Ok(None);
         }
-        // Passive probes, retried when a signal stopped them before they ran.
-        let descriptor_flags = guest
-            .inject_with_retry(
+        // Passive probes through the recording, retried when a signal stopped
+        // them before they ran.
+        let descriptor_flags = self
+            .probe_received(
+                guest,
                 syscalls::Fcntl::new()
                     .with_fd(fd)
                     .with_cmd(syscalls::FcntlCmd::F_GETFD),
             )
             .await? as i32;
-        let status_flags = guest
-            .inject_with_retry(
+        let status_flags = self
+            .probe_received(
+                guest,
                 syscalls::Fcntl::new()
                     .with_fd(fd)
                     .with_cmd(syscalls::FcntlCmd::F_GETFL),
             )
             .await? as i32;
-        let stat = self.inject_fstat(guest, fd).await?;
+        let stat = self.received_descriptor_fstat(guest, fd).await?;
         Ok(Some(ReceivedFacts {
             descriptor_flags,
             status_flags,
@@ -1188,12 +1213,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         // received end of a pipe Detcore keeps physically nonblocking still
         // waits for the writer. Checked before the anonymous-inode refusal, so
         // a received eventfd is the sender's eventfd.
-        if let Some(alias) = sent
+        if let Some(open_file) = sent
             .filter(|sent| sent.file == facts.file() && (lockstep || !anonymous))
             .and_then(|sent| sent.open_file.as_ref())
-            .and_then(|open_file| open_file.descriptor(fd, cloexec))
+            && self
+                .join_sent_open_file(guest, fd, cloexec, open_file)
+                .await?
         {
-            guest.thread_state().install_alias(alias);
             return Ok(Receipt::Joined);
         }
         let stat = &facts.stat;
@@ -1253,7 +1279,77 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (`descriptor_directory`).
         self.recognize_received_placeholder(guest, fd, stat, facts.status_flags)
             .await;
+        if stat.st_mode & libc::S_IFMT == libc::S_IFSOCK {
+            self.classify_socket_peer(guest, fd, SocketRole::Received)
+                .await;
+        }
         Ok(Receipt::New)
+    }
+
+    /// Make received descriptor `fd` an alias of `open_file`, the description
+    /// its sender's table modeled, as `dup` would, with `FD_CLOEXEC` as
+    /// `cloexec` says; whether it did. Not once every modeled descriptor of
+    /// that description is closed. Under record and replay only where this
+    /// table holds a descriptor of it (the lowest numbered, `other`): replay
+    /// holds a stand-in in `fd` and first duplicates `other` over it, so that
+    /// the slot names the live open file (`Detcore::install_live_alias`).
+    async fn join_sent_open_file<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        cloexec: bool,
+        open_file: &OpenFileHandle,
+    ) -> Result<bool, Error> {
+        let Some(alias) = open_file.descriptor(fd, cloexec) else {
+            return Ok(false);
+        };
+        if self.cfg.recordreplay_modes {
+            let Some(other) = guest
+                .thread_state()
+                .lowest_slot_naming(alias.open_file_id())
+            else {
+                return Ok(false);
+            };
+            if self.cfg.replaying {
+                let flags = if cloexec {
+                    OFlag::O_CLOEXEC
+                } else {
+                    OFlag::empty()
+                };
+                self.install_live_alias(guest, other, fd, flags)
+                    .await
+                    .map_err(|errno| {
+                        Error::Tool(anyhow::anyhow!(
+                            "replay cannot make descriptor {fd} the alias of {other} the \
+                             recording found: {errno}"
+                        ))
+                    })?;
+            }
+        }
+        guest.thread_state().install_alias(alias);
+        Ok(true)
+    }
+
+    /// `call`, a passive probe of a received descriptor, through the
+    /// recording: recorded under record, served from the recording under
+    /// replay (which holds a stand-in where the recording held the
+    /// descriptor), injected otherwise. Retried while a signal stops it
+    /// before it runs; every attempt is an event, so replay retries as the
+    /// recording did.
+    async fn probe_received<G, S>(&self, guest: &mut G, call: S) -> Result<i64, Errno>
+    where
+        G: Guest<Self>,
+        S: Into<Syscall> + Copy,
+    {
+        const ATTEMPTS: usize = 64;
+        let mut last = Errno::ERESTARTSYS;
+        for _ in 0..ATTEMPTS {
+            match self.record_or_replay(guest, call).await {
+                Err(errno @ (Errno::EINTR | Errno::ERESTARTSYS)) => last = errno,
+                answer => return answer,
+            }
+        }
+        Err(last)
     }
 
     /// Whether a send through `socket` queues the open files its
@@ -1291,14 +1387,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// the descriptors to the first buffer it queues, and queues none. A
     /// message whose descriptors' facts cannot all be taken queues nothing,
     /// so its receipt names no open file, as before. A send that failed
-    /// queued nothing in Linux and queues nothing here.
+    /// queued nothing in Linux and queues nothing here. A tool error (an
+    /// `fstat` under record and replay that could not be recorded) ends the
+    /// run.
     pub(crate) async fn queue_sent_rights<G: Guest<Self>>(
         &self,
         guest: &mut G,
         socket: RawFd,
         stream: bool,
         sent: SentRights,
-    ) {
+    ) -> Result<(), Error> {
         if sent.unread {
             self.lose_peer_lockstep(guest, socket);
         }
@@ -1324,8 +1422,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             let mut descriptors = Vec::with_capacity(fds.len());
             for &fd in &fds {
-                let Ok(stat) = self.inject_fstat(guest, fd).await else {
-                    break;
+                // Through the recording, as the receipt's facts are, so that
+                // replay matches what the recording matched.
+                let stat = match self.received_descriptor_fstat(guest, fd).await {
+                    Ok(stat) => stat,
+                    Err(Error::Tool(error)) => return Err(Error::Tool(error)),
+                    Err(_) => break,
                 };
                 descriptors.push(SentDescriptor {
                     file: (stat.st_dev, stat.st_ino),
@@ -1346,6 +1448,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.lose_peer_lockstep(guest, socket);
             }
         }
+        Ok(())
     }
 
     /// A send through `socket` may have passed descriptors its peer's queue

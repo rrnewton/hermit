@@ -4733,13 +4733,14 @@ fn record_chaos_schedule_replays_under_its_seed() {
 
 /// Descriptors received over `SCM_RIGHTS` (see
 /// `tests/c/record_replay_scm_rights.c pipe`): pipe ends sent within the
-/// process and a memfd and pipe end sent by a forked child. Detcore registers
-/// each received descriptor by probing it through the recording: `fstat`,
-/// `kcmp(KCMP_FILE)` against the descriptors it may alias, and `F_GETFL`.
-/// Neither recorder nor replayer handled kcmp, so it ran live in both phases,
-/// and replay, which holds placeholders where the recording held the received
-/// files, found no alias for the write end, probed `F_GETFL` where the
-/// recording had none, and stopped with a desynchronized stream. Both phases
+/// process and a memfd and pipe end sent by a forked child. Detcore records
+/// each received descriptor by probing it through the recording (`F_GETFD`,
+/// `F_GETFL`, `fstat`), and names the open file a self-sent end carries from
+/// the `fstat` each send through the socketpair takes through the recording
+/// too. A probe that ran live in both phases would let replay, which holds
+/// placeholders where the recording held the received files, find no alias
+/// for the write end, take probes the recording did not, and stop with a
+/// desynchronized stream. Both phases
 /// must print what a native run prints: the received write end is blocking and
 /// reaches the pipe, a blocking read through the received read end waits for a
 /// writer that sleeps first, and the child's descriptors read back its bytes.
@@ -4796,12 +4797,14 @@ fn record_replay_receives_descriptors_over_a_guests_own_unix_listener() {
 /// and writes in the kernel, and it held an eventfd placeholder, with its own
 /// count, where the recording held each received descriptor: a count written
 /// through a received descriptor never reached the original's reader, whose
-/// blocking read waited until replay refused the run, and a read through the
-/// placeholder of a file the process held nowhere else found its count wrong.
-/// Replay now makes a received descriptor that the recording found to alias
-/// one in the table a live duplicate of it, and serves the remaining
-/// placeholders' eventfd operations from the log. Both phases must print what
-/// a native run prints.
+/// blocking read waited until replay refused the run. Replay now makes a
+/// received descriptor that the recording found to alias one in the table a
+/// live duplicate of it, and serves the remaining placeholders' eventfd
+/// operations from the log. Both phases must print what a native run prints
+/// for the aliases. An eventfd whose sender closed its copy, and one from a
+/// child, are anonymous inodes Detcore does not record (its known gap,
+/// `c-programs/scm-rights-received-anon-inodes`): both phases must fail their
+/// reads with the same EBADF.
 #[test]
 fn record_replay_keeps_eventfds_received_over_scm_rights_coherent() {
     let _guard = hermit_record_lock();
@@ -4811,8 +4814,9 @@ fn record_replay_keeps_eventfds_received_over_scm_rights_coherent() {
         &["eventfd"],
         "eventfd alias: original read 5\n\
          eventfd alias: received read 7\n\
-         eventfd closed sender: received read 9\n\
-         eventfd child: received read 3 exit=0\n",
+         eventfd closed sender: received read=-1 errno=EBADF\n\
+         eventfd child: exit=0\n\
+         eventfd child: received read=-1 errno=EBADF\n",
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

@@ -838,10 +838,11 @@ impl RecordVersion {
 // chaos recording under the default schedule and fall out of step, so it is
 // refused here.
 // 0x187 -> 0x188 (HIGHEST_SHIPPED + 1 at this base; the lander re-checks it
-// at land): under record and replay Detcore registers each descriptor an
-// SCM_RIGHTS receive installs, probing it through the recording (fstat,
-// fstatfs, kcmp(KCMP_FILE) against the table's descriptors, F_GETFL), and kcmp
-// records a Return event. A received or connected socket whose peer is a guest
+// at land): under record and replay Detcore records each descriptor an
+// SCM_RIGHTS receive installs, probing it through the recording (F_GETFD,
+// F_GETFL, fstat), and an SCM_RIGHTS send through a socketpair takes each
+// carried descriptor's fstat through the recording too, so the receipt can
+// name the open file it carries. A received or connected socket whose peer is a guest
 // adds getsockopt(SO_ACCEPTCONN, SO_PEERCRED) probes and an F_SETFL that makes
 // it nonblocking, and is then internal: a blocking call on it records every
 // nonblocking attempt in the caller's turn instead of one call outside the

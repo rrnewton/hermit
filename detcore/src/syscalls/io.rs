@@ -3623,7 +3623,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             if in_turn {
                 // One message, of `result` bytes.
                 let sent = sent_rights(guest, &headers, |_| usize::try_from(result).unwrap_or(0));
-                self.queue_sent_rights(guest, call.fd(), stream, sent).await;
+                self.queue_sent_rights(guest, call.fd(), stream, sent)
+                    .await?;
             } else {
                 self.lose_peer_lockstep(guest, call.fd());
             }
@@ -3885,7 +3886,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .map_or(0, |length: u32| length as usize)
                 });
                 self.queue_sent_rights(guest, call.sockfd(), stream, sent)
-                    .await;
+                    .await?;
             } else {
                 self.lose_peer_lockstep(guest, call.sockfd());
             }
@@ -3951,7 +3952,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let recorded = self
             .record_received_descriptors(guest, &delivered, in_turn, cloexec, from)
-            .await;
+            .await?;
         // Where the tool discovers received descriptors, recvmsg's refresh
         // covers every descriptor delivered, as before; elsewhere only those
         // this receipt recorded.
@@ -4358,7 +4359,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let recorded = self
             .record_received_descriptors(guest, &delivered, in_turn, cloexec, from)
-            .await;
+            .await?;
         // Only the descriptors this receipt recorded.
         self.refresh_received_locks(guest, &recorded, super::files::LockCall::Recvmmsg)
             .await?;

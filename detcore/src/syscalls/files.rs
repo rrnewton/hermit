@@ -4098,7 +4098,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// The peer's credentials decide. Only `AF_UNIX` stream and seqpacket
     /// sockets carry a peer's; Linux reports any other socket's, and a peer
     /// outside the recording's PID namespace, as pid 0, which leaves the socket
-    /// external. Every probe goes through the recording, so replay, which holds
+    /// external. So a pid above 0 names a guest only because `hermit record`
+    /// runs its guests in a PID namespace of their own (`cred_to_ucred` maps
+    /// the peer's pid into the caller's namespace, `pid_nr_ns`); a recording
+    /// that shared the host's PID namespace would count a host process's
+    /// socket as internal, and poll a wait on it in the caller's turn. Every
+    /// probe goes through the recording, so replay, which holds
     /// placeholders, classifies the socket exactly as the recording did. A run
     /// without sequentialized threads, or with `--debug-externalize-sockets`,
     /// keeps every socket external; a plain run polls every socket already.
@@ -6705,6 +6710,29 @@ impl<T: RecordOrReplay> Detcore<T> {
             _ => self.recorded_fstat(guest, fd).await?,
         };
         Ok(crate::fd::is_random_device(stat.st_mode, stat.st_rdev))
+    }
+
+    /// [`Self::recorded_fstat`] of a descriptor an `SCM_RIGHTS` receive
+    /// installed (`Detcore::record_received_descriptors`). A failed call,
+    /// recorded or not, is its errno, which leaves the descriptor unrecorded.
+    /// Under record and replay a buffer that cannot be prepared ends the run
+    /// instead, as an open's classification does: it recorded no event, so
+    /// the other run could consume a different one.
+    pub(crate) async fn received_descriptor_fstat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        raw_fd: RawFd,
+    ) -> Result<libc::stat, Error> {
+        match self.recorded_fstat(guest, raw_fd).await {
+            Ok(stat) => Ok(stat),
+            Err(StatFailure::Scratch(errno)) if self.cfg.recordreplay_modes => {
+                Err(Error::Tool(anyhow::anyhow!(
+                    "cannot record descriptor {raw_fd}, received over SCM_RIGHTS, under \
+                     record and replay: no buffer for its fstat ({errno})"
+                )))
+            }
+            Err(failure) => Err(failure.errno().into()),
+        }
     }
 
     /// `fstat(fd)` through the recording, with [`Self::inject_fstat`]'s buffer
