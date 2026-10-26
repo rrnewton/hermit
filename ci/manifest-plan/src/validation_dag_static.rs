@@ -6115,7 +6115,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same four T2 and replay-refusal units as test.hermit_unit:
     // 1319 + 4 = 1323 (carried: the hosted lane did not run here; the
     // portable twin executed 1329 in the targeted rerun).
-    ("test.hermit_unit_on_host", 1323),
+    // And the same fifteen store-exclusive rewrite tests as test.hermit_unit: 1338.
+    ("test.hermit_unit_on_host", 1338),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
