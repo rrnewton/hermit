@@ -10651,6 +10651,131 @@ fn no_namespace_refuses_a_chosen_id_at_pid_max_before_any_task() {
     );
 }
 
+/// Under `--no-namespace` with chosen IDs, a preemption record replays: the
+/// replay takes the record's base without `--pid-base`, prints the same bytes,
+/// and follows the same schedule, which it records again event for event. A
+/// replay under another base is refused with the policy-refusal status, and so
+/// are a record whose IDs came from the host (its preemption record says so),
+/// which no replay could follow, a record that does not say how its guest was
+/// numbered, and a replay whose recorded window another run holds, naming the
+/// record. Not a PMU subject: the schedule compared here is the scheduler's
+/// own, with or without preemption points.
+#[test]
+fn no_namespace_preemption_records_replay_under_their_base() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = |name: &str| directory.path().join(name).display().to_string();
+    let record_arg = format!("--record-preemptions-to={}", path("recorded.json"));
+    let epoch = "--epoch=2026-01-01T00:00:00Z";
+    let recorded = no_namespace_in_own_pid_namespace(
+        &["--pid-base=5000", "--chaos", "--seed=3", epoch, &record_arg],
+        &[],
+    );
+    assert_success(&recorded, &["record"]);
+
+    let replay_arg = format!("--replay-preemptions-from={}", path("recorded.json"));
+    let again_arg = format!("--record-preemptions-to={}", path("replayed.json"));
+    let replayed = no_namespace_in_own_pid_namespace(&[epoch, &replay_arg, &again_arg], &[]);
+    assert_success(&replayed, &["replay"]);
+    assert_eq!(stdout(&replayed), stdout(&recorded));
+    let schedule = |name: &str| {
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path(name)).unwrap()).unwrap();
+        (
+            json["global"].clone(),
+            json["per_thread"].clone(),
+            json["guest_ids"].clone(),
+        )
+    };
+    let (global, per_thread, guest_ids) = schedule("recorded.json");
+    assert!(
+        global.as_array().is_some_and(|events| !events.is_empty()),
+        "{global}"
+    );
+    assert_eq!(guest_ids["Chosen"]["base"], 5000, "{guest_ids}");
+    assert_eq!(schedule("replayed.json"), (global, per_thread, guest_ids));
+
+    let elsewhere =
+        no_namespace_in_own_pid_namespace(&["--pid-base=6000", epoch, &replay_arg], &[]);
+    assert_eq!(
+        elsewhere.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{}",
+        stderr(&elsewhere)
+    );
+    assert!(
+        stderr(&elsewhere).contains("chosen by Hermit from 5000")
+            && stderr(&elsewhere).contains("chosen by Hermit from 6000"),
+        "{}",
+        stderr(&elsewhere)
+    );
+
+    // The collide case's host-ID task marks its record `Host`.
+    let host_record_arg = format!("--record-preemptions-to={}", path("host.json"));
+    let host = no_namespace_in_own_pid_namespace(&[epoch, &host_record_arg], &["collide"]);
+    assert_success(&host, &["collide"]);
+    let host_replay_arg = format!("--replay-preemptions-from={}", path("host.json"));
+    let refused = no_namespace_in_own_pid_namespace(&[epoch, &host_replay_arg], &["collide"]);
+    assert_eq!(
+        refused.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("host-assigned, different in every run")
+            && stderr(&refused).contains("no replay can follow it"),
+        "{}",
+        stderr(&refused)
+    );
+
+    // A record that does not say how its guest was numbered (a namespace
+    // run's, or one written before the field existed).
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path("recorded.json")).unwrap()).unwrap();
+    json.as_object_mut().unwrap().remove("guest_ids");
+    fs::write(path("stripped.json"), json.to_string()).unwrap();
+    let stripped_arg = format!("--replay-preemptions-from={}", path("stripped.json"));
+    let stripped = no_namespace_in_own_pid_namespace(&[epoch, &stripped_arg], &[]);
+    assert_eq!(
+        stripped.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{}",
+        stderr(&stripped)
+    );
+    assert!(
+        stderr(&stripped).contains("numbered by the run's PID namespace"),
+        "{}",
+        stderr(&stripped)
+    );
+
+    // The recorded window held by another run, whose first process has the
+    // base: the replay cannot have it, and says why, naming the record.
+    let hermit = env!("CARGO_BIN_EXE_hermit");
+    let guest = chosen_guest_ids_guest().to_str().unwrap().to_owned();
+    // The holder's guest blocks reading a FIFO the script keeps open (a
+    // guest's sleep would end at once in virtual time).
+    let fifo = path("hold");
+    let script = format!(
+        "mkfifo {fifo} && exec 3<>{fifo}; \
+         {hermit} run --no-namespace --base-env=minimal --pid-base=5000 -- /bin/sh -c 'read x' \
+         <{fifo} >/dev/null 2>&1 & HOLDER=$!; sleep 2; \
+         {hermit} run --no-namespace --base-env=minimal {epoch} {replay_arg} -- {guest}; \
+         echo rc=$?; echo >&3; wait $HOLDER"
+    );
+    let mut command = Command::new("unshare");
+    command.args(OWN_PID_NAMESPACE).args(["sh", "-c", &script]);
+    let label = format!("{command:?}");
+    let held = hermit_test::hermit_output(&label, &mut command);
+    assert!(
+        stdout(&held).contains(&format!("rc={HERMIT_POLICY_REFUSAL_EXIT}"))
+            && stderr(&held).contains("needs exactly those IDs")
+            && stderr(&held).contains("recorded.json"),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&held),
+        stderr(&held)
+    );
+}
+
 /// `--no-namespace` runs the guest in Hermit's own namespace, where Hermit
 /// installs no mount. Detcore still renders the guest's mount files there, on
 /// every backend, from the table of that namespace's launch mounts (the ones
