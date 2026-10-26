@@ -33,6 +33,7 @@ pub(crate) use app::exec_initial;
 reverie_liteinst::declare_legacy_tool_backing!();
 
 pub mod backend_stats;
+pub mod aarch64_lse;
 pub mod build_info;
 pub mod canonical_verdict;
 pub mod chaos_timeslice;
