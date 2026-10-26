@@ -3064,7 +3064,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 2738 + 3 = 2741, listed.
     // And +6 from 82cbd684: 2747.
     // Train 6 recount (measured on 21f770f6 base): 2788.
-    ("test.detcore_unit", 2788),
+    // And fd's queued_rights_are_taken_in_order (the descriptors a socket's
+    // SCM_RIGHTS messages carried, taken in order at the receipt): 2789, listed.
+    // And syscalls::scm_rights' unix_socket_names_are_abstract_names_and_absolute_paths
+    // and unix_connections_are_accepted_in_order (an accepted connection's
+    // peer): 2791, listed.
+    ("test.detcore_unit", 2791),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3170,7 +3175,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (an alias's blocking state through recvmsg and recvmmsg, an eventfd
     // alias's counter, an alias's own MSG_CMSG_CLOEXEC, a random device and a
     // rendered procfs file from a child): 171.
-    ("test.detcore_misc", 171),
+    // And scm_rights' two tests of the send-time queue (a pipe end from a
+    // process that keeps it; a peek, a truncated receive and a discarded
+    // message): 173.
+    // And scm_rights_over_a_connection_to_an_own_listener: 174.
+    // And scm_rights' eventfd_after_a_released_one, recvmmsg_peek and
+    // long_stream_message (a queue out of lockstep joins no anonymous inode;
+    // peeked entries; a message split across buffers): 177.
+    // And scm_rights_over_a_connection_from_a_child: 178.
+    ("test.detcore_misc", 178),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -4984,7 +4997,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same four F0a readdir_order variants: 163.
     // And the same tight-stack received-inotify test: 164.
     // And the same seven SCM_RIGHTS descriptor tests: 171.
-    ("test.detcore_misc_on_host", 171),
+    // And the same two send-time queue tests: 173.
+    // And the same connection test: 174.
+    // And the same three queue-order tests: 177.
+    // And the same child-connection test: 178.
+    ("test.detcore_misc_on_host", 178),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -5379,7 +5396,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three working-directory units: 2738 + 3 = 2741, listed.
     // And +6 from 82cbd684: 2747.
     // Train 6 recount (measured on 21f770f6 base): 2788.
-    ("test.detcore_unit_on_host", 2788),
+    // And the same queued-rights unit: 2789, listed.
+    // And the same two AF_UNIX connection units: 2791, listed.
+    ("test.detcore_unit_on_host", 2791),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

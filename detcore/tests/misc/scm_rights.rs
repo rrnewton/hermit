@@ -8,13 +8,17 @@
 
 //! Descriptors received through `SCM_RIGHTS` control messages.
 //!
-//! Most tests send a descriptor the process keeps, so the received one names
-//! an open file the receiving table models and joins it as an alias
-//! (`Detcore::join_received_alias`): it keeps that file's blocking state and
-//! an eventfd's kind, and `MSG_CMSG_CLOEXEC` marks it alone. The others receive from a child a
-//! random device and a rendered procfs file, which no descriptor of the
-//! receiving table names. Descriptors from another process in general are
-//! covered by `tests/c/scm_rights_received_descriptors.c`.
+//! Every message goes through a `socketpair`, whose sends Detcore queues with
+//! the open file each descriptor names (`detcore::syscalls::scm_rights`), so
+//! a received descriptor whose sender still holds it joins that open file as
+//! an alias: it keeps that file's blocking state and an eventfd's kind, and
+//! `MSG_CMSG_CLOEXEC` marks it alone. Most tests send a descriptor the process
+//! keeps; one receives a pipe end from a child that keeps it, which no
+//! descriptor of the receiving table names, and one follows the queue through
+//! a peek, a truncated receive and a discarded message. Others receive from a
+//! child a random device and a rendered procfs file. Descriptors from another
+//! process in general are covered by
+//! `tests/c/scm_rights_received_descriptors.c`.
 //!
 //! Each run starts in a fresh PID namespace (`run_deterministically`).
 
@@ -132,16 +136,25 @@ fn fcntl(fd: c_int, command: c_int) -> c_int {
     check(unsafe { libc::fcntl(fd, command) }, "fcntl")
 }
 
-/// Sends one byte carrying `fds` in a single `SCM_RIGHTS` message.
+/// Sends one byte carrying `fds` in a single `SCM_RIGHTS` message. It
+/// allocates nothing, so a child forked from the test process can call it.
 fn send_fds(socket: c_int, fds: &[c_int]) {
     let mut payload = *b"f";
+    assert_eq!(send_fds_with(socket, fds, &mut payload), 1);
+}
+
+/// Sends `payload` carrying `fds` in a single `SCM_RIGHTS` message and
+/// returns how many of its bytes Linux took.
+fn send_fds_with(socket: c_int, fds: &[c_int], payload: &mut [u8]) -> usize {
     let mut iov = libc::iovec {
         iov_base: payload.as_mut_ptr().cast(),
         iov_len: payload.len(),
     };
     let data_len = size_of_val(fds) as u32;
-    // `u64` storage gives the buffer the alignment `cmsghdr` needs.
-    let mut control = vec![0u64; (unsafe { libc::CMSG_SPACE(data_len) } as usize).div_ceil(8)];
+    // `u64` storage gives the buffer the alignment `cmsghdr` needs: room for
+    // the header and 28 descriptors.
+    let mut control = [0u64; 16];
+    assert!(unsafe { libc::CMSG_SPACE(data_len) } as usize <= size_of_val(&control));
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
@@ -156,7 +169,8 @@ fn send_fds(socket: c_int, fds: &[c_int]) {
         ptr::copy_nonoverlapping(fds.as_ptr(), libc::CMSG_DATA(header).cast(), fds.len());
     }
     let sent = unsafe { libc::sendmsg(socket, &message, 0) };
-    assert_eq!(sent, 1, "sendmsg: {}", io::Error::last_os_error());
+    assert!(sent > 0, "sendmsg: {}", io::Error::last_os_error());
+    sent as usize
 }
 
 /// Descriptors in the `SCM_RIGHTS` messages the kernel wrote into `message`.
@@ -181,20 +195,38 @@ fn received_fds(message: &libc::msghdr) -> Vec<c_int> {
 
 /// Receives one byte and returns the descriptors that came with it.
 fn recv_fds(socket: c_int, flags: c_int) -> Vec<c_int> {
+    recv_fds_into(socket, flags, size_of::<[u64; 16]>()).0
+}
+
+/// Receives one byte into a control buffer of `room` bytes (none for 0), and
+/// returns the descriptors that came with it and whether Linux set
+/// `MSG_CTRUNC`.
+fn recv_fds_into(socket: c_int, flags: c_int, room: usize) -> (Vec<c_int>, bool) {
     let mut payload = [0u8];
     let mut iov = libc::iovec {
         iov_base: payload.as_mut_ptr().cast(),
         iov_len: payload.len(),
     };
     let mut control = [0u64; 16];
+    assert!(room <= size_of_val(&control));
     let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
-    message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = size_of_val(&control) as _;
+    if room > 0 {
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = room as _;
+    }
     let received = unsafe { libc::recvmsg(socket, &mut message, flags) };
     assert_eq!(received, 1, "recvmsg: {}", io::Error::last_os_error());
-    received_fds(&message)
+    (
+        received_fds(&message),
+        message.msg_flags & libc::MSG_CTRUNC != 0,
+    )
+}
+
+/// Whether `fd` is blocking, as its open file's status flags say.
+fn blocking(fd: c_int) -> bool {
+    fcntl(fd, libc::F_GETFL) & libc::O_NONBLOCK == 0
 }
 
 /// A pipe end sent within the process names the open file the sender holds:
@@ -444,9 +476,362 @@ fn received_eventfd_shares_the_counter() {
     println!("eventfd {received} shares {original}'s counter, semaphore units {units:?}");
 }
 
+/// A pipe end received from another process that keeps it names the open
+/// file the sender holds, which no descriptor of the receiving table names:
+/// it keeps that file's blocking state and reaches the same pipe. Detcore
+/// keeps the pipe physically nonblocking, so a description of its own, made
+/// from the kernel's flags, would say nonblocking. The child calls only
+/// functions that allocate nothing (see
+/// `blocking_read_on_a_received_pipe_waits_for_the_writer`).
+fn pipe_end_from_a_process_that_keeps_it_shares_the_open_file() {
+    let (left, right) = socketpair(libc::SOCK_STREAM);
+    let sender = check(unsafe { libc::fork() }, "fork");
+    if sender == 0 {
+        unsafe { libc::close(right) };
+        let (read_end, write_end) = pipe();
+        send_fds(left, &[write_end]);
+        // Keep the pipe until the parent has written through its end.
+        let mut byte = [0u8];
+        let read = unsafe { libc::read(left, byte.as_mut_ptr().cast(), 1) };
+        let mut text = [0u8; 4];
+        let got = unsafe { libc::read(read_end, text.as_mut_ptr().cast(), 4) };
+        let read_back = read == 1 && got == 4 && &text == b"from";
+        unsafe { libc::_exit(if read_back { 0 } else { 1 }) };
+    }
+    unsafe { libc::close(left) };
+    let [received] = recv_fds(right, 0)[..] else {
+        panic!("expected one descriptor");
+    };
+    assert!(blocking(received), "the sender's pipe end is blocking");
+    write_all(received, b"from");
+    write_all(right, b"k");
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(sender, &mut status, 0) }, sender);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "the sender did not read what was written through the received end"
+    );
+    println!("descriptor {received} names the open file its sender holds");
+}
+
+/// An abstract `AF_UNIX` address for `name`, which starts with its NUL:
+/// nothing on the file system, freed when the run ends.
+fn abstract_address(name: &[u8]) -> (libc::sockaddr_un, u32) {
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(name) {
+        *slot = *byte as libc::c_char;
+    }
+    let length = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + name.len()) as u32;
+    (address, length)
+}
+
+fn unix_stream_socket() -> c_int {
+    check(
+        unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) },
+        "socket",
+    )
+}
+
+/// A connection a child process makes to its parent's listener carries open
+/// files as one within a process does: the child's pipe end, sent while the
+/// child keeps it, names the child's open file in the parent. The bind and
+/// the accept run in the parent and the connect in the child, so they meet
+/// only through the connections the run's tasks share. The child calls only
+/// functions that allocate nothing.
+fn descriptors_over_a_connection_from_a_child_share_their_open_files() {
+    let (address, length) = abstract_address(b"\0hermit-detcore-scm-rights-child-connection");
+    let at = (&raw const address).cast::<libc::sockaddr>();
+    let listener = unix_stream_socket();
+    check(unsafe { libc::bind(listener, at, length) }, "bind");
+    check(unsafe { libc::listen(listener, 1) }, "listen");
+    let child = check(unsafe { libc::fork() }, "fork");
+    if child == 0 {
+        unsafe { libc::close(listener) };
+        let client = unix_stream_socket();
+        if unsafe { libc::connect(client, at, length) } != 0 {
+            unsafe { libc::_exit(2) };
+        }
+        let (read_end, write_end) = pipe();
+        send_fds(client, &[write_end]);
+        // Keep the pipe until the parent has written through its end.
+        let mut byte = [0u8];
+        let read = unsafe { libc::read(client, byte.as_mut_ptr().cast(), 1) };
+        let mut text = [0u8; 4];
+        let got = unsafe { libc::read(read_end, text.as_mut_ptr().cast(), 4) };
+        let read_back = read == 1 && got == 4 && &text == b"kept";
+        unsafe { libc::_exit(if read_back { 0 } else { 1 }) };
+    }
+    let server = check(
+        unsafe { libc::accept(listener, ptr::null_mut(), ptr::null_mut()) },
+        "accept",
+    );
+    let [received] = recv_fds(server, 0)[..] else {
+        panic!("expected one descriptor");
+    };
+    assert!(blocking(received), "the child's pipe end is blocking");
+    write_all(received, b"kept");
+    write_all(server, b"k");
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "the child did not read what was written through the received end"
+    );
+    println!("descriptor {received} from a child's connection names the child's open file");
+}
+
+/// A connection the process made to its own listener carries open files as
+/// a `socketpair` does: a pipe write end the connecting socket sends names
+/// the sender's blocking open file, and an eventfd the accepted socket sends
+/// back shares the sender's counter. Detcore pairs the accepted connection
+/// with the socket whose `connect` it took.
+fn descriptors_over_a_connection_to_an_own_listener_share_their_open_files() {
+    let (address, length) = abstract_address(b"\0hermit-detcore-scm-rights-connected");
+    let listener = unix_stream_socket();
+    let at = (&raw const address).cast::<libc::sockaddr>();
+    check(unsafe { libc::bind(listener, at, length) }, "bind");
+    check(unsafe { libc::listen(listener, 1) }, "listen");
+    let client = unix_stream_socket();
+    check(unsafe { libc::connect(client, at, length) }, "connect");
+    let server = check(
+        unsafe { libc::accept(listener, ptr::null_mut(), ptr::null_mut()) },
+        "accept",
+    );
+
+    let (read_end, write_end) = pipe();
+    send_fds(client, &[write_end]);
+    let [received_end] = recv_fds(server, 0)[..] else {
+        panic!("expected one descriptor");
+    };
+    assert!(blocking(received_end), "the sender's pipe end is blocking");
+    write_all(received_end, b"over");
+    assert_eq!(read_exact(read_end, 4), b"over");
+
+    let counter = eventfd(0, 0);
+    send_fds(server, &[counter]);
+    let [received_counter] = recv_fds(client, 0)[..] else {
+        panic!("expected one descriptor");
+    };
+    eventfd_write(received_counter, 9);
+    let count = u64::from_ne_bytes(read_exact_once(counter));
+    assert_eq!(count, 9);
+    println!(
+        "pipe end {received_end} and eventfd {received_counter} name their senders' open files"
+    );
+}
+
+/// An eventfd received after a receive with no room released an earlier
+/// eventfd's message: every eventfd has one file identity, so only order
+/// could tell the two apart, and the socket's queue no longer follows its
+/// messages one for one. The later, blocking eventfd must never take the
+/// released, nonblocking one's open file. Detcore refuses it instead, as main
+/// refuses an eventfd it cannot classify, so `F_GETFL` through it fails with
+/// EBADF where Linux reports a blocking descriptor.
+fn eventfd_after_a_released_one_does_not_join_it() {
+    let (left, right) = socketpair(libc::SOCK_DGRAM);
+    let released = eventfd(0, libc::EFD_NONBLOCK);
+    send_fds(left, &[released]);
+    let (none, ctrunc) = recv_fds_into(right, 0, 0);
+    assert!(none.is_empty() && ctrunc, "Linux releases the descriptor");
+    let kept = eventfd(5, 0);
+    send_fds(left, &[kept]);
+    let [received] = recv_fds(right, 0)[..] else {
+        panic!("expected one descriptor");
+    };
+    let status = unsafe { libc::fcntl(received, libc::F_GETFL) };
+    let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    assert!(
+        status < 0 || status & libc::O_NONBLOCK == 0,
+        "the received eventfd took the released eventfd's nonblocking open file"
+    );
+    println!(
+        "received eventfd: F_GETFL={} errno={}",
+        status.max(-1),
+        if status < 0 { errno } else { 0 }
+    );
+}
+
+/// `recvmmsg` with `MSG_PEEK` peeks the first datagram for every entry, as
+/// Linux does: each entry's descriptor names the first message's pipe end,
+/// and both messages are still there to receive, in order.
+fn recvmmsg_peek_names_the_first_message_for_every_entry() {
+    let pipes: Vec<(c_int, c_int)> = (0..2).map(|_| pipe()).collect();
+    let (left, right) = socketpair(libc::SOCK_DGRAM);
+    send_fds(left, &[pipes[0].1]);
+    send_fds(left, &[pipes[1].1]);
+
+    let mut payloads = [[0u8; 1]; 2];
+    let mut iovs = payloads.each_mut().map(|payload| libc::iovec {
+        iov_base: payload.as_mut_ptr().cast(),
+        iov_len: payload.len(),
+    });
+    let mut controls = [[0u64; 16]; 2];
+    let mut messages: [libc::mmsghdr; 2] = unsafe { std::mem::zeroed() };
+    for ((message, iov), control) in messages.iter_mut().zip(&mut iovs).zip(&mut controls) {
+        message.msg_hdr.msg_iov = iov;
+        message.msg_hdr.msg_iovlen = 1;
+        message.msg_hdr.msg_control = control.as_mut_ptr().cast();
+        message.msg_hdr.msg_controllen = size_of_val(control) as _;
+    }
+    let peeked = unsafe {
+        libc::recvmmsg(
+            right,
+            messages.as_mut_ptr(),
+            2,
+            libc::MSG_PEEK,
+            ptr::null_mut(),
+        )
+    };
+    assert!(peeked >= 1, "recvmmsg: {}", io::Error::last_os_error());
+    for message in &messages[..peeked as usize] {
+        let [fd] = received_fds(&message.msg_hdr)[..] else {
+            panic!("expected one descriptor per peeked entry");
+        };
+        assert!(blocking(fd), "the first message's pipe end is blocking");
+        write_all(fd, b"p");
+        assert_eq!(read_exact(pipes[0].0, 1), b"p");
+    }
+    for (index, (read_end, _)) in pipes.iter().enumerate() {
+        let [fd] = recv_fds(right, 0)[..] else {
+            panic!("expected one descriptor");
+        };
+        assert!(blocking(fd), "pipe {index}'s write end is blocking");
+        write_all(fd, b"r");
+        assert_eq!(read_exact(*read_end, 1), b"r");
+    }
+    println!("{peeked} peeked entries named the first message");
+}
+
+/// A stream message long enough for Linux to queue in several buffers
+/// carries its descriptors in the first only: a receive of one byte takes
+/// them all, and the rest of the bytes, read without a control buffer, carry
+/// none. The socket's queue still follows its messages, so the next
+/// message's eventfd joins its sender's.
+fn descriptors_of_a_long_stream_message_come_with_its_first_byte() {
+    // Above half the default send buffer, so Linux splits it.
+    const LENGTH: usize = 150_000;
+    let (left, right) = socketpair(libc::SOCK_STREAM);
+    let (read_end, write_end) = pipe();
+    let mut payload = vec![b'x'; LENGTH];
+    let mut sent = send_fds_with(left, &[write_end], &mut payload);
+    while sent < LENGTH {
+        let written = unsafe { libc::write(left, payload[sent..].as_ptr().cast(), LENGTH - sent) };
+        assert!(written > 0, "write: {}", io::Error::last_os_error());
+        sent += written as usize;
+    }
+    let [received] = recv_fds(right, 0)[..] else {
+        panic!("expected one descriptor");
+    };
+    assert!(blocking(received), "the sender's pipe end is blocking");
+    write_all(received, b"w");
+    assert_eq!(read_exact(read_end, 1), b"w");
+    assert!(
+        read_exact(right, LENGTH - 1)
+            .iter()
+            .all(|&byte| byte == b'x')
+    );
+
+    let counter = eventfd(0, 0);
+    send_fds(left, &[counter]);
+    let [received_counter] = recv_fds(right, 0)[..] else {
+        panic!("expected one descriptor");
+    };
+    eventfd_write(received_counter, 3);
+    assert_eq!(u64::from_ne_bytes(read_exact_once(counter)), 3);
+    println!("the long message's descriptor came with its first byte; the next eventfd joined");
+}
+
+/// The open files a socket's messages carry are matched in order: a
+/// `MSG_PEEK` receive and the receive after it both name the sent pipe end; a
+/// receive with room for one of two descriptors names the first (Linux sets
+/// `MSG_CTRUNC` and releases the second); and after a receive with no control
+/// buffer discards a message, the next receive names its own message's pipe
+/// end, not the discarded one.
+fn queued_rights_follow_peek_truncation_and_discards() {
+    let pipes: Vec<(c_int, c_int)> = (0..4).map(|_| pipe()).collect();
+    let (left, right) = socketpair(libc::SOCK_DGRAM);
+    // Whether `received` is the write end of pipe `index`.
+    let reaches = |received: c_int, index: usize| {
+        assert!(blocking(received), "pipe {index}'s write end is blocking");
+        write_all(received, b"w");
+        assert_eq!(read_exact(pipes[index].0, 1), b"w");
+    };
+
+    send_fds(left, &[pipes[0].1]);
+    let [peeked] = recv_fds(right, libc::MSG_PEEK)[..] else {
+        panic!("expected one peeked descriptor");
+    };
+    let [taken] = recv_fds(right, 0)[..] else {
+        panic!("expected one descriptor");
+    };
+    assert_ne!(peeked, taken);
+    reaches(peeked, 0);
+    reaches(taken, 0);
+
+    send_fds(left, &[pipes[1].1, pipes[2].1]);
+    // CMSG_LEN(sizeof(int)): room for one descriptor (CMSG_SPACE's padding
+    // would hold a second).
+    let room = unsafe { libc::CMSG_LEN(size_of::<c_int>() as u32) } as usize;
+    let (truncated, ctrunc) = recv_fds_into(right, 0, room);
+    assert!(ctrunc, "Linux sets MSG_CTRUNC");
+    let [first] = truncated[..] else {
+        panic!("expected one of two descriptors, got {truncated:?}");
+    };
+    reaches(first, 1);
+
+    send_fds(left, &[pipes[2].1]);
+    let (discarded, ctrunc) = recv_fds_into(right, 0, 0);
+    assert!(
+        discarded.is_empty() && ctrunc,
+        "the message's descriptors are discarded"
+    );
+    send_fds(left, &[pipes[3].1]);
+    let [last] = recv_fds(right, 0)[..] else {
+        panic!("expected one descriptor");
+    };
+    reaches(last, 3);
+    println!("peeked {peeked}, taken {taken}, truncated {first}, after a discard {last}");
+}
+
 #[test]
 fn scm_rights_pipe_end_shares_the_open_file() {
     run_deterministically(received_pipe_end_shares_the_open_file);
+}
+
+#[test]
+fn scm_rights_pipe_end_from_a_process_that_keeps_it() {
+    run_deterministically(pipe_end_from_a_process_that_keeps_it_shares_the_open_file);
+}
+
+#[test]
+fn scm_rights_over_a_connection_to_an_own_listener() {
+    run_deterministically(descriptors_over_a_connection_to_an_own_listener_share_their_open_files);
+}
+
+#[test]
+fn scm_rights_over_a_connection_from_a_child() {
+    run_deterministically(descriptors_over_a_connection_from_a_child_share_their_open_files);
+}
+
+#[test]
+fn scm_rights_eventfd_after_a_released_one() {
+    run_deterministically(eventfd_after_a_released_one_does_not_join_it);
+}
+
+#[test]
+fn scm_rights_recvmmsg_peek() {
+    run_deterministically(recvmmsg_peek_names_the_first_message_for_every_entry);
+}
+
+#[test]
+fn scm_rights_long_stream_message() {
+    run_deterministically(descriptors_of_a_long_stream_message_come_with_its_first_byte);
+}
+
+#[test]
+fn scm_rights_queue_follows_peek_truncation_and_discards() {
+    run_deterministically(queued_rights_follow_peek_truncation_and_discards);
 }
 
 #[test]

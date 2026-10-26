@@ -4224,6 +4224,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     pts.1.prepare_child_process_cpu_time(dettid);
                 }
                 let guest_clock = Arc::clone(&pts.1.guest_clock);
+                let unix_connections = Arc::clone(&pts.1.unix_connections);
                 // A pending unreported signal may already have changed the
                 // parent's actions unseen: the child gets no copy then.
                 let child_signal_shadow = pts
@@ -4376,6 +4377,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // individual process. Forked processes and cloned threads
                     // therefore retain one monotonic view of raw logical time.
                     guest_clock,
+                    // So do the connections waiting for an accept.
+                    unix_connections,
                     parent_process_cpu_time: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
                         pts.1.parent_process_cpu_time.clone()
                     } else {
@@ -5502,7 +5505,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         Err(Error::Errno(Errno::EINVAL))
                     }
                 } else {
-                    self.passthrough(guest, call).await
+                    let result = self.passthrough(guest, call).await;
+                    // A forwarded splice from a socket may take a message
+                    // whose descriptors Linux releases unseen.
+                    if let Syscall::Splice(splice) = call {
+                        self.note_receive_without_control(guest, splice.fd_in(), &result);
+                    }
+                    result
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5741,7 +5750,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Read(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
                     self.handle_sock_diag_read(guest, s).await
                 }
-                Syscall::Read(s) => self.handle_read(guest, s).await,
+                Syscall::Read(s) => {
+                    let result = self.handle_read(guest, s).await;
+                    self.note_receive_without_control(guest, s.fd(), &result);
+                    result
+                }
                 Syscall::Pread64(s) => self.handle_pread64(guest, s).await,
                 Syscall::Lseek(s) => self.handle_lseek(guest, s).await,
                 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -5757,8 +5770,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     self.handle_sock_diag_readv(guest, s).await
                 }
                 Syscall::Readv(s) => {
-                    self.handle_readv_with_output(guest, s, &mut rng_readv_output)
-                        .await
+                    let result = self
+                        .handle_readv_with_output(guest, s, &mut rng_readv_output)
+                        .await;
+                    self.note_receive_without_control(guest, s.fd(), &result);
+                    result
                 }
                 Syscall::Preadv(s) => {
                     self.handle_preadv_with_output(guest, s, &mut rng_readv_output)
@@ -6081,7 +6097,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Syscall::Recvfrom(s) if self.sock_diag_reply_fd(guest, s.fd()) => {
                     self.handle_sock_diag_recvfrom(guest, s).await
                 }
-                Syscall::Recvfrom(s) => self.handle_socket_receive(guest, s, s.fd(), true).await,
+                Syscall::Recvfrom(s) => {
+                    let result = self.handle_socket_receive(guest, s, s.fd(), true).await;
+                    self.note_receive_without_control(guest, s.fd(), &result);
+                    result
+                }
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-901)
                 Syscall::Recvmsg(s) => self.handle_recvmsg(guest, s).await,
