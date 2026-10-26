@@ -16827,6 +16827,29 @@ fn run_rejects_a_missing_bind_source_before_mounting() {
     );
 }
 
+/// A `--mount` target outside `/tmp` that does not exist is named before the
+/// container is set up. Hermit mounts onto such a target as it is, so at
+/// setup it failed with only `ENOENT` from a mount, which said neither the
+/// path nor which mount: the same report a host without `/tmp` gave for
+/// Hermit's own private `/tmp`.
+#[test]
+fn run_rejects_a_missing_mount_target_outside_tmp_by_name() {
+    let source = tempfile::tempdir().unwrap();
+    let mount = format!(
+        "--mount=type=bind,source={},target=/definitely/missing/hermit-target",
+        source.path().display()
+    );
+    let output = hermit(&["run", &mount, "--", "/bin/true"]);
+    assert_hermit_refusal_contains(
+        &output,
+        Refusal::Hermit,
+        &[
+            "--mount target /definitely/missing/hermit-target",
+            "does not exist on this host",
+        ],
+    );
+}
+
 #[test]
 fn run_reports_denied_ptrace_and_seccomp_capabilities() {
     for (syscall, expected) in [

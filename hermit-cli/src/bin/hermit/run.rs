@@ -71,13 +71,14 @@ use reverie::process::MountFlags;
 use reverie::process::Namespace;
 use reverie::process::Output;
 
+use super::container::HostLayout;
 use super::container::IdentityGuard;
 use super::container::LogCapExceeded;
 use super::container::PlannedMount;
 use super::container::PolicyRefusal;
 use super::container::apply_affinity;
 use super::container::container_proc_mount;
-use super::container::identity_hardening_mounts;
+use super::container::identity_hardening_mounts_on;
 use super::container::image_container;
 use super::container::namespace_container;
 use super::global_opts::GlobalOpts;
@@ -121,6 +122,37 @@ use super::verify::write_verification_json;
 use super::verify_run;
 
 const TMP_DIR: &str = "/tmp";
+
+/// The first `--mount` target that `exists` reports missing, of those Hermit
+/// mounts onto as they are. A target inside /tmp goes to Hermit's private
+/// /tmp, which creates it. A target under an earlier `--mount` of the same
+/// run can be provided by that mount (a tmpfs, or a bind of a directory that
+/// has it), which only the container's mount table shows, so it is left to
+/// container setup. Checked before setup, a missing target is named; at
+/// setup it is only ENOENT from a mount, without the path.
+fn missing_mount_target(mounts: &[Mount], exists: impl Fn(&Path) -> bool) -> Option<&Path> {
+    mounts.iter().enumerate().find_map(|(index, mount)| {
+        let target = mount.get_target();
+        let under_an_earlier_mount = mounts[..index]
+            .iter()
+            .any(|earlier| target.starts_with(earlier.get_target()));
+        (!target.starts_with(TMP_DIR) && !under_an_earlier_mount && !exists(target))
+            .then_some(target)
+    })
+}
+
+/// Refuse a run on a host without `/tmp` (Android) when `TMPDIR` is unset:
+/// Hermit keeps its own scratch files (the guest's private `/tmp` staging,
+/// the frozen group database) in `TMPDIR`, which falls back to `/tmp`, and
+/// creating them there would fail with an ENOENT that names no path.
+fn validate_host_scratch(layout: HostLayout, tmpdir_set: bool) -> Result<(), Error> {
+    anyhow::ensure!(
+        layout.tmp || tmpdir_set,
+        "this host has no {TMP_DIR} and TMPDIR is unset: Hermit keeps its scratch files in \
+         TMPDIR, so set it to a writable directory (on Android, /data/local/tmp)"
+    );
+    Ok(())
+}
 
 #[cfg(feature = "native-exec")]
 type NativeContainerRun = super::native_exec_cli::PhysicalContainer;
@@ -3163,6 +3195,147 @@ fn e9patch_preserves_executable_identity_and_uses_ptrace_runtime() {
     // The overlay is e9patch's own mount, which the guest's mount table
     // leaves out by this identity.
     assert!(overlay.backend);
+}
+
+/// A host without `/tmp` or `/etc/group` (Android) gets neither mount: the
+/// container's setup mounted onto both and failed with ENOENT before the
+/// guest started. A host with both keeps them.
+#[test]
+fn a_host_without_tmp_or_a_group_file_mounts_neither() {
+    let ro = run_opts_for(&["hermit", "run", "/bin/true"]);
+    let tmpfs = tempfile::tempdir().unwrap();
+    let targets = |layout| -> Vec<PathBuf> {
+        ro.mounts_on(tmpfs.path(), layout)
+            .unwrap()
+            .mounts
+            .iter()
+            .map(|planned| planned.mount.get_target().to_path_buf())
+            .collect()
+    };
+    let linux = targets(HostLayout {
+        tmp: true,
+        group_file: true,
+    });
+    for target in ["/tmp", "/etc/group"] {
+        assert!(linux.iter().any(|t| t == Path::new(target)), "{linux:?}");
+    }
+    let android = targets(HostLayout {
+        tmp: false,
+        group_file: false,
+    });
+    for target in ["/tmp", "/etc/group"] {
+        assert!(
+            !android.iter().any(|t| t == Path::new(target)),
+            "{android:?}"
+        );
+    }
+}
+
+/// There, `--tmp` and a mount or bind aimed into `/tmp` are refused with the
+/// reason, rather than left to fail at container setup.
+#[test]
+fn a_host_without_tmp_refuses_what_would_go_into_it() {
+    let tmpfs = tempfile::tempdir().unwrap();
+    let android = HostLayout {
+        tmp: false,
+        group_file: true,
+    };
+    for (args, named) in [
+        (
+            &["hermit", "run", "--tmp=/data/scratch", "/bin/true"][..],
+            "none for --tmp /data/scratch to go over",
+        ),
+        (
+            &[
+                "hermit",
+                "run",
+                "--mount=type=tmpfs,target=/tmp/x",
+                "/bin/true",
+            ][..],
+            "cannot place /tmp/x there",
+        ),
+        (
+            &["hermit", "run", "--bind=/etc:/tmp/etc", "/bin/true"][..],
+            "cannot place /tmp/etc there",
+        ),
+    ] {
+        let refused = run_opts_for(args)
+            .mounts_on(tmpfs.path(), android)
+            .err()
+            .unwrap_or_else(|| panic!("{args:?} was not refused"));
+        assert!(refused.to_string().contains(named), "{refused:#}");
+    }
+    let outside = run_opts_for(&[
+        "hermit",
+        "run",
+        "--mount=type=tmpfs,target=/opt",
+        "/bin/true",
+    ]);
+    assert!(outside.mounts_on(tmpfs.path(), android).is_ok());
+    // `--strace-only` sets `--tmp` itself, and is named instead.
+    let mut strace = run_opts_for(&["hermit", "run", "--strace-only", "/bin/true"]);
+    strace.lower_strace_only();
+    let refused = strace.mounts_on(tmpfs.path(), android).err().unwrap();
+    assert!(
+        refused
+            .to_string()
+            .contains("--strace-only shares the host's /tmp"),
+        "{refused:#}"
+    );
+    // A backend's own mount into /tmp names the backend, not a choice the
+    // caller could change.
+    let mut backend = run_opts_for(&[
+        "hermit",
+        "run",
+        "--mount=type=tmpfs,target=/tmp/x",
+        "/bin/true",
+    ]);
+    backend.backend_mounts = (1, 0);
+    let refused = backend.mounts_on(tmpfs.path(), android).err().unwrap();
+    assert!(
+        refused
+            .to_string()
+            .contains("where the ptrace backend places /tmp/x"),
+        "{refused:#}"
+    );
+    // And Hermit's own scratch files need TMPDIR there.
+    let refused = validate_host_scratch(android, false).unwrap_err();
+    assert!(
+        refused.to_string().contains("TMPDIR is unset"),
+        "{refused:#}"
+    );
+    assert!(validate_host_scratch(android, true).is_ok());
+    let linux = HostLayout {
+        tmp: true,
+        group_file: true,
+    };
+    assert!(validate_host_scratch(linux, false).is_ok());
+}
+
+/// A `--mount` target that only an earlier `--mount` of the same run
+/// provides is left to container setup, which mounts in order: the host
+/// check would refuse it, though the container can mount it. Alone, the same
+/// missing target is named, and one inside /tmp is never checked.
+#[test]
+fn a_mount_target_an_earlier_mount_provides_is_not_refused() {
+    let host = |path: &Path| path == Path::new("/srv/data");
+    let mounts = |args: &[&str]| {
+        let mut argv = vec!["hermit", "run"];
+        argv.extend(args);
+        argv.push("/bin/true");
+        run_opts_for(&argv).mount
+    };
+    let bind = "--mount=type=bind,source=/srv/source,target=/srv/data";
+    let nested = "--mount=type=tmpfs,target=/srv/data/sub";
+    assert_eq!(missing_mount_target(&mounts(&[bind, nested]), host), None);
+    assert_eq!(
+        missing_mount_target(&mounts(&[nested]), host),
+        Some(Path::new("/srv/data/sub"))
+    );
+    assert_eq!(
+        missing_mount_target(&mounts(&["--mount=type=tmpfs,target=/tmp/x"]), host),
+        None
+    );
 }
 
 #[test]
@@ -7530,6 +7703,7 @@ impl RunOpts {
         // pre-empted by the generic availability probe above. E9patch is a CLI
         // preprocessor and probes its ptrace runtime and tool separately.
         self.validate_mount_sources()?;
+        validate_host_scratch(HostLayout::of_host(), std::env::var_os("TMPDIR").is_some())?;
         self.validate_program()?;
         if self.hb_list_events {
             return self.list_happens_before_events();
@@ -8412,6 +8586,14 @@ impl RunOpts {
                     source.display()
                 );
             }
+        }
+        if let Some(target) = missing_mount_target(&self.mount, Path::exists) {
+            anyhow::bail!(
+                "--mount target {} does not exist on this host. Hermit mounts onto an existing \
+                 path outside {TMP_DIR}: create it first, or choose a target under {TMP_DIR}, \
+                 which Hermit creates in the guest's private {TMP_DIR}.",
+                target.display()
+            );
         }
         Ok(())
     }
@@ -10222,6 +10404,61 @@ impl RunOpts {
     /// `--bind`s (a backend adapter's own last, marked as a backend's), the
     /// e9patch overlay (a backend's own), and the private `/tmp`.
     fn mounts(&self, tmpfs: &Path) -> Result<PreparedMounts, Error> {
+        self.mounts_on(tmpfs, HostLayout::of_host())
+    }
+
+    /// [`Self::mounts`] on a host with `layout`. A host without `/tmp`
+    /// (Android) gets no private `/tmp`, since there is no host `/tmp` for it
+    /// to hide and nothing to mount it onto; a mount or bind the caller aimed
+    /// into `/tmp` is refused there, naming why.
+    fn mounts_on(&self, tmpfs: &Path, layout: HostLayout) -> Result<PreparedMounts, Error> {
+        if !layout.tmp {
+            if let Some(tmp) = &self.tmp {
+                if self.strace_only {
+                    anyhow::bail!(
+                        "--strace-only shares the host's {TMP_DIR} with the guest, and this host \
+                         has none"
+                    );
+                }
+                anyhow::bail!(
+                    "this host has no {TMP_DIR}, so there is none for --tmp {} to go over",
+                    tmp.display()
+                );
+            }
+            let backend_mounts_from = self.mount.len().saturating_sub(self.backend_mounts.0);
+            let backend_binds_from = self.bind.len().saturating_sub(self.backend_mounts.1);
+            let into_tmp = self
+                .mount
+                .iter()
+                .enumerate()
+                .map(|(index, mount)| {
+                    (
+                        mount.get_target().to_path_buf(),
+                        index >= backend_mounts_from,
+                    )
+                })
+                .chain(self.bind.iter().enumerate().map(|(index, bind)| {
+                    (
+                        PathBuf::from(OsStr::from_bytes(bind.target.to_bytes())),
+                        index >= backend_binds_from,
+                    )
+                }))
+                .find(|(target, _)| target.starts_with(TMP_DIR));
+            match into_tmp {
+                Some((target, true)) => anyhow::bail!(
+                    "this host has no {TMP_DIR}, where the {} backend places {}: that backend \
+                     cannot run here",
+                    self.runtime_backend().as_str(),
+                    target.display()
+                ),
+                Some((target, false)) => anyhow::bail!(
+                    "this host has no {TMP_DIR}, so Hermit gives the guest none, and cannot place \
+                     {} there. Choose a target outside {TMP_DIR}.",
+                    target.display()
+                ),
+                None => {}
+            }
+        }
         // Each run of an in-process `--verify` must bind the one snapshot its
         // owner took for both; reading the host here would let a cache
         // replaced between the runs reach only one of them
@@ -10243,7 +10480,7 @@ impl RunOpts {
             "the shared inputs seal /etc/ld.so.cache, but this run did not adopt it"
         );
         let (mut identity_mounts, identity_sources) =
-            identity_hardening_mounts(self.ld_so_cache_snapshot.as_ref())?;
+            identity_hardening_mounts_on(layout, self.ld_so_cache_snapshot.as_ref())?;
         let mut identity_sources = identity_sources;
         let mut explicit_tmp_mount = false;
         let mut user_mounts = Vec::with_capacity(self.mount.len() + self.bind.len());
@@ -10303,7 +10540,7 @@ impl RunOpts {
             }
         }
 
-        if self.tmp.is_none() {
+        if self.tmp.is_none() && layout.tmp {
             if explicit_tmp_mount {
                 // The user mount or bind is installed on the generated staging
                 // path, then exposed at `/tmp` by the final bind below. Preserve
@@ -10340,8 +10577,16 @@ impl RunOpts {
         }
         // Bind the /tmp/tmpXXXXXX tmpfs mount over /tmp to hide it. This way,
         // we still preserve the files or directories bind-mounted inside of it
-        // while hiding the real /tmp.
-        mounts.push(PlannedMount::hermit(Mount::bind(tmpfs, TMP_DIR).rshared()));
+        // while hiding the real /tmp. A host without /tmp has none to hide,
+        // and nothing to mount onto (refused above for a caller's mount).
+        if layout.tmp {
+            mounts.push(PlannedMount::hermit(Mount::bind(tmpfs, TMP_DIR).rshared()));
+        } else {
+            tracing::info!(
+                "[hermit] this host has no {TMP_DIR}, so the guest has none either: Hermit's \
+                 private {TMP_DIR} goes over the host's"
+            );
+        }
 
         Ok(PreparedMounts {
             mounts,

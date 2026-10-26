@@ -1293,13 +1293,54 @@ impl LdSoCacheSnapshot {
 pub(super) fn identity_hardening_mounts(
     ld_so_cache: Option<&LdSoCacheSnapshot>,
 ) -> Result<(Vec<Mount>, IdentityGuard), Error> {
-    let group_file = frozen_group_file()?;
-    let mut mountinfo_roots = vec![MountInfoRootSource::new(
-        group_file.path(),
-        Path::new(GROUP_FILE),
-        DETERMINISTIC_GROUP_ROOT,
-    )?];
-    let mut mounts = vec![Mount::bind(group_file.path(), GROUP_FILE).readonly()];
+    identity_hardening_mounts_on(HostLayout::of_host(), ld_so_cache)
+}
+
+/// The parts of the usual Linux layout that Hermit mounts over, and whether
+/// this host has them. Android has no `/tmp` (nor `/run` or `/var`), and its
+/// C library keeps no `/etc/group`, so a mount onto either fails with ENOENT
+/// at container setup, before the guest starts. Where the host has no such
+/// path the guest gets none either: there is nothing to freeze or hide.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct HostLayout {
+    /// `/tmp` is a directory, which Hermit's private `/tmp` goes over.
+    pub(super) tmp: bool,
+    /// `/etc/group` exists, which the frozen group database goes over.
+    pub(super) group_file: bool,
+}
+
+impl HostLayout {
+    pub(super) fn of_host() -> Self {
+        Self {
+            tmp: Path::new("/tmp").is_dir(),
+            group_file: Path::new(GROUP_FILE).exists(),
+        }
+    }
+}
+
+/// [`identity_hardening_mounts`] on a host with `layout`.
+pub(super) fn identity_hardening_mounts_on(
+    layout: HostLayout,
+    ld_so_cache: Option<&LdSoCacheSnapshot>,
+) -> Result<(Vec<Mount>, IdentityGuard), Error> {
+    let mut mountinfo_roots = Vec::new();
+    let mut mounts = Vec::new();
+    let group_file = if layout.group_file {
+        let group_file = frozen_group_file()?;
+        mountinfo_roots.push(MountInfoRootSource::new(
+            group_file.path(),
+            Path::new(GROUP_FILE),
+            DETERMINISTIC_GROUP_ROOT,
+        )?);
+        mounts.push(Mount::bind(group_file.path(), GROUP_FILE).readonly());
+        Some(group_file)
+    } else {
+        tracing::info!(
+            "[hermit] this host has no {GROUP_FILE}, so the guest has none either: there is no \
+             group database to freeze"
+        );
+        None
+    };
     let ld_so_cache = frozen_ld_so_cache(ld_so_cache)?;
     if let Some(cache) = &ld_so_cache {
         mountinfo_roots.push(MountInfoRootSource::new(
@@ -1334,7 +1375,7 @@ pub(super) fn identity_hardening_mounts(
     Ok((
         mounts,
         IdentityGuard {
-            _group_file: Some(group_file),
+            _group_file: group_file,
             _ld_so_cache: ld_so_cache,
             _nscd_dir: nscd_dir,
             mountinfo_roots,
