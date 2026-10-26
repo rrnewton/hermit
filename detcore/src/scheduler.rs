@@ -1399,6 +1399,10 @@ pub struct Scheduler {
     /// `--chaos-timed-wait-spread`: the seeded wake thresholds of timed waits
     /// (`Scheduler::file_timed_wait`). `None` with the option unset.
     timed_wait_spread: Option<timed_wait_spread::TimedWaitSpread>,
+    /// The thread whose spread wait came due before its deadline in this
+    /// pass's step 2b and was queued again at the deadline
+    /// (`reach_promised_deadline`), for `replay_waits_for_a_requeued_wake`.
+    promised_wake_requeued: Option<DetTid>,
 
     /// INVARIANT: Thread IDs in `blocked` are absent from `run_queue`.
     pub blocked: BlockedPool,
@@ -5063,6 +5067,7 @@ impl Scheduler {
             turn_clocks: BTreeMap::new(),
             preemption_cap: None,
             guest_held_marks_revoked: false,
+            promised_wake_requeued: None,
             timed_wait_spread: cfg
                 .chaos_timed_wait_spread
                 .map(|spread| timed_wait_spread::TimedWaitSpread::new(spread, cfg.sched_seed())),
@@ -8647,6 +8652,7 @@ impl Scheduler {
         );
         drop(gtime);
         self.blocked.timed_waiters.insert(deadline, dettid);
+        self.promised_wake_requeued = Some(dettid);
     }
 
     /// Reschedule a single thread that has been blocked on futex.
@@ -9667,6 +9673,24 @@ impl Scheduler {
         }
     }
 
+    /// Under `--replay-schedule-from`, whether the thread the schedule runs
+    /// next went back to sleep in this pass's step 2b: a spread wait that came
+    /// due before its deadline popped and was queued again at the deadline
+    /// (`reach_promised_deadline`). Its recording ran no other thread before
+    /// it, since its next event is that thread's, so the pass ends without a
+    /// commit. The next pass's step 1 brings committed time to the deadline,
+    /// where the thread wakes, as it did in the recording. Without the wait,
+    /// the pass gives the turn to another queued thread, which the recording
+    /// did not run there, and the replay leaves its schedule.
+    fn replay_waits_for_a_requeued_wake(&self) -> bool {
+        self.promised_wake_requeued.is_some_and(|requeued| {
+            self.replayer
+                .as_ref()
+                .and_then(|replayer| replayer.next_resume())
+                .is_some_and(|(tid, _)| tid == requeued)
+        })
+    }
+
     fn step2_process_blocked(
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
@@ -9705,7 +9729,11 @@ impl Scheduler {
         // pops one due timed event, the replayed thread's last if others pop
         // ahead of it.
         let held_for_replayed_wake = self.replay_fast_forward_to_recorded_wake(global_time);
+        self.promised_wake_requeued = None;
         self.step2b_process_timed(global_time);
+        if self.replay_waits_for_a_requeued_wake() {
+            return Err(SkipTurn);
+        }
         if !held_for_replayed_wake {
             self.step2b_restore_due_pollers();
             self.upgrade_pollers_on_time();
@@ -27932,6 +27960,38 @@ mod test {
                 scheduler.blocked.timed_waiters.thread_deadline(sleeper),
                 Some(expected),
                 "recorded events left: {spread}"
+            );
+        }
+    }
+
+    /// A schedule replay whose next event is a spread sleeper's waits, in a
+    /// pass of its own, for the sleeper that step 2b put back to sleep until
+    /// its deadline, as its recording did, and does not wait for one when the
+    /// schedule runs another thread next.
+    #[test]
+    fn a_schedule_replay_waits_for_its_next_thread_put_back_to_sleep() {
+        let sleeper = DetTid::from_raw(5);
+        let (seed, factor) = spread_seed(sleeper, |factor| factor < 0.5);
+        for (next, waits) in [(sleeper, true), (DetTid::from_raw(7), false)] {
+            let (mut scheduler, global_time, start, deadline) = spread_sleeper(Some(seed), sleeper);
+            let event = SchedEvent::syscall(next, Sysno::nanosleep, SyscallPhase::Posthook);
+            scheduler.replayer = Some(Replayer::new(vec![event]));
+            assert!(!scheduler.replay_waits_for_a_requeued_wake());
+            let wake = start + LogicalTime::from_nanos((1_000_000.0 * factor).round() as u64);
+            global_time
+                .lock()
+                .unwrap()
+                .add_extra_time(wake.duration_since(start));
+            scheduler.committed_time = wake;
+            assert!(scheduler.step2b_process_timed(&global_time));
+            assert_eq!(
+                scheduler.blocked.timed_waiters.thread_deadline(sleeper),
+                Some(deadline)
+            );
+            assert_eq!(
+                scheduler.replay_waits_for_a_requeued_wake(),
+                waits,
+                "next event by {next}"
             );
         }
     }

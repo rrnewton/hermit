@@ -3166,7 +3166,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And --chaos-timed-wait-spread: three scheduler::timed_wait_spread::tests, one
     // timed_waiters test, two scheduler tests and one preemptions test: 3023.
     // And scheduler::test::a_schedule_replay_spreads_no_wait_filed_past_its_schedule: 3024.
-    ("test.detcore_unit", 3024),
+    // And scheduler::test::a_schedule_replay_waits_for_its_next_thread_put_back_to_sleep: 3025.
+    ("test.detcore_unit", 3025),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5563,7 +5564,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same sixteen #4682 re-land units: 3000 + 16 = 3016.
     // And the same seven --chaos-timed-wait-spread tests: 3023.
     // And the same spread past-the-schedule unit: 3024.
-    ("test.detcore_unit_on_host", 3024),
+    // And the same spread replay-wait unit: 3025.
+    ("test.detcore_unit_on_host", 3025),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
