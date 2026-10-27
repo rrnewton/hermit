@@ -3088,7 +3088,7 @@ fi
 # rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
 # calibrated budget, job width and limits carry unchanged from the
 # a13d0205 entry.
-# CARRY TO 882c91c02b981f56370a2912f0832b04fefc46ec (2026-10-27): from
+# CARRY TO 8e643290c8980452fada77eed19d01bf12af8bc1 (2026-10-27): from
 # ab248a36f83edbcb6b8705dad38b094bd61f1c74. Two commits (in-guest runtime
 # descriptors invisible to the guest, and the fixes from its delta review):
 # reverie-inguest places, records and moves its descriptors, reverie gains a
@@ -3099,8 +3099,8 @@ fi
 # rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
 # calibrated budget, job width and limits carry unchanged from the
 # ab248a36 entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 882c91c02b981f56370a2912f0832b04fefc46ec ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 882c91c02b981f56370a2912f0832b04fefc46ec (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 8e643290c8980452fada77eed19d01bf12af8bc1 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 8e643290c8980452fada77eed19d01bf12af8bc1 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
