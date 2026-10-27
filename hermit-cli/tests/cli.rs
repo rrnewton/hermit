@@ -50921,16 +50921,30 @@ fn a_run_without_namespaces_is_not_refused_where_user_namespaces_are_denied() {
 
 /// `hermit run --max-timeslice=1000` writes one stderr notice that a CPU-bound
 /// guest runs orders of magnitude slower and that a `--timeout` that expires
-/// may not mean a hang; the default writes none. The notice comes before the
+/// may not mean a hang; the default writes none. So does a maximum of exactly
+/// one RCB under a chaos slowdown, 110 virtual nanoseconds at
+/// `--clock-multiplier=2.5` and `--chaos-slowdown-max-factor=4.4`, which is
+/// accepted rather than refused as below one RCB. The notice comes before the
 /// program is checked, so a missing program runs no guest and the case needs
 /// no PMU: where perf counters are unavailable Hermit disables the maximum,
 /// says so, and writes no notice, which the case then checks instead.
 #[test]
 fn a_small_max_timeslice_gets_one_notice() {
     const GUEST: &str = "/nonexistent-small-max-timeslice-guest";
-    for (maximum, small) in [(Some("--max-timeslice=1000"), true), (None, false)] {
+    let slowed_one_rcb = [
+        "--chaos",
+        "--chaos-per-thread-slowdown",
+        "--chaos-slowdown-max-factor=4.4",
+        "--clock-multiplier=2.5",
+        "--max-timeslice=110",
+    ];
+    for (options, small) in [
+        (&["--max-timeslice=1000"][..], true),
+        (&slowed_one_rcb[..], true),
+        (&[][..], false),
+    ] {
         let mut args = vec!["run"];
-        args.extend(maximum);
+        args.extend(options);
         args.extend(["--", GUEST]);
         let output = hermit_test::hermit_output(
             &format!("hermit {args:?}"),
@@ -50938,6 +50952,7 @@ fn a_small_max_timeslice_gets_one_notice() {
         );
         let log = stderr(&output);
         assert!(!output.status.success(), "{args:?}: {log}");
+        assert!(!log.contains("at least one RCB"), "{args:?}: {log}");
         assert!(log.contains(GUEST), "the missing program is named: {log}");
         let timer = !log.contains("continuing with --max-timeslice=disabled");
         assert_eq!(

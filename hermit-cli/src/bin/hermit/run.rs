@@ -197,7 +197,6 @@ enum TimerUnavailable {
     NoPmuProfile(String),
 }
 
-/// Whether this host can arm Reverie's ptrace PMU timer.
 /// Whether [`reverie_timer_support`] finds this host's timer, for tests
 /// elsewhere in the binary whose expectation depends on it.
 #[cfg(test)]
@@ -205,6 +204,7 @@ pub(crate) fn reverie_timer_support_for_tests() -> bool {
     reverie_timer_support().is_ok()
 }
 
+/// Whether this host can arm Reverie's ptrace PMU timer.
 fn reverie_timer_support() -> Result<(), TimerUnavailable> {
     if !reverie_ptrace::is_perf_supported() {
         return Err(TimerUnavailable::NoPerfEvents);
@@ -5747,6 +5747,33 @@ fn max_timeslice_rejects_less_than_one_rcb() {
     let error = scaled.validate_args_with_perf_support(true).unwrap_err();
     assert!(error.to_string().contains("at least one RCB"));
 
+    // Under a chaos slowdown one RCB is NANOS_PER_RCB * (clock multiplier *
+    // largest factor), multiplied in that order as Detcore's PMU epsilon is:
+    // 110 virtual nanoseconds here, which left to right comes to one unit in
+    // the last place more and a minimum of 111.
+    let slowed = |maximum: &str| {
+        let mut ro = RunOpts::parse_from([
+            "fakehermit",
+            "--chaos",
+            "--chaos-per-thread-slowdown",
+            "--chaos-slowdown-max-factor=4.4",
+            "--clock-multiplier=2.5",
+            maximum,
+            "fakeprog",
+        ]);
+        ro.validate_args_with_perf_support(true).map(|()| ro)
+    };
+    let ro = slowed("--max-timeslice=110").unwrap();
+    assert_eq!(
+        ro.det_opts.det_config.max_timeslice,
+        std::num::NonZeroU64::new(110)
+    );
+    let error = slowed("--max-timeslice=109").unwrap_err().to_string();
+    assert!(
+        error.contains("at least one RCB (110 virtual nanoseconds"),
+        "{error}"
+    );
+
     let mut zero = RunOpts::parse_from(["fakehermit", "--clock-multiplier=0", "fakeprog"]);
     assert!(
         zero.validate_args_with_perf_support(true)
@@ -6162,15 +6189,31 @@ fn a_small_max_timeslice_gets_a_notice() {
             100,
             false,
         ),
+        // One RCB is 10 * (2.5 * 4.4) = 110 virtual nanoseconds, as Detcore
+        // multiplies; left to right it is one unit in the last place more,
+        // which would leave 110 ns no whole branch.
+        (
+            vec![
+                "--chaos",
+                "--chaos-per-thread-slowdown",
+                "--chaos-slowdown-max-factor=4.4",
+                "--clock-multiplier=2.5",
+                "--max-timeslice=110",
+            ],
+            intel,
+            1,
+            true,
+        ),
     ] {
         let mut full = vec!["hermit", "run"];
         full.extend(&argv);
         full.push("fakeprog");
         let line = notice(&full, margin).unwrap_or_else(|| panic!("{argv:?} gets a notice"));
         assert!(line.starts_with("NOTICE: --max-timeslice="), "{line}");
+        let branches = if rcbs == 1 { "branch" } else { "branches" };
         assert!(
             line.contains(&format!(
-                "at most about {rcbs} retired conditional branches"
+                "at most about {rcbs} retired conditional {branches} "
             )),
             "{argv:?}: {line}"
         );
@@ -12690,6 +12733,7 @@ impl RunOpts {
         let rcbs = (maximum as f64 / config.largest_nanos_per_rcb()).floor() as u64;
         let margin = skid_margin();
         (rcbs <= SMALL_TIMESLICE_SKID_MARGINS.saturating_mul(margin)).then(|| {
+            let branches = if rcbs == 1 { "branch" } else { "branches" };
             let slowed = if config.chaos && config.chaos_per_thread_slowdown {
                 " (at the largest chaos slowdown factor)"
             } else {
@@ -12697,7 +12741,7 @@ impl RunOpts {
             };
             format!(
                 "NOTICE: --max-timeslice={maximum} lets a thread that computes without a syscall \
-                 run at most about {rcbs} retired conditional branches{slowed} before a timer \
+                 run at most about {rcbs} retired conditional {branches}{slowed} before a timer \
                  event stops it, and the guest is stepped through up to {margin} branches (the \
                  skid margin) to place each event, so a CPU-bound guest can run orders of \
                  magnitude slower than at the default (--max-timeslice={default}), and a \
