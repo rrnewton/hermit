@@ -268,7 +268,7 @@ liteinst_build=$!
 # every one of them. Its hermit link, to ../validate/hermit, resolves once the hermit
 # build is copied there below.
 "$retry" cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-install -p detcore-sabre \
-    -p detcore-liteinst --target-dir "$target_dir"
+    -p detcore-liteinst --features hermit-install/third-party-backends --target-dir "$target_dir"
 finish_build() { # finish_build WHAT PID-VARIABLE LOG
     local status=0
     wait "${!2}" || status=$?

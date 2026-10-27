@@ -25,8 +25,8 @@
 //!   build root's, which its glibc cannot load. The wrapper reads only the name
 //!   suffixed with the target triple, `-` spelled `_`; other linkers ignore it.
 //!
-//! src/glibc_compat.rs covers the two symbols that statically linked C code
-//! would otherwise import at a newer version, and
+//! src/lib.rs compiles common/inguest/glibc_compat.rs for the two symbols
+//! statically linked C code would otherwise import at a newer version, and
 //! ci/verify-hermit-e2e-artifact.sh refuses an artifact whose plugin needs
 //! more than glibc 2.34.
 
