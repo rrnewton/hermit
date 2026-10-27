@@ -67,19 +67,14 @@ use std::os::fd::RawFd;
 
 use reverie::Error;
 use reverie::Guest;
-use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::Addr;
-use reverie::syscalls::AddrMut;
-use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::PathPtr;
-use reverie::syscalls::ProtFlags;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::linux_abi::Mmsghdr;
 use reverie::syscalls::linux_abi::Msghdr;
 use tracing::debug;
-use tracing::info;
 use tracing::warn;
 
 use crate::record_or_replay::RecordOrReplay;
@@ -737,149 +732,36 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// What descriptor `fd` of the calling thread links to, read in the
     /// guest (`readlinkat` of `/proc/thread-self/fd/<fd>`, injected), or
     /// `None` where that read fails or the link is longer than any anonymous
-    /// inode's. The path and the result are staged as `inject_fstat` stages
-    /// its buffer: in the guest stack scratch, with the bytes under them put
-    /// back, or, where the scratch cannot hold them, in a transient private
-    /// page that is unmapped before the guest resumes.
+    /// inode's. The path and the result share one buffer, staged where
+    /// `inject_fstat` stages its own
+    /// ([`crate::syscalls::scratch::inject_with_scratch`]).
     async fn received_descriptor_link<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
     ) -> Option<Vec<u8>> {
-        let mut path = [0_u8; LINK_PATH];
+        let mut buffer = [0_u8; LINK_PATH + LINK_TARGET];
         let spelled = format!("/proc/thread-self/fd/{fd}");
-        path.get_mut(..spelled.len())?
+        buffer
+            .get_mut(..spelled.len())?
             .copy_from_slice(spelled.as_bytes());
-        match Self::read_link_on_stack(guest, &path).await {
-            Err(reverie::Errno::EFAULT) => {
-                info!(
-                    "Guest stack scratch cannot hold the readlinkat buffers for fd {fd}; using a \
-                     transient page instead."
-                );
-                Self::read_link_in_transient_page(guest, &path)
-                    .await
-                    .ok()
-                    .flatten()
-            }
-            result => result.ok().flatten(),
-        }
-    }
-
-    /// The fast path of [`Self::received_descriptor_link`]: `path` and the
-    /// result in the guest stack scratch. `Err(EFAULT)` when the scratch
-    /// cannot hold them.
-    async fn read_link_on_stack<G: Guest<Self>>(
-        guest: &mut G,
-        path: &[u8; LINK_PATH],
-    ) -> Result<Option<Vec<u8>>, reverie::Errno> {
-        let mut stack = guest.stack().await;
-        let link = stack.reserve::<[u8; LINK_PATH]>().cast::<u8>();
-        let target = stack.reserve::<[u8; LINK_TARGET]>().cast::<u8>();
-        // Ptrace lends bytes below the guest red zone; they are put back after
-        // the call, as `inject_fstat` puts back its buffer's.
-        let mut saved_link = [0_u8; LINK_PATH];
-        let mut saved_target = [0_u8; LINK_TARGET];
-        guest.memory().read_exact(link, &mut saved_link)?;
-        guest.memory().read_exact(target, &mut saved_target)?;
-        let guard = match stack.commit() {
-            Ok(guard) => guard,
-            Err(errno) => {
-                let mut memory = guest.memory();
-                let _ = memory
-                    .write_exact(link, &saved_link)
-                    .and(memory.write_exact(target, &saved_target));
-                return Err(errno);
-            }
-        };
-        let read = match guest.memory().write_exact(link, path) {
-            Ok(()) => Self::inject_read_link(guest, link, target).await,
-            Err(errno) => Err(errno),
-        };
-        let mut memory = guest.memory();
-        let restored = memory
-            .write_exact(link, &saved_link)
-            .and(memory.write_exact(target, &saved_target));
-        drop(memory);
-        drop(guard);
-        let read = read?;
-        restored?;
-        Ok(read)
-    }
-
-    /// [`Self::received_descriptor_link`] with `path` and the result in a
-    /// transient private page, unmapped before the guest resumes.
-    async fn read_link_in_transient_page<G: Guest<Self>>(
-        guest: &mut G,
-        path: &[u8; LINK_PATH],
-    ) -> Result<Option<Vec<u8>>, reverie::Errno> {
-        let len = LINK_PATH + LINK_TARGET;
-        let mapped = guest
-            .inject_with_retry(Syscall::Mmap(
-                syscalls::Mmap::new()
-                    .with_addr(None)
-                    .with_len(len)
-                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
-                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
-                    .with_fd(-1)
-                    .with_offset(0),
-            ))
-            .await?;
-        let page = usize::try_from(mapped)
-            .ok()
-            .and_then(AddrMut::<u8>::from_raw)
-            .unwrap_or_else(|| panic!("transient readlinkat page mmap returned {mapped}"));
-        // SAFETY: the page just mapped holds LINK_PATH + LINK_TARGET bytes.
-        let target = unsafe { page.add(LINK_PATH) };
-        let read = match guest.memory().write_exact(page, path) {
-            Ok(()) => Self::inject_read_link(guest, page, target).await,
-            Err(errno) => Err(errno),
-        };
-        if let Err(errno) = guest
-            .inject_with_retry(Syscall::Munmap(
-                syscalls::Munmap::new()
-                    .with_addr(Some(page.cast::<libc::c_void>().into()))
-                    .with_len(len),
-            ))
-            .await
-        {
-            // Not expected: the page was mapped by this call and its address
-            // never reached the guest.
-            warn!("[detcore] could not unmap the transient readlinkat page: {errno}");
-        }
-        read
-    }
-
-    /// Inject `readlinkat(AT_FDCWD, link, target, LINK_TARGET)` and read back
-    /// the link: `None` when the call fails other than with EFAULT, or the
-    /// link fills the buffer.
-    async fn inject_read_link<G: Guest<Self>>(
-        guest: &mut G,
-        link: AddrMut<'_, u8>,
-        target: AddrMut<'_, u8>,
-    ) -> Result<Option<Vec<u8>>, reverie::Errno> {
-        let length = match guest
-            .inject_with_retry(
+        let (length, bytes) =
+            crate::syscalls::scratch::inject_with_scratch(guest, buffer, |base| {
+                // SAFETY: the buffer holds LINK_PATH + LINK_TARGET bytes.
+                let target = unsafe { base.add(LINK_PATH) };
                 syscalls::Readlinkat::new()
                     .with_dirfd(libc::AT_FDCWD)
-                    .with_path(PathPtr::from_ptr(link.as_raw() as *const libc::c_char))
+                    .with_path(PathPtr::from_ptr(base.as_raw() as *const libc::c_char))
                     .with_buf(Some(target.cast::<libc::c_char>()))
-                    .with_buf_len(LINK_TARGET),
-            )
+                    .with_buf_len(LINK_TARGET)
+                    .into()
+            })
             .await
-        {
-            Err(reverie::Errno::EFAULT) => return Err(reverie::Errno::EFAULT),
-            Err(_) => return Ok(None),
-            Ok(length) => length,
-        };
-        let Some(length) = usize::try_from(length)
+            .ok()?;
+        let length = usize::try_from(length)
             .ok()
-            .filter(|length| *length < LINK_TARGET)
-        else {
-            return Ok(None);
-        };
-        let mut bytes = vec![0; length];
-        guest.memory().read_exact(target, &mut bytes)?;
-        Ok(Some(bytes))
+            .filter(|length| *length < LINK_TARGET)?;
+        Some(bytes[LINK_PATH..LINK_PATH + length].to_vec())
     }
 }
 
