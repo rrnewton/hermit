@@ -201,7 +201,7 @@ The `dbt`, `sabre`, and `e9patch` selections require optional CLI features as
 well as runtime resources. Build both with:
 
 ```bash
-cargo build --release --workspace --features hermit-run/third-party-backends
+cargo build --release --workspace --features hermit-run/third-party-backends,hermit-install/third-party-backends
 ./target/install_pkg/hermit --backend=dbt run -- /bin/echo hello
 ```
 
@@ -308,7 +308,7 @@ thread has published it. Build Hermit and the guest, then run the default
 deterministic schedule twice. The first command rebuilds `target/release/hermit`,
 which `target/install_pkg/hermit` links to, with default features; if you built
 the `dbt`, `sabre`, and `e9patch` backends above, use
-`cargo build --release --workspace --features hermit-run/third-party-backends`
+`cargo build --release --workspace --features hermit-run/third-party-backends,hermit-install/third-party-backends`
 instead so the rebuild keeps them:
 
 ```bash
