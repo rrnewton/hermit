@@ -1529,15 +1529,18 @@ corpus:
         - timeout_seconds: 57
           cpu_timeout_seconds: 33
           slow_reason: >-
-            The full validation of 77635530182d stopped each of these DBT
-            cells at the default 22 CPU s. Local single samples on
-            devbig014 at the flip head (2026-10-27) measured git 12.465,
-            ld 14.868 and pkg-config 13.172 CPU s; the configured bound is
-            ceil(1.5 x 22.0) = 33, the rule of
+            The full validation of 77635530182d stopped git, ld and
+            pkg-config at the default 22 CPU s, and the landed flip's
+            validation of 330a8b849db3 stopped node the same way on its
+            local Buck route. Local single samples on devbig014 at the
+            flip head (2026-10-27) measured git 12.465, ld 14.868 and
+            pkg-config 13.172 CPU s; five Buck-cell runs of node at
+            25d8071f6aa measured 13.487-14.242 CPU s (max wall 24.838 s).
+            The configured bound is ceil(1.5 x 22.0) = 33, the rule of
             DBT_2026_10_25_TIMEOUT_CALIBRATIONS, because the
             validate-context measurement is the 22.0 stop itself. Wall
-            stays at the 57 s default (local walls at most 16.1 s).
-          rows: [git, ld, pkg-config]
+            stays at the 57 s default (measured walls at most 24.9 s).
+          rows: [git, ld, node, pkg-config]
       rows:
         [
           addr2line, ar, arch, as, awk, b2sum, base32, base64, basename, basenc,

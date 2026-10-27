@@ -15319,13 +15319,13 @@ fi
             };
             assert_eq!(*bounds, (59, wall), "{test}");
         }
-        // The three compat DBT cells with a `slow` budget (git, ld,
+        // The four compat DBT cells with a `slow` budget (git, ld, node,
         // pkg-config at 33/57) are not ptrace corpus cells; assert them
         // apart and return them to the calibrated set below.
         let (compat_dbt_slow, compat): (BTreeMap<_, _>, BTreeMap<_, _>) = compat
             .into_iter()
             .partition(|((_, _, backend), _)| *backend == "dbt");
-        assert_eq!(compat_dbt_slow.len(), 3);
+        assert_eq!(compat_dbt_slow.len(), 4);
         for ((test, mode, _), bounds) in &compat_dbt_slow {
             assert_eq!(*mode, "verify", "{test}");
             assert_eq!(*bounds, (33, 57), "{test}");

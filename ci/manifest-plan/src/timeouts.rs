@@ -347,16 +347,20 @@ pub const DBT_2026_10_25_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 1] = [Timeou
     configured_wall_seconds: 95,
 }];
 
-/// Four DBT verify cells the 288-cell flip made required and the full
-/// validation of 77635530182d stopped at the default 22 CPU s (validate-full
-/// log: compat/git, compat/ld, compat/pkg-config, language-runtimes/node-v8-jit
-/// all "cell exceeded 22 CPU s"). Local single samples on devbig014 at the
-/// flip head (test-harness run, 4x timeout multiplier, 2026-10-27) measured
-/// the CPU/wall below; the configured CPU bound is ceil(1.5 x 22.0) = 33,
-/// the same rule as DBT_2026_10_25 above, because the validate-context
-/// measurement is the 22.0 stop itself. Wall stays at the 57 s default:
-/// every local wall sample is at most 31.5 s and the cells are CPU-bound.
-pub const DBT_FLIP_2026_10_27_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 4] = [
+/// Five DBT verify cells the 288-cell flip made required and full validation
+/// stopped at the default 22 CPU s. The validation of 77635530182d stopped
+/// compat/git, compat/ld, compat/pkg-config and
+/// language-runtimes/node-v8-jit; the landed flip's validation of 330a8b849db3
+/// then stopped compat/node on its local Buck route (22.093 CPU s recorded at
+/// the kill). Local single samples on devbig014 at the flip head (test-harness
+/// run, 4x timeout multiplier, 2026-10-27) measured the first four cells'
+/// CPU/wall below; five Buck-cell runs of compat/node at 25d8071f6aa measured
+/// 13.487-14.242 CPU s (max wall 24.838 s). The configured CPU bound is
+/// ceil(1.5 x 22.0) = 33, the same rule as DBT_2026_10_25 above, because the
+/// validate-context measurement is the 22.0 stop itself. Wall stays at the
+/// 57 s default: every measured wall sample is at most 31.5 s and the cells
+/// are CPU-bound.
+pub const DBT_FLIP_2026_10_27_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 5] = [
     TimeoutCalibration {
         test: "compat/git",
         mode: "verify",
@@ -390,6 +394,18 @@ pub const DBT_FLIP_2026_10_27_TIMEOUT_CALIBRATIONS: [TimeoutCalibration; 4] = [
         p90_wall_millis: 14_464,
         required_cpu_seconds: 20,
         required_wall_seconds: 22,
+        configured_cpu_seconds: 33,
+        configured_wall_seconds: 57,
+    },
+    TimeoutCalibration {
+        test: "compat/node",
+        mode: "verify",
+        backend: "dbt",
+        samples: 5,
+        p90_cpu_usec: 14_242_037,
+        p90_wall_millis: 24_838,
+        required_cpu_seconds: 22,
+        required_wall_seconds: 38,
         configured_cpu_seconds: 33,
         configured_wall_seconds: 57,
     },
