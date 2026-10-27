@@ -766,9 +766,12 @@ bound too, so on a slower or busier host it can stop a trial that finishes on
 another, and change what analyze finds; leave it room, or leave the bounding
 to analyze's own. When a prefix search settles next to such a trial, the
 report calls it a hang and notes that the boundary rests on a wall-clock bound.
-Elsewhere (`--search` rounds, `--minimize`'s knock-outs and the stack-trace
-runs) analyze's own bound still counts a run it stops as not meeting the
-target. A trial that Hermit refuses when its guest reaches an operation Hermit
+Elsewhere (`--search` rounds and `--minimize`'s knock-outs) analyze's own
+bound still counts a run it stops as not meeting the target. A stack-trace run
+after a decision that analyze's bound stops runs again once with 4 times the
+bound; one stopped again, or stopped by the run arguments' `--timeout`, leaves
+its part of the report missing and says why. It never changes the decision;
+with a continuation missing, the report claims neither kind of decision. A trial that Hermit refuses when its guest reaches an operation Hermit
 does not support (exit 122) counts as not meeting the target too, with a
 warning; a refused target run still ends the analysis.
 

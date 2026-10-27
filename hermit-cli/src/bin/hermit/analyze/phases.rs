@@ -54,7 +54,6 @@ use crate::analyze::rundata::RunData;
 use crate::analyze::rundata::Stop;
 use crate::analyze::rundata::TrialEnd;
 use crate::analyze::rundata::TrialInconclusive;
-use crate::analyze::rundata::guest_reached_a_refusal;
 use crate::analyze::stop;
 use crate::analyze::stop::StopSignals;
 use crate::analyze::stop::Stopped;
@@ -1046,6 +1045,84 @@ fn timing_decision_header(
     header
 }
 
+/// The header of a `--prefix-search` report whose continuation with the
+/// deciding event is missing: the stack-trace replay that records it was
+/// stopped by a wall-clock bound (`stopped` says which). The decision stands,
+/// but not its kind: without the event the scheduler runs the deciding
+/// thread there too (`without` shows), and whether the run with it runs that
+/// thread longer, which would make it a timing decision, is what is missing.
+fn timing_decision_missing_header(
+    decision: usize,
+    event: &SchedEvent,
+    without: &Slice,
+    criteria: &str,
+    continuation: MaybeTimeslice,
+    stopped: &str,
+) -> String {
+    let thread = event.dettid;
+    let then = match without.next {
+        Some((index, next)) => format!("then thread {next} runs at event #{index} (stack2)"),
+        None => "and no other thread runs after it".to_owned(),
+    };
+    format!(
+        "The scheduling decision at event #{decision} of the target schedule decides the \
+         outcome.\nWithout it, scheduling without chaos {}, the scheduler runs thread {thread} \
+         there too, for {} events ({} retired conditional branches), {then}, and the run does \
+         not meet the target criteria; replaying event #{decision} too ({event}) meets them \
+         ({criteria}).\nWhat the scheduler runs after event #{decision} with the event, and so \
+         whether what decides is how long thread {thread} runs or which thread runs there, is \
+         missing: {stopped}. stack1, the thread that would run next with the event, is missing \
+         with it.\nThread {thread}'s own stack at event #{decision} is printed first \
+         (deciding_event in the report file).\n",
+        describe_continuation(continuation),
+        without.events,
+        without.branches,
+    )
+}
+
+/// Whether `--prefix-search`'s stack-trace replays contradict the search's
+/// outcomes: one `with` the deciding event that finished and missed the
+/// target, or one `without` it that met it. A replay a bound stopped has no
+/// outcome, and contradicts nothing.
+fn stack_runs_contradict(with: &[&PrefixStack], without: &[&PrefixStack]) -> bool {
+    with.iter().any(|run| run.finished && !run.met) || without.iter().any(|run| run.met)
+}
+
+/// What a `--prefix-search` stack-trace replay gave.
+struct PrefixStack {
+    /// It finished: a stopped replay has no outcome to compare with the
+    /// search's.
+    finished: bool,
+    /// It finished and met the target criteria.
+    met: bool,
+    /// The stack at the event, if the replay reached it.
+    stack: Option<PrettyBacktrace>,
+    /// What stopped it, when a wall-clock bound did
+    /// ([`AnalyzeOpts::stack_trace_trial`]).
+    stopped: Option<String>,
+}
+
+impl PrefixStack {
+    /// No replay: there was no event to take a stack at.
+    fn none() -> Self {
+        PrefixStack {
+            finished: false,
+            met: false,
+            stack: None,
+            stopped: None,
+        }
+    }
+
+    /// "`which` is missing: why", when a wall-clock bound stopped the replay
+    /// before it took its stack.
+    fn missing(&self, which: &str) -> Option<String> {
+        match (&self.stack, &self.stopped) {
+            (None, Some(stopped)) => Some(format!("{which} is missing: {stopped}.")),
+            _ => None,
+        }
+    }
+}
+
 /// What a stack-trace replay of a critical pair gave.
 struct StackReplay {
     /// It finished (no bound or refusal stopped it).
@@ -1333,7 +1410,9 @@ impl AnalyzeOpts {
     /// Replay `schedule` (written at `schedule_path`) for the stacks of the
     /// critical pair, its events `index - 1` and `index`, recording the
     /// schedule the replay realized. A replay that a bound stops or Hermit
-    /// refuses still returns what it captured.
+    /// refuses still returns what it captured; one that analyze's own bound
+    /// stops runs again once with a longer one first
+    /// ([`Self::stack_trace_trial`]).
     fn replay_for_stacks(
         &self,
         runname: &str,
@@ -1341,34 +1420,36 @@ impl AnalyzeOpts {
         schedule: &[SchedEvent],
         index: usize,
     ) -> anyhow::Result<StackReplay> {
-        let mut run = RunData::new_baseline(self, runname.to_string())?
-            .with_schedule_replay_from(schedule_path.to_path_buf())
-            .with_schedule_recording();
-        let root_path = run.root_path();
-        let realized = run.sched_path_out().to_path_buf();
-        let paths = [
-            root_path.with_extension("stack1"),
-            root_path.with_extension("stack2"),
-        ];
-        run.runopts.det_opts.det_config.stacktrace_event = vec![
-            (index as u64 - 1, Some(paths[0].clone())),
-            (index as u64, Some(paths[1].clone())),
-        ];
-        let finished = match run.launch() {
-            Ok(()) => true,
-            Err(error)
-                if error.downcast_ref::<RunTimeoutMarker>().is_some()
-                    || guest_reached_a_refusal(&error) =>
-            {
-                eprintln!(
-                    ":: {} the stack-trace replay {runname} did not finish ({error:#}); \
-                     using the stacks it recorded",
-                    "WARNING:".yellow().bold(),
-                );
-                false
-            }
-            Err(error) => return Err(error),
+        let stack_paths = |run: &RunData| {
+            let root_path = run.root_path();
+            [
+                root_path.with_extension("stack1"),
+                root_path.with_extension("stack2"),
+            ]
         };
+        let (end, mut run, _) = self.stack_trace_trial(runname, |name| {
+            let mut run = RunData::new_baseline(self, name.to_string())?
+                .with_schedule_replay_from(schedule_path.to_path_buf())
+                .with_schedule_recording();
+            let [first, second] = stack_paths(&run);
+            run.runopts.det_opts.det_config.stacktrace_event = vec![
+                (index as u64 - 1, Some(first)),
+                (index as u64, Some(second)),
+            ];
+            Ok(run)
+        })?;
+        let realized = run.sched_path_out().to_path_buf();
+        let paths = stack_paths(&run);
+        let finished = !matches!(end, TrialEnd::Unfinished(_));
+        if !finished {
+            eprintln!(
+                ":: {} the stack-trace replay {} did not finish ({}); using the stacks it \
+                 recorded",
+                "WARNING:".yellow().bold(),
+                run.name(),
+                describe_trial_end(end, run.trial_bound()),
+            );
+        }
         eprintln!(
             "\n:: {}\n{}",
             if finished {
@@ -1406,7 +1487,7 @@ impl AnalyzeOpts {
         };
         Ok(StackReplay {
             finished,
-            met_target: finished && run.is_a_match(),
+            met_target: end == TrialEnd::Met,
             stacks,
             left_schedule,
             ran,
@@ -1435,19 +1516,6 @@ impl AnalyzeOpts {
         let path = run.sched_path_in().to_path_buf();
         self.write_trial_record(target.schedule_prefix(len), &path)?;
         Ok(run.with_schedule_replay_from(path))
-    }
-
-    /// Launch a prefix trial and say how it ended. A trial that a wall-clock
-    /// bound ends, or that Hermit refuses, did not reach the target.
-    fn launch_prefix_trial(&self, run: &mut RunData) -> anyhow::Result<TrialEnd> {
-        if self.verbose {
-            eprintln!(
-                ":: {}\n    {}",
-                "Prefix trial, repro command:".yellow().bold(),
-                run.to_repro()
-            );
-        }
-        run.launch_trial()
     }
 
     /// Launch the search trial `make(name)` creates, and say how it ended
@@ -1716,48 +1784,121 @@ impl AnalyzeOpts {
         len: usize,
         position: usize,
         continuation: MaybeTimeslice,
-    ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)> {
-        let mut run = self.prefix_trial(runname, schedule, len, continuation)?;
-        let stack_path = run.root_path().with_extension("stack");
-        run.runopts.det_opts.det_config.stacktrace_event =
-            vec![(position as u64, Some(stack_path.clone()))];
-        let is_match = self.launch_prefix_trial(&mut run)?.reached_target();
+    ) -> anyhow::Result<PrefixStack> {
+        let (end, run, stopped) = self.stack_trace_trial(runname, |name| {
+            let mut run = self.prefix_trial(name, schedule, len, continuation)?;
+            let stack_path = run.root_path().with_extension("stack");
+            run.runopts.det_opts.det_config.stacktrace_event =
+                vec![(position as u64, Some(stack_path))];
+            Ok(run)
+        })?;
         eprintln!(
             ":: {}\n{}",
             "Stack-trace run completed.  Repro command:".green().bold(),
             run.to_repro()
         );
+        let stack_path = run.root_path().with_extension("stack");
         let stack = match File::open(&stack_path) {
             Ok(file) => Some(serde_json::from_reader(file).with_context(|| {
                 format!("cannot parse the stack trace in {}", stack_path.display())
             })?),
             Err(_) => None,
         };
-        Ok((is_match, stack))
+        Ok(PrefixStack {
+            finished: !matches!(end, TrialEnd::Unfinished(_)),
+            met: end.reached_target(),
+            stack,
+            stopped,
+        })
+    }
+
+    /// Launch the stack-trace replay `make(name)` creates. It decides
+    /// nothing (the search has decided), but a wall-clock bound stops it at a
+    /// time the host chooses, so a stop must not change the kind of answer
+    /// either. One that analyze's own bound stopped runs again once as
+    /// `<name>_retry` with [`CONFIRM_BOUND_FACTOR`] times the bound, within
+    /// the run arguments' own `--timeout`; a stop by that `--timeout` cannot
+    /// be given longer. Returns how the last run ended, that run, and, when
+    /// a wall-clock bound stopped it, what to say in place of what it would
+    /// have shown.
+    fn stack_trace_trial(
+        &self,
+        name: &str,
+        make: impl Fn(&str) -> anyhow::Result<RunData>,
+    ) -> anyhow::Result<(TrialEnd, RunData, Option<String>)> {
+        let seconds = |bound: Option<u64>| bound.map_or("?".to_owned(), |bound| bound.to_string());
+        let mut run = make(name)?;
+        self.show_trial_repro(&run);
+        let mut end = run.launch_trial()?;
+        if end == TrialEnd::Unfinished(Stop::Backstop) {
+            let retry_name = format!("{name}_retry");
+            let retry = make(&retry_name)?.with_bound_factor(CONFIRM_BOUND_FACTOR);
+            eprintln!(
+                ":: the stack-trace replay {name} did not finish within hermit analyze's \
+                 wall-clock bound of {} s; running it again as {retry_name} with a bound of {} s",
+                seconds(run.trial_bound()),
+                seconds(
+                    retry
+                        .runopts
+                        .run_timeout_seconds()
+                        .map(std::num::NonZeroU64::get)
+                ),
+            );
+            run = retry;
+            self.show_trial_repro(&run);
+            end = run.launch_trial()?;
+        }
+        let stopped = match end {
+            TrialEnd::Unfinished(Stop::Backstop) => Some(format!(
+                "the stack-trace replay {} stopped at hermit analyze's wall-clock bound ({} s)",
+                run.name(),
+                seconds(run.trial_bound())
+            )),
+            TrialEnd::Unfinished(Stop::Bound) => Some(format!(
+                "the stack-trace replay {} stopped at --timeout={}",
+                run.name(),
+                seconds(
+                    run.runopts
+                        .run_timeout_seconds()
+                        .map(std::num::NonZeroU64::get)
+                )
+            )),
+            _ => None,
+        };
+        if let Some(stopped) = &stopped {
+            eprintln!(
+                ":: {} {stopped}: what it would have shown is missing from the report, and the \
+                 decision stands",
+                "NOTE:".yellow().bold()
+            );
+        }
+        Ok((end, run, stopped))
     }
 
     /// The schedule a prefix trial of the first `len` events of `schedule`
     /// realized: the replayed events, then the events the scheduler ran after
-    /// them, and the file it is recorded in. Empty if the trial wrote no
-    /// schedule (it did not finish).
+    /// them, the file it is recorded in, and what stopped the trial when a
+    /// wall-clock bound did ([`AnalyzeOpts::stack_trace_trial`]). Empty if
+    /// the trial wrote no schedule, or was stopped.
     fn prefix_continuation(
         &self,
         runname: &str,
         schedule: &PreemptionRecord,
         len: usize,
         continuation: MaybeTimeslice,
-    ) -> anyhow::Result<(Vec<SchedEvent>, PathBuf)> {
-        let mut run = self
-            .prefix_trial(runname, schedule, len, continuation)?
-            .with_schedule_recording();
+    ) -> anyhow::Result<(Vec<SchedEvent>, PathBuf, Option<String>)> {
+        let (_, mut run, stopped) = self.stack_trace_trial(runname, |name| {
+            Ok(self
+                .prefix_trial(name, schedule, len, continuation)?
+                .with_schedule_recording())
+        })?;
         let path = run.sched_path_out().to_path_buf();
-        self.launch_prefix_trial(&mut run)?;
-        let realized = if path.exists() {
+        let realized = if stopped.is_none() && path.exists() {
             PreemptionReader::new(&path).load_all().into_global()
         } else {
             Vec::new()
         };
-        Ok((realized, path))
+        Ok((realized, path, stopped))
     }
 
     /// The report of `--prefix-search`: the stacks of the two threads that
@@ -1783,19 +1924,22 @@ impl AnalyzeOpts {
             .into_iter()
             .flatten()
             .collect();
-        let (target_met, chosen) = self.prefix_stack(
+        let target = self.prefix_stack(
             "final_target_for_stacktraces",
             &schedule,
             decision + 1,
             decision,
             continuation,
         )?;
+        // A stack-trace replay a wall-clock bound stopped leaves its part of
+        // the report missing, and says so; it never changes the decision.
+        let mut missing = Vec::new();
         // The thread the scheduler runs at event #decision once the prefix
         // ends. `--stacktrace-event` names a position of the replayed schedule
         // only, so the prefix trial without event #decision runs first with its
         // schedule recorded, and the stack is taken from a replay of that
         // schedule's first decision + 1 events.
-        let (continued, continued_path) =
+        let (continued, continued_path, continued_stopped) =
             self.prefix_continuation("final_baseline_schedule", &schedule, decision, continuation)?;
         if continued
             .get(decision)
@@ -1804,29 +1948,47 @@ impl AnalyzeOpts {
                 &schedule,
                 decision,
                 continuation,
-                (target_met, &chosen),
+                &target,
                 (&continued, &continued_path),
                 &notes,
             )?
         {
             return Ok(report);
         }
-        let (baseline_met, instead) = if continued.len() > decision {
+        if target.stack.is_none()
+            && let Some(stopped) = &target.stopped
+        {
+            missing.push(format!("stack1 is missing: {stopped}."));
+        }
+        let hang = unfinished.is_some() && continued.is_empty();
+        let baseline = if continued.len() > decision {
             let baseline = continued_record(&schedule, decision, &continued);
-            self.prefix_stack(
+            let baseline = self.prefix_stack(
                 "final_baseline_for_stacktraces",
                 &baseline,
                 decision + 1,
                 decision,
                 continuation,
-            )?
-        } else if unfinished.is_some() && continued.is_empty() {
+            )?;
+            if baseline.stack.is_none()
+                && let Some(stopped) = &baseline.stopped
+            {
+                missing.push(format!("stack2 is missing: {stopped}."));
+            }
+            Some(baseline)
+        } else if hang {
             eprintln!(
                 ":: {} the run without event #{decision} did not finish and recorded no \
                  schedule, so stack2 is empty",
                 "Note:".yellow().bold(),
             );
-            (false, None)
+            None
+        } else if let Some(stopped) = &continued_stopped {
+            missing.push(format!(
+                "which thread runs at event #{decision} without the event, and so stack2, is \
+                 missing: {stopped}."
+            ));
+            None
         } else {
             eprintln!(
                 ":: {} the run without event #{decision} ended after {} events, so no thread \
@@ -1834,17 +1996,20 @@ impl AnalyzeOpts {
                 "WARNING:".yellow().bold(),
                 continued.len()
             );
-            (false, None)
+            None
         };
-        if !target_met || baseline_met {
+        // Only finished replays have outcomes to compare with the search's.
+        let baseline_met = baseline.as_ref().is_some_and(|run| run.met);
+        if stack_runs_contradict(&[&target], &baseline.iter().collect::<Vec<_>>()) {
             eprintln!(
                 ":: {} the stack-trace runs did not repeat the search's outcomes (target met: {}, \
                  baseline met: {}); read the stacks with care",
                 "WARNING:".yellow().bold(),
-                target_met,
+                target.met,
                 baseline_met
             );
         }
+        let (chosen, instead) = (target.stack, baseline.and_then(|run| run.stack));
 
         let misses = if unfinished.is_some() {
             "does not finish, which the search counts as not meeting the target criteria (a hang, \
@@ -1860,12 +2025,17 @@ impl AnalyzeOpts {
             schedule.schedevents()[decision],
             self.display_criteria()
         );
-        if unfinished.is_some() && continued.is_empty() {
+        if hang {
             header.push_str(
                 "stack1 is the thread the target schedule runs at that point; stack2 is empty: the \
                  run without the event did not finish and recorded no schedule.\nWithout the event \
                  the guest may wait for something that never comes: look for the wait it hangs in \
                  (a lock or a join that nothing releases), which the event avoids.\n",
+            );
+        } else if continued_stopped.is_some() {
+            header.push_str(
+                "stack1 is the thread the target schedule runs at that point; the thread the \
+                 scheduler runs there without the event is missing (see below).\n",
             );
         } else {
             header.push_str(&stack_pair_sentences(
@@ -1873,7 +2043,7 @@ impl AnalyzeOpts {
                 continued.get(decision).map(|event| event.dettid),
             ));
         }
-        for note in &notes {
+        for note in missing.iter().chain(&notes) {
             header.push_str(&format!("Note: {note}\n"));
         }
         let context = Self::generate_context(
@@ -1916,29 +2086,45 @@ impl AnalyzeOpts {
     /// `continued_path`, is the schedule without it) as the target schedule
     /// does: the decision is how long that thread runs, so the report shows
     /// the thread that runs next in each continuation, and the deciding
-    /// thread's own stack (`deciding`, from a trial that met the target or
+    /// thread's own stack (from `target`, a trial that met the target or
     /// not) separately. `None` when the continuation with the event does not
     /// bear that out (it does not run the thread there, or the thread runs
-    /// exactly as long in both): the usual report follows.
+    /// exactly as long in both): the usual report follows. A continuation
+    /// with the event that a wall-clock bound stopped leaves that side
+    /// missing ([`Self::report_timing_decision_without_its_continuation`]),
+    /// never another kind of report.
     fn report_timing_decision(
         &self,
         schedule: &PreemptionRecord,
         decision: usize,
         continuation: MaybeTimeslice,
-        (target_met, deciding): (bool, &Option<PrettyBacktrace>),
+        target: &PrefixStack,
         (continued, continued_path): (&[SchedEvent], &Path),
         notes: &[String],
     ) -> anyhow::Result<Option<Report>> {
         let events = schedule.schedevents();
         let thread = events[decision].dettid;
-        let (target_continued, target_continued_path) = self.prefix_continuation(
+        let deciding = &target.stack;
+        let (target_continued, target_continued_path, target_stopped) = self.prefix_continuation(
             "final_target_schedule",
             schedule,
             decision + 1,
             continuation,
         )?;
-        let with = slice_from(&target_continued, decision, thread);
         let without = slice_from(continued, decision, thread);
+        if let Some(stopped) = &target_stopped {
+            return self
+                .report_timing_decision_without_its_continuation(
+                    schedule,
+                    decision,
+                    continuation,
+                    (target, stopped),
+                    (continued, continued_path),
+                    notes,
+                )
+                .map(Some);
+        }
+        let with = slice_from(&target_continued, decision, thread);
         if with.events == 0 || (with.events, with.branches) == (without.events, without.branches) {
             eprintln!(
                 ":: {} without event #{decision} the scheduler runs thread {thread} there too, \
@@ -1960,16 +2146,22 @@ impl AnalyzeOpts {
         let next_stack = |runname: &str, variant: &PreemptionRecord, slice: &Slice| match slice.next
         {
             Some((index, _)) => self.prefix_stack(runname, variant, index + 1, index, continuation),
-            None => Ok((false, None)),
+            None => Ok(PrefixStack::none()),
         };
-        let (next_target_met, stack1) =
-            next_stack("final_target_next_for_stacktraces", &with_record, &with)?;
-        let (baseline_met, stack2) = next_stack(
+        let next_target = next_stack("final_target_next_for_stacktraces", &with_record, &with)?;
+        let next_baseline = next_stack(
             "final_baseline_next_for_stacktraces",
             &without_record,
             &without,
         )?;
-        if !target_met || (with.next.is_some() && !next_target_met) || baseline_met {
+        let mut missing: Vec<String> = [
+            next_target.missing("stack1"),
+            next_baseline.missing("stack2"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if stack_runs_contradict(&[target, &next_target], &[&next_baseline]) {
             eprintln!(
                 ":: {} the stack-trace runs did not repeat the search's outcomes; read the \
                  stacks with care",
@@ -1980,8 +2172,8 @@ impl AnalyzeOpts {
             slice.next.map_or(variant.len(), |(index, _)| index)
         };
         let mut critical = [
-            (next_index(&target_continued, &with), stack1),
-            (next_index(continued, &without), stack2),
+            (next_index(&target_continued, &with), next_target.stack),
+            (next_index(continued, &without), next_baseline.stack),
         ];
         // When the threads that run next have the same stack in both
         // continuations, those stacks tell nothing apart; where the deciding
@@ -1996,17 +2188,20 @@ impl AnalyzeOpts {
             let stack_at = |runname: &str, variant: &PreemptionRecord, end: usize| {
                 if end == decision {
                     // A slice of one event ends where it starts.
-                    Ok((true, deciding.clone()))
+                    Ok(deciding.clone())
                 } else {
+                    // Without both, the stacks of the threads that run next
+                    // stay: a stopped replay here leaves nothing missing.
                     self.prefix_stack(runname, variant, end + 1, end, continuation)
+                        .map(|replay| replay.stack)
                 }
             };
-            let (_, with_end) = stack_at(
+            let with_end = stack_at(
                 "final_target_slice_end_for_stacktraces",
                 &with_record,
                 ends[0],
             )?;
-            let (_, without_end) = stack_at(
+            let without_end = stack_at(
                 "final_baseline_slice_end_for_stacktraces",
                 &without_record,
                 ends[1],
@@ -2048,7 +2243,8 @@ impl AnalyzeOpts {
             name(&target_continued_path),
             name(continued_path),
         ));
-        for note in notes {
+        missing.extend(notes.iter().cloned());
+        for note in &missing {
             header.push_str(&format!("Note: {note}\n"));
         }
         let context = format!(
@@ -2097,6 +2293,102 @@ impl AnalyzeOpts {
             }),
             partial: None,
         }))
+    }
+
+    /// [`Self::report_timing_decision`] when the replay that records the
+    /// continuation with the event was stopped by a wall-clock bound
+    /// (`stopped` says which). The decision stands, but not its kind: the
+    /// scheduler runs the deciding thread at that event without the event
+    /// too (`continued`, recorded at `continued_path`), and whether the run
+    /// with the event runs it longer, which would make it a timing decision,
+    /// is what is missing ([`timing_decision_missing_header`]), with stack1.
+    /// The side without the event is shown.
+    fn report_timing_decision_without_its_continuation(
+        &self,
+        schedule: &PreemptionRecord,
+        decision: usize,
+        continuation: MaybeTimeslice,
+        (target, stopped): (&PrefixStack, &str),
+        (continued, continued_path): (&[SchedEvent], &Path),
+        notes: &[String],
+    ) -> anyhow::Result<Report> {
+        let events = schedule.schedevents();
+        let thread = events[decision].dettid;
+        let without = &slice_from(continued, decision, thread);
+        let next_baseline = match without.next {
+            Some((index, _)) => self.prefix_stack(
+                "final_baseline_next_for_stacktraces",
+                &continued_record(schedule, decision, continued),
+                index + 1,
+                index,
+                continuation,
+            )?,
+            None => PrefixStack::none(),
+        };
+        if stack_runs_contradict(&[target], &[&next_baseline]) {
+            eprintln!(
+                ":: {} the stack-trace runs did not repeat the search's outcomes; read the \
+                 stacks with care",
+                "WARNING:".yellow().bold(),
+            );
+        }
+        let mut header = timing_decision_missing_header(
+            decision,
+            &events[decision],
+            without,
+            &self.display_criteria(),
+            continuation,
+            stopped,
+        );
+        header.push_str(&format!(
+            "Event numbers after #{decision} are positions in the recorded schedule of the \
+             continuation without it, in the workspace: {}.\n",
+            continued_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+        ));
+        for note in next_baseline.missing("stack2").iter().chain(notes) {
+            header.push_str(&format!("Note: {note}\n"));
+        }
+        let next = without.next.map(|(index, _)| index);
+        let context = format!(
+            "Without event #{decision}:\n{}",
+            Self::generate_context(
+                continued,
+                next.unwrap_or(decision.max(1)),
+                self.execution_context
+            ),
+        );
+
+        println!(
+            "\n------------------------------ hermit analyze report ------------------------------"
+        );
+        println!("{}", header);
+        println!("Thread {thread} at the deciding event #{decision}:");
+        Self::print_stack("the deciding thread's stack", &target.stack);
+        Self::print_stack("stack1", &None);
+        Self::print_stack("stack2", &next_baseline.stack);
+        println!("\n{}", context);
+
+        Ok(Report {
+            header,
+            additional_context: context,
+            baseline_run: false,
+            critical_event1: ReportCriticalEvent {
+                event_index: decision,
+                stack: None,
+            },
+            critical_event2: ReportCriticalEvent {
+                event_index: next.unwrap_or(continued.len()),
+                stack: next_baseline.stack,
+            },
+            deciding_event: Some(ReportCriticalEvent {
+                event_index: decision,
+                stack: target.stack.clone(),
+            }),
+            partial: None,
+        })
     }
 
     /// It's weird if no filter is specified.
@@ -5516,6 +5808,226 @@ mod tests {
         let mut options = AnalyzeOpts::try_parse_from(argv).unwrap();
         let workspace = options.phase0_initialize(Retention::Remove).unwrap();
         (options, workspace)
+    }
+
+    /// A stack-trace replay never changes what the report decides. One that
+    /// analyze's own bound stops runs again once with 4 times the bound, and
+    /// a rerun that finishes gives the report an uninterrupted run gives.
+    /// Stopped again, or stopped by the run arguments' own `--timeout` (which
+    /// cannot be given longer, so there is no rerun), it leaves its part of
+    /// the report missing and says why, and names the same event without
+    /// claiming either kind.
+    #[test]
+    fn a_stopped_stack_trace_replay_leaves_its_stacks_missing_not_the_decision() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        let tid = DetTid::from_raw;
+        let decision = 4;
+        let target_events: Vec<SchedEvent> = [3, 5, 3, 5, 3, 5, 5, 5]
+            .iter()
+            .map(|&thread| SchedEvent::branches(tid(thread), 1))
+            .collect();
+        // What the scheduler runs after a prefix of `len` events: thread 3
+        // runs on for one event without the deciding event, three with it.
+        let realized = move |replayed: &[SchedEvent]| -> Vec<SchedEvent> {
+            let tail: &[i32] = if replayed.len() > decision {
+                &[3, 3, 5, 5]
+            } else {
+                &[3, 5, 5, 5]
+            };
+            let mut realized = replayed.to_vec();
+            if replayed.len() == decision || replayed.len() == decision + 1 {
+                realized.extend(
+                    tail.iter()
+                        .map(|&thread| SchedEvent::branches(tid(thread), 1)),
+                );
+            }
+            realized
+        };
+        let runner = move |stops: fn(&str) -> bool, ran: Arc<Mutex<Vec<String>>>| {
+            crate::analyze::rundata::TrialRunner(Some(Arc::new(move |run: &mut RunData| {
+                ran.lock().unwrap().push(run.name().to_owned());
+                if stops(run.name()) {
+                    return Err(anyhow::Error::new(crate::container::RunTimeoutMarker));
+                }
+                let input = run.sched_path_in().to_path_buf();
+                let replayed = PreemptionReader::new(&input).load_all().into_global();
+                let realized = realized(&replayed);
+                for (position, path) in run.runopts.det_opts.det_config.stacktrace_event.clone() {
+                    // A frame per position, so that no two stacks match.
+                    let thread = realized[position as usize].dettid.as_raw();
+                    std::fs::write(
+                        path.unwrap(),
+                        serde_json::json!({
+                            "thread_id": thread, "thread_name": null, "frames": [{
+                                "frame": {"ip": position, "is_signal": false},
+                                "symbol": null,
+                                "locations": []
+                            }]
+                        })
+                        .to_string(),
+                    )
+                    .unwrap();
+                }
+                let output = run.sched_path_out().to_path_buf();
+                PreemptionRecord::from_sched_events(realized)
+                    .write_to_disk(&output)
+                    .unwrap();
+                run.finish_for_test(replayed.len() > decision, std::time::Duration::from_secs(1));
+                Ok(())
+            })))
+        };
+        let parent = tempfile::tempdir().unwrap();
+        let report_of = |label: &str, run_timeout: Option<&str>, stops: fn(&str) -> bool| {
+            let tmp_dir = format!("--tmp-dir={}", parent.path().join(label).display());
+            let mut argv = vec![
+                "analyze",
+                tmp_dir.as_str(),
+                "--target-stdout=FAILED",
+                "--prefix-search",
+                "--trial-timeout=10",
+                "--",
+                "--chaos",
+            ];
+            argv.extend(run_timeout);
+            argv.push("/bin/true");
+            let mut options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            let workspace = options.phase0_initialize(Retention::Remove).unwrap();
+            let ran = Arc::new(Mutex::new(Vec::new()));
+            options.trial_runner = runner(stops, ran.clone());
+            let report = options
+                .phase6_record_prefix_outputs(PrefixDecision {
+                    schedule: PreemptionRecord::from_sched_events(target_events.clone()),
+                    decision,
+                    continuation: None,
+                    refused: None,
+                    unfinished: None,
+                    fallback: None,
+                })
+                .unwrap();
+            let ran = ran.lock().unwrap().clone();
+            drop(workspace);
+            (report, ran)
+        };
+        let timing = |report: &Report| {
+            report.header.contains(
+                "it is a timing decision: with or without it, the scheduler runs thread 3",
+            )
+        };
+        let thread_of = |event: &ReportCriticalEvent| event.stack.as_ref().and_then(stack_thread);
+
+        let (whole, _) = report_of("whole", None, |_| false);
+        assert!(timing(&whole), "{}", whole.header);
+        assert_eq!(
+            whole.deciding_event.as_ref().map(|e| e.event_index),
+            Some(decision)
+        );
+        assert_eq!(thread_of(&whole.critical_event1), Some(tid(5)));
+        assert_eq!(thread_of(&whole.critical_event2), Some(tid(5)));
+
+        // Stopped once by analyze's bound: the rerun gives the same report.
+        let (rerun, ran) = report_of("rerun", None, |name| name == "final_target_schedule");
+        assert!(
+            ran.contains(&"final_target_schedule_retry".to_owned()),
+            "{ran:?}"
+        );
+        assert!(timing(&rerun), "{}", rerun.header);
+        assert_eq!(
+            [
+                rerun.critical_event1.event_index,
+                rerun.critical_event2.event_index
+            ],
+            [
+                whole.critical_event1.event_index,
+                whole.critical_event2.event_index
+            ]
+        );
+        assert_eq!(thread_of(&rerun.critical_event1), Some(tid(5)));
+
+        // Stopped twice: the same event, its kind not claimed, the
+        // continuation with the event missing.
+        let (missing, _) = report_of("missing", None, |name| {
+            name.starts_with("final_target_schedule")
+        });
+        assert!(!timing(&missing), "{}", missing.header);
+        assert!(
+            missing.header.starts_with(&format!(
+                "The scheduling decision at event #{decision} of the target schedule decides \
+                 the outcome.\n"
+            )) && missing.header.contains(
+                "is missing: the stack-trace replay final_target_schedule_retry stopped at \
+                 hermit analyze's wall-clock bound (40 s)"
+            ),
+            "{}",
+            missing.header
+        );
+        assert_eq!(
+            missing.deciding_event.as_ref().map(|e| e.event_index),
+            Some(decision)
+        );
+        assert!(missing.critical_event1.stack.is_none());
+        assert_eq!(
+            missing.critical_event2.event_index,
+            whole.critical_event2.event_index
+        );
+        assert_eq!(thread_of(&missing.critical_event2), Some(tid(5)));
+
+        // Stopped by the run arguments' own --timeout: no rerun.
+        let (own, ran) = report_of("own", Some("--timeout=5"), |name| {
+            name.starts_with("final_target_schedule")
+        });
+        assert!(!ran.iter().any(|name| name.ends_with("_retry")), "{ran:?}");
+        assert!(!timing(&own), "{}", own.header);
+        assert!(
+            own.header.contains(
+                "is missing: the stack-trace replay final_target_schedule stopped at --timeout=5"
+            ),
+            "{}",
+            own.header
+        );
+
+        // The continuation without the event stopped: the same event, the
+        // kind of answer not claimed, and why stack2 is missing.
+        let (without, _) = report_of("without", None, |name| {
+            name.starts_with("final_baseline_schedule")
+        });
+        assert!(!timing(&without), "{}", without.header);
+        assert!(
+            without.header.contains(&format!(
+                "The scheduling decision at event #{decision} of the target schedule decides the \
+                 outcome."
+            )) && without.header.contains(&format!(
+                "Note: which thread runs at event #{decision} without the event, and so stack2, \
+                 is missing: the stack-trace replay final_baseline_schedule_retry stopped"
+            )) && !without.header.contains("ended after"),
+            "{}",
+            without.header
+        );
+        assert_eq!(without.critical_event1.event_index, decision);
+        assert_eq!(thread_of(&without.critical_event1), Some(tid(3)));
+        assert!(without.critical_event2.stack.is_none());
+    }
+
+    /// The warning that the stack-trace replays did not repeat the search's
+    /// outcomes reads only replays that finished: one with the event that a
+    /// bound stopped contradicts nothing, one that finished and missed does,
+    /// and so does one without the event that met the target.
+    #[test]
+    fn only_finished_stack_trace_replays_contradict_the_search() {
+        let replay = |finished: bool, met: bool| PrefixStack {
+            finished,
+            met,
+            stack: None,
+            stopped: (!finished).then(|| "stopped".to_owned()),
+        };
+        let stopped = replay(false, false);
+        let met = replay(true, true);
+        let missed = replay(true, false);
+        assert!(!stack_runs_contradict(&[&stopped], &[&missed]));
+        assert!(!stack_runs_contradict(&[&met, &stopped], &[&stopped]));
+        assert!(stack_runs_contradict(&[&missed], &[]));
+        assert!(stack_runs_contradict(&[&met], &[&met]));
+        assert!(!stack_runs_contradict(&[&met], &[&missed, &stopped]));
     }
 
     /// A partial report says that it is partial, why, which phase was
