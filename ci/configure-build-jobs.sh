@@ -2938,8 +2938,22 @@ fi
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory, SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the ad1af851 entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a28d74243feca0fd7231a4baf0da3de7658dc39f ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a28d74243feca0fd7231a4baf0da3de7658dc39f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 3e81253ac2d0f1190801476d61782939fa11a179 (2026-10-27): from
+# a28d74243feca0fd7231a4baf0da3de7658dc39f. Two commits (in-guest runtime
+# descriptors invisible to the guest, and the fixes from its delta review):
+# reverie-inguest places, records and moves its descriptors, reverie gains a
+# counter descriptor move, reverie-rpc-transport gains
+# BlockingRpcClient::replace_stream, and the LiteInst source catalog rows
+# for the edited files are refreshed. git diff is empty under reverie-dbt/
+# and third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml; both repository inputs to the DynamoRIO content key
+# are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory, SDK and native inputs, calibrated budget, job width
+# and limits carry unchanged from the a28d7424 entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 3e81253ac2d0f1190801476d61782939fa11a179 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 3e81253ac2d0f1190801476d61782939fa11a179 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
