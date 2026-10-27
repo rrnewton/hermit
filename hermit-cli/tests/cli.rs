@@ -10327,71 +10327,201 @@ fn no_namespace_refuses_a_taken_chosen_id_only_when_asked() {
     assert!(written.contains("\"guest_ids\":\"Host\""), "{written}");
 }
 
-/// Under an explicit base, an error Linux gives the guest's own clone stays
-/// its answer instead of ending the run: a clone with `CLONE_SIGHAND` but not
-/// `CLONE_VM` gets `EINVAL` from the rewritten `clone3` as from its own call;
-/// a guest `clone3` whose own `set_tid` points at nothing gets `EFAULT`, and
-/// one with `set_tid` but no size `EINVAL`, from the kernel.
+/// An error Linux gives the guest's own clone stays its answer instead of
+/// ending the run: under an explicit base, a clone with `CLONE_SIGHAND` but
+/// not `CLONE_VM` gets `EINVAL` from the rewritten `clone3` as from its own
+/// call; a guest `clone3` whose own `set_tid` points at nothing gets
+/// `EFAULT`, and one with `set_tid` but no size `EINVAL`, from the kernel;
+/// and, in both kinds of run, a `CLONE_NEWPID` call with a one-entry
+/// `set_tid` and an unknown flag gets `EINVAL` from the rewrite that adds
+/// Hermit's entry.
 #[test]
 fn no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base() {
-    for (call, expected) in [
-        (&["sighand"][..], "clone(CLONE_SIGHAND): Invalid argument"),
-        (&["bad-tid"], "clone3 bad-tid: Bad address"),
-        (&["bad-size"], "clone3 bad-size: Invalid argument"),
+    for (base, call, expected) in [
+        (
+            "--pid-base=5000",
+            &["sighand"][..],
+            "clone(CLONE_SIGHAND): Invalid argument",
+        ),
+        (
+            "--pid-base=5000",
+            &["bad-tid"],
+            "clone3 bad-tid: Bad address",
+        ),
+        (
+            "--pid-base=5000",
+            &["bad-size"],
+            "clone3 bad-size: Invalid argument",
+        ),
+        (
+            "--pid-base=5000",
+            &["unknown-flag"],
+            "clone3 unknown-flag: Invalid argument",
+        ),
+        (
+            "--summary",
+            &["unknown-flag"],
+            "clone3 unknown-flag: Invalid argument",
+        ),
     ] {
-        let output = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], call);
+        let output = no_namespace_in_own_pid_namespace(&[base], call);
         assert_success(&output, call);
-        assert_eq!(
-            stdout(&output),
-            format!("{expected}\n"),
-            "{call:?}: {}",
+        assert!(
+            stdout(&output).starts_with(&format!("{expected}\n")),
+            "{base} {call:?}: {}",
             stderr(&output)
         );
     }
 }
 
-/// A guest `clone3` with `CLONE_NEWPID` and its own `set_tid`: with two
-/// entries the array names its task's ID in Hermit's namespace too, so an
-/// explicit base runs it, and the task has that ID; with one, the kernel
-/// picks that ID, so an explicit base refuses the call before the task
-/// exists, and a default run gives the task a host ID, with a warning and the
+/// A guest `clone3` with `CLONE_NEWPID` and its own `set_tid`. With two
+/// entries the array names its task's ID in Hermit's namespace too, and the
+/// task has that ID. With one, Detcore adds the chosen ID for Hermit's
+/// namespace, in both kinds of run. After the guest gives up its
+/// capabilities, `CLONE_NEWUSER` lets its own one-entry call through, but the
+/// added entry needs a capability over Hermit's namespace: an explicit base
+/// refuses the call before the task exists, and a default run issues the
+/// guest's own call, whose task gets a host ID, with a warning and the
 /// summary's count.
 #[test]
-fn no_namespace_takes_a_guest_set_tid_as_chosen_only_if_it_reaches_hermits_namespace() {
-    let both = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &["own-tid", "2"]);
-    assert_success(&both, &["own-tid", "2"]);
-    assert_eq!(
-        stdout(&both),
-        "clone3 own-tid: child +100, exit 0\n",
-        "{}",
-        stderr(&both)
-    );
+fn no_namespace_completes_a_guest_set_tid_with_the_chosen_id() {
+    for (base, call, expected) in [
+        (
+            "--pid-base=5000",
+            &["own-tid", "2"][..],
+            "clone3 own-tid: child +100, exit 0\n",
+        ),
+        (
+            "--pid-base=5000",
+            &["own-tid", "1"],
+            "clone3 own-tid: child +1, exit 0\n",
+        ),
+        (
+            "--summary",
+            &["own-tid", "1"],
+            "clone3 own-tid: child +1, exit 0\n",
+        ),
+    ] {
+        let output = no_namespace_in_own_pid_namespace(&[base], call);
+        assert_success(&output, call);
+        assert_eq!(
+            stdout(&output),
+            expected,
+            "{base} {call:?}: {}",
+            stderr(&output)
+        );
+    }
 
-    let inner = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &["own-tid", "1"]);
+    let refused = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &["no-caps"]);
     assert_eq!(
-        inner.status.code(),
+        refused.status.code(),
         Some(HERMIT_POLICY_REFUSAL_EXIT),
         "stdout:\n{}\nstderr:\n{}",
-        stdout(&inner),
-        stderr(&inner)
+        stdout(&refused),
+        stderr(&refused)
     );
     assert!(
-        stderr(&inner).contains("its set_tid names 1 ID(s)"),
+        stderr(&refused).contains("may not choose ID 5001 in Hermit's PID namespace (EPERM"),
         "{}",
-        stderr(&inner)
+        stderr(&refused)
     );
-    assert!(stdout(&inner).is_empty(), "{}", stdout(&inner));
+    assert!(stdout(&refused).is_empty(), "{}", stdout(&refused));
 
-    let tolerant = no_namespace_in_own_pid_namespace(&["--summary"], &["own-tid", "1"]);
-    assert_success(&tolerant, &["own-tid", "1"]);
+    let tolerant = no_namespace_in_own_pid_namespace(&["--summary"], &["no-caps"]);
+    assert_success(&tolerant, &["no-caps"]);
     assert!(
-        stdout(&tolerant).starts_with("clone3 own-tid: child ")
+        stdout(&tolerant).starts_with("clone3 no-caps: child ")
             && stdout(&tolerant).ends_with(", exit 0\n")
             && stderr(&tolerant).contains("1 task(s) got a host ID instead"),
         "stdout:\n{}\nstderr:\n{}",
         stdout(&tolerant),
         stderr(&tolerant)
     );
+}
+
+/// A guest `clone3` with `CLONE_NEWPID` and no `set_tid` creates its task
+/// with the chosen ID in Hermit's namespace (Detcore passes `set_tid` [1,
+/// ID], 1 being a new namespace's first task's), and the task sees 1 as its
+/// own ID; two runs agree bitwise under `--verify-strict`. No relaxation but
+/// the missing `--strict`, which `--no-namespace` cannot take yet.
+#[test]
+fn no_namespace_gives_a_new_pid_namespace_child_its_chosen_id() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("verify.json");
+    let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+    let args = [
+        "--pid-base=5000",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        &report_arg,
+    ];
+    let output = no_namespace_in_own_pid_namespace(&args, &["newpid"]);
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "newpid child: own ID 1\nclone3 newpid: child +1, exit 0\n",
+        "{}",
+        stderr(&output)
+    );
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+            .expect("parse the verification report");
+    assert_eq!(verdict["bitwise_parity"], true, "{verdict}");
+    let compared = &verdict["compared_log_messages"];
+    assert!(
+        compared["left"].as_u64().is_some_and(|count| count > 0)
+            && compared["left"] == compared["right"],
+        "compared no INFO messages: {verdict}"
+    );
+}
+
+/// A call that cannot carry a chosen ID is refused by an explicit base
+/// before its task exists, even where Linux would refuse it too: a raw clone
+/// with exit signal 65, which clone accepts and clone3 does not, and one with
+/// new stack pointer 1, which clone3 cannot express. A default run issues
+/// the first as made and reports its host ID. The other classes cannot arise
+/// from a guest: it cannot make a PID namespace for its children (Detcore
+/// refuses unshare and setns with EPERM) nor install a seccomp filter
+/// (Detcore refuses seccomp with ENOSYS).
+#[test]
+fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
+    for (call, reason) in [
+        ("signal65", "its exit signal 65 is not a signal number"),
+        ("sp1", "its new stack pointer 0x1 has no clone3 form"),
+    ] {
+        let output = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &[call]);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{call}: stdout:\n{}\nstderr:\n{}",
+            stdout(&output),
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains(reason),
+            "{call}: {}",
+            stderr(&output)
+        );
+        assert!(stdout(&output).is_empty(), "{call}: {}", stdout(&output));
+    }
+    let tolerant = no_namespace_in_own_pid_namespace(&["--summary"], &["signal65"]);
+    assert_success(&tolerant, &["signal65"]);
+    assert!(
+        stdout(&tolerant) == "clone signal65: created\n"
+            && stderr(&tolerant).contains("1 task(s) got a host ID instead"),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&tolerant),
+        stderr(&tolerant)
+    );
+    for (call, expected) in [
+        ("nested", "unshare: Operation not permitted\n"),
+        ("seccomp", "seccomp: Function not implemented\n"),
+    ] {
+        let output = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &[call]);
+        assert_eq!(output.status.code(), Some(1), "{call}: {}", stderr(&output));
+        assert_eq!(stdout(&output), expected, "{call}: {}", stderr(&output));
+    }
 }
 
 /// A `--pid-base` whose first IDs a task already holds (PID 1, this
