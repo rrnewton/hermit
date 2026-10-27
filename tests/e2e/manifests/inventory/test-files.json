@@ -1633,6 +1633,12 @@
       "why": "tests/c/preadv2_flags.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "cargo-integration-test-fixture",
+      "path": "tests/c/preemption_callback_boundaries.c",
+      "runner": "cargo test -p hermit-run --test clock_determinism preemption_replay_preserves_equal_rcb_software_callback_boundaries",
+      "why": "tests/c/preemption_callback_boundaries.c is compiled and exercised by hermit-cli/tests/clock_determinism.rs::preemption_replay_preserves_equal_rcb_software_callback_boundaries: direct unrolled clock_gettime syscalls require an Exec/Prehook endpoint at RCB zero and distinct adjacent equal-RCB software callback boundaries, then compare the complete recorded and replayed schedule bytes with exactly one attempt per run (https://github.com/rrnewton/hermit/issues/4082)."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/print_memaddrs.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (blocking CI)",
