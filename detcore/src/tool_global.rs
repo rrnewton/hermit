@@ -1821,7 +1821,9 @@ impl GlobalState {
             // sequences it: `Scheduler::new`'s SCHEDRAND line above, then this,
             // then the root `ThreadState::new` seeding lines.
             info!("[scheduler] daemon task starting up, waiting for guest thread start..");
-            Some(tokio::spawn(sched_loop(sched.clone(), global_time.clone())))
+            Some(tokio::spawn(crate::scheduler::exit_on_scheduler_panic(
+                sched_loop(sched.clone(), global_time.clone()),
+            )))
         } else {
             None
         };
@@ -2218,6 +2220,9 @@ impl GlobalState {
     /// join error and any requested partial preemption recording's write error
     /// for the caller, without allowing either to replace the backend failure.
     pub async fn clean_up_after_backend_failure(mut self) -> BackendFailureCleanup {
+        // From here a scheduler panic is reported beside the backend's
+        // failure, as its JoinError below, not by ending the process.
+        crate::scheduler::note_backend_failure_cleanup();
         let scheduler = if let Some(handle) = self.sched_handle.take() {
             handle.await
         } else {

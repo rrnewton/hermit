@@ -3388,6 +3388,89 @@ pub(crate) struct ProcessExitWatch {
     pidfd: OwnedFd,
 }
 
+/// The exit status of a process whose scheduler task panicked
+/// ([`exit_on_scheduler_panic`]): Rust's own status for an uncaught panic.
+pub(crate) const SCHEDULER_PANIC_EXIT: i32 = 101;
+
+/// Runs the internally spawned scheduler task, and ends the process at once
+/// if it panics.
+///
+/// The task is `tokio::spawn`ed (`GlobalState::initialize`), so its panic is
+/// caught by the task harness while every guest thread stays parked on a
+/// response only the scheduler could give (see
+/// [`Scheduler::terminal_deadlock`]). The run then hung until `--timeout`, or
+/// for ever without one, and the timeout's cleanup tripped over the scheduler
+/// mutex the panic had poisoned, a second panic, before reporting the run as
+/// a timeout (exit 124) or leaving it unconfirmed. Ending the process here
+/// makes the panic the run's primary failure: the CLI reports the container
+/// child's unchosen exit status (`HERMIT_INTERNAL_FAILURE
+/// class=container-child-exit`, exit 125) at once, and the PID namespace (or,
+/// without one, `PTRACE_O_EXITKILL`) takes the guest with it, as for the
+/// scheduler's other terminal exits. The panic hook has already printed the
+/// panic itself. Exiting skips destructors: a panicked run writes no partial
+/// `--record-preemptions-to` file and no summary.
+///
+/// While a backend failure is being cleaned up
+/// ([`note_backend_failure_cleanup`]), a scheduler panic keeps its old path
+/// instead: the task ends with it, and the cleanup reports the backend's
+/// failure first with the scheduler's `JoinError` beside it.
+pub(crate) async fn exit_on_scheduler_panic(scheduler: impl std::future::Future<Output = ()>) {
+    run_or_on_panic(scheduler, |payload| {
+        on_scheduler_panic(
+            payload,
+            BACKEND_FAILURE_CLEANUP.load(std::sync::atomic::Ordering::SeqCst),
+            || {
+                crate::host_timed_producers::emit_run_end_log();
+                use std::io::Write;
+                let _ = writeln!(
+                    crate::util::RetryingStderr,
+                    "HERMIT_SCHEDULER_PANIC: the scheduler panicked (above); every guest thread \
+                     waits on it, so the run ends here with exit status {SCHEDULER_PANIC_EXIT}."
+                );
+                std::process::exit(SCHEDULER_PANIC_EXIT);
+            },
+        )
+    })
+    .await
+}
+
+/// Set once a backend failure's cleanup has begun
+/// (`GlobalState::clean_up_after_backend_failure`); read by
+/// [`exit_on_scheduler_panic`].
+static BACKEND_FAILURE_CLEANUP: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Records that this process is cleaning up after a backend failure, whose
+/// report a scheduler panic must not pre-empt ([`exit_on_scheduler_panic`]).
+pub(crate) fn note_backend_failure_cleanup() {
+    BACKEND_FAILURE_CLEANUP.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// What a scheduler panic does: `exit` ends the process, unless a backend
+/// failure is being cleaned up, when the panic carries on unwinding so the
+/// task ends with it (its `JoinError` reaches that cleanup).
+fn on_scheduler_panic(
+    payload: Box<dyn std::any::Any + Send>,
+    backend_failure_cleanup: bool,
+    exit: impl FnOnce(),
+) {
+    if backend_failure_cleanup {
+        std::panic::resume_unwind(payload);
+    }
+    exit();
+}
+
+/// Runs `task`, and calls `on_panic` with the payload if polling it panics.
+async fn run_or_on_panic(
+    task: impl std::future::Future<Output = ()>,
+    on_panic: impl FnOnce(Box<dyn std::any::Any + Send>),
+) {
+    if let Err(payload) = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(task)).await
+    {
+        on_panic(payload);
+    }
+}
+
 pub(crate) async fn sched_loop(sched: Arc<Mutex<Scheduler>>, timer: Arc<Mutex<GlobalTime>>) {
     sched_loop_inner(sched, timer, false, None).await;
 }
@@ -29280,6 +29363,40 @@ mod test {
             );
             scheduler.step6_reenquue(yielder, requeue);
         }
+    }
+
+    /// A panic in the scheduler task reaches `on_panic` (which ends the
+    /// process in production, `exit_on_scheduler_panic`) instead of being
+    /// left to the task harness; a scheduler that returns does not.
+    #[tokio::test]
+    async fn a_scheduler_task_panic_reaches_its_handler() {
+        let called = std::cell::Cell::new(false);
+        run_or_on_panic(async { panic!("scheduler control") }, |_| called.set(true)).await;
+        assert!(called.get());
+
+        let called = std::cell::Cell::new(false);
+        run_or_on_panic(async {}, |_| called.set(true)).await;
+        assert!(!called.get());
+    }
+
+    /// A scheduler panic exits, except while a backend failure is being
+    /// cleaned up: then it carries on unwinding, so the task's `JoinError`
+    /// reaches that cleanup and the backend's failure stays the primary one.
+    #[test]
+    fn a_scheduler_panic_during_backend_failure_cleanup_still_unwinds() {
+        let exited = std::cell::Cell::new(false);
+        on_scheduler_panic(Box::new("scheduler control"), false, || exited.set(true));
+        assert!(exited.get());
+
+        let exited = std::cell::Cell::new(false);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            on_scheduler_panic(Box::new("scheduler control"), true, || exited.set(true))
+        }));
+        assert!(!exited.get());
+        assert_eq!(
+            unwound.unwrap_err().downcast_ref::<&str>(),
+            Some(&"scheduler control")
+        );
     }
 
     /// A priority change point is a turn of a thread that did not yield, so,

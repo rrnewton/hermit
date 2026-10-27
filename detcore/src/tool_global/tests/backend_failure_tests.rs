@@ -678,6 +678,10 @@ async fn backend_failure_cleanup_does_not_build_an_invalid_run_summary() {
     assert!(actual.schedevents().is_empty());
 }
 
+/// A scheduler that panics during a backend failure's cleanup: the production
+/// task (`exit_on_scheduler_panic`) ends the process on a panic at any other
+/// time, but lets this one unwind into its JoinError, so the backend's failure
+/// stays the primary one. This test installs a raw task to model that panic.
 #[tokio::test]
 async fn backend_failure_cleanup_retains_panicked_scheduler_and_recording_error() {
     let directory = tempfile::tempdir().unwrap();
