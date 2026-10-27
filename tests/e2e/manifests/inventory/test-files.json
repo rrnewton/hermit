@@ -866,6 +866,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/guest_iovec_import.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/guest_iovec_import.c is owned by hermit-cli/tests/cli.rs: the Rust CLI integration test a_blocked_vectored_call_moves_bytes_through_the_memory_it_began_with compiles this guest, whose modes block a readv, recvmsg, writev or sendmsg while main rewrites its iovec array, message header or address, and require each mode's native line natively and under strict verify; it remains a guest fixture because its CLI test checks the exact status and stdout of strict runs."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/guest_poll_recheck.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/guest_poll_recheck.c is owned by hermit-cli/tests/cli.rs: the Rust CLI integration tests pipe_calls_woken_by_signals_end_as_linux_does and pipe_wake_rows_under_record_and_replay compile this guest, whose modes signal a worker blocked in a pipe read, write or writev, then flush, re-send or install handlers, and require each mode's exact line under strict verify or record/replay (https://github.com/rrnewton/hermit/issues/4273, R2b-1); it remains a guest fixture because its CLI tests check the exact status and stdout of strict runs."

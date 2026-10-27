@@ -35,6 +35,8 @@ use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::syscalls::entry_import::Displaced;
+use crate::syscalls::entry_import::EntryImport;
 use crate::syscalls::threads::BlockedWaitSignalError;
 use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
@@ -554,6 +556,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .map(|iovec| (iovec.iov_base as usize, iovec.iov_len))
                 .collect()
         };
+        // The array as the call began, in the form the guest's own `writev`
+        // copies it: that attempt may come after another thread has run
+        // (`EntryImport`), unlike the later ones, which write from `iovecs`.
+        // Boxed, so the call's future stays small (`hot_path_futures_stay_small`).
+        let entry_import =
+            EntryImport::capture(&guest.memory(), &Syscall::Writev(call)).map(Box::new);
         let requested = iovecs.iter().try_fold(0usize, |total, (_, length)| {
             total.checked_add(*length).ok_or(Errno::EINVAL)
         })?;
@@ -740,14 +748,26 @@ impl<T: RecordOrReplay> Detcore<T> {
                 self.execute_atomic_pipe_writev_attempt(guest, call, &iovecs, atomic_scratch_iov)
                     .await
             } else {
-                match subtool {
+                // The guest's own `writev` copies the guest's array again; a
+                // segment `write` names Hermit's copy.
+                let displaced = matches!(current, Syscall::Writev(_))
+                    .then(|| entry_import.as_ref())
+                    .flatten()
+                    .map(|entry| entry.reinstate(&mut guest.memory()));
+                let result = match subtool {
                     Some(detcore) => {
                         detcore
                             .record_or_replay_preserving_tool_errors(guest, current)
                             .await
                     }
                     None => guest.inject_with_retry(current).await.map_err(Error::from),
+                };
+                if let Err(error) =
+                    put_back_entry_import(guest, &entry_import, displaced, result.is_ok())
+                {
+                    break Err(error);
                 }
+                result
             };
             match result {
                 Ok(written) if written > 0 => {
@@ -843,6 +863,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             record_retry_event(guest, call).await;
         };
+        keep_entry_view(guest, entry_import);
 
         match turn_wait {
             Some(mut wait) => {
@@ -2817,6 +2838,13 @@ where
 {
     // The signals the wait takes from the queue (rt_sigtimedwait's set).
     let consumed = call0.signals_consumed_by_wait(&guest.memory());
+    // The memory a vectored call copies when it begins (its iovec array, and
+    // a message's header, address and control data), which every attempt
+    // below sees as it was now, as the kernel's one copy would be
+    // (`EntryImport`). Linux copies it before the call can wait, so a thread
+    // that rewrites it while the call waits changes nothing the call moves.
+    // Boxed, so the call's future stays small (`hot_path_futures_stay_small`).
+    let entry_import = EntryImport::capture(&guest.memory(), &call0.into()).map(Box::new);
     // The stack-allocated memory here needs to live across the loop, which means
     // surviving multiple syscall injections:
     let (mut call, mut maybe_stackguard) = call0.into_nonblocking(guest).await;
@@ -2934,6 +2962,12 @@ where
         // (https://github.com/rrnewton/hermit/issues/4089).
         let pending = pending_real_time_among(guest, consumed).await;
         act_on_pending_real_time(guest, pending, consumed, 0).await;
+        // The call's memory as it began, for this attempt and for the reads
+        // of it below, and what another thread wrote over it meanwhile, which
+        // goes back once the attempt is made.
+        let displaced = entry_import
+            .as_ref()
+            .map(|entry| entry.reinstate(&mut guest.memory()));
         // A receive whose descriptors Detcore names reads its geometry again
         // right before each attempt: a sibling may have changed it while an
         // earlier attempt waited (`ThreadState::receive_geometry`).
@@ -2954,6 +2988,9 @@ where
                 Box::pin(Detcore::<T>::changed_placeholder_send(guest, &inspection)).await
         {
             tracing::error!("Detcore refuses {}: {reason}", inspection.sysno);
+            if let Err(error) = put_back_entry_import(guest, &entry_import, displaced, false) {
+                break Err(error);
+            }
             let panic_on_unsupported_syscalls = guest.config().panic_on_unsupported_syscalls;
             break refuse_unserviceable_operation_with(
                 guest,
@@ -2975,6 +3012,9 @@ where
             }
             None => guest.inject_with_retry(call).await.map_err(Error::from),
         };
+        if let Err(error) = put_back_entry_import(guest, &entry_import, displaced, res.is_ok()) {
+            break Err(error);
+        }
         // Under record and replay the attempt is a plain injection, which the
         // signal that woke this call, still pending, stops before it runs
         // (ERESTARTSYS, not run): the call then returns that restart errno,
@@ -3060,6 +3100,7 @@ where
             break res;
         }
     };
+    keep_entry_view(guest, entry_import);
 
     // The single exit: the guest's mask goes back before the result is
     // returned. A mask `block_in_place` installed goes back through
@@ -3172,6 +3213,50 @@ where
             .memory()
             .read_value(pollfd)
             .is_ok_and(|polled| polled.revents & libc::POLLRDHUP != 0)
+}
+
+/// Put back what another thread wrote over a call's memory as it began
+/// (`EntryImport::put_back`), after an attempt that `completed` or not. The
+/// bytes were written once already, and no guest thread has run since, so a
+/// failure is Detcore's own and ends the call rather than leave the guest's
+/// memory as the call began.
+fn put_back_entry_import<T, G>(
+    guest: &mut G,
+    entry_import: &Option<Box<EntryImport>>,
+    displaced: Option<Displaced>,
+    completed: bool,
+) -> Result<(), Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let (Some(entry), Some(displaced)) = (entry_import, displaced) else {
+        return Ok(());
+    };
+    if displaced.is_empty() {
+        return Ok(());
+    }
+    entry
+        .put_back(&mut guest.memory(), displaced, completed)
+        .map_err(|errno| {
+            tracing::error!(
+                "Detcore could not put back the guest's rewrite of a vectored call's memory: {errno}"
+            );
+            Error::from(errno)
+        })
+}
+
+/// Keep a call's memory as it began (`EntryImport`) for the observers that
+/// read the call's arguments after it returns (`ThreadState::entry_import`),
+/// when another thread has rewritten it since; otherwise those arguments are
+/// still the ones the call moved its bytes through.
+fn keep_entry_view<T, G>(guest: &mut G, entry_import: Option<Box<EntryImport>>)
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let view = entry_import.filter(|entry| entry.differs(&guest.memory()));
+    guest.thread_state_mut().entry_import = view;
 }
 
 /// Retry a blocking wait on a backend that decides signal interruption from the

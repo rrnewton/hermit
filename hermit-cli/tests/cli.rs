@@ -172,6 +172,7 @@ static POLL_RECHECK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_PARTIAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_TIMER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_ENTRY_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static IOVEC_IMPORT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RESTARTABLE_TWO_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PRIVATE_SIGCHLD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_BOOKKEEPING_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -8134,9 +8135,7 @@ fn run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files() {
 /// by `splice` from `/proc` into a pipe (natively `EINVAL` once the pipe has
 /// a reader and room, which Detcore does not model); a send of the
 /// descriptor directory after more control data than Detcore reads
-/// (natively sent); a send that waits for room while a sibling rewrites its
-/// control data to name a locked descriptor directory (natively sent, as
-/// Linux copied the control data first); a send on a connected `AF_UNIX`
+/// (natively sent); a send on a connected `AF_UNIX`
 /// socket while the process holds the descriptor directory (natively sent;
 /// in Detcore's turn, also sent), and on the socket it inherited as its
 /// standard input, which blocks in the kernel (natively sent; refused, as
@@ -8145,7 +8144,11 @@ fn run_kvm_dotdot_from_a_received_descriptor_finds_the_guests_own_files() {
 /// table of its own (natively granted; Detcore cannot tell that process's
 /// tables apart, and KVM gives no thread a table of its own). Natively as root in new user,
 /// mount and PID namespaces with a procfs of its own; each Hermit run stops
-/// with the policy's exit and names the reason.
+/// with the policy's exit and names the reason. A send that waits for room
+/// while a sibling rewrites its control data to name a locked descriptor
+/// directory is sent, natively and under Hermit, as Linux copied the control
+/// data when the call began and Detcore makes each attempt with it
+/// (`EntryImport`).
 fn refuse_calls_below_served_procfs_directories(test: &str, backend: &str) {
     let guest = proc_fd_directory_guest();
     let mut modes = vec![
@@ -8191,11 +8194,6 @@ fn refuse_calls_below_served_procfs_directories(test: &str, backend: &str) {
              data=1 errno=0\nfailures=0\n",
             "SCM_RIGHTS control data Detcore cannot read in full",
         ),
-        (
-            "--send-rewritten-while-blocked",
-            "send rewritten while it waits for room=1 errno=0\nfailures=0\n",
-            "changed while the send waited for room",
-        ),
     ];
     if backend == "ptrace" {
         modes.push((
@@ -8229,6 +8227,48 @@ fn refuse_calls_below_served_procfs_directories(test: &str, backend: &str) {
         refuse_procfs_directory_mode(backend, guest, mode, reason);
         compared.push(format!("{backend} {mode}"));
     }
+    // A send whose control data a sibling rewrites while it waits for room
+    // sends the descriptor it began with, as natively: Detcore makes each
+    // attempt with the control data as the call began, as Linux copied it.
+    let rewritten = "--send-rewritten-while-blocked";
+    let natively_rewritten = "send rewritten while it waits for room=1 errno=0\nfailures=0\n";
+    let native = Command::new("unshare")
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--pid",
+            "--fork",
+            "--",
+            "/bin/sh",
+            "-c",
+            "mount -t proc -o nosuid,nodev,noexec proc /proc && exec \"$0\" \"$1\"",
+        ])
+        .arg(guest)
+        .arg(rewritten)
+        .output()
+        .expect("run proc-fd-directory natively");
+    assert!(native.status.success(), "native {rewritten}: {native:?}");
+    assert_eq!(stdout(&native), natively_rewritten, "natively {rewritten}");
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        rewritten,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        natively_rewritten,
+        "{backend} {rewritten} under --strict"
+    );
+    compared.push(format!("{backend} {rewritten}"));
     // A send on a connected `AF_UNIX` socket from socket(2) while the process
     // holds the descriptor directory runs in Detcore's turn, as natively; the
     // same send on the socket the guest inherited as its standard input,
@@ -53018,6 +53058,79 @@ fn a_pipe_writev_whose_iovec_array_is_rewritten_keeps_both_signals() {
                 "{mode} {seed}: verification failed:\n{log}"
             );
         }
+    }
+}
+
+/// A blocked vectored call moves its bytes through the memory it named when
+/// it began, though another thread rewrites that memory while it waits: Linux
+/// copies the iovec array (`import_iovec`), and a message's header and
+/// address (`copy_msghdr_from_user`), before the call can wait. Detcore runs
+/// such a call on an internal pipe or socket as nonblocking attempts, which
+/// the kernel copies again, so each attempt now sees the memory as the call
+/// began (`EntryImport`); before, a `readv`, `recvmsg`, socket `writev` or
+/// `sendmsg` moved its bytes through the rewritten buffers or address, and a
+/// `sendto` sent to the rewritten address. Each mode of
+/// `tests/c/guest_iovec_import.c` runs natively, then at L2 (`--strict
+/// --verify --verify-strict --verify-json`, `bitwise_parity` with nonzero
+/// compared log counts), and both print the native line.
+#[test]
+fn a_blocked_vectored_call_moves_bytes_through_the_memory_it_began_with() {
+    let _guard = hermit_run_guard();
+    let guest = poll_recheck_c_guest(&IOVEC_IMPORT_GUEST, "guest_iovec_import")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for mode in [
+        "readv",
+        "recvmsg",
+        "recvmsg-header",
+        "writev",
+        "writev-pipe",
+        "sendmsg",
+        "sendmsg-header",
+        "sendmsg-name",
+        "sendto-name",
+    ] {
+        let through = if mode.ends_with("-name") {
+            "the first address"
+        } else {
+            "the first buffer"
+        };
+        let expected = format!("{mode} 16: bytes through {through}\n");
+        let native = Command::new(&guest)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run the guest natively");
+        assert!(native.status.success(), "{mode}: native run failed");
+        assert_eq!(stdout(&native), expected, "{mode}: native");
+        let directory = tempfile::tempdir().expect("failed to create report directory");
+        let report = directory.path().join("verify.json");
+        let args = [
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report.to_str().expect("report path is UTF-8"),
+            "--",
+            guest.as_str(),
+            mode,
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{mode}: stderr:\n{log}");
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+                .expect("parse the verification report");
+        assert_eq!(verdict["bitwise_parity"], true, "{mode}: {verdict}");
+        let compared = &verdict["compared_log_messages"];
+        assert!(
+            compared["left"].as_u64().is_some_and(|left| left > 0)
+                && compared["left"] == compared["right"],
+            "{mode}: {verdict}"
+        );
     }
 }
 
