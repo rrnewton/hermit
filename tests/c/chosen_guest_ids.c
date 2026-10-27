@@ -50,7 +50,8 @@
  * - `seccomp`: a fork after the guest installs a seccomp filter of its own
  *   (one that allows everything);
  * - `signal65`: a raw clone with exit signal 65, which clone accepts and
- *   clone3 does not;
+ *   clone3 does not; `vfork65` the same with CLONE_VFORK, whose parent waits
+ *   for its child's exit;
  * - `sp1`: a raw clone with new stack pointer 1, which clone3 cannot express
  *   (its child would fault at once).
  *
@@ -143,7 +144,8 @@ static int one_call(int argc, char** argv) {
     if (child > 0) {
       wait_for((pid_t)child, "clone(CLONE_SIGHAND)");
     }
-    printf("clone(CLONE_SIGHAND): %s\n", child < 0 ? strerror(errno) : "created");
+    printf("clone(CLONE_SIGHAND): %s\n",
+           child < 0 ? strerror(errno) : "created");
     return 0;
   }
   if (strcmp(what, "seccomp") == 0) {
@@ -162,9 +164,14 @@ static int one_call(int argc, char** argv) {
     printf("fork after seccomp: child %+ld\n", (long)child - first);
     return 0;
   }
-  if (strcmp(what, "signal65") == 0 || strcmp(what, "sp1") == 0) {
+  if (strcmp(what, "signal65") == 0 || strcmp(what, "vfork65") == 0 ||
+      strcmp(what, "sp1") == 0) {
     int sp1 = strcmp(what, "sp1") == 0;
-    long child = syscall(SYS_clone, sp1 ? SIGCHLD : 65, sp1 ? 1 : 0, 0, 0, 0);
+    unsigned long flags = sp1 ? SIGCHLD : 65;
+    if (strcmp(what, "vfork65") == 0) {
+      flags |= CLONE_VFORK;
+    }
+    long child = syscall(SYS_clone, flags, sp1 ? 1 : 0, 0, 0, 0);
     if (child == 0) {
       syscall(SYS_exit, 0);
     }
@@ -240,7 +247,8 @@ static int one_call(int argc, char** argv) {
       if (grandchild > 0) {
         waitpid((pid_t)grandchild, NULL, 0);
       }
-      printf("newpid child's clone3: %s\n", grandchild < 0 ? strerror(errno) : "created");
+      printf("newpid child's clone3: %s\n",
+             grandchild < 0 ? strerror(errno) : "created");
     }
     _exit(getpid() == 1 ? 0 : 1);
   }

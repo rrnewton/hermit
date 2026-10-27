@@ -2178,7 +2178,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 }
             }
-            _ => (self.inject_clone_planned(guest, call, clone_plan).await, None),
+            _ => (
+                self.inject_clone_planned(guest, call, clone_plan, is_vfork)
+                    .await,
+                None,
+            ),
         };
         // Ask before anything else is injected: the next injection replaces
         // the backend's record.
