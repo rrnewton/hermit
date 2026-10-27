@@ -2948,8 +2948,11 @@ fi
 # and CMAKE_GENERATOR unset, the SDK recipe inputs, 16-job clamp and 1050
 # effective-job-second threshold carry unchanged. At two effective jobs
 # the SDK elapsed bound remains 525 seconds; fresh build evidence is separate.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a131082c93759d2666984a639e6d02813cd16e23 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a131082c93759d2666984a639e6d02813cd16e23 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 08a0b573eb8a6256c77655a42e8ea6a1fe9209a8: SDK/native inputs and limits
+# are unchanged; Counter1 runtime reporting changed. See the matching source
+# carry in run-with-reverie-dbt-budget.sh; no new SDK calibration is claimed.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 08a0b573eb8a6256c77655a42e8ea6a1fe9209a8 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 08a0b573eb8a6256c77655a42e8ea6a1fe9209a8 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

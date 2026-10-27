@@ -2872,7 +2872,15 @@ fi
 # and CMAKE_GENERATOR unset, the SDK recipe inputs, 16-job clamp and 1050
 # effective-job-second threshold carry unchanged. At two effective jobs
 # the SDK elapsed bound remains 525 seconds; fresh build evidence is separate.
-expected_pin=a131082c93759d2666984a639e6d02813cd16e23
+# CARRY TO 08a0b573eb8a6256c77655a42e8ea6a1fe9209a8 (2026-10-27): from
+# a131082c93759d2666984a639e6d02813cd16e23. Counter1 reporting now follows
+# configured RPC ownership; examples share client discovery and CI prepares it.
+# The runtime Rust source changes, so this is not whole-DBT-tree equivalence.
+# SDK inputs remain vendor/dynamorio tree 4ab89708f2e9 and build.rs blob
+# ff1eeb32b140; native sources and inventory are unchanged. Existing SDK budget,
+# width and limits carry without recalibration. Prior focused Counter1 runtime
+# controls are retained separately; this rebase makes no new runtime claim.
+expected_pin=08a0b573eb8a6256c77655a42e8ea6a1fe9209a8
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
