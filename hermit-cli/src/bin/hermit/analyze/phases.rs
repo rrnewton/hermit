@@ -1832,6 +1832,9 @@ impl AnalyzeOpts {
         println!(
             "\n------------------------------ hermit analyze report ------------------------------"
         );
+        if let Some(warning) = &self.branch_counter_warning {
+            println!("{warning}");
+        }
         println!("{}", header);
         Self::print_stack("stack1", &chosen);
         Self::print_stack("stack2", &instead);
@@ -1849,6 +1852,7 @@ impl AnalyzeOpts {
                 event_index: decision,
                 stack: instead,
             },
+            branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event: None,
             partial: None,
         })
@@ -2011,6 +2015,9 @@ impl AnalyzeOpts {
         println!(
             "\n------------------------------ hermit analyze report ------------------------------"
         );
+        if let Some(warning) = &self.branch_counter_warning {
+            println!("{warning}");
+        }
         println!("{}", header);
         println!("Thread {thread} at the deciding event #{decision}:");
         Self::print_stack("the deciding thread's stack", deciding);
@@ -2030,6 +2037,7 @@ impl AnalyzeOpts {
                 event_index: event2,
                 stack: stack2,
             },
+            branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event: Some(ReportCriticalEvent {
                 event_index: decision,
                 stack: deciding.clone(),
@@ -3359,6 +3367,7 @@ impl AnalyzeOpts {
                 event_index: critical_indices[1],
                 stack: critical2,
             },
+            branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event,
             partial: Some(PartialReport {
                 reason: cause.reason(),
@@ -3388,6 +3397,9 @@ impl AnalyzeOpts {
         println!(
             "\n------------------------- hermit analyze report (PARTIAL) -------------------------"
         );
+        if let Some(warning) = &self.branch_counter_warning {
+            println!("{warning}");
+        }
         println!("{header}");
         if let Some(stack) = &report.critical_event1.stack {
             println!(

@@ -177,6 +177,7 @@ impl PreemptionRecord {
             pipe_wake_latency,
             signal_state_copy,
             callback_checkpoints,
+            rng_seed,
         } = self;
         let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
@@ -219,6 +220,7 @@ impl PreemptionRecord {
             pipe_wake_latency: *pipe_wake_latency,
             signal_state_copy: *signal_state_copy,
             callback_checkpoints,
+            rng_seed: *rng_seed,
         }
     }
 
