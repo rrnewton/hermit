@@ -10,6 +10,9 @@
 #[path = "../build_support.rs"]
 mod build_support;
 
+#[path = "version_provenance/explicit_build_identity.rs"]
+mod explicit_build_identity;
+
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;

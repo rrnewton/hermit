@@ -944,7 +944,8 @@ mod tests {
             // random_determinism's
             // a_schedule_replay_hands_the_guest_the_recorded_random_values (+1):
             // 694.
-            assert_eq!(population, 694);
+            // Seven explicit package-identity cases in version_provenance (+7): 701.
+            assert_eq!(population, 701);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(
