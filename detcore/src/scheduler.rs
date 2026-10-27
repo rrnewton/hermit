@@ -20699,6 +20699,7 @@ impl Scheduler {
                 exclusive_pairs: Default::default(),
                 counter_reads: Default::default(),
                 exclusive_rewrites: Default::default(),
+                exclusive_rewrite_cache_peak: 0,
                 store_exclusives: None,
                 store_exclusives_unavailable: None,
                 guest_deadlock,
