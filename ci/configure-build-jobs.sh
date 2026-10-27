@@ -2938,8 +2938,18 @@ fi
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory, SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the ad1af851 entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a28d74243feca0fd7231a4baf0da3de7658dc39f ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a28d74243feca0fd7231a4baf0da3de7658dc39f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO a131082c93759d2666984a639e6d02813cd16e23 (2026-10-27): from
+# ad1af8514f172ae05337837ce9f24f448f04059a. The 0.5.4 release updates package
+# and source catalogs; this is not a new timing or runtime qualification.
+# In reverie-dbt only Cargo.toml version literals change. Its 1012-file
+# inventory, build.rs (ff1eeb32b140), vendor/dynamorio (4ab89708f2e9),
+# third-party tree (fb49c0ba7a9a), root Cargo.toml (5d81c262e76f) and
+# rust-toolchain.toml (b7ca9302bc65) remain identical. With CMAKE=cmake
+# and CMAKE_GENERATOR unset, the SDK recipe inputs, 16-job clamp and 1050
+# effective-job-second threshold carry unchanged. At two effective jobs
+# the SDK elapsed bound remains 525 seconds; fresh build evidence is separate.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a131082c93759d2666984a639e6d02813cd16e23 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a131082c93759d2666984a639e6d02813cd16e23 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
