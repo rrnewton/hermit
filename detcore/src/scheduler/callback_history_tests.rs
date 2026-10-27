@@ -1,3 +1,11 @@
+/*
+ * Copyright (c) Meta Platforms, Inc. and affiliates.
+ * All rights reserved.
+ *
+ * This source code is licensed under the BSD-style license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+
 #[cfg(test)]
 mod callback_history_scheduler_tests {
     use std::sync::Arc;
@@ -343,12 +351,14 @@ mod callback_history_scheduler_tests {
 
             // Load an admitted strict recording through the real scheduler;
             // the legacy progress mechanism remains inactive on replay too.
-            use crate::preemptions::boundary_recording::{BoundaryRecording, Recording};
+            use crate::preemptions::boundary_recording::BoundaryRecording;
+            use crate::preemptions::boundary_recording::Recording;
             let typed = Recording::Boundaries(
                 BoundaryRecording::new(
                     crate::preemptions::PreemptionRecord::default(),
                     detcore_model::schedule::boundary::Schedule::new(vec![]).unwrap(),
-                ).unwrap(),
+                )
+                .unwrap(),
             );
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("strict.json");
