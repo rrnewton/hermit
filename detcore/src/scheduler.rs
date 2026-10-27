@@ -22569,6 +22569,7 @@ impl Scheduler {
                 // GlobalState records the effective run configuration.
                 preemption: None,
                 post_crash: None,
+                property_snapshot: None,
                 // GlobalState knows what the accounting point could not see
                 // and replaces this scope (`run_summary_for_log`).
                 syscall_histogram: Some(
