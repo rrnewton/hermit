@@ -34,7 +34,8 @@ the staged loader plus `libdetcore_sabre.so` beside the Hermit executable:
 cargo build --release --locked -p hermit-run \
   --features third-party-backends -p detcore-sabre
 HERMIT_INSTALL_FORCE_RESTAGE=local-sabre \
-  cargo build --release --locked -p hermit-install
+  cargo build --release --locked -p hermit-install \
+    --features hermit-install/third-party-backends
 
 target/release/hermit --backend sabre run --strict --epoch=2026-01-01T00:00:00Z --verify -- /bin/echo hello
 ```
