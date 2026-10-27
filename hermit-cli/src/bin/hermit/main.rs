@@ -20,6 +20,7 @@ mod bisect;
 mod clean;
 mod cli_owned_lifecycle;
 mod container;
+mod container_clone;
 mod dap_adapter;
 #[cfg(test)]
 mod exec_stop_launch_tests;

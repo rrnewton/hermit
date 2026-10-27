@@ -1844,7 +1844,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And test_isolation::tests::a_test_rerun_alone_is_out_of_reach_of_a_malloc_lock_another_test_holds
     // (unit tests that clone a container or set the skid margin run in a
     // process of their own): 1136, listed (1135 on main plus one).
-    ("test.hermit_unit", 1136),
+    // And the three test_isolation units for the checks a test build makes
+    // before a container clone or a recorded --skid-margin: 1139, listed.
+    ("test.hermit_unit", 1139),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5680,7 +5682,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (1114 on main plus one).
     // And the same fourteen pinned_cpu::tests units: 1129, listed.
     // And the same test_isolation malloc-lock test: 1130, listed.
-    ("test.hermit_unit_on_host", 1130),
+    // And the same three test_isolation check units: 1133, listed.
+    ("test.hermit_unit_on_host", 1133),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

@@ -518,6 +518,7 @@ pub(super) fn shared_input_declaration_fixture() -> Result<serde_json::Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::container_clone::CheckedClone;
 
     /// Discover inputs only; production Capture still authenticates the full
     /// declared graph against the actual host files and compiled bundle.
@@ -695,6 +696,9 @@ mod tests {
 
         use clap::CommandFactory;
 
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let cwd = std::env::current_dir().unwrap();
         assert!(
             !cwd.starts_with("/tmp"),
@@ -725,7 +729,7 @@ mod tests {
             // Isolate the normal CLI's process-global log budget and observer
             // lease. This existing container fixture launches no replacement
             // target: Subcommand retains its own genuine common run owner.
-            let isolation = reverie::process::Container::new().run(|| {
+            let isolation = reverie::process::Container::new().checked_run(|| {
                 let _lease =
                     super::super::native_exec_coordinator::bootstrap_mask_observation::Lease::arm(
                         report.try_clone().unwrap(),
@@ -842,6 +846,9 @@ mod tests {
     fn native_endpoint_directory_meets_stats_policy_under_child_umasks() {
         use std::os::unix::fs::MetadataExt;
 
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         struct RefusePeers;
         impl reverie_rpc_transport::ConnectionAdmission for RefusePeers {
             fn admit(&self, _peer: OwnedFd) -> io::Result<reverie_rpc_transport::Admitted> {
@@ -856,7 +863,7 @@ mod tests {
             // Only this real child changes its umask. No test-runner thread or
             // later invocation inherits the deliberately permissive setting.
             reverie::process::Container::new()
-                .run(|| {
+                .checked_run(|| {
                     unsafe { libc::umask(mask) };
                     let staging = tempfile::tempdir().unwrap();
                     let endpoints = NativeEndpoints::bind(staging.path()).unwrap();

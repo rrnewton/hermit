@@ -2413,6 +2413,7 @@ mod tests {
     use std::fs;
 
     use super::*;
+    use crate::container_clone::CheckedClone;
 
     /// A report larger than a page reaches a one-page pipe that has room for
     /// its first lines. Written as one write it put nothing there: 3600 bytes
@@ -2625,7 +2626,7 @@ mod tests {
         // These controls do not need the CLI's child panic-hook installation.
         super::super::container::classify_container_result(
             reverie::process::Container::new()
-                .run(|| child().map_err(hermit::SerializableError::from)),
+                .checked_run(|| child().map_err(hermit::SerializableError::from)),
         )
     }
 
