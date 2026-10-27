@@ -573,13 +573,24 @@ unset `PR_LABELS` or `PR_BODY` exits 2. For a labeled pull request, a missing
 used above because a complete comment history can exceed the per-environment-
 variable size limit.
 
-⚠️ **DO NOT "FIX" THIS BY ARMING THE GATE.** Adding a `pull_request` trigger
-contradicts the standing directive that Actions never run automatically for
-pull requests or `main`. The portable workflow's automatic integration-branch
-run is supplemental evidence only. A trigger without a `required_status_checks`
-rule — or a rule without a trigger — yields either a check that gates nothing or
-a requirement nothing can satisfy. Both layers or neither, and that pairing is
-an owner decision.
+⚠️ **DO NOT "FIX" THIS BY ARMING THE GATE.** This lint and the merge gate stay
+hand-run: no `pull_request` trigger on `merge-gate.yml` and no
+`required_status_checks` rule. A trigger without a rule, or a rule without a
+trigger, yields either a check that gates nothing or a requirement nothing can
+satisfy. Both layers or neither, and that pairing is an owner decision.
+
+The portable workflow is the one exception, by owner decision on 2026-10-27:
+"invoke CI automatically only for external PRs not by our hermit-bot account".
+`ci-portable.yml` runs on `pull_request` (opened, synchronize, reopened,
+ready_for_review) unless the author is `hermit-bot3` or the pull request is a
+draft, as well as after a push to `integration` and on manual dispatch. It
+uses no secrets and a read-only token, so it behaves the same for a branch of
+this repository and for a fork (GitHub asks a maintainer to approve a
+first-time fork contributor's run). Its result is supplemental evidence and
+gates nothing: it is not a required status check. The privileged
+(self-hosted, PMU) workflows remain dispatch-only, because a pull request's
+code must not run unreviewed on those hosts. `scripts/check-github-actions-triggers.rs`
+enforces this shape, including the bot/draft gate on every entry job.
 
 **What actually holds this line today is agents choosing to hold it.**
 

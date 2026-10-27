@@ -1,9 +1,23 @@
 name: CI (GitHub-managed portable)
 
 # Diagnostic fan-out of the constructed portable plan. It runs automatically
-# only after a commit reaches the integration branch, and may also be dispatched
-# manually. Follow AGENTS.md for landing: local or GitHub evidence is acceptable,
-# and reported failures require investigation.
+# after a commit reaches the integration branch and for pull requests opened by
+# anyone other than the project bot (owner decision, 2026-10-27: "invoke CI
+# automatically only for external PRs not by our hermit-bot account"), and may
+# also be dispatched manually. Follow AGENTS.md for landing: local or GitHub
+# evidence is acceptable, and reported failures require investigation.
+#
+# EXTERNAL PULL REQUESTS. A pull_request run whose author is hermit-bot3, or
+# whose pull request is a draft, skips every job: the gate sits on the jobs
+# that can start without a predecessor (select, plan) and on the two that run
+# under always() (regular, cleanup); every other job needs select and is skipped
+# with it. The workflow uses no secrets and a contents: read token, so it runs
+# the same for a branch of this repository and for a fork. For a fork, GitHub
+# also withholds write scopes, so cleanup (which deletes this run's short-lived
+# artifacts and needs actions: write) is skipped there; those artifacts expire
+# on their own after one day. First-time fork contributors still need a
+# maintainer to approve the run in the Actions tab (repository setting).
+# This is diagnostic signal only: no status check is required for landing.
 #
 # WHY: the former serial `regular` job ran the entire 46-node
 # portable DAG on ONE ubuntu-latest runner with outer concurrency 1 (serial
@@ -59,6 +73,8 @@ on:
   workflow_dispatch:
   push:
     branches: [integration]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
 
 concurrency:
   # Runs for one ref share a group. cancel-in-progress:false lets the running
@@ -119,6 +135,7 @@ jobs:
   # subset); this job only translates them into matrices, never widens `skip`.
   select:
     name: Select affected tests
+    if: github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
@@ -246,6 +263,7 @@ jobs:
   # from is internally consistent and covers the DAG.
   plan:
     name: Verify shard/DAG coverage
+    if: github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -1591,7 +1609,7 @@ jobs:
       - strict-compat
       - test-release
       - e2e
-    if: always()
+    if: always() && (github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft))
     runs-on: ubuntu-latest
     # 10m absorbs the folded-in e2e parity reduction (former reduce-e2e job,
     # itself 5m-capped) plus the gate jq.
@@ -1778,7 +1796,7 @@ jobs:
     # Name every artifact consumer directly. In particular, test-debug is a
     # matrix job whose integration shard owns test.cli and the run_dbt_* tests.
     needs: [test-debug, test-release, e2e, sabre_non_gated_parity, regular]
-    if: always()
+    if: always() && (github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
