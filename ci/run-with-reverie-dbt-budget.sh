@@ -2945,7 +2945,27 @@ fi
 #     reverie-dbt/native            164356b3ab65 -> 164356b3ab65
 # so the inventory (1014), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the 66196746 entry.
-expected_pin=02449ed7268c44c885ad988d4bbf45a640e87c6c
+# CARRY TO 38c3e024cae8063ff9d1433452b1d36b8c511133 (2026-10-27): from
+# 02449ed7268c44c885ad988d4bbf45a640e87c6c. Three commits: 189c0fde (a
+# LinuxEmu signalfd answers each thread from its own queue and its
+# process's, with UnsupportedOperation::Signalfd in reverie/src/unsupported.rs),
+# ff4791a2 (the dormant KVM timer's kick signal is unblocked only inside
+# KVM_RUN; reverie-kvm and a reverie-kvm-core doc line) and 38c3e024 (the
+# standard in-guest installer and the DBT prototype retain one typed
+# Config/subscription owner, reverie/src/tool_configuration.rs). Under
+# reverie-dbt/ only src/lib.rs and src/tools.rs change and
+# src/tests/tool_configuration.rs is added, so the DBT inventory grows from
+# 1014 to 1015. The root Cargo.lock gains one test-only dependency edge
+# (reverie-rpc-transport); the root Cargo.toml, rust-toolchain.toml and
+# third-party/ are unchanged, and the repository inputs to the DynamoRIO
+# content key are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+#     reverie-dbt/native            164356b3ab65 -> 164356b3ab65
+# so the SDK and native inputs, calibrated budget, job width and the 1050
+# effective-job-second limits carry unchanged from the 66196746 entry. This is
+# not whole-runtime equivalence or a new cold-SDK timing sample.
+expected_pin=38c3e024cae8063ff9d1433452b1d36b8c511133
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

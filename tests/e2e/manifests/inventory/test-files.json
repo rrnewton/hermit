@@ -2498,6 +2498,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/signalfd_threads.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace and KVM; ci=true)",
+      "why": "tests/c/signalfd_threads.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: a signalfd created while a second thread exists, with a third thread started while it is open, must answer each thread from its own pending signals and its process's: a tgkill to one thread is readable by that thread only (poll, select and read), a timer's SIGALRM and a child's SIGCHLD by every thread and read once, a read takes the thread's own signal before the process's, and a ppoll ends for a signal sent to the waiting thread and not for one sent to another (https://github.com/rrnewton/hermit/issues/4797)"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/sigpipe_siginfo.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/sigpipe_siginfo.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"

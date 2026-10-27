@@ -3878,7 +3878,11 @@ pub(crate) fn tool_decided_injection_failure(
 /// A general guard needs a Reverie API hook and is not part of this change.
 ///
 /// Any other refusal it takes counts the call as refused in the syscall
-/// histogram (`crate::syscall_histogram`).
+/// histogram (`crate::syscall_histogram`). A signalfd operation the backend
+/// does not model (`UnsupportedOperation::Signalfd`: a read that would wait,
+/// an epoll registration, a process created while one is open) is named in a
+/// warning as well: no handler takes that refusal, and its ENOSYS reaches the
+/// guest as the backend answered.
 pub(crate) fn fail_on_tool_decided_injection<T, G>(guest: &mut G, sysno: Sysno)
 where
     T: RecordOrReplay,
@@ -3888,6 +3892,14 @@ where
     let refusal = guest.take_unsupported_refusal();
     if refusal.is_some() {
         crate::syscall_histogram::mark_refused::<T, G>(guest);
+    }
+    if let Some(refusal) =
+        refusal.filter(|refusal| refusal.operation == reverie::UnsupportedOperation::Signalfd)
+    {
+        tracing::warn!(
+            "[dtid {dettid}] {sysno} refused by the backend: {}",
+            refusal.diagnostic
+        );
     }
     if let Some(failure) = tool_decided_injection_failure(refusal, dettid, sysno) {
         tracing::error!("{failure}");
