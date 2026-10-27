@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use anyhow::Context as _;
+use detcore_model::summary::ScheduleDeparture;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -276,6 +277,12 @@ pub struct JournalEntry {
     /// analysis before it asks) stands in for it. `(recorded, replayed)`.
     #[serde(default)]
     pub recording_replays_input: Option<(PathBuf, PathBuf)>,
+    /// Where its schedule replay first ran another thread than the schedule
+    /// names, if it did ([`RunData::departure`]).
+    ///
+    /// [`RunData::departure`]: crate::analyze::rundata::RunData::departure
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub departure: Option<ScheduleDeparture>,
 }
 
 struct JournalState {
@@ -742,6 +749,7 @@ mod tests {
                 sha256: "ab".repeat(32),
             }],
             recording_replays_input: None,
+            departure: None,
         };
         let journal = Journal::open(dir.path()).unwrap();
         assert!(journal.is_on());

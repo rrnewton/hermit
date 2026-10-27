@@ -14,12 +14,20 @@ use detcore_model::pid::DetTid;
 use detcore_model::schedule::Op;
 use detcore_model::schedule::SchedEvent;
 use detcore_model::schedule::SyscallPhase;
+use detcore_model::summary::ScheduleDeparture;
 use detcore_model::time::LogicalTime;
 use tracing::debug;
 use tracing::info;
 use tracing::trace;
 
 const LOOKAHEAD_WINDOW: usize = 10;
+
+/// Called with a replay's first departure from its schedule as it happens
+/// ([`Replayer::first_departure`]), so that the departure outlives a run that
+/// a timeout kills or that exits without its summary
+/// ([`crate::set_schedule_departure_hook`]).
+pub(crate) static SCHEDULE_DEPARTURE_HOOK: std::sync::RwLock<Option<fn(ScheduleDeparture)>> =
+    std::sync::RwLock::new(None);
 
 /// Replayer
 #[derive(Debug)]
@@ -35,6 +43,9 @@ pub struct Replayer {
 
     /// Desync events observed per thread.  Counts different kinds of desyncs.
     pub desync_counts: BTreeMap<DetTid, DesyncStats>,
+    /// The first event at which the run ran another thread than the schedule
+    /// names, if it did.
+    pub first_departure: Option<ScheduleDeparture>,
     /// A cached copy of the same (immutable) field in Config.
     pub replay_exhausted_panic: bool,
     /// A cached copy of the same (immutable) field in Config.
@@ -196,6 +207,7 @@ impl Replayer {
         Replayer {
             cursor,
             desync_counts: BTreeMap::new(),
+            first_departure: None,
             die_on_desync: false,
             replay_exhausted_panic: false,
             traced_event_count: 0,
@@ -302,6 +314,17 @@ impl Replayer {
                     observed.dettid,
                     current_ix
                 );
+                if self.first_departure.is_none() {
+                    let departure = ScheduleDeparture {
+                        event: current_ix,
+                        expected: expected.dettid,
+                        running: observed.dettid,
+                    };
+                    self.first_departure = Some(departure);
+                    if let Some(hook) = SCHEDULE_DEPARTURE_HOOK.read().ok().and_then(|hook| *hook) {
+                        hook(departure);
+                    }
+                }
             }
 
             let is_desync = is_desync(observed, &expected);
@@ -596,6 +619,60 @@ mod tests {
             vec!["dettid", "end_rip"]
         );
         assert!(hard_desync_fields(&recorded, &recorded).is_empty());
+    }
+
+    /// The first event at which the run ran another thread than the schedule
+    /// names is kept, with both threads; later ones do not replace it, and a
+    /// replay that keeps to its schedule has none. The installed hook
+    /// (`crate::set_schedule_departure_hook`) is called with it once.
+    #[test]
+    fn the_first_departure_from_the_schedule_is_kept() {
+        let mut b = builder::SchedTestBuilder::new();
+        let schedule = vec![
+            b.other(SOME_RIP, tid(3)),
+            b.other(SOME_RIP, tid(5)),
+            b.other(SOME_RIP, tid(3)),
+        ];
+        let mut followed = Replayer::new(schedule.clone());
+        for event in &schedule {
+            let _ = followed.observe_event(event);
+        }
+        assert_eq!(followed.first_departure, None);
+
+        let mut departed = Replayer::new(schedule.clone());
+        let _ = departed.observe_event(&schedule[0]);
+        // Thread 5 is blocked: thread 3 runs on, twice.
+        let _ = departed.observe_event(&schedule[0]);
+        let _ = departed.observe_event(&schedule[0]);
+        assert_eq!(
+            departed.first_departure,
+            Some(ScheduleDeparture {
+                event: 1,
+                expected: tid(5),
+                running: tid(3),
+            })
+        );
+
+        // The hook is process-wide and other tests replay too: count only
+        // this replay's threads.
+        static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn count(departure: ScheduleDeparture) {
+            if (departure.expected, departure.running) == (tid(7_773), tid(7_771)) {
+                CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let schedule = vec![
+            b.other(SOME_RIP, tid(7_771)),
+            b.other(SOME_RIP, tid(7_773)),
+            b.other(SOME_RIP, tid(7_771)),
+        ];
+        crate::set_schedule_departure_hook(Some(count));
+        let mut hooked = Replayer::new(schedule.clone());
+        for _ in 0..3 {
+            let _ = hooked.observe_event(&schedule[0]);
+        }
+        crate::set_schedule_departure_hook(None);
+        assert_eq!(CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

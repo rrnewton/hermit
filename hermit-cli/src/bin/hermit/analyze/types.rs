@@ -35,6 +35,7 @@ use crate::analyze::checkpoint::Progress;
 use crate::analyze::checkpoint::ProgressHandle;
 use crate::analyze::rundata::TrialInconclusive;
 use crate::analyze::rundata::TrialRunner;
+use crate::schedule_search::NoFeasibleSchedule;
 
 /// Repeat a run multiple times in a controlled search to find concurrency bugs.
 ///
@@ -679,6 +680,11 @@ pub struct PartialReport {
     /// ended the analysis (`reason` `trial-inconclusive`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inconclusive: Option<TrialInconclusive>,
+    /// The schedules between the default search's pair that it tried and
+    /// could not replay, when that ended the analysis (`reason`
+    /// `trial-inconclusive`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub infeasible: Option<NoFeasibleSchedule>,
     /// The default search's interval, if it got that far.
     pub interval: Option<BisectInterval>,
     /// `--prefix-search`'s bracket, if it got that far.
@@ -709,7 +715,8 @@ pub enum PartialReason {
     TrialBudget,
     /// A search trial that analyze's wall-clock bound stopped was stopped
     /// again when it ran once more with a longer bound
-    /// ([`TrialInconclusive`]).
+    /// ([`TrialInconclusive`]), or every schedule the default search tried
+    /// between its pair could not be replayed ([`NoFeasibleSchedule`]).
     TrialInconclusive,
 }
 

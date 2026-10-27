@@ -1919,7 +1919,21 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_empty_prefix_that_meets_the_target_given_longer_ends_the_search}), plus
     // phases::tests::{a_continuation_with_an_inconclusive_endpoint_trial_ends_the_search,
     // a_baseline_run_the_backstop_stopped_runs_again}: 1250.
-    ("test.hermit_unit", 1250),
+    // And a spliced schedule the replay cannot follow never decides:
+    // schedule_search::tests::{the_candidates_lie_between_the_pair_midpoint_first,
+    // an_infeasible_schedule_never_decides, a_pass_without_a_feasible_schedule_ends_the_search,
+    // an_endpoint_the_replay_leaves_keeps_its_outcome},
+    // phases::tests::a_bisection_round_that_left_its_schedule_never_decides and
+    // rundata::tests::a_departure_from_the_schedule_is_read_journaled_and_answered: 1256.
+    // And splicing only runs whose threads agree:
+    // schedule_search::tests::{the_matching_keeps_each_threads_order_and_its_syscalls_whole,
+    // one_reordered_event_or_split_syscall_is_a_divergence} and
+    // phases::tests::a_prefix_search_after_divergent_traces_says_why: 1259.
+    // And phases::tests::{diverging_endpoints_go_to_the_prefix_search,
+    // a_round_that_left_its_schedule_and_then_stopped_never_decides} and
+    // departure_note::tests::a_departure_noted_by_a_killed_child_reaches_its_parent_once: 1262.
+    // And departure_note::tests::arming_installs_the_hook_that_writes_the_note: 1263.
+    ("test.hermit_unit", 1263),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3132,7 +3146,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (a replay of a schedule's first events keeps their callback
     // checkpoints): 2739, listed.
     // And preemptions::tests::a_record_too_varied_to_renumber_keeps_its_priorities: 2740.
-    ("test.detcore_unit", 2740),
+    // And scheduler::replayer::tests::the_first_departure_from_the_schedule_is_kept
+    // (where a replay first ran another thread than its schedule names): 2741.
+    ("test.detcore_unit", 2741),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5415,7 +5431,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two directory st_nlink units: 2738, listed.
     // And the same schedule-prefix unit: 2739, listed.
     // And the same normalize test: 2740.
-    ("test.detcore_unit_on_host", 2740),
+    // And the same schedule-departure unit: 2741.
+    ("test.detcore_unit_on_host", 2741),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5801,7 +5818,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same cut-path decided-budget test: 1241.
     // And the same six backstop tests: 1188.
     // Less the same five confirmation tests, plus the same two backstop tests: 1244.
-    ("test.hermit_unit_on_host", 1244),
+    // And the same six infeasible-splice tests: 1250.
+    // And the same three divergence tests: 1253.
+    // And the same three dispatch, stopped-departure and note tests: 1256.
+    // And the same arming test: 1257.
+    ("test.hermit_unit_on_host", 1257),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

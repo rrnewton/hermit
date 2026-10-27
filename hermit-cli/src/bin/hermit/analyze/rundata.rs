@@ -29,6 +29,8 @@ use detcore::preemptions::PreemptionRecord;
 use detcore::preemptions::strip_times_from_events_file;
 use detcore::types::SchedEvent;
 use detcore_model::config::ExpiredWaitCharge;
+use detcore_model::summary::RunSummary;
+use detcore_model::summary::ScheduleDeparture;
 use hermit::process::Bind;
 use reverie::process::Output;
 use serde::Deserialize;
@@ -249,6 +251,9 @@ pub struct RunData {
     /// For a run the journal answered with a stop by its own `--timeout`,
     /// that `--timeout`, in seconds, as recorded.
     stopped_by: Option<u64>,
+    /// Where the run's schedule replay first ran another thread than the
+    /// schedule names, from its summary or the journal.
+    departure: Option<ScheduleDeparture>,
     /// How long the run took, once it finished.
     wall: Option<Duration>,
     /// The log file the run wrote, once it launched (`--verbose` or
@@ -572,6 +577,7 @@ impl RunData {
         }
         self.logged_to = self.trial_global_opts().log_file;
         self.journaled_log_bytes = entry.log_bytes;
+        self.departure = entry.departure;
         eprintln!(
             ":: {} answered from the journal of an earlier invocation: {}",
             self.runname,
@@ -670,6 +676,7 @@ impl RunData {
                 .map(|metadata| metadata.len()),
             outputs,
             recording_replays_input,
+            departure: self.departure,
         })
     }
 
@@ -707,7 +714,20 @@ impl RunData {
         self.runopts.write_debug_options_dump()?;
 
         let started = Instant::now();
+        if let Some(path) = &self.runopts.summary_json {
+            // A summary left by an earlier run of this name is not this run's.
+            let _ = std::fs::remove_file(path);
+        }
+        // The replay leaves its first departure in the shared note as it
+        // happens, so that a run stopped or refused before it writes its
+        // summary still says it left its schedule.
+        if let Err(error) = crate::departure_note::arm() {
+            tracing::warn!(
+                "cannot map the schedule-departure note ({error}); reading summaries only"
+            );
+        }
         let ran = self.runopts.run(&gopts, true);
+        self.departure = crate::departure_note::take().or_else(|| self.read_departure());
         stop::check()?;
         let (_, output) = ran.map_err(|error| self.name_the_trial_bound(error))?;
         let output: Output = output.context("expected captured output")?;
@@ -857,6 +877,27 @@ impl RunData {
         self.wall = Some(wall);
     }
 
+    /// A test's trial runner ([`TrialRunner`]) has the run leave its schedule
+    /// as a replay that cannot follow it does ([`RunData::departure`]).
+    #[cfg(test)]
+    pub(crate) fn depart_for_test(&mut self, departure: ScheduleDeparture) {
+        self.departure = Some(departure);
+    }
+
+    /// Where the run's schedule replay first ran another thread than the
+    /// schedule names, if it did: the run is then not that schedule's.
+    pub fn departure(&self) -> Option<ScheduleDeparture> {
+        self.departure
+    }
+
+    /// [`RunData::departure`] from the run's summary (`--summary-json`); none
+    /// when the run wrote none.
+    fn read_departure(&self) -> Option<ScheduleDeparture> {
+        let bytes = std::fs::read(self.runopts.summary_json.as_ref()?).ok()?;
+        let summary: RunSummary = serde_json::from_slice(&bytes).ok()?;
+        summary.schedule_departure
+    }
+
     /// This run's name in the workspace.
     pub fn name(&self) -> &str {
         &self.runname
@@ -916,6 +957,7 @@ impl RunData {
             own_timeout: None,
             from_journal: false,
             stopped_by: None,
+            departure: None,
             wall: None,
             logged_to: None,
             journaled_log_bytes: None,
@@ -1123,6 +1165,7 @@ impl RunData {
             own_timeout: None,
             from_journal: false,
             stopped_by: None,
+            departure: None,
             wall: None,
             logged_to: None,
             journaled_log_bytes: None,
@@ -1154,6 +1197,7 @@ impl RunData {
             own_timeout: None,
             from_journal: false,
             stopped_by: None,
+            departure: None,
             wall: None,
             logged_to: None,
             journaled_log_bytes: None,
@@ -3439,6 +3483,55 @@ mod tests {
         std::fs::write(&stdout, "PASSED\n").unwrap();
         let mut changed = RunData::new_baseline(&reopened, "prefix_round_007".into()).unwrap();
         assert!(changed.answer_from_journal(&entry).unwrap().is_none());
+    }
+
+    /// Where a run left its schedule is read from its summary, journaled with
+    /// its outcome, and answered with it: a resumed analysis sees the same
+    /// round without an outcome as the uninterrupted one did. A summary
+    /// without the field (an older one) says the run kept to it.
+    #[test]
+    fn a_departure_from_the_schedule_is_read_journaled_and_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = journaled_options(dir.path());
+        let departure = ScheduleDeparture {
+            event: 6843,
+            expected: detcore::types::DetTid::from_raw(15360),
+            running: detcore::types::DetTid::from_raw(15361),
+        };
+        let mut first = RunData::new_baseline(&options, "bisect_round_003".into()).unwrap();
+        let summary = first.runopts.summary_json.clone().unwrap();
+        std::fs::write(
+            &summary,
+            serde_json::to_string(&RunSummary {
+                schedule_departure: Some(departure),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(first.read_departure(), Some(departure));
+        std::fs::write(&summary, r#"{"sched_turns": 1}"#).unwrap();
+        assert_eq!(first.read_departure(), None, "an older summary");
+        std::fs::remove_file(&summary).unwrap();
+        assert_eq!(first.read_departure(), None, "no summary");
+
+        let stdout = first.root_path().with_extension("stdout");
+        std::fs::write(&stdout, "FAILED\n").unwrap();
+        first.is_a_match = Some(true);
+        first.departure = Some(departure);
+        let key = first.journal_key();
+        first
+            .journal_outcome(&options.journal, key.clone(), &Ok(()))
+            .unwrap();
+        assert_eq!(
+            options.journal.lookup(&key).unwrap().departure,
+            Some(departure)
+        );
+        let reopened = journaled_options(dir.path());
+        let mut again = RunData::new_baseline(&reopened, "bisect_round_003".into()).unwrap();
+        again.launch().unwrap();
+        assert_eq!(reopened.journal.answered(), 1);
+        assert_eq!(again.departure(), Some(departure));
     }
 
     /// A run its own bound stopped is journaled as such, and answered as the
