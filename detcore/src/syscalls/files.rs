@@ -9678,6 +9678,50 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
 
+        // A directory's link count is the same kind of host value: on file
+        // systems that count a directory's links (ext4, and tmpfs too) it
+        // is two plus the number of subdirectories, so it changes whenever
+        // any process adds or removes a subdirectory; only file systems
+        // that do not count them (btrfs) report 1 for every directory. The
+        // ancestors a build stats include shared directories such as
+        // `/home`, whose subdirectory count churns under parallel work on
+        // a shared machine, so the host's count broke the same `--verify`
+        // comparisons as the size above, through the hashed stat buffer
+        // the io-buffer log records. Report 1, as the procfs root above
+        // already does. GNU find's leaf optimization expects `nlink - 2`
+        // subdirectories and stats entries until it has seen that many;
+        // a count below 2 disables the optimization, so 1 makes a walker
+        // infer nothing and stat every entry -- the safe direction.
+        //
+        // Unlike the size pin above, this pin does not inherit the
+        // unprovable-procfs exclusion: a procfs directory's size 0 matters
+        // to SEEK_END, but its link count has no such consumer, and the
+        // procfs root already reports 1 on every backend, so 1 cannot be
+        // wrong for a directory that might be procfs. An anonymous-device
+        // directory with 1024-byte blocks (autofs `/home`, devpts, a FUSE
+        // mount) is therefore pinned on DBT too, where the size pin still
+        // leaves it alone. Only a proved procfs directory keeps its host
+        // count: one Detcore knows is procfs (`ProcfsEntry::At` or
+        // `ProcfsEntry::Unnamed`; see `ProcfsEntry::is_procfs`). For
+        // example `/proc/<pid>/fd` reports nlink 2 and carries its
+        // descriptor count in its size, and both are preserved here.
+        // Synthetic procfs directories Detcore serves itself (the
+        // `descriptor_directory` placeholders answered by
+        // `rendered_procfs_stat` before `determinize_stat` runs) bypass
+        // this pin entirely and keep their synthesized metadata.
+        //
+        // A deleted directory keeps 0: `mkdir`, `open(O_DIRECTORY)`,
+        // `rmdir`, then `fstat` reports `st_nlink == 0` on Linux (ext4's
+        // rmdir clears the count), and that zero is guest-visible state,
+        // not host churn. Only a positive count is pinned.
+        if stat.mode & libc::S_IFMT == libc::S_IFDIR
+            && stat.mask.contains(StatxMask::STATX_NLINK)
+            && stat.nlink >= 1
+            && !procfs.is_procfs()
+        {
+            stat.nlink = 1;
+        }
+
         let epoch_tp = Timespec {
             tv_sec: epoch.timestamp(),
             tv_nsec: epoch.timestamp_subsec_nanos() as i64,
