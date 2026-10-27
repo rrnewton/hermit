@@ -3024,7 +3024,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_exec_never_lets_a_surviving_lock_go: 2658 + 3 = 2661, listed.
     // And syscalls::inotify's a_read_into_overlapping_buffers_is_left_alone
     // (the overlap decision, without global state): 2662, listed.
-    ("test.detcore_unit", 2662),
+    // And A5 slice 3c.1e B's unit: threads' disposition_mask_tests::
+    // a_gated_managed_wait_reads_the_guest_mask_without_replacing_it: 2663,
+    // listed.
+    ("test.detcore_unit", 2663),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5248,7 +5251,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twelve P1 units: 2658, listed.
     // And the same three P1 round-three units: 2661, listed.
     // And the same overlap-decision unit: 2662, listed.
-    ("test.detcore_unit_on_host", 2662),
+    // And the same 3c.1e B unit: 2663, listed.
+    ("test.detcore_unit_on_host", 2663),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
