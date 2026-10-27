@@ -1258,6 +1258,54 @@ pub fn scheduler_owns_guest_pid_namespace() -> bool {
 #[cfg(feature = "liteinst")]
 const IN_GUEST_RUNTIME_DELIVERS_SIGNALS: bool = false;
 
+/// Set only in a test child that re-executed this test binary as PID 1 of its
+/// own user and PID namespaces (`in_guest_delivery_harness`, design D60): the
+/// gate's set points then take the runtime as delivering signals, so the dark
+/// 3c.1 mechanisms run end to end before the flip. No shipped build has it.
+#[cfg(all(test, feature = "liteinst"))]
+static FORCE_IN_GUEST_DELIVERY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the in-guest runtime delivers signals itself, at the gate's set
+/// points: [`IN_GUEST_RUNTIME_DELIVERS_SIGNALS`], or, in a test child,
+/// [`FORCE_IN_GUEST_DELIVERY`].
+#[cfg(feature = "liteinst")]
+fn runtime_delivers_signals() -> bool {
+    #[cfg(test)]
+    if FORCE_IN_GUEST_DELIVERY.load(std::sync::atomic::Ordering::Acquire) {
+        return true;
+    }
+    IN_GUEST_RUNTIME_DELIVERS_SIGNALS
+}
+
+/// How many launches in this test process computed the in-guest delivery
+/// gate on at one of its two set points. The forced-gate harness
+/// (`in_guest_delivery_harness`, design D60) reads it after a row's run, so
+/// that the row proves its own run was gated, not only that the force flag
+/// was set: another conjunct of [`in_guest_signal_delivery_gate`] turning
+/// the gate off would otherwise leave a row whose output Linux also prints
+/// passing with the gate off. Test builds only.
+#[cfg(all(test, feature = "liteinst"))]
+static GATED_LAUNCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The line a test child prints when a set point computes the gate on, for a
+/// row whose run ends the process (a stopping refusal) before it can read
+/// [`GATED_LAUNCHES`]. Test builds only.
+#[cfg(all(test, feature = "liteinst"))]
+const GATED_LAUNCH_WITNESS: &str = "IN-GUEST-DELIVERY-GATE-ON";
+
+/// The delivery gate as a set point computed it, recorded in test builds
+/// (`GATED_LAUNCHES`, `GATED_LAUNCH_WITNESS`) when on.
+#[cfg(feature = "liteinst")]
+fn record_delivery_gate(gate: bool) -> bool {
+    #[cfg(test)]
+    if gate {
+        GATED_LAUNCHES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        println!("{GATED_LAUNCH_WITNESS}");
+    }
+    gate
+}
+
 /// The in-guest delivery gate (`detcore::Config::in_guest_signal_delivery`,
 /// D35 of the A5 step 3c design) for a run of `backend` on Hermit's default
 /// in-guest route, from its final prepared configuration and the launcher's
@@ -4933,12 +4981,14 @@ async fn dispatch_backend(
             // The delivery gate, from the final configuration and whether
             // this process owns the guests' PID namespace; off until the
             // runtime takes it (A5 step 3c.1, D35, D52).
-            config.in_guest_signal_delivery = IN_GUEST_RUNTIME_DELIVERS_SIGNALS
-                && in_guest_signal_delivery_gate(
-                    &config,
-                    backend,
-                    scheduler_owns_guest_pid_namespace(),
-                );
+            config.in_guest_signal_delivery = record_delivery_gate(
+                runtime_delivers_signals()
+                    && in_guest_signal_delivery_gate(
+                        &config,
+                        backend,
+                        scheduler_owns_guest_pid_namespace(),
+                    ),
+            );
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
             let (exit_status, mut global_state, dispatch_stats, process_reports) =
@@ -5285,12 +5335,14 @@ async fn dispatch_output_backend(
             // The delivery gate, from the final configuration and whether
             // this process owns the guests' PID namespace; off until the
             // runtime takes it (A5 step 3c.1, D35, D52).
-            config.in_guest_signal_delivery = IN_GUEST_RUNTIME_DELIVERS_SIGNALS
-                && in_guest_signal_delivery_gate(
-                    &config,
-                    backend,
-                    scheduler_owns_guest_pid_namespace(),
-                );
+            config.in_guest_signal_delivery = record_delivery_gate(
+                runtime_delivers_signals()
+                    && in_guest_signal_delivery_gate(
+                        &config,
+                        backend,
+                        scheduler_owns_guest_pid_namespace(),
+                    ),
+            );
             let preload = liteinst_tool_runtime_library_path()?;
             let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
             let (output, mut global_state, dispatch_stats, process_reports) =
@@ -6266,6 +6318,9 @@ pub fn replay_with_output_and_mounts(dir: &Path, mounts: &[Mount]) -> Result<Out
         report.finish(result)
     })
 }
+
+#[cfg(all(test, feature = "liteinst"))]
+mod in_guest_delivery_harness;
 
 #[cfg(test)]
 mod tests {
