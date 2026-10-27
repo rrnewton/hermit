@@ -6447,11 +6447,11 @@ pub enum SignalScope {
 /// Detcore and a coordinator built at different revisions refuse each other
 /// before either decodes the other's messages. A change to either enum
 /// appends a revision (`config::tests::the_global_rpc_revision_matches_its_definitions`
-/// fails until it does). That test digests the two enums' bodies only: a
-/// change to a payload type defined elsewhere (`Resources`,
-/// `CommittedSendWindow`, ...) changes what is on the wire without changing
+/// fails until it does). That test digests the two enums' bodies and
+/// `Resources`: a change to another payload type defined elsewhere
+/// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 3;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 4;
 
 /// This is public only so it can be used in the `GlobalTool` trait.
 /// It should NOT be used by any client outside of this file.

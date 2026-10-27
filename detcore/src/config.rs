@@ -75,23 +75,25 @@ mod tests {
     use super::*;
 
     /// Every revision of the global RPC, oldest first, with the digest of the
-    /// code of its two enums (`definition_digest`). A change to
-    /// `GlobalRequest` or `GlobalResponse` appends a row and sets
+    /// code of its two enums and its `Resources` payload. A change to any of
+    /// these appends a row and sets
     /// `GLOBAL_RPC_REVISION` to its revision.
-    const GLOBAL_RPC_REVISIONS: &[(u32, &str)] = &[
+    const GLOBAL_RPC_REVISIONS: &[(u32, &str, &str)] = &[
         // GlobalRequest::VirtualInotifyCookies and its response, the first
         // revision the fingerprint carries.
-        (1, "a61c88ecb1abcb5e"),
+        (1, "a61c88ecb1abcb5e", "9b7e11bf5f08e6ae"),
         // GlobalRequest::RegisterDescriptorDirectory and DescriptorDirectory and
         // their responses (package K slice F1).
-        (2, "caee2c37469869d4"),
+        (2, "caee2c37469869d4", "9b7e11bf5f08e6ae"),
         // GlobalRequest::RegisterPlaceholder, Placeholder, PlaceholderFlock,
         // PlaceholderWriteHint and PlaceholderCopies and their responses, in
         // place of F1's two (package K slice P1).
-        (3, "b3d7410a78b56ae0"),
+        (3, "b3d7410a78b56ae0", "9b7e11bf5f08e6ae"),
+        // Resources::priority_row extends the positional request payload.
+        (4, "b3d7410a78b56ae0", "4e10b2de93d47d64"),
     ];
 
-    /// The lines of code, without comments or blank lines, of the enum that
+    /// The lines of code, without comments or blank lines, of the type that
     /// `source` declares on the line `header`, through its closing brace.
     fn definition(source: &str, header: &str) -> Vec<String> {
         let mut lines = source.lines().skip_while(|line| *line != header);
@@ -115,26 +117,41 @@ mod tests {
         fnv_domains(&[(0, request.as_bytes()), (1, response.as_bytes())])
     }
 
-    /// The global RPC's revision names the enums as they are: a variant added,
-    /// removed, reordered or retyped changes the digest, and the test then
+    fn resources_definition_digest(source: &str) -> String {
+        let resources = definition(source, "pub struct Resources {").join("\n");
+        fnv_domains(&[(2, resources.as_bytes())])
+    }
+
+    /// The global RPC's revision names its enums and Resources as they are:
+    /// a variant or field added, removed, reordered or retyped changes the digest,
+    /// and the test then
     /// fails until a new revision is recorded, which changes the fingerprint
     /// every runtime compares with its coordinator's.
     #[test]
     fn the_global_rpc_revision_matches_its_definitions() {
         let source = include_str!("tool_global.rs");
         let digest = definition_digest(source);
+        let resources = include_str!("resources.rs");
+        let resources_digest = resources_definition_digest(resources);
         let revision = crate::tool_global::GLOBAL_RPC_REVISION;
-        let next = GLOBAL_RPC_REVISIONS.last().map_or(1, |(last, _)| last + 1);
+        let next = GLOBAL_RPC_REVISIONS
+            .last()
+            .map_or(1, |(last, _, _)| last + 1);
         assert_eq!(
             GLOBAL_RPC_REVISIONS.last(),
-            Some(&(revision, digest.as_str())),
-            "GlobalRequest or GlobalResponse changed (digest {digest}): append ({next}, \
-             \"{digest}\") to GLOBAL_RPC_REVISIONS and set GLOBAL_RPC_REVISION to {next}, so \
+            Some(&(revision, digest.as_str(), resources_digest.as_str())),
+            "GlobalRequest, GlobalResponse or Resources changed: append ({next}, \
+             \"{digest}\", \"{resources_digest}\") to GLOBAL_RPC_REVISIONS and set \
+             GLOBAL_RPC_REVISION to {next}, so \
              that runtimes and coordinators from either side of the change refuse each other"
         );
         for pair in GLOBAL_RPC_REVISIONS.windows(2) {
             assert_eq!(pair[1].0, pair[0].0 + 1, "revisions count up by one");
-            assert_ne!(pair[1].1, pair[0].1, "each revision changed the enums");
+            assert_ne!(
+                (pair[1].1, pair[1].2),
+                (pair[0].1, pair[0].2),
+                "each revision changed the wire definitions"
+            );
         }
 
         // What the digest sees, and what it does not.
@@ -159,6 +176,21 @@ mod tests {
         );
         assert_ne!(retyped, source);
         assert_ne!(definition_digest(&retyped), digest);
+
+        let documented = resources.replacen(
+            "pub struct Resources {\n",
+            "pub struct Resources {\n    /// Documentation only.\n\n",
+            1,
+        );
+        assert_ne!(documented, resources);
+        assert_eq!(resources_definition_digest(&documented), resources_digest);
+        let removed = resources.replacen("    pub(crate) priority_row: Option<u64>,\n", "", 1);
+        assert_ne!(removed, resources);
+        assert_ne!(resources_definition_digest(&removed), resources_digest);
+        let retyped =
+            resources.replacen("priority_row: Option<u64>", "priority_row: Option<u32>", 1);
+        assert_ne!(retyped, resources);
+        assert_ne!(resources_definition_digest(&retyped), resources_digest);
     }
 
     /// The published fingerprint is the configuration's extended with the
