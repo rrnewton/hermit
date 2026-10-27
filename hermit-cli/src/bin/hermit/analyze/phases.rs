@@ -3578,6 +3578,7 @@ impl AnalyzeOpts {
                 event_index: critical_indices[1],
                 stack: critical2,
             }),
+            branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event,
             racing_accesses: None,
             partial: Some(PartialReport {
@@ -3601,6 +3602,9 @@ impl AnalyzeOpts {
         println!(
             "\n------------------------- hermit analyze report (PARTIAL) -------------------------"
         );
+        if let Some(warning) = &self.branch_counter_warning {
+            println!("{warning}");
+        }
         println!("{header}");
         for (event, schedule) in [
             (&report.critical_event1, "passing"),
