@@ -101,9 +101,18 @@ fn shared_events(left: &[u64], right: &[u64]) -> usize {
 
 impl TimeSkipSources {
     /// Remember `record`. One that made no jump counts as much as one that
-    /// did: a trial that repeats it furthest makes no jump either.
+    /// did: a trial that repeats it furthest makes no jump either. Its format
+    /// counts below the instruction-offset format
+    /// (`detcore::preemptions::format_without_instruction_offsets`): that
+    /// format and the one below it share their timing rules, and a trial
+    /// whose schedule holds offsets states it again when it is written
+    /// (`PreemptionRecord::with_format`), so a recording with offsets and a
+    /// trial's record without them share one format here.
     pub fn remember(&mut self, record: &PreemptionRecord) {
-        self.formats.insert(record.format_version());
+        self.formats
+            .insert(detcore::preemptions::format_without_instruction_offsets(
+                record.format_version(),
+            ));
         let source = Source {
             prefix_hashes: prefix_hashes(record.schedevents()),
             skips: record.time_skips().unwrap_or_default().to_vec(),
@@ -116,7 +125,8 @@ impl TimeSkipSources {
     }
 
     /// The single timing format all sources share, or the current format
-    /// before any source is read. There is no proved conversion between
+    /// below the instruction-offset format before any source is read
+    /// (`remember`). There is no proved conversion between
     /// legacy, format 2 and format 3 charging rules, even when a selected
     /// prefix comes from just one of the sources.
     pub fn trial_format(&self) -> anyhow::Result<Option<u32>> {
@@ -129,11 +139,11 @@ impl TimeSkipSources {
                 .map(|format| format.unwrap_or(1))
                 .collect::<Vec<_>>()
         );
-        Ok(self
-            .formats
-            .first()
-            .copied()
-            .unwrap_or(Some(detcore::preemptions::PREEMPTION_RECORD_FORMAT)))
+        Ok(self.formats.first().copied().unwrap_or(
+            detcore::preemptions::format_without_instruction_offsets(Some(
+                detcore::preemptions::PREEMPTION_RECORD_FORMAT,
+            )),
+        ))
     }
 
     /// Admit all Chosen source metadata before a trial or endpoint shortcut.
