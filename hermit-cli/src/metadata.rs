@@ -837,7 +837,15 @@ impl RecordVersion {
 // --chaos --seed=N`), and replay follows it. An older reader would replay a
 // chaos recording under the default schedule and fall out of step, so it is
 // refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x187);
+// 0x187 -> 0x188 (provisional: 0x188 is HIGHEST_SHIPPED + 1 at this base; the
+// lander re-checks HIGHEST_SHIPPED + 1 at land): every /proc status file
+// Detcore renders now shows TracerPid 0, by any path to the task, where it
+// showed 1 on a task's own paths (/proc/self, /proc/thread-self). Detcore
+// renders the status file over the recorded procfs bytes during recording and
+// replay, so an older stream replayed under the new rendering would show the
+// guest 0 where it read 1, and a guest that branches on the value, as a death
+// test that looks for a debugger does, would diverge. It is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x188);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -862,7 +870,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x187);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x187;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x188;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

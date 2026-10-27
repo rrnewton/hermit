@@ -32689,10 +32689,13 @@ fn procfs_status_shows_no_tracer_on_any_path() {
 /// debugger (`tests/c/death_test_tracer_check.c`, googletest's "fast" style)
 /// dies of SIGABRT under Hermit, as it does natively. When the guest read
 /// `TracerPid: 1`, the assertion raised SIGTRAP to break into a debugger
-/// instead, and the ptrace backend did not deliver that signal. The child
-/// lived, and googletest's statement then waited, so the death test hung
-/// under plain and chaos runs alike. This guest's child reports that it lived
-/// and exits, so the old behavior fails here at once.
+/// instead. The ptrace backend used not to deliver a SIGTRAP a guest sends
+/// itself, so the child lived, and googletest's statement then waited: the
+/// death test hung under plain and chaos runs alike. This guest's child reports
+/// that it lived and exits, so that failure shows here at once. Now that the
+/// backend delivers the SIGTRAP, a child that reads `TracerPid: 1` dies of it
+/// (signal 5) instead of SIGABRT. Either way the output differs from the
+/// native one this test expects.
 #[test]
 fn a_death_test_that_looks_for_a_debugger_dies_as_it_does_natively() {
     let _lock = hermit_run_guard();
@@ -36800,7 +36803,7 @@ fn the_4505_signal_guests_get_past_their_handlers_under_record() {
     };
     let mut metadata: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&metadata_path).unwrap()).unwrap();
-    assert_eq!(metadata["version"], 0x187, "RECORD_VERSION moved");
+    assert_eq!(metadata["version"], 0x188, "RECORD_VERSION moved");
     metadata["version"] = serde_json::json!(0x17f);
     fs::write(&metadata_path, serde_json::to_string(&metadata).unwrap()).unwrap();
     let replay_args = ["replay", "--autopilot", "--data-dir", directory];
