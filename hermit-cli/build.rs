@@ -23,6 +23,18 @@
 #[path = "build_support.rs"]
 pub(crate) mod build_support;
 
+#[path = "compatibility_build.rs"]
+mod compatibility_build;
+
+#[path = "compatibility_graph.rs"]
+mod compatibility_graph;
+
+#[path = "compatibility_rustc.rs"]
+mod compatibility_rustc;
+
+#[path = "compatibility_source.rs"]
+mod compatibility_source;
+
 use build_support::build_date;
 use build_support::emit_git_revision;
 
@@ -59,6 +71,8 @@ fn main() {
     if registry_build {
         println!("cargo:rustc-cfg=hermit_registry_build");
     }
+
+    compatibility_build::emit(std::path::Path::new(&manifest_dir), registry_build);
 
     let date = build_date();
 

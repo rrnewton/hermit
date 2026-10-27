@@ -1179,6 +1179,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "sha1_smol",
  "sha2",
  "shell-words",
  "syn 2.0.119",

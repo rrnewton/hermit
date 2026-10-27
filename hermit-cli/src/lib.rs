@@ -36,6 +36,7 @@ pub mod build_info;
 pub mod canonical_verdict;
 pub mod chaos_timeslice;
 mod chroot;
+pub mod compatibility;
 use hermit_record_format::consts;
 pub mod logdiff_report;
 // TODO-HUMAN-REVIEW(PR-594): Review the public e9patch preprocessing API.
