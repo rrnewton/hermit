@@ -3124,6 +3124,7 @@ fn run() -> Result<(), String> {
             })();
             let series_result = if std::env::var_os("DEV_HERMIT_PARENT").is_some() {
                 emit_series(&results, execution_root, true)
+                    .and_then(|()| record_series_emitted(&results))
             } else {
                 Ok(())
             };
@@ -4175,6 +4176,22 @@ fn emit_series(results: &Path, checkout: &Path, fresh: bool) -> Result<(), Strin
 /// times at 300 s a run, each git call at 60 s, the spool lock at 5 s -- so
 /// one still running after half an hour is hung, not slow.
 const SERIES_APPEND_CELLS_BOUND: Duration = Duration::from_secs(30 * 60);
+
+/// The file a run writes into RESULTS once its own series emit has appended
+/// every cell result. The nightly sweep (dev-hermit
+/// ci-hub/series/pressure_schedule.py) emitted each part again after the run,
+/// and that second emit appended nothing but repeated the published-rows
+/// lookup, up to about 250 s a part on the night of 2026-10-26; it now emits
+/// again only when this file is absent.
+const SERIES_EMITTED_MARKER: &str = "series-emitted.json";
+
+/// Record that this run's series emit appended every cell result
+/// ([`SERIES_EMITTED_MARKER`]).
+fn record_series_emitted(results: &Path) -> Result<(), String> {
+    let marker = results.join(SERIES_EMITTED_MARKER);
+    fs::write(&marker, "{\"schema\":1,\"emitted_by\":\"run\"}\n")
+        .map_err(|e| format!("cannot write {}: {e}", marker.display()))
+}
 
 /// What [`emit_series_to`] did.
 struct SeriesEmission {
@@ -29237,6 +29254,20 @@ print("fixture " + args[0] + " accepted")
                 (argv, stdin)
             })
             .collect()
+    }
+
+    /// A run whose series emit appended every cell result says so in its
+    /// results, under the name the nightly sweep reads before it would emit
+    /// the part again.
+    #[test]
+    fn a_run_whose_series_emit_finished_records_it_in_its_results() {
+        let fixture = Fixture::new("series-emitted", WRITER);
+        let results = fixture.path("results");
+        record_series_emitted(&results).unwrap();
+        let marker: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(results.join("series-emitted.json")).unwrap())
+                .unwrap();
+        assert_eq!(marker, json!({"schema": 1, "emitted_by": "run"}));
     }
 
     /// `emit_series`, the call site that sends a run's cells and then its
