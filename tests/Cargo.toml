@@ -194,6 +194,61 @@ path = "rust/gvisor_tkill.rs"
 test = false
 
 [[bin]]
+name = "rustbin_gvisor_utimes"
+path = "rust/gvisor_utimes.rs"
+test = false
+
+[[bin]]
+name = "rustbin_gvisor_signalfd"
+path = "rust/gvisor_signalfd.rs"
+test = false
+
+[[bin]]
+name = "rustbin_gvisor_select"
+path = "rust/gvisor_select.rs"
+test = false
+
+[[bin]]
+name = "rustbin_gvisor_mknod"
+path = "rust/gvisor_mknod.rs"
+test = false
+
+[[bin]]
+name = "rustbin_gvisor_getdents"
+path = "rust/gvisor_getdents.rs"
+test = false
+
+[[bin]]
+name = "rustbin_gvisor_inotify"
+path = "rust/gvisor_inotify.rs"
+test = false
+
+[[bin]]
+name = "rustbin_gvisor_shm"
+path = "rust/gvisor_shm.rs"
+test = false
+
+[[bin]]
+name = "rustbin_gvisor_semaphore"
+path = "rust/gvisor_semaphore.rs"
+test = false
+
+[[bin]]
+name = "rustbin_gvisor_msgqueue"
+path = "rust/gvisor_msgqueue.rs"
+test = false
+
+[[bin]]
+name = "rustbin_gvisor_mq"
+path = "rust/gvisor_mq.rs"
+test = false
+
+[[bin]]
+name = "rustbin_gvisor_pidfd"
+path = "rust/gvisor_pidfd.rs"
+test = false
+
+[[bin]]
 name = "rustbin_thread_random"
 path = "rust/thread_random.rs"
 test = false
