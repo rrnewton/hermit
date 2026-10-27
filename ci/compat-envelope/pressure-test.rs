@@ -3123,7 +3123,7 @@ fn run() -> Result<(), String> {
                 Ok(())
             })();
             let series_result = if std::env::var_os("DEV_HERMIT_PARENT").is_some() {
-                emit_series(&results, execution_root, true)
+                emit_series(&results, execution_root, true, true)
             } else {
                 Ok(())
             };
@@ -3165,7 +3165,7 @@ fn run() -> Result<(), String> {
             if output.is_some() {
                 return Err("emit-series does not accept --output".into());
             }
-            emit_series(&results, &root, false)?;
+            emit_series(&results, &root, false, false)?;
         }
         "self-test" => {
             if args.next().is_some() {
@@ -4142,7 +4142,8 @@ fn collect_series_rows(
     Ok(collected)
 }
 
-fn emit_series(results: &Path, checkout: &Path, fresh: bool) -> Result<(), String> {
+/// [`publish_series`] into `DEV_HERMIT_PARENT`, which must be set.
+fn emit_series(results: &Path, checkout: &Path, fresh: bool, mark: bool) -> Result<(), String> {
     let parent = std::env::var("DEV_HERMIT_PARENT")
         .ok()
         .filter(|value| !value.is_empty())
@@ -4154,18 +4155,39 @@ fn emit_series(results: &Path, checkout: &Path, fresh: bool) -> Result<(), Strin
              Set it to the dev-hermit checkout root and re-run."
                 .to_string()
         })?;
-    let emission = emit_series_to(
+    publish_series(
         Path::new(&parent),
         results,
         checkout,
         fresh,
         SERIES_APPEND_CELLS_BOUND,
         parity::AppendBounds::default(),
-    );
+        mark,
+    )
+}
+
+/// Emit RESULTS' series into `parent` ([`emit_series_to`]) and print its lines.
+/// A cell append that failed is the error; a parity append that failed is not
+/// (parity decides nothing). With MARK, [`SERIES_EMITTED_MARKER`] is written
+/// only when everything owed was published: the cells appended and every
+/// parity row accepted.
+fn publish_series(
+    parent: &Path,
+    results: &Path,
+    checkout: &Path,
+    fresh: bool,
+    cells_bound: Duration,
+    bounds: parity::AppendBounds,
+    mark: bool,
+) -> Result<(), String> {
+    let emission = emit_series_to(parent, results, checkout, fresh, cells_bound, bounds);
     if let Some(line) = &emission.parity {
         eprintln!("pressure-test: {line}");
     }
     println!("{}", emission.cells?);
+    if mark && emission.parity_accepted {
+        record_series_emitted(results)?;
+    }
     Ok(())
 }
 
@@ -4176,6 +4198,25 @@ fn emit_series(results: &Path, checkout: &Path, fresh: bool) -> Result<(), Strin
 /// one still running after half an hour is hung, not slow.
 const SERIES_APPEND_CELLS_BOUND: Duration = Duration::from_secs(30 * 60);
 
+/// The file a run writes into RESULTS once its own series emit has published
+/// everything it owed: every cell result appended and every parity row
+/// accepted (a `--parity-all` series has only parity rows). A parity append
+/// that was refused, failed or was killed at its bound leaves no marker, so the
+/// nightly's post-run emit publishes again. The nightly sweep (dev-hermit
+/// ci-hub/series/pressure_schedule.py) emitted each part again after the run,
+/// and that second emit appended nothing but repeated the published-rows
+/// lookup, up to about 250 s a part on the night of 2026-10-26; it now emits
+/// again only when this file is absent.
+const SERIES_EMITTED_MARKER: &str = "series-emitted.json";
+
+/// Record that this run's series emit published everything it owed
+/// ([`SERIES_EMITTED_MARKER`]).
+fn record_series_emitted(results: &Path) -> Result<(), String> {
+    let marker = results.join(SERIES_EMITTED_MARKER);
+    fs::write(&marker, "{\"schema\":1,\"emitted_by\":\"run\"}\n")
+        .map_err(|e| format!("cannot write {}: {e}", marker.display()))
+}
+
 /// What [`emit_series_to`] did.
 struct SeriesEmission {
     /// The cells' `emitted ...` line, or why they were not all appended.
@@ -4184,6 +4225,9 @@ struct SeriesEmission {
     /// cells' writer was started, whatever became of it or of them. `None`
     /// when the emit stopped before that.
     parity: Option<String>,
+    /// Whether the parity append completed: the writer accepted every row, or
+    /// the series had no parity output to send. False when it did not run.
+    parity_accepted: bool,
 }
 
 /// [`emit_series`] into the dev-hermit checkout `parent`: the cells to
@@ -4206,7 +4250,7 @@ fn emit_series_to(
     cells_bound: Duration,
     bounds: parity::AppendBounds,
 ) -> SeriesEmission {
-    let mut parity_line = None;
+    let mut parity_outcome: Option<parity::LedgerAppendOutcome> = None;
     let cells = (|| {
         let metadata_path = results.join("run.json");
         let metadata: RunMetadata = serde_json::from_str(
@@ -4228,7 +4272,7 @@ fn emit_series_to(
                 ));
             }
             let run_id = series_run_id(&metadata, results)?;
-            parity_line = Some(append_series_parity(
+            parity_outcome = Some(append_series_parity(
                 &script,
                 parent,
                 results,
@@ -4302,7 +4346,7 @@ fn emit_series_to(
             .map_err(|e| format!("series append did not terminate readably: {e}"));
         // The series' parity rows go beside its cells whatever became of them:
         // parity is measured after determinism and never decides the emit.
-        parity_line = Some(append_series_parity(
+        parity_outcome = Some(append_series_parity(
             &script,
             parent,
             results,
@@ -4335,7 +4379,10 @@ fn emit_series_to(
     })();
     SeriesEmission {
         cells,
-        parity: parity_line,
+        parity_accepted: parity_outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.accepted),
+        parity: parity_outcome.map(|outcome| outcome.line),
     }
 }
 
@@ -4387,7 +4434,11 @@ fn append_series_parity(
     source_tree_dirty: bool,
     producer: parity::ParityProducer,
     bounds: parity::AppendBounds,
-) -> String {
+) -> parity::LedgerAppendOutcome {
+    let refused = |line: String| parity::LedgerAppendOutcome {
+        line,
+        accepted: false,
+    };
     let rows = match parity::node_ledger_sources(
         results,
         parity::PRESSURE_TEST_LEDGER_LANE,
@@ -4396,23 +4447,27 @@ fn append_series_parity(
     ) {
         Ok(rows) => rows,
         Err(error) => {
-            return format!(
+            return refused(format!(
                 "parity: ERROR: no parity rows appended; the post-pass outputs in {} were \
                  refused: {error}",
                 results.display()
-            );
+            ));
         }
     };
     if rows.is_empty() {
         if let Some(line) = unfinished_series_post_pass(results) {
-            return line;
+            return refused(line);
         }
-        return format!(
-            "parity: no parity post-pass output in {}; nothing appended",
-            results.display()
-        );
+        // Nothing to send is complete: no publication is owed.
+        return parity::LedgerAppendOutcome {
+            line: format!(
+                "parity: no parity post-pass output in {}; nothing appended",
+                results.display()
+            ),
+            accepted: true,
+        };
     }
-    parity::append_ledger_rows(
+    parity::append_ledger_rows_outcome(
         &parity::LedgerAppend {
             series: script,
             parent,
@@ -29028,6 +29083,10 @@ sys.exit(2)
         }
 
         fn append(&self) -> String {
+            self.append_outcome().line
+        }
+
+        fn append_outcome(&self) -> parity::LedgerAppendOutcome {
             append_series_parity(
                 &self.path("series.py"),
                 &self.path("parent"),
@@ -29192,6 +29251,12 @@ sys.exit(2)
     /// append it is sent in `calls.jsonl`; its append-cells exits
     /// `cells_exit`.
     fn recording_parent(root: &Path, cells_exit: u8) -> PathBuf {
+        recording_parent_with(root, cells_exit, 0)
+    }
+
+    /// A recording series writer whose append-cells exits CELLS_EXIT and whose
+    /// append-parity (after its `--help` probe) exits PARITY_EXIT.
+    fn recording_parent_with(root: &Path, cells_exit: u8, parity_exit: u8) -> PathBuf {
         let parent = root.join("parent");
         let series = parent.join("ci-hub/series");
         fs::create_dir_all(&series).unwrap();
@@ -29207,6 +29272,9 @@ with parent.joinpath("calls.jsonl").open("a") as calls:
     calls.write(json.dumps({{"argv": args, "stdin": sys.stdin.read()}}) + "\n")
 if args[0] == "append-cells" and {cells_exit}:
     sys.exit({cells_exit})
+if args[0] == "append-parity" and {parity_exit}:
+    print("fixture append-parity refused", file=sys.stderr)
+    sys.exit({parity_exit})
 print("fixture " + args[0] + " accepted")
 "#
             ),
@@ -29237,6 +29305,106 @@ print("fixture " + args[0] + " accepted")
                 (argv, stdin)
             })
             .collect()
+    }
+
+    /// The series-emitted marker is written only when everything the series
+    /// owed was published: its cells appended and every parity row accepted.
+    /// A refused parity append, including a `--parity-all` series' (whose
+    /// only output is parity rows), leaves no marker, so the nightly emits the
+    /// part again; a series with no parity output owes none.
+    #[test]
+    fn a_series_is_marked_published_only_when_cells_and_parity_were_accepted() {
+        // (label, append-cells exit, append-parity exit, parity-all, parity
+        // output present, publish_series succeeds, marker written)
+        for (label, cells_exit, parity_exit, parity_all, parity_output, ok, marked) in [
+            ("all-accepted", 0u8, 0u8, false, true, true, true),
+            ("parity-refused", 0, 1, false, true, true, false),
+            ("cells-refused", 1, 0, false, true, false, false),
+            ("parity-all-refused", 0, 1, true, true, true, false),
+            ("parity-all-accepted", 0, 0, true, true, true, true),
+            ("no-parity-output", 0, 1, false, false, true, true),
+        ] {
+            let fixture = Fixture::new(&format!("marker-{label}"), WRITER);
+            let parent = recording_parent_with(&fixture.root.path, cells_exit, parity_exit);
+            let results = fixture.path("results");
+            if !parity_output {
+                fs::remove_file(results.join(parity::PARITY_STATUS_JSON)).unwrap();
+                fs::remove_file(results.join(parity::PARITY_JSONL)).unwrap();
+            }
+            fs::write(
+                results.join("run.json"),
+                json!({
+                    "schema": RUN_SCHEMA, "run_id": RUN, "hermit_sha": TREE,
+                    "detcore_tree": "fixture-detcore-tree", "source_tree_dirty": false,
+                    "run_timeout_seconds": 60, "cells": [], "parity_all": parity_all,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let cell = results.join("cells/portable-aio-refusal-verify-kvm");
+            fs::create_dir_all(&cell).unwrap();
+            let row = json!({
+                "schema": CELL_RESULT_SCHEMA, "run_id": RUN, "hermit_sha": TREE,
+                "source_tree_dirty": false, "test": "c-programs/aio-refusal",
+                "category": "c-programs", "lane": "portable", "mode": "verify",
+                "backend": "kvm", "classification": "required", "outcome": "PASS",
+                "attempt": 1, "run_index": 0, "argv": ["fixture"], "guest_argv": ["fixture"],
+                "env": {}, "cwd": "/", "shell_command": "fixture", "attempts": [],
+                "artifact_dir": "/retained/1",
+            });
+            fs::write(cell.join("results.jsonl"), format!("{row}\n")).unwrap();
+            let published = publish_series(
+                &parent,
+                &results,
+                &fixture.path("checkout"),
+                false,
+                SERIES_APPEND_CELLS_BOUND,
+                parity::AppendBounds::default(),
+                true,
+            );
+            assert_eq!(published.is_ok(), ok, "{label}: {published:?}");
+            assert_eq!(
+                results.join(SERIES_EMITTED_MARKER).is_file(),
+                marked,
+                "{label}"
+            );
+            if marked {
+                let marker: serde_json::Value = serde_json::from_str(
+                    &fs::read_to_string(results.join(SERIES_EMITTED_MARKER)).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(marker, json!({"schema": 1, "emitted_by": "run"}), "{label}");
+            }
+        }
+    }
+
+    /// `emit-series`, the post-run command, never writes the marker.
+    #[test]
+    fn the_post_run_emit_never_writes_the_marker() {
+        let fixture = Fixture::new("marker-post-run", WRITER);
+        let parent = recording_parent(&fixture.root.path, 0);
+        let results = fixture.path("results");
+        fs::write(
+            results.join("run.json"),
+            json!({
+                "schema": RUN_SCHEMA, "run_id": RUN, "hermit_sha": TREE,
+                "detcore_tree": "fixture-detcore-tree", "source_tree_dirty": false,
+                "run_timeout_seconds": 60, "cells": [], "parity_all": true,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        publish_series(
+            &parent,
+            &results,
+            &fixture.path("checkout"),
+            false,
+            SERIES_APPEND_CELLS_BOUND,
+            parity::AppendBounds::default(),
+            false,
+        )
+        .unwrap();
+        assert!(!results.join(SERIES_EMITTED_MARKER).exists());
     }
 
     /// `emit_series`, the call site that sends a run's cells and then its
