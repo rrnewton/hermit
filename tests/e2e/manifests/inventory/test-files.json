@@ -926,6 +926,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/inotify_faults.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on ptrace, SaBRe, DBT, LiteInst and in-guest-trap; ci=true)",
+      "why": "tests/c/inotify_faults.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: the events a read or readv copies before it fails with EFAULT, with the buffer ending inside the next event's header, cookie or length, at a read-only page, or after more than 64 KiB of events, must carry the cookie another instance sees for their rename, as must the event a readv copies into a second iovec that faults and the events a readv returns before an overlapping second iovec that receives nothing, an IN_IGNORED event's cut zero cookie must stay zeros, and the cookie values must repeat in every run (https://github.com/rrnewton/hermit/issues/4793)"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/inotify_received_descriptor.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (verify on every backend; ci=true)",
       "why": "tests/c/inotify_received_descriptor.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: an inotify descriptor received over SCM_RIGHTS, in the process that sent it and in a forked child that holds it only by receiving it, must give each rename the cookie another instance gives it, with values that repeat in every run (https://github.com/rrnewton/hermit/issues/4765)"

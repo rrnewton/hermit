@@ -6273,7 +6273,9 @@ mod tests {
         // per candidate backend: 3020.
         // c-programs/inotify-received-descriptor (inotify descriptors received
         // over SCM_RIGHTS) adds one row per candidate backend: 3025.
-        assert_eq!(parsed.cells.len(), 3025);
+        // c-programs/inotify-faults (the events a read copies before it
+        // faults) adds one row per candidate backend: 3030.
+        assert_eq!(parsed.cells.len(), 3030);
         assert_eq!(parsed.schema, PARITY_CELLS_SCHEMA);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448
