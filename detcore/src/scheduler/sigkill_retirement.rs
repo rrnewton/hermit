@@ -607,19 +607,24 @@ impl Scheduler {
         }
     }
 
-    /// Whether a guest's SIGKILL owns `process`'s deaths: a reserved send
-    /// names one of its threads, or a committed one doomed it. Such a send
-    /// retires the process's threads at its kill turn, so a death it caused
-    /// is never a signal death to wait for at a deregistration
-    /// (`Scheduler::note_signal_killed_group`).
+    /// Whether a guest's reserved SIGKILL owns `process`'s deaths: a reserved
+    /// send names one of its threads. Such a send retires every thread it
+    /// names at its kill turn, so a death it caused, reported before that
+    /// turn, is never a signal death to wait for at a deregistration
+    /// (`Scheduler::note_signal_killed_group`); after the turn no thread of
+    /// the process is left to wait for.
+    ///
+    /// A committed send's record in `sigkilled_processes` does not count: a
+    /// send that could not be reserved (`SigkillRefusal`) is recorded there
+    /// after the physical send but retires nothing, and its victims' deaths
+    /// arrive at their deregistrations like any other signal death.
     pub(crate) fn sigkill_owns_process(&self, process: DetPid) -> bool {
-        self.sigkilled_processes.contains(&process)
-            || self.sigkill.reservations.values().any(|reservation| {
-                reservation
-                    .victims
-                    .iter()
-                    .any(|victim| victim.process == process)
-            })
+        self.sigkill.reservations.values().any(|reservation| {
+            reservation
+                .victims
+                .iter()
+                .any(|victim| victim.process == process)
+        })
     }
 
     /// Whether `process` is a victim of the SIGKILL being committed right now.

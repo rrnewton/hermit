@@ -6668,13 +6668,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 /// calls `do_exit(SIGSYS)`), so a SIGSYS death never makes the scheduler wait
 /// for the rest of the group (`Scheduler::note_signal_killed_group`). A
 /// death by a signal nix cannot name (`SignaledRaw`, a real-time signal) is a
-/// group exit too: no real-time signal is SIGSYS.
+/// group exit too: the test is on the signal's number, whichever form the
+/// status takes.
 fn signal_ends_thread_group(status: &ExitStatus) -> bool {
-    match status {
-        ExitStatus::Signaled(signal, _) => *signal != Signal::SIGSYS,
-        ExitStatus::SignaledRaw(..) => true,
-        ExitStatus::Exited(_) => false,
-    }
+    status
+        .signal()
+        .is_some_and(|signal| signal != Signal::SIGSYS as i32)
 }
 
 #[cfg(test)]
