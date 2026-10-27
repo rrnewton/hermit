@@ -1362,6 +1362,7 @@ mod tests {
                 .into_iter()
                 .chain(args.lines().filter(|arg| !arg.is_empty()))
                 .chain(["/bin/true"]);
+            println!();
             match <Cli as clap::Parser>::try_parse_from(argv) {
                 Ok(cli) => println!("cpu-profile={}", cli.start.cpu_profile.name()),
                 Err(error) => println!("refused: {:?}", error.kind()),
