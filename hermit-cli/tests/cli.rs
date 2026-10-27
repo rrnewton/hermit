@@ -10324,7 +10324,8 @@ fn no_namespace_completes_a_guest_set_tid_with_the_chosen_id() {
         stderr(&refused)
     );
     assert!(
-        stderr(&refused).contains("may not choose ID 5001 in Hermit's PID namespace (EPERM"),
+        stderr(&refused)
+            .contains("the rewrite with ID 5001 in Hermit's PID namespace failed with EPERM"),
         "{}",
         stderr(&refused)
     );
@@ -10381,17 +10382,27 @@ fn no_namespace_gives_a_new_pid_namespace_child_its_chosen_id() {
 
 /// A call that cannot carry a chosen ID is refused by an explicit base
 /// before its task exists, even where Linux would refuse it too: a raw clone
-/// with exit signal 65, which clone accepts and clone3 does not, and one with
-/// new stack pointer 1, which clone3 cannot express. A default run issues
-/// the first as made and reports its host ID. The other classes cannot arise
-/// from a guest: it cannot make a PID namespace for its children (Detcore
-/// refuses unshare and setns with EPERM) nor install a seccomp filter
-/// (Detcore refuses seccomp with ENOSYS).
+/// with exit signal 65, which clone accepts and clone3 does not; one with new
+/// stack pointer 1, which clone3 cannot express; and a fork by a task inside
+/// a PID namespace the guest made (a `CLONE_NEWPID` child), whose new task's
+/// ID in that namespace is the kernel's. A default run issues the first and
+/// the last as made and reports their host IDs. Such a child's own
+/// `set_tid`, two levels short of Hermit's namespace, is refused in both
+/// kinds of run by the refusal of `set_tid` in a nested namespace (#4155). A
+/// guest cannot reach the seccomp class, nor make a PID namespace for its
+/// children other than with `CLONE_NEWPID`: Detcore refuses seccomp with
+/// ENOSYS, and unshare and setns with EPERM.
 #[test]
 fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
-    for (call, reason) in [
-        ("signal65", "its exit signal 65 is not a signal number"),
-        ("sp1", "its new stack pointer 0x1 has no clone3 form"),
+    let newpid_child = "newpid child: own ID 1\n";
+    for (call, reason, before) in [
+        ("signal65", "its exit signal 65 is not a signal number", ""),
+        ("sp1", "its new stack pointer 0x1 has no clone3 form", ""),
+        (
+            "newpid-fork",
+            "its task is created 1 PID namespace(s) below Hermit's, in one the guest made",
+            newpid_child,
+        ),
     ] {
         let output = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &[call]);
         assert_eq!(
@@ -10406,17 +10417,41 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
             "{call}: {}",
             stderr(&output)
         );
-        assert!(stdout(&output).is_empty(), "{call}: {}", stdout(&output));
+        assert_eq!(stdout(&output), before, "{call}: {}", stderr(&output));
     }
-    let tolerant = no_namespace_in_own_pid_namespace(&["--summary"], &["signal65"]);
-    assert_success(&tolerant, &["signal65"]);
-    assert!(
-        stdout(&tolerant) == "clone signal65: created\n"
-            && stderr(&tolerant).contains("1 task(s) got a host ID instead"),
-        "stdout:\n{}\nstderr:\n{}",
-        stdout(&tolerant),
-        stderr(&tolerant)
-    );
+    for (call, expected) in [
+        ("signal65", "clone signal65: created\n".to_owned()),
+        (
+            "newpid-fork",
+            format!(
+                "{newpid_child}newpid child's clone3: created\nclone3 newpid-fork: child +1, exit 0\n"
+            ),
+        ),
+    ] {
+        let tolerant = no_namespace_in_own_pid_namespace(&["--summary"], &[call]);
+        assert_success(&tolerant, &[call]);
+        assert!(
+            stdout(&tolerant) == expected
+                && stderr(&tolerant).contains("1 task(s) got a host ID instead"),
+            "{call}: stdout:\n{}\nstderr:\n{}",
+            stdout(&tolerant),
+            stderr(&tolerant)
+        );
+    }
+    for base in ["--pid-base=5000", "--summary"] {
+        let output = no_namespace_in_own_pid_namespace(&[base], &["newpid-set-tid"]);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{base}: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains("issues/4155"),
+            "{base}: {}",
+            stderr(&output)
+        );
+    }
     for (call, expected) in [
         ("nested", "unshare: Operation not permitted\n"),
         ("seccomp", "seccomp: Function not implemented\n"),
