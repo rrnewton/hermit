@@ -30511,6 +30511,19 @@ fn liteinst_verify_with_forwarded_records_under(
     guest: &[&str],
     rust_log: Option<&str>,
 ) -> ForwardedVerify {
+    in_guest_verify_with_forwarded_records_on("liteinst", guest, rust_log, None)
+}
+
+/// [`liteinst_verify_with_forwarded_records_under`] on in-guest `backend`
+/// (`liteinst` or `in-guest-trap`), with Hermit, and so the guest, started
+/// under a soft `RLIMIT_NOFILE` of `soft_nofile` when one is given.
+#[cfg(feature = "liteinst")]
+fn in_guest_verify_with_forwarded_records_on(
+    backend: &str,
+    guest: &[&str],
+    rust_log: Option<&str>,
+    soft_nofile: Option<libc::rlim_t>,
+) -> ForwardedVerify {
     const FORWARDED: &str = "1970-01-01T00:00:00.000000Z INFO detcore";
 
     let logs = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -30519,7 +30532,7 @@ fn liteinst_verify_with_forwarded_records_under(
     let report_arg = report.to_str().expect("UTF-8 temporary path");
     let mut args = vec![
         "--backend",
-        "liteinst",
+        backend,
         "run",
         "--max-timeslice=disabled",
         "--verify",
@@ -30539,6 +30552,26 @@ fn liteinst_verify_with_forwarded_records_under(
         .stdin(Stdio::null());
     if let Some(filter) = rust_log {
         command.env("RUST_LOG", filter);
+    }
+    if let Some(soft) = soft_nofile {
+        // SAFETY: the closure makes only getrlimit and setrlimit calls, which
+        // are async-signal-safe, between fork and exec.
+        unsafe {
+            command.pre_exec(move || {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                limit.rlim_cur = soft;
+                if libc::setrlimit(libc::RLIMIT_NOFILE, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
     assert_success(&output, &args);
@@ -31528,6 +31561,87 @@ fn liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader() {
         liteinst_verify_with_forwarded_records(&["/usr/bin/python3", "-I", "-B", "-c", GUEST]);
     assert_eq!(run.stdout, "alive\n");
     assert!(run.syscall_records > 0);
+}
+
+/// A guest that dup2s onto every number where the in-guest runtime keeps its
+/// coordinator connection, performance counter and Tool output socket gets
+/// each number as on Linux, and the runtime goes on working afterwards on both
+/// in-guest backends: the coordinator answers the guest's calls and a fork
+/// child's, and Tool records are still forwarded, including those of calls
+/// made after every dup2. The runtime moves each of its descriptors off a
+/// number the guest takes rather than refuse the call.
+///
+/// Two limits: this host's own soft `RLIMIT_NOFILE`, where the runtime's
+/// descriptors sit at 1025 and up (the guest takes 1016 to 1040), and the
+/// common default of 1024, where they sit in the top 8 numbers below the limit
+/// and, once the guest takes those, move to lower free numbers (the guest
+/// takes 1000 to 1023). The guest checks that the kernel's limit is 1024 by
+/// the kernel's own answer, EBADF for a dup2 onto 1024: `getrlimit` cannot
+/// say, because Detcore answers it with its own virtual limits.
+///
+/// The counter is not observable here: with timeslices disabled, which these
+/// backends require, Detcore never reads it (`update_logical_time_rcbs`), and
+/// guest-visible time moves by scheduler turns alone (two clock reads back to
+/// back and two around a 200,000-iteration loop both differ by 5 ms). That a
+/// moved counter keeps counting is Reverie's unit test
+/// `a_guest_dup2_onto_the_counter_moves_it_and_it_keeps_counting`.
+#[test]
+#[cfg(feature = "liteinst")]
+fn in_guest_runtime_survives_a_guest_dup2_onto_each_of_its_descriptors() {
+    const GUEST: &str = "import errno, os, sys\n\
+        low, high, soft = (int(arg) for arg in sys.argv[1:])\n\
+        if soft:\n\
+        \x20   try:\n\
+        \x20       os.dup2(1, soft)\n\
+        \x20       raise SystemExit('dup2 at the soft limit succeeded')\n\
+        \x20   except OSError as error:\n\
+        \x20       assert error.errno == errno.EBADF, error\n\
+        for fd in range(low, high):\n\
+        \x20   assert os.dup2(1, fd) == fd, fd\n\
+        os.closerange(low, high)\n\
+        pid = os.fork()\n\
+        if pid == 0:\n\
+        \x20   os.getcwd()\n\
+        \x20   os._exit(7)\n\
+        _, status = os.waitpid(pid, 0)\n\
+        assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 7, status\n\
+        os.getcwd()\n\
+        print('alive', flush=True)\n";
+
+    let _lock = hermit_run_guard();
+    for (soft_nofile, low, high) in [(None, 1016, 1041), (Some(1024), 1000, 1024)] {
+        let [low_arg, high_arg, soft_arg] =
+            [low, high, soft_nofile.unwrap_or(0)].map(|value| value.to_string());
+        for backend in ["liteinst", "in-guest-trap"] {
+            let case = format!("{backend}, soft limit {soft_nofile:?}");
+            // -I -B: a writable bytecode cache would make the two runs differ.
+            let run = in_guest_verify_with_forwarded_records_on(
+                backend,
+                &[
+                    "/usr/bin/python3",
+                    "-I",
+                    "-B",
+                    "-c",
+                    GUEST,
+                    &low_arg,
+                    &high_arg,
+                    &soft_arg,
+                ],
+                None,
+                soft_nofile,
+            );
+            assert_eq!(run.stdout, "alive\n", "{case}");
+            let last = format!("inbound syscall: dup2(1, {})", high - 1);
+            let last_dup2 = run.golden_log.find(&last).unwrap_or_else(|| {
+                panic!("{case}: no record of the last dup2:\n{}", run.golden_log)
+            });
+            let after = &run.golden_log[last_dup2..];
+            assert!(
+                after.matches("inbound syscall: getcwd(").count() >= 2,
+                "{case}: the parent's and the fork child's getcwd after the dup2s were not forwarded:\n{after}"
+            );
+        }
+    }
 }
 
 /// A guest whose own shared library's constructor, which the loader runs
