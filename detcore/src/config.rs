@@ -113,6 +113,9 @@ mod tests {
         // Adds `GlobalRequest::CommitFatalDelivery`; removes `GlobalRequest::RecordFatalSignal`; adds `GlobalResponse::CommitFatalDelivery`; removes `GlobalResponse::RecordFatalSignal`
         // (https://github.com/rrnewton/hermit/pull/4676, renumbered to 12 at landing).
         (12, "ab01c6abb5daa6d7", "dafaa96d8b8cb3ad"),
+        // Resources::passes_descriptors_out, which revokes the scheduler's
+        // guest-held marks.
+        (7, "5a4ad14e74501e11", "306391a321e2ecbf"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that

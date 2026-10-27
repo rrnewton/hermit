@@ -4861,6 +4861,12 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) in_uncharged_bootstrap_syscall: bool,
 
+    /// Set when this thread may have passed descriptors over `SCM_RIGHTS` on
+    /// a socket that is not guest-held, until its next resource request
+    /// carries that to the scheduler (`Resources::passes_descriptors_out`).
+    #[serde(default)]
+    pub(crate) passed_descriptors_out_unreported: bool,
+
     /// Set by the syscall handler when a `FUTEX_WAKE` woke a waiter and
     /// [`Config::yields_after_futex_wake`] holds, so that the
     /// syscall's post-hook takes a yield turn. A logically killed waker gets
@@ -5790,6 +5796,7 @@ impl<T> ThreadState<T> {
             committed_clock_value: 0,
             uncharged_bootstrap_syscalls: 0,
             in_uncharged_bootstrap_syscall: false,
+            passed_descriptors_out_unreported: false,
             yield_after_futex_wake: false,
             pipe_handoff_due: None,
             own_signal_turn_hold: None,
@@ -6292,6 +6299,8 @@ impl<T> ThreadState<T> {
             reads_signalfd: false,
             read_fd: None,
             polls_guest_state_only: false,
+            relies_on_guest_held_marks: false,
+            passes_descriptors_out: false,
             waits_until_nothing_else_can_run: false,
             previous_attempt_made_progress: false,
             upgraded_from_attempt: 0,
@@ -6685,6 +6694,21 @@ impl<T> ThreadState<T> {
     /// over `SCM_RIGHTS` (`DetFd::set_exported`), for a message whose
     /// descriptors Detcore could not read.
     // TODO-HUMAN-REVIEW(PR-3908)
+    /// Whether a descriptor of this table other than `fd` names, through a
+    /// guest-held description (`DetFd::is_guest_held`), the object at host
+    /// device `dev` and inode `inode`: the same socket end, or either end of
+    /// the same pipe. Only descriptions whose host `fstat` Detcore keeps can
+    /// match.
+    pub(crate) fn names_guest_held_object(&self, fd: RawFd, dev: u64, inode: u64) -> bool {
+        self.metadata().file_handles.iter().any(|(&other, detfd)| {
+            other != fd
+                && detfd.is_guest_held()
+                && detfd
+                    .stat()
+                    .is_some_and(|stat| stat.dev == dev && stat.inode == inode)
+        })
+    }
+
     pub(crate) fn mark_accept_in_turn_listeners_exported(&self) {
         for detfd in self.metadata().file_handles.values() {
             if detfd.is_accept_in_turn_eligible() {

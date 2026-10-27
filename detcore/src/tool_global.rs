@@ -5883,6 +5883,8 @@ impl GlobalState {
                     reads_signalfd: false,
                     read_fd: None,
                     polls_guest_state_only: false,
+                    relies_on_guest_held_marks: false,
+                    passes_descriptors_out: false,
                     waits_until_nothing_else_can_run: false,
                     previous_attempt_made_progress: false,
                     upgraded_from_attempt: 0,
@@ -6889,7 +6891,7 @@ pub enum SignalScope {
 /// `Resources`: a change to another payload type defined elsewhere
 /// (`CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 12;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 7;
 
 /// This is public only so it can be used in the `GlobalTool` trait.
 /// It should NOT be used by any client outside of this file.
@@ -9143,6 +9145,11 @@ where
     // backend whose `is_backend_runtime_bootstrap` can return true ever sets it.
     r.backend_runtime_bootstrap |=
         guest.thread_state().in_uncharged_bootstrap_syscall && guest.is_backend_runtime_bootstrap();
+    // A descriptor this thread may have passed out of the guest reaches the
+    // scheduler with its next request, before it makes another decision
+    // (`Resources::passes_descriptors_out`).
+    r.passes_descriptors_out |=
+        std::mem::take(&mut guest.thread_state_mut().passed_descriptors_out_unreported);
     // Any turn of its own is a hand-off under `--pipe-wake-latency`: the
     // thread goes back behind the pollers it readied (`crate::pipe_wake`).
     guest.thread_state_mut().pipe_handoff_due = None;

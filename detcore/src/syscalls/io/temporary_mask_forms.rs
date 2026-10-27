@@ -1315,6 +1315,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut rsrc = Resources::new(guest.thread_state().dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("ppoll");
+        rsrc.relies_on_guest_held_marks = crate::syscalls::helpers::poll_targets_guest_held(
+            guest,
+            call.fds().map(|fds| fds.as_raw()),
+            call.nfds() as usize,
+        );
+        rsrc.polls_guest_state_only = rsrc.relies_on_guest_held_marks;
         rsrc.set_signal_interrupt_errno(Errno::EINTR);
         rsrc.blocked_signal_mask = Some(mask);
         // IR-23: the entry, before the expired-timerfd publication's RPC,

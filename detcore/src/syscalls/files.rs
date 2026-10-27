@@ -12690,6 +12690,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await?;
             self.add_fd(guest, fds[1], call.flags(), FdType::Pipe)
                 .await?;
+            // The guest holds both ends (`DetFd::is_guest_held`).
+            for fd in fds {
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_guest_held())?;
+            }
             if internally_nonblocking {
                 self.maybe_set_nonblocking_fd(guest, fds[0]);
                 self.maybe_set_nonblocking_fd(guest, fds[1]);
@@ -13169,10 +13175,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             // are physically nonblocking, which is the same condition as `call2`
             // above: under `debug_externalize_sockets` they stay external.
             if self.cfg.use_nonblocking_sockets() {
+                // The guest holds both ends of a stream or seqpacket pair
+                // (`DetFd::is_guest_held`). A datagram end is not marked: it can
+                // gain an address, from `bind` or autobind (`SO_PASSCRED`), and
+                // then receive from any process once its peer is gone.
+                let kind = call.r#type() & !(libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC);
+                let connection = kind == libc::SOCK_STREAM || kind == libc::SOCK_SEQPACKET;
                 for fd in fds {
-                    let _ = guest
-                        .thread_state()
-                        .with_detfd(fd, |detfd| detfd.set_socketpair_endpoint());
+                    let _ = guest.thread_state().with_detfd(fd, |detfd| {
+                        detfd.set_socketpair_endpoint();
+                        if connection {
+                            detfd.set_guest_held();
+                        }
+                    });
                 }
             }
             self.note_socketpair(guest, fds, call.family(), call.r#type());
@@ -13395,6 +13410,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let addr = call.umyaddr().ok_or(Errno::EFAULT)?;
         let sock_fd = call.fd();
+        // An address lets any process reach the socket, a host process
+        // included: a datagram socketpair end whose peer has gone accepts
+        // datagrams from anyone who names it, so it is no longer guest-held
+        // (`DetFd::is_guest_held`). Cleared whatever the bind returns.
+        let _ = guest.thread_state().with_detfd(sock_fd, |detfd| {
+            if detfd.is_guest_held() {
+                detfd.clear_guest_held();
+            }
+        });
         let open_file_id = guest
             .thread_state()
             .with_detfd(sock_fd, |detfd| detfd.open_file_id())?;
@@ -13615,6 +13639,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             FdType::Eventfd,
         )
         .await?;
+        // Only a holder of this descriptor can signal it (`DetFd::is_guest_held`).
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.set_guest_held())?;
         if internally_nonblocking {
             self.maybe_set_nonblocking_fd(guest, fd);
         }
@@ -14535,6 +14563,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             detfd.set_accepted_connection();
             detfd.set_error_queue_never_waits(error_queue_never_waits);
         })?;
+        self.classify_guest_held_peer(guest, fd).await;
 
         if physically_nonblocking {
             self.maybe_set_nonblocking_fd(guest, fd);

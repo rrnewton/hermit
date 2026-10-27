@@ -623,6 +623,18 @@ pub struct Resources {
     /// whose outcome a host can change.
     #[serde(default)]
     pub(crate) polls_guest_state_only: bool,
+    /// Set with `polls_guest_state_only` when that rests on guest-held marks
+    /// (`DetFd::is_guest_held`). Once a descriptor may have left the guest
+    /// (`passes_descriptors_out`), the scheduler no longer counts such a poll
+    /// as waiting on guest state only (`Scheduler::polls_only_guest_state`).
+    #[serde(default)]
+    pub(crate) relies_on_guest_held_marks: bool,
+    /// Set on a thread's first request after it may have passed descriptors
+    /// over `SCM_RIGHTS` on a socket that is not guest-held: to a process
+    /// outside Detcore's view, which could then make an object some guest
+    /// holds ready (`ThreadState::passed_descriptors_out_unreported`).
+    #[serde(default)]
+    pub(crate) passes_descriptors_out: bool,
     /// Set by a blocking FIFO open waiting for a guest peer. When this polling
     /// turn commits and nothing else can run (`Scheduler::nothing_else_can_run`),
     /// the answer is `ResumeStatus::NothingElseCanRun`, and the open then waits
@@ -803,6 +815,12 @@ impl fmt::Debug for Resources {
         if self.polls_guest_state_only {
             debug.field("polls_guest_state_only", &true);
         }
+        if self.relies_on_guest_held_marks {
+            debug.field("relies_on_guest_held_marks", &true);
+        }
+        if self.passes_descriptors_out {
+            debug.field("passes_descriptors_out", &true);
+        }
         if self.waits_until_nothing_else_can_run {
             debug.field("waits_until_nothing_else_can_run", &true);
         }
@@ -879,6 +897,8 @@ impl Resources {
             reads_signalfd: false,
             read_fd: None,
             polls_guest_state_only: false,
+            relies_on_guest_held_marks: false,
+            passes_descriptors_out: false,
             waits_until_nothing_else_can_run: false,
             previous_attempt_made_progress: false,
             upgraded_from_attempt: 0,
@@ -948,6 +968,8 @@ impl Resources {
         self.private_sigchld_decides |= other.private_sigchld_decides;
         self.replay_served_from_log |= other.replay_served_from_log;
         self.polls_guest_state_only |= other.polls_guest_state_only;
+        self.relies_on_guest_held_marks |= other.relies_on_guest_held_marks;
+        self.passes_descriptors_out |= other.passes_descriptors_out;
         self.waits_until_nothing_else_can_run |= other.waits_until_nothing_else_can_run;
         // A combined operation is a zero-length sleep only if both parts are.
         self.zero_length_sleep &= other.zero_length_sleep;
