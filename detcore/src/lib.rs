@@ -3492,6 +3492,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Sysno::inotify_init1,
                 Sysno::inotify_add_watch,
                 Sysno::inotify_rm_watch,
+                // Inotify fault recovery leaves a faulted read's bytes alone
+                // once the address space has used protection keys, which it
+                // learns only from these two calls
+                // (`MemoryMetadata::protection_keys`). Both still pass through.
+                Sysno::pkey_alloc,
+                Sysno::pkey_mprotect,
                 Sysno::memfd_create,
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(PR-862): Keep modeled pidfd creation intercepted.
@@ -6271,6 +6277,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 self.observe_sigreturn_mask(guest).await;
                 self.passthrough(guest, call).await
             }
+            // An address space that allocates or applies a protection key may
+            // hold pages its guest cannot write although Hermit's copies can
+            // (`MemoryMetadata::protection_keys`).
+            SyscallClassification::PassThrough
+                if matches!(call.number(), Sysno::pkey_alloc | Sysno::pkey_mprotect) =>
+            {
+                guest.thread_state().note_protection_keys();
+                self.passthrough(guest, call).await
+            }
             SyscallClassification::PassThrough => self.passthrough(guest, call).await,
             // The kernel's restart of a wait Detcore emulates resumes it; any other
             // `restart_syscall` keeps the unsupported-syscall policy below.
@@ -6747,6 +6762,26 @@ mod subscription_tests {
                 .any(|sysno| sysno == Sysno::chdir),
             "chdir is PassThrough and must remain outside the partial subscription"
         );
+    }
+
+    /// Inotify fault recovery decides from these two calls whether the
+    /// address space has used protection keys
+    /// (`MemoryMetadata::protection_keys`). Under `--passthru-opt` a
+    /// PassThrough call is otherwise never seen, and recovery would rewrite
+    /// bytes a protection key kept Linux from copying.
+    #[test]
+    fn passthru_opt_intercepts_the_protection_key_calls() {
+        let subscriptions = <Detcore as Tool>::subscriptions(&strict_config(true));
+        for syscall in [Sysno::pkey_alloc, Sysno::pkey_mprotect] {
+            assert_eq!(
+                syscall_classification::classify_syscall(syscall),
+                syscall_classification::SyscallClassification::PassThrough
+            );
+            assert!(
+                subscriptions.iter_syscalls().any(|sysno| sysno == syscall),
+                "passthru_opt let {syscall} bypass Detcore's protection-key record"
+            );
+        }
     }
 
     /// Io-buffer hashing can only hash a syscall Detcore is subscribed to.

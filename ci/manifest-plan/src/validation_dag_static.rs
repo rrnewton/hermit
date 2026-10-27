@@ -3033,7 +3033,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And A5 slice 3c.1e B's unit: threads' disposition_mask_tests::
     // a_gated_managed_wait_reads_the_guest_mask_without_replacing_it: 2682,
     // listed.
-    ("test.detcore_unit", 2682),
+    // And syscalls::inotify's nine units for a read that faults (the cookies
+    // found depend only on where the copy ended, only a rename cookie is cut,
+    // a cookie before the fault is whole, the copy ends at the first page the
+    // guest cannot write, the events found account for the bytes the queue
+    // lost, rewrites leave no host cookie byte, the bytes taken past a count,
+    // the probe stays within the bytes taken, and an unreadable page ends the
+    // copy only where the count proves it): 2691, listed.
+    // And passthru_opt_intercepts_the_protection_key_calls (the inotify
+    // fault path's protection-key record under --passthru-opt): 2692, listed.
+    ("test.detcore_unit", 2692),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3133,7 +3142,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // unrecorded_passed_on_descriptor_misses_no_entry,
     // unrecorded_passed_on_descriptor_follows_repeated_seeks,
     // negative_count_on_unrecorded_received_descriptors): 163.
-    ("test.detcore_misc", 163),
+    // And tight_stack_received_inotify's test that an inotify descriptor
+    // received and read on a tight stack is recorded and renumbered: 164.
+    ("test.detcore_misc", 164),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -4894,7 +4905,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same twenty D4c-1 proc_stat_lifecycle tests: 157.
     // And the same two A+ tests: 159.
     // And the same four F0a readdir_order variants: 163.
-    ("test.detcore_misc_on_host", 163),
+    // And the same tight-stack received-inotify test: 164.
+    ("test.detcore_misc_on_host", 164),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -5281,7 +5293,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five shared runtime-FD readlink regressions: 2667, listed.
     // Fixed 0.5.4 rebase recount also retains the priority-history regressions.
     // And the same 3c.1e B unit: 2682, listed.
-    ("test.detcore_unit_on_host", 2682),
+    // And the same nine units for a read that faults: 2691, listed.
+    // And the same protection-key subscription unit: 2692, listed.
+    ("test.detcore_unit_on_host", 2692),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
