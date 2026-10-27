@@ -956,7 +956,6 @@ replay_case!(
     Mode::TraceReplayChaos
 );
 replay_case!(
-    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
     chaos_replay_nanosleep_par,
     "nanosleep-par",
     None,
@@ -994,7 +993,6 @@ replay_case!(
     Mode::TraceReplayChaos
 );
 replay_case!(
-    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
     chaos_replay_ppoll_simulation,
     "ppoll_simulation",
     None,
@@ -1705,7 +1703,6 @@ replay_case!(
     Mode::TraceReplayChaos
 );
 replay_case!(
-    #[ignore = "replayed schedule diverges from its recording at a scheduler-turn time advance; https://github.com/rrnewton/hermit/issues/4399"]
     chaos_replay_writev_determinism,
     "writev_determinism",
     None,
