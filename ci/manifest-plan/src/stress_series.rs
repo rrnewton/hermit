@@ -1713,9 +1713,13 @@ impl SeriesRow {
                                     "failed_match detail contradicts a matched comparison: {why}"
                                 ));
                             }
-                            if mode != "verify" {
+                            // A replay cell inherits its verify recipe's
+                            // declarations (runner::expectation_recipe), so
+                            // it declares expected output exactly as verify
+                            // does.
+                            if !matches!(mode, "verify" | "replay") {
                                 return Err(
-                                    "failed_match detail names a declared expected output, which only a verify cell has"
+                                    "failed_match detail names a declared expected output, which only a verify or replay cell has"
                                         .into(),
                                 );
                             }
@@ -3241,8 +3245,17 @@ mod tests {
             row.validate_for_read()
                 .unwrap_or_else(|error| panic!("{label}: read: {error}"));
         }
+        // A replay cell inherits its verify recipe's declared stdout
+        // (runner::expectation_recipe), so its failed match is admitted
+        // exactly as a verify cell's is.
         let mut replay_detail = with_detail(&exact, Some(0));
         replay_detail.series.cell = "fixture/test/replay/ptrace".into();
+        replay_detail
+            .validate_for_write()
+            .unwrap_or_else(|error| panic!("replay declared stdout: {error}"));
+        replay_detail
+            .validate_for_read()
+            .unwrap_or_else(|error| panic!("replay declared stdout: read: {error}"));
         let mut not_run_detail = no_verdict_row();
         attempt(&mut not_run_detail).detail = Some(exact.clone());
         for (label, row, expected) in [
@@ -3293,11 +3306,6 @@ mod tests {
                     Some(0),
                 ),
                 "contradicts a matched comparison: the runner finds an empty declared text",
-            ),
-            (
-                "a replay cell",
-                replay_detail,
-                "which only a verify cell has",
             ),
             (
                 "another kind",

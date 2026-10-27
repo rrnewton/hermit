@@ -2506,7 +2506,8 @@ impl ResultRow {
     ///
     /// `check_expected_stdout` and `check_expected_stdout_contains` in
     /// ci/manifest-plan/src/runner.rs fail a matched verify attempt whose two
-    /// runs agree on other bytes than the cell declares, and record why only
+    /// runs agree on other bytes than the cell declares (a replay cell
+    /// inherits the declaration), and record why only
     /// in the attempt's reason. `Ok(None)`: the reason is not one of those
     /// texts. `Ok(Some)`: it is, and the attempt's evidence bears it out, so
     /// the attempt is that red and the record says what it failed. `Err`: the
@@ -2537,9 +2538,12 @@ impl ResultRow {
                 index + 1
             )
         };
-        if self.mode != "verify" {
+        // A replay cell inherits its verify recipe's declarations
+        // (runner::expectation_recipe), so it declares expected stdout
+        // exactly as verify does.
+        if !matches!(self.mode.as_str(), "verify" | "replay") {
             return Err(contradiction(&format!(
-                "only a verify cell declares expected stdout, and this is a {} cell",
+                "only a verify or replay cell declares expected stdout, and this is a {} cell",
                 self.mode
             )));
         }
@@ -13848,7 +13852,7 @@ fn binding_matches_event(binding: &ComparisonAttemptBinding, row: &SeriesRow) ->
 }
 
 /// Refuse a stored [`ExpectedOutputFailure`] the validate fold could not have
-/// written: one outside a validate observation of a verify cell, on an attempt
+/// written: one outside a validate observation of a verify or replay cell, on an attempt
 /// the runner did not FAIL without a timeout, under an invocation whose result
 /// is a pass or a divergence, or one the runner's reason could not state.
 fn validate_expected_output_failures(tracked: &TrackedCells) -> Result<(), String> {
@@ -13859,8 +13863,8 @@ fn validate_expected_output_failures(tracked: &TrackedCells) -> Result<(), Strin
                     let Some(failure) = &attempt.expected_output_failure else {
                         continue;
                     };
-                    let why = if cell.id.mode != "verify" {
-                        Some("only a verify cell declares expected output")
+                    let why = if !matches!(cell.id.mode.as_str(), "verify" | "replay") {
+                        Some("only a verify or replay cell declares expected output")
                     } else if observation.provenance != ObservationProvenance::Validate {
                         Some("only a validate observation verifies one")
                     } else if attempt.outcome != "FAIL" || attempt.timed_out {
@@ -37340,6 +37344,70 @@ mod post_verdict_transaction_tests {
                 declared_text: String::new(),
             });
         });
+    }
+
+    /// A replay cell inherits its verify recipe's declared stdout
+    /// (runner::expectation_recipe), so the runner's red for a failed
+    /// expectation on a replay attempt is retained exactly as on verify.
+    #[test]
+    fn a_replay_failed_stdout_expectation_is_retained_red() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (mut id, declared) = declared_exit_row(&measured);
+        id.mode = "replay".into();
+        let mut replay = with_matched_exit(&declared, 0);
+        replay
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_guest_exit");
+        replay["mode"] = "replay".into();
+        // A replay comparison leaves time real, and its declared exit is
+        // admitted by the record-start invocation compared with
+        // --verify-allow=both (runner::invocation_admits_declared_guest_exit).
+        let argv = vec![
+            "hermit-verify-pair",
+            "hermit",
+            "log-diff",
+            "--verify-allow=both",
+            "hermit",
+            "record",
+            "start",
+            "--",
+            "fixture",
+        ];
+        replay["argv"] = serde_json::json!(argv);
+        replay["attempts"][0]["argv"] = serde_json::json!(argv);
+        let shell_command = literal_shell_command(
+            "/repo",
+            &BTreeMap::from([("LC_ALL".into(), "C".into())]),
+            &argv.iter().map(|arg| (*arg).into()).collect::<Vec<_>>(),
+        );
+        replay["shell_command"] = shell_command.clone().into();
+        replay["attempts"][0]["shell_command"] = shell_command.into();
+        replay["effective_args"] = serde_json::json!(&argv[1..]);
+        let mut report: JsonValue =
+            serde_json::from_str(replay["attempts"][0]["verification_report"].as_str().unwrap())
+                .unwrap();
+        report["comparison"]["virtualize_time"] = false.into();
+        let report = serde_json::to_string(&report).unwrap();
+        replay["attempts"][0]["verification_report_sha256"] =
+            format!("{:x}", Sha256::digest(report.as_bytes())).into();
+        replay["attempts"][0]["verification_report"] = report.into();
+        let observed = "getrandom[0] 918fdb56\n";
+        let expected = "getrandom[0] a29a84d6\n";
+        let replay = with_captured_stdout(&replay, observed);
+        let exact = expected_stdout_reason("first", observed, expected);
+        let failed = expected_output_failure(&replay, &exact);
+        fixture.publish_rows(&[failed]);
+        let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+        match candidates[&id][0].evidence(&id, ResultInput::Current) {
+            Ok(ValidateRowEvidence::ExpectedOutputFailed { reason, result, .. }) => {
+                assert!(reason.contains("failed its declared expected output"), "{reason}");
+                assert_eq!(result, Some(ObservedResult::CrashError));
+            }
+            other => panic!("replay failed expectation was not retained: {other:?}"),
+        }
     }
 
     /// Only the runner's own expected-output red is retained. A FAIL whose
