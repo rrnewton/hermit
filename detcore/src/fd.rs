@@ -219,8 +219,9 @@ struct SocketRights {
     /// `socket` or `accept` made it; `None` for one Detcore did not see made.
     unix_type: Option<i32>,
     /// The name a `bind` gave it (`crate::syscalls::scm_rights::unix_socket_name`),
-    /// by which a listener's connections are found.
-    unix_name: Option<Box<[u8]>>,
+    /// and which bind of that name it was, by which a listener's connections
+    /// are found (`crate::syscalls::scm_rights::UnixConnections`).
+    unix_name: Option<(Box<[u8]>, u64)>,
     /// The socket at the other end, which this one's messages reach.
     peer: Option<OpenFileHandle>,
     /// Whether the pair is `SOCK_STREAM`, where a send of no bytes carries
@@ -2095,15 +2096,43 @@ impl DetFd {
         self.with_description(|d| d.rights.unix_type)
     }
 
-    /// Record the name a `bind` gave this `AF_UNIX` socket.
-    pub(crate) fn set_unix_name(&self, name: Box<[u8]>) {
-        self.with_description(|d| d.rights.unix_name = Some(name));
+    /// Record the name a `bind` gave this `AF_UNIX` socket, and which bind
+    /// of that name it was (`generation`).
+    pub(crate) fn set_unix_name(&self, name: Box<[u8]>, generation: u64) {
+        self.with_description(|d| d.rights.unix_name = Some((name, generation)));
     }
 
-    /// The name a `bind` gave this `AF_UNIX` socket, and its type, if
-    /// Detcore knows both.
-    pub(crate) fn unix_name_and_type(&self) -> Option<(Box<[u8]>, i32)> {
-        self.with_description(|d| d.rights.unix_name.clone().zip(d.rights.unix_type))
+    /// The name a `bind` gave this `AF_UNIX` socket, which bind of that name
+    /// it was, and the socket's type, if Detcore knows all three.
+    pub(crate) fn unix_name_and_type(&self) -> Option<(Box<[u8]>, u64, i32)> {
+        self.with_description(|d| {
+            let (name, generation) = d.rights.unix_name.clone()?;
+            Some((name, generation, d.rights.unix_type?))
+        })
+    }
+
+    /// This datagram socket's messages no longer reach the peer Detcore
+    /// paired it with: a `connect` gave it another peer, or none
+    /// (`unix_dgram_connect`). Neither socket is the other's peer any more,
+    /// so no send through either queues on the other; this socket's queue is
+    /// forgotten, as Linux purges its receive queue when its peer changes
+    /// (`unix_dgram_disconnected`); and neither queue follows its socket's
+    /// messages one for one any more (`SocketRights::lockstep_lost`), since
+    /// the old peer can still name this socket, and this socket the old peer.
+    /// A connect to the socket that already is its peer changes nothing in
+    /// Linux; Detcore forgets the queue then too, which costs only joins.
+    pub(crate) fn unpair_rights_peer(&self) {
+        let peer = self.with_description(|d| {
+            d.rights.queued.clear();
+            d.rights.lockstep_lost = true;
+            d.rights.peer.take()
+        });
+        if let Some(peer) = peer {
+            peer.with_description(|d| {
+                d.rights.peer = None;
+                d.rights.lockstep_lost = true;
+            });
+        }
     }
 
     /// Whether this socket has a peer Detcore knows (`pair_sockets`,

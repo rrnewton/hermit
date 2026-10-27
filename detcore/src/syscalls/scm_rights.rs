@@ -77,16 +77,41 @@
 //! The receiving socket is known only where Detcore knows a socket's peer,
 //! in any process that holds it and through any of its aliases: the two
 //! sockets of a `socketpair`, and an `AF_UNIX` stream or seqpacket connection
-//! and the socket whose `connect` made it. Linux queues connections on a
-//! listener in the order they are made and `accept` takes the oldest
-//! (`unix_stream_connect`), so Detcore queues each guest's connection to a
-//! name a guest bound, abstract or an absolute path, where the `connect`
-//! completed in the caller's turn, and pairs the oldest with the socket an
-//! `accept` on that listener returns, also in its turn
-//! ([`Detcore::note_unix_accept`]). A connect or accept on the name outside
-//! the turn leaves its order unknown until the name is bound again; a
-//! connection made from outside Hermit, or through another spelling of a
-//! path, is not seen and shifts the pairing of those queued after it.
+//! and the socket whose `connect` made it. Linux queues each connection on
+//! the listener's receive queue at the tail (`unix_stream_connect`,
+//! `__skb_queue_tail(&other->sk_receive_queue, skb)`,
+//! <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/unix/af_unix.c?h=v6.9#n1641>)
+//! and `accept` takes it from the head (`unix_accept`, `skb_recv_datagram`,
+//! <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/unix/af_unix.c?h=v6.9#n1711>),
+//! so Detcore queues each guest's connection to a name a guest bound,
+//! abstract or an absolute path, where the `connect` completed in the
+//! caller's turn, and pairs the oldest with the socket an `accept` on that
+//! listener returns, also in its turn ([`Detcore::note_unix_accept`]).
+//!
+//! That needs every connection a listener gets. So a connect or accept on
+//! the name outside the turn leaves its order unknown until the name is
+//! bound again, and so does any `AF_UNIX` stream connect Detcore cannot
+//! attribute to one bound name, for every name: one through a relative path
+//! or another spelling of a path, to a name no guest bound here, or of a
+//! socket whose type Detcore did not see made ([`UnixConnections`]). A
+//! listener bound before its path was unlinked and bound again pairs
+//! nothing: the connections Detcore tracks for the name are the later
+//! listener's. A connection made from outside Hermit is not seen at all, and
+//! shifts the pairing of those queued after it.
+//!
+//! A `socketpair` datagram socket reaches its peer only while it stays
+//! connected to it and names no other destination. A `connect` gives it
+//! another peer, or none, and Linux then purges its receive queue
+//! (`unix_dgram_connect`, `unix_dgram_disconnected`,
+//! <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/unix/af_unix.c?h=v6.9#n1414>),
+//! so Detcore unpairs the two and neither queue is in lockstep any more
+//! (`DetFd::unpair_rights_peer`). A send that names its destination
+//! (`msg_namelen`, `unix_dgram_sendmsg`,
+//! <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/unix/af_unix.c?h=v6.9#n1980>)
+//! queues nothing, and its peer's queue is no longer in lockstep, since the
+//! named socket may be the peer itself. A seqpacket send ignores the name
+//! (`unix_seqpacket_sendmsg`) and a stream send with one fails
+//! (`unix_stream_sendmsg`).
 //!
 //! A descriptor received any other way is a description of its own in
 //! Detcore's model, as before: through any other socket (a datagram socket
@@ -104,7 +129,9 @@
 //! anonymous inode received through it joins anything
 //! (`DetFd::take_queued_rights`). That is from the first message sent to it
 //! that was not queued (unreadable control data, facts that could not be
-//! taken, a send outside the turn, more than 4096 waiting), or the first
+//! taken, a send outside the turn, a datagram send that named its
+//! destination, more than 4096 waiting), a `connect` of a datagram socket of
+//! the pair, or the first
 //! call that took a message from it Detcore could not match while some were
 //! queued: a `read`, `readv` or `recvfrom`, a receive that released
 //! descriptors (`MSG_CTRUNC` with none installed), one outside the turn or
@@ -387,8 +414,10 @@ pub(crate) struct DeliveredMessage {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SentRights {
     /// For each message Linux reports sending that carried descriptors: the
-    /// descriptors, in order, and the bytes it sent.
-    pub(crate) messages: Vec<(Vec<RawFd>, usize)>,
+    /// descriptors, in order, the bytes it sent, and whether it named its
+    /// destination (a nonzero `msg_namelen`), which a datagram socket's send
+    /// reaches instead of its peer (`unix_dgram_sendmsg`).
+    pub(crate) messages: Vec<(Vec<RawFd>, usize, bool)>,
     /// Whether a message Linux reports sending could not be read in full, so
     /// that what it carried is unknown.
     pub(crate) unread: bool,
@@ -404,34 +433,68 @@ pub(crate) struct ReceivedFrom {
     pub(crate) peek: bool,
 }
 
-/// The name an `AF_UNIX` address names a socket by, read from guest memory
-/// at `address` (`length` bytes): an abstract name's bytes after
-/// `sun_family`, its leading NUL included, which Linux compares whole
-/// (`unix_find_abstract`), or an absolute path up to its first NUL. `None` for
-/// another family, an unnamed or unreadable address, or a relative path,
-/// which names a different file from each working directory.
+/// What an address a guest passed names, for `AF_UNIX` pairing
+/// ([`unix_address`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum UnixAddress {
+    /// Not an `AF_UNIX` address (its family is another, or it is too short
+    /// to have one).
+    Other,
+    /// An `AF_UNIX` name Detcore can compare: an abstract name's bytes after
+    /// `sun_family`, its leading NUL included, which Linux compares whole
+    /// (`unix_find_abstract`), or an absolute path up to its first NUL.
+    Named(Box<[u8]>),
+    /// An `AF_UNIX` address whose socket Detcore cannot name: a relative
+    /// path, which names a different file from each working directory, an
+    /// unnamed address, or one it could not read (a `connect` or `bind`
+    /// through an unreadable address fails with `EFAULT`, so only a call
+    /// that succeeded is ever attributed).
+    Unnamed,
+}
+
+/// What the address at `address` in guest memory (`length` bytes) names
+/// ([`UnixAddress`]).
+pub(crate) fn unix_address<M: MemoryAccess>(
+    memory: &M,
+    address: usize,
+    length: usize,
+) -> UnixAddress {
+    const PATH: usize = std::mem::offset_of!(libc::sockaddr_un, sun_path);
+    let length = length.min(size_of::<libc::sockaddr_un>());
+    if length < size_of::<libc::sa_family_t>() {
+        return UnixAddress::Other;
+    }
+    let mut bytes = vec![0u8; length];
+    let read = Addr::<u8>::from_raw(address)
+        .is_some_and(|address| memory.read_exact(address, &mut bytes).is_ok());
+    if !read {
+        return UnixAddress::Unnamed;
+    }
+    if u16::from_ne_bytes([bytes[0], bytes[1]]) != libc::AF_UNIX as u16 {
+        return UnixAddress::Other;
+    }
+    let path = bytes.get(PATH..).unwrap_or_default();
+    match path.first() {
+        Some(0) => UnixAddress::Named(path.into()),
+        Some(b'/') => path
+            .split(|&byte| byte == 0)
+            .next()
+            .map_or(UnixAddress::Unnamed, |path| UnixAddress::Named(path.into())),
+        _ => UnixAddress::Unnamed,
+    }
+}
+
+/// The name an `AF_UNIX` address names a socket by ([`UnixAddress::Named`]),
+/// read from guest memory at `address` (`length` bytes). `None` for another
+/// family, an unnamed or unreadable address, or a relative path.
 pub(crate) fn unix_socket_name<M: MemoryAccess>(
     memory: &M,
     address: usize,
     length: usize,
 ) -> Option<Box<[u8]>> {
-    const PATH: usize = std::mem::offset_of!(libc::sockaddr_un, sun_path);
-    let length = length.min(size_of::<libc::sockaddr_un>());
-    if length <= PATH {
-        return None;
-    }
-    let mut bytes = vec![0u8; length];
-    memory
-        .read_exact(Addr::<u8>::from_raw(address)?, &mut bytes)
-        .ok()?;
-    if u16::from_ne_bytes([bytes[0], bytes[1]]) != libc::AF_UNIX as u16 {
-        return None;
-    }
-    let path = &bytes[PATH..];
-    match path.first() {
-        Some(0) => Some(path.into()),
-        Some(b'/') => path.split(|&byte| byte == 0).next().map(Into::into),
-        _ => None,
+    match unix_address(memory, address, length) {
+        UnixAddress::Named(name) => Some(name),
+        UnixAddress::Other | UnixAddress::Unnamed => None,
     }
 }
 
@@ -443,14 +506,26 @@ const MAX_PENDING_CONNECTIONS: usize = 4096;
 /// ([`UnixConnections`]).
 #[derive(Default)]
 struct PendingConnections {
+    /// Which bind of the name this is: a listener bound before the name was
+    /// unlinked and bound again keeps the earlier one, and its accepts take
+    /// connections Detcore no longer tracks.
+    generation: u64,
     /// The connecting sockets' descriptions, oldest first, as Linux queues
-    /// the connections on the listener for `accept` to take
-    /// (`unix_stream_connect`).
+    /// the connections on the listener for `accept` to take: at the tail
+    /// (`unix_stream_connect`), from the head (`unix_accept`).
     sockets: VecDeque<OpenFileHandle>,
     /// A `connect` or `accept` on the name completed outside its caller's
-    /// turn, or too many connections waited: which connection an `accept`
-    /// takes is unknown until a guest binds the name again.
+    /// turn, a connect Detcore could not attribute may have reached it, or
+    /// too many connections waited: which connection an `accept` takes is
+    /// unknown until a guest binds the name again.
     unknown: bool,
+}
+
+impl PendingConnections {
+    fn lose_order(&mut self) {
+        self.sockets.clear();
+        self.unknown = true;
+    }
 }
 
 /// The connections waiting for an `accept` on each `AF_UNIX` name a guest
@@ -458,23 +533,54 @@ struct PendingConnections {
 /// it are paired (`Detcore::note_unix_accept`). One per run: every task of
 /// the process tree shares it (`ThreadState::unix_connections`), as it shares
 /// the guest clock, so a bind, a connect and an accept in different threads
-/// or processes meet. A connection Detcore did not see made (from outside
-/// Hermit, or through another spelling of a path) is not in it, and shifts
-/// the pairing of the connections queued after it.
+/// or processes meet.
+///
+/// A connect Detcore cannot attribute to one of these names may have
+/// reached any of them: one through a relative path or another spelling of
+/// a path (a doubled slash, a `..`, a symlink or hard link, a renamed
+/// socket file), to a name no guest bound here, through an absolute path
+/// from a task whose root may not be the container's (`chroot`, where one
+/// path names another file), or of a socket whose type Detcore did not see
+/// made. Every name's order is then unknown until it is bound again
+/// ([`UnixConnections::lost`]), so no accept pairs with a socket whose
+/// connection it may not have taken. A bind through an absolute path from
+/// such a task is not tracked. A connection made from outside Hermit is not
+/// seen at all.
+///
+/// That costs precision, never correctness: one stream connect to a socket
+/// no guest bound here, as a glibc user or group lookup makes through NSS
+/// (nscd, systemd-userdb), stops pairing for every name until it is bound
+/// again, and descriptors received over those connections are then handled
+/// as on main.
 #[derive(Default)]
-pub(crate) struct UnixConnections(BTreeMap<Box<[u8]>, PendingConnections>);
+pub(crate) struct UnixConnections {
+    names: BTreeMap<Box<[u8]>, PendingConnections>,
+    /// The last bind's generation ([`PendingConnections::generation`]).
+    binds: u64,
+}
 
 impl UnixConnections {
     /// A guest bound a socket to `name`: its listener's queue starts empty.
-    fn bound(&mut self, name: &[u8]) {
-        self.0.insert(name.into(), PendingConnections::default());
+    /// Which bind of the name it was, for the listener to keep.
+    fn bound(&mut self, name: &[u8]) -> u64 {
+        self.binds += 1;
+        self.names.insert(
+            name.into(),
+            PendingConnections {
+                generation: self.binds,
+                ..Default::default()
+            },
+        );
+        self.binds
     }
 
     /// A guest's `connect` to `name` completed: `socket` is the connecting
     /// socket where it completed in the caller's turn, `None` where it did
-    /// not.
+    /// not. A name no guest bound here may be another spelling of one that
+    /// was ([`Self::lost`]).
     fn connected(&mut self, name: &[u8], socket: Option<OpenFileHandle>) {
-        let Some(pending) = self.0.get_mut(name) else {
+        let Some(pending) = self.names.get_mut(name) else {
+            self.lost();
             return;
         };
         match socket {
@@ -482,21 +588,31 @@ impl UnixConnections {
             Some(socket) if pending.sockets.len() < MAX_PENDING_CONNECTIONS => {
                 pending.sockets.push_back(socket)
             }
-            _ => {
-                pending.sockets.clear();
-                pending.unknown = true;
-            }
+            _ => pending.lose_order(),
         }
     }
 
-    /// A guest's `accept` on the listener bound to `name` completed, in the
-    /// caller's turn or not (`in_turn`): the socket whose connection it took,
-    /// if that is known.
-    fn accepted(&mut self, name: &[u8], in_turn: bool) -> Option<OpenFileHandle> {
-        let pending = self.0.get_mut(name)?;
+    /// A guest's stream or seqpacket `connect` completed that Detcore cannot
+    /// attribute to one name ([`UnixConnections`]): every name's order is
+    /// unknown.
+    fn lost(&mut self) {
+        self.names
+            .values_mut()
+            .for_each(PendingConnections::lose_order);
+    }
+
+    /// A guest's `accept` on the listener bound to `name` by bind
+    /// `generation` completed, in the caller's turn or not (`in_turn`): the
+    /// socket whose connection it took, if that is known. A listener whose
+    /// name was bound again since has none: the connections Detcore tracks
+    /// are the later listener's.
+    fn accepted(&mut self, name: &[u8], generation: u64, in_turn: bool) -> Option<OpenFileHandle> {
+        let pending = self
+            .names
+            .get_mut(name)
+            .filter(|pending| pending.generation == generation)?;
         if !in_turn {
-            pending.sockets.clear();
-            pending.unknown = true;
+            pending.lose_order();
         }
         if pending.unknown {
             return None;
@@ -1186,8 +1302,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         if sent.unread {
             self.lose_peer_lockstep(guest, socket);
         }
-        for (fds, bytes) in sent.messages {
+        // A datagram send that names its destination reaches the socket it
+        // names, not the peer (`unix_dgram_sendmsg`); a seqpacket send
+        // ignores a name (`unix_seqpacket_sendmsg`) and a stream send with
+        // one fails (`unix_stream_sendmsg`).
+        let datagram = guest
+            .thread_state()
+            .with_detfd(socket, |socket| socket.unix_type())
+            .ok()
+            .flatten()
+            == Some(libc::SOCK_DGRAM);
+        for (fds, bytes, addressed) in sent.messages {
             if stream && bytes == 0 {
+                continue;
+            }
+            if datagram && addressed {
+                // The named socket may be the peer itself, which then holds a
+                // message its queue does not.
+                self.lose_peer_lockstep(guest, socket);
                 continue;
             }
             let mut descriptors = Vec::with_capacity(fds.len());
@@ -1284,44 +1416,87 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// ([`unix_socket_name`]): a listener there starts with no connection
     /// waiting.
     pub(crate) fn note_unix_bind<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd, name: &[u8]) {
-        if self.pairs_unix_sockets(guest) {
+        // An absolute path names another file from a task whose root may not
+        // be the container's: such a listener is not tracked.
+        if self.pairs_unix_sockets(guest) && !Self::path_names_another_file(guest, name) {
+            let generation = with_connections(guest, |connections| connections.bound(name));
             let _ = guest
                 .thread_state()
-                .with_detfd(fd, |detfd| detfd.set_unix_name(name.into()));
-            with_connections(guest, |connections| connections.bound(name));
+                .with_detfd(fd, |detfd| detfd.set_unix_name(name.into(), generation));
         }
     }
 
-    /// A `connect` of stream or seqpacket socket `fd` to the `AF_UNIX` name
-    /// `name` completed, in the caller's turn or not (`in_turn`, decided
-    /// before the call, [`Self::completes_in_turn`]): queue the connection
-    /// for the listener's `accept`. Only one completed in the turn has a
-    /// known place among the others.
+    /// A `connect` of socket `fd` to `address` succeeded, in the caller's
+    /// turn or not (`in_turn`, decided before the call,
+    /// [`Self::completes_in_turn`]).
+    ///
+    /// A datagram socket now sends to the socket it connected to, or to
+    /// none (`AF_UNSPEC`), not to the peer Detcore paired it with
+    /// (`DetFd::unpair_rights_peer`). A stream or seqpacket connection to a
+    /// name a guest bound queues for that listener's `accept`; only one
+    /// completed in the turn has a known place among the others. Any other
+    /// `AF_UNIX` connect may have reached any listener: through a relative
+    /// path or another spelling of a path, or from a socket whose type
+    /// Detcore did not see made ([`UnixConnections`]).
     pub(crate) fn note_unix_connect<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
-        name: &[u8],
+        address: &UnixAddress,
         in_turn: bool,
     ) {
         if !self.pairs_unix_sockets(guest) {
             return;
         }
-        let Ok(Some(kind)) = guest
+        let kind = guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.unix_type())
-        else {
-            return;
-        };
-        if kind != libc::SOCK_STREAM && kind != libc::SOCK_SEQPACKET {
+            .ok()
+            .flatten();
+        if kind == Some(libc::SOCK_DGRAM) {
+            let _ = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.unpair_rights_peer());
             return;
         }
-        let socket = guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.open_file_handle())
-            .ok()
-            .filter(|_| in_turn);
-        with_connections(guest, |connections| connections.connected(name, socket));
+        let address = match address {
+            UnixAddress::Named(name) if Self::path_names_another_file(guest, name) => {
+                &UnixAddress::Unnamed
+            }
+            address => address,
+        };
+        match (address, kind) {
+            (UnixAddress::Other, _) => {}
+            (UnixAddress::Named(name), Some(libc::SOCK_STREAM | libc::SOCK_SEQPACKET)) => {
+                let socket = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.open_file_handle())
+                    .ok()
+                    .filter(|_| in_turn);
+                with_connections(guest, |connections| connections.connected(name, socket));
+            }
+            // A named connect of a socket whose type Detcore did not see made
+            // may be a stream connection: that name's order, or every name's
+            // where no guest bound it here, is unknown.
+            (UnixAddress::Named(name), None) => {
+                with_connections(guest, |connections| connections.connected(name, None));
+            }
+            (UnixAddress::Named(_), Some(_)) => {}
+            (UnixAddress::Unnamed, _) => with_connections(guest, UnixConnections::lost),
+        }
+    }
+
+    /// Whether `name`, an `AF_UNIX` name ([`UnixAddress::Named`]), is an
+    /// absolute path the calling task may resolve against another root
+    /// than the container's: one it, or a task it shares or inherited its
+    /// root from, changed with `chroot` (`ThreadState::changed_root`). An
+    /// abstract name names the same socket from any root.
+    fn path_names_another_file<G: Guest<Self>>(guest: &G, name: &[u8]) -> bool {
+        name.first() == Some(&b'/')
+            && guest
+                .thread_state()
+                .changed_root
+                .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// An `accept` on `listener` made the connection `fd`, in the caller's
@@ -1338,13 +1513,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         if !self.pairs_unix_sockets(guest) {
             return;
         }
-        let Ok(Some((name, kind))) = guest
+        let Ok(Some((name, generation, kind))) = guest
             .thread_state()
             .with_detfd(listener, |detfd| detfd.unix_name_and_type())
         else {
             return;
         };
-        let peer = with_connections(guest, |connections| connections.accepted(&name, in_turn));
+        let peer = with_connections(guest, |connections| {
+            connections.accepted(&name, generation, in_turn)
+        });
         let _ = guest.thread_state().with_detfd(fd, |detfd| {
             detfd.set_unix_type(kind);
             if let Some(peer) = &peer {
@@ -1763,40 +1940,126 @@ mod tests {
         };
 
         connections.connected(name, Some(first.open_file_handle()));
-        connections.bound(name);
+        let bind = connections.bound(name);
         assert_eq!(
-            taken(connections.accepted(name, true)),
+            taken(connections.accepted(name, bind, true)),
             None,
             "no guest bound the name yet"
         );
         connections.connected(name, Some(first.open_file_handle()));
         connections.connected(name, Some(second.open_file_handle()));
         assert_eq!(
-            taken(connections.accepted(name, true)),
+            taken(connections.accepted(name, bind, true)),
             Some(first.open_file_id())
         );
         assert_eq!(
-            taken(connections.accepted(name, true)),
+            taken(connections.accepted(name, bind, true)),
             Some(second.open_file_id())
         );
-        assert_eq!(taken(connections.accepted(name, true)), None);
+        assert_eq!(taken(connections.accepted(name, bind, true)), None);
 
         connections.connected(name, None);
         connections.connected(name, Some(first.open_file_handle()));
         assert_eq!(
-            taken(connections.accepted(name, true)),
+            taken(connections.accepted(name, bind, true)),
             None,
             "after a connect outside the turn"
         );
 
-        connections.bound(name);
+        let bind = connections.bound(name);
         connections.connected(name, Some(second.open_file_handle()));
-        assert_eq!(taken(connections.accepted(name, false)), None);
+        assert_eq!(taken(connections.accepted(name, bind, false)), None);
         connections.connected(name, Some(first.open_file_handle()));
         assert_eq!(
-            taken(connections.accepted(name, true)),
+            taken(connections.accepted(name, bind, true)),
             None,
             "after an accept outside the turn"
+        );
+    }
+
+    /// A connect Detcore cannot attribute to one bound name (a relative
+    /// path, another spelling of a path, a name no guest bound here) may have
+    /// reached any listener: every name's order is unknown until it is bound
+    /// again, so a later accept pairs with nothing rather than with the
+    /// wrong connecting socket.
+    #[test]
+    fn an_unattributed_connect_leaves_every_name_unknown() {
+        use crate::fd::DetFd;
+        use crate::fd::FdType;
+        use crate::types::DetTid;
+        use crate::types::OpenFileId;
+        let socket = |sequence| {
+            DetFd::new(
+                3,
+                nix::fcntl::OFlag::O_RDWR,
+                FdType::Socket,
+                OpenFileId::new(DetTid::from_raw(1), sequence),
+            )
+        };
+        let (first, second) = (socket(0), socket(1));
+        let taken = |accepted: Option<OpenFileHandle>| {
+            accepted
+                .and_then(|handle| handle.descriptor(9, false))
+                .map(|detfd| detfd.open_file_id())
+        };
+        let (path, other) = (&b"/tmp/listener"[..], &b"\0other-listener"[..]);
+
+        type Unattributed<'a> = Box<dyn Fn(&mut UnixConnections) + 'a>;
+        let unattributed: [Unattributed<'_>; 3] = [
+            // A relative path, or a socket of a type Detcore did not see made.
+            Box::new(|connections| connections.lost()),
+            // Another spelling of the bound path, in the turn or not.
+            Box::new(|connections| connections.connected(b"/tmp//listener", None)),
+            Box::new(|connections| {
+                connections.connected(b"/tmp/listener-link", Some(first.open_file_handle()))
+            }),
+        ];
+        for unattributed in unattributed {
+            let mut connections = UnixConnections::default();
+            let (bind, other_bind) = (connections.bound(path), connections.bound(other));
+            unattributed(&mut connections);
+            connections.connected(path, Some(second.open_file_handle()));
+            connections.connected(other, Some(first.open_file_handle()));
+            assert_eq!(taken(connections.accepted(path, bind, true)), None);
+            assert_eq!(taken(connections.accepted(other, other_bind, true)), None);
+
+            let bind = connections.bound(path);
+            connections.connected(path, Some(first.open_file_handle()));
+            assert_eq!(
+                taken(connections.accepted(path, bind, true)),
+                Some(first.open_file_id()),
+                "a new bind starts the name's order again"
+            );
+        }
+    }
+
+    /// A listener bound before its path was unlinked and bound again takes
+    /// connections Detcore no longer tracks: its accepts pair with nothing,
+    /// and the later listener's connections stay its own.
+    #[test]
+    fn a_listener_whose_name_was_bound_again_pairs_nothing() {
+        use crate::fd::DetFd;
+        use crate::fd::FdType;
+        use crate::types::DetTid;
+        use crate::types::OpenFileId;
+        let socket = DetFd::new(
+            3,
+            nix::fcntl::OFlag::O_RDWR,
+            FdType::Socket,
+            OpenFileId::new(DetTid::from_raw(1), 0),
+        );
+        let path = &b"/tmp/rebound"[..];
+        let mut connections = UnixConnections::default();
+        let earlier = connections.bound(path);
+        let later = connections.bound(path);
+        connections.connected(path, Some(socket.open_file_handle()));
+        assert!(connections.accepted(path, earlier, true).is_none());
+        assert!(
+            connections
+                .accepted(path, later, true)
+                .and_then(|handle| handle.descriptor(9, false))
+                .is_some_and(|detfd| detfd.open_file_id() == socket.open_file_id()),
+            "the later listener takes its own connection"
         );
     }
 }

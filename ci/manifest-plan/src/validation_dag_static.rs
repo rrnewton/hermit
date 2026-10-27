@@ -3069,7 +3069,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And syscalls::scm_rights' unix_socket_names_are_abstract_names_and_absolute_paths
     // and unix_connections_are_accepted_in_order (an accepted connection's
     // peer): 2791, listed.
-    ("test.detcore_unit", 2791),
+    // And syscalls::scm_rights' an_unattributed_connect_leaves_every_name_unknown
+    // and a_listener_whose_name_was_bound_again_pairs_nothing: 2793, listed.
+    ("test.detcore_unit", 2793),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -3183,7 +3185,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // long_stream_message (a queue out of lockstep joins no anonymous inode;
     // peeked entries; a message split across buffers): 177.
     // And scm_rights_over_a_connection_from_a_child: 178.
-    ("test.detcore_misc", 178),
+    // And scm_rights' connection_through_a_relative_path, addressed_datagram
+    // and reconnected_datagram_socket (no anonymous inode joins over a
+    // pairing Detcore could not follow): 181.
+    // And scm_rights_connection_from_a_chroot: 182.
+    ("test.detcore_misc", 182),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -5001,7 +5007,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same connection test: 174.
     // And the same three queue-order tests: 177.
     // And the same child-connection test: 178.
-    ("test.detcore_misc_on_host", 178),
+    // And the same three unfollowed-pairing tests: 181.
+    // And the same chroot connection test: 182.
+    ("test.detcore_misc_on_host", 182),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -5398,7 +5406,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // And the same queued-rights unit: 2789, listed.
     // And the same two AF_UNIX connection units: 2791, listed.
-    ("test.detcore_unit_on_host", 2791),
+    // And the same two unattributed-connection units: 2793, listed.
+    ("test.detcore_unit_on_host", 2793),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
