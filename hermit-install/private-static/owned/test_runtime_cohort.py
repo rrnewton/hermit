@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 D = Path(__file__).resolve().parent
 
@@ -64,6 +65,64 @@ class ContentCohort(unittest.TestCase):
             for bad in [rows+(rows[0],),((rows[0][0],rows[0][1],rows[1][2],rows[1][3]),rows[1])]:
                 with self.assertRaisesRegex(RuntimeError,'one complete reviewed content cohort'):
                     self.apply(root,bad)
+
+
+class NeutralCoreSupportCohort(unittest.TestCase):
+    """Source-association controls only; neither compilation nor qualification."""
+
+    def facts(self, rows, root):
+        return {
+            str(root / ('reverie' if label == 'R' else '') / relative):
+                dict(path=str(root / ('reverie' if label == 'R' else '') / relative),
+                     bytes=size, sha256=digest)
+            for label, relative, size, digest in rows
+        }
+
+    def test_all_complete_historical_associations_remain_accepted(self):
+        # Metadata fixtures exercise the complete selector with every old tuple
+        # present. They do not substitute for observed-file or Git custody proof.
+        root = Path('/data-only-cohort')
+        historical = cohort.COHORTS[:-1]
+        self.assertEqual(len(historical), 5)
+        for name, rows in historical:
+            with self.subTest(cohort=name):
+                facts = self.facts(rows, root)
+                with patch.object(cohort, 'observed_file', side_effect=lambda path: facts[str(path)]):
+                    self.assertEqual(cohort.bind(root)['cohort'], name)
+
+    def test_current_neutral_core_sources_match_complete_association(self):
+        self.assertEqual(cohort.bind(D.parents[2])['cohort'], 'neutral-core-support-content-v1')
+
+    def test_mixed_old_and_neutral_support_rows_are_refused(self):
+        root = Path('/data-only-cohort')
+        facts = self.facts(cohort.NEUTRAL_CORE_SUPPORT, root)
+        old = self.facts(cohort.FINAL_DEVELOPMENT_054, root)
+        path = str(root / 'detcore-liteinst/build.rs')
+        facts[path] = old[path]
+        with patch.object(cohort, 'observed_file', side_effect=lambda path: facts[str(path)]):
+            with self.assertRaisesRegex(RuntimeError, 'one complete reviewed content cohort'):
+                cohort.bind(root)
+
+    def test_each_changed_source_refuses_same_size_mutation_and_truncation(self):
+        source = D.parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for label, relative, _, _ in cohort.NEUTRAL_CORE_SUPPORT:
+                relative = Path('reverie') / relative if label == 'R' else Path(relative)
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes((source / relative).read_bytes())
+            for relative in ['detcore-liteinst/build.rs', 'detcore-liteinst/src/lib.rs']:
+                path = root / relative
+                original = path.read_bytes()
+                for changed in [bytes([original[0] ^ 1]) + original[1:], original[:-1]]:
+                    with self.subTest(path=relative, size=len(changed)):
+                        path.write_bytes(changed)
+                        try:
+                            with self.assertRaisesRegex(RuntimeError, 'one complete reviewed content cohort'):
+                                cohort.bind(root)
+                        finally:
+                            path.write_bytes(original)
 
 
 class FixedPageData(unittest.TestCase):

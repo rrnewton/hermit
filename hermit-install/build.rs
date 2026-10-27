@@ -14,8 +14,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
+#[cfg(feature = "third-party-backends")]
 mod cmake_source;
 
+#[cfg(feature = "third-party-backends")]
 const DYNAMORIO_FILES: &[&str] = &[
     "bin64/drrun",
     "lib64/release/libdynamorio.so",
@@ -30,6 +32,7 @@ const DYNAMORIO_FILES: &[&str] = &[
 /// `git rebase --exec` steps, and GIT_DIR, GIT_WORK_TREE and GIT_INDEX_FILE to
 /// hooks, so a release build started from either inherits them, and they
 /// override `git -C` (https://github.com/rrnewton/hermit/issues/3362).
+#[cfg(feature = "third-party-backends")]
 const GIT_REPOSITORY_LOCATION_VARIABLES: [&str; 8] = [
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -48,6 +51,7 @@ const GIT_REPOSITORY_LOCATION_VARIABLES: [&str; 8] = [
 /// caller's HEAD, so the pin checks failed, and `submodule update --init` ran
 /// against the caller's repository and failed. Configuration passed through
 /// GIT_CONFIG_COUNT or GIT_CONFIG_PARAMETERS is kept.
+#[cfg(feature = "third-party-backends")]
 fn git() -> Command {
     let mut command = Command::new("git");
     for name in GIT_REPOSITORY_LOCATION_VARIABLES {
@@ -64,6 +68,7 @@ fn run(command: &mut Command, description: &str) {
     assert!(status.success(), "failed to {description}: {status}");
 }
 
+#[cfg(feature = "third-party-backends")]
 fn output(command: &mut Command, description: &str) -> String {
     let result = command
         .output()
@@ -98,6 +103,7 @@ fn copy_file(source: &Path, destination: &Path) {
     });
 }
 
+#[cfg(feature = "third-party-backends")]
 fn ensure_submodule(
     repository: &Path,
     name: &str,
@@ -142,6 +148,7 @@ fn ensure_submodule(
     (source, expected)
 }
 
+#[cfg(feature = "third-party-backends")]
 fn stage_sabre(resources: &Path, expected_reverie_revision: &str) {
     // Reverie's vendor tree includes the frame/bootstrap repairs that are not
     // in its original third-party/sabre gitlink. Use the loader built by that
@@ -169,6 +176,7 @@ fn stage_sabre(resources: &Path, expected_reverie_revision: &str) {
     );
 }
 
+#[cfg(feature = "third-party-backends")]
 fn build_e9patch(repository: &Path, build_root: &Path, resources: &Path) {
     let (source, _) = ensure_submodule(repository, "e9patch", "third-party/e9patch", "Makefile");
     let build = build_root.join("e9patch");
@@ -196,8 +204,8 @@ fn build_e9patch(repository: &Path, build_root: &Path, resources: &Path) {
     copy_file(&build.join("e9patch"), &resources.join("e9patch"));
 }
 
-fn copy_licenses(repository_root: &Path, reverie_root: &Path, install: &Path) {
-    copy_file(&repository_root.join("LICENSE"), &install.join("LICENSE"));
+#[cfg(feature = "third-party-backends")]
+fn copy_third_party_licenses(reverie_root: &Path, install: &Path) {
     let licenses = install.join("licenses");
     for name in [
         "LICENSE",
@@ -232,6 +240,7 @@ fn copy_licenses(repository_root: &Path, reverie_root: &Path, install: &Path) {
     );
 }
 
+#[cfg(feature = "third-party-backends")]
 fn copy_dynamorio(resources: &Path) -> PathBuf {
     let drrun = reverie_dbt::bundled_drrun_path();
     let root = drrun
@@ -247,6 +256,7 @@ fn copy_dynamorio(resources: &Path) -> PathBuf {
     reverie_dbt::bundled_dynamorio_cmake_dir().to_path_buf()
 }
 
+#[cfg(feature = "third-party-backends")]
 fn build_dbt_client(
     manifest_dir: &Path,
     build_root: &Path,
@@ -374,6 +384,7 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=cmake_source.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
+    println!("cargo:rerun-if-changed=reverie-LICENSE");
     println!("cargo:rerun-if-env-changed=HERMIT_INSTALL_FORCE_RESTAGE");
     println!("cargo:rerun-if-changed=../scripts/stage-liteinst-runtime.sh");
     println!("cargo:rerun-if-changed=native-client/CMakeLists.txt");
@@ -418,6 +429,11 @@ fn main() {
     let install = target_dir.join("install_pkg");
     let resources = install.join("rsrcs");
     let build_root = target_dir.join("install-build");
+    // Cargo caches separate build-script invocations for the two feature sets,
+    // but their package directory is shared. Switching back to a cached mode
+    // must restage it rather than reuse the other mode's installed resources.
+    let selection = build_root.join("package-selection");
+    println!("cargo:rerun-if-changed={}", selection.display());
 
     if install.exists() {
         fs::remove_dir_all(&install)
@@ -428,7 +444,6 @@ fn main() {
     fs::create_dir_all(&build_root)
         .unwrap_or_else(|error| panic!("failed to create {}: {error}", build_root.display()));
 
-    // These two current-profile runtimes remain ordinary installation links.
     // Ordinary Detcore LiteInst is finalized AFTER outer Cargo exits, using
     // the existing liteinst-runtime profile and shared physical/source proof.
     // Never expose this invocation's validate/LTO-off DSO as an installed one.
@@ -436,29 +451,43 @@ fn main() {
     println!(
         "cargo:warning=finish LiteInst packaging with target/<profile>/stage-detcore-liteinst --git target (make install-deps does this automatically)"
     );
-    for library in ["libdetcore_dbt.so", "libdetcore_sabre.so"] {
-        replace_symlink(
-            &resources.join(library),
-            &Path::new("../..").join(&profile_dir_name).join(library),
-        )
-        .unwrap_or_else(|error| panic!("failed to link packaged {library}: {error}"));
-    }
+    #[cfg(feature = "third-party-backends")]
+    {
+        // Only full installations link the current-profile third-party runtimes.
+        for library in ["libdetcore_dbt.so", "libdetcore_sabre.so"] {
+            replace_symlink(
+                &resources.join(library),
+                &Path::new("../..").join(&profile_dir_name).join(library),
+            )
+            .unwrap_or_else(|error| panic!("failed to link packaged {library}: {error}"));
+        }
 
-    let dynamorio_cmake = copy_dynamorio(&resources);
-    build_dbt_client(&manifest_dir, &build_root, &resources, &dynamorio_cmake);
+        let dynamorio_cmake = copy_dynamorio(&resources);
+        build_dbt_client(&manifest_dir, &build_root, &resources, &dynamorio_cmake);
+    }
 
     let repository = manifest_dir
         .parent()
         .expect("hermit-install is not inside the Hermit repository");
     build_liteinst_runtime(repository, &build_root, &profile_dir, &resources);
 
-    let reverie_root = reverie_dbt::native_client_source_dir()
-        .parent()
-        .and_then(Path::parent)
-        .expect("reverie-dbt source is not inside the Reverie repository");
-    stage_sabre(&resources, &reverie_pin(repository));
-    build_e9patch(reverie_root, &build_root, &resources);
-    copy_licenses(repository, reverie_root, &install);
+    copy_file(&repository.join("LICENSE"), &install.join("LICENSE"));
+    // Core LiteInst also ships Reverie code; keep its notice without requiring
+    // a third-party backend dependency merely to locate the license.
+    copy_file(
+        &manifest_dir.join("reverie-LICENSE"),
+        &install.join("licenses/LICENSE"),
+    );
+    #[cfg(feature = "third-party-backends")]
+    {
+        let reverie_root = reverie_dbt::native_client_source_dir()
+            .parent()
+            .and_then(Path::parent)
+            .expect("reverie-dbt source is not inside the Reverie repository");
+        stage_sabre(&resources, &reverie_pin(repository));
+        build_e9patch(reverie_root, &build_root, &resources);
+        copy_third_party_licenses(reverie_root, &install);
+    }
 
     replace_symlink(
         &install.join("hermit"),
@@ -470,6 +499,19 @@ fn main() {
         "Hermit release staging package. Copy with symlink dereferencing (for example, cp -aL) to create a standalone installation.\n",
     )
     .expect("failed to write install package README");
+    let selected = if cfg!(feature = "third-party-backends") {
+        "third-party-backends\n"
+    } else {
+        "core\n"
+    };
+    let previous = match fs::read_to_string(&selection) {
+        Ok(previous) => Some(previous),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => panic!("failed to read install package selection: {error}"),
+    };
+    if previous.as_deref() != Some(selected) {
+        fs::write(selection, selected).expect("failed to record install package selection");
+    }
 }
 
 /// The Cargo artifact directory of the active profile: `OUT_DIR` is
