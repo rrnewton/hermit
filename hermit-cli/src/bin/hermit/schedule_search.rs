@@ -540,17 +540,20 @@ where
             // The failing run took a path the passing one did not (an error branch, a
             // retry), so its schedule keeps events the passing one lacks. Without them
             // the two differ by the one remaining swap; that order is the critical
-            // pair if it still fails.
+            // pair if it still fails. It is selected like every other midpoint:
+            // within the jitter bound, or stable across replays, and the trace it
+            // selects is what the search reports.
             if let Some(trimmed) = events_shared_with(&failing_schedule, &passing_schedule) {
                 eprintln!(
                     ":: Schedules are one swap apart; testing the failing schedule without its {} events the passing one lacks",
                     failing_schedule.len() - trimmed.len(),
                 );
-                let (trimmed_passes, _) = tester(&trimmed)?;
+                let (trimmed_passes, selected) =
+                    test_and_select_stable_point(tester, &trimmed, cfg)?;
                 if !trimmed_passes {
                     return Ok(EventLevelSearchResult {
                         passing_schedule,
-                        failing_schedule: trimmed,
+                        failing_schedule: selected,
                     });
                 }
             }
@@ -1092,6 +1095,60 @@ mod tests {
             None,
             "identical schedules are not one swap apart"
         );
+    }
+
+    /// The failing schedule without its extra events is selected like every
+    /// other midpoint, through the jitter bound and the replay-stability
+    /// check, and the search reports the trace it selected, not the one it
+    /// asked for.
+    #[test]
+    fn the_trimmed_failing_schedule_is_selected_as_a_stable_point() {
+        let a = SchedEvent::syscall(DetTid::from_raw(3), Sysno::write, SyscallPhase::Prehook);
+        let b = SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook);
+        let c = SchedEvent::syscall(DetTid::from_raw(3), Sysno::getpid, SyscallPhase::Prehook);
+        let extra = SchedEvent::syscall(DetTid::from_raw(7), Sysno::close, SyscallPhase::Prehook);
+        let late = SchedEvent::syscall(DetTid::from_raw(9), Sysno::getppid, SyscallPhase::Prehook);
+        let passing = vec![a.clone(), b.clone(), c.clone()];
+        let failing = vec![b.clone(), a.clone(), c.clone(), extra];
+        let trimmed = vec![b.clone(), a, c];
+        // Thread 5 first fails; every replay realizes one more event at the end.
+        let tester = |calls: &mut Vec<Vec<SchedEvent>>, schedule: &[SchedEvent]| -> TrialOutcome {
+            calls.push(schedule.to_vec());
+            let mut realized = schedule.to_vec();
+            realized.push(late.clone());
+            Ok((schedule.first() != Some(&b), realized))
+        };
+
+        // Within the jitter bound, the realized trace is reported.
+        let mut calls = Vec::new();
+        let within = Config {
+            max_jitter_editdist: 1,
+            max_jitter_swapdist: 1,
+            ..Default::default()
+        };
+        let result = event_level_search(
+            &mut |schedule: &[SchedEvent]| tester(&mut calls, schedule),
+            passing.clone(),
+            failing.clone(),
+            &within,
+        )
+        .unwrap();
+        let mut realized = trimmed.clone();
+        realized.push(late.clone());
+        assert_eq!(result.failing_schedule, realized);
+        assert_eq!(calls, std::slice::from_ref(&trimmed));
+
+        // Past it, the trimmed schedule is replayed again for stability first.
+        let mut calls = Vec::new();
+        let result = event_level_search(
+            &mut |schedule: &[SchedEvent]| tester(&mut calls, schedule),
+            passing,
+            failing,
+            &Config::default(),
+        )
+        .unwrap();
+        assert_eq!(result.failing_schedule, trimmed);
+        assert_eq!(calls, [trimmed.clone(), trimmed]);
     }
 
     #[test]
