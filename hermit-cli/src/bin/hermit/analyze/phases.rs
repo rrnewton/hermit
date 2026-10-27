@@ -40,6 +40,7 @@ use crate::logdiff::LogDiffCLIOpts;
 use crate::run::RunOpts;
 use crate::schedule_search::Config;
 use crate::schedule_search::CriticalSchedule;
+use crate::schedule_search::INEXACT_COUNTER_BRANCH_JITTER;
 use crate::schedule_search::TrialOutcome;
 use crate::schedule_search::search_for_critical_schedule;
 
@@ -80,6 +81,22 @@ fn critical_pair_caveat(crit: &CriticalSchedule, timed_out: usize) -> Option<Str
 }
 
 impl AnalyzeOpts {
+    /// The branch-count difference two replays of one control schedule may
+    /// show and still count as one realized trace
+    /// (`schedule_search::Config::max_branch_count_jitter`): on a host whose
+    /// branch counter is not exact only, which analyze says. Elsewhere the two
+    /// must be identical, event times included.
+    fn replay_branch_jitter(&self) -> Option<u32> {
+        let reason = (self.inexact_branch_counter)()?;
+        eprintln!(
+            ":: {} this host's branch counter is not exact ({reason}), so two replays of one \
+             schedule count as the same trace when their branch counts differ by at most {}",
+            "NOTE:".yellow().bold(),
+            INEXACT_COUNTER_BRANCH_JITTER
+        );
+        Some(INEXACT_COUNTER_BRANCH_JITTER)
+    }
+
     pub fn get_tmp(&self) -> anyhow::Result<&Path> {
         if let Some(pb) = &self.tmp_dir {
             Ok(pb.as_path())
@@ -559,6 +576,7 @@ impl AnalyzeOpts {
         let mut cfg = Config {
             verbose: self.verbose,
             needleman_search: self.run_needleman,
+            max_branch_count_jitter: self.replay_branch_jitter(),
             ..Default::default()
         };
         if let Some(dist) = self.jitter_dist {
@@ -1137,6 +1155,20 @@ mod tests {
         let workspace = options.get_tmp().unwrap();
         assert_eq!(workspace.parent(), Some(requested.as_path()));
         assert!(workspace.is_dir(), "{}", workspace.display());
+    }
+
+    /// Two replays of one schedule may differ by a few branches and still
+    /// count as one trace only on a host whose branch counter is not exact.
+    #[test]
+    fn replays_tolerate_branch_skid_only_on_an_inexact_counter() {
+        let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
+        options.inexact_branch_counter = || None;
+        assert_eq!(options.replay_branch_jitter(), None, "an exact counter");
+        options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
+        assert_eq!(
+            options.replay_branch_jitter(),
+            Some(INEXACT_COUNTER_BRANCH_JITTER)
+        );
     }
 
     #[test]
