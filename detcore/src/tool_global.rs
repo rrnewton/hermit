@@ -5801,9 +5801,15 @@ impl GlobalState {
         {
             return;
         }
-        sched.retire_deregistered_thread(dettid, detpid, mm);
-        if killed_by_group_signal {
-            sched.note_signal_killed_group(dettid, detpid);
+        // The process as the scheduler registered the thread, as the retire
+        // path reads it (`logically_kill_thread`), not the backend's report.
+        let process = sched.registered_process(dettid).unwrap_or(detpid);
+        // A leader retired at its own exit (`retire_exited_leader`) reports
+        // here a death already accounted: whatever killed its group, a guest's
+        // SIGKILL above all, is accounted where it happened, not at this
+        // host-timed moment.
+        if sched.retire_deregistered_thread(dettid, detpid, mm) && killed_by_group_signal {
+            sched.note_signal_killed_group(dettid, process);
         }
         trace!(
             "[detcore, dtid {}] thread deregistered, removed from sched structures.",

@@ -91,3 +91,45 @@ async fn a_sigkill_deregistration_waits_for_the_rest_of_its_group() {
         );
     }
 }
+
+/// A death the scheduler already accounted is no signal death to wait for.
+/// A leader retired at its own exit while its group lived on reports its
+/// death by SIGKILL only at its deregistration, and a guest's
+/// `kill(leader, SIGKILL)` retires the rest of the group at the kill turn:
+/// the leader's deregistration landing first, at a host-chosen moment, must
+/// neither log nor make the process a victim
+/// (https://github.com/rrnewton/hermit/issues/4445). Nor does a death in a
+/// process a committed SIGKILL doomed.
+#[tokio::test]
+async fn a_death_already_accounted_waits_for_nothing() {
+    let process = DetPid::from_raw(LEADER.as_raw());
+    for already in ["retired leader", "committed sigkill"] {
+        let (state, time) = state();
+        let (dying, sender_mm) = {
+            let mut sched = state.sched.lock().unwrap();
+            if already == "retired leader" {
+                assert!(sched.retire_test_exited_leader(LEADER, MmId::initial(LEADER)));
+                (LEADER, MmId::initial(LEADER))
+            } else {
+                sched.record_committed_sigkill(LEADER, Some(process));
+                (WORKER, MmId::initial(LEADER))
+            }
+        };
+        let response = state
+            .receive_rpc(
+                Tid::from_raw(dying.as_raw()),
+                (
+                    time,
+                    sender_mm,
+                    GlobalRequest::DeregisterThread(deregistration(dying, true)),
+                ),
+            )
+            .await;
+        assert_eq!(response, (None, GlobalResponse::DeregisterThread(())));
+        let sched = state.sched.lock().unwrap();
+        assert!(!sched.signal_death_victim(process), "{already}");
+        if already == "retired leader" {
+            assert!(sched.next_turns.contains_key(&WORKER), "{already}");
+        }
+    }
+}
