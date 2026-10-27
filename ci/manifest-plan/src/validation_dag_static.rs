@@ -1836,7 +1836,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And tests::defined_dynamic_symbols_are_read_from_the_dynamic_segment_alone
     // and tests::the_dynamic_symbol_count_comes_from_the_hash_table (that check
     // reads only the runtime's dynamic symbols): 1112, listed.
-    ("test.hermit_unit", 1114),
+    // And run::detlog_anon_is_ptrace_only: 1115.
+    ("test.hermit_unit", 1115),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3027,7 +3028,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the five shared runtime-FD readlink handler regressions, including
     // numeric-parent scratch overlap and syscall precedence: 2667, listed.
     // Fixed 0.5.4 rebase recount also retains the priority-history regressions.
-    ("test.detcore_unit", 2681),
+    // And procmaps' three --detlog-anon units: 2684, listed.
+    ("test.detcore_unit", 2684),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4280,7 +4282,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none
     // (the placeholder is mounted only for KVM), are run_kvm_ tests, which this
     // node skips and privileged-test.cli_kvm runs.
-    ("test.cli", 622),
+    // And detlog_anon_records_a_write_to_an_anonymous_mapping: 623.
+    ("test.cli", 623),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4796,7 +4799,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two tests split out of the discarded-at-send test, not
     // excluded: 535.
     // And the same four P1 placeholder tests, not excluded: 539.
-    ("test.cli_on_host", 541),
+    // And detlog_anon_records_a_write_to_an_anonymous_mapping: 542.
+    ("test.cli_on_host", 542),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5253,7 +5257,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same overlap-decision unit: 2662, listed.
     // And the same five shared runtime-FD readlink regressions: 2667, listed.
     // Fixed 0.5.4 rebase recount also retains the priority-history regressions.
-    ("test.detcore_unit_on_host", 2681),
+    // And procmaps' three --detlog-anon units: 2684, listed.
+    ("test.detcore_unit_on_host", 2684),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
