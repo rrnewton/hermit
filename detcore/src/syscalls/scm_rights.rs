@@ -548,16 +548,24 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// each descriptor whose facts cannot be taken. Under record and replay
     /// and without sequentialized threads none is recorded, logged at debug
     /// level only (a warning per call, or per tool process, would differ
-    /// between runs that share a process).
+    /// between runs that share a process). `cloexec` is whether the receive
+    /// asked for its descriptors close-on-exec (`MSG_CMSG_CLOEXEC`), which a
+    /// descriptor listed without its facts keeps.
     pub(crate) async fn record_received_descriptors<G: Guest<Self>>(
         &self,
         guest: &mut G,
         delivered: &Delivered,
         in_turn: bool,
+        cloexec: bool,
     ) -> Vec<RawFd> {
         match self.receipt_mode(guest) {
             ReceiptMode::Discovered => return Vec::new(),
             ReceiptMode::Unrecorded(why) => {
+                if !delivered.fds.is_empty() || delivered.refused.is_some() {
+                    // A listing of this table cannot come from the model now
+                    // (`syscalls::files::descriptor_directory`).
+                    guest.thread_state().note_unaccounted_receipt();
+                }
                 if !delivered.fds.is_empty() {
                     debug!(
                         "[detcore] descriptors {:?}, received over SCM_RIGHTS, are not recorded \
@@ -570,6 +578,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             ReceiptMode::Recorded => {}
         }
         if let Some(reason) = delivered.refused {
+            guest.thread_state().note_unaccounted_receipt();
             warn!(
                 "[detcore] the descriptors a receive got over SCM_RIGHTS, if any, are not \
                  recorded: {reason}"
@@ -578,6 +587,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         if !in_turn {
             if !delivered.fds.is_empty() {
+                guest.thread_state().note_unaccounted_receipt();
                 warn!(
                     "[detcore] descriptors {:?}, received over SCM_RIGHTS on the background \
                      path, are not recorded: another task may have closed or replaced their \
@@ -595,9 +605,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             match self.record_received_descriptor(guest, fd).await {
                 Ok(true) => recorded.push(fd),
                 Ok(false) => {}
-                Err(error) => warn!(
-                    "[detcore] descriptor {fd}, received over SCM_RIGHTS, is not recorded: {error}"
-                ),
+                Err(error) => {
+                    // Open, but without its facts: listed, never modelled.
+                    guest.thread_state().note_unmodelled_descriptor(fd, cloexec);
+                    warn!(
+                        "[detcore] descriptor {fd}, received over SCM_RIGHTS, is not recorded: \
+                         {error}"
+                    )
+                }
             }
         }
         recorded
@@ -644,6 +659,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `EFD_SEMAPHORE` eventfd read twice). Left unrecorded instead, as
         // before.
         if stat.st_mode & libc::S_IFMT == 0 {
+            // Open, and listed in the table's descriptor directory, but not
+            // modelled.
+            guest
+                .thread_state()
+                .note_unmodelled_descriptor(fd, descriptor_flags & libc::FD_CLOEXEC != 0);
             warn!(
                 "[detcore] descriptor {fd}, received over SCM_RIGHTS, is an anonymous inode \
                  whose kind fstat does not tell: not recorded"
@@ -666,6 +686,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest
             .thread_state()
             .add_discovered_fd(fd, descriptor_flags, status_flags, &stat)?;
+        // A descriptor directory's descriptor on `/proc`, which its tag tells
+        // apart (`descriptor_directory`).
+        self.recognize_received_descriptor_directory(guest, fd, &stat, status_flags)
+            .await;
         Ok(true)
     }
 }
