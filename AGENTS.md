@@ -584,13 +584,24 @@ The portable workflow is the one exception, by owner decision on 2026-10-27:
 `ci-portable.yml` runs on `pull_request` (opened, synchronize, reopened,
 ready_for_review) unless the author is `hermit-bot3` or the pull request is a
 draft, as well as after a push to `integration` and on manual dispatch. It
-uses no secrets and a read-only token, so it behaves the same for a branch of
-this repository and for a fork (GitHub asks a maintainer to approve a
-first-time fork contributor's run). Its result is supplemental evidence and
-gates nothing: it is not a required status check. The privileged
-(self-hosted, PMU) workflows remain dispatch-only, because a pull request's
-code must not run unreviewed on those hosts. `scripts/check-github-actions-triggers.rs`
-enforces this shape, including the bot/draft gate on every entry job.
+uses no secrets and a `contents: read` token (its `cleanup` job alone asks for
+`actions: write` to delete the run's own artifacts, and skips fork pull
+requests, whose token cannot have it), so it behaves the same for a branch of
+this repository and for a fork. Its result is supplemental evidence and gates
+nothing: it is not a required status check. The privileged (self-hosted, PMU)
+workflows remain dispatch-only. `scripts/check-github-actions-triggers.rs`
+enforces this shape: the bot/draft gate on every job that can start on its
+own, and GitHub-hosted runners only for every `ci-portable.yml` job.
+
+⚠️ **THE CHECKED-IN TRIGGERS DO NOT PROTECT THE SELF-HOSTED HOSTS.** For a
+`pull_request` event GitHub runs the workflow files from the pull request
+itself, so a fork can add a workflow, or edit this one, that targets the
+self-hosted labels. What keeps an outside contributor's code off those hosts is
+repository configuration: Settings, Actions, "Fork pull request workflows from
+outside collaborators" set to require approval for all outside collaborators
+(not only first-time ones), and runner access that does not admit pull
+requests from forks. A maintainer approving a fork run must first read the
+pull request's `.github/` changes.
 
 **What actually holds this line today is agents choosing to hold it.**
 

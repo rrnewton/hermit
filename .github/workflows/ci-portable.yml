@@ -125,9 +125,9 @@ env:
 jobs:
   # -------------------------------------------------- affected-test selection
   # Consume ci/select-tests.rs (#1500) to shrink the matrix for a limited-
-  # footprint pull request. That selection path is dormant under the current
-  # trigger policy: the integration push and workflow_dispatch events always
-  # select the full suite. A disabled kill-switch, an
+  # footprint pull request. That selection path runs for pull_request events
+  # (non-bot, non-draft pull requests, since 2026-10-27); the integration push
+  # and workflow_dispatch events always select the full suite. A disabled kill-switch, an
   # unresolvable base, ANY tool error, or an unrecognized decision all fall
   # through to the full matrix — the exact behavior before this job existed. The
   # `skip`/`selective` decisions themselves are the tool's audited, proof-of-inert
@@ -255,8 +255,10 @@ jobs:
           echo "selection: decision=$decision debug_shards=$run_dbg release_shards=$run_rel strict_compat=$run_strict e2e=$run_e2e backends=[$backends] build_debug=$build_debug build_release=$build_release" >&2
 
   # ---------------------------------------------------------------- plan (cheap)
-  # Fail-closed integrity guard over the shard map itself. Runs UNCONDITIONALLY
-  # (it has no `needs: select`) so a corrupt ci/portable-shards.json reds the
+  # Fail-closed integrity guard over the shard map itself. Runs on every
+  # admitted event (it has no `needs: select`; like select it carries the
+  # pull-request gate, so a bot or draft pull request skips it) so a corrupt
+  # ci/portable-shards.json reds the
   # `regular` diagnostic even on a skip/selective run. The shard MATRICES are
   # now derived by the `select` job (full or affected-test-filtered); this job no
   # longer emits them, it only verifies the map every downstream matrix is cut
