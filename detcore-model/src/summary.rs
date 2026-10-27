@@ -199,6 +199,34 @@ pub struct RunSummary {
     /// human-readable summary, whose INFO view is compared by `--verify`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub syscall_histogram: Option<SyscallHistogramSummary>,
+
+    /// Skid-overshoot events of the run's precise PMU timers: preemption
+    /// points that took effect past the branch count they were programmed
+    /// for, because the overflow interrupt was handled late. One event is
+    /// one thread's timer and its target, however many sites reported it
+    /// (`detcore::skid_overshoots`). Absent where the backend has no such
+    /// timers. Shown in the full report when nonzero, but not in the INFO
+    /// view used by `--verify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skid_overshoots: Option<u64>,
+
+    /// The detection sites' reports of those events, Reverie's and Detcore's
+    /// prehook's, which usually both report one event
+    /// (`reverie::take_skid_overshoot_count`). Present exactly when
+    /// `skid_overshoots` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skid_overshoot_reports: Option<u64>,
+
+    /// `false` when this execution was not reproducible from its seed and
+    /// configuration: a skid overshoot moved a preemption point in this run by
+    /// host interrupt latency. It describes this execution, never the seed: the
+    /// same seed can run clean once and overshoot the next time, so no seed is
+    /// classified by it. Absent otherwise, which claims nothing either way: an
+    /// absent field with `skid_overshoots: 0` means that no overshoot was
+    /// observed in this run, not that the seed reproduces it; see
+    /// [`RunSummary::record_skid_overshoots`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_reproducible: Option<bool>,
 }
 
 /// The full human-readable report, including recorded launch configuration.
@@ -228,6 +256,22 @@ impl RunSummary {
     pub fn syscall_histogram_is_consistent(&self) -> Option<bool> {
         let histogram = self.syscall_histogram.as_ref()?;
         Some(Some(histogram.total_calls()) == self.syscalls)
+    }
+
+    /// Records the skid-overshoot `events` of a run whose backend has precise
+    /// PMU timers, and the `reports` of them by its detection sites; there
+    /// are events exactly when there are reports. Any report means a
+    /// preemption point of this execution moved by host interrupt latency, so
+    /// its seed does not reproduce this execution; another run of the same
+    /// seed may not overshoot. None proves no more than that no overshoot was
+    /// observed in this run: it is no reproducibility guarantee, and a relaxed
+    /// configuration may still not be reproducible, so `seed_reproducible` is
+    /// then left absent rather than set to `true`.
+    pub fn record_skid_overshoots(&mut self, events: u64, reports: u64) {
+        debug_assert!(events <= reports && (events > 0) == (reports > 0));
+        self.skid_overshoots = Some(events);
+        self.skid_overshoot_reports = Some(reports);
+        self.seed_reproducible = (reports > 0).then_some(false);
     }
 
     pub fn info<'a>(&'a self, reprio_description: Option<&'a str>) -> RunSummaryInfo<'a> {
@@ -262,6 +306,9 @@ impl RunSummary {
             preemption,
             dispatch_stats: _,
             syscall_histogram: _,
+            skid_overshoots,
+            skid_overshoot_reports,
+            seed_reproducible: _,
         } = self;
         writeln!(f, "Final thread-tree was: {}", threads_descrip)?;
         writeln!(
@@ -288,6 +335,21 @@ impl RunSummary {
 
         if include_report_metadata && let Some(preemption) = preemption {
             writeln!(f, "{preemption}")?;
+        }
+        if include_report_metadata
+            && let Some(events) = skid_overshoots.filter(|&events| events > 0)
+        {
+            let reports = match skid_overshoot_reports {
+                Some(reports) if *reports != events => format!(" ({reports} reports)"),
+                _ => String::new(),
+            };
+            writeln!(
+                f,
+                "Skid overshoots: {events} event(s){reports}; a precise timer took effect past \
+                 its programmed branch count, so this run is not reproducible from its seed \
+                 (the overshoot moved a preemption point in this execution; another run of the \
+                 same seed may not overshoot)"
+            )?;
         }
 
         if let Some(txt) = desync_descrip {
@@ -487,6 +549,69 @@ mod tests {
         value["preemption"] = serde_json::Value::Null;
         let parsed: RunSummary = serde_json::from_value(value).unwrap();
         assert_eq!(parsed.preemption, None);
+    }
+
+    // A summary records skid-overshoot events and their reports only where
+    // a backend counted them. Any marks the run as not reproducible from its
+    // seed, in the JSON and in the full report, which names the reports when
+    // they outnumber the events; none leaves `seed_reproducible` absent,
+    // which claims nothing. The INFO view `--verify` compares never shows
+    // them.
+    #[test]
+    fn skid_overshoots_mark_a_run_not_reproducible_from_its_seed() {
+        let baseline = RunSummary::default();
+        let value = serde_json::to_value(&baseline).unwrap();
+        assert!(value.get("skid_overshoots").is_none());
+        assert!(value.get("skid_overshoot_reports").is_none());
+        assert!(value.get("seed_reproducible").is_none());
+
+        let mut clean = baseline.clone();
+        clean.record_skid_overshoots(0, 0);
+        let value = serde_json::to_value(&clean).unwrap();
+        assert_eq!(value["skid_overshoots"], 0);
+        assert_eq!(value["skid_overshoot_reports"], 0);
+        assert!(value.get("seed_reproducible").is_none());
+        assert_eq!(clean.to_string(), baseline.to_string());
+
+        // Three events, each reported by Reverie and by Detcore's prehook.
+        let mut overshot = baseline.clone();
+        overshot.record_skid_overshoots(3, 6);
+        let value = serde_json::to_value(&overshot).unwrap();
+        assert_eq!(value["skid_overshoots"], 3);
+        assert_eq!(value["skid_overshoot_reports"], 6);
+        assert_eq!(value["seed_reproducible"], false);
+        let parsed: RunSummary = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.skid_overshoots, Some(3));
+        assert_eq!(parsed.skid_overshoot_reports, Some(6));
+        assert_eq!(parsed.seed_reproducible, Some(false));
+        assert!(
+            overshot.to_string().contains(
+                "Skid overshoots: 3 event(s) (6 reports); a precise timer took effect past its \
+                 programmed branch count, so this run is not reproducible from its seed (the \
+                 overshoot moved a preemption point in this execution; another run of the same \
+                 seed may not overshoot)\n"
+            ),
+            "{overshot}"
+        );
+        assert_eq!(
+            overshot.info(None).to_string(),
+            baseline.info(None).to_string()
+        );
+
+        // One site alone reported each event.
+        let mut single = baseline.clone();
+        single.record_skid_overshoots(2, 2);
+        let value = serde_json::to_value(&single).unwrap();
+        assert_eq!(value["skid_overshoots"], 2);
+        assert_eq!(value["skid_overshoot_reports"], 2);
+        assert_eq!(value["seed_reproducible"], false);
+        assert!(
+            single.to_string().contains(
+                "Skid overshoots: 2 event(s); a precise timer took effect past its programmed \
+                 branch count"
+            ),
+            "{single}"
+        );
     }
 
     #[test]

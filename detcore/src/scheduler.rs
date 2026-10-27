@@ -16480,6 +16480,10 @@ impl Scheduler {
                 syscall_histogram: Some(
                     syscall_histogram.summary(SyscallObservationScope::Complete),
                 ),
+                // The backend's precise timers count these.
+                skid_overshoots: None,
+                skid_overshoot_reports: None,
+                seed_reproducible: None,
             },
             info_reprio_descrip,
         ))

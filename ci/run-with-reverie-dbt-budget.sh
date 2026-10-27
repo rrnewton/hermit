@@ -2833,7 +2833,7 @@ fi
 # content key are byte-identical by git object id:
 #     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# so the inventory, SDK and native inputs, calibrated budget, job width
+# so the inventory (1015), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the 394619b9 entry.
 # CARRY TO ad1af8514f172ae05337837ce9f24f448f04059a (2026-10-26): from
 # f443afab11361467fdf6560171bb3f588164880e. One commit (coordinator): the
@@ -2846,7 +2846,7 @@ fi
 # to the DynamoRIO content key are byte-identical by git object id:
 #     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# so the inventory, SDK and native inputs, calibrated budget, job width
+# so the inventory (1015), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the f443afab entry.
 # CARRY TO a28d74243feca0fd7231a4baf0da3de7658dc39f (2026-10-27): from
 # ad1af8514f172ae05337837ce9f24f448f04059a. Two commits: 537a01f3 (an import of exported
@@ -2860,7 +2860,7 @@ fi
 # object id:
 #     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# so the inventory, SDK and native inputs, calibrated budget, job width
+# so the inventory (1015), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the ad1af851 entry.
 # CARRY TO a131082c93759d2666984a639e6d02813cd16e23 (2026-10-27): from
 # ad1af8514f172ae05337837ce9f24f448f04059a. The 0.5.4 release updates package
@@ -2999,7 +2999,17 @@ fi
 # rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
 # calibrated budget, job width and limits carry unchanged from the 38c3e024
 # entry.
-expected_pin=a13d020537c0e510bd3209af4f0ebc22e4e66152
+# CARRY TO 86dcfc5d3258bb38c1f6aac45994b19af4cb4d36 (2026-10-27): from
+# a13d020537c0e510bd3209af4f0ebc22e4e66152. Four commits on a13d0205: Reverie #1151 (each skid overshoot a precise timer detects is also recorded as a SkidOvershootDetail, take_skid_overshoot_details, and skid_overshoot_count() reads the count without resetting it), the LiteInst artifact's catalog row for reverie/src/pmu_config.rs refreshed to match, and two CI workflow changes.
+# They change .github/workflows/ci.yml, reverie-liteinst-artifact/src/lib.rs, reverie-ptrace/src/plain_guest_regression_tests.rs, reverie-ptrace/src/timer.rs, reverie/src/pmu_config.rs, reverie/src/timer.rs only. git diff is empty
+# under reverie-dbt/ and third-party/ and for the root Cargo.toml, Cargo.lock
+# and rust-toolchain.toml; both repository inputs to the DynamoRIO content key
+# are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory (1015), SDK and native inputs, calibrated budget, job width
+# and limits carry unchanged from the a13d0205 entry.
+expected_pin=86dcfc5d3258bb38c1f6aac45994b19af4cb4d36
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
