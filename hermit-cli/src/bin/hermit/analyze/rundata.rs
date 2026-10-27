@@ -393,9 +393,20 @@ impl RunData {
     /// container, whose `/tmp` is private: a workspace under host `/tmp` is
     /// bound into it. One elsewhere (`--tmp-dir`) is visible as it is, and a
     /// bind of it would only make every trial warn that the bind has no
-    /// effect (`hermit run` honors binds under `/tmp` alone).
+    /// effect (`hermit run` honors binds under `/tmp` alone). Where the
+    /// workspace is is decided on its canonical path, so a relative path or a
+    /// symlink into `/tmp` is bound, and one under `/tmp` that leads out of it
+    /// is not.
     fn runopts_add_binds(aopts: &AnalyzeOpts, runopts: &mut RunOpts) -> anyhow::Result<()> {
         let workspace = aopts.get_tmp()?;
+        let workspace = std::fs::canonicalize(workspace)
+            .or_else(|_| std::path::absolute(workspace))
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot resolve the workspace {}: {error}",
+                    workspace.display()
+                )
+            })?;
         if workspace.starts_with("/tmp") {
             runopts
                 .bind
@@ -1727,6 +1738,27 @@ mod tests {
 
         options.tmp_dir = Some(PathBuf::from("/home/someone/analyze-ws/hermit_analyzeXYZ"));
         assert!(binds(&options).is_empty(), "visible as it is");
+
+        // Where the workspace really is decides. A relative path to a
+        // directory under /tmp is bound, as its canonical path.
+        let under_tmp = tempfile::Builder::new()
+            .prefix("hermit_analyze_bind")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let canonical = std::fs::canonicalize(under_tmp.path()).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+        assert!(canonical.starts_with("/tmp"), "{}", canonical.display());
+        let relative = PathBuf::from("../".repeat(cwd.components().count() - 1))
+            .join(canonical.strip_prefix("/").unwrap());
+        assert!(relative.is_relative());
+        options.tmp_dir = Some(relative);
+        assert_eq!(binds(&options), [canonical.to_str().unwrap()]);
+        // A symlink under /tmp that leads out of it is not: the workspace is
+        // visible where it really is.
+        let link = canonical.join("out-of-tmp");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        options.tmp_dir = Some(link);
+        assert!(binds(&options).is_empty(), "{:?}", binds(&options));
     }
 
     #[test]
