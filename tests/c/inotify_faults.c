@@ -20,7 +20,11 @@
 // and after more than 64 KiB of events. An IN_IGNORED event, whose cookie is
 // 0, cut inside its cookie leaves the zeros Linux wrote. A readv whose second
 // iovec overlaps its first but receives nothing leaves its first iovec's
-// events as they were returned.
+// events as they were returned. A copy that runs on through a write-only page
+// keeps a rename's two cookies equal. And a read that Linux refuses before it
+// reads the queue (a count past the end of the address space, a bad later
+// iovec, an iovec array the guest cannot read) leaves the buffer exactly as
+// it was, events already there included, and the queue full.
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -31,6 +35,7 @@
 #include <string.h>
 #include <sys/inotify.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -87,6 +92,41 @@ static int faults(int fd, char *at, size_t count) {
   return read(fd, at, count) == -1 && errno == EFAULT;
 }
 
+// Reads that Linux refuses before it reads the queue of `fd`, which holds
+// `queued` bytes, into a buffer that holds `stale` (earlier events, cookies
+// included): a count that runs past the end of the address space, a second
+// iovec there, and an iovec array the guest cannot read. Each must fail with
+// EFAULT and leave the buffer and the queue as they were.
+static void refused_before_copy(int fd, const char *stale, size_t queued, const char *kind,
+                                int *all) {
+  char buffer[4 * EVENT] __attribute__((aligned(8)));
+  char what[160];
+  memcpy(buffer, stale, sizeof buffer);
+  // The raw call: the C library's declaration lets the compiler refuse a
+  // count larger than the buffer, which is the point here.
+  int ok = syscall(SYS_read, fd, buffer, (size_t)1 << 62) == -1 && errno == EFAULT;
+  snprintf(what, sizeof what, "%s: a read whose count runs past the address space fails with EFAULT and leaves the buffer", kind);
+  report(what, ok && memcmp(buffer, stale, sizeof buffer) == 0, all);
+
+  struct iovec bad[2] = {{buffer, sizeof buffer}, {(void *)0xffff800000000000ull, EVENT}};
+  ok = readv(fd, bad, 2) == -1 && errno == EFAULT;
+  snprintf(what, sizeof what, "%s: a readv with a second iovec outside the address space fails with EFAULT and leaves the buffer", kind);
+  report(what, ok && memcmp(buffer, stale, sizeof buffer) == 0, all);
+
+  struct iovec *hidden = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (hidden == MAP_FAILED) exit(4);
+  hidden[0] = (struct iovec){buffer, sizeof buffer};
+  if (mprotect(hidden, page, PROT_NONE) != 0) exit(4);
+  ok = readv(fd, hidden, 1) == -1 && errno == EFAULT;
+  snprintf(what, sizeof what, "%s: a readv whose iovec array the guest cannot read fails with EFAULT and leaves the buffer", kind);
+  report(what, ok && memcmp(buffer, stale, sizeof buffer) == 0, all);
+
+  char *all_events = malloc(queued + EVENT);
+  snprintf(what, sizeof what, "%s: the queue still holds every event", kind);
+  report(what, all_events && read(fd, all_events, queued + EVENT) == (ssize_t)queued, all);
+  free(all_events);
+}
+
 int main(void) {
   int all = 1;
   page = sysconf(_SC_PAGESIZE);
@@ -100,7 +140,7 @@ int main(void) {
   // them whole; the others read them into buffers that end early. O sees
   // only their IN_MOVED_FROM halves.
   int a = watch(), b = watch(), c = watch(), d = watch(), v = watch(), e = watch();
-  int o = watch_for(IN_MOVED_FROM);
+  int o = watch_for(IN_MOVED_FROM), x = watch();
   rename_in_dir("f0", "f1");
   rename_in_dir("f1", "f2");
   char whole[4 * EVENT] __attribute__((aligned(8)));
@@ -159,6 +199,9 @@ int main(void) {
   report("both have their renames' cookies",
          cookie_at(both) == c1 && cookie_at(both + EVENT) == c2, &all);
 
+  // X holds both renames' four events, and the buffer the events A read.
+  refused_before_copy(x, whole, sizeof whole, "nonblocking", &all);
+
   // An IN_IGNORED event, whose cookie is 0, read into a buffer that ends
   // inside its cookie: the bytes Linux wrote there are zeros.
   int g = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
@@ -173,7 +216,7 @@ int main(void) {
   // More than 64 KiB of events before the fault: the renames f2 -> f3 and
   // back, MANY times, read whole by A and into 18 pages, the last one
   // inaccessible, by M.
-  int m = watch();
+  int m = watch(), wo = watch();
   for (int i = 0; i < MANY; i++) rename_in_dir(i % 2 ? "f3" : "f2", i % 2 ? "f2" : "f3");
   size_t size = (size_t)2 * MANY * EVENT;
   char *reference = malloc(size);
@@ -185,6 +228,19 @@ int main(void) {
   report("a read that faults after more than 64 KiB of events fails with EFAULT", ok, &all);
   report("its first and last whole events have the renames' cookies",
          ok && cookie_at(at) == cookie_at(reference) && cookie_at(at + last) == cookie_at(reference + last),
+         &all);
+
+  // 42 writable bytes, then a write-only page, then an inaccessible one: the
+  // copy runs on through the write-only page and faults after 4,138 bytes.
+  // The second event's cookie, split by the first page boundary, was copied
+  // whole, as its rename's first event's was.
+  at = edge(3, PROT_NONE, page + 42);
+  if (mprotect(at + 42, page, PROT_WRITE) != 0) return 4;
+  report("a read that faults after a write-only page fails with EFAULT",
+         faults(wo, at, 42 + page + 64), &all);
+  report("the rename split by the page boundary keeps one cookie in both events",
+         (mask_at(at) & IN_MOVED_FROM) && (mask_at(at + EVENT) & IN_MOVED_TO) &&
+             cookie_at(at) == cookie_at(at + EVENT),
          &all);
 
   snprintf(path, sizeof path, "%s/f2", dir);
