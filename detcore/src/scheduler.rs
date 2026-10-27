@@ -4199,7 +4199,8 @@ impl Scheduler {
             let writer = PreemptionWriter::new(cfg.record_preemptions_to.clone())
                 .with_epoch(cfg.epoch)
                 .with_pipe_wake_latency(cfg.pipe_wake_latency_in_effect())
-                .with_signal_state_copy(cfg.signal_state_copy);
+                .with_signal_state_copy(cfg.signal_state_copy)
+                .with_guest_ids(cfg.guest_ids);
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -16241,6 +16242,8 @@ impl Scheduler {
                 syscall_histogram: Some(
                     syscall_histogram.summary(SyscallObservationScope::Complete),
                 ),
+                guest_ids: None,
+                host_id_tasks: 0,
             },
             info_reprio_descrip,
         ))

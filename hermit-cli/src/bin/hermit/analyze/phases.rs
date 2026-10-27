@@ -781,6 +781,7 @@ impl AnalyzeOpts {
         .into_iter()
         .filter_map(|(option, path)| Some((option, path?)))
         .collect();
+        Self::refuse_recordings_numbered_apart(&recordings)?;
         self.adopt_recorded_epoch(&recordings)?;
         self.refuse_recordings_under_another_pipe_wake_latency(&recordings)
     }

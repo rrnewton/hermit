@@ -1055,6 +1055,7 @@ mod tests {
         ("replay-networking", &["--replay-networking=/tmp/old.trace"]),
         ("namespace-only", &["--lite"]),
         ("no-namespace", &["--core-only"]),
+        ("pid-base", &["--no-namespace", "--pid-base=4000"]),
         ("strace-only", &["--strace-only"]),
         ("tmp", &["--tmp=/tmp/guest tmp"]),
         ("image", &["--image=docker.io/library/busybox@sha256:00"]),

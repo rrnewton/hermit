@@ -760,6 +760,14 @@ pub struct Config {
     #[clap(skip)]
     pub has_uts_namespace: bool,
 
+    /// How the guest's process and thread IDs are numbered
+    /// ([`GuestIds`](crate::pid::GuestIds)). The host sets it, not a flag:
+    /// `hermit run` from `--no-namespace` and `--pid-base`. Recorded schedules
+    /// store it, and a replay under another numbering is refused.
+    #[serde(default)]
+    #[clap(skip)]
+    pub guest_ids: crate::pid::GuestIds,
+
     /// **Internal:** Path to the replay data folder.
     #[clap(skip)]
     pub replay_data: Option<PathBuf>,
@@ -2796,7 +2804,9 @@ mod legacy_backend_json {
     /// as unset.
     /// `signal_at` came after the form froze; the scheduler acts on it, not
     /// the runtime, so it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 25] = [
+    /// `guest_ids` came after it too: DBT numbers its guest itself, so it is
+    /// never written and reads as `GuestIds::Namespace`, its serde default.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 26] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -2822,6 +2832,7 @@ mod legacy_backend_json {
         "work_span_report",
         "signal_at",
         "in_guest_signal_delivery",
+        "guest_ids",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -2996,6 +3007,14 @@ mod legacy_backend_json {
                     .deserialize(serde_json::Value::Null)
                     .map(Some)
                     .map_err(<A::Error as de::Error>::custom),
+                // Numbered by a PID namespace, as its serde default is.
+                Some("guest_ids") => {
+                    let namespace = serde_json::to_value(crate::pid::GuestIds::Namespace)
+                        .map_err(<A::Error as de::Error>::custom)?;
+                    seed.deserialize(namespace)
+                        .map(Some)
+                        .map_err(<A::Error as de::Error>::custom)
+                }
                 // Unknown, as its serde default is.
                 Some("inherited_seccomp") => {
                     let unknown = serde_json::to_value(super::InheritedSeccomp::Unknown)
@@ -3266,7 +3285,8 @@ mod legacy_backend_json {
                 | "signal_delivery_check_fatal"
                 | "work_span_report"
                 | "signal_at"
-                | "in_guest_signal_delivery" => Ok(()),
+                | "in_guest_signal_delivery"
+                | "guest_ids" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -3994,7 +4014,8 @@ mod tests {
                 | "signal_delivery_check_fatal"
                 | "work_span_report"
                 | "signal_at"
-                | "in_guest_signal_delivery" => {}
+                | "in_guest_signal_delivery"
+                | "guest_ids" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -4013,11 +4034,11 @@ mod tests {
         // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`, `cpu_profile_source`,
         // `signal_state_copy`, `container_mount_table`,
         // `mountinfo_mount_namespace`, `signal_delivery_check_fatal`,
-        // `work_span_report`, `signal_at` and `in_guest_signal_delivery`
-        // and `strict_schedule_boundaries` none: fourteen more keys and
-        // twenty-four fewer, so ten keys fewer than fields.
+        // `work_span_report`, `signal_at`, `in_guest_signal_delivery` and
+        // `guest_ids` and `strict_schedule_boundaries` none: fourteen more
+        // keys and twenty-five fewer, so eleven keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 10);
+        assert_eq!(fields.len(), keys.len() + 11);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -4256,6 +4277,40 @@ mod tests {
             !from_legacy_backend_json(&array)
                 .unwrap()
                 .guest_may_inherit_a_terminal
+        );
+    }
+
+    /// `guest_ids` never enters the legacy form, whatever its value: the
+    /// legacy string keeps its bytes, and it reads back as numbered by a PID
+    /// namespace from both the object and the array form.
+    #[test]
+    fn the_guest_numbering_never_enters_the_legacy_form() {
+        let namespace = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let chosen = Config {
+            guest_ids: crate::pid::GuestIds::Chosen {
+                base: 5000,
+                refuse_host_ids: true,
+            },
+            ..namespace.clone()
+        };
+        let json = to_legacy_backend_json(&chosen).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&namespace).unwrap());
+        assert!(!json.contains("guest_ids"), "{json}");
+        assert_eq!(
+            from_legacy_backend_json(&json).unwrap().guest_ids,
+            crate::pid::GuestIds::Namespace
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert_eq!(
+            from_legacy_backend_json(&array).unwrap().guest_ids,
+            crate::pid::GuestIds::Namespace
         );
     }
 

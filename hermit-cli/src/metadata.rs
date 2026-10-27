@@ -1166,6 +1166,8 @@ fn record_or_replay_config_with_timer_support(
         // Not measured for record and replay.
         inherited_seccomp: detcore::InheritedSeccomp::Unknown,
         has_uts_namespace: true,
+        // A recording runs in a PID namespace of its own.
+        guest_ids: detcore::GuestIds::Namespace,
         // The path to the directory where syscalls will be recorded.
         replay_data: Some(data.to_path_buf()),
         clock_multiplier: None,

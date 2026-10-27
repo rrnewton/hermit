@@ -2377,6 +2377,7 @@ fn signal_state_reads_leave_no_status_descriptor_in_the_guest() {
 }
 
 static SESSION_CONTAINMENT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static CHOSEN_GUEST_IDS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 
 fn session_containment_guest() -> &'static Path {
     SESSION_CONTAINMENT_GUEST.get_or_init(|| {
@@ -8252,6 +8253,371 @@ fn assert_unplanned_table(what: &str, mountinfo: &str, cwd: &Path) -> Vec<String
         );
     }
     shown
+}
+
+fn chosen_guest_ids_guest() -> &'static Path {
+    CHOSEN_GUEST_IDS_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("chosen-guest-ids");
+        fs::create_dir_all(&build_root).expect("failed to create chosen-guest-ids directory");
+        let guest = build_root.join("chosen_guest_ids");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/chosen_guest_ids.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile chosen_guest_ids");
+        assert!(
+            output.status.success(),
+            "chosen_guest_ids compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// `hermit run --no-namespace <args> -- chosen_guest_ids <guest_args>` as
+/// the init of a new user and PID namespace with its own /proc, where it may
+/// choose process IDs without privilege on the host, and which no other task
+/// shares, so the IDs half of `pid_max` up are free.
+fn no_namespace_in_own_pid_namespace(args: &[&str], guest_args: &[&str]) -> Output {
+    let mut command = Command::new("unshare");
+    command
+        .args(OWN_PID_NAMESPACE)
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--no-namespace", "--base-env=minimal"])
+        .args(args)
+        .arg("--")
+        .arg(chosen_guest_ids_guest())
+        .args(guest_args);
+    let label = format!("{command:?}");
+    hermit_test::hermit_output(&label, &mut command)
+}
+
+/// `unshare`'s arguments for a user, PID, mount and network namespace of the
+/// test's own: its PIDs are its own to choose, and so are the abstract socket
+/// names `--no-namespace` reserves ID windows by, which concurrent tests would
+/// otherwise share.
+const OWN_PID_NAMESPACE: [&str; 7] = [
+    "--user",
+    "--map-root-user",
+    "--pid",
+    "--fork",
+    "--mount",
+    "--mount-proc",
+    "--net",
+];
+
+/// Two `--no-namespace` runs started together in one PID namespace reserve
+/// different windows of IDs, so neither collides with the other: both
+/// succeed, each with its own base and its guest's IDs following it.
+#[test]
+fn no_namespace_concurrent_runs_take_different_windows() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let hermit = env!("CARGO_BIN_EXE_hermit");
+    let guest = chosen_guest_ids_guest().to_str().unwrap().to_owned();
+    let run = |name: &str| {
+        let out = directory.path().join(name).display().to_string();
+        format!(
+            "{hermit} run --no-namespace --base-env=minimal -- {guest} >{out}.out 2>{out}.err & "
+        )
+    };
+    let script = format!(
+        "{}A=$!; {}B=$!; wait $A; ra=$?; wait $B; rb=$?; echo $ra $rb",
+        run("a"),
+        run("b")
+    );
+    let mut command = Command::new("unshare");
+    command.args(OWN_PID_NAMESPACE).args(["sh", "-c", &script]);
+    let label = format!("{command:?}");
+    let output = hermit_test::hermit_output(&label, &mut command);
+    let read = |name: &str| fs::read_to_string(directory.path().join(name)).unwrap();
+    assert_eq!(
+        stdout(&output).trim(),
+        "0 0",
+        "a: {}\nb: {}",
+        read("a.err"),
+        read("b.err")
+    );
+    let base = |name: &str| {
+        let out = read(name);
+        assert!(out.contains("0 mismatches"), "{out}");
+        out.lines()
+            .find_map(|line| line.strip_prefix("first process "))
+            .expect("the guest prints its first process")
+            .parse::<i32>()
+            .unwrap()
+    };
+    let (a, b) = (base("a.out"), base("b.out"));
+    assert!(
+        (a - b).abs() >= 256,
+        "the runs took overlapping IDs: {a} and {b}"
+    );
+}
+
+/// Under `--no-namespace`, the guest's IDs are the base's and the next ones in
+/// creation order, through every way the guest learns one: the creating call's
+/// return value, the new task's own getpid or gettid, the settid words the
+/// kernel writes, /proc/self, and waitpid's and waitid's answers, for
+/// pthread_create, fork, vfork, a raw clone and a raw clone3. They are the
+/// same in both runs of `--verify --verify-strict`, logs included, which
+/// host IDs could not be (without the base, the first run of this guest in a
+/// test's PID namespace would have IDs from 2 up, hermit's own processes and
+/// threads interleaved). No relaxation but the missing `--strict`, which
+/// `--no-namespace` cannot take yet.
+#[test]
+fn no_namespace_guest_ids_follow_the_base_and_creation_order() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = directory.path().join("verify.json");
+    let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
+    let args = [
+        "--pid-base=5000",
+        "--verify",
+        "--verify-strict",
+        "--verify-json",
+        &report_arg,
+    ];
+    let output = no_namespace_in_own_pid_namespace(&args, &[]);
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "first process 5000\n\
+         main gettid +0\n\
+         /proc/self +0\n\
+         thread gettid +1\n\
+         thread gettid +2\n\
+         fork returned +3\n\
+         fork waitpid +3\n\
+         vfork returned +4\n\
+         vfork waitpid +4\n\
+         clone returned +5\n\
+         clone parent_tid word +5\n\
+         clone waitid si_pid +5\n\
+         clone3 returned +6\n\
+         clone3 waitpid +6\n\
+         0 mismatches\n"
+    );
+    let verdict: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+            .expect("parse the verification report");
+    assert_eq!(verdict["bitwise_parity"], true, "{verdict}");
+    let compared = &verdict["compared_log_messages"];
+    assert!(
+        compared["left"].as_u64().is_some_and(|count| count > 0)
+            && compared["left"] == compared["right"],
+        "compared no INFO messages: {verdict}"
+    );
+}
+
+/// The summary and the INFO log say how the guest was numbered.
+#[test]
+fn no_namespace_reports_its_guest_numbering() {
+    let output = no_namespace_in_own_pid_namespace(&["--pid-base=5000", "--summary"], &[]);
+    assert_success(&output, &["--pid-base=5000", "--summary"]);
+    assert!(
+        stderr(&output).contains(
+            "Guest process IDs: chosen by Hermit from 5000 in creation order (clone3 set_tid)"
+        ),
+        "{}",
+        stderr(&output)
+    );
+}
+
+/// A chosen ID that a task holds when the guest creates the task it was
+/// chosen for (here a process of the guest's own, made with clone3's set_tid
+/// on the next ID) ends a run that gave `--pid-base` with the policy-refusal
+/// status, naming the ID and its holder, before any task gets a host ID. A
+/// run that did not give it warns, that one task gets a host ID, the summary
+/// says the run's IDs are not deterministic, and its preemption record says
+/// its IDs came from the host, so a replay refuses it.
+#[test]
+fn no_namespace_refuses_a_taken_chosen_id_only_when_asked() {
+    let refused = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &["collide"]);
+    assert_eq!(
+        refused.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&refused),
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("ID 5003 is taken: process 5003 (chosen_guest_i"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(
+        !stdout(&refused).contains("fork returned"),
+        "{}",
+        stdout(&refused)
+    );
+
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let record = directory.path().join("preemptions.json");
+    let record_arg = format!("--record-preemptions-to={}", record.display());
+    let warned = no_namespace_in_own_pid_namespace(&["--summary", &record_arg], &["collide"]);
+    assert_success(&warned, &["collide"]);
+    assert!(
+        stderr(&warned).contains("got a host ID, not a chosen one: ID ")
+            && stderr(&warned).contains(
+                "1 task(s) got a host ID instead, so this run's process IDs are not deterministic"
+            )
+            && stdout(&warned).contains("0 mismatches"),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&warned),
+        stderr(&warned)
+    );
+    // The record says its IDs came from the host, so a replay refuses it.
+    let written = fs::read_to_string(&record).expect("read the preemption record");
+    assert!(written.contains("\"guest_ids\":\"Host\""), "{written}");
+}
+
+/// A `--pid-base` whose first IDs a task already holds (PID 1, this
+/// namespace's init) is refused before the guest starts, naming the holder.
+#[test]
+fn no_namespace_refuses_a_held_pid_base() {
+    let output = no_namespace_in_own_pid_namespace(&["--pid-base=1"], &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("--pid-base with --no-namespace needs the guest's process IDs")
+            && stderr(&output).contains("process 1 ("),
+        "{}",
+        stderr(&output)
+    );
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+}
+
+/// Under `--no-namespace` with chosen IDs, a preemption record replays: the
+/// replay takes the record's base without `--pid-base`, prints the same bytes,
+/// and follows the same schedule, which it records again event for event. A
+/// replay under another base is refused with the policy-refusal status, and so
+/// are a record whose IDs came from the host (its preemption record says so),
+/// which no replay could follow, a record that does not say how its guest was
+/// numbered, and a replay whose recorded window another run holds, naming the
+/// record. Not a PMU subject: the schedule compared here is the scheduler's
+/// own, with or without preemption points.
+#[test]
+fn no_namespace_preemption_records_replay_under_their_base() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = |name: &str| directory.path().join(name).display().to_string();
+    let record_arg = format!("--record-preemptions-to={}", path("recorded.json"));
+    let epoch = "--epoch=2026-01-01T00:00:00Z";
+    let recorded = no_namespace_in_own_pid_namespace(
+        &["--pid-base=5000", "--chaos", "--seed=3", epoch, &record_arg],
+        &[],
+    );
+    assert_success(&recorded, &["record"]);
+
+    let replay_arg = format!("--replay-preemptions-from={}", path("recorded.json"));
+    let again_arg = format!("--record-preemptions-to={}", path("replayed.json"));
+    let replayed = no_namespace_in_own_pid_namespace(&[epoch, &replay_arg, &again_arg], &[]);
+    assert_success(&replayed, &["replay"]);
+    assert_eq!(stdout(&replayed), stdout(&recorded));
+    let schedule = |name: &str| {
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path(name)).unwrap()).unwrap();
+        (
+            json["global"].clone(),
+            json["per_thread"].clone(),
+            json["guest_ids"].clone(),
+        )
+    };
+    let (global, per_thread, guest_ids) = schedule("recorded.json");
+    assert!(
+        global.as_array().is_some_and(|events| !events.is_empty()),
+        "{global}"
+    );
+    assert_eq!(guest_ids["Chosen"]["base"], 5000, "{guest_ids}");
+    assert_eq!(schedule("replayed.json"), (global, per_thread, guest_ids));
+
+    let elsewhere =
+        no_namespace_in_own_pid_namespace(&["--pid-base=6000", epoch, &replay_arg], &[]);
+    assert_eq!(
+        elsewhere.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{}",
+        stderr(&elsewhere)
+    );
+    assert!(
+        stderr(&elsewhere).contains("chosen by Hermit from 5000")
+            && stderr(&elsewhere).contains("chosen by Hermit from 6000"),
+        "{}",
+        stderr(&elsewhere)
+    );
+
+    // The collide case's host-ID task marks its record `Host`.
+    let host_record_arg = format!("--record-preemptions-to={}", path("host.json"));
+    let host = no_namespace_in_own_pid_namespace(&[epoch, &host_record_arg], &["collide"]);
+    assert_success(&host, &["collide"]);
+    let host_replay_arg = format!("--replay-preemptions-from={}", path("host.json"));
+    let refused = no_namespace_in_own_pid_namespace(&[epoch, &host_replay_arg], &["collide"]);
+    assert_eq!(
+        refused.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(
+        stderr(&refused).contains("host-assigned, different in every run")
+            && stderr(&refused).contains("no replay can follow it"),
+        "{}",
+        stderr(&refused)
+    );
+
+    // A record that does not say how its guest was numbered (a namespace
+    // run's, or one written before the field existed).
+    let mut json: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path("recorded.json")).unwrap()).unwrap();
+    json.as_object_mut().unwrap().remove("guest_ids");
+    fs::write(path("stripped.json"), json.to_string()).unwrap();
+    let stripped_arg = format!("--replay-preemptions-from={}", path("stripped.json"));
+    let stripped = no_namespace_in_own_pid_namespace(&[epoch, &stripped_arg], &[]);
+    assert_eq!(
+        stripped.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{}",
+        stderr(&stripped)
+    );
+    assert!(
+        stderr(&stripped).contains("numbered by the run's PID namespace"),
+        "{}",
+        stderr(&stripped)
+    );
+
+    // The recorded window held by another run, whose first process has the
+    // base: the replay cannot have it, and says why, naming the record.
+    let hermit = env!("CARGO_BIN_EXE_hermit");
+    let guest = chosen_guest_ids_guest().to_str().unwrap().to_owned();
+    // The holder's guest blocks reading a FIFO the script keeps open (a
+    // guest's sleep would end at once in virtual time).
+    let fifo = path("hold");
+    let script = format!(
+        "mkfifo {fifo} && exec 3<>{fifo}; \
+         {hermit} run --no-namespace --base-env=minimal --pid-base=5000 -- /bin/sh -c 'read x' \
+         <{fifo} >/dev/null 2>&1 & HOLDER=$!; sleep 2; \
+         {hermit} run --no-namespace --base-env=minimal {epoch} {replay_arg} -- {guest}; \
+         echo rc=$?; echo >&3; wait $HOLDER"
+    );
+    let mut command = Command::new("unshare");
+    command.args(OWN_PID_NAMESPACE).args(["sh", "-c", &script]);
+    let label = format!("{command:?}");
+    let held = hermit_test::hermit_output(&label, &mut command);
+    assert!(
+        stdout(&held).contains(&format!("rc={HERMIT_POLICY_REFUSAL_EXIT}"))
+            && stderr(&held).contains("needs exactly those IDs")
+            && stderr(&held).contains("recorded.json"),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&held),
+        stderr(&held)
+    );
 }
 
 /// `--no-namespace` runs the guest in Hermit's own namespace, where Hermit
@@ -14559,6 +14925,9 @@ fn incompatible_run_modes_fail_during_argument_parsing() {
     );
 }
 
+/// `--replay-schedule-from` and `--replay-preemptions-from` are not among
+/// these: a `--no-namespace` replay follows a record whose guest IDs Hermit
+/// chose, and is refused at run time otherwise (`replay_guest_ids_refusal`).
 #[test]
 fn no_namespace_rejects_container_only_options() {
     let cases = [
@@ -14569,8 +14938,6 @@ fn no_namespace_rejects_container_only_options() {
         "--network=local",
         "--network=host",
         "--tmp=/tmp/custom",
-        "--replay-schedule-from=/tmp/schedule.json",
-        "--replay-preemptions-from=/tmp/preemptions.json",
     ];
 
     for incompatible in cases {

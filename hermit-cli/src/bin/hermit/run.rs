@@ -1411,7 +1411,14 @@ pub struct RunOpts {
     /// Run syscall interception directly on the host without creating Linux namespaces or
     /// mounting an isolated `/tmp`. This is not a sandbox and must only be used with trusted
     /// guests. Host process, filesystem, and network state are shared, reducing determinism.
-    /// Schedule and preemption replay require stable namespace PIDs and are not supported.
+    /// A recorded schedule or preemption record replays only where Hermit chose the guest's
+    /// IDs, both when recording and when replaying: the replay takes the record's base (see
+    /// `--pid-base`) and is refused if it cannot have those IDs.
+    ///
+    /// Where Hermit may choose process IDs (as root, with CAP_CHECKPOINT_RESTORE or
+    /// CAP_SYS_ADMIN over the host's PID namespace), the guest's IDs do not come from the host:
+    /// see `--pid-base`. Otherwise the guest gets the host's next free IDs, which differ from run
+    /// to run, and Hermit warns.
     ///
     /// The guest's mount table (/proc/self/mountinfo, /proc/mounts) is not the host's: it
     /// lists the mounts holding the guest's working directory and the host /tmp, their
@@ -1431,12 +1438,53 @@ pub struct RunOpts {
             "network",
             "tmp",
             "namespace_only",
-            "analyze_networking",
-            "replay_schedule_from",
-            "replay_preemptions_from"
+            "analyze_networking"
         ]
     )]
     no_namespace: bool,
+
+    /// With `--no-namespace`, the process ID of the guest's first process. Every later process
+    /// or thread the guest creates gets the next ID, in the guest's own order of creation, and no
+    /// ID is given out twice, so the guest's process and thread IDs depend only on this base and
+    /// the guest itself, as a PID namespace's would. The kernel hands out exactly these IDs
+    /// (`clone3` with `set_tid`), so they are what the guest's own calls, `/proc` and futex owner
+    /// words show. Hermit must be allowed to choose IDs: root, or CAP_CHECKPOINT_RESTORE or
+    /// CAP_SYS_ADMIN over the host's PID namespace; so must the guest's tasks, so a guest that
+    /// gives those capabilities up gets host IDs from then on.
+    ///
+    /// The ID space is cut into aligned windows of 1024 IDs (256 where `pid_max` is above 65536),
+    /// and a run reserves the window or windows its IDs start in for as long as it runs, so two
+    /// Hermit runs on one host never take the same IDs. The reservation is an abstract Unix socket
+    /// named after the PID namespace and the window, so it covers runs that share a network
+    /// namespace; a run in another one can still take the same window, and the later run then
+    /// ends with status 122, naming the ID, when its first process cannot have it.
+    ///
+    /// Given explicitly (and under `--strict`, whose base is half of `pid_max` unless given), the
+    /// base is a requirement: before the run, Hermit checks that no host task holds one of the
+    /// window's IDs from it, that no other run holds its windows, and that it may choose IDs, and
+    /// refuses the run otherwise. During the run, a task that cannot have its ID (taken by a host
+    /// task meanwhile; a call Hermit cannot issue with a chosen ID, such as one under a seccomp
+    /// filter of the guest's own or in a PID namespace of the guest's) ends the run. Both refusals
+    /// exit with status 122 and name the cause.
+    ///
+    /// Without this option, the run takes the first window no host task holds and no other run
+    /// has reserved, starting just behind the kernel's PID allocation cursor (so that host
+    /// processes reach it last) and going down, then from the top, and reports the base it took.
+    /// Such a run tolerates host IDs: a task that cannot have its chosen ID gets a host ID with a
+    /// warning, and the run's summary and preemption record say its IDs are not deterministic.
+    /// With no window left, the guest gets host IDs and Hermit warns. A guest that creates more
+    /// tasks than a window holds goes on into the next window. Needs the ptrace backend with
+    /// sequentialized threads.
+    ///
+    /// A replay of a record whose IDs were chosen (`--replay-preemptions-from`,
+    /// `--replay-schedule-from`) takes its base from the record, as if given here.
+    ///
+    /// For tooling: the same IDs come back in every run from the same base, and a window is free
+    /// for the next run as soon as one ends, so a process ID remembered from one run may name a
+    /// later run's guest. Check a remembered process's identity (a pidfd, its start time or its
+    /// command line) before signalling it.
+    #[clap(long, value_name = "pid", requires = "no_namespace")]
+    pid_base: Option<i32>,
 
     /// Run in a minimally invasive syscall-interception mode. Combine with `hermit --log=info` to
     /// print intercepted syscalls.
@@ -2077,6 +2125,9 @@ impl fmt::Display for RunOpts {
         if self.no_namespace {
             write!(f, " --no-namespace")?;
         }
+        if let Some(base) = self.pid_base {
+            write!(f, " --pid-base={base}")?;
+        }
         if self.summary {
             write!(f, " --summary")?;
         }
@@ -2383,6 +2434,111 @@ fn vmm_time_warning_silent_for_non_vmm_programs() {
             vmm_time_virtualization_warning(Path::new(program), &[], true).is_none(),
             "unexpected VMM warning for {program}"
         );
+    }
+}
+
+/// The guest IDs every trial of an analysis or bisection under
+/// `--no-namespace` uses, from those its first trial resolved: chosen IDs,
+/// with any task that cannot have its own refused rather than given a host ID
+/// that no replay could follow. Host IDs are refused.
+fn trial_guest_ids(
+    resolved: detcore_model::pid::GuestIds,
+) -> Result<detcore_model::pid::GuestIds, String> {
+    use detcore_model::pid::GuestIds;
+    match resolved {
+        GuestIds::Chosen { base, .. } => Ok(GuestIds::Chosen {
+            base,
+            refuse_host_ids: true,
+        }),
+        other => Err(format!(
+            "`hermit analyze` and `hermit bisect` under --no-namespace need guest process IDs \
+             that Hermit chooses, because their trials replay one another's records, and this \
+             trial's guest would be numbered {other}; the warning above names why Hermit could \
+             not choose them (no permission to, or no free window of IDs). Run as a user that \
+             may choose process IDs (CAP_CHECKPOINT_RESTORE or CAP_SYS_ADMIN) where a window of \
+             IDs is free, or with a PID namespace"
+        )),
+    }
+}
+
+#[test]
+fn trials_under_no_namespace_take_only_chosen_ids_and_refuse_host_ones() {
+    use detcore_model::pid::GuestIds;
+    for refuse_host_ids in [false, true] {
+        assert_eq!(
+            trial_guest_ids(GuestIds::Chosen {
+                base: 31744,
+                refuse_host_ids
+            }),
+            Ok(GuestIds::Chosen {
+                base: 31744,
+                refuse_host_ids: true
+            })
+        );
+    }
+    for other in [GuestIds::Host, GuestIds::Namespace] {
+        let refusal = trial_guest_ids(other).expect_err("only chosen IDs replay");
+        assert!(refusal.contains("CAP_CHECKPOINT_RESTORE"), "{refusal}");
+    }
+}
+
+/// Why a `--no-namespace` replay of a record whose guest numbering is
+/// `recorded` (named by `source`, an option and a path) is refused, when this
+/// run's numbering is `replay` (`None` before it is resolved), if it is. A
+/// replay follows a record only where Hermit chooses the guest's IDs and
+/// numbers them alike: never a record whose IDs came from the host, nor on a
+/// run whose own IDs Hermit does not choose (KVM and DBT number the guest
+/// themselves; without sequentialized threads the host does).
+fn replay_guest_ids_refusal(
+    source: &str,
+    recorded: detcore_model::pid::GuestIds,
+    replay: Option<detcore_model::pid::GuestIds>,
+) -> Option<String> {
+    use detcore_model::pid::GuestIds;
+    match (recorded, replay) {
+        (GuestIds::Host, _) => Some(format!(
+            "{source} was recorded with guest process IDs {recorded}. The record names every \
+             thread by its ID, so no replay can follow it. Record the run again under \
+             --no-namespace with --pid-base or --strict, which refuse a run whose IDs come from \
+             the host"
+        )),
+        (_, None) => None,
+        (_, Some(replay @ (GuestIds::Namespace | GuestIds::Host))) => Some(format!(
+            "{source} cannot be replayed under --no-namespace here: a --no-namespace replay \
+             follows a record only where Hermit chooses the guest's process IDs (the ptrace \
+             backend with sequentialized threads), and this run's would be {replay}"
+        )),
+        (recorded, Some(replay)) => {
+            detcore::preemptions::guest_ids_mismatch(source, recorded, replay)
+        }
+    }
+}
+
+#[test]
+fn no_namespace_replays_follow_only_records_whose_ids_were_chosen_alike() {
+    use detcore_model::pid::GuestIds;
+    let chosen = |base| GuestIds::Chosen {
+        base,
+        refuse_host_ids: true,
+    };
+    let refused = |recorded, replay| replay_guest_ids_refusal("rec", recorded, replay);
+    // A host-numbered record is refused before anything is resolved, and
+    // whatever the replay would be.
+    for replay in [None, Some(GuestIds::Host), Some(chosen(5000))] {
+        let refusal = refused(GuestIds::Host, replay).expect("a host-numbered record");
+        assert!(refusal.contains("no replay can follow it"), "{refusal}");
+    }
+    assert_eq!(refused(chosen(5000), None), None);
+    assert_eq!(refused(chosen(5000), Some(chosen(5000))), None);
+    assert!(refused(chosen(5000), Some(chosen(6000))).is_some());
+    // A namespace (or older) record, under a run whose IDs Hermit chooses.
+    assert!(refused(GuestIds::Namespace, Some(chosen(5000))).is_some());
+    // Runs whose IDs Hermit does not choose follow nothing.
+    for replay in [GuestIds::Namespace, GuestIds::Host] {
+        for recorded in [GuestIds::Namespace, chosen(5000)] {
+            let refusal = refused(recorded, Some(replay)).expect("not chosen here");
+            assert!(refusal.contains("only where Hermit chooses"), "{refusal}");
+        }
     }
 }
 
@@ -6592,6 +6748,36 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Refuse a replay whose guest would be numbered otherwise than the run
+    /// its record came from (`detcore::preemptions::guest_ids_mismatch`): a
+    /// record of a `--no-namespace` run names its threads by IDs that a
+    /// replay in a PID namespace does not give them. A replay runs in a PID
+    /// namespace: `--no-namespace` does not take either replay option.
+    fn refuse_replay_under_other_guest_ids(&self) -> Result<(), Error> {
+        if self.namespace_only || self.no_namespace {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        for (option, path) in [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            let recorded =
+                detcore::preemptions::read_recorded_guest_ids(path).map_err(Error::msg)?;
+            if let Some(refusal) = detcore::preemptions::guest_ids_mismatch(
+                &format!("{option} {}", path.display()),
+                recorded,
+                detcore::GuestIds::Namespace,
+            ) {
+                return Err(Error::new(PolicyRefusal).context(refusal));
+            }
+        }
+        Ok(())
+    }
+
     /// Point this run at an OCI image rootfs, as `--image` does.
     ///
     /// Used by `hermit oci run`, which resolves the user's reference to the
@@ -7368,6 +7554,7 @@ impl RunOpts {
         self.refuse_strict_with_host_drawn_inputs()?;
         self.refuse_replay_under_another_pipe_wake_latency()?;
         self.refuse_replay_under_another_signal_state_copy()?;
+        self.refuse_replay_under_other_guest_ids()?;
         if !self.namespace_only
             && (self.verify_verbose
                 || global
@@ -7635,6 +7822,7 @@ impl RunOpts {
             capture.require_initial(&command)?;
             self.native_exec_capture = Some(capture);
         }
+        self.resolve_guest_ids()?;
         self.warn_no_namespace();
 
         if self.namespace_only {
@@ -7735,6 +7923,19 @@ impl RunOpts {
             anyhow::bail!(
                 "--image chroots the guest into a materialized OCI rootfs, which requires mount \
                  and PID namespaces; it is incompatible with --no-namespace"
+            );
+        }
+        if self.pid_base.is_some() && self.runtime_backend() != Backend::Ptrace {
+            anyhow::bail!(
+                "--pid-base needs the ptrace backend, which creates the guest's tasks with the \
+                 chosen IDs; backend `{}` cannot",
+                backend.as_str()
+            );
+        }
+        if self.pid_base.is_some() && (self.no_sequentialize_threads || self.strace_only) {
+            anyhow::bail!(
+                "--pid-base needs sequentialized threads: without them, the order the guest's \
+                 tasks are created in, and so their IDs, is the host's"
             );
         }
         if self.image.is_some() && backend != Backend::Ptrace {
@@ -8212,10 +8413,14 @@ impl RunOpts {
                 "it puts every trial on the host network, so the trials are no longer reproducible",
             ),
             (
-                self.no_namespace,
+                // Trials replay one another's records, which name every thread
+                // by its ID: under --no-namespace only IDs Hermit chooses stay
+                // the same from trial to trial (`prepare_trial_guest_ids`).
+                self.no_namespace && super::guest_ids::may_choose_ids().is_err(),
                 "--no-namespace",
-                "every trial would share the host's processes, files and network, and schedule \
-                 and preemption replay, which the trials are, need stable namespace PIDs",
+                "Hermit cannot choose the guest's process IDs here, so every trial's guest would \
+                 get the host's next free IDs, and schedule and preemption replay, which the \
+                 trials are, need IDs that do not change from run to run",
             ),
             (
                 config.gdbserver,
@@ -9231,6 +9436,129 @@ impl RunOpts {
         #[cfg(not(all(feature = "exec-stop-launcher", feature = "liteinst")))]
         let _ = mapped_image;
         Ok(value)
+    }
+
+    /// Decide how the guest's process IDs are numbered (`guest_ids::resolve`).
+    /// Detcore reports it, at INFO level and in the run summary. Only the ptrace
+    /// backend can create a guest's tasks with chosen IDs; another backend
+    /// without a PID namespace gives its guest host IDs.
+    fn resolve_guest_ids(&mut self) -> Result<(), Error> {
+        // A replay under --no-namespace needs the record's IDs: its base,
+        // required as if given by --pid-base, so that a replay that cannot
+        // have them is refused, naming the record. A record no replay can
+        // follow is refused before anything is reserved or probed.
+        let replayed = self.no_namespace_replayed_guest_ids()?;
+        if let Some((source, recorded)) = &replayed
+            && let Some(refusal) = replay_guest_ids_refusal(source, *recorded, None)
+        {
+            return Err(Error::new(PolicyRefusal).context(refusal));
+        }
+        let required = match (&replayed, self.pid_base) {
+            (_, Some(base)) => Some(super::guest_ids::Required::PidBase(base)),
+            (Some((source, detcore_model::pid::GuestIds::Chosen { base, .. })), None) => {
+                Some(super::guest_ids::Required::Replay {
+                    source,
+                    base: *base,
+                })
+            }
+            _ => None,
+        };
+        let backend = self.runtime_backend();
+        let (ids, warning) =
+            if backend == Backend::Ptrace && self.det_opts.det_config.sequentialize_threads {
+                super::guest_ids::resolve(self.no_namespace, required, self.strict)?
+            } else if self.no_namespace
+                && matches!(
+                    backend,
+                    Backend::Ptrace | Backend::Liteinst | Backend::InGuestTrap | Backend::Sabre
+                )
+            {
+                // The guest's tasks are host tasks numbered by the host: unless
+                // threads are sequentialized, the order IDs would be chosen in is
+                // the host's too. KVM and DBT number the guest themselves.
+                (detcore_model::pid::GuestIds::Host, None)
+            } else {
+                (detcore_model::pid::GuestIds::Namespace, None)
+            };
+        if let Some((source, recorded)) = &replayed
+            && let Some(refusal) = replay_guest_ids_refusal(source, *recorded, Some(ids))
+        {
+            return Err(Error::new(PolicyRefusal).context(refusal));
+        }
+        if let Some(warning) = warning {
+            // Not `eprintln!`, which panics when stderr's reader has gone.
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "{warning}");
+        }
+        self.det_opts.det_config.guest_ids = ids;
+        Ok(())
+    }
+
+    /// Numbers a trial's guest as `RunOpts::main` does (`resolve_guest_ids`),
+    /// which a trial, started through `RunOpts::run`, would otherwise skip.
+    ///
+    /// Under `--no-namespace` the IDs are resolved once per process, by the
+    /// first trial, and every later trial reuses them: the window they start
+    /// in stays reserved for this process (`guest_ids::Reservation`), so a
+    /// second resolution would find it taken by this very analysis. Trials
+    /// replay one another's records, which name every thread by its ID, so
+    /// the IDs must be chosen: a first trial that would get host IDs is
+    /// refused, and so is any task that cannot have its chosen ID
+    /// (`refuse_host_ids`), instead of desyncing every replay after it. A
+    /// trial that replays a record with other IDs is refused as
+    /// `hermit run` refuses it.
+    ///
+    /// The memo has no key: it serves one analysis per process, as `hermit
+    /// analyze` and `hermit bisect` are, whose trials share every option that
+    /// numbers a guest. The window is not checked again for host tasks; one
+    /// that takes an ID in it during the analysis gets the trial whose task
+    /// needed that ID refused (`refuse_host_ids`), which ends the analysis.
+    pub(crate) fn prepare_trial_guest_ids(&mut self) -> Result<(), Error> {
+        use detcore_model::pid::GuestIds;
+        static RESOLVED: std::sync::Mutex<Option<GuestIds>> = std::sync::Mutex::new(None);
+        if !self.no_namespace {
+            return Ok(());
+        }
+        let mut resolved = RESOLVED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(ids) = *resolved {
+            if let Some((source, recorded)) = self.no_namespace_replayed_guest_ids()?
+                && let Some(refusal) = replay_guest_ids_refusal(&source, recorded, Some(ids))
+            {
+                return Err(Error::new(PolicyRefusal).context(refusal));
+            }
+            self.det_opts.det_config.guest_ids = ids;
+            return Ok(());
+        }
+        self.resolve_guest_ids()?;
+        let ids = trial_guest_ids(self.det_opts.det_config.guest_ids)
+            .map_err(|refusal| Error::new(PolicyRefusal).context(refusal))?;
+        self.det_opts.det_config.guest_ids = ids;
+        *resolved = Some(ids);
+        Ok(())
+    }
+
+    /// Under `--no-namespace`, the replayed record (`--replay-preemptions-from`
+    /// or `--replay-schedule-from`) and the guest IDs it was recorded with.
+    fn no_namespace_replayed_guest_ids(
+        &self,
+    ) -> Result<Option<(String, detcore_model::pid::GuestIds)>, Error> {
+        if !self.no_namespace {
+            return Ok(None);
+        }
+        let config = &self.det_opts.det_config;
+        let replayed = [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ]
+        .into_iter()
+        .find_map(|(option, path)| Some((option, path.as_ref()?)));
+        let Some((option, path)) = replayed else {
+            return Ok(None);
+        };
+        let recorded = detcore::preemptions::read_recorded_guest_ids(path).map_err(Error::msg)?;
+        Ok(Some((format!("{option} {}", path.display()), recorded)))
     }
 
     fn warn_no_namespace(&self) {
@@ -10462,6 +10790,10 @@ impl RunOpts {
         let program = self.e9patch_program.as_ref().unwrap_or(&self.program);
         let mut command = Command::new(program);
         command.args(&self.args);
+        // The guest's first process has the base ID; Detcore numbers the rest.
+        if let Some(base) = self.det_opts.det_config.guest_ids.base() {
+            command.pid(reverie::process::Pid::from_raw(base));
+        }
         if self.e9patch_program.is_some() {
             command.arg0(&self.program);
         }
