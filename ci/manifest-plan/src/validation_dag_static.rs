@@ -2003,7 +2003,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_order_of_events_opening_says_what_the_stacks_show,
     // a_realized_pair_says_why_the_schedules_were_not_followed,
     // stacks_a_shifted_replay_took_on_other_threads_are_left_out}: 1402.
-    ("test.hermit_unit", 1402),
+    // And analyze::phases::tests::{
+    // a_thread_created_at_the_boundary_is_passed_over_for_the_thread_it_moves,
+    // the_consumer_the_deciding_turn_moves_past_is_stack2,
+    // a_turn_that_runs_longer_names_its_thread_where_the_continuations_part,
+    // a_realized_pair_passes_over_a_creator_and_a_thread_start,
+    // a_creator_is_passed_over_only_when_it_only_finishes_creating_another_thread,
+    // phase6_takes_stack2_where_the_plan_says}: 1408.
+    ("test.hermit_unit", 1408),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6134,7 +6141,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 26 watch-stage tests: 1388.
     // And the same three: 1391.
     // And the same five report-stack tests: 1396.
-    ("test.hermit_unit_on_host", 1396),
+    // And the same six stack2 thread-choice tests: 1402.
+    ("test.hermit_unit_on_host", 1402),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
