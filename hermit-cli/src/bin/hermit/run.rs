@@ -4640,6 +4640,64 @@ fn replay_networking_reads_the_trace_before_the_guest_starts() {
     );
 }
 
+/// A preemption record whose change points for one thread are not strictly
+/// increasing in time is refused before the container starts, naming the
+/// record, the thread and the change point, instead of panicking the
+/// container child where Detcore reads it (rrnewton/hermit#4859). A valid
+/// record, and a run with no replayed record, pass.
+#[test]
+fn a_replayed_record_that_does_not_increase_is_refused_before_the_container() {
+    let dir = tempfile::tempdir().unwrap();
+    let write = |name: &str, times: [u64; 3]| {
+        let path = dir.path().join(name);
+        let rows: Vec<_> = times
+            .iter()
+            .map(|ns| serde_json::json!([ns, detcore::DEFAULT_PRIORITY]))
+            .collect();
+        let record = serde_json::json!({
+            "global": [],
+            "per_thread": {
+                "3": {
+                    "prio_changes": rows,
+                    "preemption_rcbs": [100, 100, 200],
+                    "final_prio": detcore::DEFAULT_PRIORITY,
+                }
+            }
+        });
+        std::fs::write(&path, record.to_string()).unwrap();
+        path
+    };
+    let refused = |path: &std::path::Path| {
+        let flag = format!("--replay-preemptions-from={}", path.display());
+        let ro = RunOpts::parse_from(["fakehermit", &flag, "fakeprog"]);
+        ro.refuse_an_invalid_replayed_record()
+    };
+
+    let bad = write("bad.json", [1_000, 2_500, 2_000]);
+    let error = refused(&bad).unwrap_err();
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    let text = format!("{error:#}");
+    assert!(
+        text.contains(&bad.display().to_string())
+            && text.contains("thread 3's change point 3 at")
+            && text.contains("is not after change point 2"),
+        "{text}"
+    );
+
+    assert!(refused(&write("good.json", [1_000, 2_000, 2_500])).is_ok());
+
+    // A truncated record is refused the same way, as is a missing one.
+    let truncated = dir.path().join("truncated.json");
+    let whole = std::fs::read(dir.path().join("good.json")).unwrap();
+    std::fs::write(&truncated, &whole[..whole.len() / 2]).unwrap();
+    let error = refused(&truncated).unwrap_err();
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    let error = refused(&dir.path().join("missing.json")).unwrap_err();
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    let ro = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    assert!(ro.refuse_an_invalid_replayed_record().is_ok());
+}
+
 #[test]
 fn replay_networking_adopts_the_trace_epoch_and_refuses_another() {
     let dir = tempfile::tempdir().unwrap();
@@ -8410,6 +8468,39 @@ impl RunOpts {
         self.det_opts.det_config.epoch.to_rfc3339()
     }
 
+    /// Refuses a `--replay-preemptions-from` or `--replay-schedule-from`
+    /// record that Detcore's loader would reject, before stdin is read or the
+    /// container starts: unreadable, not valid JSON, or failing its checks,
+    /// for example a thread whose change points are not strictly increasing
+    /// in time, as a hand edit or an edited knock-out trial can leave.
+    /// Detcore reads the record again in the container, where the same
+    /// rejection could only panic the container child
+    /// (rrnewton/hermit#4859). The refusal names the record and what is
+    /// wrong with it (the thread and change point, for an ordering error).
+    /// A record is parsed here once more than before; for a large
+    /// `--replay-schedule-from` that is a measurable but one-off cost.
+    fn refuse_an_invalid_replayed_record(&self) -> Result<(), Error> {
+        if self.namespace_only {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        let replayed = [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ];
+        for (flag, path) in replayed {
+            let Some(path) = path else { continue };
+            if let Err(error) = detcore::preemptions::boundary_recording::Recording::read(path) {
+                return Err(Error::new(PolicyRefusal).context(format!(
+                    "{flag}={}: Hermit cannot replay this record: {error:#}. Pass a complete \
+                     record Hermit wrote (re-record it), or correct the named entry.",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Start a replay from the virtual-time epoch its recording was made under.
     ///
     /// A preemption record stores absolute logical times, i.e. offsets from the
@@ -9668,6 +9759,9 @@ impl RunOpts {
         // Right after validation, which may have turned the preemption timer
         // off, and still before stdin is read or anything is launched.
         self.refuse_happens_before_without_preemption()?;
+        // Before the epoch read below, so an unreadable, unparsable or
+        // invalid replayed record is refused one way, whichever flag names it.
+        self.refuse_an_invalid_replayed_record()?;
         self.adopt_replayed_schedule_epoch()?;
         self.adopt_replayed_rng_seed()?;
         // After the replayed epoch is adopted, which makes an omitted epoch

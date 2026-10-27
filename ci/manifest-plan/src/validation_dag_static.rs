@@ -1890,7 +1890,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4619 adds seven hermit-run units: 1243 + 7 = 1250, re-measured at this integration head.
     // PR 4725 adds fourteen hermit-run units: 1250 + 14 = 1264, re-measured at this integration head.
     // PR 4679 adds eight hermit-run units: 1264 + 8 = 1272, re-measured at this integration head.
-    ("test.hermit_unit", 1272),
+    // PR 4865 adds one hermit-run unit: 1272 + 1 = 1273, re-measured at this integration head.
+    ("test.hermit_unit", 1273),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5876,7 +5877,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same seven PR 4619 units: 1237 + 7 = 1244.
     // The same fourteen PR 4725 units: 1244 + 14 = 1258.
     // The same eight PR 4679 units: 1258 + 8 = 1266.
-    ("test.hermit_unit_on_host", 1266),
+    // The same one PR 4865 unit: 1266 + 1 = 1267.
+    ("test.hermit_unit_on_host", 1267),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

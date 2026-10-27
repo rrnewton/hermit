@@ -592,13 +592,19 @@ impl PreemptionRecord {
                         if !is_ordinary_priority(*prio) {
                             return Err(format!(
                                 "preemption priority #{} for thread {} invalid: {}",
-                                count, tid, history.final_prio
+                                count, tid, prio
                             ));
                         }
                         if *ns <= last {
                             return Err(format!(
-                                "Timestamps failed to monotonically increase ({}), in series:\n {:?}",
-                                ns, history.prio_changes
+                                "thread {}'s change point {} at {} is not after change point {} \
+                                 at {} (counting from 1): a thread's change points must be \
+                                 strictly increasing in time",
+                                tid,
+                                count + 1,
+                                ns,
+                                count,
+                                last
                             ));
                         }
                     }
