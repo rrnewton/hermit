@@ -2980,7 +2980,10 @@ fi
 # rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
 # calibrated budget, job width and limits carry unchanged from the 38c3e024
 # entry.
-expected_pin=a90e2acd50051c1dbc5551001fad447b95678810
+# CARRY TO a13d020537c0e510bd3209af4f0ebc22e4e66152 (2026-10-27): from
+# a90e2acd50051c1dbc5551001fad447b95678810. LOCAL CONTROL ONLY, never committed for landing: Reverie
+# main without P2a, to learn whether Hermit main qualifies with it.
+expected_pin=a13d020537c0e510bd3209af4f0ebc22e4e66152
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
