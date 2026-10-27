@@ -1841,7 +1841,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1121, listed (1114 on main plus seven).
     // And the fourteen pinned_cpu::tests units, which choose the CPU a run is
     // pinned to (https://github.com/rrnewton/hermit/issues/4824): 1135, listed.
-    ("test.hermit_unit", 1136),
+    ("test.hermit_unit", 1160),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3044,7 +3044,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // copy only where the count proves it): 2691, listed.
     // And passthru_opt_intercepts_the_protection_key_calls (the inotify
     // fault path's protection-key record under --passthru-opt): 2692, listed.
-    ("test.detcore_unit", 2693),
+    ("test.detcore_unit", 2695),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4323,7 +4323,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity, the ptrace
     // halves of https://github.com/rrnewton/hermit/issues/4798's two run_kvm_
     // tests: 632 + 2 = 634.
-    ("test.cli", 634),
+    ("test.cli", 637),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4850,7 +4850,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed.
     // And the same two ptrace group-exit signal-wait tests, not excluded:
     // 551 + 2 = 553.
-    ("test.cli_on_host", 553),
+    ("test.cli_on_host", 556),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5313,7 +5313,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same 3c.1e B unit: 2682, listed.
     // And the same nine units for a read that faults: 2691, listed.
     // And the same protection-key subscription unit: 2692, listed.
-    ("test.detcore_unit_on_host", 2693),
+    ("test.detcore_unit_on_host", 2695),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5681,7 +5681,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.hermit_unit runs all seven: 1115, listed
     // (1114 on main plus one).
     // And the same fourteen pinned_cpu::tests units: 1129, listed.
-    ("test.hermit_unit_on_host", 1130),
+    ("test.hermit_unit_on_host", 1154),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
