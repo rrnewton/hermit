@@ -2174,7 +2174,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
             clone_plan => (
-                self.inject_clone_planned(guest, call, clone_plan).await,
+                self.inject_clone_planned(guest, call, clone_plan, is_vfork)
+                    .await,
                 None,
             ),
         };
