@@ -2965,7 +2965,7 @@ fi
 # so the SDK and native inputs, calibrated budget, job width and the 1050
 # effective-job-second limits carry unchanged from the 66196746 entry. This is
 # not whole-runtime equivalence or a new cold-SDK timing sample.
-# CARRY TO a90e2acd50051c1dbc5551001fad447b95678810 (2026-10-27): from
+# CARRY TO 180dc1285bce67de129e01f1230d435a8f852138 (2026-10-27): from
 # 38c3e024cae8063ff9d1433452b1d36b8c511133. Six commits. Three from
 # another team: 75520cbe (the ptracer host is checked again only after a
 # waker callback; reverie-ptrace/src/timer.rs and safeptrace), 016de7d3
@@ -2980,7 +2980,7 @@ fi
 # rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
 # calibrated budget, job width and limits carry unchanged from the 38c3e024
 # entry.
-expected_pin=a90e2acd50051c1dbc5551001fad447b95678810
+expected_pin=180dc1285bce67de129e01f1230d435a8f852138
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
