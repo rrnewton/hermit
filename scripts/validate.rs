@@ -3815,7 +3815,7 @@ fn self_test() -> Result<(), String> {
     // bracket accepts the real prefix, rejects deletion, and rejects the subtle
     // goalpost move of putting the same spelling in guest argv.
     for mode in LEGACY_BELOW_L2_STRICT_MODES {
-        let rendered = mode.run_args("whoami", "/tmp/nsswitch.conf");
+        let rendered = mode.run_args("whoami", "/tmp/nsswitch.conf", None);
         let guest_separator = rendered
             .iter()
             .position(|arg| arg == "--")
