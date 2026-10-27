@@ -110,6 +110,9 @@ mod tests {
         // Adds `GlobalRequest::StoreExclusive` and `GlobalResponse::StoreExclusive`
         // (https://github.com/rrnewton/hermit/pull/4740, renumbered to 11 at landing).
         (11, "8bb87305b1bd45a3", "dafaa96d8b8cb3ad"),
+        // Adds `GlobalRequest::CommitFatalDelivery`; removes `GlobalRequest::RecordFatalSignal`; adds `GlobalResponse::CommitFatalDelivery`; removes `GlobalResponse::RecordFatalSignal`
+        // (https://github.com/rrnewton/hermit/pull/4676, renumbered to 12 at landing).
+        (12, "ab01c6abb5daa6d7", "dafaa96d8b8cb3ad"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
