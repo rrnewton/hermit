@@ -10327,6 +10327,73 @@ fn no_namespace_refuses_a_taken_chosen_id_only_when_asked() {
     assert!(written.contains("\"guest_ids\":\"Host\""), "{written}");
 }
 
+/// Under an explicit base, an error Linux gives the guest's own clone stays
+/// its answer instead of ending the run: a clone with `CLONE_SIGHAND` but not
+/// `CLONE_VM` gets `EINVAL` from the rewritten `clone3` as from its own call;
+/// a guest `clone3` whose own `set_tid` points at nothing gets `EFAULT`, and
+/// one with `set_tid` but no size `EINVAL`, from the kernel.
+#[test]
+fn no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base() {
+    for (call, expected) in [
+        (&["sighand"][..], "clone(CLONE_SIGHAND): Invalid argument"),
+        (&["bad-tid"], "clone3 bad-tid: Bad address"),
+        (&["bad-size"], "clone3 bad-size: Invalid argument"),
+    ] {
+        let output = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], call);
+        assert_success(&output, call);
+        assert_eq!(
+            stdout(&output),
+            format!("{expected}\n"),
+            "{call:?}: {}",
+            stderr(&output)
+        );
+    }
+}
+
+/// A guest `clone3` with `CLONE_NEWPID` and its own `set_tid`: with two
+/// entries the array names its task's ID in Hermit's namespace too, so an
+/// explicit base runs it, and the task has that ID; with one, the kernel
+/// picks that ID, so an explicit base refuses the call before the task
+/// exists, and a default run gives the task a host ID, with a warning and the
+/// summary's count.
+#[test]
+fn no_namespace_takes_a_guest_set_tid_as_chosen_only_if_it_reaches_hermits_namespace() {
+    let both = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &["own-tid", "2"]);
+    assert_success(&both, &["own-tid", "2"]);
+    assert_eq!(
+        stdout(&both),
+        "clone3 own-tid: child +100, exit 0\n",
+        "{}",
+        stderr(&both)
+    );
+
+    let inner = no_namespace_in_own_pid_namespace(&["--pid-base=5000"], &["own-tid", "1"]);
+    assert_eq!(
+        inner.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&inner),
+        stderr(&inner)
+    );
+    assert!(
+        stderr(&inner).contains("its set_tid names 1 ID(s)"),
+        "{}",
+        stderr(&inner)
+    );
+    assert!(stdout(&inner).is_empty(), "{}", stdout(&inner));
+
+    let tolerant = no_namespace_in_own_pid_namespace(&["--summary"], &["own-tid", "1"]);
+    assert_success(&tolerant, &["own-tid", "1"]);
+    assert!(
+        stdout(&tolerant).starts_with("clone3 own-tid: child ")
+            && stdout(&tolerant).ends_with(", exit 0\n")
+            && stderr(&tolerant).contains("1 task(s) got a host ID instead"),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&tolerant),
+        stderr(&tolerant)
+    );
+}
+
 /// A `--pid-base` whose first IDs a task already holds (PID 1, this
 /// namespace's init) is refused before the guest starts, naming the holder.
 #[test]

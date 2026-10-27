@@ -1382,10 +1382,11 @@ pub struct RunOpts {
     #[clap(skip)]
     epoch_captured_from_host: bool,
 
-    /// How the host decided this `--no-namespace` run's guest IDs, if it did
-    /// (`resolve_guest_ids`): `free-window` for a base taken from the windows
-    /// free on this host, `host-ids` for the host's own IDs. A base given by
-    /// `--pid-base` or required by `--strict` is not drawn from the host.
+    /// Whether this `--no-namespace` run's guest ID base was drawn from the
+    /// host (`resolve_guest_ids`): `free-window` for a base taken from the
+    /// windows free on this host. A base given by `--pid-base` or required by
+    /// `--strict` is not; nor are the host's own IDs, which no rerun can
+    /// reproduce (the summary and the preemption record say `Host`).
     #[clap(skip)]
     guest_ids_drawn_from_host: Option<&'static str>,
 
@@ -1612,7 +1613,8 @@ pub struct RunOpts {
     ///
     /// The ID space is cut into aligned windows of 1024 IDs (256 where `pid_max` is above 65536),
     /// and a run reserves the window or windows its IDs start in for as long as it runs, so two
-    /// Hermit runs on one host never take the same IDs. The reservation is an abstract Unix socket
+    /// Hermit runs on one host do not start in the same IDs (IDs past those windows are not
+    /// reserved; see below). The reservation is an abstract Unix socket
     /// named after the PID namespace and the window, so it covers runs that share a network
     /// namespace; a run in another one can still take the same window, and the later run then
     /// ends with status 122, naming the ID, when its first process cannot have it.
@@ -3223,10 +3225,10 @@ impl RunOpts {
     }
 }
 
-/// How the host decided a `--no-namespace` run's guest IDs `ids`, if it did:
-/// `free-window` for a base taken from the windows free on this host (unless
-/// `--pid-base` or `--strict` `required` it), `host-ids` for the host's own
-/// IDs. `None` in a PID namespace.
+/// Whether a `--no-namespace` run's guest IDs `ids` have a base drawn from the
+/// host: `free-window` for a base taken from the windows free on this host,
+/// unless `--pid-base` or `--strict` `required` it. `None` for host IDs, which
+/// no rerun can reproduce, and in a PID namespace.
 fn guest_ids_drawn_from_host(
     no_namespace: bool,
     ids: detcore_model::pid::GuestIds,
@@ -3234,15 +3236,13 @@ fn guest_ids_drawn_from_host(
 ) -> Option<&'static str> {
     use detcore_model::pid::GuestIds;
     match ids {
-        _ if !no_namespace => None,
-        GuestIds::Host => Some("host-ids"),
-        GuestIds::Chosen { .. } if !required => Some("free-window"),
+        GuestIds::Chosen { .. } if no_namespace && !required => Some("free-window"),
         _ => None,
     }
 }
 
 #[test]
-fn a_base_or_host_ids_the_host_decided_are_host_drawn() {
+fn a_base_the_host_decided_is_host_drawn() {
     use detcore_model::pid::GuestIds;
     let chosen = GuestIds::Chosen {
         base: 7168,
@@ -3253,10 +3253,7 @@ fn a_base_or_host_ids_the_host_decided_are_host_drawn() {
         Some("free-window")
     );
     assert_eq!(guest_ids_drawn_from_host(true, chosen, true), None);
-    assert_eq!(
-        guest_ids_drawn_from_host(true, GuestIds::Host, false),
-        Some("host-ids")
-    );
+    assert_eq!(guest_ids_drawn_from_host(true, GuestIds::Host, false), None);
     assert_eq!(
         guest_ids_drawn_from_host(false, GuestIds::Namespace, false),
         None
@@ -13341,6 +13338,7 @@ impl RunOpts {
             [EPOCH_KEY] => "its epoch",
             [SEED_KEY] => "its seed",
             [manifest::MAX_TIMESLICE_KEY] => "its preemption timer setting",
+            [crate::run_config::PID_BASE_KEY] => "its guest process ID base",
             _ => "settings",
         };
         match recording {
@@ -13362,6 +13360,12 @@ impl RunOpts {
                         EPOCH_KEY => format!("--epoch={}", self.epoch_rfc3339()),
                         SEED_KEY => format!("--seed={}", self.seed_from_resolved.unwrap_or(0)),
                         manifest::MAX_TIMESLICE_KEY => "--max-timeslice=disabled".to_owned(),
+                        crate::run_config::PID_BASE_KEY => {
+                            match self.det_opts.det_config.guest_ids.base() {
+                                Some(base) => format!("--pid-base={base}"),
+                                None => String::new(),
+                            }
+                        }
                         other => format!("--{other}"),
                     })
                     .collect::<Vec<_>>()
