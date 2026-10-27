@@ -56,7 +56,8 @@ use super::insn::{self};
 /// The loop shapes this rewriter recognises.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Idiom {
-    /// `LDxXR; <alu>; STxXR; CBNZ` - read-modify-write.
+    /// `LDxXR; <alu>; STxXR; CBNZ` - read-modify-write, the ALU operation
+    /// possibly setting the flags (`SUBS` in Rust's `Arc` drop).
     Rmw,
     /// `LDxXR; STxXR; CBNZ` - unconditional store, that is, a swap.
     Swap,
@@ -93,6 +94,15 @@ pub enum Refusal {
     /// A relocation points into the sequence, so the loader writes those
     /// bytes itself, for the instruction that used to be there.
     Relocated,
+    /// `LDxXR Rt; CMP Rt, Re; B.NE out; <alu> Rv, ...; STxXR Ws, Rv; CBNZ`: a
+    /// compare-and-swap that computes the value it stores after the compare
+    /// (Rust's `futex_rwlock` read path and panic count). A CAS needs that
+    /// value in a register before it runs, and the only registers the
+    /// original changes on its mismatch path are Rt and the flags, both still
+    /// needed there; with six instructions to replace, there is no room to
+    /// restore another. Rewriting it needs a seventh instruction, or proof
+    /// that the failure path overwrites Rv before reading it.
+    NewValueAfterCompare,
 }
 
 /// A sequence the rewriter replaces, and its replacement.
@@ -254,25 +264,52 @@ fn match_sequence(
         } => (size, ord, rs, rt, rn),
         _ => unreachable!("caller matched a store-exclusive"),
     };
-    // The loop must close with `CBNZ Rs, <load>` right after the store.
+    // A compare-and-swap that computes its new value after the compare has
+    // no load within the three instructions any idiom spans, so nothing
+    // below could match it; name why it is left alone, wherever it retries.
+    if store >= 4
+        && matches!(decoded[store - 4], Insn::LoadExcl { rn: load_rn, .. } if load_rn == rn)
+        && matches!(decoded[store - 3], Insn::Cmp { .. })
+        && matches!(decoded[store - 2], Insn::CondBranch { cond: 1, .. })
+        && matches!(decoded[store - 1], Insn::Alu { rd, .. } if rd == rv)
+    {
+        return Err(Refusal::NewValueAfterCompare);
+    }
+    // The store must be followed by `CBNZ Rs, <retry>`, its failure path.
     let close = store + 1;
-    let (closes_loop, back) = match decoded.get(close) {
+    let retry = match decoded.get(close) {
         Some(&Insn::CompareBranch {
             nonzero: true,
             sf: false,
             rt,
             offset,
-        }) if rt == rs => (true, offset),
-        _ => (false, 0),
+        }) if rt == rs => close as i64 + offset / 4,
+        _ => return Err(Refusal::NotCanonical),
     };
-    if !closes_loop {
-        return Err(Refusal::NotCanonical);
-    }
-    let start_isize = close as i64 + back / 4;
-    if start_isize < 0 || start_isize as usize >= store {
-        return Err(Refusal::NotCanonical);
-    }
-    let start = start_isize as usize;
+    // The canonical loop retries at its own load. A loop that retries
+    // elsewhere, such as Rust's `fetch_update` around a weak
+    // compare-exchange (which recomputes the new value from the one it read
+    // before trying again), starts at the nearest load-exclusive before the
+    // store, at most three instructions back, the longest idiom. Where the
+    // retry goes does not matter to the replacement: the retry runs only
+    // when the store-exclusive fails, and the atomic never does, so every
+    // execution of the replacement is one in which the original's first
+    // store-exclusive succeeded. A retry into the sequence after its first
+    // instruction would be entered part-way, and is refused.
+    let start = if (0..store as i64).contains(&retry)
+        && matches!(decoded[retry as usize], Insn::LoadExcl { .. })
+    {
+        retry as usize
+    } else {
+        let start = (store.saturating_sub(3)..store)
+            .rev()
+            .find(|&i| matches!(decoded[i], Insn::LoadExcl { .. }))
+            .ok_or(Refusal::NoPairedLoad)?;
+        if (start as i64 + 1..=close as i64).contains(&retry) {
+            return Err(Refusal::NotCanonical);
+        }
+        start
+    };
     let (load_size, load_ord, rt) = match decoded[start] {
         Insn::LoadExcl {
             size,
@@ -449,9 +486,16 @@ fn rmw(
     sf: bool,
     zero_status: u32,
 ) -> Result<Vec<u32>, Refusal> {
+    // A flag-setting ADDS or SUBS sets the flags from the loaded value. The
+    // replacement runs the same instruction on the value the atomic returns,
+    // which is the value the original's successful store-exclusive replaced,
+    // and nothing after it in the replacement or the original sets flags, so
+    // the flags at the exit are the original's. The materialising move and
+    // the atomic set none either, and the original sets them before any read.
     let (op, alu_sf, rd, alu_rn, operand) = match alu {
         Insn::Alu {
             op,
+            sets_flags: _,
             sf,
             rd,
             rn,
@@ -686,6 +730,28 @@ mod tests {
             &[0xc85ffc20, 0xb5000080, 0xc802fc23, 0x35ffffa2],
             &[0xaa1f03e0, 0xc8e0fc23, 0xb5000060, 0x2a1f03e2],
         ),
+        // The two below are an Android linker's own words (Rust's std, linked
+        // into it), and their replacements are llvm-mc's encodings.
+        // `Arc` drop: ldxr x9,[x8]; subs x9,x9,#1; stlxr w10,x9,[x8]; cbnz w10,
+        // whose flags a `b.ne` after the loop reads. It becomes
+        // mov x10,#-1; ldaddl x10,x9,[x8]; subs x9,x9,#1; mov w10,wzr.
+        (
+            "rmw_subs_x_release_arc_drop",
+            Idiom::Rmw,
+            &[0xc85f7d09, 0xf1000529, 0xc80afd09, 0x35ffffaa],
+            &[0x9280000a, 0xf86a0109, 0xf1000529, 0x2a1f03ea],
+        ),
+        // `ThreadId::new`'s weak compare-exchange: ldxr x10,[x9]; cmp x10,x11;
+        // b.ne out; stxr w11,x8,[x9]; cbnz w11,<recompute> - the retry goes
+        // back before the load, and the status register is the expected
+        // value's. It becomes mov x10,x11; cas x10,x8,[x9]; cmp x10,x11;
+        // b.ne out; mov w11,wzr.
+        (
+            "cas_compare_retry_elsewhere_status_is_expected",
+            Idiom::CasCompare,
+            &[0xc85f7d2a, 0xeb0b015f, 0x54ffff01, 0xc80b7d28, 0x35fffeeb],
+            &[0xaa0b03ea, 0xc8aa7d28, 0xeb0b015f, 0x54fffee1, 0x2a1f03eb],
+        ),
     ];
 
     /// Sequences that must survive untouched, with the reason they do.
@@ -719,6 +785,47 @@ mod tests {
             "memory_access_between_the_pair",
             &[0xc85ffc64, 0xf94000e6, 0xc805fc64, 0x35ffffa5],
             Refusal::Undecoded,
+        ),
+        // The compare-exchange above with its retry at the CMP (cbnz w11,.-12):
+        // the replacement would be entered after its first instruction.
+        (
+            "retry_into_the_sequence",
+            &[0xc85f7d2a, 0xeb0b015f, 0x54ffff01, 0xc80b7d28, 0x35ffffab],
+            Refusal::NotCanonical,
+        ),
+        // The linker's `futex_rwlock::read_contended`: ldaxr w9,[x19];
+        // cmp w9,w8; b.ne out; add w8,w8,#1; stxr w10,w8,[x19]; cbnz w10,.-52.
+        (
+            "new_value_after_the_compare",
+            &[
+                0x885f_fe69,
+                0x6b08_013f,
+                0x54ff_fe81,
+                0x1100_0508,
+                0x880a_7e68,
+                0x35ff_fe6a,
+            ],
+            Refusal::NewValueAfterCompare,
+        ),
+        // The same loop retrying at its own load (cbnz w10,.-16).
+        (
+            "new_value_after_the_compare_retrying_at_the_load",
+            &[
+                0x885f_fe69,
+                0x6b08_013f,
+                0x54ff_fe81,
+                0x1100_0508,
+                0x880a_7e68,
+                0x35ff_ff8a,
+            ],
+            Refusal::NewValueAfterCompare,
+        ),
+        // A retry elsewhere with no load-exclusive within three instructions of
+        // the store: nop; nop; nop; stxr w11,x8,[x9]; cbnz w11,.-36.
+        (
+            "retry_elsewhere_without_a_load",
+            &[0xd503201f, 0xd503201f, 0xd503201f, 0xc80b7d28, 0x35fffeeb],
+            Refusal::NoPairedLoad,
         ),
     ];
 
@@ -908,6 +1015,53 @@ mod tests {
             let report = plan(&words, BASE);
             assert_eq!(report.patched, vec![], "{before:#010x}");
         }
+    }
+
+    #[test]
+    fn the_flags_an_arc_drop_leaves_are_kept_for_the_branch_after_it() {
+        // The linker's `Arc` drop and the `b.ne` after it that reads the flags
+        // the loop's SUBS set: only the loop is replaced, and the replacement's
+        // SUBS is the original instruction, so the branch reads the same flags.
+        let words = [
+            0xc85f_7d09,
+            0xf100_0529,
+            0xc80a_fd09,
+            0x35ff_ffaa,
+            0x5400_00a1,
+        ];
+        let report = plan(&words, BASE);
+        assert_eq!(report.refused, vec![], "{report:?}");
+        assert_eq!(report.patched.len(), 1);
+        let site = &report.patched[0];
+        assert_eq!(site.words.len(), 4);
+        assert_eq!(site.words[2], words[1], "the SUBS runs again, unchanged");
+        let mut rewritten = words;
+        apply(&mut rewritten, BASE, &report);
+        assert_eq!(rewritten[4], words[4], "the flag consumer is untouched");
+    }
+
+    #[test]
+    fn a_compare_exchange_that_retries_elsewhere_keeps_its_exits() {
+        // `ThreadId::new`'s loop in a region with its recompute block before
+        // it, as the linker lays it out: the retry target and the B.NE target
+        // stay outside the replacement, so nothing enters it part-way.
+        // mov w12,wzr; mov x11,x10; adds x8,x11,#1; <the loop>; mov w12,#1.
+        let mut words = vec![0x2a1f_03ecu32, 0xaa0a_03eb, 0xb100_0568];
+        // ldxr x10,[x9]; cmp x10,x11; b.ne <before the region>;
+        // stxr w11,x8,[x9]; cbnz w11,<the recompute block's first instruction>.
+        words.extend_from_slice(&[
+            0xc85f_7d2a,
+            0xeb0b_015f,
+            0x54ff_ff41,
+            0xc80b_7d28,
+            0x35ff_ff2b,
+        ]);
+        words.push(0x5280_002c);
+        let report = plan(&words, BASE);
+        assert_eq!(report.refused, vec![], "{report:?}");
+        assert_eq!(report.patched.len(), 1);
+        assert_eq!(report.patched[0].addr, BASE + 12);
+        assert_eq!(report.patched[0].idiom, Idiom::CasCompare);
     }
 
     #[test]
