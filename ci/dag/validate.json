@@ -1961,6 +1961,13 @@
           "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-prlimit-self",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -2914,6 +2921,13 @@
           "test": "c-programs/get-robust-list-child",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/get-robust-list-thread",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -4944,6 +4958,13 @@
           "test": "c-programs/nanosleep-par",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/nanosleep-threads-nocrash",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -6266,6 +6287,13 @@
           "category": "c-programs",
           "test": "c-programs/printf-with-threads",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/printf-with-threads",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -6574,6 +6602,13 @@
           "category": "c-programs",
           "test": "c-programs/procfs-identity-agreement",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/procfs-identity-agreement",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -6659,6 +6694,13 @@
           "test": "c-programs/pselect6-simulation",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pthread-lifecycle",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -7764,6 +7806,13 @@
           "category": "c-programs",
           "test": "c-programs/sched-yield-progress",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sched-yield-progress",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -8352,6 +8401,13 @@
           "category": "c-programs",
           "test": "c-programs/sigtimedwait-timeout-0s",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigtimedwait-timeout-0s",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -8387,6 +8443,13 @@
           "category": "c-programs",
           "test": "c-programs/so-incoming-cpu-tcp4",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/so-incoming-cpu-tcp4",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -8415,6 +8478,13 @@
           "category": "c-programs",
           "test": "c-programs/so-incoming-cpu-tcp6",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/so-incoming-cpu-tcp6",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -8577,6 +8647,13 @@
           "test": "c-programs/socket-cookie-unix",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/socket-epoll-ordering",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -9444,6 +9521,13 @@
           "category": "c-programs",
           "test": "c-programs/tcp-info-accept6",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/tcp-info-accept6",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -9466,6 +9550,13 @@
           "test": "c-programs/tcp-info-accept6",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/tcp-info-client4",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -9570,6 +9661,13 @@
           "category": "c-programs",
           "test": "c-programs/thread-self-procfs-handoff",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/thread-self-procfs-handoff",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -9606,6 +9704,13 @@
           "test": "c-programs/threadexhaustion",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/threadexhaustion",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -10173,6 +10278,13 @@
           "test": "chaos-c/lock-granularity",
           "mode": "chaos",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "chaos-c",
+          "test": "chaos-c/lock-granularity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -22554,6 +22666,13 @@
           "category": "determinism-stress-c",
           "test": "determinism-stress-c/lock-free",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress-c",
+          "test": "determinism-stress-c/lock-free",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -22715,6 +22834,13 @@
           "category": "determinism-stress-c",
           "test": "determinism-stress-c/signal-order",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress-c",
+          "test": "determinism-stress-c/signal-order",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -22828,6 +22954,13 @@
           "test": "determinism-stress/order-violation",
           "mode": "chaos",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress",
+          "test": "determinism-stress/order-violation",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -24073,6 +24206,13 @@
           "test": "system-utils/ssh-keygen-ed25519",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/startup-surface-identity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -33203,6 +33343,13 @@
           "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-prlimit-self",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -33603,6 +33750,13 @@
           "test": "c-programs/get-robust-list-child",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/get-robust-list-thread",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -34505,6 +34659,13 @@
           "category": "c-programs",
           "test": "c-programs/nanosleep-threads-nocrash",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/nanosleep-threads-nocrash",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -35086,6 +35247,13 @@
           "category": "c-programs",
           "test": "c-programs/printf-with-threads",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/printf-with-threads",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -35226,6 +35394,13 @@
           "category": "c-programs",
           "test": "c-programs/procfs-identity-agreement",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/procfs-identity-agreement",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -35262,6 +35437,13 @@
           "test": "c-programs/pselect6-simulation",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pthread-lifecycle",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -35744,6 +35926,13 @@
           "category": "c-programs",
           "test": "c-programs/sched-yield-progress",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sched-yield-progress",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -36038,6 +36227,13 @@
           "category": "c-programs",
           "test": "c-programs/sigtimedwait-timeout-0s",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigtimedwait-timeout-0s",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -36059,7 +36255,21 @@
           "category": "c-programs",
           "test": "c-programs/so-incoming-cpu-tcp4",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/so-incoming-cpu-tcp4",
+          "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/so-incoming-cpu-tcp6",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -36123,6 +36333,13 @@
           "test": "c-programs/socket-cookie-unix",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/socket-epoll-ordering",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -36472,7 +36689,21 @@
           "category": "c-programs",
           "test": "c-programs/tcp-info-accept6",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/tcp-info-accept6",
+          "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/tcp-info-client4",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -36514,6 +36745,13 @@
           "category": "c-programs",
           "test": "c-programs/thread-self-procfs-handoff",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/thread-self-procfs-handoff",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -36543,6 +36781,13 @@
           "test": "c-programs/threadexhaustion",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/threadexhaustion",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -36823,6 +37068,13 @@
           "test": "chaos-c/lock-granularity",
           "mode": "chaos",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "chaos-c",
+          "test": "chaos-c/lock-granularity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -40085,6 +40337,13 @@
           "category": "determinism-stress-c",
           "test": "determinism-stress-c/lock-free",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress-c",
+          "test": "determinism-stress-c/lock-free",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -40149,6 +40408,13 @@
           "test": "determinism-stress-c/producer-consumer",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress-c",
+          "test": "determinism-stress-c/signal-order",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -40240,6 +40506,13 @@
           "test": "determinism-stress/order-violation",
           "mode": "chaos",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress",
+          "test": "determinism-stress/order-violation",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -40919,6 +41192,13 @@
           "test": "system-utils/ssh-keygen-ed25519",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/startup-surface-identity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -50179,6 +50459,13 @@
           "category": "c-programs",
           "test": "c-programs/dbt-prlimit-self",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-prlimit-self",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -51132,6 +51419,13 @@
           "test": "c-programs/get-robust-list-child",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/get-robust-list-thread",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -53162,6 +53456,13 @@
           "test": "c-programs/nanosleep-par",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/nanosleep-threads-nocrash",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -54484,6 +54785,13 @@
           "category": "c-programs",
           "test": "c-programs/printf-with-threads",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/printf-with-threads",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -54792,6 +55100,13 @@
           "category": "c-programs",
           "test": "c-programs/procfs-identity-agreement",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/procfs-identity-agreement",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -54877,6 +55192,13 @@
           "test": "c-programs/pselect6-simulation",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pthread-lifecycle",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -55982,6 +56304,13 @@
           "category": "c-programs",
           "test": "c-programs/sched-yield-progress",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sched-yield-progress",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -56570,6 +56899,13 @@
           "category": "c-programs",
           "test": "c-programs/sigtimedwait-timeout-0s",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigtimedwait-timeout-0s",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -56605,6 +56941,13 @@
           "category": "c-programs",
           "test": "c-programs/so-incoming-cpu-tcp4",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/so-incoming-cpu-tcp4",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -56633,6 +56976,13 @@
           "category": "c-programs",
           "test": "c-programs/so-incoming-cpu-tcp6",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/so-incoming-cpu-tcp6",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -56795,6 +57145,13 @@
           "test": "c-programs/socket-cookie-unix",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/socket-epoll-ordering",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -57662,6 +58019,13 @@
           "category": "c-programs",
           "test": "c-programs/tcp-info-accept6",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/tcp-info-accept6",
+          "mode": "verify",
           "backend": "in-guest-trap"
         },
         {
@@ -57684,6 +58048,13 @@
           "test": "c-programs/tcp-info-accept6",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/tcp-info-client4",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -57788,6 +58159,13 @@
           "category": "c-programs",
           "test": "c-programs/thread-self-procfs-handoff",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/thread-self-procfs-handoff",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -57824,6 +58202,13 @@
           "test": "c-programs/threadexhaustion",
           "mode": "replay",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/threadexhaustion",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -58382,6 +58767,13 @@
           "test": "chaos-c/lock-granularity",
           "mode": "chaos",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "chaos-c",
+          "test": "chaos-c/lock-granularity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -64071,6 +64463,13 @@
           "category": "determinism-stress-c",
           "test": "determinism-stress-c/lock-free",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress-c",
+          "test": "determinism-stress-c/lock-free",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -64232,6 +64631,13 @@
           "category": "determinism-stress-c",
           "test": "determinism-stress-c/signal-order",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress-c",
+          "test": "determinism-stress-c/signal-order",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -64336,6 +64742,13 @@
           "test": "determinism-stress/order-violation",
           "mode": "chaos",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress",
+          "test": "determinism-stress/order-violation",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -65555,6 +65968,13 @@
           "test": "system-utils/ssh-keygen-ed25519",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/startup-surface-identity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
