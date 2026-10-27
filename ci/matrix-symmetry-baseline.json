@@ -3,7 +3,12 @@
   "asymmetric_manifest_tests": [
     "applications/kvm-python-examples",
     "applications/kvm-shell-environment",
-    "c-programs/child-subreaper-refusal"
+    "c-programs/child-subreaper-refusal",
+    "c-programs/gvisor-mq",
+    "c-programs/gvisor-msgqueue",
+    "c-programs/gvisor-semaphore",
+    "c-programs/gvisor-shm",
+    "c-programs/gvisor-tkill"
   ],
   "backend_private_guest_files": [
     "tests/c/kvm_exact_child_waits.c",

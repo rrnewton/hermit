@@ -239,6 +239,7 @@ fn first_attempt() -> u64 {
 pub const REQUIRES_VOCABULARY: &[(&str, Option<HostCapability>)] = &[
     ("ar", None),
     ("bash", None),
+    ("cargo", None),
     ("cc", None),
     ("cpuid", Some(HostCapability::CpuidFaulting)),
     ("cxx", None),
@@ -512,6 +513,12 @@ pub struct BuildRecipe {
     pub cflags: Vec<String>,
     #[serde(default)]
     pub rustflags: Vec<String>,
+    /// Name of a Cargo binary target that builds this `.rs` program, for
+    /// guests that need workspace crates and so cannot be compiled by the
+    /// single-file `rustc` path. The binary is built from the nearest
+    /// `Cargo.toml` above the program path. `None` keeps the `rustc` path.
+    #[serde(default)]
+    pub cargo_bin: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -5209,28 +5216,88 @@ fn prepare_test_until(
             let output = dir.join("fixtures/program");
             if !context.prebuilt {
                 let _ = fs::remove_file(&output);
-                let mut args = vec!["-O".to_string()];
-                args.extend(
-                    cell.test
-                        .build
-                        .as_ref()
-                        .map(|b| b.rustflags.clone())
-                        .unwrap_or_default(),
-                );
-                args.push(context.root.join(program).to_string_lossy().into_owned());
-                args.push("-o".into());
-                args.push(output.to_string_lossy().into_owned());
-                cpu_usage_usec = cpu_usage_usec
-                    .checked_add(run_preparation(
-                        context,
-                        dir,
-                        "rustc",
-                        &args,
-                        deadline,
-                        wall_timeout_seconds,
-                        observations,
-                    )?)
-                    .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
+                if let Some(cargo_bin) = cell
+                    .test
+                    .build
+                    .as_ref()
+                    .and_then(|b| b.cargo_bin.as_deref())
+                {
+                    // A guest that needs workspace crates: build its Cargo
+                    // binary target and stage it as the fixture program.
+                    let manifest_path = context
+                        .root
+                        .join(program)
+                        .ancestors()
+                        .skip(1)
+                        .find(|dir| dir.join("Cargo.toml").is_file())
+                        .map(|dir| dir.join("Cargo.toml"))
+                        .ok_or_else(|| {
+                            format!("{}: no Cargo.toml above program `{program}`", cell.test.id)
+                        })?;
+                    let target_dir = match std::env::var_os("CARGO_TARGET_DIR") {
+                        Some(value) => {
+                            let path = PathBuf::from(value);
+                            if path.is_absolute() {
+                                path
+                            } else {
+                                context.root.join(path)
+                            }
+                        }
+                        None => context.root.join("target"),
+                    };
+                    let args = vec![
+                        "build".to_string(),
+                        "--offline".to_string(),
+                        "--manifest-path".to_string(),
+                        manifest_path.to_string_lossy().into_owned(),
+                        "--bin".to_string(),
+                        cargo_bin.to_string(),
+                        "--target-dir".to_string(),
+                        target_dir.to_string_lossy().into_owned(),
+                    ];
+                    cpu_usage_usec = cpu_usage_usec
+                        .checked_add(run_preparation(
+                            context,
+                            dir,
+                            "cargo",
+                            &args,
+                            deadline,
+                            wall_timeout_seconds,
+                            observations,
+                        )?)
+                        .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
+                    let built = target_dir.join("debug").join(cargo_bin);
+                    fs::copy(&built, &output).map_err(|e| {
+                        format!(
+                            "cannot copy cargo-built guest {} to {}: {e}",
+                            built.display(),
+                            output.display()
+                        )
+                    })?;
+                } else {
+                    let mut args = vec!["-O".to_string()];
+                    args.extend(
+                        cell.test
+                            .build
+                            .as_ref()
+                            .map(|b| b.rustflags.clone())
+                            .unwrap_or_default(),
+                    );
+                    args.push(context.root.join(program).to_string_lossy().into_owned());
+                    args.push("-o".into());
+                    args.push(output.to_string_lossy().into_owned());
+                    cpu_usage_usec = cpu_usage_usec
+                        .checked_add(run_preparation(
+                            context,
+                            dir,
+                            "rustc",
+                            &args,
+                            deadline,
+                            wall_timeout_seconds,
+                            observations,
+                        )?)
+                        .ok_or_else(|| "cell CPU usage overflowed u64".to_string())?;
+                }
             }
             require_executable_program(&output, &dir.join("captures"))?;
             vec![output.to_string_lossy().into_owned()]
@@ -10640,6 +10707,20 @@ fn execute_observed_until(
 
 #[cfg(test)]
 mod tests {
+    /// A build recipe names a Cargo binary target so a `.rs` guest that
+    /// needs workspace crates is built by Cargo, not by single-file rustc.
+    #[test]
+    fn build_recipe_names_a_cargo_binary_target() {
+        let recipe: BuildRecipe =
+            serde_yaml::from_str("cargo_bin: rustbin_gvisor_eventfd\n").unwrap();
+        assert_eq!(recipe.cargo_bin.as_deref(), Some("rustbin_gvisor_eventfd"));
+        assert!(recipe.cflags.is_empty() && recipe.rustflags.is_empty());
+        let plain: BuildRecipe = serde_yaml::from_str("rustflags: [-O]\n").unwrap();
+        assert_eq!(plain.cargo_bin, None);
+        // Unknown keys stay refused.
+        assert!(serde_yaml::from_str::<BuildRecipe>("cargo_binary: x\n").is_err());
+    }
+
     /// The session is the field after the process group, whatever bytes the
     /// command name holds.
     #[test]

@@ -1206,10 +1206,29 @@ fn validate_and_expand(
     }
 
     if let Some(build) = test.get("build") {
-        ensure_keys(build, &["cflags", "rustflags"], &format!("{id}.build"));
+        ensure_keys(
+            build,
+            &["cflags", "rustflags", "cargo_bin"],
+            &format!("{id}.build"),
+        );
         for key in ["cflags", "rustflags"] {
             if build.get(key).is_some() {
                 let _flags = string_array(build.get(key), &format!("{id}.build.{key}"));
+            }
+        }
+        if let Some(cargo_bin) = build.get("cargo_bin") {
+            if cargo_bin.as_str().is_none_or(|name| name.is_empty()) {
+                die(format!("{id}.build.cargo_bin: must be a non-empty string"));
+            }
+            let extension = program_path
+                .as_ref()
+                .and_then(|path| path.extension())
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("");
+            if extension != "rs" {
+                die(format!(
+                    "{id}.build.cargo_bin: only a `.rs` program may name a Cargo binary target"
+                ));
             }
         }
     }

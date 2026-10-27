@@ -4705,6 +4705,90 @@
       "why": "tests/rust/futex_wake_some.rs is owned by tests/Cargo.toml and Hermit integration targets: Cargo target `futex_wake_some` is built from `tests/rust/futex_wake_some.rs` with package wiring from tests/Cargo.toml, then selected by a Rust integration test that owns backend arguments and semantic assertions. It remains outside the program manifest because a standalone exit/output check would omit that integration contract."
     },
     {
+      "disposition": "manifest-test",
+      "path": "tests/rust/gvisor_eventfd.rs",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/rust/gvisor_eventfd.rs is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Rust port of one gVisor syscall acceptance file, syscall coverage batch (2026-10-27)"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/rust/gvisor_getdents.rs",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/rust/gvisor_getdents.rs is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Rust port of one gVisor syscall acceptance file, syscall coverage batch (2026-10-27)"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/rust/gvisor_inotify.rs",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/rust/gvisor_inotify.rs is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Rust port of one gVisor syscall acceptance file, syscall coverage batch (2026-10-27)"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/rust/gvisor_mknod.rs",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/rust/gvisor_mknod.rs is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Rust port of one gVisor syscall acceptance file, syscall coverage batch (2026-10-27)"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/rust/gvisor_mq.rs",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
+      "why": "tests/rust/gvisor_mq.rs is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Rust port of one gVisor syscall acceptance file, syscall coverage batch (2026-10-27); its verify cells stay out of CI for the reason the manifest names"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/rust/gvisor_msgqueue.rs",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
+      "why": "tests/rust/gvisor_msgqueue.rs is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Rust port of one gVisor syscall acceptance file, syscall coverage batch (2026-10-27); its verify cells stay out of CI for the reason the manifest names"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/rust/gvisor_pidfd.rs",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/rust/gvisor_pidfd.rs is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Rust port of one gVisor syscall acceptance file, syscall coverage batch (2026-10-27)"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/rust/gvisor_select.rs",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/rust/gvisor_select.rs is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Rust port of one gVisor syscall acceptance file, syscall coverage batch (2026-10-27)"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/rust/gvisor_semaphore.rs",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
+      "why": "tests/rust/gvisor_semaphore.rs is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Rust port of one gVisor syscall acceptance file, syscall coverage batch (2026-10-27); its verify cells stay out of CI for the reason the manifest names"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/rust/gvisor_shm.rs",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
+      "why": "tests/rust/gvisor_shm.rs is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Rust port of one gVisor syscall acceptance file, syscall coverage batch (2026-10-27); its verify cells stay out of CI for the reason the manifest names"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/rust/gvisor_signalfd.rs",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/rust/gvisor_signalfd.rs is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Rust port of one gVisor syscall acceptance file, syscall coverage batch (2026-10-27)"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/rust/gvisor_timerfd.rs",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/rust/gvisor_timerfd.rs is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Rust port of one gVisor syscall acceptance file, syscall coverage batch (2026-10-27)"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/rust/gvisor_tkill.rs",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
+      "why": "tests/rust/gvisor_tkill.rs is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Rust port of one gVisor syscall acceptance file, syscall coverage batch (2026-10-27); its verify cells stay out of CI for the reason the manifest names"
+    },
+    {
+      "disposition": "manifest-test",
+      "path": "tests/rust/gvisor_utimes.rs",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
+      "why": "tests/rust/gvisor_utimes.rs is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): Rust port of one gVisor syscall acceptance file, syscall coverage batch (2026-10-27)"
+    },
+    {
       "disposition": "cargo-binary",
       "path": "tests/rust/heap_ptrs.rs",
       "runner": "tests/Cargo.toml and Hermit integration targets",

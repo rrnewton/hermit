@@ -21835,3 +21835,945 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/gvisor-eventfd
+    description: 'gVisor eventfd.cc Rust port: eventfd read/write, semaphore and illegal-operation cases'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cargo
+    occasional: false
+    program: tests/rust/gvisor_eventfd.rs
+    build:
+      cargo_bin: rustbin_gvisor_eventfd
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled: [ptrace, dbt, kvm]
+        backends_disabled:
+          sabre: SaBRe was not measured for this guest in the slot build (the SaBRe executable is not staged beside the slot hermit binary); qualify SaBRe in validate before enabling
+          liteinst: The in-guest backend cannot create a thread (clone3 is not forwarded), and EventfdTest.BlockingWrite spawns a reader thread; measured 2026-10-27
+          in-guest-trap: The in-guest backend cannot create a thread (clone3 is not forwarded), and EventfdTest.BlockingWrite spawns a reader thread; measured 2026-10-27
+      naked:
+        ci: false
+        ci_disabled_reason: Native control is not the oracle for this deterministic syscall-coverage check
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts Hermit-presented syscall results, so a native run is not its oracle
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: This single-threaded coverage guest has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: No custom edge-case arguments have been calibrated for this Rust guest
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this Rust guest
+          dbt: No custom edge-case arguments have been calibrated for this Rust guest
+          kvm: No custom edge-case arguments have been calibrated for this Rust guest
+          sabre: No custom edge-case arguments have been calibrated for this Rust guest
+          liteinst: No custom edge-case arguments have been calibrated for this Rust guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for this Rust guest
+  - id: c-programs/gvisor-timerfd
+    description: 'gVisor timerfd.cc Rust port: timerfd create/settime/gettime and read cases'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cargo
+    occasional: false
+    program: tests/rust/gvisor_timerfd.rs
+    build:
+      cargo_bin: rustbin_gvisor_timerfd
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled: [ptrace, dbt, kvm, liteinst, in-guest-trap]
+        backends_disabled:
+          sabre: SaBRe was not measured for this guest in the slot build (the SaBRe executable is not staged beside the slot hermit binary); qualify SaBRe in validate before enabling
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed verify that way in the 2026-10-27 qualification run for this batch
+      naked:
+        ci: false
+        ci_disabled_reason: Native control is not the oracle for this deterministic syscall-coverage check
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts Hermit-presented syscall results, so a native run is not its oracle
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: This single-threaded coverage guest has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: No custom edge-case arguments have been calibrated for this Rust guest
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this Rust guest
+          dbt: No custom edge-case arguments have been calibrated for this Rust guest
+          kvm: No custom edge-case arguments have been calibrated for this Rust guest
+          sabre: No custom edge-case arguments have been calibrated for this Rust guest
+          liteinst: No custom edge-case arguments have been calibrated for this Rust guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for this Rust guest
+  - id: c-programs/gvisor-utimes
+    description: 'gVisor utimes.cc Rust port: utime/utimes on files, directories and missing paths'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cargo
+    occasional: false
+    program: tests/rust/gvisor_utimes.rs
+    build:
+      cargo_bin: rustbin_gvisor_utimes
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled: [ptrace, dbt, kvm, liteinst, in-guest-trap]
+        backends_disabled:
+          sabre: SaBRe was not measured for this guest in the slot build (the SaBRe executable is not staged beside the slot hermit binary); qualify SaBRe in validate before enabling
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed verify that way in the 2026-10-27 qualification run for this batch
+      naked:
+        ci: false
+        ci_disabled_reason: Native control is not the oracle for this deterministic syscall-coverage check
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts Hermit-presented syscall results, so a native run is not its oracle
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: This single-threaded coverage guest has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: No custom edge-case arguments have been calibrated for this Rust guest
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this Rust guest
+          dbt: No custom edge-case arguments have been calibrated for this Rust guest
+          kvm: No custom edge-case arguments have been calibrated for this Rust guest
+          sabre: No custom edge-case arguments have been calibrated for this Rust guest
+          liteinst: No custom edge-case arguments have been calibrated for this Rust guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for this Rust guest
+  - id: c-programs/gvisor-select
+    description: 'gVisor select.cc Rust port: select nfds, closed-fd and readiness cases'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cargo
+    occasional: false
+    program: tests/rust/gvisor_select.rs
+    build:
+      cargo_bin: rustbin_gvisor_select
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled: [ptrace, dbt, kvm, liteinst, in-guest-trap]
+        backends_disabled:
+          sabre: SaBRe was not measured for this guest in the slot build (the SaBRe executable is not staged beside the slot hermit binary); qualify SaBRe in validate before enabling
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed verify that way in the 2026-10-27 qualification run for this batch
+      naked:
+        ci: false
+        ci_disabled_reason: Native control is not the oracle for this deterministic syscall-coverage check
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts Hermit-presented syscall results, so a native run is not its oracle
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: This single-threaded coverage guest has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: No custom edge-case arguments have been calibrated for this Rust guest
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this Rust guest
+          dbt: No custom edge-case arguments have been calibrated for this Rust guest
+          kvm: No custom edge-case arguments have been calibrated for this Rust guest
+          sabre: No custom edge-case arguments have been calibrated for this Rust guest
+          liteinst: No custom edge-case arguments have been calibrated for this Rust guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for this Rust guest
+  - id: c-programs/gvisor-mknod
+    description: 'gVisor mknod.cc Rust port: mknod regular file, fifo, permissions and EEXIST cases'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cargo
+    occasional: false
+    program: tests/rust/gvisor_mknod.rs
+    build:
+      cargo_bin: rustbin_gvisor_mknod
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled: [ptrace, dbt, kvm, liteinst, in-guest-trap]
+        backends_disabled:
+          sabre: SaBRe was not measured for this guest in the slot build (the SaBRe executable is not staged beside the slot hermit binary); qualify SaBRe in validate before enabling
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed verify that way in the 2026-10-27 qualification run for this batch
+      naked:
+        ci: false
+        ci_disabled_reason: Native control is not the oracle for this deterministic syscall-coverage check
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts Hermit-presented syscall results, so a native run is not its oracle
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: This single-threaded coverage guest has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: No custom edge-case arguments have been calibrated for this Rust guest
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this Rust guest
+          dbt: No custom edge-case arguments have been calibrated for this Rust guest
+          kvm: No custom edge-case arguments have been calibrated for this Rust guest
+          sabre: No custom edge-case arguments have been calibrated for this Rust guest
+          liteinst: No custom edge-case arguments have been calibrated for this Rust guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for this Rust guest
+  - id: c-programs/gvisor-signalfd
+    description: 'gVisor signalfd.cc Rust port: signalfd create, mask replacement and read cases'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cargo
+    occasional: false
+    program: tests/rust/gvisor_signalfd.rs
+    build:
+      cargo_bin: rustbin_gvisor_signalfd
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled: [ptrace, kvm, liteinst, in-guest-trap]
+        backends_disabled:
+          dbt: DBT answers a signalfd mask replacement on a live descriptor with EPERM (SignalfdTest.MaskWorks) (https://github.com/rrnewton/hermit/issues/4850)
+          sabre: SaBRe was not measured for this guest in the slot build (the SaBRe executable is not staged beside the slot hermit binary); qualify SaBRe in validate before enabling
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed verify that way in the 2026-10-27 qualification run for this batch
+      naked:
+        ci: false
+        ci_disabled_reason: Native control is not the oracle for this deterministic syscall-coverage check
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts Hermit-presented syscall results, so a native run is not its oracle
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: This single-threaded coverage guest has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: No custom edge-case arguments have been calibrated for this Rust guest
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this Rust guest
+          dbt: No custom edge-case arguments have been calibrated for this Rust guest
+          kvm: No custom edge-case arguments have been calibrated for this Rust guest
+          sabre: No custom edge-case arguments have been calibrated for this Rust guest
+          liteinst: No custom edge-case arguments have been calibrated for this Rust guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for this Rust guest
+  - id: c-programs/gvisor-getdents
+    description: 'gVisor getdents.cc Rust port: getdents directory listing, removal and error cases'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cargo
+    occasional: false
+    program: tests/rust/gvisor_getdents.rs
+    build:
+      cargo_bin: rustbin_gvisor_getdents
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled: [ptrace, dbt, liteinst, in-guest-trap]
+        backends_disabled:
+          kvm: The KVM executor answers getdents with ENOSYS (https://github.com/rrnewton/hermit/issues/4849)
+          sabre: SaBRe was not measured for this guest in the slot build (the SaBRe executable is not staged beside the slot hermit binary); qualify SaBRe in validate before enabling
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed verify that way in the 2026-10-27 qualification run for this batch
+      naked:
+        ci: false
+        ci_disabled_reason: Native control is not the oracle for this deterministic syscall-coverage check
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts Hermit-presented syscall results, so a native run is not its oracle
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: This single-threaded coverage guest has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: No custom edge-case arguments have been calibrated for this Rust guest
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this Rust guest
+          dbt: No custom edge-case arguments have been calibrated for this Rust guest
+          kvm: No custom edge-case arguments have been calibrated for this Rust guest
+          sabre: No custom edge-case arguments have been calibrated for this Rust guest
+          liteinst: No custom edge-case arguments have been calibrated for this Rust guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for this Rust guest
+  - id: c-programs/gvisor-inotify
+    description: 'gVisor inotify.cc Rust port: inotify_init, add_watch and create-event cases'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cargo
+    occasional: false
+    program: tests/rust/gvisor_inotify.rs
+    build:
+      cargo_bin: rustbin_gvisor_inotify
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled: [ptrace, dbt, liteinst, in-guest-trap]
+        backends_disabled:
+          kvm: The KVM executor answers inotify_init with ENOSYS (https://github.com/rrnewton/hermit/issues/4852)
+          sabre: SaBRe was not measured for this guest in the slot build (the SaBRe executable is not staged beside the slot hermit binary); qualify SaBRe in validate before enabling
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled; each passed verify that way in the 2026-10-27 qualification run for this batch
+      naked:
+        ci: false
+        ci_disabled_reason: Native control is not the oracle for this deterministic syscall-coverage check
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts Hermit-presented syscall results, so a native run is not its oracle
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: This single-threaded coverage guest has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: No custom edge-case arguments have been calibrated for this Rust guest
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this Rust guest
+          dbt: No custom edge-case arguments have been calibrated for this Rust guest
+          kvm: No custom edge-case arguments have been calibrated for this Rust guest
+          sabre: No custom edge-case arguments have been calibrated for this Rust guest
+          liteinst: No custom edge-case arguments have been calibrated for this Rust guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for this Rust guest
+  - id: c-programs/gvisor-pidfd
+    description: 'gVisor pidfd_test.cc Rust port: pidfd_open and pidfd_send_signal cases'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cargo
+    occasional: false
+    program: tests/rust/gvisor_pidfd.rs
+    build:
+      cargo_bin: rustbin_gvisor_pidfd
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled: [ptrace, dbt]
+        backends_disabled:
+          kvm: On KVM, PidfdTest.PidfdOpenInvalid and PidfdTest.SendSignalViaPidfdOpenPidfdToSelfSucceeds fail (measured 2026-10-27 with this Rust port); the remaining case passes
+          sabre: SaBRe was not measured for this guest in the slot build (the SaBRe executable is not staged beside the slot hermit binary); qualify SaBRe in validate before enabling
+          liteinst: The guest stops on LiteInst; a process exited without deregistering and its exit was not scheduled (measured 2026-10-27)
+          in-guest-trap: The guest stops on in-guest-trap at pidfd_send_signal and no guest process reports LiteInst statistics (measured 2026-10-27)
+      naked:
+        ci: false
+        ci_disabled_reason: Native control is not the oracle for this deterministic syscall-coverage check
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts Hermit-presented syscall results, so a native run is not its oracle
+      replay:
+        ci: true
+        backends_enabled: [ptrace]
+        backends_disabled:
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: This single-threaded coverage guest has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: No custom edge-case arguments have been calibrated for this Rust guest
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this Rust guest
+          dbt: No custom edge-case arguments have been calibrated for this Rust guest
+          kvm: No custom edge-case arguments have been calibrated for this Rust guest
+          sabre: No custom edge-case arguments have been calibrated for this Rust guest
+          liteinst: No custom edge-case arguments have been calibrated for this Rust guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for this Rust guest
+  - id: c-programs/gvisor-tkill
+    description: 'gVisor tkill.cc Rust port: tkill invalid-tid, permission and real-signal cases'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cargo
+    occasional: false
+    program: tests/rust/gvisor_tkill.rs
+    build:
+      cargo_bin: rustbin_gvisor_tkill
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled: [dbt]
+        backends_disabled:
+          ptrace: A real-time signal sent with tkill kills the guest on ptrace (TkillTest.ValidTIDAndRealSignal) (https://github.com/rrnewton/hermit/issues/4851)
+          kvm: On KVM, TkillTest.InvalidTID and TkillTest.ValidTIDAndRealSignal fail (measured 2026-10-27 with this Rust port); the remaining case passes
+          sabre: SaBRe was not measured for this guest in the slot build (the SaBRe executable is not staged beside the slot hermit binary); qualify SaBRe in validate before enabling
+          liteinst: The guest dies during the run on LiteInst; verify exits 125 before producing a terminal comparison (measured 2026-10-27)
+          in-guest-trap: The guest dies during the run on in-guest-trap; verify exits 125 before producing a terminal comparison (measured 2026-10-27)
+      naked:
+        ci: false
+        ci_disabled_reason: Native control is not the oracle for this deterministic syscall-coverage check
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts Hermit-presented syscall results, so a native run is not its oracle
+      replay:
+        ci: false
+        ci_disabled_reason: 'The guest kills itself on ptrace (https://github.com/rrnewton/hermit/issues/4851), so there is no recording to replay'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: The guest kills itself on ptrace (https://github.com/rrnewton/hermit/issues/4851), so there is no recording to replay
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: This single-threaded coverage guest has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: No custom edge-case arguments have been calibrated for this Rust guest
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this Rust guest
+          dbt: No custom edge-case arguments have been calibrated for this Rust guest
+          kvm: No custom edge-case arguments have been calibrated for this Rust guest
+          sabre: No custom edge-case arguments have been calibrated for this Rust guest
+          liteinst: No custom edge-case arguments have been calibrated for this Rust guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for this Rust guest
+  - id: c-programs/gvisor-shm
+    description: 'gVisor shm.cc Rust port: SysV shared memory get/attach/stat cases (refused by Detcore)'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cargo
+    occasional: false
+    program: tests/rust/gvisor_shm.rs
+    build:
+      cargo_bin: rustbin_gvisor_shm
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: false
+        ci_disabled_reason: 'Detcore refuses shmget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Detcore refuses shmget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          dbt: Detcore refuses shmget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          kvm: Detcore refuses shmget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          sabre: Detcore refuses shmget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          liteinst: Detcore refuses shmget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          in-guest-trap: Detcore refuses shmget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+      naked:
+        ci: false
+        ci_disabled_reason: Native control is not the oracle for this deterministic syscall-coverage check
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts Hermit-presented syscall results, so a native run is not its oracle
+      replay:
+        ci: false
+        ci_disabled_reason: 'Detcore refuses shmget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Detcore refuses shmget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: This single-threaded coverage guest has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: No custom edge-case arguments have been calibrated for this Rust guest
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this Rust guest
+          dbt: No custom edge-case arguments have been calibrated for this Rust guest
+          kvm: No custom edge-case arguments have been calibrated for this Rust guest
+          sabre: No custom edge-case arguments have been calibrated for this Rust guest
+          liteinst: No custom edge-case arguments have been calibrated for this Rust guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for this Rust guest
+  - id: c-programs/gvisor-semaphore
+    description: 'gVisor semaphore.cc Rust port: SysV semaphore get/op/ctl cases (refused by Detcore)'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cargo
+    occasional: false
+    program: tests/rust/gvisor_semaphore.rs
+    build:
+      cargo_bin: rustbin_gvisor_semaphore
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: false
+        ci_disabled_reason: 'Detcore refuses semget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Detcore refuses semget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          dbt: Detcore refuses semget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          kvm: Detcore refuses semget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          sabre: Detcore refuses semget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          liteinst: Detcore refuses semget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          in-guest-trap: Detcore refuses semget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+      naked:
+        ci: false
+        ci_disabled_reason: Native control is not the oracle for this deterministic syscall-coverage check
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts Hermit-presented syscall results, so a native run is not its oracle
+      replay:
+        ci: false
+        ci_disabled_reason: 'Detcore refuses semget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Detcore refuses semget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: This single-threaded coverage guest has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: No custom edge-case arguments have been calibrated for this Rust guest
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this Rust guest
+          dbt: No custom edge-case arguments have been calibrated for this Rust guest
+          kvm: No custom edge-case arguments have been calibrated for this Rust guest
+          sabre: No custom edge-case arguments have been calibrated for this Rust guest
+          liteinst: No custom edge-case arguments have been calibrated for this Rust guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for this Rust guest
+  - id: c-programs/gvisor-msgqueue
+    description: 'gVisor msgqueue.cc Rust port: SysV message queue send/receive/stat cases (refused by Detcore)'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cargo
+    occasional: false
+    program: tests/rust/gvisor_msgqueue.rs
+    build:
+      cargo_bin: rustbin_gvisor_msgqueue
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: false
+        ci_disabled_reason: 'Detcore refuses msgget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Detcore refuses msgget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          dbt: Detcore refuses msgget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          kvm: Detcore refuses msgget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          sabre: Detcore refuses msgget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          liteinst: Detcore refuses msgget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          in-guest-trap: Detcore refuses msgget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+      naked:
+        ci: false
+        ci_disabled_reason: Native control is not the oracle for this deterministic syscall-coverage check
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts Hermit-presented syscall results, so a native run is not its oracle
+      replay:
+        ci: false
+        ci_disabled_reason: 'Detcore refuses msgget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Detcore refuses msgget with ENOSYS on every backend (see c-programs/sysv-ipc-refusal); this guest passes on native Linux and lights up when the family is implemented
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: This single-threaded coverage guest has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: No custom edge-case arguments have been calibrated for this Rust guest
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this Rust guest
+          dbt: No custom edge-case arguments have been calibrated for this Rust guest
+          kvm: No custom edge-case arguments have been calibrated for this Rust guest
+          sabre: No custom edge-case arguments have been calibrated for this Rust guest
+          liteinst: No custom edge-case arguments have been calibrated for this Rust guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for this Rust guest
+  - id: c-programs/gvisor-mq
+    description: 'gVisor mq.cc Rust port: POSIX message queue open/send/receive cases (refused by Detcore)'
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cargo
+    occasional: false
+    program: tests/rust/gvisor_mq.rs
+    build:
+      cargo_bin: rustbin_gvisor_mq
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: false
+        ci_disabled_reason: 'Detcore refuses mq_open with ENOSYS on every backend; this guest passes on native Linux and lights up when the family is implemented'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Detcore refuses mq_open with ENOSYS on every backend; this guest passes on native Linux and lights up when the family is implemented
+          dbt: Detcore refuses mq_open with ENOSYS on every backend; this guest passes on native Linux and lights up when the family is implemented
+          kvm: Detcore refuses mq_open with ENOSYS on every backend; this guest passes on native Linux and lights up when the family is implemented
+          sabre: Detcore refuses mq_open with ENOSYS on every backend; this guest passes on native Linux and lights up when the family is implemented
+          liteinst: Detcore refuses mq_open with ENOSYS on every backend; this guest passes on native Linux and lights up when the family is implemented
+          in-guest-trap: Detcore refuses mq_open with ENOSYS on every backend; this guest passes on native Linux and lights up when the family is implemented
+      naked:
+        ci: false
+        ci_disabled_reason: Native control is not the oracle for this deterministic syscall-coverage check
+        backends_enabled: []
+        backends_disabled:
+          native: This guest asserts Hermit-presented syscall results, so a native run is not its oracle
+      replay:
+        ci: false
+        ci_disabled_reason: 'Detcore refuses mq_open with ENOSYS on every backend; this guest passes on native Linux and lights up when the family is implemented'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Detcore refuses mq_open with ENOSYS on every backend; this guest passes on native Linux and lights up when the family is implemented
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: This single-threaded coverage guest has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Single-threaded coverage check; chaos scheduling asserts nothing extra
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: No custom edge-case arguments have been calibrated for this Rust guest
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this Rust guest
+          dbt: No custom edge-case arguments have been calibrated for this Rust guest
+          kvm: No custom edge-case arguments have been calibrated for this Rust guest
+          sabre: No custom edge-case arguments have been calibrated for this Rust guest
+          liteinst: No custom edge-case arguments have been calibrated for this Rust guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for this Rust guest

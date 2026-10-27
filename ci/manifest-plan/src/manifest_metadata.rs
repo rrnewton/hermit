@@ -78,6 +78,8 @@ pub enum DirectMetadata {
 pub struct BuildMetadata {
     pub cflags: Vec<String>,
     pub rustflags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_bin: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -222,6 +224,7 @@ fn test_metadata(category: &str, test: &TestRecipe) -> TestMetadata {
     let build = test.build.as_ref().map(|build| BuildMetadata {
         cflags: build.cflags.clone(),
         rustflags: build.rustflags.clone(),
+        cargo_bin: build.cargo_bin.clone(),
     });
     TestMetadata {
         id: test.id.clone(),
@@ -640,6 +643,7 @@ mod tests {
                     build: Some(BuildMetadata {
                         cflags: vec!["-O2".into()],
                         rustflags: vec!["-Copt-level=2".into()],
+                        cargo_bin: None,
                     }),
                     observation: ObservationMetadata {
                         status: false,
