@@ -1614,6 +1614,14 @@ pub struct RunOpts {
     /// tasks than a window holds goes on into the next window. Needs the ptrace backend with
     /// sequentialized threads.
     ///
+    /// Only the window or windows the IDs start in are checked and reserved. IDs are never given
+    /// out twice in a run, so every task the guest ever creates (each process and thread,
+    /// including those that exited) takes the next one, and a guest that creates more tasks than
+    /// those windows hold goes on into IDs that nobody checked or reserved, where a host task or
+    /// another run may already be. Its outcome then depends on the host, though never silently:
+    /// a task that cannot have its ID ends a run with an explicit base, or gets a host ID with a
+    /// warning and marks the run's record.
+    ///
     /// For tooling: the same IDs come back in every run from the same base, and a window is free
     /// for the next run as soon as one ends, so a process ID remembered from one run may name a
     /// later run's guest. Check a remembered process's identity (a pidfd, its start time or its
