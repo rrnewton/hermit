@@ -94,6 +94,9 @@ const ARGS_ID: &str = "args";
 pub(crate) const EPOCH_KEY: &str = "epoch";
 pub(crate) const SEED_KEY: &str = "seed";
 pub(crate) const SEED_FROM_KEY: &str = "seed-from";
+/// The recommended range a `--chaos-timeslice-draw` given without one drew
+/// from (`RunOpts::resolve_recommended_chaos_timeslice_range`).
+pub(crate) const CHAOS_TIMESLICE_RANGE_KEY: &str = "chaos-timeslice-range";
 const REPLAY_NETWORKING_KEY: &str = "replay-networking";
 
 /// One run config document. See the module documentation for the format.
@@ -934,13 +937,10 @@ mod tests {
             "chaos-timeslice-range",
             &["--chaos", "--chaos-timeslice-range=1000..2000000"],
         ),
+        // The discovery mode: a draw without a range.
         (
             "chaos-timeslice-draw",
-            &[
-                "--chaos",
-                "--chaos-timeslice-range=1000..2000000",
-                "--chaos-timeslice-draw=run",
-            ],
+            &["--chaos", "--chaos-timeslice-draw=run"],
         ),
         ("fuzz-futexes", &["--fuzz-futexes"]),
         ("chaos-target-races", &["--chaos-target-races"]),

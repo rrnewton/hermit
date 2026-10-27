@@ -312,8 +312,10 @@ impl PreemptionRecord {
     }
 
     /// The same record, stating the `--pipe-wake-latency` of the trials it
-    /// came from. Every record analyze, minimize or bisect writes from trials
-    /// carries it, so that a replay under another value is refused.
+    /// came from. Every trial-produced, minimized, synthetic and final
+    /// schedule analyze or bisect writes carries it (a supplied record copied
+    /// unchanged, and its normalized copy, are not restamped), so that a
+    /// replay under another value is refused.
     pub fn with_pipe_wake_latency(mut self, latency: Option<u64>) -> Self {
         self.pipe_wake_latency = latency;
         self
@@ -328,6 +330,16 @@ impl PreemptionRecord {
     /// The virtual-time epoch this record was produced under, if it was stored.
     pub fn epoch(&self) -> Option<DateTime<Utc>> {
         self.epoch
+    }
+
+    /// The same record, stating the virtual-time epoch of the trials it came
+    /// from. Every trial-produced, minimized, synthetic and final schedule
+    /// analyze writes carries it (a supplied record analyze copies unchanged,
+    /// and its normalized copy, are not restamped), so that a replay, or
+    /// `hermit bisect`, starts from that epoch rather than its own default.
+    pub fn with_epoch(mut self, epoch: DateTime<Utc>) -> Self {
+        self.epoch = Some(epoch);
+        self
     }
 
     /// Whether the signal-state copy was on in the run this record came
@@ -348,9 +360,10 @@ impl PreemptionRecord {
     }
 
     /// The same record, stating whether the copy was on in the trials it
-    /// came from (`None` for unknown). Every record analyze, minimize or
-    /// bisect writes from trials carries it, as it carries the pipe-wake
-    /// latency.
+    /// came from (`None` for unknown). Every trial-produced, minimized,
+    /// synthetic and final schedule analyze or bisect writes carries it, as it
+    /// carries the pipe-wake latency (a supplied record copied unchanged, and
+    /// its normalized copy, are not restamped).
     pub fn with_signal_state_copy(mut self, on: Option<bool>) -> Self {
         self.signal_state_copy = on;
         self
@@ -969,7 +982,7 @@ mod tests {
     use crate::types::RcbTimeMultiplier;
 
     /// `--pipe-wake-latency` rides in a preemption record as the epoch does:
-    /// omitted when off, kept through JSON and through every record a run or
+    /// omitted when off, kept through JSON and through the records a run or
     /// an analysis writes, and compared exactly, so that `Some(0)` is not off
     /// (https://github.com/rrnewton/hermit/issues/4380).
     #[test]
@@ -1097,9 +1110,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("record.json");
         std::fs::write(&path, &written).unwrap();
-        assert_eq!(read_recorded_chaos_timeslice(&path), Ok(Some(4321)));
+        assert_eq!(
+            read_recorded_chaos_timeslice(&path),
+            Ok(std::num::NonZeroU64::new(4321))
+        );
         std::fs::write(&path, &unsaid).unwrap();
         assert_eq!(read_recorded_chaos_timeslice(&path), Ok(None));
+        // 0 is no drawn value: refused rather than read as "no preemption".
+        std::fs::write(
+            &path,
+            written.replace("\"chaos_timeslice\":4321", "\"chaos_timeslice\":0"),
+        )
+        .unwrap();
+        assert!(read_recorded_chaos_timeslice(&path).is_err());
     }
 
     #[test]
@@ -2367,12 +2390,13 @@ pub fn expired_wait_charge_mismatch(
 /// Read only the timeslice a preemption record file states its run drew under
 /// `--chaos-timeslice-draw=run` (`PreemptionRecord::chaos_timeslice`), as
 /// [`read_recorded_epoch`] reads the epoch. `Ok(None)` for a record without
-/// one.
-pub fn read_recorded_chaos_timeslice(path: &Path) -> Result<Option<u64>, String> {
+/// one; an error for a record stating 0, which no run draws and which would
+/// otherwise turn preemption off where it is passed on as `--max-timeslice`.
+pub fn read_recorded_chaos_timeslice(path: &Path) -> Result<Option<std::num::NonZeroU64>, String> {
     #[derive(Deserialize)]
     struct TimesliceOnly {
         #[serde(default)]
-        chaos_timeslice: Option<u64>,
+        chaos_timeslice: Option<std::num::NonZeroU64>,
     }
     Ok(boundary_recording::read_settings::<TimesliceOnly>(path)?.chaos_timeslice)
 }

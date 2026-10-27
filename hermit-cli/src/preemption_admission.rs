@@ -21,16 +21,28 @@ use crate::Backend;
 pub struct UnsupportedPreemption {
     backend: Backend,
     setting: &'static str,
+    /// The replayed record's drawn maximum, in virtual nanoseconds, which a
+    /// refusal of that maximum states.
+    recorded_maximum: Option<u64>,
 }
 
 impl std::fmt::Display for UnsupportedPreemption {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "unsupported_preemption: --backend={} refuses {}: this runtime cannot deliver \
-             Detcore preemption timer events; the guest has not started",
+            "unsupported_preemption: --backend={} refuses {}",
             self.backend.as_str(),
             self.setting,
+        )?;
+        if self.setting == REPLAYED_RECORD_MAXIMUM
+            && let Some(maximum) = self.recorded_maximum
+        {
+            write!(f, " ({maximum} ns)")?;
+        }
+        write!(
+            f,
+            ": this runtime cannot deliver Detcore preemption timer events; the guest has not \
+             started"
         )?;
         if self.setting == "--max-timeslice" {
             write!(
@@ -38,11 +50,66 @@ impl std::fmt::Display for UnsupportedPreemption {
                 "; to request execution without that bound, pass --max-timeslice=disabled"
             )?;
         }
+        if self.setting == RECOMMENDED_RANGE_DRAW {
+            write!(
+                f,
+                "; remove --chaos-timeslice-draw, or use a backend with PMU-backed preemption \
+                 (--backend=ptrace)"
+            )?;
+        }
+        if self.setting == REPLAYED_RECORD_MAXIMUM {
+            write!(
+                f,
+                "; replay the record with a backend that delivers PMU-backed preemption \
+                 (--backend=ptrace) on a host with usable performance counters"
+            )?;
+        }
         Ok(())
     }
 }
 
 impl std::error::Error for UnsupportedPreemption {}
+
+/// The setting a refused `--chaos-timeslice-range` is named by when `hermit
+/// run` filled the range in for a `--chaos-timeslice-draw` given without one.
+const RECOMMENDED_RANGE_DRAW: &str = "--chaos-timeslice-draw (which draws from the recommended range when no \
+     --chaos-timeslice-range is given)";
+
+/// The setting a replay is refused by when it adopted a record's drawn
+/// maximum: whatever range or draw is beside it draws nothing.
+const REPLAYED_RECORD_MAXIMUM: &str = "a replayed record's drawn --max-timeslice";
+
+impl UnsupportedPreemption {
+    /// The refusal named by the replayed record's drawn maximum when `hermit
+    /// run` adopted it: a range or `--chaos-timeslice-draw` beside the record
+    /// draws nothing, so naming them, or suggesting their removal, would
+    /// mislead. A refusal of another kind of setting is unchanged.
+    pub fn for_a_replayed_record(self) -> Self {
+        if self.setting == "--chaos-timeslice-range" || self.setting == RECOMMENDED_RANGE_DRAW {
+            Self {
+                setting: REPLAYED_RECORD_MAXIMUM,
+                ..self
+            }
+        } else {
+            self
+        }
+    }
+
+    /// The refusal named by the option the user gave when the refused range
+    /// is the recommended one `hermit run` filled in for a
+    /// `--chaos-timeslice-draw` given without a range; any other refusal is
+    /// unchanged.
+    pub fn for_a_draw_from_the_recommended_range(self) -> Self {
+        if self.setting == "--chaos-timeslice-range" {
+            Self {
+                setting: RECOMMENDED_RANGE_DRAW,
+                ..self
+            }
+        } else {
+            self
+        }
+    }
+}
 
 /// Check command-line requests before launching a guest or consuming input.
 /// `maximum_requested` records parser provenance, including config-file and
@@ -69,17 +136,18 @@ pub fn refuse_unsupported_preemption(
         "--chaos-timeslice-range"
     } else if config.chaos_timeslice.is_some() {
         // A replayed record's drawn maximum binds the replay as much.
-        "a replayed record's drawn --max-timeslice"
+        REPLAYED_RECORD_MAXIMUM
     } else if maximum_requested && config.max_timeslice.is_some() {
         "--max-timeslice"
     } else if config.imprecise_timers {
         "--imprecise-timers"
     } else if !config.interrupt_at.is_empty() {
         "--interrupt-at"
+    } else if config.preemption_stacktrace_log_file.is_some() {
+        // Before `--preemption-stacktrace`, which the log file turns on too.
+        "--preemption-stacktrace-log-file"
     } else if config.preemption_stacktrace {
         "--preemption-stacktrace"
-    } else if config.preemption_stacktrace_log_file.is_some() {
-        "--preemption-stacktrace-log-file"
     } else if config.panic_on_rcb_overshoot {
         "--panic-on-rbc-overshoot (--panic-on-rcb-overshoot)"
     } else if skid_margin_requested {
@@ -89,7 +157,11 @@ pub fn refuse_unsupported_preemption(
     } else {
         return Ok(());
     };
-    Err(UnsupportedPreemption { backend, setting })
+    Err(UnsupportedPreemption {
+        backend,
+        setting,
+        recorded_maximum: config.chaos_timeslice.map(std::num::NonZeroU64::get),
+    })
 }
 
 /// A named, pre-guest refusal of a configuration that cannot replay a
@@ -208,6 +280,98 @@ mod tests {
             }
             refuse_unsupported_preemption(&config, Backend::Ptrace, true, false).unwrap();
         }
+    }
+
+    /// A validated configuration with `--preemption-stacktrace-log-file` (which
+    /// validation turns `--preemption-stacktrace` on for) is refused under the
+    /// log file's name, the option the user gave.
+    #[test]
+    fn a_validated_stacktrace_log_file_is_refused_by_its_own_name() {
+        let mut config = Config::parse_from([
+            "detcore",
+            "--max-timeslice=disabled",
+            "--preemption-stacktrace-log-file=unused",
+        ]);
+        config.validate();
+        assert!(config.preemption_stacktrace);
+        for backend in TIMERLESS {
+            let error = refuse_unsupported_preemption(&config, backend, true, false).unwrap_err();
+            assert_eq!(error.setting, "--preemption-stacktrace-log-file");
+        }
+    }
+
+    /// A range `hermit run` filled in for a draw given without one is refused
+    /// under the draw's name, with the remedy; an explicit range keeps its own
+    /// name; a replay that adopted a record's drawn value is refused under the
+    /// record's maximum, whatever range or draw is beside it.
+    #[test]
+    fn a_draw_from_the_recommended_range_is_refused_by_its_own_name() {
+        let config = Config::parse_from([
+            "detcore",
+            "--chaos",
+            "--chaos-timeslice-range=1000..200000000",
+            "--chaos-timeslice-draw=run",
+        ]);
+        for backend in TIMERLESS {
+            let explicit =
+                refuse_unsupported_preemption(&config, backend, false, false).unwrap_err();
+            assert_eq!(explicit.setting, "--chaos-timeslice-range");
+            assert_eq!(
+                explicit
+                    .clone()
+                    .for_a_draw_from_the_recommended_range()
+                    .setting,
+                RECOMMENDED_RANGE_DRAW
+            );
+            let message = explicit.for_a_draw_from_the_recommended_range().to_string();
+            assert!(
+                message.contains("refuses --chaos-timeslice-draw (which draws"),
+                "{message}"
+            );
+            assert!(
+                message.contains(
+                    "remove --chaos-timeslice-draw, or use a backend with PMU-backed preemption"
+                ),
+                "{message}"
+            );
+        }
+        // A replay that adopted a record's drawn value: the record is named,
+        // with the PMU-backed remedy, never the range or draw beside it.
+        let mut adopted = config.clone();
+        adopted.chaos_timeslice = std::num::NonZeroU64::new(4321);
+        for backend in TIMERLESS {
+            let refusal = refuse_unsupported_preemption(&adopted, backend, false, false)
+                .unwrap_err()
+                .for_a_replayed_record();
+            assert_eq!(refusal.setting, REPLAYED_RECORD_MAXIMUM);
+            let message = refusal.to_string();
+            assert!(
+                message.contains(
+                    "refuses a replayed record's drawn --max-timeslice (4321 ns): this runtime"
+                ),
+                "{message}"
+            );
+            assert!(
+                message.contains("(--backend=ptrace) on a host with usable performance counters"),
+                "{message}"
+            );
+            assert!(
+                !message.contains("remove --chaos-timeslice-draw"),
+                "{message}"
+            );
+            assert!(!message.contains("--chaos-timeslice-range"), "{message}");
+        }
+        let maximum = refuse_unsupported_preemption(
+            &Config::parse_from(["detcore", "--max-timeslice=1000"]),
+            Backend::Kvm,
+            true,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(
+            maximum.for_a_draw_from_the_recommended_range().setting,
+            "--max-timeslice"
+        );
     }
 
     #[test]

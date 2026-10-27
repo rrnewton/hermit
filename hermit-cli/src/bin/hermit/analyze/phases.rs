@@ -920,7 +920,9 @@ impl AnalyzeOpts {
                 from_where = "non-chaos (0 extra preemptions) run";
 
                 // Otherwise we just assume that a *baseline* (non-chaos) run will do the trick.
-                ro.det_opts.det_config.chaos = false;
+                // Without chaos the run arguments' timeslice range and draw mean nothing, and
+                // validating the run again would refuse them.
+                ro.turn_chaos_off();
             }
             newrun.launch()?;
             self.record_endpoint(&newrun);
@@ -2521,8 +2523,10 @@ mod tests {
         let zero = record("zero", Some(0));
         let options = prepare(&zero, &["--pipe-wake-latency=0"]).unwrap();
         assert_eq!(options.trial_pipe_wake_latency(), Some(0));
-        // Every record analyze writes carries the trials' latency: the final
-        // schedules, each trial's schedule, and minimize's records.
+        // Every trial-produced, minimized, synthetic and final schedule analyze
+        // writes carries the trials' latency: the final schedules, each
+        // trial's schedule, and minimize's records (a supplied record analyze
+        // copies unchanged, and its normalized copy, are not restamped).
         let written = |options: &AnalyzeOpts| {
             let (failing, passing, trial) = (
                 dir.path().join("final-failing.json"),
@@ -2568,9 +2572,184 @@ mod tests {
         }
     }
 
-    /// Every record analyze writes states the trials' signal-state copy
-    /// setting, and a recording made under the other setting is refused
-    /// before any trial; one that states no setting is accepted.
+    /// A drawn timeslice travels from analyze to bisect through the production
+    /// wiring: `prepare` adopts it from the recording (`--run1-preemptions`,
+    /// or a replay in the run arguments beside `--run1-seed`),
+    /// `write_final_schedules` stamps it on both final schedules, and
+    /// `BisectOpts::prepare` adopts it from them, so every bisect replay runs
+    /// under it. Removing any of the three steps fails this test. A recording
+    /// that states none leaves bisect at the default. The recordings carry an
+    /// epoch, which the trials start from, both final schedules state, and
+    /// bisect adopts in turn.
+    #[test]
+    fn analyze_final_schedules_carry_a_drawn_timeslice_into_bisect() {
+        let Some(arm) =
+            epoch_environment_arm("analyze_final_schedules_carry_a_drawn_timeslice_into_bisect")
+        else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let resources = Path::new(env!("CARGO_MANIFEST_DIR")).join("test-resources");
+        let events = |fixture: &str| {
+            let source = resources.join(format!("flaky_cas_sequence_schedules-{fixture}.json"));
+            let record: PreemptionRecord =
+                serde_json::from_str(&std::fs::read_to_string(source).unwrap()).unwrap();
+            record.into_global()
+        };
+        // The recordings carry an epoch, as real ones do: the trials must
+        // start from it whichever way the recording is given.
+        let record = |name: &str, timeslice: Option<u64>| {
+            let path = record_with_epoch(dir.path(), name, Some(RECORDED));
+            let mut value: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            if let Some(timeslice) = timeslice {
+                value["chaos_timeslice"] = serde_json::Value::from(timeslice);
+            }
+            std::fs::write(&path, value.to_string()).unwrap();
+            path
+        };
+        let analyze = |analyze_args: &[&str], run_args: &[&str]| {
+            let mut argv = vec!["hermit", "analyze"];
+            argv.extend(analyze_args);
+            argv.push("--");
+            argv.extend(run_args);
+            argv.push("/bin/true");
+            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.prepare(&args.global).map(|_| options)
+        };
+        let bisect = |good: &Path, bad: &Path| {
+            let good = format!("--good={}", good.display());
+            let bad = format!("--bad={}", bad.display());
+            let argv = [
+                "hermit",
+                "bisect",
+                &good,
+                &bad,
+                "--",
+                "--chaos",
+                "/bin/true",
+            ];
+            let args = crate::Args::try_parse_from(argv).unwrap();
+            let crate::Subcommand::Bisect(options) = args.command else {
+                panic!("{argv:?} is not bisect")
+            };
+            let (analyzer, _, _) = options
+                .prepare(&args.global)
+                .unwrap_or_else(|error| panic!("{argv:?}: {error:#}"));
+            analyzer
+        };
+        let marked = record("marked", Some(808_237));
+        let plain = record("plain", None);
+        let run1 = format!("--run1-preemptions={}", marked.display());
+        let replay = format!("--replay-preemptions-from={}", marked.display());
+        let plain_run1 = format!("--run1-preemptions={}", plain.display());
+        for (label, analyze_args, run_args, expected) in [
+            (
+                "--run1-preemptions",
+                vec![run1.as_str()],
+                vec!["--chaos"],
+                Some(808_237),
+            ),
+            (
+                "a replay in the run arguments",
+                vec!["--run1-seed=3"],
+                vec!["--chaos", replay.as_str()],
+                Some(808_237),
+            ),
+            (
+                "a recording without one",
+                vec![plain_run1.as_str()],
+                vec!["--chaos"],
+                None,
+            ),
+        ] {
+            if arm == "set" {
+                // HERMIT_EPOCH is an explicit epoch other than the
+                // recording's: refused before any trial, however it is given.
+                let error = analyze(&analyze_args, &run_args).unwrap_err();
+                assert!(
+                    format!("{error:#}")
+                        .contains(&format!("differs from the epoch {RECORDED_RFC3339}")),
+                    "{label}: {error:#}"
+                );
+                continue;
+            }
+            let mut options = analyze(&analyze_args, &run_args)
+                .unwrap_or_else(|error| panic!("{label}: {error:#}"));
+            options.tmp_dir = Some(dir.path().to_path_buf());
+            // The trials start from the recording's epoch (checked on the run
+            // arguments: building a trial validates it against this host's
+            // PMU, which a drawn timeslice needs).
+            assert!(
+                options
+                    .run_arg
+                    .contains(&format!("--epoch={RECORDED_RFC3339}")),
+                "{label}: {:?}",
+                options.run_arg
+            );
+            let (good, bad) = (
+                dir.path().join(format!("{expected:?}-good.json")),
+                dir.path().join(format!("{expected:?}-bad.json")),
+            );
+            options.write_final_schedules(events("failing"), &bad, events("passing"), &good);
+            for path in [&good, &bad] {
+                assert_eq!(
+                    detcore::preemptions::read_recorded_chaos_timeslice(path)
+                        .unwrap()
+                        .map(std::num::NonZeroU64::get),
+                    expected,
+                    "{label}: {}",
+                    path.display()
+                );
+                // The trials' epoch is stated too, so bisect starts there.
+                assert_eq!(
+                    detcore::preemptions::read_recorded_epoch(path)
+                        .unwrap()
+                        .map(|epoch| epoch.to_rfc3339()),
+                    Some(RECORDED_RFC3339.to_owned()),
+                    "{label}: {}",
+                    path.display()
+                );
+            }
+            let trials = bisect(&good, &bad);
+            assert_eq!(
+                trials.trial_chaos_timeslice.map(std::num::NonZeroU64::get),
+                expected,
+                "{label}"
+            );
+            assert!(
+                trials
+                    .run_arg
+                    .contains(&format!("--epoch={RECORDED_RFC3339}")),
+                "{label}: {:?}",
+                trials.run_arg
+            );
+            let maximum: Vec<&String> = trials
+                .run_arg
+                .iter()
+                .filter(|arg| arg.starts_with("--max-timeslice"))
+                .collect();
+            match expected {
+                Some(timeslice) => {
+                    assert_eq!(
+                        maximum,
+                        [&format!("--max-timeslice={timeslice}")],
+                        "{label}"
+                    )
+                }
+                None => assert!(maximum.is_empty(), "{label}: {maximum:?}"),
+            }
+        }
+    }
+
+    /// Every trial-produced, minimized, synthetic and final schedule analyze
+    /// writes states the trials' signal-state copy setting (a supplied record
+    /// analyze copies unchanged, and its normalized copy, are not restamped),
+    /// and a recording made under the other setting is refused before any
+    /// trial; one that states no setting is accepted.
     #[test]
     fn analyze_stamps_and_checks_the_signal_state_copy_setting() {
         let dir = tempfile::tempdir().unwrap();
@@ -2722,6 +2901,70 @@ mod tests {
                  --run2-preemptions"
             ),
         );
+    }
+
+    /// A preemption record or schedule the run arguments replay
+    /// (`--replay-preemptions-from`, `--replay-schedule-from`) is replayed by
+    /// every trial, from the epoch it was recorded under: the trials get that
+    /// epoch as `--epoch`, and a record from another epoch than the given
+    /// recording, or than an explicit epoch, is refused before any trial,
+    /// naming it. Before, its epoch was adopted only by `RunOpts::main`, which
+    /// trials never reach (they start through `RunOpts::run`), so they
+    /// replayed it from the run arguments' epoch. The checks run in a child
+    /// process whose environment fixes `HERMIT_EPOCH`.
+    #[test]
+    fn analyze_replays_a_run_argument_record_from_the_epoch_it_was_recorded_under() {
+        let Some(arm) = epoch_environment_arm(
+            "analyze_replays_a_run_argument_record_from_the_epoch_it_was_recorded_under",
+        ) else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        let recorded = record_with_epoch(dir, "replayed", Some(RECORDED));
+        let other = record_with_epoch(dir, "replayed-other", Some(OTHER));
+        for option in ["--replay-preemptions-from", "--replay-schedule-from"] {
+            let replay = format!("{option}={}", recorded.display());
+            let named = format!("the run arguments' {option}");
+            if arm == "set" {
+                refused(
+                    prepared_analysis(dir, None, None, &[&replay]).unwrap_err(),
+                    &format!(
+                        "the explicit virtual-time epoch 2026-01-01T00:00:00+00:00 (from \
+                         --epoch or HERMIT_EPOCH) differs from the epoch {RECORDED_RFC3339} \
+                         that {named}"
+                    ),
+                );
+                continue;
+            }
+            // The record alone sets the trials' epoch.
+            let analysis = prepared_analysis(dir, None, None, &[&replay]).unwrap();
+            assert_eq!(
+                analysis.trial_epoch_for_test(),
+                RECORDED_RFC3339,
+                "{option}"
+            );
+            // Beside a given recording from the same epoch it is accepted.
+            let analysis = prepared_analysis(dir, Some(RECORDED), None, &[&replay]).unwrap();
+            assert_eq!(
+                analysis.trial_epoch_for_test(),
+                RECORDED_RFC3339,
+                "{option}"
+            );
+            // From another epoch than the given recording: refused, naming it.
+            let replay_other = format!("{option}={}", other.display());
+            refused(
+                prepared_analysis(dir, Some(RECORDED), None, &[&replay_other]).unwrap_err(),
+                &format!(
+                    "was recorded under the virtual-time epoch {RECORDED_RFC3339} and {named}"
+                ),
+            );
+            // An explicit epoch other than the record's is refused.
+            refused(
+                prepared_analysis(dir, None, None, &[&replay, "--epoch", OTHER]).unwrap_err(),
+                &format!("pass --epoch={RECORDED_RFC3339}"),
+            );
+        }
     }
 
     /// A network trace the run arguments replay (`--replay-networking`)

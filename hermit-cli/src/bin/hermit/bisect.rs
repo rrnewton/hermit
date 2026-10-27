@@ -100,7 +100,7 @@ impl BisectOpts {
 
     /// Everything `main` does before the first replay: the refusals, the two
     /// schedules, and the trial configuration they imply.
-    fn prepare(
+    pub(crate) fn prepare(
         &self,
         global: &GlobalOpts,
     ) -> Result<(AnalyzeOpts, Vec<SchedEvent>, Vec<SchedEvent>), Error> {
@@ -143,6 +143,8 @@ impl BisectOpts {
             // the run arguments' --timeout alone.
             trial_timeout: crate::analyze::TrialTimeout::Off,
             endpoints: Default::default(),
+            // Set from the two schedules by `adopt_recorded_timeslice`.
+            trial_chaos_timeslice: None,
         };
         // Before the schedules are read: a refused cap or counter reads and
         // starts nothing.
@@ -160,8 +162,9 @@ impl BisectOpts {
 
         let good = read_schedule(&self.good, "good")?;
         let bad = read_schedule(&self.bad, "bad")?;
-        // Each trial's schedule is written anew without an epoch, so the
-        // trials replay from the one the two schedules were recorded under.
+        // Each trial's schedule is written anew, stamped with the trials'
+        // epoch, so the trials must start from the one the two schedules
+        // were recorded under: adopt it here.
         analyzer.adopt_recorded_epoch(&[("--good", &self.good), ("--bad", &self.bad)])?;
         // Every replay charges expired timed waits as the failing schedule did.
         analyzer.adopt_expired_wait_charge(Some(&self.bad))?;

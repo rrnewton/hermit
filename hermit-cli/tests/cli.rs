@@ -5892,6 +5892,209 @@ fn a_library_launch_refuses_an_unqualified_annotated_configuration() {
     }
 }
 
+/// A replay of a record whose run drew its timeslice
+/// (`--chaos-timeslice-draw=run`) is refused on a backend without the
+/// preemption timer before the guest starts, and the refusal names the
+/// replayed record's maximum and its value, whatever range or draw is beside
+/// the record, rather than the replay option or the (inert) range. That
+/// backend refusal comes only once every other replay and draw check has
+/// passed, so a run with another problem is refused for that problem, never
+/// sent to a backend with the timer that would refuse it in turn: an explicit
+/// `--max-timeslice` other than the record's, a recorded value below one RCB
+/// under `--clock-multiplier`, a draw without `--chaos`, and a draw beside a
+/// record that states no drawn value; and, for any replayed record, drawn or
+/// not, a conflicting `--epoch`, another `--pipe-wake-latency`, or another
+/// signal-state copy setting. An explicit `--max-timeslice` equal to the
+/// record's changes nothing, and a record that states no drawn value,
+/// replayed alone, gets the backend's `--replay-preemptions-from` refusal, as
+/// before.
+#[test]
+fn a_timerless_backend_refuses_a_drawn_record_by_its_maximum() {
+    let _guard = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("test-resources/flaky_cas_sequence_schedules-passing.json");
+    let mut record: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(source).unwrap()).unwrap();
+    let old = directory.path().join("old.json");
+    fs::write(&old, record.to_string()).unwrap();
+    let replay_old = format!("--replay-preemptions-from={}", old.display());
+    // Records that the replay checks after validation refuse, drawn or not.
+    let variant = |name: &str, field: &str, value: serde_json::Value, drawn: bool| {
+        let mut variant = record.clone();
+        variant[field] = value;
+        if drawn {
+            variant["chaos_timeslice"] = serde_json::Value::from(4321_u64);
+        }
+        let path = directory.path().join(name);
+        fs::write(&path, variant.to_string()).unwrap();
+        format!("--replay-preemptions-from={}", path.display())
+    };
+    let replay_epoch = variant(
+        "epoch.json",
+        "epoch",
+        serde_json::Value::from("2000-12-31T23:59:59.123456789Z"),
+        false,
+    );
+    let replay_epoch_drawn = variant(
+        "epoch-drawn.json",
+        "epoch",
+        serde_json::Value::from("2000-12-31T23:59:59.123456789Z"),
+        true,
+    );
+    let replay_latency = variant(
+        "latency.json",
+        "pipe_wake_latency",
+        serde_json::Value::from(3_000_000_u64),
+        true,
+    );
+    let replay_copy = variant(
+        "copy.json",
+        "signal_state_copy",
+        serde_json::Value::from(false),
+        false,
+    );
+    record["chaos_timeslice"] = serde_json::Value::from(4321_u64);
+    let path = directory.path().join("drawn.json");
+    fs::write(&path, record.to_string()).unwrap();
+    let replay = format!("--replay-preemptions-from={}", path.display());
+    let guest = ["--", "/bin/echo", "drawn-record-guest-must-not-start"];
+    // Refused before the guest starts, with every `expected` text and none of
+    // the `unexpected` ones.
+    let refused = |args: &[&str], expected: &[&str], unexpected: &[&str]| {
+        let output = hermit(args);
+        let stderr = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{args:?}: {stderr}"
+        );
+        for text in expected {
+            assert!(stderr.contains(text), "{args:?}: {stderr}");
+        }
+        for text in unexpected {
+            assert!(!stderr.contains(text), "{args:?}: {stderr}");
+        }
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("drawn-record-guest-must-not-start")
+        );
+    };
+    let command = |backend: &'static str, options: &[&'static str], record: &str| {
+        let mut args: Vec<String> = ["--backend", backend, "run"]
+            .iter()
+            .chain(options)
+            .map(|arg| (*arg).to_owned())
+            .collect();
+        args.push(record.to_owned());
+        args.extend(guest.iter().map(|arg| (*arg).to_owned()));
+        args
+    };
+    for backend in ["dbt", "sabre", "kvm", "liteinst", "in-guest-trap"] {
+        let named = format!(
+            "unsupported_preemption: --backend={backend} refuses a replayed record's drawn \
+             --max-timeslice (4321 ns)"
+        );
+        for beside in [
+            &["--chaos"][..],
+            &["--chaos", "--chaos-timeslice-draw=run"],
+            &["--chaos", "--chaos-timeslice-range=1000..200000000"],
+            &["--chaos", "--max-timeslice=4321"],
+            &[
+                "--chaos",
+                "--chaos-timeslice-draw=run",
+                "--max-timeslice=4321",
+            ],
+        ] {
+            let args = command(backend, beside, &replay);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            refused(
+                &args,
+                &[
+                    &named,
+                    "(--backend=ptrace) on a host with usable performance counters",
+                ],
+                &[
+                    "refuses --replay-preemptions-from",
+                    "refuses --chaos-timeslice",
+                ],
+            );
+        }
+        // Each run's own problem, not the backend's.
+        for (options, record, expected) in [
+            (
+                &["--chaos", "--max-timeslice=5000"][..],
+                &replay,
+                &[
+                    "the replayed record's --max-timeslice (4321 ns, --replay-preemptions-from",
+                    "differs from the --max-timeslice given (5000 ns)",
+                ][..],
+            ),
+            (
+                &[
+                    "--chaos",
+                    "--chaos-timeslice-draw=run",
+                    "--max-timeslice=5000",
+                ],
+                &replay,
+                &["differs from the --max-timeslice given (5000 ns)"],
+            ),
+            // One RCB is 6000 ns at --clock-multiplier=600.
+            (
+                &["--chaos", "--clock-multiplier=600"],
+                &replay,
+                &[
+                    "the replayed record's --max-timeslice (4321 ns, --replay-preemptions-from",
+                    "is below one RCB under this run's settings (6000 virtual nanoseconds",
+                ],
+            ),
+            (
+                &["--chaos-timeslice-draw=run"],
+                &replay,
+                &[
+                    "--chaos-timeslice-draw=run chooses how a chaos run draws its timeslice; add --chaos",
+                ],
+            ),
+            (
+                &["--chaos", "--chaos-timeslice-draw=run"],
+                &replay_old,
+                &["states no drawn --max-timeslice", "A replay never draws"],
+            ),
+            // The replay checks after validation, for any replayed record.
+            (
+                &["--chaos", "--epoch=2001-01-01T00:00:00Z"],
+                &replay_epoch,
+                &["the explicit virtual-time epoch 2001-01-01T00:00:00+00:00"],
+            ),
+            (
+                &["--chaos", "--epoch=2001-01-01T00:00:00Z"],
+                &replay_epoch_drawn,
+                &["pass --epoch=2000-12-31T23:59:59.123456789+00:00"],
+            ),
+            (&["--chaos"], &replay_latency, &["--pipe-wake-latency"]),
+            (&["--chaos"], &replay_copy, &["signal-state copy"]),
+        ] {
+            let args = command(backend, options, record);
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            refused(
+                &args,
+                expected,
+                &["unsupported_preemption", "in-guest LiteInst"],
+            );
+        }
+        // A record that states none, alone: the backend's refusal of the
+        // preemption replay, as before.
+        let args = command(backend, &["--chaos"], &replay_old);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        refused(
+            &args,
+            &[&format!(
+                "unsupported_preemption: --backend={backend} refuses --replay-preemptions-from"
+            )],
+            &[],
+        );
+    }
+}
+
 fn assert_timerless_default_and_disabled_maximum_run(backend: &str) {
     let _guard = hermit_run_guard();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -18458,6 +18661,123 @@ fn a_run_draw_picks_the_timeslice_and_a_replay_runs_under_it() {
     );
     let (_, other) = run(&["--seed=4", range, draw], &path("other.summary.json"));
     assert_ne!(other, drawn, "seeds 3 and 4 drew the same timeslice");
+}
+
+/// The discovery mode: `--chaos-timeslice-draw=run` without a range draws a
+/// chaos run's `--max-timeslice` from `RECOMMENDED_CHAOS_TIMESLICE_RANGE`,
+/// exactly as that range given explicitly does for the same seed: the summary
+/// reports the same value, inside the range, the guest prints the same, and
+/// the two preemption records are the same and state the value. Seeds 3 and 4
+/// draw 835700 and 372270 ns. A plain `--chaos` run keeps the default 200 ms
+/// and its record states no drawn value; a replay of that record beside
+/// `--chaos-timeslice-draw=run` is refused, since a replay never draws.
+///
+/// PMU SUBJECT: without a usable PMU timer the draw is refused, so test.cli
+/// and test.cli_on_host skip it by exact name and
+/// privileged-test.pmu_cli_cases runs it.
+#[test]
+fn a_draw_without_a_range_draws_from_the_recommended_range() {
+    use detcore_model::config::RECOMMENDED_CHAOS_TIMESLICE_RANGE;
+    let _guard = hermit_run_guard();
+    let guest = chaos_spinner_and_new_thread_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let path = |name: &str| directory.path().join(name).to_str().unwrap().to_owned();
+    let base = [
+        "run",
+        "--strict",
+        "--base-env=minimal",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--chaos",
+    ];
+    let run = |extra: &[&str], summary: &str| {
+        let mut args = base.to_vec();
+        let summary_arg = format!("--summary-json={summary}");
+        args.extend_from_slice(extra);
+        args.push(&summary_arg);
+        args.extend(["--", guest]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let summary: serde_json::Value =
+            serde_json::from_slice(&fs::read(summary).unwrap()).unwrap();
+        let timeslice = summary["preemption"]["max_timeslice_ns"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("no timeslice in {summary}"));
+        (stdout(&output), timeslice)
+    };
+    let record = |path: &str| -> serde_json::Value {
+        serde_json::from_slice(&fs::read(path).expect("no preemption record")).unwrap()
+    };
+    let range = RECOMMENDED_CHAOS_TIMESLICE_RANGE;
+    let explicit_range = format!("--chaos-timeslice-range={range}");
+    let mut drawn = Vec::new();
+    for seed in ["--seed=3", "--seed=4"] {
+        let bare_record = path(&format!("bare{seed}.json"));
+        let (bare_stdout, bare) = run(
+            &[
+                seed,
+                "--chaos-timeslice-draw=run",
+                &format!("--record-preemptions-to={bare_record}"),
+            ],
+            &path(&format!("bare{seed}.summary.json")),
+        );
+        assert!(
+            (range.min.get()..=range.max.get()).contains(&bare),
+            "{seed}: {bare} is outside {range}"
+        );
+        let explicit_record = path(&format!("explicit{seed}.json"));
+        let (explicit_stdout, explicit) = run(
+            &[
+                seed,
+                &explicit_range,
+                "--chaos-timeslice-draw=run",
+                &format!("--record-preemptions-to={explicit_record}"),
+            ],
+            &path(&format!("explicit{seed}.summary.json")),
+        );
+        assert_eq!(bare, explicit, "{seed}: another value was drawn");
+        assert_eq!(bare_stdout, explicit_stdout, "{seed}");
+        let bare_json = record(&bare_record);
+        assert_eq!(
+            bare_json["chaos_timeslice"], bare,
+            "{seed}: the record does not state the draw"
+        );
+        assert_eq!(
+            bare_json,
+            record(&explicit_record),
+            "{seed}: another schedule ran"
+        );
+        drawn.push(bare);
+    }
+    assert_ne!(drawn[0], drawn[1], "seeds 3 and 4 drew the same timeslice");
+    // A plain chaos run keeps the default, and its record states no draw.
+    let plain_record = path("plain.json");
+    let (_, plain) = run(
+        &[
+            "--seed=3",
+            &format!("--record-preemptions-to={plain_record}"),
+        ],
+        &path("plain.summary.json"),
+    );
+    assert_eq!(plain, 200_000_000);
+    assert!(record(&plain_record).get("chaos_timeslice").is_none());
+    // A replay never draws: the plain record beside a draw is refused.
+    let replay = format!("--replay-preemptions-from={plain_record}");
+    let mut args = base.to_vec();
+    args.extend(["--chaos-timeslice-draw=run", &replay, "--", guest]);
+    let output = hermit(&args);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{args:?}: {}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("states no drawn --max-timeslice"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 /// The same bound on KVM, where the spinner's getpid takes no scheduler turn
@@ -32725,9 +33045,10 @@ fn liteinst_in_guest_refuses_verify_without_reading_stdin() {
 /// epoch its recording was made under is refused by policy (122) in every
 /// build. Replay-epoch reconciliation does not depend on the backend being
 /// compiled in, so a build without the `liteinst` feature must not answer
-/// "backend unavailable" (125) instead.
+/// "backend unavailable" (125) instead. Nor must the backend's refusal of the
+/// preemption replay itself: a replay's preemption admission comes after the
+/// replay checks (`RunOpts::admit_deferred_preemption`).
 #[test]
-#[ignore = "unsupported_preemption: --backend=liteinst refuses --replay-preemptions-from before replay epoch reconciliation"]
 fn liteinst_replay_with_a_conflicting_epoch_is_refused_in_every_build() {
     let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))

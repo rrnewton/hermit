@@ -1209,7 +1209,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // matching the full validate at c00dc58e0cd, which ran 1910 in this
     // selection (1909 passed; the one failure was the hosted-pin
     // assertion for the twin below, not a count refusal on this node).
-    ("test.regular_crates", 1911),
+    // And detcore-model config::tests::a_draw_without_a_range_names_the_recommended_range: 1912.
+    ("test.regular_crates", 1912),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1870,7 +1871,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And PR 4715's a_trial_writes_what_it_replays_only_into_the_workspace
     // (a trial never writes into a --replay-schedule-from or
     // --replay-preemptions-from file of the run arguments): 1226 + 1 = 1227.
-    ("test.hermit_unit", 1227),
+    // And run's a_draw_without_a_range_uses_the_recommended_range,
+    // a_replay_never_draws_a_timeslice and
+    // a_rendered_draw_reruns_the_same_timeslice; analyze's
+    // analyze_schedules_carry_the_drawn_timeslice_into_bisect,
+    // analyze_takes_the_drawn_timeslice_of_a_recording_its_run_arguments_replay
+    // and analyze_runs_its_chaos_free_baseline_beside_a_timeslice_range; and the
+    // lib's preemption_admission::tests::a_draw_from_the_recommended_range_is_refused_by_its_own_name: 1234.
+    // And analyze's analyze_final_schedules_carry_a_drawn_timeslice_into_bisect: 1235.
+    // And analyze's analyze_replays_a_run_argument_record_from_the_epoch_it_was_recorded_under: 1236.
+    // And the lib's preemption_admission::tests::a_validated_stacktrace_log_file_is_refused_by_its_own_name: 1237.
+    ("test.hermit_unit", 1237),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -4410,7 +4421,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured with `cargo nextest list` at 11c35a504a6.
     // Binder receipt adds one CLI identity (capability-skipped without binderfs):
     // 703 + 1 = 704.
-    ("test.cli", 704),
+    // a_draw_without_a_range_draws_from_the_recommended_range is added to the
+    // cli binary and, needing the PMU timer too, skipped by exact name here and
+    // in test.cli_on_host (privileged-test.pmu_cli_cases runs it): 704 + 1 - 1
+    // = 704.
+    // And a_timerless_backend_refuses_a_drawn_record_by_its_maximum, which
+    // needs no PMU (the refusal comes before any guest): 705.
+    // And liteinst_replay_with_a_conflicting_epoch_is_refused_in_every_build,
+    // no longer ignored: a replay's preemption admission now follows the
+    // replay-epoch check, so the epoch refusal it asserts comes first: 706.
+    ("test.cli", 706),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4496,7 +4516,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run_schedule_replay_ends_check_in_slices_where_the_record_did, whose
     // replay needs a PMU stop on a branch count to go wrong, joins them: 17,
     // listed.
-    ("privileged-test.pmu_cli_cases", 18),
+    // a_draw_without_a_range_draws_from_the_recommended_range needs it too (a draw is refused without one): 19, listed.
+    ("privileged-test.pmu_cli_cases", 19),
     // The six x86-64-v3 CLI cases that run a guest, with
     // HERMIT_TEST_REQUIRE_CPU_PROFILE_V3=1 so that a refusal fails
     // (https://github.com/rrnewton/hermit/issues/4243): 6, listed with this
@@ -4962,7 +4983,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two TracerPid cli tests: 619 + 2 = 621.
     // And the same two 11c35a504a6 tests: 621 + 2 = 623.
     // And the same binder descriptor test, not excluded: 623.
-    ("test.cli_on_host", 623),
+    // And a_timerless_backend_refuses_a_drawn_record_by_its_maximum: 624.
+    // And liteinst_replay_with_a_conflicting_epoch_is_refused_in_every_build,
+    // no longer ignored: 625.
+    ("test.cli_on_host", 625),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5816,7 +5840,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same 23, keeping the six local-only cases: 1196 + 23 = 1219.
     // The same six analyze outcome controls replace one obsolete warning test: +5.
     // And the same PR 4715 trial-input workspace test: 1220 + 1 = 1221.
-    ("test.hermit_unit_on_host", 1221),
+    // And the same seven discovery-mode units: 1228.
+    // And the same analyze-to-bisect unit: 1229.
+    // And the same run-argument epoch unit: 1230.
+    // And the same stacktrace-log-file unit: 1231.
+    ("test.hermit_unit_on_host", 1231),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6035,7 +6063,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // so the hosted twin executes 1910 - 14 = 1896. Two of the four added
     // since 1894 are themselves hosted-excluded, so this twin gains only
     // two, not four: 1894 + 2 = 1896.
-    ("test.regular_crates_on_host", 1897),
+    // And the same discovery-mode unit: 1898.
+    ("test.regular_crates_on_host", 1898),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

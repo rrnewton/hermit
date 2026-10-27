@@ -1407,6 +1407,21 @@ pub struct RunOpts {
     #[clap(skip)]
     chaos_timeslice_adopted: bool,
 
+    /// Whether `resolve_recommended_chaos_timeslice_range` filled in
+    /// `RECOMMENDED_CHAOS_TIMESLICE_RANGE` for a `--chaos-timeslice-draw` given
+    /// without a range: refusals then name the draw, and `--save-config`
+    /// writes the range out.
+    #[clap(skip)]
+    chaos_timeslice_range_recommended: bool,
+
+    /// Set by `main`: a run whose preemption admission is deferred
+    /// (`defers_preemption_admission`) is admitted by `main` itself, after the
+    /// replay checks that follow validation (the replayed epoch, the
+    /// pipe-wake latency and the signal-state copy), rather than at the end of
+    /// validation, which other callers keep.
+    #[clap(skip)]
+    admission_after_replay_checks: bool,
+
     /// Runtime-only: the seed `--seed-from` chose, which `--save-config`
     /// writes in its place.
     #[clap(skip)]
@@ -4774,6 +4789,539 @@ fn a_run_draw_picks_the_maximum_and_a_replay_takes_the_recorded_one() {
         std::num::NonZeroU64::new(200_000_000)
     );
     assert_eq!(plain.det_opts.det_config.chaos_timeslice, None);
+}
+
+/// The discovery mode: `--chaos-timeslice-draw=run` given without a range
+/// draws from `RECOMMENDED_CHAOS_TIMESLICE_RANGE` exactly as the range given
+/// explicitly does, through `validate_args` and again on a second
+/// validation; `slice` without a range draws each slice's mean from it. A
+/// plain `--chaos` run is unchanged. The draw needs `--chaos`, conflicts with
+/// an explicit `--max-timeslice` and `--target-timeslice`, needs the PMU
+/// timer, and its range must start at one RCB or more at the run's clock
+/// multiplier (seed 0 draws 2123 ns, below the 3000 ns of one RCB at
+/// `--clock-multiplier=300`, which `Detcore::new` would refuse by panicking).
+#[test]
+fn a_draw_without_a_range_uses_the_recommended_range() {
+    use detcore_model::config::ChaosTimesliceDraw;
+    use detcore_model::config::RECOMMENDED_CHAOS_TIMESLICE_RANGE;
+    let validate = |argv: &[&str]| {
+        let mut ro = run_opts_for(argv);
+        ro.validate_args_with_perf_support(true)
+            .unwrap_or_else(|error| panic!("{argv:?}: {error:#}"));
+        ro
+    };
+    let explicit_range = format!("--chaos-timeslice-range={RECOMMENDED_CHAOS_TIMESLICE_RANGE}");
+    let explicit = validate(&[
+        "hermit",
+        "run",
+        "--chaos",
+        "--seed=7",
+        &explicit_range,
+        "--chaos-timeslice-draw=run",
+        "prog",
+    ]);
+    let drawn = detcore::preemptions::draw_chaos_timeslice(RECOMMENDED_CHAOS_TIMESLICE_RANGE, 7);
+    let mut bare = validate(&[
+        "hermit",
+        "run",
+        "--chaos",
+        "--seed=7",
+        "--chaos-timeslice-draw=run",
+        "prog",
+    ]);
+    for round in 0..2 {
+        let config = &bare.det_opts.det_config;
+        assert_eq!(config.max_timeslice, Some(drawn), "{round}");
+        assert_eq!(config.chaos_timeslice, Some(drawn), "{round}");
+        assert_eq!(
+            config.chaos_timeslice_range,
+            Some(RECOMMENDED_CHAOS_TIMESLICE_RANGE)
+        );
+        assert_eq!(
+            serde_json::to_value(config).unwrap(),
+            serde_json::to_value(&explicit.det_opts.det_config).unwrap(),
+            "the draw without a range is not the explicit spelling"
+        );
+        assert_eq!(
+            bare.preemption_summary().max_timeslice_ns,
+            Some(drawn.get())
+        );
+        bare.validate_args_with_perf_support(true).unwrap();
+    }
+    // `slice` without a range draws each slice's mean from it.
+    let slices = validate(&[
+        "hermit",
+        "run",
+        "--chaos",
+        "--chaos-timeslice-draw=slice",
+        "prog",
+    ]);
+    let config = &slices.det_opts.det_config;
+    assert_eq!(
+        config.chaos_timeslice_range,
+        Some(RECOMMENDED_CHAOS_TIMESLICE_RANGE)
+    );
+    assert_eq!(
+        config.max_timeslice,
+        Some(RECOMMENDED_CHAOS_TIMESLICE_RANGE.max)
+    );
+    assert_eq!(config.chaos_timeslice, None);
+    // A plain chaos run is what it was.
+    let plain = validate(&["hermit", "run", "--chaos", "--seed=7", "prog"]);
+    let config = &plain.det_opts.det_config;
+    assert_eq!(config.max_timeslice, std::num::NonZeroU64::new(200_000_000));
+    assert_eq!(config.chaos_timeslice_range, None);
+    assert_eq!(config.chaos_timeslice_draw, None);
+    assert_eq!(config.chaos_timeslice, None);
+    assert!(!plain.chaos_timeslice_range_recommended);
+
+    let refused = |argv: &[&str], perf: bool, expected: &str| {
+        let mut ro = run_opts_for(argv);
+        let error = ro.validate_args_with_perf_support(perf).unwrap_err();
+        assert!(
+            error.downcast_ref::<PolicyRefusal>().is_some(),
+            "{argv:?}: {error:#}"
+        );
+        assert!(
+            format!("{error:#}").contains(expected),
+            "{argv:?}: {error:#}"
+        );
+    };
+    let range_text = RECOMMENDED_CHAOS_TIMESLICE_RANGE.to_string();
+    refused(
+        &["hermit", "run", "--chaos-timeslice-draw=run", "prog"],
+        true,
+        "--chaos-timeslice-draw=run chooses how a chaos run draws its timeslice; add --chaos",
+    );
+    refused(
+        &[
+            "hermit",
+            "run",
+            "--chaos-timeslice-range=1000..2000000",
+            "prog",
+        ],
+        true,
+        "--chaos-timeslice-range=1000..2000000 chooses how a chaos run draws its timeslice; add \
+         --chaos",
+    );
+    refused(
+        &[
+            "hermit",
+            "run",
+            "--chaos",
+            "--chaos-timeslice-draw=run",
+            "--max-timeslice=5000",
+            "prog",
+        ],
+        true,
+        &format!("drawing from the recommended range {range_text}"),
+    );
+    refused(
+        &[
+            "hermit",
+            "run",
+            "--chaos",
+            "--chaos-timeslice-draw=slice",
+            "--target-timeslice=5000",
+            "prog",
+        ],
+        true,
+        "--target-timeslice=5000 conflicts with",
+    );
+    refused(
+        &[
+            "hermit",
+            "run",
+            "--chaos",
+            "--chaos-timeslice-draw=run",
+            "prog",
+        ],
+        false,
+        "Remove --chaos-timeslice-draw",
+    );
+    // One RCB is 3000 ns at --clock-multiplier=300: the recommended range,
+    // and an explicit one, starting below it are refused before seed 0 draws
+    // 2123 ns; a range that starts at it is accepted.
+    assert_eq!(
+        detcore::preemptions::draw_chaos_timeslice(RECOMMENDED_CHAOS_TIMESLICE_RANGE, 0).get(),
+        2123
+    );
+    refused(
+        &[
+            "hermit",
+            "run",
+            "--chaos",
+            "--seed=0",
+            "--clock-multiplier=300",
+            "--chaos-timeslice-draw=run",
+            "prog",
+        ],
+        true,
+        "recommended range 1000..200000000 when no --chaos-timeslice-range is given, and its MIN is below one RCB (3000 virtual nanoseconds",
+    );
+    refused(
+        &[
+            "hermit",
+            "run",
+            "--chaos",
+            "--seed=0",
+            "--clock-multiplier=300",
+            "--chaos-timeslice-range=1000..200000000",
+            "--chaos-timeslice-draw=run",
+            "prog",
+        ],
+        true,
+        "Give --chaos-timeslice-range=3000..200000000",
+    );
+    let scaled = validate(&[
+        "hermit",
+        "run",
+        "--chaos",
+        "--seed=0",
+        "--clock-multiplier=300",
+        "--chaos-timeslice-range=3000..200000000",
+        "--chaos-timeslice-draw=run",
+        "prog",
+    ]);
+    assert!(
+        scaled.det_opts.det_config.max_timeslice.unwrap().get()
+            >= scaled.det_opts.det_config.minimum_max_timeslice_nanos()
+    );
+    scaled.det_opts.det_config.validate_invariants();
+    // The minimum also scales with the chaos per-thread slowdown's maximum
+    // factor (default 10): 10 ns x 30 x 10 = 3000 ns refuses the recommended
+    // range, while 10 ns x 30 = 300 ns without the slowdown does not.
+    refused(
+        &[
+            "hermit",
+            "run",
+            "--chaos",
+            "--clock-multiplier=30",
+            "--chaos-per-thread-slowdown",
+            "--chaos-timeslice-draw=run",
+            "prog",
+        ],
+        true,
+        "below one RCB (3000 virtual nanoseconds: 10 ns times --clock-multiplier and, under \
+         --chaos-per-thread-slowdown, --chaos-slowdown-max-factor)",
+    );
+    validate(&[
+        "hermit",
+        "run",
+        "--chaos",
+        "--clock-multiplier=30",
+        "--chaos-timeslice-draw=run",
+        "prog",
+    ]);
+    assert_eq!(
+        run_opts_for(&[
+            "hermit",
+            "run",
+            "--chaos",
+            "--chaos-timeslice-draw=slice",
+            "prog"
+        ])
+        .det_opts
+        .det_config
+        .chaos_timeslice_draw,
+        Some(ChaosTimesliceDraw::Slice)
+    );
+}
+
+/// A replay never draws. A record whose run drew a timeslice is adopted with
+/// `--chaos-timeslice-draw=run` and without it, a range or none; a record that
+/// states none (a fixed-timeslice run's, or one recorded before records
+/// stated the draw) is refused beside `--chaos-timeslice-draw=run`, with or
+/// without a range, under either replay option; `slice` beside it replays the
+/// record's slice ends under the range's MAX, as #4767 documents for
+/// replaying a range run, and draws no per-run value. An adopted record takes
+/// precedence over a range or draw beside it: an explicit maximum is compared
+/// with the record (not refused as conflicting with the inert range), and
+/// without the PMU timer or on a timerless backend the refusal names the
+/// record's maximum and a PMU-backed remedy, not the range or draw.
+#[test]
+fn a_replay_never_draws_a_timeslice() {
+    use std::num::NonZeroU64;
+
+    use detcore_model::config::RECOMMENDED_CHAOS_TIMESLICE_RANGE;
+    let dir = tempfile::tempdir().unwrap();
+    let marked = dir.path().join("marked.json");
+    detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+        .with_chaos_timeslice(Some(4321))
+        .write_to_disk(&marked)
+        .unwrap();
+    let unmarked = dir.path().join("unmarked.json");
+    detcore::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+        .write_to_disk(&unmarked)
+        .unwrap();
+    let range = "--chaos-timeslice-range=1000..200000000";
+    for option in ["--replay-preemptions-from", "--replay-schedule-from"] {
+        let marked_arg = format!("{option}={}", marked.display());
+        let unmarked_arg = format!("{option}={}", unmarked.display());
+        for extra in [
+            &["--chaos-timeslice-draw=run"][..],
+            &[range, "--chaos-timeslice-draw=run"],
+            &["--chaos-timeslice-draw=slice"],
+            &[],
+        ] {
+            let mut argv = vec!["hermit", "run", "--chaos", "--seed=9"];
+            argv.extend_from_slice(extra);
+            argv.extend([marked_arg.as_str(), "prog"]);
+            let mut ro = run_opts_for(&argv);
+            ro.validate_args_with_perf_support(true)
+                .unwrap_or_else(|error| panic!("{argv:?}: {error:#}"));
+            let config = &ro.det_opts.det_config;
+            assert_eq!(config.max_timeslice, NonZeroU64::new(4321), "{argv:?}");
+            assert_eq!(config.chaos_timeslice, NonZeroU64::new(4321), "{argv:?}");
+        }
+        for extra in [
+            &["--chaos-timeslice-draw=run"][..],
+            &[range, "--chaos-timeslice-draw=run"],
+        ] {
+            let mut argv = vec!["hermit", "run", "--chaos", "--seed=9"];
+            argv.extend_from_slice(extra);
+            argv.extend([unmarked_arg.as_str(), "prog"]);
+            let mut ro = run_opts_for(&argv);
+            let error = ro.validate_args_with_perf_support(true).unwrap_err();
+            assert!(
+                error.downcast_ref::<PolicyRefusal>().is_some(),
+                "{argv:?}: {error:#}"
+            );
+            let text = format!("{error:#}");
+            assert!(text.contains("states no drawn --max-timeslice"), "{text}");
+            assert!(text.contains(option), "{text}");
+            assert!(text.contains("A replay never draws"), "{text}");
+        }
+        for extra in [&["--chaos-timeslice-draw=slice"][..], &[range]] {
+            let mut argv = vec!["hermit", "run", "--chaos", "--seed=9"];
+            argv.extend_from_slice(extra);
+            argv.extend([unmarked_arg.as_str(), "prog"]);
+            let mut ro = run_opts_for(&argv);
+            ro.validate_args_with_perf_support(true)
+                .unwrap_or_else(|error| panic!("{argv:?}: {error:#}"));
+            let config = &ro.det_opts.det_config;
+            assert_eq!(
+                config.max_timeslice,
+                Some(RECOMMENDED_CHAOS_TIMESLICE_RANGE.max)
+            );
+            assert_eq!(config.chaos_timeslice, None, "{argv:?} drew a timeslice");
+        }
+        // A replay that adopts a drawn value draws nothing from the range, so
+        // a range below one RCB at this clock multiplier (3000 ns) is not
+        // refused; the adopted value (4321 ns) is above it.
+        for extra in [
+            &["--chaos-timeslice-draw=run"][..],
+            &[range, "--chaos-timeslice-draw=run"],
+        ] {
+            let mut argv = vec!["hermit", "run", "--chaos", "--clock-multiplier=300"];
+            argv.extend_from_slice(extra);
+            argv.extend([marked_arg.as_str(), "prog"]);
+            let mut ro = run_opts_for(&argv);
+            ro.validate_args_with_perf_support(true)
+                .unwrap_or_else(|error| panic!("{argv:?}: {error:#}"));
+            assert_eq!(
+                ro.det_opts.det_config.max_timeslice,
+                NonZeroU64::new(4321),
+                "{argv:?}"
+            );
+        }
+        // The record takes precedence over a range or draw beside it, so an
+        // explicit maximum beside them is compared with the record, not
+        // refused as conflicting with the (inert) range.
+        for extra in [
+            &["--chaos-timeslice-draw=run", "--max-timeslice=4321"][..],
+            &[range, "--chaos-timeslice-draw=run", "--max-timeslice=4321"],
+            &[range, "--max-timeslice=4321"],
+        ] {
+            let mut argv = vec!["hermit", "run", "--chaos", "--seed=9"];
+            argv.extend_from_slice(extra);
+            argv.extend([marked_arg.as_str(), "prog"]);
+            let mut ro = run_opts_for(&argv);
+            ro.validate_args_with_perf_support(true)
+                .unwrap_or_else(|error| panic!("{argv:?}: {error:#}"));
+            assert_eq!(
+                ro.det_opts.det_config.max_timeslice,
+                NonZeroU64::new(4321),
+                "{argv:?}"
+            );
+            assert!(ro.chaos_timeslice_adopted, "{argv:?}");
+        }
+        let mut argv = vec!["hermit", "run", "--chaos", "--chaos-timeslice-draw=run"];
+        argv.extend(["--max-timeslice=5000", marked_arg.as_str(), "prog"]);
+        let error = run_opts_for(&argv)
+            .validate_args_with_perf_support(true)
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(&format!(
+                "the replayed record's --max-timeslice (4321 ns, {option}"
+            )) && format!("{error:#}").contains("differs from the --max-timeslice given (5000 ns)"),
+            "{argv:?}: {error:#}"
+        );
+        // Under clock or slowdown settings that put the recorded value below
+        // one RCB, the refusal names the record and the settings to match.
+        for settings in [
+            &["--clock-multiplier=600"][..],
+            &["--clock-multiplier=50", "--chaos-per-thread-slowdown"],
+        ] {
+            let mut argv = vec!["hermit", "run", "--chaos"];
+            argv.extend_from_slice(settings);
+            argv.extend([marked_arg.as_str(), "prog"]);
+            let error = run_opts_for(&argv)
+                .validate_args_with_perf_support(true)
+                .unwrap_err();
+            let text = format!("{error:#}");
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{text}");
+            assert!(
+                text.contains(&format!("the replayed record's --max-timeslice (4321 ns, {option}"))
+                    && text.contains("is below one RCB under this run's settings")
+                    && text.contains("Replay the record with the --clock-multiplier and per-thread slowdown settings it was recorded with"),
+                "{argv:?}: {text}"
+            );
+        }
+        // Without the PMU timer, or on a timerless backend, the refusal names
+        // the replayed record's maximum and a PMU-backed remedy, never the
+        // range or draw beside it.
+        for extra in [
+            &["--chaos-timeslice-draw=run"][..],
+            &[range, "--chaos-timeslice-draw=run"],
+            &[],
+        ] {
+            let mut argv = vec!["hermit", "run", "--chaos"];
+            argv.extend_from_slice(extra);
+            argv.extend([marked_arg.as_str(), "prog"]);
+            let error = run_opts_for(&argv)
+                .validate_args_with_perf_support(false)
+                .unwrap_err();
+            let text = format!("{error:#}");
+            assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{text}");
+            assert!(
+                text.contains(
+                    "the replayed record's drawn --max-timeslice (4321 ns) needs \
+                     PMU-backed preemption"
+                ) && text.contains("Replay the record on a host with usable performance counters"),
+                "{argv:?}: {text}"
+            );
+            assert!(!text.contains("Remove"), "{argv:?}: {text}");
+            let mut argv = vec!["hermit", "--backend=dbt", "run", "--chaos"];
+            argv.extend_from_slice(extra);
+            argv.extend([marked_arg.as_str(), "prog"]);
+            let error = run_opts_for(&argv)
+                .validate_args_with_perf_support(true)
+                .unwrap_err();
+            let text = format!("{error:#}");
+            assert!(
+                text.contains("refuses a replayed record's drawn --max-timeslice (4321 ns)")
+                    && text
+                        .contains("(--backend=ptrace) on a host with usable performance counters"),
+                "{argv:?}: {text}"
+            );
+            assert!(
+                !text.contains("remove --chaos-timeslice-draw")
+                    && !text.contains("--chaos-timeslice-range"),
+                "{argv:?}: {text}"
+            );
+        }
+        // Without any timeslice option the old record replays as before.
+        let mut ro = run_opts_for(&["hermit", "run", "--chaos", &unmarked_arg, "prog"]);
+        ro.validate_args_with_perf_support(true).unwrap();
+        assert_eq!(
+            ro.det_opts.det_config.max_timeslice,
+            NonZeroU64::new(200_000_000)
+        );
+        assert_eq!(ro.det_opts.det_config.chaos_timeslice, None);
+    }
+}
+
+/// The rendered command line of a resolved draw (analyze's reproducers)
+/// reruns it exactly: a draw given without a range renders the recommended
+/// range it drew from, so it draws the same value even if the recommendation
+/// moves, and `--save-config` writes that range out.
+#[test]
+fn a_rendered_draw_reruns_the_same_timeslice() {
+    let validated = |argv: &[String]| {
+        let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let mut ro = run_opts_for(&argv);
+        ro.validate_args_with_perf_support(true)
+            .unwrap_or_else(|error| panic!("{argv:?}: {error:#}"));
+        ro
+    };
+    let argv = |args: &[&str]| -> Vec<String> {
+        ["hermit", "run"]
+            .iter()
+            .chain(args)
+            .map(|arg| (*arg).to_owned())
+            .collect()
+    };
+    for args in [
+        &["--chaos", "--seed=11", "--chaos-timeslice-draw=run", "prog"][..],
+        &[
+            "--chaos",
+            "--seed=11",
+            "--chaos-timeslice-draw=slice",
+            "prog",
+        ],
+        &["--chaos", "--seed=11", "prog"],
+    ] {
+        let first = validated(&argv(args));
+        let rendered = first.to_string();
+        let mut again = vec!["hermit".to_owned(), "run".to_owned()];
+        again.extend(shell_words::split(&rendered).unwrap());
+        let second = validated(&again);
+        let (a, b) = (&first.det_opts.det_config, &second.det_opts.det_config);
+        assert_eq!(a.max_timeslice, b.max_timeslice, "{args:?}: {rendered}");
+        assert_eq!(a.chaos_timeslice, b.chaos_timeslice, "{args:?}: {rendered}");
+        assert_eq!(
+            a.chaos_timeslice_range, b.chaos_timeslice_range,
+            "{args:?}: {rendered}"
+        );
+        assert_eq!(second.to_string(), rendered, "{args:?}");
+    }
+    let drawn = validated(&argv(&[
+        "--chaos",
+        "--seed=11",
+        "--chaos-timeslice-draw=run",
+        "prog",
+    ]));
+    assert!(
+        drawn.to_string().contains(&format!(
+            "--chaos-timeslice-range={} --chaos-timeslice-draw=run",
+            detcore_model::config::RECOMMENDED_CHAOS_TIMESLICE_RANGE
+        )),
+        "{drawn}"
+    );
+    let save = [
+        "hermit",
+        "run",
+        "--chaos",
+        "--seed=11",
+        "--chaos-timeslice-draw=run",
+        "--save-config=unused.yaml",
+        "/bin/true",
+    ];
+    let matches = <crate::Args as clap::CommandFactory>::command()
+        .try_get_matches_from(save)
+        .unwrap();
+    let args = crate::args_from_matches_with_clock(&matches, SystemTime::now).unwrap();
+    let crate::Subcommand::Run(mut ro) = args.command else {
+        panic!("{save:?} is not a `run` command");
+    };
+    assert_eq!(
+        ro.saved_run_config()
+            .unwrap()
+            .run
+            .get("chaos-timeslice-range"),
+        None
+    );
+    ro.validate_args_with_perf_support(true).unwrap();
+    let saved = ro.saved_run_config().unwrap();
+    assert_eq!(
+        saved.run["chaos-timeslice-range"],
+        detcore_model::config::RECOMMENDED_CHAOS_TIMESLICE_RANGE
+            .to_string()
+            .as_str(),
+        "{saved:?}"
+    );
+    assert_eq!(saved.run["chaos-timeslice-draw"], "run", "{saved:?}");
 }
 
 /// The environment variable that turned the signal-state copy on while it
@@ -9071,14 +9619,27 @@ impl RunOpts {
             );
         }
         self.refuse_unapplied_config()?;
-        self.resolve_preemption_settings()?;
+        // A run with a timeslice range or draw, or that replays a record, is
+        // admitted at the end of validation instead (`validate_args`), once
+        // every replay and draw invariant has passed: a backend refusal here
+        // would otherwise mask the run's real problem, or name an option that
+        // the replayed record makes inert.
+        if !self.defers_preemption_admission() {
+            self.resolve_preemption_settings()?;
+        }
         if let Some(path) = &self.backend_engagement_json {
             clear_machine_record(path, "backend engagement")?;
         }
         // Before `--verify` reads stdin to its end below: a run that in-guest
         // LiteInst refuses must not wait for its input. `validate_args` repeats
-        // the check for its other callers.
-        self.refuse_unqualified_liteinst_in_guest_options()?;
+        // the check for its other callers, and is the only check for a run
+        // whose preemption admission waits for validation
+        // (`defers_preemption_admission`): LiteInst's refusal of the timer
+        // comes after the admission and every replay and draw invariant, as
+        // the backend refusal does.
+        if !self.defers_preemption_admission() {
+            self.refuse_unqualified_liteinst_in_guest_options()?;
+        }
         // Beside the refusals above, and before stdin is read for the same
         // reason: a refused run must not consume its input. It is also above the
         // DBT arm below, which returns without reaching `RunOpts::run`.
@@ -9101,7 +9662,9 @@ impl RunOpts {
 
         // Argument validation and epoch reconciliation also come before stdin
         // is read: neither needs the input, and a run they refuse must not wait
-        // for it.
+        // for it. A deferred preemption admission waits for the replay checks
+        // below (`admit_deferred_preemption`).
+        self.admission_after_replay_checks = true;
         self.validate_args()?;
         // Right after validation, which may have turned the preemption timer
         // off, and still before stdin is read or anything is launched.
@@ -9127,6 +9690,10 @@ impl RunOpts {
         }
         self.refuse_replay_under_another_expired_wait_charge()?;
         self.refuse_replay_under_another_cap_preemption_charge()?;
+        // After every replay and draw check, so that a run with a timeslice
+        // range or draw, or that replays a record, is refused for its backend
+        // only when it is otherwise valid.
+        self.admit_deferred_preemption()?;
         if !self.namespace_only
             && (self.verify_verbose
                 || global
@@ -9430,6 +9997,23 @@ impl RunOpts {
             Ok(())
         };
         self.validate_args_with_timer_support(timer)?;
+        // A deferred admission waits for `main`'s replay checks, LiteInst's
+        // timer refusal with it.
+        if self.admission_after_replay_checks && self.defers_preemption_admission() {
+            return Ok(());
+        }
+        self.refuse_unqualified_liteinst_in_guest_options()
+    }
+
+    /// The deferred preemption admission (`defers_preemption_admission`), for
+    /// `main` to run after the replay checks that follow validation: the
+    /// backend's refusal of a timer request, and in-guest LiteInst's refusal
+    /// of the timer. It only checks; any other run was admitted already.
+    fn admit_deferred_preemption(&self) -> Result<(), Error> {
+        if !self.defers_preemption_admission() {
+            return Ok(());
+        }
+        self.resolve_preemption_settings()?;
         self.refuse_unqualified_liteinst_in_guest_options()
     }
 
@@ -9459,7 +10043,10 @@ impl RunOpts {
     /// [`Self::validate_args_with_timer_support`] for tests, with a missing
     /// timer reported as missing perf counters.
     #[cfg(test)]
-    fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {
+    pub(crate) fn validate_args_with_perf_support(
+        &mut self,
+        perf_supported: bool,
+    ) -> Result<(), Error> {
         self.validate_args_with_timer_support(if perf_supported {
             Ok(())
         } else {
@@ -9476,8 +10063,13 @@ impl RunOpts {
         self.lower_strace_only();
         self.refuse_unready_exec_stop()?;
         // Before the timer settings are checked, which read the timeslice.
+        self.resolve_recommended_chaos_timeslice_range()?;
         self.resolve_chaos_timeslice_range()?;
-        self.resolve_preemption_settings()?;
+        // Deferred to the end of validation for a run with a timeslice range
+        // or draw, or that replays a record (`defers_preemption_admission`).
+        if !self.defers_preemption_admission() {
+            self.resolve_preemption_settings()?;
+        }
         let backend = self.selected_backend();
         // LiteInst passes here so that the in-guest refusal, which names why
         // it cannot honour `--skid-margin`, is the one that stops the run.
@@ -9826,10 +10418,54 @@ impl RunOpts {
         if let Some(max_timeslice) = config.max_timeslice
             && u64::from(max_timeslice) < minimum_max_timeslice
         {
+            // A replayed record's value is not this run's to raise: name it,
+            // and the settings that make it valid again.
+            if self.chaos_timeslice_adopted {
+                let source = [
+                    ("--replay-preemptions-from", &config.replay_preemptions_from),
+                    ("--replay-schedule-from", &config.replay_schedule_from),
+                ]
+                .into_iter()
+                .find_map(|(option, path)| Some(format!("{option} {}", path.as_ref()?.display())))
+                .unwrap_or_default();
+                return Err(anyhow::Error::new(PolicyRefusal).context(format!(
+                    "the replayed record's --max-timeslice ({max_timeslice} ns, {source}) is \
+                     below one RCB under this run's settings ({minimum_max_timeslice} virtual \
+                     nanoseconds: 10 ns times --clock-multiplier and, under \
+                     --chaos-per-thread-slowdown, --chaos-slowdown-max-factor). Replay the \
+                     record with the --clock-multiplier and per-thread slowdown settings it was \
+                     recorded with, or record the run again under these settings."
+                )));
+            }
             anyhow::bail!(
                 "--max-timeslice must be at least one RCB ({} virtual nanoseconds at this clock multiplier)",
                 minimum_max_timeslice
             );
+        }
+        // A per-run draw can land anywhere in the range, so all of it must be
+        // a valid maximum: the draw below is checked again, but a range that
+        // starts below one RCB is refused here, before anything runs. A
+        // replay that adopted a record's drawn value draws nothing from the
+        // range, and that value was checked against one RCB above.
+        if let Some(range) = config.chaos_timeslice_range
+            && !self.chaos_timeslice_adopted
+            && range.min.get() < minimum_max_timeslice
+        {
+            let request = if self.chaos_timeslice_range_recommended {
+                format!(
+                    "--chaos-timeslice-draw draws from the recommended range {range} when no \
+                     --chaos-timeslice-range is given, and its MIN"
+                )
+            } else {
+                format!("--chaos-timeslice-range={range}: its MIN")
+            };
+            return Err(anyhow::Error::new(PolicyRefusal).context(format!(
+                "{request} is below one RCB ({minimum_max_timeslice} virtual nanoseconds: 10 ns \
+                 times --clock-multiplier and, under --chaos-per-thread-slowdown, \
+                 --chaos-slowdown-max-factor), the shortest timeslice. Give \
+                 --chaos-timeslice-range={minimum_max_timeslice}..{} or a narrower range.",
+                range.max.get().max(minimum_max_timeslice)
+            )));
         }
 
         // Perform internal validation on the Config args, before taking into account the
@@ -9849,14 +10485,31 @@ impl RunOpts {
                 }
                 TimerUnavailable::NoPmuProfile(reason) => reason.to_string(),
             };
-            let request = match config.chaos_timeslice_range {
-                Some(range) => format!("--chaos-timeslice-range={range}"),
-                None => "the replayed record's drawn --max-timeslice".to_owned(),
+            // An adopted record's value binds the replay whatever range or
+            // draw is beside it (they draw nothing): name the record, and do
+            // not suggest dropping options that change nothing.
+            let refusal = match config.chaos_timeslice_range {
+                Some(range)
+                    if !self.chaos_timeslice_adopted && self.chaos_timeslice_range_recommended =>
+                {
+                    format!(
+                        "--chaos-timeslice-draw, drawing from the recommended range {range}, \
+                         needs PMU-backed preemption, but {reason}. Remove \
+                         --chaos-timeslice-draw, or run on a host with a usable PMU."
+                    )
+                }
+                Some(range) if !self.chaos_timeslice_adopted => format!(
+                    "--chaos-timeslice-range={range} needs PMU-backed preemption, but {reason}. \
+                     Remove the range, or run on a host with a usable PMU."
+                ),
+                _ => format!(
+                    "the replayed record's drawn --max-timeslice ({} ns) needs PMU-backed \
+                     preemption, but {reason}. Replay the record on a host with usable \
+                     performance counters.",
+                    config.chaos_timeslice.map_or(0, std::num::NonZeroU64::get)
+                ),
             };
-            return Err(anyhow::Error::new(PolicyRefusal).context(format!(
-                "{request} needs PMU-backed preemption, but {reason}. Remove the range, or \
-                 replay on a host with a usable PMU."
-            )));
+            return Err(anyhow::Error::new(PolicyRefusal).context(refusal));
         }
 
         // This is a Detcore Config-internal matter, but relies on reverie_ptrace, which detcore is
@@ -9889,11 +10542,25 @@ impl RunOpts {
         // `--chaos-timeslice-draw=run` draws from the effective scheduler seed,
         // which `--seed-from` has just settled, unless a replayed record gave
         // the timeslice. Drawing again on a later validation gives the same value.
+        // A replay never draws: `resolve_chaos_timeslice_range` adopted the
+        // record's value or refused the draw.
         if !self.chaos_timeslice_adopted
-            && config.chaos_timeslice_draw == detcore_model::config::ChaosTimesliceDraw::Run
+            && config.chaos
+            && config.replay_preemptions_from.is_none()
+            && config.replay_schedule_from.is_none()
+            && config.chaos_timeslice_draw == Some(detcore_model::config::ChaosTimesliceDraw::Run)
             && let Some(range) = config.chaos_timeslice_range
         {
             let drawn = detcore::preemptions::draw_chaos_timeslice(range, config.sched_seed());
+            // The range was checked against one RCB above; the drawn value
+            // is the run's maximum and is held to the same bound.
+            let minimum = config.minimum_max_timeslice_nanos();
+            if drawn.get() < minimum {
+                anyhow::bail!(
+                    "--chaos-timeslice-draw=run drew a --max-timeslice of {drawn} ns, below one \
+                     RCB ({minimum} virtual nanoseconds at this clock multiplier)"
+                );
+            }
             config.max_timeslice = Some(drawn);
             config.chaos_timeslice = Some(drawn);
         }
@@ -10019,6 +10686,17 @@ impl RunOpts {
             && matches!(backend, Backend::Ptrace | Backend::E9patch);
         if self.record_networking.is_some() {
             self.network = NetworkingMode::Host;
+        }
+
+        // The deferred preemption admission, after every other check: a run
+        // with a timeslice range or draw, or that replays a record, is refused
+        // for its backend only when it is otherwise valid, so the refusal
+        // names the setting that would bind it on a backend with the timer
+        // (the replayed record's drawn maximum, once adopted). It only checks.
+        // `main` runs it later still, after its replay checks
+        // (`admit_deferred_preemption`).
+        if self.defers_preemption_admission() && !self.admission_after_replay_checks {
+            self.resolve_preemption_settings()?;
         }
 
         // Advise when running a VMM (e.g. QEMU) under host-time virtualization,
@@ -12732,6 +13410,68 @@ impl RunOpts {
         Ok(())
     }
 
+    /// Turn chaos off for a run that `hermit analyze` derives from a
+    /// validated chaos run (its chaos-free baseline), clearing the options
+    /// that only mean something under chaos, so that validating the run again
+    /// accepts it: the timeslice range and its draw. The maximum the range set
+    /// stays, as it did before chaos-free runs refused a range; nothing is
+    /// drawn without chaos.
+    pub(crate) fn turn_chaos_off(&mut self) {
+        let config = &mut self.det_opts.det_config;
+        config.chaos = false;
+        config.chaos_timeslice_draw = None;
+        config.chaos_timeslice_range = None;
+        self.chaos_timeslice_range_recommended = false;
+    }
+
+    /// Fill in [`detcore_model::config::RECOMMENDED_CHAOS_TIMESLICE_RANGE`] for
+    /// a `--chaos-timeslice-draw` given without `--chaos-timeslice-range`,
+    /// before `resolve_chaos_timeslice_range` resolves the range: the run is
+    /// then exactly the one the range given explicitly would make, and its
+    /// rendered command line and `--save-config` state the range. An explicit
+    /// range wins. The draw and the range need `--chaos` (the parser lets
+    /// them through for `hermit analyze`, which turns chaos on before
+    /// validating, and clears them with [`RunOpts::turn_chaos_off`] for its
+    /// chaos-free baseline), and the draw conflicts with `--target-timeslice`
+    /// as a range does; an explicit
+    /// `--max-timeslice`, a missing PMU timer and a timerless backend are
+    /// refused as for a range. Repeating this changes nothing.
+    fn resolve_recommended_chaos_timeslice_range(&mut self) -> Result<(), Error> {
+        let config = &mut self.det_opts.det_config;
+        if !config.chaos {
+            // The parser lets both through without --chaos, for analyze.
+            let given = match (config.chaos_timeslice_range, config.chaos_timeslice_draw) {
+                (_, Some(draw)) => Some(format!("--chaos-timeslice-draw={}", draw.as_str())),
+                (Some(range), None) => Some(format!("--chaos-timeslice-range={range}")),
+                (None, None) => None,
+            };
+            if let Some(given) = given {
+                return Err(Error::new(PolicyRefusal).context(format!(
+                    "{given} chooses how a chaos run draws its timeslice; add --chaos"
+                )));
+            }
+        }
+        let Some(draw) = config.chaos_timeslice_draw else {
+            return Ok(());
+        };
+        if config.chaos_timeslice_range.is_some() {
+            return Ok(());
+        }
+        if let Some(target) = config.target_timeslice {
+            return Err(Error::new(PolicyRefusal).context(format!(
+                "--chaos-timeslice-draw={} draws from a timeslice range (the recommended {} \
+                 without --chaos-timeslice-range), which --target-timeslice={target} conflicts \
+                 with; give one of them, not both",
+                draw.as_str(),
+                detcore_model::config::RECOMMENDED_CHAOS_TIMESLICE_RANGE
+            )));
+        }
+        config.chaos_timeslice_range =
+            Some(detcore_model::config::RECOMMENDED_CHAOS_TIMESLICE_RANGE);
+        self.chaos_timeslice_range_recommended = true;
+        Ok(())
+    }
+
     /// Decide the run's `--max-timeslice` under `--chaos-timeslice-range`, or
     /// when a replayed record states the one its run drew
     /// (`PreemptionRecord::chaos_timeslice`).
@@ -12751,40 +13491,61 @@ impl RunOpts {
     /// record that states a drawn timeslice. Repeating this (analyze
     /// revalidates its trials' options) gives the same result.
     fn resolve_chaos_timeslice_range(&mut self) -> Result<(), Error> {
+        // Decided afresh on every validation, from the replay options as they
+        // are now.
+        self.chaos_timeslice_adopted = false;
+        let recorded = self.replayed_record_timeslice()?;
         let config = &self.det_opts.det_config;
-        let mut recorded = None;
-        for (option, path) in [
-            ("--replay-preemptions-from", &config.replay_preemptions_from),
-            ("--replay-schedule-from", &config.replay_schedule_from),
-        ] {
-            let Some(path) = path else {
-                continue;
-            };
-            if let Some(timeslice) =
-                detcore::preemptions::read_recorded_chaos_timeslice(path).map_err(Error::msg)?
-            {
-                recorded = Some((timeslice, format!("{option} {}", path.display())));
-            }
-        }
-        // `--chaos-seeded-timeslice` would replace the maximum with its own
-        // draw once the seed is settled, so the run would report one maximum
-        // and run under the other.
-        if let Some(range) = config.chaos_timeslice_range
-            && self.chaos_seeded_timeslice
+        // A replay never draws a timeslice. A record whose run drew one is
+        // adopted below; one that states none was recorded under a fixed
+        // timeslice (or before records stated the draw), and a draw cannot
+        // reproduce it.
+        if recorded.is_none()
+            && config.chaos_timeslice_draw == Some(detcore_model::config::ChaosTimesliceDraw::Run)
+            && let Some((option, path)) = [
+                ("--replay-preemptions-from", &config.replay_preemptions_from),
+                ("--replay-schedule-from", &config.replay_schedule_from),
+            ]
+            .into_iter()
+            .find_map(|(option, path)| Some((option, path.as_ref()?)))
         {
             return Err(Error::new(PolicyRefusal).context(format!(
-                "--chaos-timeslice-range={range} sets the run's --max-timeslice (to its MAX, {} \
-                 ns, or to a value drawn from it), and --chaos-seeded-timeslice draws \
-                 --max-timeslice from the scheduler seed; give one of them, not both",
-                range.max
+                "{option} {} states no drawn --max-timeslice: its run did not draw one with \
+                 --chaos-timeslice-draw=run, or was recorded before records stated it. A replay \
+                 never draws, so --chaos-timeslice-draw=run cannot reproduce that run. Remove \
+                 --chaos-timeslice-draw (and any --chaos-timeslice-range) to replay the record \
+                 without a draw: under the default --max-timeslice, or under the \
+                 --max-timeslice it was recorded with, given again.",
+                path.display()
             )));
         }
-        if let Some(range) = config.chaos_timeslice_range
-            && self.max_timeslice_explicit
+        // A record's drawn value takes precedence over a range beside it,
+        // which then draws nothing: only a range that will be drawn from
+        // conflicts with an explicit maximum. Beside a record, an explicit
+        // maximum must match the record instead (below).
+        if recorded.is_none()
+            && let Some(range) = config.chaos_timeslice_range
+            && (self.max_timeslice_explicit || self.chaos_seeded_timeslice)
         {
+            let request = if self.chaos_timeslice_range_recommended {
+                format!(
+                    "--chaos-timeslice-draw (drawing from the recommended range {range}, as no \
+                     --chaos-timeslice-range is given)"
+                )
+            } else {
+                format!("--chaos-timeslice-range={range}")
+            };
+            // `--chaos-seeded-timeslice` would replace the maximum with its
+            // own draw once the seed is settled, so the run would report one
+            // maximum and run under the other.
+            let other = if self.chaos_seeded_timeslice {
+                ", and --chaos-seeded-timeslice draws --max-timeslice from the scheduler seed"
+            } else {
+                ""
+            };
             return Err(Error::new(PolicyRefusal).context(format!(
-                "--chaos-timeslice-range={range} sets the run's --max-timeslice (to its MAX, {} \
-                 ns, or to a value drawn from it); give one of them, not both",
+                "{request} sets the run's --max-timeslice (to its MAX, {} ns, or to a value \
+                 drawn from it){other}; give one of them, not both",
                 range.max
             )));
         }
@@ -12803,23 +13564,8 @@ impl RunOpts {
                          one."
                     )));
                 }
-                if self.max_timeslice_explicit
-                    && config.max_timeslice.map(std::num::NonZeroU64::get) != Some(recorded)
-                {
-                    return Err(Error::new(PolicyRefusal).context(format!(
-                        "{source} was recorded under a --max-timeslice of {recorded} ns, drawn \
-                         by --chaos-timeslice-draw=run, and would be replayed under {}. Chaos \
-                         slices and the PMU maximum follow the timeslice, so the replay cannot \
-                         reproduce the run. Omit --max-timeslice to replay under the recorded \
-                         one, or pass --max-timeslice={recorded}.",
-                        config
-                            .max_timeslice
-                            .map_or_else(|| "none".to_owned(), |maximum| format!("{maximum} ns")),
-                    )));
-                }
-                std::num::NonZeroU64::new(recorded).ok_or_else(|| {
-                    Error::msg(format!("{source} records a --max-timeslice of 0 ns"))
-                })?
+                self.refuse_a_maximum_other_than_the_recorded_one(recorded, &source)?;
+                recorded
             }
             // The per-run draw waits for the effective seed (`--seed-from`),
             // which validation settles later (`draw_chaos_timeslice_for_run`);
@@ -12838,20 +13584,92 @@ impl RunOpts {
         Ok(())
     }
 
+    /// The drawn `--max-timeslice` a replayed record states
+    /// (`PreemptionRecord::chaos_timeslice`), with the option and path that
+    /// name the record: the `--replay-schedule-from` record's if both replay
+    /// options are given and both state one.
+    fn replayed_record_timeslice(&self) -> Result<Option<(std::num::NonZeroU64, String)>, Error> {
+        let config = &self.det_opts.det_config;
+        let mut recorded = None;
+        for (option, path) in [
+            ("--replay-preemptions-from", &config.replay_preemptions_from),
+            ("--replay-schedule-from", &config.replay_schedule_from),
+        ] {
+            let Some(path) = path else {
+                continue;
+            };
+            if let Some(timeslice) =
+                detcore::preemptions::read_recorded_chaos_timeslice(path).map_err(Error::msg)?
+            {
+                recorded = Some((timeslice, format!("{option} {}", path.display())));
+            }
+        }
+        Ok(recorded)
+    }
+
+    /// Refuse an explicit `--max-timeslice` that differs from the drawn value
+    /// the replayed record `source` states: chaos slices and the PMU maximum
+    /// follow the timeslice, so the replay could not reproduce the run.
+    fn refuse_a_maximum_other_than_the_recorded_one(
+        &self,
+        recorded: std::num::NonZeroU64,
+        source: &str,
+    ) -> Result<(), Error> {
+        let given = self.det_opts.det_config.max_timeslice;
+        if !self.max_timeslice_explicit || given == Some(recorded) {
+            return Ok(());
+        }
+        Err(Error::new(PolicyRefusal).context(format!(
+            "the replayed record's --max-timeslice ({recorded} ns, {source}) differs from the \
+             --max-timeslice given ({}). Chaos slices and the PMU maximum follow the timeslice, \
+             so the replay cannot reproduce the run. Omit --max-timeslice to replay under the \
+             recorded one, or pass --max-timeslice={recorded}.",
+            given.map_or_else(|| "none".to_owned(), |maximum| format!("{maximum} ns")),
+        )))
+    }
+
+    /// Whether this run's preemption admission waits for the end of
+    /// validation: a run with a timeslice range or draw, or that replays a
+    /// preemption record or schedule. Such a run is checked against its
+    /// backend only once every replay and draw invariant has passed, and with
+    /// a replayed record's drawn value adopted, so that a backend refusal
+    /// never masks a refusal of the run itself or names an option the record
+    /// makes inert. Any other run is admitted where it always was.
+    fn defers_preemption_admission(&self) -> bool {
+        let config = &self.det_opts.det_config;
+        config.chaos_timeslice_range.is_some()
+            || config.chaos_timeslice_draw.is_some()
+            || config.replay_preemptions_from.is_some()
+            || config.replay_schedule_from.is_some()
+    }
+
     fn resolve_preemption_settings(&self) -> Result<(), Error> {
         // Namespace-only runs do not dispatch an instrumentation backend.
         if self.namespace_only {
             return Ok(());
         }
+        let backend = self.selected_backend();
         // The inherited maximum also chooses Detcore's clock accounting and
         // cooperative deadline. Checking a timer request must not rewrite it.
         hermit::preemption_admission::refuse_unsupported_preemption(
             &self.det_opts.det_config,
-            self.selected_backend(),
+            backend,
             self.max_timeslice_explicit,
             self.skid_margin.is_some(),
         )
-        .map_err(|refusal| Error::new(PolicyRefusal).context(refusal))
+        .map_err(|refusal| {
+            // An adopted record's value binds the replay, whatever range or
+            // draw is beside it; otherwise the range a draw given without one
+            // drew from is the draw's.
+            let refusal = if self.chaos_timeslice_adopted {
+                refusal.for_a_replayed_record()
+            } else if self.chaos_timeslice_range_recommended {
+                refusal.for_a_draw_from_the_recommended_range()
+            } else {
+                refusal
+            };
+            Error::new(PolicyRefusal).context(refusal)
+        })
     }
 
     fn preemption_summary(&self) -> detcore_model::summary::PreemptionSummary {
@@ -12890,6 +13708,16 @@ impl RunOpts {
         if let Some(seed) = self.seed_from_resolved {
             config.run.remove(SEED_FROM_KEY);
             config.run.insert(SEED_KEY.to_owned(), seed.into());
+        }
+        // The recommended range a draw given without one drew from, so that
+        // the saved run keeps drawing from it if the recommendation moves.
+        if self.chaos_timeslice_range_recommended
+            && let Some(range) = self.det_opts.det_config.chaos_timeslice_range
+        {
+            config.run.insert(
+                crate::run_config::CHAOS_TIMESLICE_RANGE_KEY.to_owned(),
+                range.to_string().into(),
+            );
         }
         Ok(config)
     }

@@ -286,6 +286,14 @@ pub struct AnalyzeOpts {
     /// measured before it.
     #[clap(skip)]
     pub endpoints: EndpointMeasurements,
+
+    /// The per-run `--max-timeslice` the recordings state, which every trial
+    /// runs under and every trial-produced, minimized, synthetic and final
+    /// schedule analyze writes states (a supplied record analyze copies
+    /// unchanged, and its normalized copy, are not restamped); set by
+    /// [`AnalyzeOpts::adopt_recorded_timeslice`].
+    #[clap(skip)]
+    pub trial_chaos_timeslice: Option<std::num::NonZeroU64>,
 }
 
 /// `--trial-timeout`.
