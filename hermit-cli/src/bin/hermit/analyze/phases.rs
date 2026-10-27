@@ -3354,6 +3354,7 @@ impl AnalyzeOpts {
                 event_index: critical_indices[1],
                 stack: critical2,
             },
+            branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event,
             partial: Some(PartialReport {
                 reason: expired.kind,
@@ -3376,6 +3377,9 @@ impl AnalyzeOpts {
         println!(
             "\n------------------------- hermit analyze report (PARTIAL) -------------------------"
         );
+        if let Some(warning) = &self.branch_counter_warning {
+            println!("{warning}");
+        }
         println!("{header}");
         if let Some(stack) = &report.critical_event1.stack {
             println!(
