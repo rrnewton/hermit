@@ -817,6 +817,17 @@ fn raw_path(path: &std::path::Path) -> std::io::Result<std::ffi::CString> {
 
 /// The status of the file at `path`, following links, by a raw `newfstatat`.
 pub fn raw_stat(path: &std::path::Path) -> std::io::Result<libc::stat> {
+    raw_stat_with(path, 0)
+}
+
+/// The status of the file at `path`, not following a link in its last
+/// component, by a raw `newfstatat`.
+pub fn raw_lstat(path: &std::path::Path) -> std::io::Result<libc::stat> {
+    raw_stat_with(path, libc::AT_SYMLINK_NOFOLLOW)
+}
+
+/// The status of the file at `path` by a raw `newfstatat` with `flags`.
+fn raw_stat_with(path: &std::path::Path, flags: libc::c_int) -> std::io::Result<libc::stat> {
     let path = raw_path(path)?;
     // SAFETY: a NUL-terminated path; an all-zero `stat` is a valid value.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -827,7 +838,7 @@ pub fn raw_stat(path: &std::path::Path) -> std::io::Result<libc::stat> {
                 libc::AT_FDCWD as u64,
                 path.as_ptr() as u64,
                 &mut stat as *mut libc::stat as u64,
-                0,
+                flags as u64,
                 0,
                 0,
             ],
