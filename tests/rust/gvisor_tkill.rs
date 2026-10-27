@@ -103,7 +103,8 @@ mod tkill_test {
         // SAFETY: sigaction/sigprocmask with valid, zeroed structures.
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = sig_handler as usize;
+            sa.sa_sigaction =
+                sig_handler as extern "C" fn(i32, *mut libc::siginfo_t, *mut libc::c_void) as usize;
             libc::sigfillset(&mut sa.sa_mask);
             sa.sa_flags = libc::SA_SIGINFO;
             check(
