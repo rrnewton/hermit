@@ -2990,7 +2990,16 @@ fi
 # Cargo.lock and rust-toolchain.toml, so the inventory (1015), SDK and
 # native inputs, calibrated budget, job width and limits carry unchanged
 # from the 38c3e024 entry.
-expected_pin=d2b46ad625ff62324efcd7caec90c46461572742
+# CARRY TO a13d020537c0e510bd3209af4f0ebc22e4e66152 (2026-10-27): from
+# d2b46ad625ff62324efcd7caec90c46461572742. One commit: the revert of the
+# LiteInst Tool publication repair (c784ee8d, 7aba0ad0, a90e2acd), touching
+# only reverie-inguest/src/guest/tool_region*.rs and
+# reverie-liteinst-artifact/src/lib.rs. git diff is empty under reverie-dbt/
+# and third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
+# calibrated budget, job width and limits carry unchanged from the 38c3e024
+# entry.
+expected_pin=a13d020537c0e510bd3209af4f0ebc22e4e66152
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

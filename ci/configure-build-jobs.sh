@@ -3061,8 +3061,17 @@ fi
 # Cargo.lock and rust-toolchain.toml, so the inventory (1015), SDK and
 # native inputs, calibrated budget, job width and limits carry unchanged
 # from the 38c3e024 entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d2b46ad625ff62324efcd7caec90c46461572742 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d2b46ad625ff62324efcd7caec90c46461572742 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO a13d020537c0e510bd3209af4f0ebc22e4e66152 (2026-10-27): from
+# d2b46ad625ff62324efcd7caec90c46461572742. One commit: the revert of the
+# LiteInst Tool publication repair (c784ee8d, 7aba0ad0, a90e2acd), touching
+# only reverie-inguest/src/guest/tool_region*.rs and
+# reverie-liteinst-artifact/src/lib.rs. git diff is empty under reverie-dbt/
+# and third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
+# calibrated budget, job width and limits carry unchanged from the 38c3e024
+# entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a13d020537c0e510bd3209af4f0ebc22e4e66152 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a13d020537c0e510bd3209af4f0ebc22e4e66152 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
