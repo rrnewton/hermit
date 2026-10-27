@@ -498,7 +498,7 @@ impl UserBind {
 /// Say that a user bind's mountinfo rows keep the host source path as their
 /// root: Hermit could not identify them, so the guest can see that path.
 fn warn_unrewritten_bind(target: &Path) {
-    crate::tracing::diagnostic_eprintln!(
+    crate::app::tracing::diagnostic_eprintln!(
         "WARNING: /proc/self/mountinfo shows the host source path of the bind at {}: \
          Hermit could not identify its rows (https://github.com/rrnewton/hermit/issues/4266).",
         target.display()
@@ -1489,7 +1489,7 @@ pub(super) fn image_container(
     //   and a determinism question in its own right, and nothing in the current
     //   image workloads needs it.
     let dev_root = rootfs.join("dev");
-    for node in crate::image::DEV_BIND_TARGETS {
+    for node in crate::app::image::DEV_BIND_TARGETS {
         container.mount(Mount::bind(
             Path::new("/dev").join(node),
             dev_root.join(node),
@@ -4600,7 +4600,6 @@ static EXIT_AFTER_PUBLICATION: std::sync::atomic::AtomicBool =
 /// result is published instead of waiting for that thread, with the status
 /// the init returns anyway. Each init is its own process, so this never
 /// affects the caller.
-#[cfg(feature = "dbt")]
 pub(super) fn exit_init_after_publication() {
     EXIT_AFTER_PUBLICATION.store(true, Ordering::Release);
 }
@@ -5960,7 +5959,7 @@ mod tests {
         for directory in ["proc", "tmp", "dev/pts"] {
             fs::create_dir_all(rootfs.path().join(directory)).unwrap();
         }
-        for node in crate::image::DEV_BIND_TARGETS {
+        for node in crate::app::image::DEV_BIND_TARGETS {
             File::create(rootfs.path().join("dev").join(node)).unwrap();
         }
 
@@ -6020,7 +6019,7 @@ mod tests {
                 for directory in ["proc", "tmp", "dev/pts"] {
                     fs::create_dir_all(rootfs.join(directory)).map_err(|e| e.to_string())?;
                 }
-                for node in crate::image::DEV_BIND_TARGETS {
+                for node in crate::app::image::DEV_BIND_TARGETS {
                     File::create(rootfs.join("dev").join(node)).map_err(|e| e.to_string())?;
                 }
                 fs::create_dir(&tmpfs).map_err(|e| e.to_string())?;
@@ -6563,9 +6562,9 @@ mod tests {
         use std::io::Read as _;
 
         in_isolated_process(move || {
-            let budget = crate::tracing::LogBudget::new(100).map_err(|e| e.to_string())?;
+            let budget = crate::app::tracing::LogBudget::new(100).map_err(|e| e.to_string())?;
             // Only in this isolated process; the harness registers nothing.
-            crate::tracing::register_invocation_log_budget(Some(budget.clone()));
+            crate::app::tracing::register_invocation_log_budget(Some(budget.clone()));
             // SAFETY: `prctl` touches no caller memory; this process is a fresh
             // fork, so the attribute reaches no other test.
             if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } == -1 {
@@ -6609,7 +6608,7 @@ mod tests {
                     }
                     libc::close(marker_fd);
                     let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
-                    let mut writer = crate::tracing::CappedWriter::file(
+                    let mut writer = crate::app::tracing::CappedWriter::file(
                         std::fs::File::from_raw_fd(null),
                         0,
                         Some(budget.clone()),

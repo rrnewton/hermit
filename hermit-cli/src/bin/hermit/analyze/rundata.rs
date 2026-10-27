@@ -29,10 +29,10 @@ use hermit::process::Bind;
 use reverie::process::Output;
 use tracing::metadata::LevelFilter;
 
-use crate::analyze::consts::*;
-use crate::analyze::types::AnalyzeOpts;
-use crate::global_opts::GlobalOpts;
-use crate::run::RunOpts;
+use crate::app::analyze::consts::*;
+use crate::app::analyze::types::AnalyzeOpts;
+use crate::app::global_opts::GlobalOpts;
+use crate::app::run::RunOpts;
 
 /// A single run plus the results of the run, either in memory or on disk.
 pub struct RunData {
@@ -401,7 +401,7 @@ impl RunData {
         let matches = RunOpts::command()
             .try_get_matches_from(run_cmd.iter())
             .unwrap_or_else(|error| {
-                if crate::misplaced_backend_argument(&error).is_some() {
+                if crate::app::misplaced_backend_argument(&error).is_some() {
                     // `--backend` is global. Point at the spelling that selects the
                     // trials' backend instead of letting clap suggest the unrelated
                     // `--backend-engagement-json`. clap reports only the flag name,
@@ -696,8 +696,8 @@ impl AnalyzeOpts {
             match recorded {
                 None => recorded = Some(epoch),
                 Some(first) if first != epoch => {
-                    return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(
-                        format!(
+                    return Err(
+                        anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                             "{} was recorded under the virtual-time epoch {} and {source} \
                              under {}. Each record's times are measured from its own epoch, \
                              so no single replay epoch reproduces both. Record both with the \
@@ -705,8 +705,8 @@ impl AnalyzeOpts {
                             sources[0],
                             first.to_rfc3339(),
                             epoch.to_rfc3339(),
-                        ),
-                    ));
+                        )),
+                    );
                 }
                 Some(_) => {}
             }
@@ -725,7 +725,7 @@ impl AnalyzeOpts {
             return Ok(());
         }
         Err(
-            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+            anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                 "the explicit virtual-time epoch {} (from --epoch or HERMIT_EPOCH) differs from \
                  the epoch {recorded_text} that {} {} recorded under. A record's times are \
                  absolute virtual times measured from its own epoch, so replaying it from \
@@ -813,7 +813,9 @@ impl AnalyzeOpts {
                 recorded,
                 config.pipe_wake_latency,
             ) {
-                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+                return Err(
+                    anyhow::Error::new(crate::app::container::PolicyRefusal).context(refusal)
+                );
             }
             let recorded = detcore::preemptions::read_recorded_signal_state_copy(path)
                 .map_err(anyhow::Error::msg)?;
@@ -822,7 +824,9 @@ impl AnalyzeOpts {
                 recorded,
                 config.signal_state_copy,
             ) {
-                return Err(anyhow::Error::new(crate::container::PolicyRefusal).context(refusal));
+                return Err(
+                    anyhow::Error::new(crate::app::container::PolicyRefusal).context(refusal)
+                );
             }
         }
         Ok(())
@@ -857,7 +861,7 @@ impl AnalyzeOpts {
         // write the same trace path.
         if let Some(path) = trial.record_networking_trace() {
             return Err(
-                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                     "`hermit analyze` and `hermit bisect` refuse --record-networking={} in the \
                      run arguments: it puts every trial on the host network, so the trials \
                      are no longer reproducible, and every trial writes that same trace, so \
@@ -871,7 +875,7 @@ impl AnalyzeOpts {
         let refused = trial.options_trials_refuse();
         if !refused.is_empty() {
             return Err(
-                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                     "`hermit analyze` and `hermit bisect` refuse {} in the run arguments: {}. \
                      Remove {} from the run arguments.",
                     refused
@@ -899,7 +903,7 @@ impl AnalyzeOpts {
             return Ok(());
         }
         Err(
-            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+            anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                 "`hermit analyze` and `hermit bisect` write each trial's configuration and summary \
              into their workspace, so {} would never be written. Remove {} from the run \
              arguments; the workspace keeps both files for every trial.",
@@ -930,7 +934,7 @@ impl AnalyzeOpts {
             return Ok(());
         }
         Err(
-            anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+            anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                 "`hermit analyze` and `hermit bisect` cannot apply {} to their trials: each trial \
              starts through `RunOpts::run`, and only `hermit run` itself applies {}. Remove {} \
              from the run arguments, or run the program with `hermit run`.",
@@ -956,9 +960,9 @@ mod tests {
     #[test]
     fn log_cap_refusal_reaches_analyze_and_bisect_trials() {
         let options = |argv: &[&str]| {
-            let args = crate::Args::try_parse_from(argv)
+            let args = crate::app::Args::try_parse_from(argv)
                 .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.apply_global(&args.global);
@@ -1020,7 +1024,7 @@ mod tests {
                 .expect_err("the trial's guest could outlive hermit");
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{refused:?}: {error:#}"
             );
@@ -1072,9 +1076,9 @@ mod tests {
     #[test]
     fn strict_trials_refuse_an_inexact_branch_counter() {
         let options = |argv: &[&str], probe: fn() -> Option<String>| {
-            let args = crate::Args::try_parse_from(argv)
+            let args = crate::app::Args::try_parse_from(argv)
                 .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.apply_global(&args.global);
@@ -1118,7 +1122,7 @@ mod tests {
                 .expect_err("a strict trial on an inexact counter");
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{refused:?}: {error:#}"
             );
@@ -1165,9 +1169,9 @@ mod tests {
     #[test]
     fn trials_without_strict_warn_once_of_an_inexact_branch_counter() {
         let options = |argv: &[&str], probe: fn() -> Option<String>| {
-            let args = crate::Args::try_parse_from(argv)
+            let args = crate::app::Args::try_parse_from(argv)
                 .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.apply_global(&args.global);
@@ -1181,8 +1185,8 @@ mod tests {
             (result, lines)
         };
         let inexact: fn() -> Option<String> = || Some("SpecLockMap is enabled".to_string());
-        let warning = crate::run::warning_for_an_inexact_branch_counter(
-            crate::run::CounterReader::Trials,
+        let warning = crate::app::run::warning_for_an_inexact_branch_counter(
+            crate::app::run::CounterReader::Trials,
             inexact,
         )
         .unwrap();
@@ -1209,7 +1213,7 @@ mod tests {
         assert!(
             result.is_err_and(|error| {
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some()
             }),
             "--strict refuses"
@@ -1255,9 +1259,9 @@ mod tests {
     #[test]
     fn trials_refuse_run_options_only_main_applies() {
         let options = |argv: &[&str]| {
-            let args = crate::Args::try_parse_from(argv)
+            let args = crate::app::Args::try_parse_from(argv)
                 .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.apply_global(&args.global);
@@ -1290,7 +1294,7 @@ mod tests {
                 .expect_err("a dropped run option");
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{argv:?}: {error:#}"
             );
@@ -1347,7 +1351,7 @@ mod tests {
                 .expect_err("an overwritten output");
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{run_args:?}: {error:#}"
             );
@@ -1374,7 +1378,7 @@ mod tests {
             .expect_err("a network recording");
         assert!(
             error
-                .downcast_ref::<crate::container::PolicyRefusal>()
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
                 .is_some(),
             "{error:#}"
         );
@@ -1412,7 +1416,7 @@ mod tests {
                 .expect_err("an option the trials cannot take");
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{run_arg}: {error:#}"
             );
@@ -1438,8 +1442,8 @@ mod tests {
     #[test]
     fn trials_refuse_a_timeout_their_backend_cannot_enforce() {
         let options = |argv: &[&str]| {
-            let args = crate::Args::try_parse_from(argv).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let args = crate::app::Args::try_parse_from(argv).unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.apply_global(&args.global);
@@ -1457,7 +1461,7 @@ mod tests {
         .expect_err("KVM does not enforce --timeout");
         assert!(
             error
-                .downcast_ref::<crate::container::PolicyRefusal>()
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
                 .is_some(),
             "{error:#}"
         );
@@ -1562,14 +1566,14 @@ mod tests {
                 extra,
                 "/bin/true",
             ]);
-            let args = crate::Args::try_parse_from(&argv).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let args = crate::app::Args::try_parse_from(&argv).unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             let error = options.main(&args.global).unwrap_err();
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{argv:?}: {error:#}"
             );
@@ -1598,8 +1602,8 @@ mod tests {
             "--skid-margin=4321",
             "/bin/true",
         ];
-        let args = crate::Args::try_parse_from(argv).unwrap();
-        let crate::Subcommand::Analyze(mut options) = args.command else {
+        let args = crate::app::Args::try_parse_from(argv).unwrap();
+        let crate::app::Subcommand::Analyze(mut options) = args.command else {
             panic!("{argv:?} is not analyze")
         };
         // The refusal that follows the preflight, not an earlier one.
@@ -1632,14 +1636,14 @@ mod tests {
         let run = RunData::new_baseline(&options, "timeout-repro".to_owned()).unwrap();
         let repro = run.to_repro();
         assert_eq!(repro.matches(" --timeout=7").count(), 1, "{repro}");
-        let matches = crate::Args::command()
+        let matches = crate::app::Args::command()
             .try_get_matches_from(shell_words::split(&repro).unwrap())
             .unwrap();
-        let args = crate::args_from_matches_with_clock(&matches, || {
+        let args = crate::app::args_from_matches_with_clock(&matches, || {
             panic!("analyzer reproduction must retain its actual fixed input")
         })
         .unwrap();
-        let crate::Subcommand::Run(mut parsed) = args.command else {
+        let crate::app::Subcommand::Run(mut parsed) = args.command else {
             panic!("expected run")
         };
         parsed.validate_args().unwrap();
@@ -1666,15 +1670,15 @@ mod tests {
             "--strict",
             "/bin/true",
         ];
-        let args = crate::Args::try_parse_from(argv).unwrap();
-        let crate::Subcommand::Analyze(mut options) = args.command else {
+        let args = crate::app::Args::try_parse_from(argv).unwrap();
+        let crate::app::Subcommand::Analyze(mut options) = args.command else {
             panic!("{argv:?} is not analyze")
         };
         options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
         let error = options.main(&args.global).unwrap_err();
         assert!(
             error
-                .downcast_ref::<crate::container::PolicyRefusal>()
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
                 .is_some(),
             "{error:#}"
         );
@@ -1697,9 +1701,9 @@ mod tests {
     #[test]
     fn analyze_trials_charge_the_invocations_log_budget() {
         let argv = ["hermit", "--max-log-bytes=4K", "analyze", "--", "/bin/true"];
-        let mut args = crate::Args::try_parse_from(argv).unwrap();
+        let mut args = crate::app::Args::try_parse_from(argv).unwrap();
         args.global.prepare_log_budget().unwrap();
-        let crate::Subcommand::Analyze(mut options) = args.command else {
+        let crate::app::Subcommand::Analyze(mut options) = args.command else {
             panic!("{argv:?} is not analyze")
         };
         options.apply_global(&args.global);
@@ -1727,11 +1731,11 @@ mod tests {
                 "--".to_owned(),
                 "/bin/true".to_owned(),
             ];
-            let args = crate::Args::try_parse_from(&argv).unwrap();
+            let args = crate::app::Args::try_parse_from(&argv).unwrap();
             args.command
                 .validate_backend_scope(args.global.backend)
                 .unwrap_or_else(|error| panic!("{argv:?} must be in scope: {error:#}"));
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.apply_global(&args.global);
@@ -1766,8 +1770,8 @@ mod tests {
             let mut argv = vec!["hermit", "--backend=kvm", "analyze", "--"];
             argv.extend(maximum);
             argv.push("/bin/true");
-            let args = crate::Args::try_parse_from(argv).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let args = crate::app::Args::try_parse_from(argv).unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("expected analyze")
             };
             options.apply_global(&args.global);
@@ -1778,7 +1782,7 @@ mod tests {
                 let error = result.err().expect("explicit maximum must refuse");
                 assert!(
                     error
-                        .downcast_ref::<crate::container::PolicyRefusal>()
+                        .downcast_ref::<crate::app::container::PolicyRefusal>()
                         .is_some()
                 );
                 assert!(
@@ -1822,14 +1826,14 @@ mod tests {
             let run = RunData::new_baseline(&options, "epoch-repro".to_owned()).unwrap();
             let repro = run.to_repro();
             assert_eq!(repro.matches("--epoch=").count(), 1, "{repro}");
-            let matches = crate::Args::command()
+            let matches = crate::app::Args::command()
                 .try_get_matches_from(shell_words::split(&repro).unwrap())
                 .unwrap();
-            let args = crate::args_from_matches_with_clock(&matches, || {
+            let args = crate::app::args_from_matches_with_clock(&matches, || {
                 panic!("analyzer reproduction must retain its actual fixed input")
             })
             .unwrap();
-            let crate::Subcommand::Run(parsed) = args.command else {
+            let crate::app::Subcommand::Run(parsed) = args.command else {
                 panic!("expected run")
             };
             assert_eq!(

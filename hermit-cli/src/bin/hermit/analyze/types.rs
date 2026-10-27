@@ -209,13 +209,13 @@ pub struct AnalyzeOpts {
     #[clap(skip)]
     pub max_log_bytes: Option<u64>,
     #[clap(skip)]
-    pub log_budget: Option<crate::tracing::LogBudget>,
+    pub log_budget: Option<crate::app::tracing::LogBudget>,
 
     /// Why this host's retired-branch counter is inexact, if it is; handed to
     /// every trial's `RunOpts` for the `--strict` refusal and the warning
     /// without `--strict`. Tests replace it to reach both on a host whose
     /// counters pass.
-    #[clap(skip = crate::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
+    #[clap(skip = crate::app::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
     pub inexact_branch_counter: fn() -> Option<String>,
 
     /// The branch-counter warning `admit_branch_counter` printed before the

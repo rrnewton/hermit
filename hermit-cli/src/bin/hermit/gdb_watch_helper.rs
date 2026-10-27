@@ -413,7 +413,7 @@ pub(super) fn helper_command(control: RawFd, parent: RawFd) -> Command {
     #[cfg(test)]
     command
         .arg("--exact")
-        .arg("gdb_watch_helper::tests::exec_helper_entry")
+        .arg("app::gdb_watch_helper::tests::exec_helper_entry")
         .arg("--nocapture")
         .arg("--test-threads=1")
         .env(TEST_CONTROL_FD, control.to_string())
