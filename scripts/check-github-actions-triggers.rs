@@ -414,14 +414,20 @@ fn top_level_conjuncts(expr: &str) -> Vec<String> {
     parts
 }
 
-/// Whether an expression replaces the default success() with a status function,
-/// so the job can run although a job it needs was skipped.
+/// Whether an expression uses a status function, which replaces the implicit
+/// `success() &&` GitHub adds otherwise. `success()` counts too: written
+/// explicitly it can be negated or or-ed away (`!success()`).
 fn has_status_function(expr: &str) -> bool {
-    // Expression function names match regardless of case (`Always()`).
-    let lower = expr.to_ascii_lowercase();
-    ["always()", "cancelled()", "failure()"]
+    // Expression function names match regardless of case (`Always()`) and of
+    // whitespace before the parenthesis (`always ( )`). Over-matching only refuses.
+    let squeezed = expr
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    ["always(", "cancelled(", "failure(", "success("]
         .iter()
-        .any(|function| lower.contains(function))
+        .any(|function| squeezed.contains(function))
 }
 
 /// Whether an expression has a `||` at parenthesis depth 0, outside quotes.
@@ -446,10 +452,17 @@ fn has_top_level_or(expr: &str) -> bool {
 /// A line without its YAML comment: `#` starts a comment only at the start of
 /// the line or after whitespace, and outside quotes.
 fn yaml_code(line: &str) -> &str {
-    let (mut single, mut double) = (false, false);
+    let (mut single, mut double, mut escaped) = (false, false, false);
     let mut previous = ' ';
     for (i, c) in line.char_indices() {
+        if escaped {
+            // A double-quoted `\"` or `\\` does not end the string.
+            escaped = false;
+            previous = c;
+            continue;
+        }
         match c {
+            '\\' if double => escaped = true,
             '\'' if !double => single = !single,
             '"' if !single => double = !double,
             '#' if !single && !double && previous.is_whitespace() => {
@@ -566,6 +579,21 @@ fn portable_jobs(source: &str) -> Result<Vec<PortableJob>, String> {
             continue;
         }
         let text = line.trim();
+        // Only a plain `key:` is read below. A quoted key (`"if":`), a space
+        // before the colon (`if :`), an explicit `? key` or a `<<` merge key is
+        // still a job key to YAML, so it is refused rather than skipped.
+        let plain_key = text.split_once(':').is_some_and(|(key, _)| {
+            !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        });
+        if !plain_key {
+            return Err(format!(
+                "job `{}` has a job-level line that is not a plain `key:`: `{text}`",
+                job.name
+            ));
+        }
         let guarded = ["if", "needs", "runs-on"].into_iter().find_map(|key| {
             text.strip_prefix(key)
                 .and_then(|rest| rest.strip_prefix(':'))
@@ -574,6 +602,14 @@ fn portable_jobs(source: &str) -> Result<Vec<PortableJob>, String> {
         let Some((key, value)) = guarded else {
             continue;
         };
+        let seen = match key {
+            "if" => job.condition.is_some(),
+            "needs" => !job.needs.is_empty(),
+            _ => !job.runs_on.is_empty(),
+        };
+        if seen {
+            return Err(format!("job `{}` repeats `{key}:`", job.name));
+        }
         if value.starts_with('*') || value.starts_with('&') {
             return Err(format!(
                 "job `{}` uses a YAML alias or anchor in `{key}:`; write the value out",
@@ -1581,6 +1617,73 @@ mod tests {
             portable_fixture()
         );
         rejected_with(&source, "uses a status function");
+    }
+
+    #[test]
+    fn an_explicit_success_is_a_status_function() {
+        // Review round 3, R1 and R2: written out, success() can be or-ed away
+        // or negated, and then the job runs when the gated job was skipped.
+        for condition in [
+            "success() || github.event_name == 'pull_request'",
+            "${{ !success() }}",
+        ] {
+            let source = format!(
+                "{}  probe:\n    needs: select\n    if: {condition}\n    runs-on: ubuntu-latest\n",
+                portable_fixture()
+            );
+            assert!(
+                !validate_portable_pr_gate(&source).is_empty(),
+                "{condition}"
+            );
+        }
+    }
+
+    #[test]
+    fn status_functions_are_found_with_spaces_before_the_parenthesis() {
+        // Review round 3, R3: `always ( )`.
+        let source = format!(
+            "{}  spaced:\n    needs: select\n    if: ${{{{ always ( ) }}}}\n    runs-on: ubuntu-latest\n",
+            portable_fixture()
+        );
+        rejected_with(&source, "uses a status function");
+    }
+
+    #[test]
+    fn a_job_key_must_be_written_plainly() {
+        // Review round 3, R5-R7: YAML reads each of these as the key `if`.
+        for line in [
+            "\"if\": always()",
+            "'if': always()",
+            "if : always()",
+            "? if",
+            "<<: *base",
+        ] {
+            let source = format!(
+                "{}  probe:\n    needs: select\n    {line}\n    runs-on: ubuntu-latest\n",
+                portable_fixture()
+            );
+            rejected_with(&source, "not a plain `key:`");
+        }
+    }
+
+    #[test]
+    fn an_escaped_quote_does_not_end_a_double_quoted_string() {
+        // Review round 3, R4: the `\"` must not reopen a comment before always().
+        let source = format!(
+            "{}  probe:\n    needs: select\n    if: \"contains(github.ref, '\\\" #') || always()\"\n    runs-on: ubuntu-latest\n",
+            portable_fixture()
+        );
+        rejected_with(&source, "top-level `||`");
+    }
+
+    #[test]
+    fn a_guarded_key_may_appear_once() {
+        // Review round 3, R13: two `if:` keys, whichever GitHub keeps.
+        let source = format!(
+            "{}  twice:\n    needs: select\n    if: always()\n    if: needs.select.result == 'success'\n    runs-on: ubuntu-latest\n",
+            portable_fixture()
+        );
+        rejected_with(&source, "repeats `if:`");
     }
 
     #[test]
