@@ -97,6 +97,7 @@ fn refusal_name(reason: &Refusal) -> &'static str {
         Refusal::UnsupportedOperation => "unsupported-operation",
         Refusal::BranchOutOfRange => "branch-out-of-range",
         Refusal::Relocated => "relocation-inside-the-sequence",
+        Refusal::NewValueAfterCompare => "new-value-after-compare",
     }
 }
 
