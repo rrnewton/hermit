@@ -5509,7 +5509,7 @@ enum KeyAccess {
 /// kernel, which is also the guest's kernel: a private FUTEX_WAKE with count 0
 /// keys the word without touching it and fails with EFAULT exactly when
 /// `access_ok` refuses it.
-fn user_ptr_max() -> usize {
+pub(crate) fn user_ptr_max() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
         let accepted = |address: usize| {

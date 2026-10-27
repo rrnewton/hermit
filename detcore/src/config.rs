@@ -85,6 +85,10 @@ mod tests {
         // GlobalRequest::RegisterDescriptorDirectory and DescriptorDirectory and
         // their responses (package K slice F1).
         (2, "caee2c37469869d4"),
+        // GlobalRequest::RegisterPlaceholder, Placeholder, PlaceholderFlock,
+        // PlaceholderWriteHint and PlaceholderCopies and their responses, in
+        // place of F1's two (package K slice P1).
+        (3, "b3d7410a78b56ae0"),
     ];
 
     /// The lines of code, without comments or blank lines, of the enum that

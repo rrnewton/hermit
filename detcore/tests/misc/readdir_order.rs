@@ -3285,10 +3285,12 @@ fn an_inherited_fdinfo_table_names_the_parents_entries() {
 }
 
 /// With `/proc/self/fd` as the working directory, a stat of `"40"` relative
-/// to it gives the entry a listing gives (P2-2). The working directory is
-/// entered by its path: Detcore serves the directory's descriptor from a
-/// descriptor on `/proc` (package K slice F1), and refuses an `fchdir` to it
-/// by name (EACCES) until the directory has an object of its own.
+/// to it (the kernel's entry, numbered by Detcore) gives the entry Detcore's
+/// served listing of the directory gives (P2-2). `fchdir` to the directory's
+/// descriptor enters it, as on Linux, and the working directory is then the
+/// directory's own path: Detcore serves the directory on a descriptor on
+/// procfs's root (ptrace) and enters the directory itself, by its path
+/// within procfs from that descriptor (package K slices F1 and P1).
 fn cwd_table_guest() {
     open_slot_40();
     let dir = unsafe {
@@ -3298,12 +3300,11 @@ fn cwd_table_guest() {
         )
     };
     assert!(dir >= 0);
-    assert_eq!(unsafe { libc::fchdir(dir) }, -1);
+    assert_eq!(unsafe { libc::fchdir(dir) }, 0);
     assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EACCES)
+        std::env::current_dir().unwrap(),
+        std::path::PathBuf::from(format!("/proc/{}/fd", std::process::id()))
     );
-    assert_eq!(unsafe { libc::chdir(c"/proc/self/fd".as_ptr()) }, 0);
     let listed = listed_in(dir, "40");
     let relative = at_identity(libc::AT_FDCWD, c"40", libc::AT_SYMLINK_NOFOLLOW).1;
     assert_eq!(relative, listed, "cwd-relative stat and listing");

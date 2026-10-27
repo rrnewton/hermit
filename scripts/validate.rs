@@ -17651,7 +17651,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "91");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "94");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -17726,16 +17726,20 @@ mod nextest_timeout_tests {
         // run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec (Detcore's
         // empty-signal-boundary opt-in): 90. And
         // run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec
-        // (replaced-request parked ownership): 91. The spinner is retained
-        // but ignored and excluded because its explicit maximum requests an
-        // unavailable timer: 90 selected CLI tests remain.
+        // (replaced-request parked ownership): 91. And package K slice P1's
+        // run_kvm_procfs_directories_are_served_only_in_a_container,
+        // run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name and
+        // run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none
+        // (https://github.com/rrnewton/hermit/issues/4604): 94. The spinner is
+        // retained but ignored and excluded because its explicit maximum
+        // requests an unavailable timer: 93 selected CLI tests remain.
         assert_eq!(
             names.len(),
-            91,
+            94,
             "update the exact CI inventory with new KVM tests"
         );
         names.retain(|name| name != excluded);
-        assert_eq!(names.len(), 90);
+        assert_eq!(names.len(), 93);
         let required_cases = [
             "run_kvm_self_sigkill_from_nonleader_is_group_fatal",
             "run_kvm_synchronous_root_segv_preserves_guest_exit",
@@ -17759,6 +17763,9 @@ mod nextest_timeout_tests {
             "run_kvm_cpuid_rows_match_ptrace",
             "run_kvm_a_parked_wait_leaves_nothing_to_refuse_an_exec",
             "run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec",
+            "run_kvm_procfs_directories_are_served_only_in_a_container",
+            "run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name",
+            "run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -18844,7 +18851,12 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // empty-signal-boundary opt-in): 90 selected.
         // run_kvm_a_signal_ending_a_parked_read_leaves_nothing_to_refuse_an_exec
         // (replaced-request parked ownership): 91 selected.
-        ("privileged-only-test.cli_kvm", 91usize),
+        // Package K slice P1's
+        // run_kvm_procfs_directories_are_served_only_in_a_container,
+        // run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name and
+        // run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none
+        // (https://github.com/rrnewton/hermit/issues/4604): 94 selected.
+        ("privileged-only-test.cli_kvm", 94usize),
     ] {
         let step = privileged
             .steps

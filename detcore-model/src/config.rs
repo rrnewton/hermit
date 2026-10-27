@@ -543,6 +543,40 @@ pub struct Config {
     #[clap(skip)]
     pub container_mount_table: Option<crate::container_mounts::ContainerMountTable>,
 
+    /// The guest path of the empty, read-only directory hermit-cli mounted in
+    /// the guest's container for Detcore's placeholder directories where the
+    /// guest's procfs is not the kernel's (KVM: the backend provides process
+    /// signal control, `procfs_inode::tool_can_name_guest_descriptors`): a
+    /// tmpfs at `/proc/fs/nfsd`, procfs's own permanently empty mount point,
+    /// which Detcore's `--proc` level table hides from the guest at every
+    /// level, and which the guest's mount table leaves out. Each descriptor
+    /// Detcore serves there for `/proc` itself or the caller's own
+    /// `/proc/<pid>/fd` is open on this directory, and Detcore answers every
+    /// call through it from its model; an open, stat or statx of the guest's
+    /// that reaches the directory otherwise fails as `/proc/fs` does. `None`
+    /// where the guest's procfs is the kernel's (ptrace, the in-guest
+    /// backends: nothing is mounted, see [`Self::container_procfs`]), and
+    /// where hermit-cli mounted none or a later mount covers it:
+    /// `--no-namespace`, `--namespace-only`, record and replay, a user mount
+    /// over the placeholder, every library caller, and every older
+    /// configuration. On KVM, Detcore then serves no placeholder directory,
+    /// and an open of `/proc` or a descriptor directory is refused (`EACCES`).
+    /// Runtime provenance, not a user option.
+    #[serde(default)]
+    #[clap(skip)]
+    pub directory_placeholder: Option<PathBuf>,
+
+    /// Whether the guest runs in hermit-cli's container, whose procfs mount
+    /// at `/proc` is its own (every container hermit-cli runs a guest in, not
+    /// `--no-namespace`, not a library caller, not an older configuration).
+    /// Where the guest's procfs is the kernel's (ptrace), Detcore serves
+    /// `/proc` itself and the caller's own `/proc/<pid>/fd` then, each on a
+    /// descriptor on that procfs's root, and serves neither without it.
+    /// Runtime provenance, not a user option.
+    #[serde(default)]
+    #[clap(skip)]
+    pub container_procfs: bool,
+
     /// Sequentialize thread execution deterministically.
     #[clap(long)]
     pub sequentialize_threads: bool,
@@ -2788,7 +2822,9 @@ mod legacy_backend_json {
     /// coordinated startup's typed configuration, which is how Hermit
     /// launches DBT, carries the table.
     /// `mountinfo_mount_namespace` too, for the same reason: it is never
-    /// written and reads as absent.
+    /// written and reads as absent. So are `directory_placeholder` and
+    /// `container_procfs`, which describe one run's container; the
+    /// coordinated startup's typed configuration carries them.
     /// `signal_delivery_check_fatal` matters only where the copy is kept, so
     /// it is never written and reads as false.
     /// `work_span_report` came after it as well: the report is written by the
@@ -2796,7 +2832,7 @@ mod legacy_backend_json {
     /// as unset.
     /// `signal_at` came after the form froze; the scheduler acts on it, not
     /// the runtime, so it is never written and reads as unset.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 25] = [
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 27] = [
         "backend",
         "strict_schedule_boundaries",
         "record_host_inputs",
@@ -2818,6 +2854,8 @@ mod legacy_backend_json {
         "signal_state_copy",
         "container_mount_table",
         "mountinfo_mount_namespace",
+        "directory_placeholder",
+        "container_procfs",
         "signal_delivery_check_fatal",
         "work_span_report",
         "signal_at",
@@ -2960,7 +2998,8 @@ mod legacy_backend_json {
                     | "target_timeslice_syscalls_only"
                     | "futex_wake_yields"
                     | "replaying"
-                    | "signal_delivery_check_fatal",
+                    | "signal_delivery_check_fatal"
+                    | "container_procfs",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 // Empty, as its serde default is.
                 Some("in_guest_reserved_signals") => {
@@ -2978,6 +3017,7 @@ mod legacy_backend_json {
                     | "pipe_wake_latency"
                     | "container_mount_table"
                     | "mountinfo_mount_namespace"
+                    | "directory_placeholder"
                     | "work_span_report"
                     | "signal_at",
                 ) => seed
@@ -3263,6 +3303,8 @@ mod legacy_backend_json {
                 | "signal_state_copy"
                 | "container_mount_table"
                 | "mountinfo_mount_namespace"
+                | "directory_placeholder"
+                | "container_procfs"
                 | "signal_delivery_check_fatal"
                 | "work_span_report"
                 | "signal_at"
@@ -3991,6 +4033,8 @@ mod tests {
                 | "signal_state_copy"
                 | "container_mount_table"
                 | "mountinfo_mount_namespace"
+                | "directory_placeholder"
+                | "container_procfs"
                 | "signal_delivery_check_fatal"
                 | "work_span_report"
                 | "signal_at"
@@ -4012,12 +4056,13 @@ mod tests {
         // `pipe_wake_latency`, `replaying`, `scheduler_turn_cost`,
         // `inherited_seccomp`, `cpu_profile`, `cpu_profile_host`, `cpu_profile_source`,
         // `signal_state_copy`, `container_mount_table`,
-        // `mountinfo_mount_namespace`, `signal_delivery_check_fatal`,
-        // `work_span_report`, `signal_at` and `in_guest_signal_delivery`
-        // and `strict_schedule_boundaries` none: fourteen more keys and
-        // twenty-four fewer, so ten keys fewer than fields.
+        // `mountinfo_mount_namespace`, `directory_placeholder`,
+        // `container_procfs`, `signal_delivery_check_fatal`,
+        // `work_span_report`, `signal_at` and `in_guest_signal_delivery` and
+        // `strict_schedule_boundaries` none: fourteen more keys and
+        // twenty-six fewer, so twelve keys fewer than fields.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len(), keys.len() + 10);
+        assert_eq!(fields.len(), keys.len() + 12);
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -5276,6 +5321,11 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("mountinfo_mount_namespace");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("directory_placeholder");
+        value.as_object_mut().unwrap().remove("container_procfs");
         let restored: Config = serde_json::from_value(value).unwrap();
         assert!(restored.mountinfo_root_rewrites.is_empty());
         assert!(restored.mountinfo_device_rewrites.is_empty());
@@ -5284,6 +5334,8 @@ mod tests {
         assert!(restored.mount_id_assignment_order.is_empty());
         assert!(restored.container_mount_table.is_none());
         assert!(restored.mountinfo_mount_namespace.is_none());
+        assert!(restored.directory_placeholder.is_none());
+        assert!(!restored.container_procfs);
     }
 
     #[test]

@@ -1134,6 +1134,10 @@ fn record_or_replay_config_with_timer_support(
         mount_id_assignment_order: Vec::new(),
         // The recorder and the replayer set the table from the recording.
         container_mount_table: None,
+        // Detcore serves no placeholder directory under record and replay,
+        // whose containers mount none, and serves no `/proc` directory there.
+        directory_placeholder: None,
+        container_procfs: false,
         virtualize_cpuid: true,
         // The recorder and the replayer set the profile from the command line
         // and the recording; see `record_or_replay_config`'s callers.

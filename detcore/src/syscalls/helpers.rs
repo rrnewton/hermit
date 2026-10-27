@@ -367,6 +367,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         res
     }
 
+    /// Whether [`Self::execute_nonblockable_fd_syscall`] runs `call` as a
+    /// blocking call outside this thread's turn
+    /// ([`Self::record_or_replay_blocking`]), where other threads may run
+    /// before the kernel reads the call's arguments: without sequentialized
+    /// threads, for an external descriptor under record and replay, for a
+    /// descriptor that is blocking in the kernel as well, and where the
+    /// descriptor cannot be classified. Decided as that function decides it.
+    pub(crate) fn nonblockable_call_runs_outside_turn<G, C>(&self, guest: &mut G, call: C) -> bool
+    where
+        G: Guest<Self>,
+        C: SyscallInfo + Into<Syscall> + Copy,
+    {
+        let wrapped: Syscall = call.into();
+        match ioaction_based_on_fd_status(guest, call) {
+            Err(_) => true,
+            Ok(action) => {
+                !self.cfg.sequentialize_threads
+                    || (self.cfg.recordreplay_modes && !syscall_targets_internal_fd(guest, wrapped))
+                    || action == IOAction::Blocking
+            }
+        }
+    }
+
     /// Executes a nonblockable syscall according to the following strategy:
     /// - Record mode: Execute possibly blocking syscall
     /// - Run mode: Transform the syscall to nonblocking if required before executing
@@ -2549,6 +2572,28 @@ where
             let geometry =
                 crate::syscalls::scm_rights::ReceiveGeometry::before(&guest.memory(), &call.into());
             guest.thread_state_mut().receive_geometry = Some(geometry);
+        }
+        // A send whose `SCM_RIGHTS` descriptors Detcore inspected reads them
+        // again right before each attempt: a sibling may have rewritten its
+        // messages, or replaced what their descriptor numbers name, since the
+        // inspection or while an earlier attempt waited
+        // (`ThreadState::send_inspection`). An attempt that would pass other
+        // placeholders than those whose copies Detcore counted is refused by
+        // name. Boxed: only a send that may pass a placeholder carries it.
+        if let Some(inspection) = guest.thread_state().send_inspection.clone()
+            && let Some(reason) =
+                Box::pin(Detcore::<T>::changed_placeholder_send(guest, &inspection)).await
+        {
+            tracing::error!("Detcore refuses {}: {reason}", inspection.sysno);
+            let panic_on_unsupported_syscalls = guest.config().panic_on_unsupported_syscalls;
+            break refuse_unserviceable_operation_with(
+                guest,
+                panic_on_unsupported_syscalls,
+                inspection.sysno,
+                Errno::EOPNOTSUPP,
+                Some(&reason),
+            )
+            .await;
         }
         // Route through the record/replay subtool for internal pipes so each poll (an
         // EAGAIN, or the final data-bearing read) becomes one recorded event that replay

@@ -686,9 +686,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest
             .thread_state()
             .add_discovered_fd(fd, descriptor_flags, status_flags, &stat)?;
-        // A descriptor directory's descriptor on `/proc`, which its tag tells
-        // apart (`descriptor_directory`).
-        self.recognize_received_descriptor_directory(guest, fd, &stat, status_flags)
+        // A placeholder descriptor, which its identity and its tag tell apart
+        // (`descriptor_directory`).
+        self.recognize_received_placeholder(guest, fd, &stat, status_flags)
             .await;
         Ok(true)
     }

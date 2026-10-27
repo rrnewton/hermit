@@ -1113,7 +1113,7 @@ fn descriptor_identity(tid: i32, fd: RawFd) -> Option<(PathBuf, bool)> {
 /// root. Stripping `/proc/<pid>/root` produces the same guest-absolute path in
 /// record and replay without depending on the opened descriptor (which is an
 /// eventfd placeholder during replay).
-fn resolved_at_fdcwd_path(pid: i32, path: &Path) -> Option<PathBuf> {
+pub(crate) fn resolved_at_fdcwd_path(pid: i32, path: &Path) -> Option<PathBuf> {
     debug_assert!(!path.is_absolute());
     let root = std::fs::read_link(format!("/proc/{pid}/root")).ok()?;
     let cwd = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
@@ -3710,6 +3710,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        if let Some(stat) = &host_stat {
+            procfs_inode::note_anchor_opened(&guest.config().backend, stat.st_dev, stat.st_mode);
+        }
         guest
             .thread_state()
             .add_fd(fd, flags, ty, host_stat.map(Into::into))?;
@@ -3879,6 +3882,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         drop(stack_guard);
         let text = String::from_utf8(bytes?).ok()?;
+        // The placeholder directory Detcore serves `/proc` and descriptor
+        // directories on, which no guest path reaches: the directory the
+        // descriptor stands for (`descriptor_directory`).
+        if guest
+            .config()
+            .directory_placeholder
+            .as_deref()
+            .is_some_and(|placeholder| placeholder.as_os_str() == std::ffi::OsStr::new(&text))
+        {
+            return Self::unrecorded_placeholder_base(guest, dirfd).await;
+        }
         let (mut names, positions) = procfs_directory_task_positions(&text)?;
         if Self::translates_procfs_numbers(guest) && !positions.is_empty() {
             let kernel = positions
@@ -4333,9 +4347,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_release_all(guest).await;
             return result;
         }
-        // The caller's own descriptor directory, which Detcore lists from its
-        // own table on every backend (`descriptor_directory`).
+        // `/proc` itself, or the caller's own descriptor directory, which
+        // Detcore serves on a placeholder descriptor, listing them from its
+        // model on ptrace and KVM (`descriptor_directory`).
         if !path.as_os_str().is_empty()
+            && !Self::starts_at_a_recorded_link(guest, call.dirfd(), &path)
             && let Some(opened) = self
                 .descriptor_directory_opened(
                     guest,
@@ -4350,14 +4366,31 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await
         {
             let result = match opened {
-                Ok(opened) => {
-                    self.open_descriptor_directory(guest, call.flags(), opened)
-                        .await
-                }
+                Ok(opened) => self.open_placeholder(guest, call.flags(), opened).await,
                 Err(errno) => Err(errno.into()),
             };
             resource_release_all(guest).await;
             return result;
+        }
+        // `/proc` itself, or a descriptor directory, where the guest's procfs
+        // is the backend's own and Detcore serves no placeholder: refused
+        // before the open can reach the backend's `/proc`
+        // (`descriptor_directory`).
+        if !path.as_os_str().is_empty()
+            && !Self::starts_at_a_recorded_link(guest, call.dirfd(), &path)
+            && Self::refuses_backend_procfs_directory(
+                guest,
+                guest_spelled
+                    .as_ref()
+                    .map_or(&observed_path, |(observed, _)| observed),
+                guest_spelled
+                    .as_ref()
+                    .map_or(&procfs_spelling, |(_, spelling)| spelling),
+            )
+            .await
+        {
+            resource_release_all(guest).await;
+            return Err(Errno::EACCES.into());
         }
         // An `exe` link Detcore answers from its record (`Detcore::launched_exe`)
         // opens that image, for reading only: a write open of a running image
@@ -4617,14 +4650,32 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // while a placeholder may be about.
                 let identity = match &host_stat {
                     Some(stat) => Some(*stat),
-                    None if self.renders_procfs(guest)
+                    None if (self.renders_procfs(guest)
                         && (guest.thread_state().holds_a_rendered_procfs_file()
-                            || rendered_procfs::placeholders_exist()) =>
+                            || rendered_procfs::placeholders_exist()))
+                        || guest.config().directory_placeholder.is_some() =>
                     {
                         self.inject_fstat(guest, fd).await.ok()
                     }
                     None => None,
                 };
+                // The placeholder directory, reached through a spelling the
+                // `--proc` level table could not resolve: hidden, as
+                // `/proc/fs` is (`descriptor_directory`).
+                if let Some(stat) = &identity
+                    && Self::reaches_hidden_placeholder(
+                        guest,
+                        stat.st_mode,
+                        stat.st_dev,
+                        stat.st_ino,
+                    )
+                    .await
+                {
+                    guest.thread_state().remove_fd(fd);
+                    let _ = guest.inject(syscalls::Close::new().with_fd(fd)).await;
+                    resource_release_all(guest).await;
+                    return Err(Errno::ENOENT.into());
+                }
                 let reached = match &identity {
                     Some(stat) if self.renders_procfs(guest) => {
                         self.recognize_placeholder(
@@ -6350,13 +6401,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .flatten(),
             None => None,
         };
-        let contents = match rendered_target {
-            Some((_, offset)) => format!(
+        // The kernel's fdinfo for a placeholder descriptor describes the
+        // placeholder: its tag as the position, its tmpfs mount and inode.
+        // Linux's names the directory it stands for: Detcore's position, the
+        // guest's procfs mount and the directory's inode
+        // (`descriptor_directory`).
+        // Boxed, so that this call's future holds its answer alone.
+        let placeholder = match target_fd {
+            Some(target_fd) if rendered_target.is_none() => {
+                Box::pin(self.placeholder_fdinfo(guest, target_fd)).await?
+            }
+            _ => None,
+        };
+        let placeholder_inode = placeholder.as_ref().map(|(_, inode)| *inode);
+        let contents = match (rendered_target, placeholder) {
+            (Some((_, offset)), _) => format!(
                 "pos:\t{offset}\nflags:\t0\nmnt_id:\t{}\nino:\t0\n",
                 rendered_procfs::guest_procfs_mount_id()?
             )
             .into_bytes(),
-            None => contents,
+            (None, Some((placeholder, _))) => placeholder,
+            (None, None) => contents,
         };
         let fdinfo_identity = if let Some(target_fd) = target_fd {
             let (cached_stat, logical_flags, open_file_id, fd_type, inode_override) =
@@ -6380,6 +6445,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 None if let Some((path, _)) = rendered_target => {
                     DetInode::mint(procfs_inode::rendered_inode(path))
                 }
+                // The directory a placeholder stands for, as its `fstat`
+                // numbers it.
+                None if let Some(inode) = placeholder_inode => DetInode::mint(inode),
                 None => {
                     let procfs =
                         Self::procfs_entry(guest, &stat, StatTarget::Descriptor(target_fd)).await;
@@ -7603,9 +7671,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             // guest's control flow and desynchronizing the event stream. Routing
             // through record_or_replay records the offset once and substitutes
             // the recorded value on replay, keeping the two runs identical.
-            // A descriptor on procfs's root is never moved into the range
-            // of the positions that tag a descriptor directory's descriptor
-            // (`descriptor_directory`), which would pass for one.
+            // A placeholder descriptor Detcore does not know is never moved
+            // into the range of the positions that tag one
+            // (`descriptor_directory`), where it would pass for another.
             if self
                 .seek_would_place_a_tag(
                     guest,
@@ -9640,13 +9708,36 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ),
                 None => target,
             };
+            let before = Self::stat_buffer_before(
+                guest,
+                call.stat().map(|result| result.0.as_raw()),
+                std::mem::size_of::<libc::stat>(),
+            );
             Self::inject_translated(guest, Syscall::from(call)).await?;
             let statptr = call.stat().ok_or(Errno::EFAULT)?;
             let inode_override = target
                 .descriptor()
                 .and_then(|fd| stdio_inode_override(guest, fd));
+            let stat: libc::stat = guest.memory().read_value(statptr.0)?;
+            // The placeholder directory, reached through a spelling the
+            // `--proc` level table could not resolve: hidden, as `/proc/fs`
+            // is (`descriptor_directory`). Until its identity is learnt, the
+            // question is asked in a boxed future, after which the result is
+            // read again, so that no stat is kept across it.
+            let (mode, dev, ino) = (stat.st_mode, stat.st_dev, stat.st_ino);
+            let stat = match Self::hidden_placeholder_known(guest, mode, dev, ino) {
+                Some(true) => {
+                    return Self::hidden_placeholder_stat(guest, statptr.0.as_raw(), before);
+                }
+                Some(false) => stat,
+                None => {
+                    if Box::pin(Self::hidden_placeholder_reached(guest, mode, dev, ino)).await {
+                        return Self::hidden_placeholder_stat(guest, statptr.0.as_raw(), before);
+                    }
+                    guest.memory().read_value(statptr.0)?
+                }
+            };
             let mut memory = guest.memory();
-            let stat: libc::stat = memory.read_value(statptr.0)?;
             // A placeholder another process made, or an earlier image of this
             // one, becomes known by its identity (`determinize_stat`).
             if inode_override.is_none() {
@@ -9675,7 +9766,25 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest.memory().write_value(statptr.0, &stat.into())?;
                 return Ok(0);
             }
-            Ok(self.record_or_replay(guest, call).await?)
+            let before = Self::stat_buffer_before(
+                guest,
+                call.stat().map(|result| result.0.as_raw()),
+                std::mem::size_of::<libc::stat>(),
+            );
+            let ret = self.record_or_replay(guest, call).await?;
+            // The placeholder directory is hidden here too (record and replay
+            // have none, so a recording is unchanged).
+            if ret == 0
+                && before.is_some()
+                && let Some(statptr) = call.stat()
+            {
+                let stat: libc::stat = guest.memory().read_value(statptr.0)?;
+                let (mode, dev, ino) = (stat.st_mode, stat.st_dev, stat.st_ino);
+                if Self::reaches_hidden_placeholder(guest, mode, dev, ino).await {
+                    return Self::hidden_placeholder_stat(guest, statptr.0.as_raw(), before);
+                }
+            }
+            Ok(ret)
         }
     }
 
@@ -9725,14 +9834,39 @@ impl<T: RecordOrReplay> Detcore<T> {
             // fs/stat.c:248-259) after the filesystem's getattr, which sees
             // `STATX_MNT_ID` in place of `STATX_MNT_ID_UNIQUE`.
             let unique = statx_requested_mask(call) & STATX_MNT_ID_UNIQUE != 0;
+            let before = Self::stat_buffer_before(
+                guest,
+                call.statx().map(|result| result.0.as_raw()),
+                std::mem::size_of::<reverie::syscalls::linux_abi::Statx>(),
+            );
             Self::inject_translated(guest, Syscall::from(statx_asking_classic_mount_id(call)))
                 .await?;
             let statptr = call.statx().ok_or(Errno::EFAULT)?;
             let inode_override = target
                 .descriptor()
                 .and_then(|fd| stdio_inode_override(guest, fd));
+            let stat: reverie::syscalls::linux_abi::Statx = guest.memory().read_value(statptr.0)?;
+            // The placeholder directory, reached through a spelling the
+            // `--proc` level table could not resolve: hidden, as `/proc/fs`
+            // is (`descriptor_directory`), asked as for the other stat calls
+            // (`handle_stat_family`).
+            let (mode, dev, ino) = {
+                let identity = DetStat::from(stat);
+                (identity.mode, identity.dev, identity.inode)
+            };
+            let stat = match Self::hidden_placeholder_known(guest, mode, dev, ino) {
+                Some(true) => {
+                    return Self::hidden_placeholder_stat(guest, statptr.0.as_raw(), before);
+                }
+                Some(false) => stat,
+                None => {
+                    if Box::pin(Self::hidden_placeholder_reached(guest, mode, dev, ino)).await {
+                        return Self::hidden_placeholder_stat(guest, statptr.0.as_raw(), before);
+                    }
+                    guest.memory().read_value(statptr.0)?
+                }
+            };
             let mut memory = guest.memory();
-            let stat: reverie::syscalls::linux_abi::Statx = memory.read_value(statptr.0)?;
             // A placeholder another process made, or an earlier image of this
             // one, becomes known by its identity (`determinize_stat`).
             let placeholder = match inode_override {
@@ -9774,6 +9908,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else if let Some(stat) = self.rendered_procfs_stat(guest, target).await? {
                 return self.write_rendered_statx(guest, call, stat).await;
             }
+            let before = Self::stat_buffer_before(
+                guest,
+                call.statx().map(|result| result.0.as_raw()),
+                std::mem::size_of::<reverie::syscalls::linux_abi::Statx>(),
+            );
             let ret = self.record_or_replay(guest, call).await?;
             // The same in recording, in replay and without either: a recording
             // keeps only the fields Detcore models, so what else the kernel
@@ -9781,6 +9920,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             if ret == 0
                 && let Some(statptr) = call.statx()
             {
+                // The placeholder directory is hidden here too
+                // (`handle_stat_family`), before the tail is canonicalized.
+                if before.is_some() {
+                    let stat: reverie::syscalls::linux_abi::Statx =
+                        guest.memory().read_value(statptr.0)?;
+                    let identity = DetStat::from(stat);
+                    let (mode, dev, ino) = (identity.mode, identity.dev, identity.inode);
+                    if Self::reaches_hidden_placeholder(guest, mode, dev, ino).await {
+                        return Self::hidden_placeholder_stat(guest, statptr.0.as_raw(), before);
+                    }
+                }
                 canonicalize_statx_tail(&mut guest.memory(), statptr.0.as_raw())?;
             }
             Ok(ret)
@@ -10300,6 +10450,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         page: usize,
         fd: RawFd,
     ) -> Result<Result<Vec<u8>, FdinfoFailure>, Error> {
+        // A backend whose `/proc` is its own (KVM) gives no procfs anchor:
+        // nothing is opened there, and the description is untrackable, as an
+        // anchor that is not procfs makes it.
+        if !procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend) {
+            return Ok(Err(FdinfoFailure::NotProcfs(
+                "the backend's /proc is not the kernel's procfs",
+            )));
+        }
         let path_ptr =
             PathPtr::from_ptr((page + FDINFO_PATH) as *const libc::c_char).ok_or(Errno::EFAULT)?;
         self.write_fdinfo_path(guest, page, "/proc")?;
@@ -11003,6 +11161,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let path: PathBuf = pointer.read(&guest.memory())?;
             let observed = Self::observed_path(guest, libc::AT_FDCWD, &path)?;
             if self.rendered_procfs_at(guest, &observed).await?.is_some()
+                || Box::pin(Self::names_placeholder_directory(guest, &observed)).await
                 || self
                     .placeholder_reached(guest, libc::AT_FDCWD, Some(pointer), true)
                     .await
@@ -13992,6 +14151,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         fd: RawFd,
         target: i64,
     ) {
+        // A placeholder's kernel position is its tag, which nothing moves:
+        // Detcore answers its listing and its seeks from its model.
+        if Self::placeholder_of(guest, fd).is_some() {
+            return;
+        }
         let seek = syscalls::Lseek::new()
             .with_fd(fd)
             .with_offset(target)

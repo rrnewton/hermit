@@ -9303,9 +9303,12 @@ impl RunOpts {
             timeout,
             move |(_, identity, guards, native_plan)| {
                 // What the mount plan made, before anything else uses the
-                // container's mounts (a no-op for a plan with no record).
+                // container's mounts (a no-op for a plan with no record), and
+                // whether the placeholder directory is still where the guest
+                // path reaches it.
                 if let Some(identity) = identity.as_mut() {
                     identity.record_plan()?;
+                    identity.confirm_directory_placeholder();
                 }
                 #[cfg(feature = "native-exec")]
                 let native = native_plan
@@ -10327,10 +10330,22 @@ impl RunOpts {
         // image's materialized rootfs (deterministic file inputs) rather than
         // the host filesystem. This replaces the default namespace+mounts setup
         // with a chroot into the pinned image root.
+        // Detcore's placeholder directory, only where the guest's procfs is
+        // not the kernel's (`detcore::needs_directory_placeholder`): where it
+        // is, Detcore serves its `/proc` directories on that procfs's root,
+        // and no tmpfs of Hermit's is there for a guest to reach.
+        let mounts_placeholder = detcore::needs_directory_placeholder(
+            &hermit::backend_capabilities(self.runtime_backend()),
+        );
         if let Some(image) = &self.image {
             let rootfs = crate::image::materialize_rootfs(image)?;
-            let (mut container, identity_sources) =
-                image_container(&rootfs, tmpfs, self.pin_threads, self.tmp.is_none())?;
+            let (mut container, identity_sources) = image_container(
+                &rootfs,
+                tmpfs,
+                self.pin_threads,
+                self.tmp.is_none(),
+                mounts_placeholder,
+            )?;
             self.network
                 .configure(&mut container, self.analyze_networking);
             return Ok((container, identity_sources));
@@ -10344,9 +10359,33 @@ impl RunOpts {
             mounts,
             mut identity_sources,
         } = self.mounts(tmpfs)?;
+        // Detcore's placeholder directory, where the backend needs one, right
+        // after the container's own `/proc`, which holds its mount point,
+        // unless a later mount of the plan covers it, as the setup resolves
+        // each target in turn (a `--mount` at `/proc/fs` or the directory
+        // itself, by any spelling that resolves there:
+        // `container::later_mount_covers`): then Detcore serves no
+        // placeholder directory, as without a container. The container's init
+        // checks again once every mount is in
+        // (`IdentityGuard::confirm_directory_placeholder`).
+        let placeholder = PathBuf::from(super::container::DIRECTORY_PLACEHOLDER);
         let mut plan = vec![PlannedMount::hermit(container_proc_mount())];
+        if mounts_placeholder {
+            plan.push(PlannedMount::placeholder(
+                super::container::directory_placeholder_mount(&placeholder),
+            ));
+        }
         plan.extend(mounts);
+        let placeholder = if !mounts_placeholder {
+            None
+        } else if super::container::later_mount_covers(&plan, 1) {
+            plan.remove(1);
+            None
+        } else {
+            Some(placeholder)
+        };
         identity_sources.set_plan(&mut container, plan)?;
+        identity_sources.set_directory_placeholder(placeholder);
         #[cfg(feature = "native-exec")]
         if self.native_exec_capture.is_some() {
             identity_sources.forget_plan();
@@ -11789,6 +11828,14 @@ pub(super) fn complete_container_config(
         .transpose()?;
     config.mount_id_assignment_order.clear();
     config.mountinfo_mount_ids_captured = true;
+    // The placeholder directory the container's setup mounted, if any, and
+    // whether the guest runs in a container with a procfs of its own; neither
+    // without a container (`--no-namespace`), where Detcore serves no `/proc`
+    // directory.
+    config.directory_placeholder = identity_sources
+        .and_then(IdentityGuard::directory_placeholder)
+        .map(Path::to_path_buf);
+    config.container_procfs = identity_sources.is_some();
     match view {
         Some(view) => {
             config.mountinfo_root_rewrites = view.root_rewrites;

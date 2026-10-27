@@ -245,14 +245,48 @@ pub(crate) const KVM_SYNTHETIC_PROC_DEVICE: u64 = libc::makedev(0, 0xff01);
 /// entry (`ProcfsEntry`), not by its stat fields: an anonymous device with
 /// 1024-byte blocks is also devpts, autofs or a FUSE mount that reports those
 /// blocks (Codex re-check of https://github.com/rrnewton/hermit/pull/4369).
+///
+/// Every caller asks about a directory, and the only directory on that
+/// device is KVM's `/proc` anchor, which no guest descriptor reaches where
+/// Detcore serves `/proc` on a placeholder (package K slice P1): each match
+/// is logged ([`warn_anchor_reached`]) so that a run shows none before the
+/// anchor is deleted from the executor.
 pub(crate) fn is_backend_procfs_device(
     backend: &BackendCapabilities,
     device: u64,
     block_size: i64,
 ) -> bool {
-    !tool_can_name_guest_descriptors(backend)
+    let anchor = !tool_can_name_guest_descriptors(backend)
         && device == KVM_SYNTHETIC_PROC_DEVICE
-        && block_size == 4096
+        && block_size == 4096;
+    if anchor {
+        warn_anchor_reached("a directory stat on the executor's procfs device");
+    }
+    anchor
+}
+
+/// Log, by name, that a guest descriptor or path reached KVM's `/proc`
+/// anchor: the executor's own `/proc` handle (`reverie-linuxemu`'s
+/// `open_synthetic_proc_directory`), which Detcore neither opens nor lets an
+/// open reach (package K slice P1): it serves `/proc` on a placeholder in a
+/// container, and refuses an open of `/proc` with `EACCES` where it serves
+/// none (`--no-namespace`, a library caller, a nested PID namespace). The
+/// tripwire for the anchor's removal from the executor (slice P2): a KVM run
+/// shows no such line.
+pub(crate) fn warn_anchor_reached(what: &str) {
+    tracing::warn!("[detcore] KVM /proc anchor reached: {what}");
+}
+
+/// Whether the stat result a guest descriptor's open recorded is KVM's
+/// `/proc` anchor: a directory on the device of the executor's procfs files
+/// where the backend's `/proc` is its own ([`warn_anchor_reached`]).
+pub(crate) fn note_anchor_opened(backend: &BackendCapabilities, device: u64, mode: u32) {
+    if !tool_can_name_guest_descriptors(backend)
+        && device == KVM_SYNTHETIC_PROC_DEVICE
+        && mode & libc::S_IFMT == libc::S_IFDIR
+    {
+        warn_anchor_reached("a guest descriptor was opened on it");
+    }
 }
 
 /// Whether a stat result must be taken as procfs although Detcore cannot

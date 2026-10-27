@@ -14,12 +14,17 @@
 //!
 //! An open of the caller's own directory (`/proc/self/fd`,
 //! `/proc/thread-self/fd`, `/proc/<own pid>/fd`,
-//! `/proc/<own pid>/task/<own tid>/fd`) gets a descriptor on `/proc` itself
-//! (on KVM, its executor's existing `/proc` handle), which Detcore marks with
-//! the task the directory is bound to, as Linux binds it at the open
-//! (`DetFd::descriptor_directory`). A listing then comes from Detcore's own
+//! `/proc/<own pid>/task/<own tid>/fd`) gets a placeholder descriptor (package
+//! K slice P1): one on procfs's root where the guest's procfs is the kernel's
+//! (ptrace), as slice F1 opened it, and elsewhere (KVM) one on the
+//! placeholder directory, the empty read-only tmpfs hermit-cli mounts in the
+//! guest's container (`DetConfig::directory_placeholder`). Detcore marks it
+//! with the task the directory is bound to, as Linux binds it at the open
+//! (`DetFd::placeholder`). A listing then comes from Detcore's own
 //! table, read at each `getdents` from the descriptor's position, as Linux
-//! reads the task's table at each call.
+//! reads the task's table at each call. An open of `/proc` itself gets such a
+//! descriptor too ([`PlaceholderDirectory::Root`]), listed from Detcore's
+//! procfs model (`procfs::listing`).
 //!
 //! The position of each entry is Linux's: `.` at 0, `..` at 1, descriptor
 //! `N` at `N + 2`, and the end at the table's capacity plus 2
@@ -44,7 +49,18 @@ use serde::Deserialize;
 use serde::Serialize;
 
 /// Whose descriptor table a descriptor directory lists.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize
+)]
 pub enum DescriptorDirectoryTable {
     /// The process's (`/proc/<pid>/fd`), which procfs reads from the thread
     /// group leader.
@@ -71,13 +87,11 @@ pub struct DescriptorDirectoryBinding {
     pub process_incarnation: u32,
     /// The same for the thread number of a thread directory.
     pub thread_incarnation: Option<u32>,
-    /// The device of the `/proc` the descriptor is open on, which keys its
-    /// entries' inode numbers with the entries' paths.
+    /// The device that keys the directory's inode number and its entries'
+    /// with their paths: the device of the guest's procfs as the backend
+    /// reports it (`Detcore::procfs_key_device`), never the placeholder's,
+    /// whose device is the host's choice.
     pub device: u64,
-    /// The inode of that `/proc` descriptor (procfs's root), which with
-    /// `device` is the identity a received descriptor must have to be this
-    /// directory's.
-    pub ino: u64,
     /// The descriptor table the bound thread held at the open, for a
     /// thread's directory: another thread holding the same table reads it as
     /// its own.
@@ -119,6 +133,90 @@ impl DescriptorDirectoryBinding {
             _ => self.canonical(),
         }
     }
+}
+
+/// A `/proc` directory Detcore serves on a placeholder descriptor (package K
+/// slice P1): every call through the descriptor is answered from Detcore's
+/// model, and a name looked up below it reaches what Linux reaches below the
+/// directory: below procfs's root, the descriptor's object on ptrace, by the
+/// directory's path within it; at the directory's absolute spelling where
+/// the object is the placeholder directory (KVM).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PlaceholderDirectory {
+    /// `/proc` itself, procfs's root, the same directory for every task.
+    Root,
+    /// A task's descriptor directory, bound to that task at the open.
+    Descriptors(DescriptorDirectoryBinding),
+}
+
+impl PlaceholderDirectory {
+    /// The directory's absolute guest path: `/proc`, or the descriptor
+    /// directory's (`/proc/<pid>/fd`), which is what Linux's
+    /// `/proc/self/fd/N` link to it reads.
+    pub(crate) fn canonical(&self) -> PathBuf {
+        match self {
+            Self::Root => PathBuf::from("/proc"),
+            Self::Descriptors(binding) => binding.canonical(),
+        }
+    }
+
+    /// The absolute spelling a name relative to the directory's descriptor is
+    /// looked up below, for a caller whose pid and tid are `caller`
+    /// ([`DescriptorDirectoryBinding::lookup_base`]).
+    pub(crate) fn lookup_base(&self, caller: (i32, i32)) -> PathBuf {
+        match self {
+            Self::Root => PathBuf::from("/proc"),
+            Self::Descriptors(binding) => binding.lookup_base(caller),
+        }
+    }
+
+    /// Which directory, as Linux tells its inodes apart for `flock`: procfs's
+    /// one root, or the descriptor directory of one task incarnation (a
+    /// thread's own, by its thread).
+    pub(crate) fn lock_key(&self) -> PlaceholderLockKey {
+        match self {
+            Self::Root => PlaceholderLockKey::Root,
+            Self::Descriptors(binding) => PlaceholderLockKey::Descriptors {
+                table: binding.table,
+                pid: binding.pid,
+                process_incarnation: binding.process_incarnation,
+                thread: (binding.table == DescriptorDirectoryTable::Thread)
+                    .then_some((binding.tid, binding.thread_incarnation)),
+            },
+        }
+    }
+}
+
+/// The directory a `flock` through a placeholder descriptor locks
+/// ([`PlaceholderDirectory::lock_key`]): Linux keeps one lock list per inode,
+/// procfs's root has one inode, and each task's descriptor directory one of
+/// its own.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize
+)]
+pub enum PlaceholderLockKey {
+    /// `/proc`.
+    Root,
+    /// A task's descriptor directory.
+    Descriptors {
+        /// Whose table.
+        table: DescriptorDirectoryTable,
+        /// The process.
+        pid: i32,
+        /// Its incarnation.
+        process_incarnation: u32,
+        /// For a thread's directory, the thread and its incarnation.
+        thread: Option<(i32, Option<u32>)>,
+    },
 }
 
 /// Which of the caller's own descriptor directories the absolute guest path
@@ -300,15 +398,15 @@ pub(crate) fn seek(position: u64, offset: i64, whence: i32) -> Result<u64, Errno
     Ok(target as u64)
 }
 
-/// The kernel position a descriptor directory's descriptor on `/proc` is
-/// left at, which tells it apart where Detcore meets that descriptor without
-/// its record (received over `SCM_RIGHTS`, or after an in-guest backend's
-/// `exec`): above any ordinal position Detcore gives a directory of its own,
-/// within procfs's [`MAX_POSITION`]. The guest never reads it: Detcore
-/// answers the descriptor's `lseek` from its model.
+/// The kernel position a placeholder descriptor is left at, which tells
+/// which directory it stands for where Detcore meets the descriptor without
+/// its record (received over `SCM_RIGHTS`): above any ordinal position
+/// Detcore gives a directory of its own, within procfs's [`MAX_POSITION`].
+/// The guest never reads it: Detcore answers the descriptor's `lseek` and
+/// `getdents` from its model, so the position stays where the open left it.
 pub(crate) const TAG_BASE: u64 = 0x4000_0000;
 
-/// The kernel position that tags the `index`th registered descriptor
+/// The kernel position that tags the `index`th registered placeholder
 /// directory of the run, if it fits.
 pub(crate) fn tag(index: usize) -> Option<u64> {
     let tag = TAG_BASE.checked_add(u64::try_from(index).ok()?)?;
@@ -490,7 +588,6 @@ mod tests {
             process_incarnation: 1,
             thread_incarnation: None,
             device: 0,
-            ino: 1,
             files: None,
         };
         assert_eq!(binding.lookup_base((7, 9)), Path::new("/proc/self/fd"));
@@ -508,5 +605,45 @@ mod tests {
         );
         assert_eq!(thread.lookup_base((7, 7)), Path::new("/proc/7/task/9/fd"));
         assert_eq!(thread.within(), Path::new("/7/task/9/fd"));
+    }
+
+    /// The root placeholder is `/proc` for every caller; a descriptor
+    /// directory's is its binding's; each locks as its own inode, and a
+    /// thread's directory apart from its process's.
+    #[test]
+    fn a_placeholder_names_its_directory_and_its_lock() {
+        let process = DescriptorDirectoryBinding {
+            table: DescriptorDirectoryTable::Process,
+            pid: 7,
+            tid: 7,
+            process_incarnation: 1,
+            thread_incarnation: None,
+            device: 0,
+            files: None,
+        };
+        let root = PlaceholderDirectory::Root;
+        assert_eq!(root.canonical(), Path::new("/proc"));
+        assert_eq!(root.lookup_base((7, 9)), Path::new("/proc"));
+        let directory = PlaceholderDirectory::Descriptors(process);
+        assert_eq!(directory.canonical(), Path::new("/proc/7/fd"));
+        assert_eq!(directory.lookup_base((7, 7)), Path::new("/proc/self/fd"));
+        let thread = PlaceholderDirectory::Descriptors(DescriptorDirectoryBinding {
+            table: DescriptorDirectoryTable::Thread,
+            tid: 9,
+            thread_incarnation: Some(1),
+            ..process
+        });
+        let keys = [root.lock_key(), directory.lock_key(), thread.lock_key()];
+        assert_ne!(keys[0], keys[1]);
+        assert_ne!(keys[1], keys[2]);
+        assert_ne!(keys[0], keys[2]);
+        let reopened = PlaceholderDirectory::Descriptors(DescriptorDirectoryBinding {
+            device: 5,
+            files: Some(detcore_model::fd::FilesId::initial(
+                detcore_model::pid::DetTid::from_raw(7),
+            )),
+            ..process
+        });
+        assert_eq!(reopened.lock_key(), keys[1], "the same task's directory");
     }
 }
