@@ -734,6 +734,39 @@ This is deliberately a narrow allow-list of *observed* volatile fields, not a
 general procfs emulation: files and fields outside the list still read through to
 the host kernel and remain potential determinism boundaries.
 
+### CPU identity
+
+A run presents one CPU and one NUMA node, whichever host CPUs the tracer may
+use: `sched_getaffinity`, `getcpu` (the system call and the vDSO entry Reverie
+patches), the CPU and node lists under `/sys/devices/system`, `Cpus_allowed` in
+`/proc/self/status`, the last-run CPU in `/proc/self/stat`, the CPUID APIC
+IDs and RDTSCP's CPU ID all name CPU 0 and node 0. Listings of
+`/sys/devices/system/cpu`, `/sys/devices/system/node`, their `/sys/bus`
+counterparts and `cpufreq` show only number 0, and a lookup of any other `cpuN`,
+`nodeN` or `policyN` there, or of a name below one, finds nothing; so do
+node0's `cpuN` links, the processor driver's and a memory block's `nodeN`
+link. A spelling with `..` or another symbolic link that reaches one of them
+is the kernel's to resolve and is not refused. Under record and replay the
+listings and lookups are the host's. `rseq` is
+refused with ENOSYS under every policy, `--allow-unsupported-syscalls`
+included: the kernel writes the CPU and node a thread runs on into a registered
+area (Linux v6.16 `rseq_update_cpu_node_id`, kernel/rseq.c).
+
+One source remains under the ptrace backend. The kernel loads the CPU and node
+numbers into the limit of a per-CPU segment and into `TSC_AUX` (v6.16
+`setup_getcpu`, arch/x86/kernel/cpu/common.c, through `vdso_encode_cpunode`),
+and an `lsl` of that segment, or RDPID where the CPU has it, reads them back
+(`vdso_read_cpunode`, arch/x86/include/asm/segment.h). Neither instruction
+traps, so code that runs one itself sees the host CPU. That differs between
+runs: a run that pins its threads (`--pin-threads`, implied by a maximum
+timeslice with sequentialized threads) is pinned to a randomly chosen core of
+the tracer's allowed set, and an unpinned one can migrate. glibc and the
+dynamic loader do not run them; they reach the CPU number through `getcpu`.
+Closing it needs the instruction rewritten before it runs (e9patch
+preprocessing) or a backend that owns the guest's segment table and `TSC_AUX`
+(KVM). Memory blocks under `/sys/devices/system/memory` that belong to other
+nodes are still listed, and their own files name the node.
+
 ### Futexes
 
 In precise mode, Detcore emulates `FUTEX_WAIT` and `FUTEX_WAKE` instead of

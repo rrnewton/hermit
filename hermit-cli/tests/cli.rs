@@ -239,6 +239,7 @@ static VIRTUAL_CPUS_POOL_RACE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_DIRECTORY_READS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CWD_DOTDOT_LOOKUPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DOTDOT_LOOKUPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static ABSENT_CPU_LOOKUPS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPUINFO_MATCHES_CPUID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLOCK_ID_VALIDATION_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CPU_TIME_CLOCKS_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -38344,6 +38345,79 @@ fn cpu_directory_reads_list_only_cpu0_on_every_path() {
         serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
             .expect("the verdict must be JSON");
     assert_eq!(report["bitwise_parity"], true, "{report}");
+}
+
+/// The CPUs and NUMA nodes other than number 0 that the sysfs listings leave
+/// out are not found by a lookup either, however it is spelled: absolutely,
+/// below the entry, relative to a directory descriptor, through
+/// `/sys/bus/cpu/devices`, with stat, access and readlink. cpu0 and node0 stay
+/// found. rseq fails with ENOSYS and leaves its area untouched, under the
+/// default policy at bitwise parity and under `--allow-unsupported-syscalls`
+/// too: the kernel would write the host CPU into the area (Linux v6.16
+/// `rseq_update_cpu_node_id`).
+#[test]
+fn absent_cpus_and_nodes_are_not_found_and_rseq_is_refused() {
+    let guest = futex_c_guest(&ABSENT_CPU_LOOKUPS_GUEST, "absent_cpu_lookups")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let expected = "/sys/devices/system/node/node1/cpulist: ENOENT\n\
+                    /sys/devices/system/cpu/cpu1/topology/core_id: ENOENT\n\
+                    /sys/devices/system/cpu/cpu0/topology/core_id: ok\n\
+                    /sys/devices/system/node/node0/cpulist: ok\n\
+                    stat /sys/devices/system/cpu/cpu1: ENOENT\n\
+                    access /sys/devices/system/node/node1: ENOENT\n\
+                    readlink /sys/bus/cpu/devices/cpu1: ENOENT\n\
+                    readlink /sys/bus/cpu/devices/cpu0: ok\n\
+                    readlink /sys/bus/cpu/drivers/processor/cpu1: ENOENT\n\
+                    openat cpu1/online: ENOENT\n\
+                    fstatat cpu1: ENOENT\n\
+                    rseq: ENOSYS\n\
+                    rseq cpu_id: -1\n";
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let verdict = directory.path().join("verify.json");
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=info",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            verdict.to_str().unwrap(),
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+        ]),
+        directory.path(),
+        Duration::from_secs(180),
+        false,
+    );
+    let guest_stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+        .expect("failed to read the guest's stdout");
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "stdout:\n{guest_stdout}\nstderr:\n{log}"
+    );
+    assert_eq!(guest_stdout, expected, "stderr:\n{log}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&verdict).expect("failed to read the verdict"))
+            .expect("the verdict must be JSON");
+    assert_eq!(report["bitwise_parity"], true, "{report}");
+
+    let allowed = [
+        "run",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--allow-unsupported-syscalls",
+        "--",
+        guest.as_str(),
+    ];
+    let output = hermit(&allowed);
+    assert_success(&output, &allowed);
+    assert_eq!(stdout(&output), expected);
 }
 
 /// A vfork child that waits for a thread other than its own vfork child

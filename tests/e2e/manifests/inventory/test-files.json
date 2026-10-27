@@ -55,6 +55,12 @@
       "why": "tests/c/PACKAGE is owned by Meta Buck test targets: It supplies package-level Buck policy for the C guest corpus. The file configures the internal build graph and is not itself a guest program or public manifest input."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/absent_cpu_lookups.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/absent_cpu_lookups.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test absent_cpus_and_nodes_are_not_found_and_rseq_is_refused compiles this guest, which looks up CPUs and NUMA nodes other than number 0 under /sys/devices/system and /sys/bus/cpu/devices (open absolutely and below the entry, openat and fstatat relative to a directory descriptor, stat, access, readlink) and registers an rseq area, and requires exact lines showing ENOENT for every absent entry, cpu0 and node0 found, and ENOSYS for rseq with its area untouched, at bitwise parity under hermit run --strict --verify --verify-strict and again under --allow-unsupported-syscalls; it remains a guest fixture because a generic manifest cannot assert this exact output."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/acct_refusal_probe.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

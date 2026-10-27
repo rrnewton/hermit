@@ -222,6 +222,50 @@ fn absent_prefix(path: &Path, level: detcore_model::config::ProcLevel) -> Option
     None
 }
 
+/// The spelling the kernel is given in place of `named`, whose component
+/// ending `prefix` names nothing: `parent` (`prefix`'s directory, in the
+/// guest's view), then that component replaced by as many dashes, then the
+/// rest of `named`. What follows the omitted name stays: the kernel's walk
+/// ends at it, before them, but which name is the last decides how a call
+/// treats it (rename looks up the last one's directory first). So does a
+/// trailing slash in the guest's spelling `bytes` (O_CREAT then fails with
+/// EISDIR).
+fn dashed_spelling(parent: &Path, prefix: &Path, named: &Path, bytes: &[u8]) -> Option<Vec<u8>> {
+    let name_length = prefix.file_name()?.len();
+    let mut substituted = parent.as_os_str().as_bytes().to_vec();
+    if !substituted.ends_with(b"/") {
+        substituted.push(b'/');
+    }
+    substituted.resize(substituted.len() + name_length, b'-');
+    let rest = named.strip_prefix(prefix).ok()?;
+    if !rest.as_os_str().is_empty() {
+        substituted.push(b'/');
+        substituted.extend_from_slice(rest.as_os_str().as_bytes());
+    }
+    if bytes.ends_with(b"/") {
+        substituted.push(b'/');
+    }
+    Some(substituted)
+}
+
+/// Whether the directory `path`, in the tool's view, is on sysfs: not a
+/// user bind or another file system mounted over part of `/sys`, whose
+/// `cpuN` and `nodeN` names are the guest's own.
+fn is_on_sysfs(path: &Path) -> bool {
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    let mut buffer = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `buffer` has room for a `statfs`,
+    // which the call fills when it returns 0.
+    if unsafe { libc::statfs(path.as_ptr(), buffer.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    // SAFETY: filled by the successful call above.
+    let buffer = unsafe { buffer.assume_init() };
+    buffer.f_type == libc::SYSFS_MAGIC
+}
+
 /// The pathname in an `AF_UNIX` socket address, as its bytes; `None` for
 /// any other address: another family, an unnamed or abstract address, or one
 /// the kernel refuses before it looks anything up (too short or too long).
@@ -751,25 +795,25 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(root) if !guest_view => Path::new("/").join(parent.strip_prefix(root).ok()?),
                 _ => parent.to_path_buf(),
             };
-            let name_length = prefix.file_name()?.len();
-            let mut substituted = parent.as_os_str().as_bytes().to_vec();
-            if !substituted.ends_with(b"/") {
-                substituted.push(b'/');
+            dashed_spelling(&parent, &prefix, named, bytes)
+        });
+        // A CPU or node that the virtual CPUs and single node leave out, below
+        // the sysfs directories that list them
+        // (`crate::procfs::absent_cpu_entry_prefix`), as the guest named it
+        // before any `chroot`: the listings leave it out, so a lookup finds
+        // nothing either. Not under record and replay, where the listings keep
+        // every entry (`Detcore::drop_absent_entries`).
+        let substituted = substituted.or_else(|| {
+            if root.is_some() || self.cfg.recordreplay_modes {
+                return None;
             }
-            substituted.resize(substituted.len() + name_length, b'-');
-            // What follows the omitted name stays: the kernel's walk ends at
-            // it, before them, but which name is the last decides how a call
-            // treats it (rename looks up the last one's directory first).
-            let rest = named.strip_prefix(&prefix).ok()?;
-            if !rest.as_os_str().is_empty() {
-                substituted.push(b'/');
-                substituted.extend_from_slice(rest.as_os_str().as_bytes());
+            let prefix =
+                crate::procfs::absent_cpu_entry_prefix(&observed, self.cfg.virtual_cpu_count())?;
+            let parent = prefix.parent()?;
+            if !is_on_sysfs(parent) {
+                return None;
             }
-            // So does a trailing slash (O_CREAT then fails with EISDIR).
-            if bytes.ends_with(b"/") {
-                substituted.push(b'/');
-            }
-            Some(substituted)
+            dashed_spelling(parent, &prefix, &observed, bytes)
         });
         Decision {
             substituted,

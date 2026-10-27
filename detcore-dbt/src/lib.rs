@@ -2410,9 +2410,10 @@ fn copied_child_reads_clock_or_limit(sysno: Sysno, args: *const u64) -> bool {
 /// reader or writer.
 ///
 /// The gate covers the classic Unsupported set plus the broader fixed-error
-/// boundary. Unconditional deterministic refusals fail closed in every mode;
-/// compatibility families that the root process refuses only under strict
-/// execution (`rseq`, zero-copy pipes, keyrings) retain native non-strict
+/// boundary. Unconditional deterministic refusals fail closed in every mode,
+/// except `rseq`, which answers ENOSYS in every mode as the root process
+/// does; compatibility families that the root process refuses only under
+/// strict execution (zero-copy pipes, keyrings) retain native non-strict
 /// behavior. Before PR-978 both groups could execute natively in a copied child
 /// despite the root Detcore policy.
 ///
@@ -2656,6 +2657,11 @@ pub unsafe extern "C" fn reverie_dbt_runtime_copied_syscall(sysnum: i64, args: *
     // native behaviour, as the arms above do.
     if strict && copied_child_reads_clock_or_limit(sysno, args) {
         return 1;
+    }
+    // rseq answers ENOSYS in every mode, as the dispatcher does: the kernel
+    // would write the host CPU into a registered area.
+    if detcore::is_cpu_identity_refused_syscall(sysno) {
+        return -libc::ENOSYS;
     }
     if detcore::is_deterministically_refused_syscall(sysno)
         && (strict || !detcore::is_strict_only_deterministic_refusal_syscall(sysno))

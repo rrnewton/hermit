@@ -1373,6 +1373,7 @@ pub struct RunOpts {
 
     /// Permit unsupported syscalls to reach the host kernel. This weakens determinism and exists
     /// only as an explicit compatibility escape hatch; ordinary runs fail closed by default.
+    /// `rseq` stays refused with ENOSYS: the kernel would write the host CPU into its area.
     #[clap(
         long,
         conflicts_with_all = ["strict", "panic_on_unsupported_syscalls"]
