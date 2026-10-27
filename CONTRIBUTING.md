@@ -22,9 +22,11 @@ We actively welcome your pull requests.
 
 GitHub-hosted portable CI (`.github/workflows/ci-portable.yml`) runs
 automatically on pull requests opened by anyone other than the project bot,
-from a branch or a fork, once the pull request is out of draft. A first-time
-fork contributor's run waits for a maintainer to approve it in the Actions tab.
-The privileged (self-hosted, PMU/KVM) workflows do not run on pull requests: a
+from a branch or a fork, once the pull request is out of draft. A run for a
+fork pull request waits for a maintainer to approve it in the Actions tab; the
+maintainer first reads the pull request's `.github/` changes, because GitHub
+runs the workflow files from the pull request itself. The privileged
+(self-hosted, PMU/KVM) workflows are not triggered by pull requests: a
 maintainer dispatches them after reviewing the change. CI results are
 supplemental evidence; local validation (below) is what a reviewer looks for.
 
