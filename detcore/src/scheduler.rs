@@ -61,6 +61,7 @@ use detcore_model::happens_before::Strength;
 use detcore_model::happens_before::ThreadRef;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
+use detcore_model::syscall_histogram::SparseSyscallHistogram;
 use detcore_model::syscall_histogram::SyscallHistogram;
 use detcore_model::syscall_histogram::SyscallObservationScope;
 use futures::FutureExt;
@@ -2102,10 +2103,12 @@ pub struct Scheduler {
 
     /// Final syscall histogram reported by each thread when it deregisters,
     /// kept exactly like `per_thread_syscalls`, whose counts are its totals.
-    per_thread_syscall_histograms: BTreeMap<DetTid, SyscallHistogram>,
+    /// Kept in the nonzero-only form: a dense histogram per exited thread
+    /// cost 14,784 bytes each until the run ended.
+    per_thread_syscall_histograms: BTreeMap<DetTid, SparseSyscallHistogram>,
 
     /// The histograms behind `transferred_exec_syscall_offsets`.
-    transferred_exec_syscall_histograms: BTreeMap<DetTid, SyscallHistogram>,
+    transferred_exec_syscall_histograms: BTreeMap<DetTid, SparseSyscallHistogram>,
 
     /// A record of which preemptions occured on each thread.  Only used IF `--record-preemptions`
     /// was specified in the Config, otherwise this remains empty.
@@ -16012,7 +16015,7 @@ impl Scheduler {
         &mut self,
         dettid: DetTid,
         count: u64,
-        histogram: SyscallHistogram,
+        histogram: SparseSyscallHistogram,
     ) {
         let consumed = self
             .transferred_exec_syscall_offsets
@@ -16211,7 +16214,7 @@ impl Scheduler {
         let syscalls = self.per_thread_syscalls.values().copied().sum();
         let mut syscall_histogram = SyscallHistogram::default();
         for histogram in self.per_thread_syscall_histograms.values() {
-            syscall_histogram.merge(histogram);
+            histogram.add_to(&mut syscall_histogram);
         }
 
         Ok((
@@ -18861,12 +18864,12 @@ mod test {
 
     /// A histogram of `n` getpid entries, as a thread with `syscall_count` n
     /// reports it.
-    fn entries(n: u64) -> SyscallHistogram {
+    fn entries(n: u64) -> SparseSyscallHistogram {
         let mut histogram = SyscallHistogram::default();
         for _ in 0..n {
             histogram.enter(reverie::syscalls::Sysno::getpid);
         }
-        histogram
+        (&histogram).into()
     }
 
     #[test]
