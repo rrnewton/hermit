@@ -3158,7 +3158,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the same two fixes through the hooks): 3005, listed.
     // And tool_local::timeslice_tests::a_schedule_deadline_on_the_backstop_keeps_its_place
     // (a schedule deadline that falls on the backstop is still the schedule's): 3006, listed.
-    ("test.detcore_unit", 3006),
+    // And preemptions::callback_history::tests::a_timer_stop_before_the_recorded_callback_leaves_the_slice_to_it
+    // and tool_global::tests::a_timer_stop_before_a_recorded_syscall_slice_end_leaves_it_to_the_call
+    // (a timer stop at a recorded system call's slice end leaves it to the call): 3008, listed.
+    ("test.detcore_unit", 3008),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5557,7 +5560,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two callback-checkpoint replay units: 2814, listed.
     // And the same two hook-level replay units: 3005, listed.
     // And the same backstop-coincidence unit: 3006, listed.
-    ("test.detcore_unit_on_host", 3006),
+    // And the same two timer-stop-before-a-call units: 3008, listed.
+    ("test.detcore_unit_on_host", 3008),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
