@@ -6796,10 +6796,13 @@ impl Scheduler {
     /// still retired at its own deregistration, which keeps the order a robust
     /// list's owner deaths are accounted in.
     ///
-    /// A process a guest's SIGKILL owns (`sigkill_owns_process`) is not one:
-    /// that send retires its threads at its kill turn, and noting a death the
-    /// kill caused here, at a host-timed deregistration, would log and wait at
-    /// a host-chosen moment (https://github.com/rrnewton/hermit/issues/4445).
+    /// A process a guest's reserved SIGKILL owns (`sigkill_owns_process`) is
+    /// not one: that send retires its threads at its kill turn, and noting a
+    /// death the kill caused here, at a host-timed deregistration, would wait
+    /// at a host-chosen moment (https://github.com/rrnewton/hermit/issues/4445).
+    ///
+    /// The note is logged at debug level only: the deregistration's moment is
+    /// the host's, so it is no INFO record (which `--verify-strict` compares).
     pub(crate) fn note_signal_killed_group(&mut self, dettid: DetTid, detpid: DetPid) {
         if self.sigkill_owns_process(detpid) {
             return;
@@ -6809,7 +6812,7 @@ impl Scheduler {
             .into_iter()
             .any(|thread| thread != dettid && self.next_turns.contains_key(&thread));
         if others_live {
-            info!(
+            debug!(
                 "[scheduler] dettid {} died of a fatal signal; waiting for the other threads of process {} to die",
                 dettid, detpid
             );
@@ -31462,6 +31465,25 @@ mod test {
             .take_terminal_deadlock()
             .expect("past the valve the wait is reported");
         assert!(report.contains("which a fatal signal ends"), "{report}");
+
+        // A guest's SIGKILL the scheduler could not reserve (a fallback send)
+        // is recorded after the physical send but retires nothing: the
+        // worker's death is still awaited, so the blocked leader is no
+        // deadlock until its own death arrives.
+        let mut fallback = scheduler();
+        fallback.record_committed_sigkill(worker, Some(process));
+        fallback.retire_deregistered_thread(worker, process, mm);
+        fallback.note_signal_killed_group(worker, process);
+        assert!(fallback.signal_death_victim(process));
+        assert!(fallback.step2d_handle_empty_queue(&global_time).is_err());
+        assert_eq!(
+            fallback.take_terminal_deadlock(),
+            None,
+            "after a fallback SIGKILL the empty run queue waits for the leader's death"
+        );
+        fallback.retire_deregistered_thread(leader, process, mm);
+        let _ = fallback.step2d_handle_empty_queue(&global_time);
+        assert_eq!(fallback.take_terminal_deadlock(), None);
     }
 
     /// The positive half of the bracket: refusing to fast-forward onto an

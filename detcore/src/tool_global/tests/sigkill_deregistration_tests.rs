@@ -98,20 +98,32 @@ async fn a_sigkill_deregistration_waits_for_the_rest_of_its_group() {
 /// `kill(leader, SIGKILL)` retires the rest of the group at the kill turn:
 /// the leader's deregistration landing first, at a host-chosen moment, must
 /// neither log nor make the process a victim
-/// (https://github.com/rrnewton/hermit/issues/4445). Nor does a death in a
-/// process a committed SIGKILL doomed.
+/// (https://github.com/rrnewton/hermit/issues/4445). Nor does that of a
+/// thread that reserved a SIGKILL of its own process: its send kills it, but
+/// it is not among the victims the kill turn retires (the others are), so its
+/// deregistration may land first. A SIGKILL the scheduler could not reserve,
+/// only recorded after the send, retires nothing, so a death after it is
+/// still awaited.
 #[tokio::test]
 async fn a_death_already_accounted_waits_for_nothing() {
     let process = DetPid::from_raw(LEADER.as_raw());
-    for already in ["retired leader", "committed sigkill"] {
+    for already in ["retired leader", "fallback sigkill", "reserved sigkill"] {
         let (state, time) = state();
         let (dying, sender_mm) = {
             let mut sched = state.sched.lock().unwrap();
             if already == "retired leader" {
                 assert!(sched.retire_test_exited_leader(LEADER, MmId::initial(LEADER)));
                 (LEADER, MmId::initial(LEADER))
-            } else {
+            } else if already == "fallback sigkill" {
                 sched.record_committed_sigkill(LEADER, Some(process));
+                (WORKER, MmId::initial(LEADER))
+            } else {
+                for tid in [LEADER, WORKER] {
+                    sched.record_thread_mm(tid, MmId::initial(LEADER));
+                }
+                sched
+                    .reserve_sigkill(WORKER, process, 0)
+                    .expect("the worker reserves a SIGKILL of its own process");
                 (WORKER, MmId::initial(LEADER))
             }
         };
@@ -127,9 +139,17 @@ async fn a_death_already_accounted_waits_for_nothing() {
             .await;
         assert_eq!(response, (None, GlobalResponse::DeregisterThread(())));
         let sched = state.sched.lock().unwrap();
-        assert!(!sched.signal_death_victim(process), "{already}");
+        assert_eq!(
+            sched.signal_death_victim(process),
+            already == "fallback sigkill",
+            "{already}"
+        );
         if already == "retired leader" {
             assert!(sched.next_turns.contains_key(&WORKER), "{already}");
+        }
+        if already == "reserved sigkill" {
+            // The reserved victim waits for the kill turn.
+            assert!(sched.next_turns.contains_key(&LEADER), "{already}");
         }
     }
 }
