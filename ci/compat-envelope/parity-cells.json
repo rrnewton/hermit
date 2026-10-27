@@ -8,59 +8,59 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
-      "cells": 3040,
-      "applicable": 1924,
-      "selectable": 1445,
-      "population": 2975,
-      "population_candidate_selected": 1445,
+      "cells": 3045,
+      "applicable": 1925,
+      "selectable": 1446,
+      "population": 2980,
+      "population_candidate_selected": 1446,
       "population_candidate_not_selected": 472,
-      "population_candidate_disabled": 1058
+      "population_candidate_disabled": 1062
     },
     "by_backend": {
       "dbt": {
-        "cells": 608,
+        "cells": 609,
         "applicable": 261,
         "selectable": 260,
-        "population": 595,
+        "population": 596,
         "population_candidate_selected": 260,
         "population_candidate_not_selected": 1,
-        "population_candidate_disabled": 334
+        "population_candidate_disabled": 335
       },
       "in-guest-trap": {
-        "cells": 608,
+        "cells": 609,
         "applicable": 310,
         "selectable": 310,
-        "population": 595,
+        "population": 596,
         "population_candidate_selected": 310,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 285
+        "population_candidate_disabled": 286
       },
       "kvm": {
-        "cells": 608,
-        "applicable": 566,
-        "selectable": 564,
-        "population": 595,
-        "population_candidate_selected": 564,
+        "cells": 609,
+        "applicable": 567,
+        "selectable": 565,
+        "population": 596,
+        "population_candidate_selected": 565,
         "population_candidate_not_selected": 0,
         "population_candidate_disabled": 31
       },
       "liteinst": {
-        "cells": 608,
+        "cells": 609,
         "applicable": 311,
         "selectable": 311,
-        "population": 595,
+        "population": 596,
         "population_candidate_selected": 311,
         "population_candidate_not_selected": 0,
-        "population_candidate_disabled": 284
+        "population_candidate_disabled": 285
       },
       "sabre": {
-        "cells": 608,
+        "cells": 609,
         "applicable": 476,
         "selectable": 0,
-        "population": 595,
+        "population": 596,
         "population_candidate_selected": 0,
         "population_candidate_not_selected": 471,
-        "population_candidate_disabled": 124
+        "population_candidate_disabled": 125
       }
     }
   },
@@ -1255,6 +1255,11 @@
     {"test_id":"c-programs/signalfd-create","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/signalfd-create","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/signalfd-create","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"c-programs/signalfd-threads","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: dbt verify is disabled: DynamoRIO emulates signalfd itself (https://github.com/rrnewton/hermit/issues/4690), and in this guest neither a signal sent to one thread nor a timer's SIGALRM becomes readable or pending (9 of the 25 checks fail)"},
+    {"test_id":"c-programs/signalfd-threads","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: The in-guest backend cannot create a thread (clone is not forwarded), and this guest needs three"},
+    {"test_id":"c-programs/signalfd-threads","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/signalfd-threads","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: liteinst verify is disabled: The in-guest backend cannot create a thread (clone is not forwarded), and this guest needs three"},
+    {"test_id":"c-programs/signalfd-threads","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: sabre verify is disabled: The SaBRe tracee is killed by SIGSEGV at address 0 in this multi-threaded guest; SaBRe is archived"},
     {"test_id":"c-programs/sigpipe-siginfo","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/sigpipe-siginfo","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)"},
     {"test_id":"c-programs/sigpipe-siginfo","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
