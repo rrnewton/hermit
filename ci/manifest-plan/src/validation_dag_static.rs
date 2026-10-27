@@ -3269,8 +3269,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And preemptions::callback_history::tests::a_timer_stop_before_the_recorded_callback_leaves_the_slice_to_it
     // and tool_global::tests::a_timer_stop_before_a_recorded_syscall_slice_end_leaves_it_to_the_call
     // (a timer stop at a recorded system call's slice end leaves it to the call): 3008, listed.
-    // Rebased onto main fcd62385f: 3465 + 8 = 3473.
-    ("test.detcore_unit", 3473),
+    // And four units pinning each replayed slice end the schedule installs
+    // and the kept slice's backstop restart (callback_history_tests'
+    // a_replayed_event_deadline_is_the_schedules_and_no_backstop,
+    // a_replayed_slice_end_past_the_maximum_is_the_schedules_and_no_backstop,
+    // a_replayed_checkpoint_that_keeps_the_slice_restarts_its_backstop, and
+    // exec_identity_tests'
+    // an_exec_continuation_resumes_the_schedules_slice_end_not_a_backstop):
+    // 3012, listed.
+    // Rebased onto main fcd62385f: 3465 + 12 = 3477.
+    ("test.detcore_unit", 3477),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4649,8 +4657,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Composed on landed batch main: 789 + 5 = 794 (Train 5 delta +5 over 787).
     // And a_schedule_replay_under_chaos_follows_its_recording: 743, listed.
     // And a_schedule_replay_ends_each_recorded_slice_once: 744, listed.
-    // Rebased onto main fcd62385f: 794 + 2 = 796.
-    ("test.cli", 796),
+    // Each of the two schedule-replay tests split into one test per seed
+    // (seeds 1, 2 and 3), so each fits the 57-second wall bound: 656 + 4 = 748.
+    // Rebased onto main fcd62385f: 794 + 6 = 800.
+    ("test.cli", 800),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5281,8 +5291,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (same growth as test.cli), composed on landed batch main: 708 + 5 = 713.
     // And a_schedule_replay_under_chaos_follows_its_recording: 662, listed.
     // And a_schedule_replay_ends_each_recorded_slice_once: 663, listed.
-    // Rebased onto main fcd62385f: 713 + 2 = 715.
-    ("test.cli_on_host", 715),
+    // And the same per-seed split of the two schedule-replay tests:
+    // 575 + 4 = 667.
+    // Rebased onto main fcd62385f: 713 + 6 = 719.
+    ("test.cli_on_host", 719),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5842,8 +5854,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two hook-level replay units: 3005, listed.
     // And the same backstop-coincidence unit: 3006, listed.
     // And the same two timer-stop-before-a-call units: 3008, listed.
-    // Rebased onto main fcd62385f: 3465 + 8 = 3473.
-    ("test.detcore_unit_on_host", 3473),
+    // And the same four replayed-slice-end units: 3012, listed.
+    // Rebased onto main fcd62385f: 3465 + 12 = 3477.
+    ("test.detcore_unit_on_host", 3477),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
