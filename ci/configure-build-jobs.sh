@@ -3051,24 +3051,18 @@ fi
 # rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
 # calibrated budget, job width and limits carry unchanged from the 38c3e024
 # entry.
-# CARRY TO 415114abe656b09e77776243d32febdfbe40916c (2026-10-27): from
-# a90e2acd50051c1dbc5551001fad447b95678810. Ten commits. Eight from another
-# team, under reverie-process, reverie-ptrace and safeptrace only: gdb
-# thread inspection, shared breakpoints and signal-number translation (0834dddc,
-# fdce072f, 8c068c64, 1f6cb9af, 14346e00), sanitizer options kept (b60c7e13),
-# a guest's own SIGTRAP delivered (a8e9d1d5) and a contended exit poll woken
-# (180dc128). Then two commits, 80d6253b and 415114ab (the re-land of in-guest
-# runtime descriptors invisible to the guest, d128128f and 7091b37a
-# rebased): reverie-inguest places, records and
-# moves its descriptors, reverie gains a counter descriptor move,
-# reverie-rpc-transport gains BlockingRpcClient::replace_stream, and the
-# LiteInst source catalog rows for the edited files are refreshed. git diff
+# CARRY TO d2b46ad625ff62324efcd7caec90c46461572742 (2026-10-27): from
+# a90e2acd50051c1dbc5551001fad447b95678810. Eight commits from another team
+# under reverie-process, reverie-ptrace and safeptrace only (gdb thread
+# support, sanitizer options, a guest's own SIGTRAP, a contended exit poll;
+# 0834dddc..180dc128), then the descriptor-isolation re-land (80d6253b,
+# 415114ab) and its revert d2b46ad6, whose tree equals 180dc128's. git diff
 # is empty under reverie-dbt/ and third-party/ and for the root Cargo.toml,
 # Cargo.lock and rust-toolchain.toml, so the inventory (1015), SDK and
 # native inputs, calibrated budget, job width and limits carry unchanged
 # from the 38c3e024 entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 415114abe656b09e77776243d32febdfbe40916c ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 415114abe656b09e77776243d32febdfbe40916c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d2b46ad625ff62324efcd7caec90c46461572742 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d2b46ad625ff62324efcd7caec90c46461572742 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
