@@ -115,7 +115,7 @@ impl CompatMode {
 
     /// The `hermit ...` arguments preceding `--`, reproducing the `run_args`
     /// selection in `strict_compatibility_probe` (validate.sh:2964-2994).
-    pub fn run_args(self, label: &str, nsswitch: &str) -> Vec<String> {
+    pub fn run_args(self, label: &str, nsswitch: &str, proc: Option<&str>) -> Vec<String> {
         let s = |v: &str| v.to_string();
         match self {
             CompatMode::E9patch => {
@@ -130,6 +130,13 @@ impl CompatMode {
                     v.push(format!(
                         "--mount=type=bind,source={nsswitch},target=/etc/nsswitch.conf,readonly"
                     ));
+                }
+                // A row that reads a /proc name the minimal level omits
+                // (vmstat, lsirq) declares its level in the corpus, as
+                // compat.yaml rows do; without it the guest fails with
+                // "/proc must be mounted" before any comparison.
+                if let Some(level) = proc {
+                    v.push(format!("--proc={level}"));
                 }
                 v.push(s("--strict"));
                 v.push(s(canonical_test_epoch::CANONICAL_TEST_EPOCH_ARG));
@@ -607,7 +614,7 @@ pub fn compat_nodes(
     let mut out = Vec::new();
     for row in rows {
         let mut argv: Vec<String> = vec![hermit_bin.to_string()];
-        argv.extend(mode.run_args(&row.label, nsswitch));
+        argv.extend(mode.run_args(&row.label, nsswitch, row.proc.as_deref()));
         let wall = mode.timeout_for(&row.label);
         let description = match mode {
             CompatMode::E9patch => format!(
@@ -615,12 +622,27 @@ pub fn compat_nodes(
                 mode.corpus_name()
             ),
         };
+        // Per-node TMPDIR and bytecode cache: the probes run in parallel
+        // under one validate-owned TMPDIR, and Detcore makes guest-visible
+        // time and pids deterministic, so two probes' `mktemp -d` pick the
+        // SAME name and collide (mkdir Ok in one run, EEXIST in the other),
+        // and one probe's python bytecode cache is visible to the next.
+        // A private directory per probe removes the cross-probe sharing;
+        // the two --verify runs of one probe stay sequential in it.
+        let node_tmp = format!(
+            "{}/compat-tmp/{}",
+            paths.validation_tmp_dir,
+            sanitize_job(&row.label)
+        );
+        let node_pycache = format!("{node_tmp}/python-cache");
         let mut step = node(
             "compat",
             &sanitize_job(&row.label),
             &format!("{} compatibility: {}", mode.display_name(), row.label),
             format!(
-                "{} {} </dev/null",
+                "mkdir -p {} {} && {} {} </dev/null",
+                shell_quote(&node_tmp),
+                shell_quote(&node_pycache),
                 shell_join(&argv),
                 compat_guest_command(&row, paths)
             ),
@@ -629,6 +651,8 @@ pub fn compat_nodes(
             COMPAT_CPU_TIMEOUT_S.max(wall),
             COMPAT_MEM_BYTES,
         );
+        step.env.insert("TMPDIR".into(), node_tmp);
+        step.env.insert("PYTHONPYCACHEPREFIX".into(), node_pycache);
         step.description = description;
         out.push(step);
     }

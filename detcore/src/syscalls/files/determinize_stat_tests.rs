@@ -330,3 +330,61 @@ async fn determinize_stat_answers_a_placeholder_only_outside_record_and_replay()
         }
     }
 }
+
+/// A directory's host link count is two plus its subdirectory count on
+/// file systems that count links, so a shared ancestor such as `/home`
+/// reports a different count whenever another process adds or removes a
+/// subdirectory. The determinized stat reports 1, as file systems that do
+/// not count directory links do; a regular file keeps its host count,
+/// which names the guest's own hard links.
+#[tokio::test]
+async fn determinize_stat_reports_one_link_for_directories_only() {
+    let epoch = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let config = config(false, epoch);
+    let process = DetPid::from_raw(7);
+    let global = GlobalState::init_global_state(&config).await;
+    let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
+    let mut thread = crate::ThreadState::new(process, &config, ());
+    thread.detpid = Some(process);
+    let mut guest = StatGuest {
+        config: &config,
+        global: &global,
+        thread,
+        sender: Tid::from_raw(process.as_raw()),
+    };
+    let host_stat = |mode: u32, nlink: u64| {
+        let mut stat = host_uuid_stat();
+        stat.mode = mode;
+        stat.nlink = nlink;
+        stat
+    };
+
+    let directory = tool
+        .determinize_stat(
+            &mut guest,
+            host_stat(libc::S_IFDIR | 0o755, 5),
+            None,
+            ProcfsEntry::NotProcfs,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        directory.nlink, 1,
+        "directory link count must not leak the host's subdirectory count"
+    );
+    assert_eq!(directory.size, 4096);
+
+    let file = tool
+        .determinize_stat(
+            &mut guest,
+            host_stat(libc::S_IFREG | 0o644, 3),
+            None,
+            ProcfsEntry::NotProcfs,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        file.nlink, 3,
+        "a regular file's hard-link count is guest-visible semantics"
+    );
+}
