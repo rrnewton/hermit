@@ -853,9 +853,17 @@ impl AnalyzeOpts {
     }
 
     /// Write the schedule `events` for a trial to replay, stamped
-    /// ([`Self::stamp_trial_record`]).
+    /// ([`Self::stamp_trial_record`]). The events alone carry no callback
+    /// checkpoints: a schedule analyze edits (a swap, a reordering) has no
+    /// recorded slice ends to keep.
     pub fn write_trial_schedule(&self, events: Vec<SchedEvent>, path: &Path) -> anyhow::Result<()> {
-        self.stamp_trial_record(PreemptionRecord::from_sched_events(events))
+        self.write_trial_record(PreemptionRecord::from_sched_events(events), path)
+    }
+
+    /// Write `record` for a trial to replay, stamped
+    /// ([`Self::stamp_trial_record`]).
+    pub fn write_trial_record(&self, record: PreemptionRecord, path: &Path) -> anyhow::Result<()> {
+        self.stamp_trial_record(record)
             .write_to_disk(path)
             .map_err(anyhow::Error::msg)
     }
