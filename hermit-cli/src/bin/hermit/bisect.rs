@@ -104,6 +104,7 @@ impl BisectOpts {
             search: false,
             run_needleman: self.needleman,
             minimize: false,
+            prefix_search: false,
             imprecise_search: false,
             run1_seed: None,
             run1_preemptions: None,
