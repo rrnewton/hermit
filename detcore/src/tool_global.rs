@@ -2668,6 +2668,16 @@ impl GlobalState {
         summary.host_id_tasks = self.host_id_tasks.load(SeqCst);
         summary.binder_external_calls =
             Some(crate::syscalls::binder::external_calls()).filter(|calls| *calls > 0);
+        summary.post_crash = self.sched.lock().unwrap().post_crash_summary();
+        if let Some(post_crash) = &summary.post_crash
+            && post_crash.recorded_not_taken > 0
+        {
+            tracing::warn!(
+                "this preemption replay did not take {} post-crash switch(es) its record holds; it \
+                 left its record before reaching them",
+                post_crash.recorded_not_taken
+            );
+        }
         //
         // Real time report:
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the
@@ -3137,7 +3147,7 @@ impl GlobalTool for GlobalState {
             self.sched.lock().unwrap().take_deadline_hint(dtid);
             let (time, response) = self.dispatch_rpc(from, gr).await;
             let hint = self.sched.lock().unwrap().take_deadline_hint(dtid);
-            match hint {
+            let (time, response) = match hint {
                 Some(remaining)
                     if response != GlobalResponse::ThreadExited
                         && response != GlobalResponse::Retired =>
@@ -3145,6 +3155,23 @@ impl GlobalTool for GlobalState {
                     (
                         time,
                         GlobalResponse::WithDeadline(remaining, Box::new(response)),
+                    )
+                }
+                _ => (time, response),
+            };
+            // Once the post-crash switch has made this thread's process a
+            // crashed one, every reply that resumes it from a grant carries
+            // the bound, so it uses it from its next slice
+            // (`crate::post_crash`).
+            let bound = self.sched.lock().unwrap().post_crash_bound_for(dtid);
+            match bound {
+                Some(bound)
+                    if response != GlobalResponse::ThreadExited
+                        && response != GlobalResponse::Retired =>
+                {
+                    (
+                        time,
+                        GlobalResponse::WithPostCrashBound(bound, Box::new(response)),
                     )
                 }
                 _ => (time, response),
@@ -3813,6 +3840,14 @@ impl GlobalState {
                 .discarded_signal_control(dtid, control);
             return (None, R::DiscardedSignal(answer));
         }
+        // A post-crash step (`crate::post_crash`): like the control messages
+        // above, it carries no logical time and its answer carries none back.
+        // It is sent in the sender's own turn, so the scheduler applies the
+        // steps of a run in the same order every time.
+        if let GlobalRequest::PostCrash(event) = request {
+            let bound = self.sched.lock().unwrap().post_crash_step(dtid, event);
+            return (None, R::PostCrash(bound));
+        }
         // A thread's copied signal dispositions
         // (`syscalls::signal_shadow::publish_dispositions`): like the control
         // messages above, it carries no logical time and its answer carries
@@ -4163,6 +4198,9 @@ impl GlobalState {
             }
             GlobalRequest::DiscardedSignal(_) => {
                 unreachable!("discarded-at-send control answered before clock accounting")
+            }
+            GlobalRequest::PostCrash(_) => {
+                unreachable!("post-crash step answered before clock accounting")
             }
             GlobalRequest::RecordDeterminismLoss(_) => {
                 unreachable!("determinism loss answered before clock accounting")
@@ -6259,6 +6297,9 @@ impl GlobalState {
                     exit_signal,
                 );
                 sched.work_span_note_spawn(parent_dettid, child_dettid);
+                if is_group_leader && flags.is_some() {
+                    sched.post_crash_process_created(parent_dettid, child_dettid);
+                }
                 if is_group_leader {
                     sched.forget_previous_process_exit(child_dettid);
                     // The child's exit signal is posted to its parent at a
@@ -8528,6 +8569,10 @@ pub enum GlobalRequest {
     /// due, if one did (`Scheduler::take_sleep_interruption`), for the sleep's
     /// remaining time. Appended last.
     TakeSleepInterruption,
+    /// A step of the post-crash timeslice switch (`crate::post_crash`,
+    /// `Scheduler::post_crash_step`), answered before any clock or scheduler
+    /// accounting. Appended last.
+    PostCrash(crate::post_crash::PostCrashEvent),
 }
 
 /// Responses from the global object
@@ -8895,6 +8940,13 @@ pub enum GlobalResponse {
     StoreProcfsSequence(()),
     /// The answer to `GlobalRequest::TakeSleepInterruption`. Appended last.
     TakeSleepInterruption(Option<LogicalTime>),
+    /// The answer to `GlobalRequest::PostCrash`: the post-crash bound once
+    /// the switch is taken. Appended last.
+    PostCrash(Option<std::num::NonZeroU64>),
+    /// `response`, carrying the post-crash bound to a thread the reply
+    /// resumes from a grant, once the switch is taken (`crate::post_crash`).
+    /// Appended last.
+    WithPostCrashBound(std::num::NonZeroU64, Box<GlobalResponse>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -9730,6 +9782,29 @@ where
     }
 }
 
+/// A post-crash step from the calling thread (`crate::post_crash`), answered
+/// with the post-crash bound once the switch is taken. Sent like
+/// [`publish_signal_dispositions`]: no logical time, nothing consumed.
+pub(crate) async fn post_crash_step<G, T>(
+    guest: &mut G,
+    event: crate::post_crash::PostCrashEvent,
+) -> Option<std::num::NonZeroU64>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let state = guest.thread_state();
+    let message = (
+        state.thread_logical_time.clone(),
+        state.mm_id,
+        GlobalRequest::PostCrash(event),
+    );
+    match guest.send_rpc(message).await.1 {
+        GlobalResponse::PostCrash(bound) => bound,
+        _ => None,
+    }
+}
+
 /// Whether the scheduler took `mask` as the calling thread's
 /// (`Scheduler::publish_signal_mask`; `None` withdraws it). Sent like
 /// [`publish_signal_dispositions`].
@@ -9843,6 +9918,10 @@ where
         }
         _ => None,
     };
+    if let GlobalResponse::WithPostCrashBound(bound, response) = resp.1 {
+        resp.1 = *response;
+        guest.thread_state_mut().post_crash_bound = Some(bound);
+    }
     let deadline = match resp.1 {
         GlobalResponse::WithDeadline(remaining, response) => {
             resp.1 = *response;
