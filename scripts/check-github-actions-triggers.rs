@@ -417,9 +417,49 @@ fn top_level_conjuncts(expr: &str) -> Vec<String> {
 /// Whether an expression replaces the default success() with a status function,
 /// so the job can run although a job it needs was skipped.
 fn has_status_function(expr: &str) -> bool {
+    // Expression function names match regardless of case (`Always()`).
+    let lower = expr.to_ascii_lowercase();
     ["always()", "cancelled()", "failure()"]
         .iter()
-        .any(|function| expr.contains(function))
+        .any(|function| lower.contains(function))
+}
+
+/// Whether an expression has a `||` at parenthesis depth 0, outside quotes.
+/// `&&` binds tighter, so `x || y && anchor` does not require the anchor.
+fn has_top_level_or(expr: &str) -> bool {
+    let (mut depth, mut quoted) = (0usize, false);
+    let chars = expr.chars().collect::<Vec<_>>();
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '\'' {
+            quoted = !quoted;
+        } else if !quoted && c == '(' {
+            depth += 1;
+        } else if !quoted && c == ')' {
+            depth = depth.saturating_sub(1);
+        } else if !quoted && depth == 0 && c == '|' && chars.get(i + 1) == Some(&'|') {
+            return true;
+        }
+    }
+    false
+}
+
+/// A line without its YAML comment: `#` starts a comment only at the start of
+/// the line or after whitespace, and outside quotes.
+fn yaml_code(line: &str) -> &str {
+    let (mut single, mut double) = (false, false);
+    let mut previous = ' ';
+    for (i, c) in line.char_indices() {
+        match c {
+            '\'' if !double => single = !single,
+            '"' if !single => double = !double,
+            '#' if !single && !double && previous.is_whitespace() => {
+                return line[..i].trim_end();
+            }
+            _ => {}
+        }
+        previous = c;
+    }
+    line.trim_end()
 }
 
 fn list_value(value: &str) -> Option<Vec<String>> {
@@ -445,8 +485,10 @@ fn portable_jobs(source: &str) -> Result<Vec<PortableJob>, String> {
     let mut jobs: Vec<PortableJob> = Vec::new();
     // The key whose block-scalar or block-list continuation is being read.
     let mut open: Option<(&'static str, usize)> = None;
+    // A guarded key whose value was given on its own line: nothing may continue it.
+    let mut closed: Option<&'static str> = None;
     for raw in source[jobs_start + "\njobs:\n".len()..].lines() {
-        let line = code(raw);
+        let line = yaml_code(raw);
         if line.trim().is_empty() {
             continue;
         }
@@ -488,6 +530,16 @@ fn portable_jobs(source: &str) -> Result<Vec<PortableJob>, String> {
             }
             open = None;
         }
+        if let Some(key) = closed {
+            if indent > 4 {
+                let job = jobs.last().map_or("", |job| job.name.as_str());
+                return Err(format!(
+                    "job `{job}` continues its single-line `{key}:` value on a further line; write the whole value on one line or as a block: `{}`",
+                    line.trim()
+                ));
+            }
+            closed = None;
+        }
         if indent == 2 {
             let name = line
                 .trim()
@@ -514,23 +566,55 @@ fn portable_jobs(source: &str) -> Result<Vec<PortableJob>, String> {
             continue;
         }
         let text = line.trim();
-        if let Some(value) = text.strip_prefix("if:") {
-            let value = value.trim();
-            if value.is_empty() || matches!(value, ">" | ">-" | "|" | "|-") {
+        let guarded = ["if", "needs", "runs-on"].into_iter().find_map(|key| {
+            text.strip_prefix(key)
+                .and_then(|rest| rest.strip_prefix(':'))
+                .map(|value| (key, value.trim()))
+        });
+        let Some((key, value)) = guarded else {
+            continue;
+        };
+        if value.starts_with('*') || value.starts_with('&') {
+            return Err(format!(
+                "job `{}` uses a YAML alias or anchor in `{key}:`; write the value out",
+                job.name
+            ));
+        }
+        if (value.starts_with('>') || value.starts_with('|'))
+            && !matches!(value, ">" | ">-" | "|" | "|-")
+        {
+            return Err(format!(
+                "job `{}` uses an unsupported block-scalar header `{value}` in `{key}:`",
+                job.name
+            ));
+        }
+        let block = value.is_empty() || matches!(value, ">" | ">-" | "|" | "|-");
+        match key {
+            "if" if block => {
                 job.condition = Some(String::new());
                 open = Some(("if", 4));
-            } else {
+            }
+            "if" => {
                 job.condition = Some(value.to_string());
+                closed = Some("if");
             }
-        } else if let Some(value) = text.strip_prefix("needs:") {
-            match list_value(value) {
-                Some(items) => job.needs = items,
-                None => open = Some(("needs", 4)),
+            "needs" | "runs-on" if value.is_empty() => {
+                open = Some((if key == "needs" { "needs" } else { "runs-on" }, 4));
             }
-        } else if let Some(value) = text.strip_prefix("runs-on:") {
-            match list_value(value) {
-                Some(items) => job.runs_on = items,
-                None => open = Some(("runs-on", 4)),
+            _ => {
+                let items = list_value(value).ok_or_else(|| {
+                    format!(
+                        "job `{}` has an unreadable `{key}:` value `{value}`",
+                        job.name
+                    )
+                })?;
+                if key == "needs" {
+                    job.needs = items;
+                    closed = Some("needs");
+                } else {
+                    job.runs_on = items;
+                    closed = Some("runs-on");
+                }
             }
         }
     }
@@ -614,6 +698,11 @@ fn validate_portable_pr_gate(source: &str) -> Vec<String> {
                         "ci-portable.yml job `cleanup` deletes artifacts and must have `if:` exactly: {cleanup}"
                     ))
                 }
+            } else if has_status_function(&condition) && has_top_level_or(&condition) {
+                Err(format!(
+                    "ci-portable.yml job `{}` combines a status function with a top-level `||`, which makes its success requirement optional",
+                    job.name
+                ))
             } else if has_status_function(&condition) {
                 let anchored = top_level_conjuncts(&condition).iter().any(|part| {
                     part.strip_prefix("needs.")
@@ -1420,6 +1509,98 @@ mod tests {
             validate_portable_pr_gate(&ok).is_empty(),
             "{:?}",
             validate_portable_pr_gate(&ok)
+        );
+    }
+
+    fn rejected_with(source: &str, needle: &str) {
+        let errors = validate_portable_pr_gate(source);
+        assert!(
+            errors.iter().any(|error| error.contains(needle)),
+            "expected an error containing {needle:?}, got {errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_single_line_condition_cannot_continue_on_the_next_line() {
+        // Review round 2, P1: `if: x` then `      || always()` was ignored.
+        let source = format!(
+            "{}  wrapped:\n    needs: select\n    if: needs.select.outputs.decision != 'skip'\n      || always()\n    runs-on: ubuntu-latest\n",
+            portable_fixture()
+        );
+        rejected_with(&source, "continues its single-line `if:` value");
+    }
+
+    #[test]
+    fn a_top_level_or_cannot_make_the_success_anchor_optional() {
+        let ok = portable_fixture();
+        // Review round 2, P4 and P14.
+        for prefix in ["always() || true && ", "!cancelled() || (true) && "] {
+            let source = ok.replace("\"!cancelled() && ", &format!("\"{prefix}"));
+            assert_ne!(source, ok);
+            rejected_with(&source, "top-level `||`");
+        }
+    }
+
+    #[test]
+    fn a_hash_inside_quotes_is_not_a_comment() {
+        // Review round 2, P5: `contains(github.ref, '#') || always()` was cut at `#`.
+        let source = format!(
+            "{}  hashed:\n    needs: select\n    if: contains(github.ref, '#') || always()\n    runs-on: ubuntu-latest\n",
+            portable_fixture()
+        );
+        rejected_with(&source, "`hashed`");
+    }
+
+    #[test]
+    fn unsupported_block_scalar_headers_are_refused() {
+        // Review round 2, P6 and P6b.
+        for header in [">+", "|2", ">2-"] {
+            let source = format!(
+                "{}  blocky:\n    needs: select\n    if: {header}\n      always()\n    runs-on: ubuntu-latest\n",
+                portable_fixture()
+            );
+            rejected_with(&source, "unsupported block-scalar header");
+        }
+    }
+
+    #[test]
+    fn yaml_aliases_are_refused() {
+        // Review round 2, P7: `if: *st`.
+        let source = format!(
+            "{}  aliased:\n    needs: select\n    if: *st\n    runs-on: ubuntu-latest\n",
+            portable_fixture()
+        );
+        rejected_with(&source, "YAML alias or anchor");
+    }
+
+    #[test]
+    fn status_functions_are_found_in_any_case() {
+        // Review round 2, P2: `${{ Always() }}`.
+        let source = format!(
+            "{}  shouty:\n    needs: select\n    if: ${{{{ Always() }}}}\n    runs-on: ubuntu-latest\n",
+            portable_fixture()
+        );
+        rejected_with(&source, "uses a status function");
+    }
+
+    #[test]
+    fn earlier_rejections_name_their_cause() {
+        let ok = portable_fixture();
+        rejected_with(
+            &format!("{ok}  newroot:\n    runs-on: ubuntu-latest\n"),
+            "has no `needs:`",
+        );
+        rejected_with(
+            &ok.replace(&format!(" && ({PORTABLE_FORK_GUARD})"), ""),
+            "job `cleanup`",
+        );
+        rejected_with(
+            &ok.replace(" && needs.build-debug.result == 'success'", ""),
+            "uses a status function",
+        );
+        rejected_with(
+            &format!("{ok}  orphan:\n    needs: select\n"),
+            "has no `runs-on`",
         );
     }
 
