@@ -15084,12 +15084,13 @@ impl Scheduler {
     /// came out of order.
     ///
     /// So where the recorded schedule runs `dettid` next, a queued thread whose
-    /// filed request is a polling retry (`is_polling_turn`) is not counted. Had
-    /// the recording run that retry before the delivery, its attempt, a
-    /// recorded event, would come next instead. Any other queued work still
-    /// defers the delivery, as in the recording: a kernel-run blocking call
-    /// records no event, so the schedule cannot say whether it went first, and
-    /// it keeps the order the run queue gives it.
+    /// filed request is a polling retry its turn grants (`files_polling_turn`)
+    /// is not counted. Had the recording run that retry before the delivery,
+    /// its attempt, a recorded event, would come next instead. Any other queued
+    /// work still defers the delivery, as in the recording: a kernel-run
+    /// blocking call, or a poller's pending backoff, records no event, so the
+    /// schedule cannot say whether it went first, and it keeps the order the
+    /// run queue gives it.
     fn sigchld_waits_behind_work(&self, dettid: DetTid) -> bool {
         if self.replay_runs_next(dettid) {
             self.run_queue
@@ -15108,13 +15109,17 @@ impl Scheduler {
                 .is_some_and(|(next, _)| next == dettid)
     }
 
-    /// Whether `tid`'s filed request is a polling retry (`is_polling_turn`).
+    /// Whether `tid`'s filed request is a polling retry that its next turn
+    /// grants (`is_polling_turn`, with `poll_attempt` 0), so the guest's
+    /// attempt is recorded when it runs. A request with `poll_attempt > 0` is a
+    /// pending backoff: step 4 requeues it without a grant and records nothing,
+    /// so it is not one.
     fn files_polling_turn(&self, tid: DetTid) -> bool {
         self.next_turns
             .get(&tid)
             .and_then(|next_turn| next_turn.req.try_read())
             .and_then(Result::ok)
-            .is_some_and(|request| Self::is_polling_turn(&request))
+            .is_some_and(|request| Self::is_polling_turn(&request) && request.poll_attempt == 0)
     }
 
     /// `child`, created by the vfork whose `BlockingVfork` operation is
@@ -28240,6 +28245,81 @@ mod test {
         assert!(deferred(SchedEvent::branches(signaled, 76), true));
         // The schedule runs the poller next: deferred as before.
         assert!(deferred(SchedEvent::branches(poller, 3), false));
+    }
+
+    /// A polling request with `poll_attempt > 0` is a pending backoff: step 4
+    /// requeues it without a grant and records nothing. So a replay counts it
+    /// as work for a SIGCHLD delivery to the thread its schedule runs next.
+    /// Once the backoff has run, the poller sits in the last band, and step
+    /// 2e's own gate admits the delivery (Codex review of the readmission
+    /// follow-up).
+    #[test]
+    fn a_pending_poll_backoff_keeps_a_replayed_sigchld_parked() {
+        let poller = DetTid::from_raw(3);
+        let signaled = DetTid::from_raw(7);
+        let inbound = ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD));
+        let mut scheduler = Scheduler::new(&Config::default());
+        let mut backoff = Resources::new(poller);
+        backoff.insert(ResourceID::InternalIOPolling, Permission::W);
+        backoff.poll_attempt = 1;
+        register_known_thread(&mut scheduler, poller);
+        let next = scheduler.next_turns.get_mut(&poller).unwrap();
+        next.req = Ivar::full(Ok(backoff.clone()));
+        let response = next.resp.clone();
+        scheduler
+            .priorities
+            .insert(poller, REPLAY_DEFERRED_PRIORITY);
+        scheduler.runqueue_push_back(poller);
+        register_known_thread(&mut scheduler, signaled);
+        scheduler
+            .priorities
+            .insert(signaled, REPLAY_FOREGROUND_PRIORITY);
+        let received = SchedEvent {
+            op: detcore_model::schedule::Op::SignalReceived(SigWrapper(libc::SIGCHLD)),
+            ..SchedEvent::branches(signaled, 1)
+        }
+        .with_time(LogicalTime::from_nanos(10_000));
+        scheduler.replayer = Some(Replayer::new(vec![
+            received.clone(),
+            SchedEvent::branches(signaled, 76),
+        ]));
+        let _ = scheduler.consume_schedevent(&received);
+
+        // The delivery waits behind the pending backoff.
+        scheduler.runqueue_push_back(signaled);
+        assert_eq!(
+            scheduler.run_queue.tentative_pop_tid(signaled),
+            Some(signaled)
+        );
+        assert!(
+            scheduler
+                .block_for_one_resource(
+                    signaled,
+                    &inbound,
+                    &Permission::RW,
+                    None,
+                    None,
+                    &Ivar::new(),
+                )
+                .is_err()
+        );
+        assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
+        scheduler.step2e_process_signal_deferred();
+        assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
+
+        // The real backoff path grants nothing and moves the poller to the
+        // last band; step 2e's own gate then admits the delivery.
+        assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(poller));
+        assert!(
+            scheduler
+                .step4_resource_block(poller, &backoff, &response)
+                .is_err()
+        );
+        assert!(response.try_read().is_none());
+        assert!(scheduler.run_queue.only_pollers());
+        scheduler.step2e_process_signal_deferred();
+        assert!(!scheduler.blocked.sigchld_deferred.contains(&signaled));
+        assert!(scheduler.run_queue.contains_tid(signaled));
     }
 
     /// The control for the two tests above: a queue of real pollers alone still
