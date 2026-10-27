@@ -1190,7 +1190,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-model's
     // syscall_histogram::tests::the_finished_form_keeps_only_nonzero_slots_and_sums_back_exactly
     // (finished threads keep sparse histograms): 1867, listed.
-    ("test.regular_crates", 1867),
+    ("test.regular_crates", 1880),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1836,7 +1836,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And tests::defined_dynamic_symbols_are_read_from_the_dynamic_segment_alone
     // and tests::the_dynamic_symbol_count_comes_from_the_hash_table (that check
     // reads only the runtime's dynamic symbols): 1112, listed.
-    ("test.hermit_unit", 1112),
+    ("test.hermit_unit", 1114),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3026,7 +3026,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the overlap decision, without global state): 2662, listed.
     // And the five shared runtime-FD readlink handler regressions, including
     // numeric-parent scratch overlap and syscall precedence: 2667, listed.
-    ("test.detcore_unit", 2667),
+    ("test.detcore_unit", 2676),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4279,7 +4279,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none
     // (the placeholder is mounted only for KVM), are run_kvm_ tests, which this
     // node skips and privileged-test.cli_kvm runs.
-    ("test.cli", 620),
+    ("test.cli", 622),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4795,7 +4795,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two tests split out of the discarded-at-send test, not
     // excluded: 535.
     // And the same four P1 placeholder tests, not excluded: 539.
-    ("test.cli_on_host", 539),
+    ("test.cli_on_host", 541),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5251,7 +5251,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three P1 round-three units: 2661, listed.
     // And the same overlap-decision unit: 2662, listed.
     // And the same five shared runtime-FD readlink regressions: 2667, listed.
-    ("test.detcore_unit_on_host", 2667),
+    ("test.detcore_unit_on_host", 2676),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5612,7 +5612,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same DBT runtime fingerprint-check unit: 1106, listed.
     // And the same four P1 container units: 1110, listed.
     // And the same two dynamic-symbol units: 1112, listed.
-    ("test.hermit_unit_on_host", 1112),
+    ("test.hermit_unit_on_host", 1114),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -5817,7 +5817,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same native-client publication regression is included on the host.
     // And the same detcore-dbt fingerprint test: 1852, listed.
     // And the same finished-thread sparse histogram unit: 1853, listed.
-    ("test.regular_crates_on_host", 1853),
+    ("test.regular_crates_on_host", 1866),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.
