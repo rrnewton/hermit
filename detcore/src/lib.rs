@@ -3199,7 +3199,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     fn detlog_memory_maps<G: Guest<Self>>(&self, guest: &mut G) -> Result<(), reverie::Error> {
-        if !(self.cfg.detlog_stack || self.cfg.detlog_heap) {
+        if !(self.cfg.detlog_stack || self.cfg.detlog_heap || self.cfg.detlog_anon.is_some()) {
             // Don't incur the *significant* performance penalty for reading
             // /proc/maps unless one of these flags is enabled.
             return Ok(());
@@ -3260,19 +3260,52 @@ impl<T: RecordOrReplay> Detcore<T> {
             .brk_model
             .is_some();
         let mut labelled_heap = false;
+        let anon = self.cfg.detlog_anon;
         for mmap in procmaps::from_pid(guest.pid(), |map| match map.pathname {
             procmaps::MMapPath::Stack if self.cfg.detlog_stack => true,
             procmaps::MMapPath::Heap if self.cfg.detlog_heap && !modeled_brk => true,
-            _ => false,
+            _ => anon.is_some() && procmaps::is_hashed_anonymous(map),
         })? {
             labelled_heap |= matches!(mmap.pathname, procmaps::MMapPath::Heap);
             let dettid = guest.thread_state().dettid;
-            detlog!(
-                "[memory][dtid {}] {}->{}",
-                dettid,
-                procmaps::display(&mmap),
-                procmaps::compute_hash(guest, &mmap)?
-            )
+            if !procmaps::is_hashed_anonymous(&mmap) {
+                detlog!(
+                    "[memory][dtid {}] {}->{}",
+                    dettid,
+                    procmaps::display(&mmap),
+                    procmaps::compute_hash(guest, &mmap)?
+                );
+                continue;
+            }
+            // `--detlog-anon`: a mapping another thread of the process unmaps
+            // between the listing and the read (threads not sequentialized)
+            // is recorded as unreadable rather than failing the guest's call.
+            let pages = anon == Some(detcore_model::config::DetlogAnon::Pages);
+            match procmaps::compute_hash_and_pages(guest, mmap.address.0, mmap.address.1, pages) {
+                Ok(procmaps::AnonHash::Hashed(digest, Some(pages))) => detlog!(
+                    "[memory][dtid {}] {}->{} pages={}",
+                    dettid,
+                    procmaps::display(&mmap),
+                    digest,
+                    pages
+                ),
+                Ok(procmaps::AnonHash::Hashed(digest, None)) => detlog!(
+                    "[memory][dtid {}] {}->{}",
+                    dettid,
+                    procmaps::display(&mmap),
+                    digest
+                ),
+                Ok(procmaps::AnonHash::TooLarge(size)) => detlog!(
+                    "[memory][dtid {}] {}->too large ({size} bytes)",
+                    dettid,
+                    procmaps::display(&mmap)
+                ),
+                Err(error) => detlog!(
+                    "[memory][dtid {}] {}->unreadable ({error})",
+                    dettid,
+                    procmaps::display(&mmap)
+                ),
+            }
         }
 
         // The kernel labels `[heap]` only for `[mm->start_brk, mm->brk)`. Under a

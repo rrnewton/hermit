@@ -7396,6 +7396,69 @@ fn display_runopts_without_a_pmu_profile() {
     );
 }
 
+/// `--detlog-anon` and `--detlog-anon=pages` parse and render back, and a
+/// backend whose `/proc/<tid>/maps` is not the guest's alone refuses them.
+#[test]
+fn detlog_anon_is_ptrace_only() {
+    let validated = |argv: &[&str]| {
+        let mut ro = run_opts_for(argv);
+        ro.validate_args_with_timer_support(Ok(())).map(|()| ro)
+    };
+    let pages = validated(&["hermit", "run", "--detlog-anon=pages", "fakeprog"]).unwrap();
+    assert_eq!(
+        pages.det_opts.det_config.detlog_anon,
+        Some(detcore_model::config::DetlogAnon::Pages)
+    );
+    assert!(
+        format!("{pages}").contains(" --detlog-anon=pages "),
+        "{pages}"
+    );
+    let mappings = validated(&["hermit", "run", "--detlog-anon", "fakeprog"]).unwrap();
+    assert_eq!(
+        mappings.det_opts.det_config.detlog_anon,
+        Some(detcore_model::config::DetlogAnon::Mappings)
+    );
+    assert!(
+        format!("{mappings}").contains(" --detlog-anon "),
+        "{mappings}"
+    );
+    assert!(
+        validated(&[
+            "hermit",
+            "--backend",
+            "e9patch",
+            "run",
+            "--detlog-anon",
+            "fakeprog"
+        ])
+        .is_ok()
+    );
+    for backend in ["dbt", "kvm", "liteinst"] {
+        let error = validated(&[
+            "hermit",
+            "--backend",
+            backend,
+            "run",
+            "--detlog-anon",
+            "fakeprog",
+        ])
+        .expect_err(backend);
+        assert!(
+            format!("{error}").contains("--detlog-anon hashes the anonymous mappings"),
+            "{backend}: {error}"
+        );
+    }
+    let error = validated(&[
+        "hermit",
+        "run",
+        "--namespace-only",
+        "--detlog-anon",
+        "fakeprog",
+    ])
+    .expect_err("--namespace-only");
+    assert!(format!("{error}").contains("--namespace-only"), "{error}");
+}
+
 fn shebang_interpreter(path: &Path) -> Option<PathBuf> {
     let mut file = File::open(path).ok()?;
     let mut bytes = [0_u8; 256];
@@ -9498,6 +9561,20 @@ impl RunOpts {
             anyhow::bail!(
                 "--fatal-core-dir captures cores at the ptrace backend's exit stop, so it \
                  needs --backend=ptrace or --backend=e9patch, without --namespace-only"
+            );
+        }
+        // `--detlog-anon` lists the guest task's own `/proc/<tid>/maps`. An
+        // in-guest tool (DBT, SaBRe, liteinst, the in-guest trap) maps its
+        // own memory into that table, KVM's describes the VMM, and
+        // `--namespace-only` intercepts nothing.
+        if self.det_opts.det_config.detlog_anon.is_some()
+            && (self.namespace_only || !matches!(backend, Backend::Ptrace | Backend::E9patch))
+        {
+            anyhow::bail!(
+                "--detlog-anon hashes the anonymous mappings in the guest's own /proc/<tid>/maps, \
+                 so it needs --backend=ptrace or --backend=e9patch, without --namespace-only: \
+                 backend `{}` shares that table with its tool or keeps the guest elsewhere",
+                backend.as_str()
             );
         }
         if self.image.is_some() && self.no_namespace {

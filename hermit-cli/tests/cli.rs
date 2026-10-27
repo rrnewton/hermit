@@ -130,6 +130,7 @@ use hermit::canonical_verdict::Verdict;
 use hermit::canonical_verdict::VerificationReport;
 
 static DBT_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static ANON_MAPPING_WRITE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_EXEC_FAILURE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_EXECVEAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PREEMPTION_CHARGE_REPLAY_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -13518,6 +13519,64 @@ fn run_dbt_program_break_of_a_pie_starts_at_linuxs_rule() {
         assert_success(&output, &args);
         assert_eq!(stdout(&output), expected, "{backend}");
     }
+}
+
+/// `--detlog-anon` hashes a private anonymous mapping at every syscall
+/// (ptrace backend). The guest's two-page mapping (`tests/c/anon_mapping_write.c`)
+/// has the same digest from its `mprotect` through its first two marker calls,
+/// and a different one at the marker after its one-byte write into page 1.
+/// With `--detlog-anon=pages`, page 1 is listed only after that write, and the
+/// untouched page 0 never is.
+#[test]
+fn detlog_anon_records_a_write_to_an_anonymous_mapping() {
+    let guest = compiled_c_guest(&ANON_MAPPING_WRITE_GUEST, "anon_mapping_write");
+    let program = guest.to_str().expect("guest path should be UTF-8");
+    // That mapping's records in order: what follows "->" in each.
+    let records = |flag: &str| {
+        let args = ["--log", "info", "run", flag, "--", program];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let range = stdout(&output)
+            .strip_prefix("mapping ")
+            .and_then(|range| range.strip_suffix('\n'))
+            .expect("the guest prints its mapping")
+            .to_owned();
+        let records = stderr(&output)
+            .lines()
+            .filter_map(|line| {
+                let record = &line[line.find("[memory]")?..];
+                let record = record
+                    .split_once(" DETLOG_RECORD")
+                    .map_or(record, |(record, _)| record);
+                let (_, rest) = record.split_once("] ")?;
+                let (mapping, digest) = rest.split_once("->")?;
+                mapping
+                    .starts_with(&format!("{range} "))
+                    .then(|| digest.to_owned())
+            })
+            .collect::<Vec<_>>();
+        (range, records)
+    };
+    let (range, digests) = records("--detlog-anon");
+    // The mprotect that makes the mapping writable, the guest's write of its
+    // address, two markers, then the marker after the write.
+    assert!(digests.len() >= 5, "{range}: {digests:#?}");
+    let (last, before) = digests.split_last().expect("records");
+    assert!(
+        before.iter().all(|digest| digest == &before[0]) && last != &before[0],
+        "{range}: {digests:#?}"
+    );
+    let (range, paged) = records("--detlog-anon=pages");
+    let (last, before) = paged.split_last().expect("records");
+    assert!(
+        before.iter().all(|record| record.ends_with(" pages=")),
+        "{range}: {paged:#?}"
+    );
+    let pages = last.rsplit_once(" pages=").expect("a page list").1;
+    assert!(
+        pages.starts_with("1:") && pages.len() == 2 + 16,
+        "{range}: {paged:#?}"
+    );
 }
 
 /// Under DBT, `--detlog-heap` records the guest's heap as ptrace's kernel

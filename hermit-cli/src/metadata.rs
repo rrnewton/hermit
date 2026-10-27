@@ -1353,6 +1353,7 @@ fn record_or_replay_config_with_timer_support(
         no_rcb_time: false,
         detlog_heap: false,
         detlog_stack: false,
+        detlog_anon: None,
         detlog_regs: false,
         detlog_io_buffers: crate::RECORD_REPLAY_HASHES_IO_BUFFERS,
         detlog_regs_cadence: 1,
