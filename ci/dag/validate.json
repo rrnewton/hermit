@@ -10528,6 +10528,7 @@
         "build.e2e_artifact_in_pinned_root",
         "build.manifest_guests_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.manifest_plan",
@@ -17344,6 +17345,7 @@
       "deps": [
         "build.host_hermit_link",
         "build.rust_scripts",
+        "check.dbt_runtime_abi",
         "compatprep.fixtures",
         "gate.manifest",
         "pre.reverie_pin",
@@ -25606,6 +25608,7 @@
         "build.e2e_artifact_in_pinned_root",
         "build.manifest_guests_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.manifest_plan",
@@ -26214,6 +26217,7 @@
         "build.e2e_artifact_in_pinned_root",
         "build.manifest_guests_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.manifest_plan",
@@ -30616,6 +30620,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
         "gate.manifest",
         "pre.reverie_pin",
         "privileged-build.manifest_guests_in_pinned_root",
@@ -30779,6 +30784,7 @@
       "deps": [
         "build.e2e_artifact_in_pinned_root",
         "build.rust_scripts_in_pinned_root",
+        "check.dbt_runtime_abi",
         "gate.manifest",
         "pre.reverie_pin",
         "privileged-build.manifest_guests_in_pinned_root",
