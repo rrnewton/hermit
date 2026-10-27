@@ -434,6 +434,7 @@ class StageCargoOverlapTest(unittest.TestCase):
                                                 "--target-dir", target],
             "hermit-install+detcore-sabre+detcore-liteinst": common + [
                 "--profile", "validate", "-p", "hermit-install", "-p", "detcore-sabre", "-p", "detcore-liteinst",
+                "--features", "hermit-install/third-party-backends",
                 "--target-dir", target],
             "detcore-liteinst": common + ["-p", "detcore-liteinst", "--lib", "--profile", "liteinst-runtime",
                                           "--target-dir", target],
