@@ -771,9 +771,20 @@ bound still counts a run it stops as not meeting the target. A stack-trace run
 after a decision that analyze's bound stops runs again once with 4 times the
 bound; one stopped again, or stopped by the run arguments' `--timeout`, leaves
 its part of the report missing and says why. It never changes the decision;
-with a continuation missing, the report claims neither kind of decision. A trial that Hermit refuses when its guest reaches an operation Hermit
-does not support (exit 122) counts as not meeting the target too, with a
-warning; a refused target run still ends the analysis.
+with a continuation missing, the report claims neither kind of decision.
+
+A trial that Hermit refuses after its guest started (exit 122) never counts as
+meeting or missing the target: it could not be evaluated. A refusal the
+host's timing decides (a skid overshoot, `cause=skid-overshoot`) runs the
+trial again once; a second refusal ends the analysis with a partial report
+(exit 120, `trial-inconclusive`). A deterministic refusal (an operation the
+guest reached that the run's configuration refuses, such as an unsupported
+syscall) ends it at once, naming the refusal and Detcore's reason, since every
+run of that trial would be refused alike. This holds for every trial: search
+and baseline runs, `--search` rounds, `--minimize`'s knock-outs and stack-trace
+runs, where a refused run leaves the stacks it did not reach missing and says
+why. A refusal decided before the guest starts (an option or a backend Hermit
+does not admit), and a refused target run, still end the analysis.
 
 By default analyze bisects between the failing schedule and a passing one from
 another run. Each round replays a splice of the two orders, matching each

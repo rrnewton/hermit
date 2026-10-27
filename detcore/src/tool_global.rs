@@ -3394,7 +3394,7 @@ impl GlobalState {
                 R::ReleaseAllResources(self.recv_release_all_resources(from).await)
             }
             GlobalRequest::PolicyRefusal(reason) => {
-                self.policy_refusal.lock().unwrap().get_or_insert(reason);
+                keep_policy_refusal(&self.policy_refusal, reason);
                 R::PolicyRefusal(())
             }
             // Acted on even from a committed SIGKILL victim (it is in the
@@ -3426,7 +3426,7 @@ impl GlobalState {
                     "[detcore] a stopping refusal was filed without the in-guest delivery gate; recorded as a policy refusal, without the run-wide exit: {}",
                     reason
                 );
-                self.policy_refusal.lock().unwrap().get_or_insert(reason);
+                keep_policy_refusal(&self.policy_refusal, reason);
                 R::PolicyRefusal(())
             }
             // TODO-HUMAN-REVIEW(PR-643): Review run-wide unsupported-syscall aggregation.
@@ -7850,6 +7850,25 @@ where
         response,
         GlobalResponse::AnnounceSignalHandlerNotInstalled(())
     );
+}
+
+/// Called with the first reason a run's fail-closed policy refused it for
+/// (`GlobalState::policy_refusal`), as it is filed, so that the reason
+/// outlives a run whose exit carries only its status
+/// ([`crate::set_policy_refusal_hook`]).
+pub(crate) static POLICY_REFUSAL_HOOK: std::sync::RwLock<Option<fn(&str)>> =
+    std::sync::RwLock::new(None);
+
+/// Keep `reason` in `kept` unless a reason is kept already (the first one
+/// counts), handing a first one to [`POLICY_REFUSAL_HOOK`].
+fn keep_policy_refusal(kept: &Mutex<Option<String>>, reason: String) {
+    let mut kept = kept.lock().unwrap();
+    if kept.is_none()
+        && let Some(hook) = POLICY_REFUSAL_HOOK.read().ok().and_then(|hook| *hook)
+    {
+        hook(&reason);
+    }
+    kept.get_or_insert(reason);
 }
 
 /// Tells the coordinator why the fail-closed policy is ending the run, before

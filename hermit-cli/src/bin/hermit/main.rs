@@ -70,6 +70,7 @@ mod podman_store;
 mod record;
 mod record_envelope;
 mod record_start;
+mod refusal_note;
 mod remove;
 mod replay;
 mod run;
