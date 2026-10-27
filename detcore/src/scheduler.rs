@@ -2246,6 +2246,23 @@ pub struct Scheduler {
     /// information and needs to "cooperate" and setup it's preemption for the amount
     pub timeslices: BTreeMap<DetTid, Option<LogicalTime>>,
 
+    /// Where the timer of each `timeslices` entry's slice was armed past its
+    /// branch target in the recording (`SchedEvent::instruction_offset`),
+    /// for a schedule replay of a preemption recorded with
+    /// `--chaos-instruction-offset`. Written and removed with its
+    /// `timeslices` entry (`set_replay_timeslice`, `forget_replay_timeslice`,
+    /// and the grant that consumes the timeslice, `grant_replay_timeslice`).
+    pub(crate) replay_instruction_offsets:
+        BTreeMap<DetTid, detcore_model::schedule::InstructionOffset>,
+
+    /// The offset beside the timeslice each thread's latest grant carried
+    /// (`grant_replay_timeslice`), until that grant's receiver takes it:
+    /// a `TraceSchedEvent` that yielded for the grant, or a nonleader exec's
+    /// continuation (`take_granted_replay_instruction_offset`). Every grant
+    /// replaces it, so a receiver takes its own grant's offset or none.
+    pub(crate) granted_replay_instruction_offsets:
+        BTreeMap<DetTid, detcore_model::schedule::InstructionOffset>,
+
     /// Typed boundary expectations carried by the same existing grant reply.
     /// Unlike legacy `timeslices`, these are guest RCB identities, not logical
     /// durations. No production lookahead populates this staged mailbox yet.
@@ -4675,6 +4692,12 @@ pub struct ConsumeResult {
     /// The number of this event in the global total order of events.
     #[allow(dead_code)]
     pub event_ix: u64,
+    /// Where `timeslice_remaining`'s slice had its timer armed past its branch
+    /// target in the recording (`Replayer::next_instruction_offset`): `Some`
+    /// only beside a timeslice for the thread that keeps running. A context
+    /// switch's timeslice belongs to the thread it switches to, which takes
+    /// its offset with its grant (`Scheduler::replay_instruction_offsets`).
+    pub instruction_offset: Option<detcore_model::schedule::InstructionOffset>,
 }
 
 /// Any non-None response means that the guest should print its stack trace before proceeding, and
@@ -4799,8 +4822,13 @@ impl Scheduler {
             Some(path) => {
                 trace!("Scheduler loading trace from path {}", path.display());
                 // File/JSON failures retain the ordinary loader's panic class.
-                // Only explicit format-policy mismatches below are refusals.
-                let recording = Recording::read(path).unwrap();
+                // Only explicit format-policy mismatches below, and a record
+                // of a newer format, are refusals.
+                let recording =
+                    crate::preemptions::boundary_recording::exit_on_record_format_refusal(
+                        Recording::read(path),
+                    )
+                    .unwrap();
                 recording
                     .require_faithful_replay()
                     .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
@@ -5188,6 +5216,8 @@ impl Scheduler {
             thread_tree: Default::default(),
             priorities: Default::default(),
             timeslices: Default::default(),
+            replay_instruction_offsets: Default::default(),
+            granted_replay_instruction_offsets: Default::default(),
             boundary_budgets: Default::default(),
             boundary_owners: boundaries.then(Default::default),
             deadline_hints: Default::default(),
@@ -6075,10 +6105,12 @@ impl Scheduler {
         debug_assert!(self.replayer.is_some());
         let mytid = observed.dettid;
 
-        if let Some((ix, action)) = self.replayer.as_mut().map(|r| {
+        if let Some((ix, action, instruction_offset)) = self.replayer.as_mut().map(|r| {
             let current_ix = r.traced_event_count;
             let action = r.observe_event(observed);
-            (current_ix, action)
+            // Read at once: the offset of the event the action's timeslice
+            // comes from.
+            (current_ix, action, r.next_instruction_offset())
         }) {
             let print_stack = self.try_pop_stacktrace_event(ix, observed);
             debug!("Next ReplayAction = {:?}", action);
@@ -6091,6 +6123,7 @@ impl Scheduler {
                         print_stack,
                         event_ix: ix,
                         timeslice_remaining,
+                        instruction_offset,
                     };
                 }
                 replayer::ReplayAction::Stop(StopReason::FatalDesync) => immediate_fatal_exit(),
@@ -6111,12 +6144,14 @@ impl Scheduler {
                             // immediate_fatal_exit();
                         }
                     }
-                    self.timeslices.insert(new_tid, timeslice_remaining);
+                    self.set_replay_timeslice(new_tid, timeslice_remaining, instruction_offset);
                     return ConsumeResult {
                         keep_running: !is_now,
                         print_stack,
                         event_ix: ix,
                         timeslice_remaining,
+                        // `new_tid`'s, taken with its grant.
+                        instruction_offset: None,
                     };
                 }
             };
@@ -6127,7 +6162,99 @@ impl Scheduler {
             print_stack: None,
             event_ix: 0,
             timeslice_remaining: None,
+            instruction_offset: None,
         }
+    }
+
+    /// Note the timeslice a schedule replay gives `tid` with its next grant,
+    /// and where its recorded slice's timer was armed past its branch target
+    /// (`replay_instruction_offsets`), replacing any earlier pair.
+    pub(crate) fn set_replay_timeslice(
+        &mut self,
+        tid: DetTid,
+        timeslice: Option<LogicalTime>,
+        instruction_offset: Option<detcore_model::schedule::InstructionOffset>,
+    ) {
+        self.timeslices.insert(tid, timeslice);
+        match instruction_offset.filter(|_| timeslice.is_some()) {
+            Some(offset) => self.replay_instruction_offsets.insert(tid, offset),
+            None => self.replay_instruction_offsets.remove(&tid),
+        };
+    }
+
+    /// Forget `tid`'s replay timeslice and its offset, granted or not: the
+    /// thread is gone, or its entry no longer describes its next grant.
+    pub(crate) fn forget_replay_timeslice(&mut self, tid: &DetTid) {
+        self.timeslices.remove(tid);
+        self.replay_instruction_offsets.remove(tid);
+        self.granted_replay_instruction_offsets.remove(tid);
+    }
+
+    /// The answer a committed grant gives `dtid`. A control answer (a fatal
+    /// alarm, pending signals, a futex timeout) consumes no replay timeslice:
+    /// the staged pair, timeslice and offset together, waits for the thread's
+    /// next grant, as the timeslice alone did before offsets existed. Only a
+    /// plain grant consumes it (`grant_replay_timeslice`), so an offset never
+    /// travels without its timeslice.
+    fn grant_answer(
+        &mut self,
+        dtid: DetTid,
+        fatal_alarm: bool,
+        signaled: bool,
+        signals: Vec<SigWrapper>,
+        futex_timed_out: bool,
+        alone: bool,
+    ) -> SchedResponse {
+        if fatal_alarm {
+            SchedResponse::InGuestFatalAlarm
+        } else if signaled {
+            SchedResponse::Signaled(Some(signals))
+        } else if futex_timed_out {
+            SchedResponse::Go(Some(SchedValue::TimeOut))
+        } else {
+            let timeslice = self.grant_replay_timeslice(dtid);
+            // TODO(T137799529): use a more strongly typed representation rather than reusing
+            // SchedValue/u64:
+            let as_schedvalue = timeslice
+                .as_ref()
+                .map(LogicalTime::as_nanos)
+                .map(SchedValue::Value);
+            if alone {
+                SchedResponse::GoAlone(as_schedvalue)
+            } else {
+                SchedResponse::Go(as_schedvalue)
+            }
+        }
+    }
+
+    /// The replay timeslice `tid`'s grant carries, consumed. The offset beside
+    /// it moves with it, for that grant's receiver
+    /// (`take_granted_replay_instruction_offset`); a grant without a
+    /// timeslice leaves none.
+    fn grant_replay_timeslice(&mut self, tid: DetTid) -> Option<LogicalTime> {
+        let timeslice = self.timeslices.remove(&tid).flatten();
+        match self
+            .replay_instruction_offsets
+            .remove(&tid)
+            .filter(|_| timeslice.is_some())
+        {
+            Some(offset) => self.granted_replay_instruction_offsets.insert(tid, offset),
+            None => self.granted_replay_instruction_offsets.remove(&tid),
+        };
+        timeslice
+    }
+
+    /// The offset beside the timeslice `tid`'s latest grant carried
+    /// (`granted_timeslice`), for the receiver that installs that timeslice:
+    /// taken, so it arms one slice. A receiver that installs no timeslice
+    /// (`None`) takes none, and drops it.
+    pub(crate) fn take_granted_replay_instruction_offset(
+        &mut self,
+        tid: DetTid,
+        granted_timeslice: Option<LogicalTime>,
+    ) -> Option<detcore_model::schedule::InstructionOffset> {
+        let offset = self.granted_replay_instruction_offsets.remove(&tid);
+        granted_timeslice.and(offset)
     }
 
     /// Updates the address Linux clears and wakes when this thread exits.
@@ -6241,7 +6368,7 @@ impl Scheduler {
         }
         for tid in &retired {
             self.logically_kill_thread(tid, &process, mm);
-            self.timeslices.remove(tid);
+            self.forget_replay_timeslice(tid);
         }
         self.parent_death_exec_survivor = None;
         self.remove_exec_vfork_barriers(&retired);
@@ -6316,6 +6443,10 @@ impl Scheduler {
         self.kernel_run_requests.remove(dtid);
         self.published_masks.remove(dtid);
         self.instruction_offsets.remove(dtid);
+        // A schedule replay's timeslice for it, and the offset beside it,
+        // die with it too, even when it dies between the replayer choosing it
+        // and its grant (idempotent with the exec paths' own call).
+        self.forget_replay_timeslice(dtid);
         let retired = self
             .discarded_at_send
             .retire(discarded_at_send::QueueId::Thread(*dtid));
@@ -7014,7 +7145,7 @@ impl Scheduler {
             self.parent_death_exec_survivor = Some((detpid, caller));
             for sibling in &siblings {
                 self.logically_kill_thread(sibling, &detpid, pre_exec_mm);
-                self.timeslices.remove(sibling);
+                self.forget_replay_timeslice(sibling);
             }
             self.parent_death_exec_survivor = None;
             siblings
@@ -7099,7 +7230,13 @@ impl Scheduler {
             // ContextSwitch(false, new_leader, ..) already refers to the
             // replacement. Neither priority nor the old entry distinguishes
             // those cases, and the cursor may have advanced in the meantime.
-            self.timeslices.insert(new_leader, timeslice);
+            // The cursor has not moved since `replay_resume` was read, so its
+            // next event's offset is that timeslice's.
+            let offset = self
+                .replayer
+                .as_ref()
+                .and_then(Replayer::next_instruction_offset);
+            self.set_replay_timeslice(new_leader, timeslice, offset);
         }
         if let Some(writer) = &mut self.preemption_writer {
             // The caller survives exec; raw replay's foreground/deferred band
@@ -7165,7 +7302,7 @@ impl Scheduler {
             self.turn_clocks.insert(new_leader, clock);
         }
         self.logically_kill_thread(&caller, &detpid, pre_exec_mm);
-        self.timeslices.remove(&caller);
+        self.forget_replay_timeslice(&caller);
         retired.push(caller);
         self.remove_exec_vfork_barriers(&retired);
         retired
@@ -17405,26 +17542,8 @@ impl Scheduler {
         }
         self.last_committed_turn = Some(self.turn);
         self.turn += 1;
-        let answer = if fatal_alarm {
-            SchedResponse::InGuestFatalAlarm
-        } else if signaled {
-            SchedResponse::Signaled(Some(signals))
-        } else if futex_timed_out {
-            SchedResponse::Go(Some(SchedValue::TimeOut))
-        } else {
-            let timeslice = self.timeslices.remove(&dtid).flatten();
-            // TODO(T137799529): use a more strongly typed representation rather than reusing
-            // SchedValue/u64:
-            let as_schedvalue = timeslice
-                .as_ref()
-                .map(LogicalTime::as_nanos)
-                .map(SchedValue::Value);
-            if alone {
-                SchedResponse::GoAlone(as_schedvalue)
-            } else {
-                SchedResponse::Go(as_schedvalue)
-            }
-        };
+        let answer =
+            self.grant_answer(dtid, fatal_alarm, signaled, signals, futex_timed_out, alone);
         match self.grant_deadline_hint(dtid) {
             Some(remaining) => self.deadline_hints.insert(dtid, remaining),
             None => self.deadline_hints.remove(&dtid),
@@ -17870,6 +17989,7 @@ impl Scheduler {
                 print_stack,
                 event_ix: _,
                 timeslice_remaining: _,
+                instruction_offset: _,
             } = self.consume_schedevent(&ev);
             // We should not ever need to background the thread when it is going to exit anyway.
             if !keep_running {
@@ -29929,6 +30049,7 @@ mod test {
             start_rip: None,
             end_rip: std::num::NonZeroUsize::new(rip),
             end_time: Some(LogicalTime::from_nanos(0)),
+            instruction_offset: None,
         };
         let directory = tempfile::tempdir().unwrap();
         let schedule = directory.path().join("schedule.json");
@@ -30592,6 +30713,169 @@ mod test {
             assert!(scheduler.run_queue.remove_tid(waiter));
             scheduler.run_queue.push_poller(waiter, 9820, u32::MAX);
         });
+    }
+
+    /// A control answer (a fatal alarm, pending signals, a futex timeout)
+    /// consumes no replay timeslice, so the staged pair stays together,
+    /// timeslice and offset, for the thread's next grant; a plain grant then
+    /// moves both. An offset never travels without its own timeslice.
+    #[test]
+    fn a_control_answer_leaves_the_replay_pair_staged_together() {
+        use detcore_model::schedule::InstructionOffset;
+        let mut scheduler = Scheduler::new(&Config::default());
+        let tid = DetTid::from_raw(3);
+        let offset = InstructionOffset {
+            rcb_target: 120,
+            instructions: 6,
+        };
+        let slice = LogicalTime::from_rcbs(123);
+        scheduler.set_replay_timeslice(tid, Some(slice), Some(offset));
+        let staged = |scheduler: &Scheduler| {
+            (
+                scheduler.timeslices.get(&tid).copied().flatten(),
+                scheduler.replay_instruction_offsets.get(&tid).copied(),
+                scheduler
+                    .granted_replay_instruction_offsets
+                    .get(&tid)
+                    .copied(),
+            )
+        };
+        let signal = SigWrapper(libc::SIGUSR1);
+        let answer = scheduler.grant_answer(tid, true, false, vec![], false, false);
+        assert!(
+            matches!(answer, SchedResponse::InGuestFatalAlarm),
+            "{answer:?}"
+        );
+        assert_eq!(staged(&scheduler), (Some(slice), Some(offset), None));
+        let answer = scheduler.grant_answer(tid, false, true, vec![signal], false, false);
+        assert!(
+            matches!(&answer, SchedResponse::Signaled(Some(signals)) if *signals == [signal]),
+            "{answer:?}"
+        );
+        assert_eq!(staged(&scheduler), (Some(slice), Some(offset), None));
+        let answer = scheduler.grant_answer(tid, false, false, vec![], true, false);
+        assert!(
+            matches!(answer, SchedResponse::Go(Some(SchedValue::TimeOut))),
+            "{answer:?}"
+        );
+        assert_eq!(staged(&scheduler), (Some(slice), Some(offset), None));
+        let answer = scheduler.grant_answer(tid, false, false, vec![], false, true);
+        assert!(
+            matches!(answer, SchedResponse::GoAlone(Some(SchedValue::Value(nanos))) if nanos == slice.as_nanos()),
+            "{answer:?}"
+        );
+        assert_eq!(staged(&scheduler), (None, None, Some(offset)));
+    }
+
+    /// A schedule replay hands a recorded instruction offset to the thread
+    /// whose timeslice it belongs to: with the continuing thread's own
+    /// timeslice in the consume result, and beside a context switch's
+    /// timeslice for the thread switched to, which takes it with its grant,
+    /// once, and only with that grant's timeslice. Every grant moves or drops
+    /// it with the timeslice. Forgetting the timeslice forgets the offset.
+    #[test]
+    fn a_replayed_instruction_offset_rides_with_its_timeslice() {
+        use detcore_model::schedule::InstructionOffset;
+        let (three, five) = (DetTid::from_raw(3), DetTid::from_raw(5));
+        let offset = InstructionOffset {
+            rcb_target: 120,
+            instructions: 6,
+        };
+        let other = |tid| SchedEvent {
+            dettid: tid,
+            op: detcore_model::schedule::Op::OtherInstructions,
+            count: 1,
+            start_rip: None,
+            end_rip: None,
+            end_time: Some(LogicalTime::from_nanos(1)),
+            instruction_offset: None,
+        };
+        let branch =
+            |tid, count| SchedEvent::branches(tid, count).with_time(LogicalTime::from_nanos(1));
+        let slice = Some(LogicalTime::from_rcbs(123));
+        let mut scheduler = Scheduler::new(&Config::default());
+
+        // The thread that keeps running gets its offset in the result.
+        scheduler.replayer = Some(replayer::Replayer::new(vec![
+            other(three),
+            branch(three, 123).with_instruction_offset(Some(offset)),
+            other(three),
+            branch(five, 1),
+        ]));
+        let consumed = scheduler.consume_schedevent(&other(three));
+        assert!(consumed.keep_running);
+        assert_eq!(consumed.timeslice_remaining, slice);
+        assert_eq!(consumed.instruction_offset, Some(offset));
+        assert!(scheduler.replay_instruction_offsets.is_empty());
+
+        // A context switch leaves it for the thread switched to.
+        scheduler.replayer = Some(replayer::Replayer::new(vec![
+            other(five),
+            branch(three, 123).with_instruction_offset(Some(offset)),
+            other(three),
+            branch(five, 1),
+        ]));
+        let consumed = scheduler.consume_schedevent(&other(five));
+        assert!(!consumed.keep_running);
+        assert_eq!(consumed.instruction_offset, None);
+        assert_eq!(scheduler.timeslices.get(&three), Some(&slice));
+        assert_eq!(
+            scheduler.replay_instruction_offsets.get(&three),
+            Some(&offset)
+        );
+        // The grant consumes the timeslice and moves the offset with it, for
+        // the grant's receiver, which takes it once.
+        assert_eq!(scheduler.grant_replay_timeslice(three), slice);
+        assert!(scheduler.replay_instruction_offsets.is_empty());
+        assert_eq!(
+            scheduler.take_granted_replay_instruction_offset(three, slice),
+            Some(offset)
+        );
+        assert_eq!(
+            scheduler.take_granted_replay_instruction_offset(three, slice),
+            None
+        );
+        // A receiver that installs no timeslice (a new thread's start) takes
+        // no offset, and drops it.
+        scheduler.set_replay_timeslice(three, slice, Some(offset));
+        assert_eq!(scheduler.grant_replay_timeslice(three), slice);
+        assert_eq!(
+            scheduler.take_granted_replay_instruction_offset(three, None),
+            None
+        );
+        assert!(scheduler.granted_replay_instruction_offsets.is_empty());
+        // A later grant replaces an offset no receiver took: one without a
+        // timeslice leaves none.
+        scheduler.set_replay_timeslice(three, slice, Some(offset));
+        assert_eq!(scheduler.grant_replay_timeslice(three), slice);
+        assert_eq!(scheduler.grant_replay_timeslice(three), None);
+        assert!(scheduler.granted_replay_instruction_offsets.is_empty());
+        scheduler.set_replay_timeslice(three, slice, Some(offset));
+        scheduler.forget_replay_timeslice(&three);
+        assert!(!scheduler.timeslices.contains_key(&three));
+        assert!(scheduler.replay_instruction_offsets.is_empty());
+        scheduler.set_replay_timeslice(three, slice, Some(offset));
+        scheduler.grant_replay_timeslice(three);
+        scheduler.forget_replay_timeslice(&three);
+        assert!(scheduler.granted_replay_instruction_offsets.is_empty());
+        // A timeslice without an offset replaces one with it.
+        scheduler.set_replay_timeslice(three, slice, Some(offset));
+        scheduler.set_replay_timeslice(three, slice, None);
+        assert!(scheduler.replay_instruction_offsets.is_empty());
+        // A thread killed between the replayer choosing it and its grant
+        // takes its timeslice and offset with it, so a later thread with its
+        // tid takes neither.
+        scheduler.set_replay_timeslice(three, slice, Some(offset));
+        let process = DetPid::from_raw(3);
+        scheduler.thread_tree.add_child(three, three, true);
+        scheduler.logically_kill_thread(&three, &process, MmId::initial(process));
+        assert!(!scheduler.timeslices.contains_key(&three));
+        assert!(scheduler.replay_instruction_offsets.is_empty());
+        assert!(scheduler.granted_replay_instruction_offsets.is_empty());
+        assert_eq!(
+            scheduler.take_granted_replay_instruction_offset(three, slice),
+            None
+        );
     }
 
     /// A background grant (here `BlockingExternalIO`) is a turn of a thread

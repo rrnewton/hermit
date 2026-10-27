@@ -125,7 +125,7 @@ configuration without changing scheduling behavior.
 | `--skid-margin` | Configures the ptrace PMU timer, not a guest clock. |
 | `--replay-preemptions-from` | Loads per-thread preemption points. This CLI request refuses on a timerless backend rather than reducing the recording to a cooperative subset. |
 | `--chaos-per-thread-slowdown` | Retains its existing acceptance. It weights sampled RCB time at callbacks and does not itself need timer delivery. Its effect depends on the backend's clock progress and `use_rcb_time`. |
-| `--chaos-instruction-offset=N` | Arms a chaos timeslice's own maximum `k` single steps past its branch target, `k` drawn per timeslice from `0..=N` (see below). Needs `--chaos`, precise timers and the ptrace backend on x86_64, the only one that steps; every other backend refuses it, as does a replay of a record that carries offsets. |
+| `--chaos-instruction-offset=N` | Arms a chaos timeslice's own maximum `k` single steps past its branch target, `k` drawn per timeslice from `0..=N` (see below). Needs `--chaos`, precise timers and the ptrace backend on x86_64, the only one that steps; every other backend refuses it, as does a replay (preemption or schedule) of a record that carries offsets. |
 
 `--target-timeslice` is a cooperative deadline checked when control returns to
 Detcore. It cannot bound guest code that never
@@ -174,9 +174,38 @@ was armed for and `k` (straight-line code can return to an address without a
 conditional branch, so the step count, not an address, names the point), and
 `--replay-preemptions-from` arms the same timer. A written record omits the
 offsets when it has none, so a record made without the option is unchanged.
-Schedule traces do not carry the offsets: `--replay-schedule-from`,
-`--strict-schedule-boundaries`, `hermit analyze` and `hermit bisect` refuse
-the option and records that use it.
+
+The schedule trace carries them too. The timer's own batch of branches
+(`Op::Branch`, followed by the `Op::OtherInstructions` event that names the
+address the steps stopped at) holds the same `(rcb_target, k)` in
+`SchedEvent::instruction_offset`, and the recording that writes an offset
+states `"format_version": 2` (`PREEMPTION_RECORD_FORMAT`); one without is
+written as before, with neither field. An edit keeps the format of the record
+it edits. The format is one monotone counter: format N holds every feature numbered N
+or lower, and a Hermit reads every format up to its own and refuses a newer
+one by name before reading anything else from the record, so a record that
+holds what it does not know is never read without it. (A Hermit from before
+the counter ignores the field, and a record from an unlanded branch whose
+counter assigns its numbers differently, such as an integration build where
+format 2 means poll skips, is outside this guarantee.) `--replay-schedule-from` hands the
+offset to the thread with the replayer's timeslice for that batch, and the
+thread arms `RcbsAndInstructions(rcb_target - now, k)` instead of the batch's
+branch count, which can lie up to one branch per step beyond the target. The
+replayed batch then carries the same offset, so a replay that does not stop
+there desyncs. Such a replay refuses `--chaos`: a chaos draw has no offset,
+so where the recorded slice ended at a syscall or trap among its timer's
+steps, the draw would stop the thread at the branch target first. It also
+refuses a record made under `--chaos-per-thread-slowdown`, whose factors it
+would not apply without `--chaos` (both until schedule replays draw no chaos
+decisions, #4614). `hermit analyze` and `hermit bisect` carry the offsets
+through every schedule they build, splice, minimize or write; their trials
+that replay a record draw none of their own, and when the analysis carries
+offsets its schedule replays run without chaos (and so it refuses chaos
+slowdown). A record whose rows hold offsets but
+whose schedule trace does not (written before the schedule trace held them)
+still replays with `--replay-preemptions-from`; `--replay-schedule-from`,
+`hermit analyze` and `hermit bisect` refuse it, as `--strict-schedule-boundaries`
+refuses the option.
 
 Where host timing could decide the point, the run fails closed with the
 retryable skid marker instead of placing it:

@@ -143,6 +143,7 @@ impl BisectOpts {
             // the run arguments' --timeout alone.
             trial_timeout: crate::analyze::TrialTimeout::Off,
             endpoints: Default::default(),
+            replays_instruction_offsets: false,
         };
         // Before the schedules are read: a refused cap or counter reads and
         // starts nothing.
@@ -158,6 +159,9 @@ impl BisectOpts {
             crate::tracing::write_stderr_diagnostic(&notice);
         }
 
+        // A schedule of a format this Hermit does not read is refused before
+        // anything else is read from either.
+        analyzer.refuse_unread_record_formats(&[("--good", &self.good), ("--bad", &self.bad)])?;
         let good = read_schedule(&self.good, "good")?;
         let bad = read_schedule(&self.bad, "bad")?;
         // Each trial's schedule is written anew without an epoch, so the
@@ -171,7 +175,7 @@ impl BisectOpts {
             ("--good", &self.good),
             ("--bad", &self.bad),
         ])?;
-        analyzer.refuse_instruction_offsets(&[("--good", &self.good), ("--bad", &self.bad)])?;
+        analyzer.adopt_instruction_offsets(&[("--good", &self.good), ("--bad", &self.bad)])?;
         let mut good = good.into_global();
         let mut bad = bad.into_global();
         // Analyze's trial outputs omit optional event timestamps. Put these
@@ -264,6 +268,73 @@ mod tests {
         assert_eq!(fs::read(good_path).unwrap(), good_bytes);
         assert_eq!(fs::read(bad_path).unwrap(), bad_bytes);
         result
+    }
+
+    /// Bisect accepts schedules whose events carry instruction offsets, keeps
+    /// them in the events it searches, and replays its trials without chaos
+    /// (`AnalyzeOpts::adopt_instruction_offsets`) and without drawing
+    /// offsets of its own. A schedule of a newer format is refused by name,
+    /// before anything else is read from it (here its epoch, which the run
+    /// arguments' would contradict).
+    #[test]
+    fn bisect_replays_offset_schedules_without_chaos() {
+        let tid = DetTid::from_raw(3);
+        let offset = detcore::preemptions::InstructionOffset {
+            rcb_target: 18,
+            instructions: 4,
+        };
+        let batch =
+            |count, offset| SchedEvent::branches(tid, count).with_instruction_offset(offset);
+        let good = search_record(vec![batch(20, None), batch(5, None)]);
+        let bad = search_record(vec![batch(22, Some(offset)), batch(3, None)]);
+        assert_eq!(bad["format_version"], 2, "{bad}");
+        let dir = tempfile::tempdir().unwrap();
+        let (good_path, bad_path) = (dir.path().join("good.json"), dir.path().join("bad.json"));
+        fs::write(&good_path, good.to_string()).unwrap();
+        fs::write(&bad_path, bad.to_string()).unwrap();
+        let prepare = |bad_path: &Path| {
+            let args = crate::Args::try_parse_from([
+                "hermit".to_owned(),
+                "bisect".to_owned(),
+                format!("--good={}", good_path.display()),
+                format!("--bad={}", bad_path.display()),
+                "--".to_owned(),
+                format!("--epoch={RECORDED}"),
+                "--pipe-wake-latency=3000000".to_owned(),
+                "--chaos".to_owned(),
+                "/bin/true".to_owned(),
+            ])
+            .unwrap();
+            let crate::Subcommand::Bisect(options) = args.command else {
+                panic!("expected bisect")
+            };
+            options.prepare(&args.global)
+        };
+        let (mut analyzer, _, bad_events) = prepare(&bad_path).unwrap();
+        assert!(analyzer.replays_instruction_offsets);
+        assert_eq!(bad_events[0].instruction_offset, Some(offset));
+        analyzer.tmp_dir = Some(dir.path().to_path_buf());
+        let raw = crate::analyze::rundata::RunData::get_raw_runopts(&analyzer);
+        assert!(raw.det_opts.det_config.chaos);
+        let trial = crate::analyze::rundata::RunData::new(&analyzer, "trial".to_owned(), raw)
+            .with_schedule_replay_from(bad_path.clone())
+            .into_runopts();
+        assert!(!trial.det_opts.det_config.chaos);
+        assert_eq!(trial.det_opts.det_config.chaos_instruction_offset, 0);
+
+        let mut newer = bad.clone();
+        newer["format_version"] = serde_json::json!(3);
+        newer["epoch"] = serde_json::json!("2001-02-03T04:05:06Z");
+        let newer_path = dir.path().join("newer.json");
+        fs::write(&newer_path, newer.to_string()).unwrap();
+        let Err(error) = prepare(&newer_path) else {
+            panic!("a newer format is refused")
+        };
+        assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("is format 3, written by a newer Hermit"),
+            "{error:#}"
+        );
     }
 
     #[test]

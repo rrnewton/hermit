@@ -169,6 +169,9 @@ fn compare_desync(observed: &SchedEvent, expected: &SchedEvent) -> String {
         if observed.end_time != expected.end_time {
             msg = "TIME-".to_owned() + &msg;
         }
+        if observed.instruction_offset != expected.instruction_offset {
+            msg = "OFFSET-".to_owned() + &msg;
+        }
         if observed.op == Op::Branch
             && expected.op == Op::Branch
             && observed.count != expected.count
@@ -204,6 +207,13 @@ fn is_desync(observed: &SchedEvent, expected: &SchedEvent) -> bool {
         return true;
     }
 
+    // Where a timer armed past its branch target stopped the thread: the
+    // replay arms the recorded one, so the observed event carries it exactly
+    // when the expected one does.
+    if observed.instruction_offset != expected.instruction_offset {
+        return true;
+    }
+
     false
 }
 
@@ -227,6 +237,9 @@ fn hard_desync_fields(observed: &SchedEvent, expected: &SchedEvent) -> Vec<&'sta
     }
     if expected.end_rip.is_some() && observed.end_rip != expected.end_rip {
         fields.push("end_rip");
+    }
+    if observed.instruction_offset != expected.instruction_offset {
+        fields.push("instruction_offset");
     }
     fields
 }
@@ -400,6 +413,21 @@ impl Replayer {
     /// Where the replay dropped the rest of the schedule, if it did.
     pub(super) fn release(&self) -> Option<&Release> {
         self.release.as_ref()
+    }
+
+    /// Where the timer of the slice that [`Self::next_resume`]'s, and the last
+    /// `ReplayAction`'s, timeslice runs to was armed past its branch target,
+    /// if its recording armed it so (`SchedEvent::instruction_offset`). Read
+    /// right after `observe_event`, it belongs to that action's timeslice:
+    /// both come from the next event to replay, the timeslice from its
+    /// branch count (`resolve_time_to_run`) and this from its offset, so an
+    /// offset comes only with a timeslice.
+    pub(super) fn next_instruction_offset(
+        &self,
+    ) -> Option<detcore_model::schedule::InstructionOffset> {
+        let next = self.cursor.peek()?;
+        self.resolve_time_to_run(next)?;
+        next.instruction_offset
     }
 
     /// Whether the recorded schedule still has an event to replay. Past its
@@ -724,6 +752,7 @@ mod builder {
                 start_rip: None,
                 end_rip: InstructionPointer::new(end_rip),
                 end_time: Some(self.time.as_nanos()),
+                instruction_offset: None,
                 op: Op::Syscall(sys_no, SyscallPhase::Prehook),
             }
         }
@@ -736,6 +765,7 @@ mod builder {
                 start_rip: None,
                 end_rip: InstructionPointer::new(end_rip),
                 end_time: Some(self.time.as_nanos()),
+                instruction_offset: None,
                 op: Op::Syscall(sys_no, SyscallPhase::Posthook),
             }
         }
@@ -746,6 +776,7 @@ mod builder {
                 dettid: tid,
                 start_rip: None,
                 end_time: Some(self.time.as_nanos()),
+                instruction_offset: None,
                 op: Op::OtherInstructions,
                 end_rip: InstructionPointer::new(end_rip),
             }
@@ -758,6 +789,7 @@ mod builder {
                 dettid: tid,
                 end_rip: None,
                 end_time: Some(self.time.as_nanos()),
+                instruction_offset: None,
                 op: Op::Branch,
                 start_rip: None,
             }
@@ -1083,6 +1115,114 @@ mod tests {
         assert!(
             replayer.keep_retry_turn(tid(3)),
             "the schedule advanced, so the count starts again"
+        );
+    }
+
+    /// A recorded preemption's instruction offset comes with the timeslice
+    /// the replayer derives from its batch of branches, for the thread that
+    /// keeps running and for one a context switch hands the turn to, and never
+    /// without that timeslice.
+    #[test]
+    fn a_recorded_instruction_offset_comes_with_its_timeslice() {
+        let offset = detcore_model::schedule::InstructionOffset {
+            rcb_target: 120,
+            instructions: 6,
+        };
+        let mut b = builder::SchedTestBuilder::new();
+        let continuing = vec![
+            b.other(SOME_RIP, tid(3)),
+            b.branch(123, tid(3)).with_instruction_offset(Some(offset)),
+            b.other(SOME_RIP, tid(3)),
+            b.branch(1, tid(5)),
+        ];
+        let mut replayer = Replayer::new(continuing.clone());
+        assert_eq!(replayer.next_instruction_offset(), None);
+        assert_eq!(
+            replayer.observe_event(&continuing[0]),
+            ReplayAction::Continue(Some(LogicalTime::from_rcbs(123)))
+        );
+        assert_eq!(replayer.next_instruction_offset(), Some(offset));
+        assert_eq!(
+            replayer.next_resume(),
+            Some((tid(3), Some(LogicalTime::from_rcbs(123))))
+        );
+
+        let switching = vec![
+            b.other(SOME_RIP, tid(5)),
+            b.branch(123, tid(3)).with_instruction_offset(Some(offset)),
+            b.other(SOME_RIP, tid(3)),
+            b.branch(1, tid(5)),
+        ];
+        let mut replayer = Replayer::new(switching.clone());
+        assert_eq!(
+            replayer.observe_event(&switching[0]),
+            ReplayAction::ContextSwitch(true, tid(3), Some(LogicalTime::from_rcbs(123)))
+        );
+        assert_eq!(replayer.next_instruction_offset(), Some(offset));
+
+        // A known gap, as a recording produces it: the offset timer's batch,
+        // its `OtherInstructions` event, then a syscall of the same thread at
+        // once (the thread kept running after the slice end). The replayer
+        // gives such a batch no timeslice (`resolve_time_to_run`), so its
+        // offset is not armed and its replay desyncs. A slice end of the same
+        // shape without an offset (a stop at a branch followed by the same
+        // thread's syscall) has the same gap today
+        // (https://github.com/rrnewton/hermit/issues/4833).
+        let continued_to_a_syscall = vec![
+            b.other(SOME_RIP, tid(3)),
+            b.branch(123, tid(3)).with_instruction_offset(Some(offset)),
+            b.other(SOME_RIP, tid(3)),
+            b.syscall_pre(Sysno::write, SOME_RIP, tid(3)),
+        ];
+        let mut replayer = Replayer::new(continued_to_a_syscall.clone());
+        assert_eq!(
+            replayer.observe_event(&continued_to_a_syscall[0]),
+            ReplayAction::Continue(None)
+        );
+        assert_eq!(replayer.next_instruction_offset(), None);
+    }
+
+    /// A batch of branches observed without the offset its recording carries
+    /// (a replay that did not stop the thread where its recording did), or
+    /// with another one, is a hard desync that names the offset, and a fatal
+    /// one under `--die-on-desync`.
+    #[test]
+    fn a_missed_instruction_offset_is_a_hard_desync() {
+        let offset = detcore_model::schedule::InstructionOffset {
+            rcb_target: 120,
+            instructions: 6,
+        };
+        let mut b = builder::SchedTestBuilder::new();
+        let recorded = b.branch(123, tid(3)).with_instruction_offset(Some(offset));
+        let missed = SchedEvent {
+            instruction_offset: None,
+            ..recorded
+        };
+        let moved = SchedEvent {
+            instruction_offset: Some(detcore_model::schedule::InstructionOffset {
+                instructions: 5,
+                ..offset
+            }),
+            ..recorded
+        };
+        for observed in [&missed, &moved] {
+            assert!(is_desync(observed, &recorded));
+            assert!(is_hard_desync(observed, &recorded));
+            assert_eq!(
+                hard_desync_fields(observed, &recorded),
+                vec!["instruction_offset"]
+            );
+            assert!(compare_desync(observed, &recorded).starts_with("OFFSET-"));
+        }
+        // And in the other direction: an offset the recording does not have.
+        assert!(is_hard_desync(&recorded, &missed));
+        assert!(!is_desync(&recorded, &recorded));
+
+        let mut replayer = Replayer::new(vec![recorded.clone(), b.branch(1, tid(5))]);
+        replayer.die_on_desync = true;
+        assert_eq!(
+            replayer.observe_event(&missed),
+            ReplayAction::Stop(StopReason::FatalDesync)
         );
     }
 

@@ -12,7 +12,7 @@ mod consts;
 mod memory;
 mod minimize;
 mod phases;
-mod rundata;
+pub(crate) mod rundata;
 mod types;
 
 pub use memory::MemoryBudget;

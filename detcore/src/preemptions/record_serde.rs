@@ -67,6 +67,8 @@ struct RawRecord {
     host_inputs: Option<HostInputSet>,
     #[serde(default, skip_serializing_if = "HostObservedCount::is_zero")]
     store_exclusive_failures: HostObservedCount,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    format_version: Option<u32>,
 }
 
 struct LegacyFields<'a>(&'a PreemptionRecord);

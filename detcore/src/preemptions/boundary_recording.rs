@@ -68,6 +68,67 @@ impl FormatProbe {
     }
 }
 
+/// A `format_version` as [`probe_format`] reads it: a format number, or
+/// `None` for anything else, which the record's ordinary decoding reports.
+struct StatedFormat(Option<u32>);
+
+impl<'de> Deserialize<'de> for StatedFormat {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(Self(
+            value.as_u64().and_then(|format| u32::try_from(format).ok()),
+        ))
+    }
+}
+
+/// The envelope field, present (even as null) or absent, so that a null
+/// envelope is not taken for a legacy record.
+fn present_envelope<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<T>>, D::Error> {
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+/// The format a preemption record states (`PreemptionRecord::format_version`,
+/// 1 when absent), read from its bytes without decoding the record: at the
+/// top level of a legacy record, and only in the preemptions of a
+/// slice-boundary one (a field beside the envelope is the envelope decoder's
+/// to refuse). A reader checks it first, so that a record of a format it does
+/// not read is refused as such ([`super::RecordFormatRefusal`]) before anything
+/// that format could change is parsed or applied. The probe is typed, so a
+/// duplicated `format_version` or `preemptions` is an error here, as in the
+/// strict decoders, never a format; every other field is skipped unread. A
+/// format that is not a number, or a null envelope, reads as 1, and an
+/// envelope that is not an object is an error, each left to the record's
+/// ordinary decoding to report.
+pub(super) fn probe_format(bytes: &[u8]) -> Result<u32, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct Preemptions {
+        #[serde(default)]
+        format_version: Option<StatedFormat>,
+    }
+    #[derive(Deserialize)]
+    struct Envelope {
+        #[serde(default)]
+        preemptions: Option<Preemptions>,
+    }
+    #[derive(Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        format_version: Option<StatedFormat>,
+        #[serde(default, deserialize_with = "present_envelope")]
+        slice_boundary_recording: Option<Option<Envelope>>,
+    }
+    let probe: Probe = serde_json::from_slice(bytes)?;
+    let stated = match probe.slice_boundary_recording {
+        Some(envelope) => envelope
+            .and_then(|envelope| envelope.preemptions)
+            .and_then(|preemptions| preemptions.format_version),
+        None => probe.format_version,
+    };
+    Ok(stated.and_then(|format| format.0).unwrap_or(1))
+}
+
 pub(super) fn read_settings<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, String> {
     let bytes = std::fs::read(path)
         .map_err(|e| format!("cannot read preemption record {}: {}", path.display(), e))?;
@@ -95,6 +156,31 @@ impl BoundaryRecording {
         if !preemptions.global.is_empty() {
             bail!("slice-boundary recording has a second, legacy global event stream");
         }
+        // --chaos-instruction-offset refuses --strict-schedule-boundaries, so
+        // no slice-boundary recording holds an offset decision, in a thread's
+        // rows or in its events.
+        if let Some((tid, _)) = preemptions
+            .per_thread
+            .iter()
+            .find(|(_, history)| history.has_instruction_offsets())
+        {
+            bail!(
+                "slice-boundary recording thread {tid}'s rows carry instruction offsets, which a \
+                 slice-boundary recording cannot hold; the record is malformed"
+            );
+        }
+        if let Some(index) = schedule.records().iter().position(|record| {
+            matches!(
+                record,
+                detcore_model::schedule::boundary::Record::Event(event)
+                    if event.instruction_offset.is_some()
+            )
+        }) {
+            bail!(
+                "slice-boundary recording record {index} carries an instruction offset, which a \
+                 slice-boundary recording cannot hold; the record is malformed"
+            );
+        }
         Ok(Self {
             preemptions,
             schedule,
@@ -119,8 +205,24 @@ impl TryFrom<BoundaryWire> for BoundaryRecording {
     type Error = anyhow::Error;
 
     fn try_from(wire: BoundaryWire) -> Result<Self, Self::Error> {
+        wire.preemptions.check_format()?;
         Self::new(wire.preemptions, wire.schedule)
     }
+}
+
+/// Exit with the policy-refusal status when `result` failed because the
+/// record is of a format this Hermit does not read
+/// ([`super::RecordFormatRefusal`]); pass any other result through, so the
+/// caller keeps its own handling of unreadable or malformed files.
+pub(crate) fn exit_on_record_format_refusal<T>(result: anyhow::Result<T>) -> anyhow::Result<T> {
+    if let Err(error) = &result
+        && error
+            .chain()
+            .any(|cause| cause.downcast_ref::<super::RecordFormatRefusal>().is_some())
+    {
+        crate::scheduler::exit_on_scheduler_refusal(&format!("{error:#}"));
+    }
+    result
 }
 
 impl From<BoundaryRecording> for BoundaryWire {
@@ -170,6 +272,15 @@ impl Recording {
     /// Validate and parse either format without a malformed-new-to-legacy
     /// fallback.
     pub fn decode(bytes: &[u8]) -> anyhow::Result<Self> {
+        // A format this Hermit does not read is refused before anything else
+        // is parsed, kept typed so that a replay exits with the policy status
+        // (`exit_on_record_format_refusal`), for both forms.
+        // A record the probe cannot read (malformed JSON, a duplicated field,
+        // an envelope that is not an object) is left to the decoding below,
+        // which reports it.
+        if let Ok(format) = probe_format(bytes) {
+            super::check_record_format(format)?;
+        }
         // Inspect only to dispatch. Deserialize the ORIGINAL bytes again so
         // duplicate fields in the envelope are rejected. A malformed new
         // recording never falls back to legacy.
@@ -334,7 +445,7 @@ impl std::fmt::Display for HistoryReader {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use detcore_model::schedule::boundary::Boundary;
     use detcore_model::schedule::boundary::Cause;
     use detcore_model::schedule::boundary::Entry;
@@ -352,7 +463,7 @@ mod tests {
     use crate::types::LogicalTime;
     use crate::types::SchedEvent;
 
-    fn sample(markers: bool) -> Recording {
+    pub(crate) fn sample(markers: bool) -> Recording {
         let metadata: PreemptionRecord = serde_json::from_str(
             &PreemptionWriter::new(None)
                 .with_epoch("2001-02-03T04:05:06Z".parse().unwrap())
@@ -394,6 +505,168 @@ mod tests {
         Recording::Boundaries(
             BoundaryRecording::new(metadata, Schedule::new(records).unwrap()).unwrap(),
         )
+    }
+
+    /// Strict slice boundaries refuse --chaos-instruction-offset, so a
+    /// slice-boundary recording whose events hold an offset is malformed:
+    /// refused when built and when read, as an error rather than a format
+    /// refusal. The same recording without the offset is accepted.
+    #[test]
+    fn a_boundary_recording_holding_an_instruction_offset_is_malformed() {
+        let metadata = || -> PreemptionRecord {
+            serde_json::from_str(
+                &PreemptionWriter::new(None)
+                    .with_epoch("2001-02-03T04:05:06Z".parse().unwrap())
+                    .with_pipe_wake_latency(Some(0))
+                    .with_signal_state_copy(false)
+                    .into_string(),
+            )
+            .unwrap()
+        };
+        let offset = crate::resources::InstructionOffset {
+            rcb_target: 40,
+            instructions: 5,
+        };
+        let plain = SchedEvent::branches(DetTid::from_raw(3), 3);
+        let with = plain.clone().with_instruction_offset(Some(offset));
+        let error = BoundaryRecording::new(
+            metadata(),
+            Schedule::new(vec![Record::Event(with.clone())]).unwrap(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("malformed"), "{error:#}");
+
+        let text = String::from_utf8(
+            Recording::Boundaries(
+                BoundaryRecording::new(
+                    metadata(),
+                    Schedule::new(vec![Record::Event(plain.clone())]).unwrap(),
+                )
+                .unwrap(),
+            )
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+        Recording::decode(text.as_bytes()).unwrap();
+        let plain_json = serde_json::to_string(&plain).unwrap();
+        assert!(text.contains(&plain_json), "{text}");
+        let spliced = text.replacen(&plain_json, &serde_json::to_string(&with).unwrap(), 1);
+        let error = Recording::decode(spliced.as_bytes()).unwrap_err();
+        assert!(format!("{error:#}").contains("malformed"), "{error:#}");
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<crate::preemptions::RecordFormatRefusal>()),
+            "{error:#}"
+        );
+
+        // An offset in a thread's rows (a slice whose timer stopped it at a
+        // syscall or trap leaves no offset on an event): refused when built
+        // and when read, and the boundary writer refuses to record one.
+        let tid = DetTid::from_raw(3);
+        let priority = crate::scheduler::runqueue::DEFAULT_PRIORITY;
+        let at = LogicalTime::from_nanos;
+        let mut writer = PreemptionWriter::new(None)
+            .with_epoch("2001-02-03T04:05:06Z".parse().unwrap())
+            .with_pipe_wake_latency(Some(0))
+            .with_signal_state_copy(false);
+        writer.register_thread(tid, priority);
+        writer.insert_reprioritization(tid, at(100), 41, priority, 5, Some(offset));
+        let rows: PreemptionRecord = serde_json::from_str(&writer.into_string()).unwrap();
+        let error =
+            BoundaryRecording::new(rows.clone(), Schedule::new(vec![]).unwrap()).unwrap_err();
+        assert!(format!("{error:#}").contains("malformed"), "{error:#}");
+        let mut envelope: serde_json::Value = serde_json::from_str(&text).unwrap();
+        envelope["slice_boundary_recording"]["preemptions"] = serde_json::to_value(&rows).unwrap();
+        let error = Recording::decode(envelope.to_string().as_bytes()).unwrap_err();
+        assert!(format!("{error:#}").contains("malformed"), "{error:#}");
+        assert!(
+            !error
+                .chain()
+                .any(|cause| cause.is::<crate::preemptions::RecordFormatRefusal>()),
+            "{error:#}"
+        );
+        let boundary_writer = std::panic::catch_unwind(|| {
+            let mut writer = PreemptionWriter::new(None).with_slice_boundaries().unwrap();
+            writer.register_thread(tid, priority);
+            writer.insert_reprioritization(tid, at(100), 41, priority, 5, Some(offset));
+        });
+        assert!(boundary_writer.is_err());
+    }
+
+    /// A slice-boundary recording states its format inside its envelope
+    /// alone: a `format_version` beside the envelope is the envelope
+    /// decoder's to refuse, not a format refusal, and a null or malformed
+    /// envelope reaches ordinary decoding. A legacy record states it at the
+    /// top level.
+    #[test]
+    fn an_envelope_states_its_format_only_inside_it() {
+        let refused = |bytes: &[u8]| {
+            Recording::decode(bytes).err().is_some_and(|error| {
+                error
+                    .chain()
+                    .any(|cause| cause.is::<crate::preemptions::RecordFormatRefusal>())
+            })
+        };
+        let envelope: serde_json::Value =
+            serde_json::from_slice(&sample(false).encode().unwrap()).unwrap();
+        // Beside the envelope: read as 1, refused by the envelope decoder.
+        let mut beside = envelope.clone();
+        beside["format_version"] = serde_json::json!(99);
+        let beside = beside.to_string();
+        assert_eq!(probe_format(beside.as_bytes()).unwrap(), 1);
+        let error = Recording::decode(beside.as_bytes()).unwrap_err();
+        assert!(!refused(beside.as_bytes()), "{error:#}");
+        // Inside it: refused by format.
+        let mut inside = envelope.clone();
+        inside["slice_boundary_recording"]["preemptions"]["format_version"] = serde_json::json!(99);
+        let inside = inside.to_string();
+        assert_eq!(probe_format(inside.as_bytes()).unwrap(), 99);
+        assert!(refused(inside.as_bytes()));
+        // A null or malformed envelope: ordinary decoding reports it, never
+        // a format refusal (the probe reads 1, or cannot read it at all).
+        for broken in [
+            serde_json::json!({"slice_boundary_recording": null, "format_version": 99}),
+            serde_json::json!({"slice_boundary_recording": 7, "format_version": 99}),
+            serde_json::json!({"slice_boundary_recording": {"preemptions": {"format_version": "x"}}}),
+        ] {
+            let broken = broken.to_string();
+            assert_eq!(probe_format(broken.as_bytes()).unwrap_or(1), 1, "{broken}");
+            assert!(Recording::decode(broken.as_bytes()).is_err(), "{broken}");
+            assert!(!refused(broken.as_bytes()), "{broken}");
+        }
+        // A duplicated `format_version` (top level or in the envelope's
+        // preemptions) or `preemptions`, in either order: an error of the
+        // strict decoders, never a format refusal.
+        let preemptions = |format: u32| {
+            format!(r#""preemptions":{{"per_thread":{{}},"global":[],"format_version":{format}}}"#)
+        };
+        let mut duplicated = Vec::new();
+        for (first, second) in [(99, 1), (1, 99)] {
+            let (a, b) = (
+                format!(r#""format_version":{first}"#),
+                format!(r#""format_version":{second}"#),
+            );
+            duplicated.push(format!(r#"{{"per_thread":{{}},"global":[],{a},{b}}}"#));
+            duplicated.push(format!(
+                r#"{{"slice_boundary_recording":{{"preemptions":{{"per_thread":{{}},"global":[],{a},{b}}},"schedule":[]}}}}"#
+            ));
+            duplicated.push(format!(
+                r#"{{"slice_boundary_recording":{{{},{},"schedule":[]}}}}"#,
+                preemptions(first),
+                preemptions(second)
+            ));
+        }
+        for record in duplicated {
+            assert!(probe_format(record.as_bytes()).is_err(), "{record}");
+            assert!(Recording::decode(record.as_bytes()).is_err(), "{record}");
+            assert!(!refused(record.as_bytes()), "{record}");
+        }
+        // A legacy record: the top level.
+        let legacy = serde_json::json!({"per_thread": {}, "global": [], "format_version": 99});
+        assert_eq!(probe_format(legacy.to_string().as_bytes()).unwrap(), 99);
+        assert!(refused(legacy.to_string().as_bytes()));
     }
 
     #[test]

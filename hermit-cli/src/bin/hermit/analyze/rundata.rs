@@ -553,7 +553,7 @@ impl RunData {
     }
 
     /// The raw, unvarnished, RunOpts.
-    fn get_raw_runopts(aopts: &AnalyzeOpts) -> RunOpts {
+    pub(crate) fn get_raw_runopts(aopts: &AnalyzeOpts) -> RunOpts {
         // Bogus arg 0 for CLI argument parsing:
         let mut run_cmd: Vec<String> = vec!["hermit-run".to_string()];
 
@@ -618,6 +618,7 @@ impl RunData {
             ro.det_opts.det_config.seed = seed;
         } else if let Some(path) = &aopts.run1_preemptions {
             ro.det_opts.det_config.replay_preemptions_from = Some(path.clone());
+            Self::draw_no_instruction_offsets(&mut ro);
         }
         Ok(ro)
     }
@@ -681,6 +682,7 @@ impl RunData {
     /// that diverges does.
     pub fn with_preempts_path_in(mut self, path: PathBuf) -> Self {
         self.runopts.det_opts.det_config.replay_preemptions_from = Some(path);
+        Self::draw_no_instruction_offsets(&mut self.runopts);
         self
     }
 
@@ -697,6 +699,21 @@ impl RunData {
 
     /// Replay `pr`, a record analyze edited
     /// ([`Self::with_edited_preempts_path_in`]).
+    /// A trial that replays a record, or runs without chaos, draws no
+    /// instruction offsets: a replay arms the offsets its record holds, and
+    /// `hermit run` refuses `--chaos-instruction-offset` beside a replay or
+    /// without `--chaos`. Only the chaos runs that search for a target keep
+    /// the run arguments' `--chaos-instruction-offset`.
+    pub(crate) fn draw_no_instruction_offsets(runopts: &mut RunOpts) {
+        let config = &mut runopts.det_opts.det_config;
+        if config.replay_preemptions_from.is_some()
+            || config.replay_schedule_from.is_some()
+            || !config.chaos
+        {
+            config.chaos_instruction_offset = 0;
+        }
+    }
+
     pub fn with_preempts_in(mut self, pr: PreemptionRecord) -> Self {
         let path = self.preempts_path_in().to_path_buf();
         pr.write_to_disk(&path)
@@ -733,6 +750,13 @@ impl RunData {
 
     pub fn with_schedule_replay_from(mut self, path: PathBuf) -> Self {
         self.runopts.det_opts.det_config.replay_schedule_from = Some(path);
+        // A schedule replay of offsets takes every timer from its schedule
+        // (`AnalyzeOpts::adopt_instruction_offsets`).
+        // TODO(#4614): drop once schedule replays draw no chaos decisions.
+        if self.analyze_opts.replays_instruction_offsets {
+            self.runopts.det_opts.det_config.chaos = false;
+        }
+        Self::draw_no_instruction_offsets(&mut self.runopts);
         self
     }
 
@@ -1432,28 +1456,135 @@ impl AnalyzeOpts {
         RunData::get_raw_runopts(self).ensure_timeout_supported()
     }
 
-    /// Refuses (exit 122) `--chaos-instruction-offset` in the run arguments,
-    /// and any of `recordings` (or a record the run arguments replay) whose
-    /// timeslices it delivered past their branch targets. The searches edit
-    /// preemption records and schedule traces row by row and replay them by
-    /// logical time and branch count, which cannot carry an instruction
-    /// offset, so their trials would not reproduce the run they started from.
-    pub fn refuse_instruction_offsets(&self, recordings: &[(&str, &Path)]) -> anyhow::Result<()> {
+    /// Checks, before any workspace or trial exists, the instruction offsets
+    /// `--chaos-instruction-offset` decides in the run arguments' chaos runs
+    /// and records in `recordings` (or in a record the run arguments replay).
+    /// Refuses (exit 122):
+    /// - a record of a newer format than this Hermit reads
+    ///   (`detcore::preemptions::RecordFormatRefusal`);
+    /// - a record whose rows hold offsets its schedule trace does not (written
+    ///   before schedule traces held them): the searches replay and splice
+    ///   schedule traces, and that one would stop each such slice at a branch;
+    /// - offsets, drawn or recorded, that the trials cannot stop at: off the
+    ///   ptrace backend, with imprecise timers (`--imprecise-search` too) or
+    ///   disabled ones, under `--no-rcb-time`, or on aarch64, as a
+    ///   `hermit run` replay refuses them (`instruction_offset_replay_refusal`).
+    ///
+    /// An analysis may combine recordings with offsets and without: each
+    /// event and each row carries its own offset or none, so a trial spliced
+    /// from both replays each event as it was recorded. The default baseline,
+    /// a run without chaos, never has any. (A `--run1-preemptions` analysis
+    /// panics before its search on this base whatever it holds,
+    /// https://github.com/rrnewton/hermit/issues/4832.)
+    ///
+    /// Notes whether the analysis replays offsets
+    /// (`replays_instruction_offsets`): its schedule replays then run without
+    /// chaos. A chaos draw in a replay draws no offset, so where the
+    /// recording's slice ended among the steps of its timer (at a system
+    /// call or a trap), the replay's draw would stop the thread at the branch
+    /// target first. The schedule trace holds every timer decision such a
+    /// replay needs.
+    pub fn adopt_instruction_offsets(
+        &mut self,
+        recordings: &[(&str, &Path)],
+    ) -> anyhow::Result<()> {
+        use detcore::preemptions::RecordedOffsets;
         let trial = RunData::get_raw_runopts(self);
         let config = &trial.det_opts.det_config;
-        let refuse = |what: String| {
+        let recordings = Self::recordings_with_run_arguments(recordings, config);
+        let refuse = |what: String, why: String| {
             Err(
                 anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
-                    "`hermit analyze` and `hermit bisect` cannot search {what}: their edited \
-                     records do not carry --chaos-instruction-offset's instruction offsets, so \
-                     a trial would not reproduce the run. Search without the option, or replay \
-                     the record with `hermit run --replay-preemptions-from`."
+                    "`hermit analyze` and `hermit bisect` cannot replay the instruction offsets \
+                     (--chaos-instruction-offset) of {what} in their trials: {why}"
                 )),
             )
         };
+        let mut sources = Vec::new();
         if config.chaos_instruction_offset > 0 {
-            return refuse("runs with --chaos-instruction-offset".to_owned());
+            if self.imprecise_search {
+                return refuse(
+                    "runs with --chaos-instruction-offset".to_owned(),
+                    "--imprecise-search searches with imprecise timers, which take no single \
+                     steps; search without it"
+                        .to_owned(),
+                );
+            }
+            sources.push("runs with --chaos-instruction-offset".to_owned());
         }
+        for (option, path) in &recordings {
+            match detcore::preemptions::read_recorded_offsets(path).map_err(anyhow::Error::msg)? {
+                RecordedOffsets::None => {}
+                RecordedOffsets::RowsOnly => {
+                    return refuse(
+                        format!("{option} {}", path.display()),
+                        "its schedule trace does not record the instruction offsets its rows \
+                         hold (it was recorded before schedule traces held them), and the \
+                         searches replay and splice schedule traces. Record it again with this \
+                         Hermit, or replay it with `hermit run --replay-preemptions-from`"
+                            .to_owned(),
+                    );
+                }
+                // A malformed record is an error, not a policy refusal.
+                RecordedOffsets::Malformed => anyhow::bail!(
+                    "{option} {}: {}",
+                    path.display(),
+                    crate::run::malformed_offsets()
+                ),
+                RecordedOffsets::Recorded => sources.push(format!("{option} {}", path.display())),
+            }
+        }
+        let Some(what) = sources.into_iter().next() else {
+            return Ok(());
+        };
+        // The trials' schedule replays run without chaos, which also drops
+        // `--chaos-per-thread-slowdown`'s factors, and with them the virtual
+        // time the recording ran under.
+        // TODO(#4614): drop once schedule replays draw no chaos decisions.
+        let mut slowed = Vec::new();
+        if config.chaos && config.chaos_per_thread_slowdown {
+            slowed.push("the run arguments' --chaos-per-thread-slowdown".to_owned());
+        }
+        for (option, path) in &recordings {
+            if detcore::preemptions::read_recorded_chaos_slowdown(path)
+                .map_err(anyhow::Error::msg)?
+            {
+                slowed.push(format!("{option} {}, recorded with it", path.display()));
+            }
+        }
+        if let Some(slowed) = slowed.first() {
+            return refuse(
+                what,
+                format!(
+                    "the trials replay schedules without --chaos, and so without the per-thread \
+                     slowdown of {slowed}, which changes the virtual time each thread ran under. \
+                     Analyze without --chaos-per-thread-slowdown until schedule replays keep the \
+                     slowdown without chaos's draws (#4614)"
+                ),
+            );
+        }
+        // The trials' replays, which run without chaos.
+        let mut replay = trial.det_opts.det_config.clone();
+        replay.chaos = false;
+        if let Some(why) = crate::run::instruction_offset_replay_refusal(
+            RecordedOffsets::Recorded,
+            true,
+            cfg!(target_arch = "aarch64"),
+            trial.selected_backend(),
+            &replay,
+        ) {
+            return refuse(what, why);
+        }
+        self.replays_instruction_offsets = true;
+        Ok(())
+    }
+
+    /// The recordings an analysis reads: those given to it, and those its run
+    /// arguments replay.
+    fn recordings_with_run_arguments<'a>(
+        recordings: &[(&'a str, &'a Path)],
+        config: &'a detcore::Config,
+    ) -> Vec<(&'a str, &'a Path)> {
         let in_run_arguments = [
             (
                 "--replay-schedule-from",
@@ -1464,16 +1595,28 @@ impl AnalyzeOpts {
                 config.replay_preemptions_from.as_deref(),
             ),
         ];
-        for (option, path) in recordings.iter().copied().chain(
-            in_run_arguments
-                .into_iter()
-                .filter_map(|(option, path)| Some((option, path?))),
-        ) {
-            if detcore::preemptions::read_recorded_instruction_offsets(path)
-                .map_err(anyhow::Error::msg)?
-            {
-                return refuse(format!("{option} {}", path.display()));
-            }
+        recordings
+            .iter()
+            .copied()
+            .chain(
+                in_run_arguments
+                    .into_iter()
+                    .filter_map(|(option, path)| Some((option, path?))),
+            )
+            .collect()
+    }
+
+    /// Refuses (exit 122) a recording, given to the analysis or replayed by
+    /// its run arguments, of a format this Hermit does not read
+    /// (`detcore::preemptions::RecordFormatRefusal`). Called before any
+    /// other reader of the recordings: the epoch, the pipe-wake latency and
+    /// the offsets a newer format could change are not read from it.
+    pub fn refuse_unread_record_formats(&self, recordings: &[(&str, &Path)]) -> anyhow::Result<()> {
+        let trial = RunData::get_raw_runopts(self);
+        for (option, path) in
+            Self::recordings_with_run_arguments(recordings, &trial.det_opts.det_config)
+        {
+            crate::run::refuse_unread_record_format_of(option, path)?;
         }
         Ok(())
     }

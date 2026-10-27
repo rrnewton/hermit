@@ -242,7 +242,12 @@ impl AnalyzeOpts {
                             }
                             Ok(())
                         })?;
-                    self.stamp_trial_record(PreemptionRecord::from_vecs(&btmap))
+                    // A record with instruction offsets keeps each kept
+                    // row's branch target and offset (`from_vecs_of`).
+                    self.stamp_trial_record(
+                        PreemptionRecord::from_vecs_of(&btmap, &init_schedule)
+                            .map_err(anyhow::Error::msg)?,
+                    )
                 };
                 if let Err(e) = pr_new.validate() {
                     bail!(
@@ -323,6 +328,83 @@ mod tests {
 
     use super::*;
     use crate::container::LogCapExceeded;
+
+    /// Minimizing a record with `--chaos-instruction-offset` decisions keeps
+    /// each kept row's exact branch target and offset in every trial, so a
+    /// trial still stops where the record did, and the minimal record keeps
+    /// the critical row's offset, stamped format 2. Here the target outcome
+    /// needs exactly the row that ended past its branch target.
+    #[test]
+    fn minimizing_keeps_each_rows_branch_target_and_instruction_offset() {
+        use detcore::preemptions::InstructionOffset;
+        use detcore::preemptions::PreemptionWriter;
+        let workspace = tempfile::tempdir().unwrap();
+        let preempts_path = workspace.path().join("target.preempts");
+        let tid = DetTid::from_raw(3);
+        let critical = InstructionOffset {
+            rcb_target: 5_000,
+            instructions: 6,
+        };
+        let mut writer = PreemptionWriter::new(None);
+        writer.register_thread(tid, detcore::DEFAULT_PRIORITY);
+        let mut prior = detcore::DEFAULT_PRIORITY;
+        for k in 1..=8u64 {
+            let next = FIRST_PRIORITY + k;
+            writer.insert_reprioritization(
+                tid,
+                LogicalTime::from_nanos(k * 1000),
+                k * 1000 + 2,
+                prior,
+                next,
+                (k == 5).then_some(critical),
+            );
+            prior = next;
+        }
+        std::fs::write(&preempts_path, writer.into_string()).unwrap();
+        let options =
+            AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
+                .unwrap();
+        let mut trials = 0;
+        let (minimal, _, _) = options
+            .minimize_with(&preempts_path, |_runname, trial_preempts| {
+                trials += 1;
+                let trial = PreemptionReader::new(trial_preempts).load_all();
+                let history = trial.extract_all().remove(&tid).unwrap();
+                let mut rows = history.into_iter();
+                let mut has_critical = false;
+                while let Some((time, _, rcbs, offset)) = rows.next_with_offset() {
+                    // Every kept row ends at its recorded branch count.
+                    assert_eq!(rcbs, Some(time.as_nanos() + 2), "trial {trials}");
+                    has_critical |= offset == Some(critical);
+                    assert!(offset.is_none() || offset == Some(critical));
+                }
+                assert_eq!(
+                    trial.carries_instruction_offsets(),
+                    has_critical,
+                    "trial {trials}"
+                );
+                Ok(has_critical)
+            })
+            .unwrap();
+        assert!(trials > 1);
+        assert_eq!(
+            minimal.format_version(),
+            detcore::preemptions::INSTRUCTION_OFFSET_FORMAT
+        );
+        // The minimal record keeps the critical row, at its exact branch
+        // target and offset, and drops every row after it.
+        let mut rows = minimal.extract_all().remove(&tid).unwrap().into_iter();
+        let mut kept = Vec::new();
+        while let Some((time, _, rcbs, offset)) = rows.next_with_offset() {
+            kept.push((time.as_nanos(), rcbs, offset));
+        }
+        assert_eq!(
+            kept.last(),
+            Some(&(5_000, Some(5_002), Some(critical))),
+            "{kept:?}"
+        );
+        assert!(kept.len() < 8, "{kept:?}");
+    }
 
     /// A minimization trial that `--max-log-bytes` ended stops the
     /// minimization and returns that error, still a `LogCapExceeded`, so main
