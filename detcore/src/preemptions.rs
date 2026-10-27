@@ -738,7 +738,7 @@ impl ThreadHistoryIterator {
     }
 
     /// How many recorded rows have been installed as slice ends. The row the
-    /// current slice ends is the last of them: `next_with_rcbs` advances past
+    /// current slice ends is the last of them: `next_slice_end` advances past
     /// a row as it installs it, before that row's priority request is filed.
     pub fn installed_rows(&self) -> usize {
         self.ix
