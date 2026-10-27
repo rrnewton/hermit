@@ -44594,7 +44594,7 @@
       "backend": "dbt",
       "category": "compat",
       "classification": "required",
-      "cpu_timeout_seconds": 22,
+      "cpu_timeout_seconds": 33,
       "lane": "portable",
       "mode": "verify",
       "requires": [
@@ -44866,7 +44866,7 @@
       "backend": "dbt",
       "category": "compat",
       "classification": "required",
-      "cpu_timeout_seconds": 22,
+      "cpu_timeout_seconds": 33,
       "lane": "portable",
       "mode": "verify",
       "requires": [
@@ -45554,7 +45554,7 @@
       "backend": "dbt",
       "category": "compat",
       "classification": "required",
-      "cpu_timeout_seconds": 22,
+      "cpu_timeout_seconds": 33,
       "lane": "portable",
       "mode": "verify",
       "requires": [
@@ -47122,7 +47122,7 @@
       "backend": "dbt",
       "category": "language-runtimes",
       "classification": "required",
-      "cpu_timeout_seconds": 22,
+      "cpu_timeout_seconds": 33,
       "lane": "portable",
       "mode": "verify",
       "requires": [
