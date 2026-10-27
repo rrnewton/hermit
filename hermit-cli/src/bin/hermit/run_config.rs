@@ -131,7 +131,7 @@ impl RunConfig {
     fn new() -> Self {
         RunConfig {
             schema: SCHEMA.to_owned(),
-            hermit_version: Some(crate::version::Version::get().to_owned()),
+            hermit_version: Some(crate::app::version::Version::get().to_owned()),
             global: BTreeMap::new(),
             run: BTreeMap::new(),
             program: None,
@@ -143,6 +143,15 @@ impl RunConfig {
     /// The document `--save-config` writes.
     pub(crate) fn to_yaml(&self) -> Result<String, Error> {
         let body = serde_yaml::to_string(self).context("cannot encode the run config as YAML")?;
+        if let Some(backend) = self.global.get("backend").and_then(Value::as_str)
+            && super::backend_hook::validate_name(backend).is_ok()
+        {
+            return Ok(format!(
+                "# Written by executable-selected backend `{backend}`. Reproduce with the same\n\
+                 # backend executable and `run --config FILE`; options given on that command\n\
+                 # line replace the ones here.\n{body}"
+            ));
+        }
         Ok(format!(
             "# Written by `hermit run --save-config`. Reproduce the run with\n\
              # `hermit run --config FILE`; options given on that command line\n\
@@ -217,7 +226,7 @@ pub(crate) fn read(path: &Path) -> Result<RunConfig, Error> {
 
 /// Says so when a manifest's run started in another directory: a rerun
 /// resolves relative paths against its own.
-fn note_another_directory(manifest: &crate::manifest::Manifest) {
+fn note_another_directory(manifest: &crate::app::manifest::Manifest) {
     let here = std::env::current_dir().ok();
     if let Some(there) = &manifest.command.cwd
         && here.as_deref() != Some(Path::new(there))
@@ -234,15 +243,15 @@ fn note_another_directory(manifest: &crate::manifest::Manifest) {
 /// checked against the digest it recorded, becomes `--replay-networking`. A
 /// syscall recording is replayed with `hermit replay`, not rerun.
 pub(crate) fn from_manifest_at(
-    manifest: &crate::manifest::Manifest,
+    manifest: &crate::app::manifest::Manifest,
     path: &Path,
 ) -> Result<RunConfig, Error> {
-    use crate::manifest::Kind;
+    use crate::app::manifest::Kind;
     let mut config = from_manifest(manifest)?;
     match manifest.kind {
         Kind::InputsOnly | Kind::History => {}
         Kind::Network => {
-            let trace = crate::manifest::checked_network_trace(manifest, path)?;
+            let trace = crate::app::manifest::checked_network_trace(manifest, path)?;
             let trace = trace.to_str().ok_or_else(|| {
                 anyhow::anyhow!("network trace path {} is not UTF-8", trace.display())
             })?;
@@ -254,7 +263,7 @@ pub(crate) fn from_manifest_at(
             "{} describes a syscall recording, which `hermit run --from` does not rerun; replay \
              it with: hermit replay {}",
             path.display(),
-            crate::manifest::directory_of(path).display()
+            crate::app::manifest::directory_of(path).display()
         ),
     }
     Ok(config)
@@ -262,7 +271,7 @@ pub(crate) fn from_manifest_at(
 
 /// The run config a manifest's `inputs` and `command` stand for, which
 /// `hermit run --from` loads as `--config` loads a file.
-pub(crate) fn from_manifest(manifest: &crate::manifest::Manifest) -> Result<RunConfig, Error> {
+pub(crate) fn from_manifest(manifest: &crate::app::manifest::Manifest) -> Result<RunConfig, Error> {
     let section = |entries: &BTreeMap<String, serde_json::Value>| {
         entries
             .iter()
@@ -494,9 +503,23 @@ fn scalar(text: &str) -> Value {
 /// invocation to the ordinary parser, when it is not a `hermit run` that
 /// names `--config`, or when it does not parse even leniently (an unknown
 /// option, `--help`), which that parser then reports.
+#[cfg(test)]
 pub(crate) fn expand_argv(
     command: &Command,
     argv: &[OsString],
+) -> Result<Option<Vec<OsString>>, Error> {
+    expand_argv_for_application(command, argv, None)
+}
+
+/// A separately linked executable owns its selected backend identity. Saved
+/// configs/manifests use the existing `global.backend` string to bind that
+/// identity: only the matching executable may consume it without a built-in
+/// `--backend` enum. Ordinary Hermit still parses the value normally and
+/// refuses an unknown backend instead of silently choosing ptrace.
+pub(super) fn expand_argv_for_application(
+    command: &Command,
+    argv: &[OsString],
+    application_backend: Option<&str>,
 ) -> Result<Option<Vec<OsString>>, Error> {
     let names = |long: &str| {
         let with_value = format!("{long}=");
@@ -520,12 +543,13 @@ pub(crate) fn expand_argv(
             .collect()
     };
     let (configs, manifests) = (given_paths(CONFIG_ID), given_paths(FROM_ID));
-    let (path, config) = match (configs.as_slice(), manifests.as_slice()) {
+    let (path, mut config) = match (configs.as_slice(), manifests.as_slice()) {
         ([], []) => return Ok(None),
         ([path], []) => (PathBuf::from(path), read(Path::new(path))?),
         ([], [spec]) => {
-            use crate::manifest::Target;
-            let path = match crate::manifest::resolve(&crate::manifest::data_dir(), spec)? {
+            use crate::app::manifest::Target;
+            let path = match crate::app::manifest::resolve(&crate::app::manifest::data_dir(), spec)?
+            {
                 Target::Manifest(path) => path,
                 Target::Recording { data_dir, id } => anyhow::bail!(
                     "{} is a syscall recording, which `hermit run --from` does not rerun; \
@@ -534,7 +558,7 @@ pub(crate) fn expand_argv(
                     data_dir.join(id.to_string()).display()
                 ),
             };
-            let manifest = crate::manifest::read(&path)?;
+            let manifest = crate::app::manifest::read(&path)?;
             note_another_directory(&manifest);
             let config = from_manifest_at(&manifest, &path)?;
             (path, config)
@@ -548,6 +572,17 @@ pub(crate) fn expand_argv(
             paths.len()
         ),
     };
+    if let Some(application) = application_backend
+        && let Some(backend) = config.global.remove("backend")
+    {
+        anyhow::ensure!(
+            backend.as_str() == Some(application),
+            "{} selects backend {}, but this executable selects `{application}`; \
+             use the executable for the saved backend instead",
+            path.display(),
+            display_value(&backend),
+        );
+    }
     let run = run_command(command);
     let given =
         |matches: &ArgMatches, id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
@@ -1138,19 +1173,19 @@ mod tests {
         run: String,
     }
 
-    fn parse_at(argv: &[OsString], seconds: u64) -> (crate::Args, ArgMatches) {
-        let matches = crate::Args::command()
+    fn parse_at(argv: &[OsString], seconds: u64) -> (crate::app::Args, ArgMatches) {
+        let matches = crate::app::Args::command()
             .try_get_matches_from(argv)
             .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
-        let args = crate::args_from_matches_with_clock(&matches, || {
+        let args = crate::app::args_from_matches_with_clock(&matches, || {
             UNIX_EPOCH + Duration::from_secs(seconds)
         })
         .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
         (args, matches)
     }
 
-    fn parsed(args: &crate::Args) -> Parsed {
-        let crate::Subcommand::Run(run) = &args.command else {
+    fn parsed(args: &crate::app::Args) -> Parsed {
+        let crate::app::Subcommand::Run(run) = &args.command else {
             panic!("not a `run` command: {args:?}");
         };
         Parsed {
@@ -1163,7 +1198,7 @@ mod tests {
         let mut command_line = argv(&[], &["--config"], &[]);
         command_line.push(path.into());
         command_line.extend(run.iter().map(OsString::from));
-        expand_argv(&crate::Args::command(), &command_line)
+        expand_argv(&crate::app::Args::command(), &command_line)
             .unwrap_or_else(|error| panic!("{command_line:?} should load: {error:#}"))
             .unwrap_or_else(|| panic!("{command_line:?} names --config"))
     }
@@ -1174,12 +1209,12 @@ mod tests {
     fn save_and_load(argv: &[OsString]) -> (Parsed, Parsed, RunConfig) {
         let (mut args, matches) = parse_at(argv, SAVING_CLOCK);
         let config = capture(
-            &crate::Args::command(),
+            &crate::app::Args::command(),
             &matches,
             matches.subcommand_matches(RUN).unwrap(),
         )
         .unwrap();
-        let crate::Subcommand::Run(run) = &mut args.command else {
+        let crate::app::Subcommand::Run(run) = &mut args.command else {
             panic!("{argv:?} is not a `run` command");
         };
         run.set_config_capture(config);
@@ -1202,26 +1237,26 @@ mod tests {
             let argv = sample_argv(section, tokens);
             let (mut args, matches) = parse_at(&argv, SAVING_CLOCK);
             let config = capture(
-                &crate::Args::command(),
+                &crate::app::Args::command(),
                 &matches,
                 matches.subcommand_matches(RUN).unwrap(),
             )
             .unwrap();
-            let crate::Subcommand::Run(run) = &mut args.command else {
+            let crate::app::Subcommand::Run(run) = &mut args.command else {
                 panic!("{argv:?} is not a `run` command");
             };
             run.set_config_capture(config);
             let saved = run.saved_run_config().unwrap();
             let (global, run_inputs) = to_manifest_parts(&saved).unwrap();
-            let manifest = crate::manifest::Manifest::new(
+            let manifest = crate::app::manifest::Manifest::new(
                 hermit::Id::unique(),
-                crate::manifest::Kind::InputsOnly,
-                crate::manifest::Command {
+                crate::app::manifest::Kind::InputsOnly,
+                crate::app::manifest::Command {
                     program: saved.program.clone(),
                     args: saved.args.clone(),
                     cwd: None,
                 },
-                crate::manifest::Inputs {
+                crate::app::manifest::Inputs {
                     global,
                     run: run_inputs,
                     host_drawn: BTreeMap::new(),
@@ -1232,10 +1267,10 @@ mod tests {
             let path = directory
                 .path()
                 .join("id")
-                .join(crate::manifest::MANIFEST_NAME);
-            crate::manifest::write(&path, &manifest).unwrap();
+                .join(crate::app::manifest::MANIFEST_NAME);
+            crate::app::manifest::write(&path, &manifest).unwrap();
             let command_line = argv_for_from(path.parent().unwrap());
-            let expanded = expand_argv(&crate::Args::command(), &command_line)
+            let expanded = expand_argv(&crate::app::Args::command(), &command_line)
                 .unwrap()
                 .expect("--from expands");
             let (reloaded, _) = parse_at(&expanded, LOADING_CLOCK);
@@ -1262,7 +1297,7 @@ mod tests {
             let mut command_line = argv(&[], &["--config"], &[]);
             command_line.push(path.into());
             assert!(
-                expand_argv(&crate::Args::command(), &command_line).is_err(),
+                expand_argv(&crate::app::Args::command(), &command_line).is_err(),
                 "{entry}"
             );
         }
@@ -1273,7 +1308,7 @@ mod tests {
     /// refused with the `hermit replay` command to use instead.
     #[test]
     fn from_a_network_manifest_replays_its_trace() {
-        use crate::manifest;
+        use crate::app::manifest;
         let directory = tempfile::tempdir().unwrap();
         let trace = directory.path().join("net.trace");
         std::fs::write(&trace, b"HERMIT-NET-TRACE\x04\0\0\0").unwrap();
@@ -1321,7 +1356,7 @@ mod tests {
     fn from_and_config_together_are_refused() {
         let mut command_line = argv(&[], &["--config=/nonexistent.yaml", "--from"], &[]);
         command_line.push("/nonexistent".into());
-        let error = expand_argv(&crate::Args::command(), &command_line).unwrap_err();
+        let error = expand_argv(&crate::app::Args::command(), &command_line).unwrap_err();
         assert!(
             format!("{error:#}").contains("give one of them"),
             "{error:#}"
@@ -1330,7 +1365,7 @@ mod tests {
 
     #[test]
     fn every_option_has_a_round_trip_sample() {
-        let hermit = crate::Args::command();
+        let hermit = crate::app::Args::command();
         let options: BTreeSet<(&str, String)> = [Section::Global, Section::Run]
             .into_iter()
             .flat_map(|section| {
@@ -1398,13 +1433,13 @@ mod tests {
         let path = directory.path().join("exec-stop.yaml");
         write(&path, &saved).unwrap();
         let args = run_options(&load(&path, &[]));
-        let crate::Subcommand::Run(run) = args.command else {
+        let crate::app::Subcommand::Run(run) = args.command else {
             unreachable!()
         };
         let error = run.refuse_unready_exec_stop().unwrap_err();
         assert!(
             error
-                .downcast_ref::<crate::container::PolicyRefusal>()
+                .downcast_ref::<crate::app::container::PolicyRefusal>()
                 .is_some(),
             "{error:#}"
         );
@@ -1447,7 +1482,7 @@ mod tests {
         path
     }
 
-    fn run_options(argv: &[OsString]) -> crate::Args {
+    fn run_options(argv: &[OsString]) -> crate::app::Args {
         parse_at(argv, LOADING_CLOCK).0
     }
 
@@ -1468,7 +1503,7 @@ mod tests {
         let mut command_line = argv(&["--log-file=/from/cli.log"], &["--config"], &[]);
         command_line.push(path.clone().into());
         command_line.extend(["--seed=2", "-e", "C=3"].map(OsString::from));
-        let expanded = expand_argv(&crate::Args::command(), &command_line)
+        let expanded = expand_argv(&crate::app::Args::command(), &command_line)
             .unwrap()
             .unwrap();
         let args = run_options(&expanded);
@@ -1477,7 +1512,7 @@ mod tests {
             Some(tracing::level_filters::LevelFilter::INFO)
         );
         assert_eq!(args.global.log_file, Some("/from/cli.log".into()));
-        let crate::Subcommand::Run(run) = &args.command else {
+        let crate::app::Subcommand::Run(run) = &args.command else {
             panic!("{expanded:?}");
         };
         let expected = run_options(&argv(
@@ -1485,7 +1520,7 @@ mod tests {
             &["--seed=2", "--env=C=3", "--verify", "--summary"],
             &["--", "/bin/from-file", "x"],
         ));
-        let crate::Subcommand::Run(expected) = &expected.command else {
+        let crate::app::Subcommand::Run(expected) = &expected.command else {
             unreachable!()
         };
         assert_eq!(
@@ -1495,7 +1530,7 @@ mod tests {
 
         // A guest on the command line replaces the file's program and args.
         let args = run_options(&load(&path, &["--", "/bin/from-cli", "-y"]));
-        let crate::Subcommand::Run(run) = &args.command else {
+        let crate::app::Subcommand::Run(run) = &args.command else {
             unreachable!()
         };
         let expected = run_options(&argv(
@@ -1509,7 +1544,7 @@ mod tests {
             ],
             &["--", "/bin/from-cli", "-y"],
         ));
-        let crate::Subcommand::Run(expected) = &expected.command else {
+        let crate::app::Subcommand::Run(expected) = &expected.command else {
             unreachable!()
         };
         assert_eq!(
@@ -1534,7 +1569,7 @@ mod tests {
             "schema: hermit-run-config/v1\nrun: {verify-strict: true}\n",
         );
         let expanded = load(&path, &["--", "/bin/true"]);
-        let error = crate::Args::command()
+        let error = crate::app::Args::command()
             .try_get_matches_from(&expanded)
             .unwrap_err()
             .to_string();
@@ -1562,7 +1597,7 @@ mod tests {
         command_line.push(path.into());
         format!(
             "{:#}",
-            expand_argv(&crate::Args::command(), &command_line).unwrap_err()
+            expand_argv(&crate::app::Args::command(), &command_line).unwrap_err()
         )
     }
 
@@ -1677,7 +1712,7 @@ mod tests {
     /// Only a top-level `hermit run` that names `--config` is rewritten.
     #[test]
     fn other_invocations_are_left_to_the_parser() {
-        let hermit = crate::Args::command();
+        let hermit = crate::app::Args::command();
         for command_line in [
             argv(&[], &[], &["--", "/bin/echo", "--config", "x"]),
             argv(&[], &["--config=x", "--help"], &[]),
@@ -1728,7 +1763,7 @@ mod tests {
     /// options of `hermit run`.
     #[test]
     fn resolved_input_keys_name_run_options() {
-        let hermit = crate::Args::command();
+        let hermit = crate::app::Args::command();
         let longs: Vec<String> = option_specs(run_command(&hermit))
             .into_iter()
             .map(|spec| spec.long)

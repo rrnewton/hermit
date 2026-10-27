@@ -57,6 +57,178 @@ use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::record_envelope::RecordEnvelopePolicy;
 
+/// The exact native dimensions used by both live adapters and retained-run
+/// comparison. The full validated snapshot stays with the physical adapter.
+pub(super) trait NativeStatistics: std::fmt::Debug {
+    fn intercepted_syscalls(&self) -> u64;
+    fn rewritten_syscalls(&self) -> u64;
+    fn stdin_reads(&self) -> u64;
+    fn memory_hash_fold(&self) -> u64;
+}
+
+pub(super) fn same_native_observable_behavior(
+    first: &impl NativeStatistics,
+    second: &impl NativeStatistics,
+) -> bool {
+    // The counted-branch clock is a separate exact dimension, not an exemption.
+    first.intercepted_syscalls() == second.intercepted_syscalls()
+        && first.rewritten_syscalls() == second.rewritten_syscalls()
+        && first.stdin_reads() == second.stdin_reads()
+        && first.memory_hash_fold() == second.memory_hash_fold()
+}
+
+pub(super) fn native_branch_clock_mismatch(label: &str, first: u64, second: u64) -> Option<String> {
+    (first != second).then(|| {
+        format!(
+            "{label} verification failed: counted-branch clocks differed between runs ({first} != {second}); \
+             the clock is a deterministic function of the executed instruction stream"
+        )
+    })
+}
+
+pub(super) fn native_initialization_record_mismatch(
+    label: &str,
+    first: usize,
+    second: usize,
+) -> Option<String> {
+    (first != second).then(|| {
+        format!(
+            "{label} verification failed: authenticated process-image initialization counts differed between runs ({first} != {second})"
+        )
+    })
+}
+
+#[derive(Debug)]
+pub(super) struct NativeSummaryComparison {
+    failure: Option<String>,
+}
+
+impl NativeSummaryComparison {
+    #[cfg(all(test, feature = "dbt"))]
+    pub(super) fn compare(
+        first_stats: &impl NativeStatistics,
+        second_stats: &impl NativeStatistics,
+        first_initialization_records: usize,
+        second_initialization_records: usize,
+    ) -> Self {
+        Self::compare_named(
+            "DBT",
+            first_stats,
+            second_stats,
+            first_initialization_records,
+            second_initialization_records,
+        )
+    }
+
+    fn compare_named(
+        label: &str,
+        first_stats: &impl NativeStatistics,
+        second_stats: &impl NativeStatistics,
+        first_initialization_records: usize,
+        second_initialization_records: usize,
+    ) -> Self {
+        let mut failures = Vec::new();
+        if !same_native_observable_behavior(first_stats, second_stats) {
+            failures.push(format!(
+                "{label} verification failed: typed native Detcore statistics differed \
+                 ({first_stats:?} != {second_stats:?})"
+            ));
+        }
+        if let Some(failure) = native_initialization_record_mismatch(
+            label,
+            first_initialization_records,
+            second_initialization_records,
+        ) {
+            failures.push(failure);
+        }
+        Self {
+            failure: (!failures.is_empty()).then(|| failures.join("; ")),
+        }
+    }
+
+    pub(super) fn requires_log_retention(&self) -> bool {
+        self.failure.is_some()
+    }
+
+    pub(super) fn apply(self, outcome: &mut VerificationOutcome) -> Option<String> {
+        if self.failure.is_some() {
+            outcome.verdict = Verdict::Diverged;
+            outcome.no_result_reason = None;
+        }
+        self.failure
+    }
+}
+
+pub(super) fn record_native_branch_clock_comparison(
+    label: &str,
+    outcome: &mut VerificationOutcome,
+    comparison: DbtCountedBranchComparison,
+) -> Option<String> {
+    match native_branch_clock_mismatch(label, comparison.left, comparison.right) {
+        Some(message) => {
+            outcome.dbt_counted_branches = Some(comparison);
+            outcome.verdict = Verdict::Diverged;
+            outcome.no_result_reason = None;
+            Some(message)
+        }
+        None if outcome.verdict == Verdict::NoResult => {
+            // Equal clocks never promote a refused common comparison.
+            outcome.dbt_counted_branches = None;
+            None
+        }
+        None => {
+            outcome.dbt_counted_branches = Some(comparison);
+            None
+        }
+    }
+}
+
+/// Core-owned exact evidence policy, applied around the sole common comparator.
+pub(super) struct NativeEvidenceComparison {
+    label: String,
+    branches: DbtCountedBranchComparison,
+    summary: NativeSummaryComparison,
+}
+
+impl NativeEvidenceComparison {
+    pub(super) fn new(
+        backend: &str,
+        first: &super::backend_hook::NativeFacts,
+        second: &super::backend_hook::NativeFacts,
+    ) -> Self {
+        // Preserve the existing DBT diagnostics and wire field exactly. A new
+        // executable uses its own validated identity, never a fabricated enum.
+        let label = if backend == "dbt" { "DBT" } else { backend }.to_owned();
+        Self {
+            branches: DbtCountedBranchComparison {
+                left: first.counted_branches,
+                right: second.counted_branches,
+            },
+            summary: NativeSummaryComparison::compare_named(
+                &label,
+                first,
+                second,
+                first.initialization_records,
+                second.initialization_records,
+            ),
+            label,
+        }
+    }
+
+    pub(super) fn configure(&self, options: &mut ComparisonOptions) {
+        options.strictness = LogCompareStrictness::Canonical;
+        let mismatch = !self.branches.matched() || self.summary.requires_log_retention();
+        options.keep_logs |= mismatch;
+        options.match_overridden |= mismatch;
+    }
+
+    pub(super) fn apply(self, outcome: &mut VerificationOutcome) -> Vec<String> {
+        let summary = self.summary.apply(outcome);
+        let branches = record_native_branch_clock_comparison(&self.label, outcome, self.branches);
+        branches.into_iter().chain(summary).collect()
+    }
+}
+
 const FAILED_VERIFY_LOG_DIR_PREFIX: &str = "comparison-";
 const FAILED_VERIFY_LOG_PENDING_PREFIX: &str = ".pending-comparison-";
 const FAILED_VERIFY_LOG_RETIRING_PREFIX: &str = ".retiring-comparison-";
@@ -1048,17 +1220,14 @@ pub(crate) fn run_failed_report(
 /// backend whose scheduler runs in this process (DBT) installs it; a backend
 /// whose scheduler runs in a container child reports the same exit as a
 /// container failure.
-#[cfg(feature = "dbt")]
 pub(crate) struct TerminalDeadlockRecording;
 
-#[cfg(feature = "dbt")]
 impl Drop for TerminalDeadlockRecording {
     fn drop(&mut self) {
         detcore::set_terminal_deadlock_hook(None);
     }
 }
 
-#[cfg(feature = "dbt")]
 pub(crate) fn record_terminal_deadlock(
     path: Option<&Path>,
     run: VerificationRun,
@@ -3180,7 +3349,7 @@ mod tests {
         drop(reader);
         assert_eq!(
             retention_report_in_child(
-                "verify::tests::log_cap_retention_report_survives_a_stderr_without_a_reader",
+                "app::verify::tests::log_cap_retention_report_survives_a_stderr_without_a_reader",
                 "log cap",
                 &writer,
                 dir.path()
@@ -3217,7 +3386,7 @@ mod tests {
         }
         assert_eq!(
             retention_report_in_child(
-                "verify::tests::log_cap_retention_report_does_not_wait_on_a_full_stderr_pipe",
+                "app::verify::tests::log_cap_retention_report_does_not_wait_on_a_full_stderr_pipe",
                 "log cap",
                 &writer,
                 dir.path()
@@ -3240,7 +3409,7 @@ mod tests {
             let (reader, writer) = retention_stderr_pipe();
             assert_eq!(
                 retention_report_in_child(
-                    "verify::tests::retention_report_reads_as_before_when_stderr_has_room",
+                    "app::verify::tests::retention_report_reads_as_before_when_stderr_has_room",
                     class,
                     &writer,
                     dir.path()
