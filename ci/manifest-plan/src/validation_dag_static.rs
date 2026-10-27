@@ -3091,7 +3091,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And chosen_ids' a_restarted_clone_keeps_its_id_only_for_the_same_call,
     // a_new_pid_namespace_is_one_set_tid_cannot_number_for_hermit and
     // eperm_and_resource_errors_are_attributed_to_their_cause: 2705 + 3 = 2911, listed.
-    ("test.detcore_unit", 2911),
+    // And chosen_ids' a_guest_set_tid_the_kernel_refuses_goes_to_the_kernel and
+    // a_pid_namespace_depth_counts_from_hermits: 2708 + 2 = 2913, listed.
+    ("test.detcore_unit", 2913),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4402,7 +4404,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // no_namespace_refuses_a_held_pid_base) and
     // no_namespace_concurrent_runs_take_different_windows: 637 + 5 = 708.
     // And no_namespace_refuses_a_chosen_id_at_pid_max_before_any_task: 642 + 1 = 709.
-    ("test.cli", 709),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
+    // And no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base and
+    // no_namespace_takes_a_guest_set_tid_as_chosen_only_if_it_reaches_hermits_namespace: 643 + 2 = 711.
+    ("test.cli", 711),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
     // sabre_reports_a_replaced_host_file_without_naming_it_the_cause,
@@ -4954,7 +4958,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two 11c35a504a6 tests: 621 + 2 = 623.
     // And the same five --no-namespace chosen-ID tests, not excluded: 556 + 5 = 627.
     // And the same pid_max refusal test, not excluded: 561 + 1 = 628.
-    ("test.cli_on_host", 628),
+    // And the same two clone tests, not excluded: 562 + 2 = 630.
+    ("test.cli_on_host", 630),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5433,7 +5438,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same nine chosen-ID units: 2695 + 9 = 2907.
     // And the same untraced-clone unit: 2908.
     // And the same three chosen_ids units: 2705 + 3 = 2911.
-    ("test.detcore_unit_on_host", 2911),
+    // And the same two chosen_ids units: 2708 + 2 = 2913.
+    ("test.detcore_unit_on_host", 2913),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

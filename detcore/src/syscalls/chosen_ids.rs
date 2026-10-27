@@ -74,9 +74,11 @@ pub(crate) enum ChosenIdCall {
     /// creates a task, so no ID is needed, and `clone3` could refuse it with
     /// another error.
     Unchanged,
-    /// A guest `clone3` that names its task's ID itself (`set_tid`): issued
-    /// as made, its ID the guest's choice.
-    GuestChosen,
+    /// A guest `clone3` that passes `set_tid` itself, with its `struct
+    /// clone_args` (the first 88 bytes, zero extended): its ID is the guest's
+    /// choice if the array reaches Hermit's PID namespace
+    /// (`Detcore::plan_clone_id`).
+    GuestChosen { args: [u8; CLONE_ARGS_SIZE_VER2] },
     /// The call creates a task, and `clone3` cannot express it; the reason.
     Inexpressible(String),
 }
@@ -291,9 +293,9 @@ fn clone3_with_room_for_set_tid(bytes: Option<&[u8]>) -> ChosenIdCall {
         .any(|byte| *byte != 0)
     {
         // The guest names its task's ID itself, or passes `set_tid` and
-        // `set_tid_size` the kernel refuses: either way the call goes as it
-        // was made.
-        return ChosenIdCall::GuestChosen;
+        // `set_tid_size` the kernel refuses (`Detcore::plan_clone_id` tells
+        // which).
+        return ChosenIdCall::GuestChosen { args };
     }
     ChosenIdCall::Clone3 {
         args,
@@ -313,6 +315,8 @@ pub(crate) struct ChosenId {
     args: [u8; CLONE_ARGS_SIZE_VER2],
     /// How many of those bytes `clone3` is given.
     size: usize,
+    /// The guest's call passed `CLONE_UNTRACED`, which `args` no longer do.
+    untraced: bool,
 }
 
 /// How a clone-family call is issued, as [`Detcore::plan_clone_id`] decides.
@@ -327,7 +331,9 @@ pub(crate) enum ClonePlan {
     /// expected to refuse it, or its task gets a host ID, for `reason`. A task
     /// it does create is reported ([`Detcore::gave_host_id`]).
     AsMade { reason: String },
-    /// As the guest made it: a guest `clone3` that names its task's ID itself.
+    /// As the guest made it: a guest `clone3` that names its task's ID in
+    /// Hermit's PID namespace itself, or passes a `set_tid` the kernel
+    /// refuses before creating a task.
     GuestChosen,
 }
 
@@ -337,10 +343,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// it is to create: in the caller's turn, before anything the call does
     /// could let another thread run, so with sequentialized threads the order
     /// of the IDs is the guest's own order of calls. A call that was
-    /// restarted keeps the ID it took (`ThreadState::restarted_clone_id`).
+    /// restarted keeps the ID it took (`ThreadState::restarted_clone_id`), if
+    /// it comes back with the same arguments.
     ///
     /// A call that would create its task with a host ID ends a run that needs
-    /// every ID chosen here, before any task exists.
+    /// every ID chosen here, before any task exists. A guest `clone3` with a
+    /// `set_tid` the kernel refuses goes to the kernel first, so its error
+    /// stays the guest's answer.
     pub(crate) async fn plan_clone_id<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -364,25 +373,42 @@ impl<T: RecordOrReplay> Detcore<T> {
         let restarted = guest.thread_state_mut().restarted_clone_id.take();
         let (args, size) = match form {
             ChosenIdCall::Clone3 { args, size } => (args, size),
-            ChosenIdCall::GuestChosen => {
-                // The guest's own set_tid names its task's ID in the PID
-                // namespace the task is created in. In a new one, or one the
-                // guest made for its children, the ID in Hermit's namespace
-                // is the host's unless the array reaches it; and an untraced
-                // task's own clones never reach Detcore. Both are taken as
-                // host IDs, whatever the array says.
-                let flags = clone3_args
-                    .as_deref()
-                    .and_then(|bytes| bytes.get(..8))
-                    .map_or(0, |flags| u64::from_ne_bytes(flags.try_into().unwrap()));
-                if let Some(why) = untraced_clone(flags)
-                    .or_else(|| nested_pid_namespace(guest.tid().as_raw(), flags))
-                {
-                    return self
-                        .host_id_planned(guest, sysno, why, refuse_host_ids)
-                        .await;
+            ChosenIdCall::GuestChosen { args } => {
+                // A call the kernel refuses before creating a task goes to the
+                // kernel, whose error is the guest's answer.
+                let tid = guest.tid().as_raw();
+                let Some(tids) = guest_set_tid(&guest.memory(), &args, tid) else {
+                    return Ok(ClonePlan::GuestChosen);
+                };
+                let flags = u64::from_ne_bytes(args[..8].try_into().unwrap());
+                if let Some(why) = untraced_clone(flags) {
+                    // Detcore would neither see the task nor rewrite the
+                    // guest's own array, so not even a run that takes host IDs
+                    // can go on: the task would run outside the scheduler.
+                    refuse_host_id(
+                        guest,
+                        format!("this clone3 with set_tid cannot be traced: {why}"),
+                    )
+                    .await
                 }
-                return Ok(ClonePlan::GuestChosen);
+                // The array runs from the new task's PID namespace outwards:
+                // the guest chose the task's ID in Hermit's namespace only if
+                // it is long enough to reach it.
+                let why = match pid_namespace_depth(tid, flags) {
+                    Some(depth) if tids.len() > depth => return Ok(ClonePlan::GuestChosen),
+                    Some(depth) => format!(
+                        "its set_tid names {} ID(s), but its task is created {depth} PID \
+                         namespace(s) below Hermit's, so the kernel picks its ID in Hermit's",
+                        tids.len()
+                    ),
+                    None => "the depth of the PID namespace its task is created in could not \
+                             be read, so whether its set_tid reaches Hermit's namespace is \
+                             unknown"
+                        .to_owned(),
+                };
+                return self
+                    .host_id_planned(guest, sysno, why, refuse_host_ids)
+                    .await;
             }
             ChosenIdCall::Unchanged => {
                 return Ok(ClonePlan::AsMade {
@@ -396,13 +422,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         };
         let flags = u64::from_ne_bytes(args[..8].try_into().unwrap());
-        if let Some(why) =
-            untraced_clone(flags).or_else(|| self.clone3_could_fare_otherwise(guest, flags))
-        {
+        if let Some(why) = self.clone3_could_fare_otherwise(guest, flags) {
             return self
                 .host_id_planned(guest, sysno, why, refuse_host_ids)
                 .await;
         }
+        // A task Detcore numbers must be traced: its own clones reach Detcore
+        // only then. `CLONE_UNTRACED` only keeps a tracer from following the
+        // task, and the guest's tasks are Hermit's to trace, so the rewrite
+        // drops it (as https://github.com/rrnewton/hermit/pull/4660 does for
+        // every clone). Nothing else in the call depends on it.
+        let untraced = flags & libc::CLONE_UNTRACED as u64 != 0;
+        let mut args = args;
+        args[..8].copy_from_slice(&(flags & !(libc::CLONE_UNTRACED as u64)).to_ne_bytes());
         let call = RestartedCloneId::fingerprint(sysno, &args, size);
         let id = match restarted {
             Some(restarted) if restarted.call == call => restarted.id,
@@ -427,6 +459,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             call,
             args,
             size,
+            untraced,
         }))
     }
 
@@ -563,6 +596,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             call: fingerprint,
             args,
             size,
+            untraced,
         } = chosen;
         let flags = u64::from_ne_bytes(args[..8].try_into().unwrap());
         // An ID at or above pid_max is EINVAL from set_tid (alloc_pid), which
@@ -576,14 +610,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     guest,
                     format!(
                         "this {} cannot create its task with its chosen ID: {cause}. The guest \
-                         has created more tasks than the IDs from its base to pid_max; pass a \
-                         lower --pid-base",
+                         has created more tasks than the IDs from its base to pid_max hold; the \
+                         run needs a lower base",
                         call.number()
                     ),
                 )
                 .await
             }
-            return self.issue_as_made(guest, call, &cause).await;
+            return self.issue_as_made(guest, call, &cause, untraced).await;
         }
         let mut stack = guest.stack().await;
         let set_tid = stack.push(id as libc::pid_t);
@@ -642,9 +676,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                         )
                         .await
                     }
-                    // The resource errors a plain clone gets as well: the
-                    // guest's answer, with no task created.
-                    Err(errno) if refuse_host_ids && is_resource_error(errno) => {
+                    // An error the guest's own call gets as well, with no
+                    // task created: its answer.
+                    Err(errno) if refuse_host_ids && is_guests_own_error(errno, flags) => {
                         return Err(errno);
                     }
                     Err(errno) => format!("clone3 with set_tid {id} failed with {errno}"),
@@ -654,7 +688,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         // A run that needs every ID chosen ends here, before the guest's own
         // call could create a task with a host ID (and, for vfork, run it).
-        if refuse_host_ids {
+        if refuse_host_ids || untraced {
             refuse_host_id(
                 guest,
                 format!(
@@ -664,17 +698,31 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await
         }
-        self.issue_as_made(guest, call, &cause).await
+        self.issue_as_made(guest, call, &cause, untraced).await
     }
 
     /// Issue the guest's own call `call`, whose task, if it creates one, has
-    /// a host ID for `cause` ([`Self::gave_host_id`]).
+    /// a host ID for `cause` ([`Self::gave_host_id`]). An untraced call is not
+    /// issued: its task would run outside Detcore's scheduler, so even a run
+    /// that takes host IDs ends.
     async fn issue_as_made<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: Syscall,
         cause: &str,
+        untraced: bool,
     ) -> Result<i64, Errno> {
+        if untraced {
+            refuse_host_id(
+                guest,
+                format!(
+                    "this {} cannot create its task with its chosen ID ({cause}), and the guest's \
+                     own call would create a task the tracer does not follow (CLONE_UNTRACED)",
+                    call.number()
+                ),
+            )
+            .await
+        }
         let original = guest.inject(call).await;
         if let Ok(child) = original {
             self.gave_host_id(guest, child, cause).await;
@@ -684,9 +732,14 @@ impl<T: RecordOrReplay> Detcore<T> {
 }
 
 /// The ID a restarted clone-family call took (`ThreadState::restarted_clone_id`),
-/// for that call only: `call` fingerprints its number and its `clone3` form.
-/// Linux restarts the same call with the same arguments; a different call
-/// in between, such as a signal handler's clone, takes an ID of its own.
+/// and `call`, a fingerprint of its number and `clone3` form. Linux restarts
+/// the same call with the same arguments, so the restart matches it and keeps
+/// the ID. The binding is by arguments, not by call instance: a call in
+/// between with other arguments (a signal handler's `clone` with its own
+/// stack) takes an ID of its own and retires this one; one with the same
+/// arguments (a handler's `fork`) takes this ID, and the restart then takes
+/// the next. Either way no ID is given twice, and where the handler runs is
+/// decided by the scheduler, so the pairing is the same in every run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RestartedCloneId {
     pub(crate) id: i32,
@@ -748,24 +801,160 @@ fn pid_max() -> Option<i32> {
     })
 }
 
-/// Whether `errno` is a resource error a plain clone can get too
-/// (`copy_process` running out of tasks, memory or IDs), rather than one of
-/// `set_tid`'s own.
-fn is_resource_error(errno: Errno) -> bool {
-    [Errno::EAGAIN, Errno::ENOMEM, Errno::ENOSPC].contains(&errno)
+/// Whether `errno`, from the rewritten `clone3` of a call with `flags`, is
+/// one the guest's own call gets as well, with no task created, rather than
+/// one of `set_tid`'s own:
+///
+/// - the resource errors (`copy_process` running out of tasks, memory or
+///   IDs: `EAGAIN`, `ENOMEM`, `ENOSPC`);
+/// - `EINVAL`: once the chosen ID is below pid_max (checked before the call),
+///   `set_tid` of one entry in Hermit's namespace, which has an init, cannot
+///   cause it, and the rewrite keeps every check of `copy_process` and
+///   `clone3_args_valid` the original call meets. One remains: a legacy
+///   `clone` whose new stack pointer is not a user address passes `clone3`
+///   a stack `clone3_stack_valid` refuses, where the guest's own call would
+///   create a task that faults at once;
+/// - `EINTR` (a fatal signal is pending: the task is about to die);
+/// - `EPERM` beside a namespace flag, which needs a capability of its own
+///   (`copy_namespaces`).
+fn is_guests_own_error(errno: Errno, flags: u64) -> bool {
+    [
+        Errno::EAGAIN,
+        Errno::ENOMEM,
+        Errno::ENOSPC,
+        Errno::EINVAL,
+        Errno::EINTR,
+    ]
+    .contains(&errno)
+        || (errno == Errno::EPERM && flags & NAMESPACES != 0)
 }
 
-/// Why a clone-family call with `flags` cannot be given a chosen ID, if it
-/// creates a task the tracer does not follow (`CLONE_UNTRACED`): Detcore sees
-/// none of that task's own clone calls, so its descendants would take host IDs
-/// that nothing reports. The call is issued as made instead, and its task's
-/// host ID is reported (`gave_host_id`), which marks the run's record
-/// `GuestIds::Host`, or ends a run that needs every ID chosen before the task
-/// exists.
+/// The kernel's limit on PID namespace nesting (`MAX_PID_NS_LEVEL`), and so
+/// on `set_tid_size`.
+const MAX_SET_TID: u64 = 32;
+
+/// A guest `clone3`'s own `set_tid` array, given its `struct clone_args`
+/// `args`, if the kernel can accept the call as far as Detcore can tell from
+/// the caller, thread `tid`: `None` for a form it refuses before creating a
+/// task, which then goes to the kernel as made so its error stays the
+/// guest's answer (`guest_set_tid_form`, an unreadable array (`EFAULT`), an
+/// entry below 1 or a first entry other than 1 in a new PID namespace
+/// (`EINVAL`), a caller with neither `CAP_SYS_ADMIN` nor
+/// `CAP_CHECKPOINT_RESTORE` (`EPERM`)).
+fn guest_set_tid<M: MemoryAccess>(
+    memory: &M,
+    args: &[u8; CLONE_ARGS_SIZE_VER2],
+    tid: i32,
+) -> Option<Vec<libc::pid_t>> {
+    let (address, size) = guest_set_tid_form(args)?;
+    let mut tids = vec![0 as libc::pid_t; size];
+    memory
+        .read_values(Addr::<libc::pid_t>::from_raw(address as usize)?, &mut tids)
+        .ok()?;
+    let flags = u64::from_ne_bytes(args[..8].try_into().unwrap());
+    if tids.iter().any(|tid| *tid < 1) || (flags & libc::CLONE_NEWPID as u64 != 0 && tids[0] != 1) {
+        return None;
+    }
+    const CAP_SYS_ADMIN: u32 = 21;
+    const CAP_CHECKPOINT_RESTORE: u32 = 40;
+    let capabilities = std::fs::read_to_string(format!("/proc/{tid}/status"))
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:"))
+                .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+        });
+    let choose = (1u64 << CAP_SYS_ADMIN) | (1u64 << CAP_CHECKPOINT_RESTORE);
+    if capabilities.is_some_and(|mask| mask & choose == 0) {
+        return None;
+    }
+    Some(tids)
+}
+
+/// The address and length of a guest `clone3`'s own `set_tid` array, from
+/// its `struct clone_args` `args`, unless the kernel refuses the call on
+/// those bytes alone, before it creates a task, on every kernel that has
+/// `set_tid`:
+///
+/// - `copy_clone_args_from_user`: an exit signal that is not a signal
+///   number, `set_tid` without `set_tid_size` or the reverse, more than
+///   `MAX_PID_NS_LEVEL` entries;
+/// - `clone3_args_valid`: `CLONE_DETACHED`, a `CSIGNAL` bit other than
+///   `CLONE_NEWTIME` (which Linux 6.3 allows), `CLONE_SIGHAND` beside
+///   `CLONE_CLEAR_SIGHAND`, an exit signal beside `CLONE_THREAD` or
+///   `CLONE_PARENT`, a stack without a size or the reverse;
+/// - `copy_process`'s flag checks: `CLONE_FS` beside `CLONE_NEWNS` or
+///   `CLONE_NEWUSER`, `CLONE_THREAD` without `CLONE_SIGHAND` or beside
+///   `CLONE_NEWUSER` or `CLONE_NEWPID`, `CLONE_SIGHAND` without `CLONE_VM`,
+///   `CLONE_PIDFD` beside `CLONE_DETACHED`.
+///
+/// Checks that depend on the caller's state (namespaces, a container init's
+/// `CLONE_PARENT`) are left to the kernel.
+fn guest_set_tid_form(args: &[u8; CLONE_ARGS_SIZE_VER2]) -> Option<(u64, usize)> {
+    let field =
+        |index: usize| u64::from_ne_bytes(args[index * 8..index * 8 + 8].try_into().unwrap());
+    let (flags, exit_signal, stack, stack_size) = (field(0), field(4), field(5), field(6));
+    let (set_tid, set_tid_size) = (field(8), field(9));
+    let has = |bits: i32| flags & bits as u64 != 0;
+    const CLONE_CLEAR_SIGHAND: u64 = 0x1_0000_0000;
+    let invalid = exit_signal > 64
+        || (set_tid == 0) != (set_tid_size == 0)
+        || set_tid_size > MAX_SET_TID
+        || has(libc::CLONE_DETACHED)
+        || flags & (libc::CSIGNAL as u64 & !0x80) != 0
+        || (has(libc::CLONE_SIGHAND) && flags & CLONE_CLEAR_SIGHAND != 0)
+        || ((has(libc::CLONE_THREAD) || has(libc::CLONE_PARENT)) && exit_signal != 0)
+        || (stack == 0) != (stack_size == 0)
+        || (has(libc::CLONE_FS) && (has(libc::CLONE_NEWNS) || has(libc::CLONE_NEWUSER)))
+        || (has(libc::CLONE_THREAD)
+            && (!has(libc::CLONE_SIGHAND) || has(libc::CLONE_NEWUSER) || has(libc::CLONE_NEWPID)))
+        || (has(libc::CLONE_SIGHAND) && !has(libc::CLONE_VM))
+        || (has(libc::CLONE_PIDFD) && has(libc::CLONE_DETACHED));
+    (!invalid && set_tid_size > 0).then_some((set_tid, set_tid_size as usize))
+}
+
+/// How many PID namespaces out of the one a clone-family call with `flags`
+/// by thread `tid` creates its task in Hermit's own is: 0 for Hermit's, one
+/// more with `CLONE_NEWPID`, and the depth of a namespace the guest made for
+/// its children (`pid_for_children`), walked up with `NS_GET_PARENT`. `None`
+/// if it cannot be read, or the walk does not reach Hermit's within the
+/// kernel's nesting limit.
+fn pid_namespace_depth(tid: i32, flags: u64) -> Option<usize> {
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::MetadataExt;
+    // ioctl_ns(2): _IO(0xb7, 0x2).
+    const NS_GET_PARENT: u64 = 0xb702;
+    let own = std::fs::metadata("/proc/self/ns/pid").ok()?;
+    let mut namespace = std::fs::File::open(format!("/proc/{tid}/ns/pid_for_children")).ok()?;
+    let new = usize::from(flags & libc::CLONE_NEWPID as u64 != 0);
+    for depth in 0..=MAX_SET_TID as usize {
+        let here = namespace.metadata().ok()?;
+        if (here.dev(), here.ino()) == (own.dev(), own.ino()) {
+            return Some(depth + new);
+        }
+        // SAFETY: NS_GET_PARENT takes no argument and returns a new file
+        // descriptor, owned from here on, or -1.
+        let parent = unsafe { libc::ioctl(namespace.as_raw_fd(), NS_GET_PARENT as _) };
+        if parent < 0 {
+            return None;
+        }
+        // SAFETY: `parent` is a file descriptor nothing else owns.
+        namespace = unsafe { std::fs::File::from_raw_fd(parent) };
+    }
+    None
+}
+
+/// Why a guest call with `flags` creates a task the tracer does not follow
+/// (`CLONE_UNTRACED`), if it does: Detcore would see none of that task's own
+/// clone calls, and the task would run outside its scheduler. A call Detcore
+/// rewrites drops the flag; a guest `clone3` with its own `set_tid` is not
+/// rewritten, so it is refused.
 fn untraced_clone(flags: u64) -> Option<String> {
     (flags & libc::CLONE_UNTRACED as u64 != 0).then(|| {
-        "it creates a task the tracer does not follow (CLONE_UNTRACED), whose own clones \
-         Detcore cannot number"
+        "it creates a task the tracer does not follow (CLONE_UNTRACED), which would run outside \
+         Detcore's scheduler"
             .to_owned()
     })
 }
@@ -779,7 +968,9 @@ const NAMESPACES: u64 = (libc::CLONE_NEWNS
     | libc::CLONE_NEWPID
     | libc::CLONE_NEWNET) as u64
     // CLONE_NEWTIME (0x80), which libc does not name, needs CAP_SYS_ADMIN
-    // too (copy_time_ns), and clone3 alone accepts it.
+    // too (copy_namespaces). Only clone3 can pass it, and only from Linux
+    // 6.3: before, clone3_args_valid refuses it with EINVAL, which the
+    // guest's own clone3 gets as well.
     | 0x80;
 
 /// Whether `errno` is one of the kernel's restart codes, which a call returns
@@ -1058,14 +1249,14 @@ mod tests {
         own[SET_TID_SIZE_OFFSET..SET_TID_SIZE_OFFSET + 8].copy_from_slice(&1u64.to_ne_bytes());
         assert_eq!(
             clone3_form(Sysno::clone3, &none, Some(&own)),
-            ChosenIdCall::GuestChosen
+            ChosenIdCall::GuestChosen { args: own }
         );
         let mut short = [0u8; 70];
         short[SET_TID_OFFSET] = 1;
-        assert_eq!(
+        assert!(matches!(
             clone3_form(Sysno::clone3, &none, Some(&short)),
-            ChosenIdCall::GuestChosen
-        );
+            ChosenIdCall::GuestChosen { .. }
+        ));
         for refused in [&[0u8; 32][..], &[[0u8; 96], [1u8; 96]].concat()[..]] {
             assert_eq!(
                 clone3_form(Sysno::clone3, &none, Some(refused)),
@@ -1102,8 +1293,9 @@ mod tests {
         );
     }
 
-    /// A call creating a task the tracer does not follow cannot be given a
-    /// chosen ID: its descendants' clones would never reach Detcore.
+    /// A call creating a task the tracer does not follow is named as such
+    /// (`untraced_clone`): Detcore drops the flag where it rewrites the call,
+    /// and refuses a guest `clone3` with its own `set_tid` that carries it.
     #[test]
     fn an_untraced_clone_is_not_given_a_chosen_id() {
         let thread = (libc::CLONE_VM | libc::CLONE_THREAD | libc::CLONE_SIGHAND) as u64;
@@ -1111,7 +1303,78 @@ mod tests {
         let untraced = super::untraced_clone(thread | libc::CLONE_UNTRACED as u64);
         assert!(
             untraced.is_some_and(|why| why.contains("CLONE_UNTRACED")),
-            "an untraced clone must take the host-ID path"
+            "an untraced clone must be named"
+        );
+    }
+
+    /// A guest `clone3` whose own `set_tid` the kernel refuses on its bytes
+    /// alone is told apart from one it can accept, so its error stays the
+    /// guest's: a valid array of one or two entries; an array without a size
+    /// or the reverse, or too long; and flags, exit signal or stack shapes
+    /// `clone3` or `copy_process` refuse.
+    #[test]
+    fn a_guest_set_tid_the_kernel_refuses_goes_to_the_kernel() {
+        let args = |fields: &[(usize, u64)]| {
+            let mut args = [0u8; CLONE_ARGS_SIZE_VER2];
+            for (index, value) in fields {
+                args[index * 8..index * 8 + 8].copy_from_slice(&value.to_ne_bytes());
+            }
+            args
+        };
+        let newpid = libc::CLONE_NEWPID as u64;
+        let sigchld = libc::SIGCHLD as u64;
+        let form = |fields: &[(usize, u64)]| super::guest_set_tid_form(&args(fields));
+        assert_eq!(
+            form(&[(0, newpid), (4, sigchld), (8, 0x1000), (9, 1)]),
+            Some((0x1000, 1))
+        );
+        assert_eq!(
+            form(&[(0, newpid), (4, sigchld), (8, 0x1000), (9, 2)]),
+            Some((0x1000, 2))
+        );
+        for refused in [
+            vec![(4, sigchld), (8, 0x1000)],
+            vec![(4, sigchld), (9, 1)],
+            vec![(4, sigchld), (8, 0x1000), (9, 33)],
+            vec![(4, 65), (8, 0x1000), (9, 1)],
+            vec![
+                (0, libc::CLONE_SIGHAND as u64),
+                (4, sigchld),
+                (8, 0x1000),
+                (9, 1),
+            ],
+            vec![(0, libc::CLONE_DETACHED as u64), (8, 0x1000), (9, 1)],
+            vec![(0, libc::SIGCHLD as u64), (8, 0x1000), (9, 1)],
+            vec![(4, sigchld), (5, 0x2000), (8, 0x1000), (9, 1)],
+            vec![(4, sigchld), (6, 64), (8, 0x1000), (9, 1)],
+            vec![
+                (
+                    0,
+                    (libc::CLONE_THREAD | libc::CLONE_SIGHAND | libc::CLONE_VM) as u64 | newpid,
+                ),
+                (8, 0x1000),
+                (9, 1),
+            ],
+        ] {
+            assert_eq!(form(&refused), None, "{refused:x?}");
+        }
+        // CLONE_NEWTIME (0x80) in CSIGNAL is left to the kernel: 6.3 allows it.
+        assert_eq!(
+            form(&[(0, 0x80), (4, sigchld), (8, 0x1000), (9, 1)]),
+            Some((0x1000, 1))
+        );
+    }
+
+    /// The depth of the PID namespace a call creates its task in, out of
+    /// Hermit's: this test's own namespace is Hermit's here, so 0, and one
+    /// more with CLONE_NEWPID.
+    #[test]
+    fn a_pid_namespace_depth_counts_from_hermits() {
+        let own = unsafe { libc::gettid() };
+        assert_eq!(super::pid_namespace_depth(own, 0), Some(0));
+        assert_eq!(
+            super::pid_namespace_depth(own, libc::CLONE_NEWPID as u64),
+            Some(1)
         );
     }
 
@@ -1151,16 +1414,27 @@ mod tests {
 
     /// EPERM is set_tid's own only where nothing else in the call needs a
     /// capability: every namespace flag, CLONE_NEWTIME included, does. The
-    /// resource errors a plain clone gets too are the guest's answer.
+    /// errors the guest's own call gets as well (resources, EINVAL, EINTR,
+    /// EPERM beside a namespace flag) are its answer; EEXIST and a
+    /// namespace-free EPERM are set_tid's.
     #[test]
     fn eperm_and_resource_errors_are_attributed_to_their_cause() {
         assert_ne!(super::NAMESPACES & 0x80, 0, "CLONE_NEWTIME");
         assert_ne!(super::NAMESPACES & libc::CLONE_NEWUSER as u64, 0);
-        for errno in [Errno::EAGAIN, Errno::ENOMEM, Errno::ENOSPC] {
-            assert!(super::is_resource_error(errno), "{errno}");
+        let fork = libc::SIGCHLD as u64;
+        let newpid = libc::CLONE_NEWPID as u64;
+        for errno in [
+            Errno::EAGAIN,
+            Errno::ENOMEM,
+            Errno::ENOSPC,
+            Errno::EINVAL,
+            Errno::EINTR,
+        ] {
+            assert!(super::is_guests_own_error(errno, fork), "{errno}");
         }
-        for errno in [Errno::EINVAL, Errno::EEXIST, Errno::EPERM] {
-            assert!(!super::is_resource_error(errno), "{errno}");
+        assert!(super::is_guests_own_error(Errno::EPERM, newpid));
+        for errno in [Errno::EEXIST, Errno::EPERM] {
+            assert!(!super::is_guests_own_error(errno, fork), "{errno}");
         }
     }
 }

@@ -27,6 +27,16 @@
  * CAP_SYS_ADMIN for, and keeps it alive across the fork, so that Hermit's
  * choice for the fork is taken.
  *
+ * With the argument `sighand`, `own-tid 1`, `own-tid 2`, `bad-tid` or
+ * `bad-size`, it makes one call instead and prints its outcome:
+ * - `sighand`: a raw clone with CLONE_SIGHAND but not CLONE_VM, which Linux
+ *   refuses with EINVAL;
+ * - `own-tid N`: a clone3 with CLONE_NEWPID and its own set_tid of N entries,
+ *   [1] (the new namespace's ID only) or [1, first + 100] (also the ID in the
+ *   guest's own namespace); the child checks it is 1 in its namespace;
+ * - `bad-tid`: a clone3 whose set_tid points at an unmapped address (EFAULT);
+ * - `bad-size`: a clone3 with set_tid but set_tid_size 0 (EINVAL).
+ *
  * Every line is the ID's offset from the first process's, so a run whose IDs
  * are chosen from a base prints the same bytes whatever the base, with the
  * offsets in creation order, and a run on host IDs shows whatever IDs other
@@ -100,10 +110,60 @@ static pid_t hold(pid_t id) {
   return (pid_t)holder;
 }
 
+/* One call, as the arguments `sighand`, `own-tid N`, `bad-tid` and
+ * `bad-size` ask, and its outcome. */
+static int one_call(int argc, char** argv) {
+  const char* what = argv[1];
+  if (strcmp(what, "sighand") == 0) {
+    long child = syscall(SYS_clone, CLONE_SIGHAND | SIGCHLD, 0, 0, 0, 0);
+    if (child == 0) {
+      _exit(0);
+    }
+    if (child > 0) {
+      wait_for((pid_t)child, "clone(CLONE_SIGHAND)");
+    }
+    printf("clone(CLONE_SIGHAND): %s\n", child < 0 ? strerror(errno) : "created");
+    return 0;
+  }
+  pid_t tids[2] = {1, first + 100};
+  struct clone_args args;
+  memset(&args, 0, sizeof args);
+  args.exit_signal = SIGCHLD;
+  args.set_tid = (uint64_t)(uintptr_t)tids;
+  if (strcmp(what, "own-tid") == 0 && argc > 2) {
+    args.flags = CLONE_NEWPID;
+    args.set_tid_size = strtoul(argv[2], NULL, 10);
+  } else if (strcmp(what, "bad-tid") == 0) {
+    args.set_tid = 8;
+    args.set_tid_size = 1;
+  } else if (strcmp(what, "bad-size") == 0) {
+    args.set_tid_size = 0;
+  } else {
+    printf("unknown call %s\n", what);
+    return 2;
+  }
+  long child = syscall(SYS_clone3, &args, sizeof args);
+  if (child == 0) {
+    _exit(getpid() == 1 ? 0 : 1);
+  }
+  if (child < 0) {
+    printf("clone3 %s: %s\n", what, strerror(errno));
+    return 0;
+  }
+  int status = 0;
+  waitpid((pid_t)child, &status, 0);
+  printf("clone3 %s: child %+ld, exit %d\n", what, child - first,
+         WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   int collide = argc > 1 && strcmp(argv[1], "collide") == 0;
   setvbuf(stdout, NULL, _IONBF, 0);
   first = getpid();
+  if (argc > 1 && !collide) {
+    return one_call(argc, argv);
+  }
   printf("first process %d\n", first);
   report("main gettid", syscall(SYS_gettid), first);
   char link[32] = {0};
