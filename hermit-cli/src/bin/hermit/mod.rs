@@ -22,8 +22,12 @@ mod clean;
 mod cli_owned_lifecycle;
 mod container;
 mod dap_adapter;
+mod dispatch_entry;
+mod dispatch_executable;
+mod dispatch_input;
 #[cfg(test)]
 mod exec_stop_launch_tests;
+mod executable_probe;
 mod gdb_client;
 mod gdb_watch_helper;
 mod global_opts;
@@ -90,6 +94,36 @@ use std::os::fd::FromRawFd;
 use std::path::Path;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
+
+/// Handle the exact identity-only probe before fbinit or app startup. The
+/// executable still owns its binary-only preinit stdin reservation.
+pub fn compatibility_probe() -> Option<i32> {
+    executable_probe::core()
+}
+
+/// The corresponding pre-fbinit entry for one statically linked adapter.
+/// This uses only the adapter type's compiled identity; it constructs no
+/// adapter/options, consumes no stdin and admits no private runtime role.
+/// It is metadata-only: held dispatch requires [`executable_entry_with_backend`].
+pub fn compatibility_probe_with_backend<A: backend_hook::BackendAdapter>() -> Option<i32> {
+    executable_probe::backend(A::NAME, false)
+}
+
+/// Executable-only entry before fbinit, private roles or normal app setup.
+/// Returns a terminal status for a metadata request/refusal, or replaces this
+/// process with the exact compatible backend executable. `None` retains the
+/// ordinary builtin application path. The binary still owns its preinit hook.
+pub fn executable_entry() -> Option<i32> {
+    dispatch_entry::core()
+}
+
+/// The matching early entry for one statically linked backend executable.
+/// Call this before fbinit and before constructing the adapter/options. It
+/// handles metadata or adopts the core's affine input handoff; it never
+/// redispatches, reads guest stdin, or grants a private runtime role.
+pub fn executable_entry_with_backend<A: backend_hook::BackendAdapter>() -> Option<i32> {
+    dispatch_entry::backend::<A>()
+}
 
 const STDIN_UNCAPTURED: i32 = i32::MIN;
 const STDIN_TAKEN: i32 = i32::MIN + 1;
@@ -733,12 +767,22 @@ pub fn main() {
 ///
 /// The executable must retain the same preinit stdin reservation as `hermit`.
 /// Its identity selects the adapter directly; no built-in backend enum value or
-/// injected `--backend` argument is needed. Ordinary [`main`] is unchanged.
+/// injected argument is needed. An explicit shared --backend selector must
+/// match that identity. Ordinary [`main`] is unchanged.
 pub fn main_with_backend<A: backend_hook::BackendAdapter>(adapter: A) {
     main_application(adapter, true);
 }
 
 fn main_application<A: backend_hook::BackendAdapter>(adapter: A, selected_by_executable: bool) {
+    // A plain environment locator is not startup authority. In particular an
+    // executable that omitted its pre-fbinit handoff entry cannot accidentally
+    // enter private roles or retire/adopt the original input a second time.
+    if let Err(error) =
+        dispatch_entry::require_application_entry(selected_by_executable.then_some(A::NAME))
+    {
+        display_entry_error("Executable input handoff refused", &error);
+        std::process::exit(HERMIT_INTERNAL_FAILURE_EXIT);
+    }
     // The CLI launches from its main thread or a container child's own stack,
     // and a container child must not gain a thread that outlives its entry
     // point (`hermit::launch_on_calling_thread`).
@@ -812,21 +856,24 @@ fn main_application<A: backend_hook::BackendAdapter>(adapter: A, selected_by_exe
     let argv = std::env::args_os().collect::<Vec<_>>();
     // `hermit run --config FILE` means the command line the file names, so
     // it is rewritten into that command line before anything is parsed.
-    let (argv, config_applied) = match run_config::expand_argv_for_application(
-        &schema,
-        &argv,
-        selected_by_executable.then_some(A::NAME),
-    ) {
-        Ok(Some(expanded)) => (expanded, true),
-        Ok(None) => (argv, false),
-        Err(error) => schema
+    let parsed_argv = if selected_by_executable {
+        run_config::application_arguments(&schema, &argv, A::NAME)
+    } else {
+        run_config::expand_argv_for_application(&schema, &argv, None).map(|expanded| match expanded
+        {
+            Some(expanded) => (expanded, true),
+            None => (argv, false),
+        })
+    };
+    let (argv, config_applied) = parsed_argv.unwrap_or_else(|error| {
+        schema
             .clone()
             .error(
                 clap::error::ErrorKind::ValueValidation,
                 format!("{error:#}"),
             )
-            .exit(),
-    };
+            .exit()
+    });
     let matches = schema
         .clone()
         .try_get_matches_from(&argv)
@@ -907,9 +954,14 @@ fn stamp_entry_descriptor_failure_with_schema(
     schema: &clap::Command,
     application_backend: Option<&str>,
 ) -> Result<(), Error> {
-    let expanded = run_config::expand_argv_for_application(schema, argv, application_backend)?;
-    let argv = expanded.as_deref().unwrap_or(argv);
-    let matches = schema.clone().try_get_matches_from(argv)?;
+    let (parsed, _) = match application_backend {
+        Some(backend) => run_config::application_arguments(schema, argv, backend)?,
+        None => {
+            let expanded = run_config::expand_argv_for_application(schema, argv, None)?;
+            (expanded.unwrap_or_else(|| argv.to_vec()), false)
+        }
+    };
+    let matches = schema.clone().try_get_matches_from(&parsed)?;
     let args = args_from_matches_with_schema(&matches, std::time::SystemTime::now, schema)?;
     if let Some(path) = args.command.verification_json_path() {
         write_pending_verification_json(path)?;
