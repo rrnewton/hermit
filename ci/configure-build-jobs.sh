@@ -2948,8 +2948,22 @@ fi
 # and CMAKE_GENERATOR unset, the SDK recipe inputs, 16-job clamp and 1050
 # effective-job-second threshold carry unchanged. At two effective jobs
 # the SDK elapsed bound remains 525 seconds; fresh build evidence is separate.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a131082c93759d2666984a639e6d02813cd16e23 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a131082c93759d2666984a639e6d02813cd16e23 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 7091b37ab2e206b01f7939fc3cc0b240aa513676 (2026-10-27): from
+# a131082c93759d2666984a639e6d02813cd16e23. Two commits (in-guest runtime
+# descriptors invisible to the guest, and the fixes from its delta review):
+# reverie-inguest places, records and moves its descriptors, reverie gains a
+# counter descriptor move, reverie-rpc-transport gains
+# BlockingRpcClient::replace_stream, and the LiteInst source catalog rows
+# for the edited files are refreshed. git diff is empty under reverie-dbt/
+# and third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml; both repository inputs to the DynamoRIO content key
+# are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory, SDK and native inputs, calibrated budget, job width
+# and limits carry unchanged from the a131082c entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 7091b37ab2e206b01f7939fc3cc0b240aa513676 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 7091b37ab2e206b01f7939fc3cc0b240aa513676 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
