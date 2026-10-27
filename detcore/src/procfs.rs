@@ -28,6 +28,7 @@ use serde::Serialize;
 use crate::machine::MachineDescription;
 use crate::syscalls::VIRTUAL_CPUSET_BYTES;
 
+pub(crate) mod fd_directory;
 mod fixed;
 pub(crate) mod ids;
 pub(crate) mod levels;
