@@ -1276,6 +1276,20 @@ impl AnalyzeOpts {
     /// copy setting, `--expired-wait-charge` and `--sleep-registration`, as
     /// every record analyze writes must be: a record that omitted one would
     /// be accepted when replayed under another value
+    /// The post-crash bound in effect in the trials
+    /// (`Config::post_crash_timeslice_in_effect`; `None` for off).
+    pub fn trial_post_crash_timeslice(&self) -> Option<u64> {
+        RunData::get_raw_runopts(self)
+            .det_opts
+            .det_config
+            .post_crash_timeslice_in_effect()
+            .map(std::num::NonZeroU64::get)
+    }
+
+    /// `record` stamped with the trials' `--pipe-wake-latency`, signal-state
+    /// copy setting, `--expired-wait-charge` and post-crash bound, as every
+    /// record analyze writes must be: a record that omitted one would be
+    /// accepted when replayed under another value
     /// (<https://github.com/rrnewton/hermit/issues/4380>).
     pub fn stamp_trial_record(&self, record: PreemptionRecord) -> PreemptionRecord {
         record
@@ -1288,6 +1302,7 @@ impl AnalyzeOpts {
             .with_queued_sleeps_registered_at_first_pass(
                 self.trial_sleep_registration() == SleepRegistration::FirstPass,
             )
+            .with_post_crash_timeslice(self.trial_post_crash_timeslice())
     }
 
     /// Whether the trials cap preemption charges (`--cap-preemption-charge`
