@@ -51400,9 +51400,9 @@ fn run_pipe_calls_woken_by_signals(guests: &[&str], rows: usize) {
             line: "atomic33-full-two: writev -1 EINTR, h1 1, h2 1",
         },
         // No signal: a thread the worker starts just before its call rewrites
-        // the iovec array after 1 ms, as writev_determinism's reader does, and
-        // every byte comes from the array the call began with (arm A21R, the
-        // reverted landing's logic, writes the second array).
+        // the iovec array once the call has begun, and every byte comes from
+        // the array the call began with (arm A21R, the reverted landing's
+        // logic, writes the second array).
         PollRecheckRow {
             guest: E,
             args: &["atomic-full-quiet-swap"],
@@ -53009,12 +53009,16 @@ fn restartable_two_signal_rows_under_record_and_replay() {
 /// attempt writes from Hermit's copy of it. With two caught signals pending
 /// at entry, both handlers run; a quiet write (a 70000-byte one that keeps
 /// polling, or a 100-byte atomic one into a full pipe), whose array a thread
-/// started just before the call rewrites after 1 ms, writes bytes from the
-/// first array only (writev_determinism's atomic full-pipe case, which reverted the
-/// first landing of R2b-1, where the first attempt waited for a turn and then
-/// took the rewritten array; the Claude re-check, R1 and N5). The rows run
-/// under two chaos seeds (5 and 1). Native (Linux 7.1.3, 5 of 5 each): the
-/// same lines.
+/// started just before the call rewrites once the call has begun, writes
+/// bytes from the first array only (writev_determinism's atomic full-pipe
+/// case, which reverted the first landing of R2b-1, where the first attempt
+/// waited for a turn and then took the rewritten array; the Claude re-check,
+/// R1 and N5). The rewriter waits for the pipe to fill, or 50 ms of virtual
+/// time, far more than the worker's last steps before its call take, rather
+/// than 1 ms, which a 1 us timeslice outran
+/// (https://github.com/rrnewton/hermit/issues/4804). The rows run under two
+/// chaos seeds (5 and 1). Native (Linux 7.1.3, 5 of 5 each; the two quiet
+/// rows also 5 of 5 on Linux 6.16): the same lines.
 #[test]
 fn a_pipe_writev_whose_iovec_array_is_rewritten_keeps_both_signals() {
     let _guard = hermit_run_guard();
