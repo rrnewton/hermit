@@ -4324,13 +4324,19 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// recorded, `Detcore::record_received_descriptors`) is left out, so its
     /// locks are hidden once no modelled table names the description (a
     /// named residual).
+    ///
+    /// Not under record and replay: they render no procfs files
+    /// (`Detcore::renders_procfs`), so the ledger feeds nothing the guest
+    /// reads, and the refresh reads each descriptor's fdinfo live, which in
+    /// replay is a stand-in eventfd's wherever the recording held a file this
+    /// process held nowhere else.
     async fn refresh_received_locks<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fds: &[RawFd],
         call: super::files::LockCall,
     ) -> Result<(), Error> {
-        if self.cfg.virtualize_time {
+        if self.cfg.virtualize_time && !self.cfg.recordreplay_modes {
             for &fd in fds {
                 self.refresh_description_locks(guest, fd, call).await?;
             }

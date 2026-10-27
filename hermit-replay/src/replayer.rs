@@ -226,20 +226,13 @@ const ACCEPT_STAND_IN_COUNT: u32 = 0x3880_acc7;
 /// when the recording found the received file already in the receiver's
 /// table (`Detcore::install_live_alias`); one that remains names a file this
 /// process held nowhere else, which replay does not have. Replay serves every
-/// operation on it from the log, eventfd reads and writes included, which it
-/// otherwise applies in the kernel (`holds_received_stand_in`), so the count
-/// never changes and marks exactly the remaining stand-ins and their
-/// duplicates, as `ACCEPT_STAND_IN_COUNT` marks accepted connections'.
+/// operation on it from the log. No recorded eventfd operation names one:
+/// Detcore records a received eventfd only as an alias of a descriptor the
+/// receiving table holds, which replay makes live, and leaves any other
+/// received anonymous inode but an inotify instance unrecorded. Nothing reads
+/// the count back; it is distinctive only so that a stand-in can be told
+/// apart from a guest eventfd in a replay's `/proc/<pid>/fdinfo`.
 pub(super) const RECEIVED_STAND_IN_COUNT: u32 = 0x5c3d_f0d5;
-
-/// Whether `fd` in the table of thread `tid` holds the stand-in for a received
-/// descriptor (`RECEIVED_STAND_IN_COUNT`).
-pub(super) fn holds_received_stand_in(tid: Pid, fd: libc::c_int) -> bool {
-    std::fs::read_to_string(format!("/proc/{}/fdinfo/{fd}", tid.as_raw()))
-        .ok()
-        .and_then(|fdinfo| parse_eventfd_count(&fdinfo))
-        == Some(u64::from(RECEIVED_STAND_IN_COUNT))
-}
 
 /// The `eventfd-count` line of an fdinfo file, present for eventfds. Linux
 /// prints the count in hexadecimal.

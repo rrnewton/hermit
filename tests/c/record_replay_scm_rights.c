@@ -40,7 +40,14 @@
  *         Their lines print the errno, so that record and replay must agree
  *         on it.
  *
- * Usage: record_replay_scm_rights pipe|stream|eventfd
+ *   inotify: sends an inotify instance watching a directory over a
+ *         socketpair, closes the original, creates a file in the directory
+ *         and reads the event through the received descriptor alone. Its link
+ *         names an inotify instance, which Detcore records as one; replay,
+ *         which holds a stand-in eventfd in that slot, must take the link
+ *         from the recording and serve the same event.
+ *
+ * Usage: record_replay_scm_rights pipe|stream|eventfd|inotify
  * Prints one line per step and exits 0 only if every step saw what Linux
  * gives a native run, the two eventfd lines that print an errno aside.
  */
@@ -59,8 +66,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -369,10 +378,50 @@ static void eventfd_mode(void) {
   eventfd_report("eventfd child", received[0]);
 }
 
+static void inotify_mode(void) {
+  const char* dir = "scm-inotify-dir";
+  const char* file = "scm-inotify-dir/created";
+  check(mkdir(dir, 0700) == 0 || errno == EEXIST, "mkdir");
+  unlink(file);
+  int pair[2];
+  check(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0, "socketpair");
+  int original = inotify_init1(0);
+  check(original >= 0, "inotify_init1");
+  check(inotify_add_watch(original, dir, IN_CREATE) >= 0, "inotify_add_watch");
+  check(send_fds(pair[0], &original, 1) == 0, "send inotify");
+  close(original);
+  int received[MAX_FDS];
+  check(recv_fds(pair[1], received, 0) == 1, "receive inotify");
+  int created = open(file, O_CREAT | O_WRONLY, 0600);
+  check(created >= 0, "create");
+  close(created);
+  /* Room for a few events: the read returns every queued one. */
+  char buf[4 * (sizeof(struct inotify_event) + 16)]
+      __attribute__((aligned(__alignof__(struct inotify_event))));
+  ssize_t got = read(received[0], buf, sizeof(buf));
+  if (got < 0) {
+    printf("inotify: read=%zd errno=%s\n", got, strerrorname_np(errno));
+  } else {
+    int events = 0;
+    const struct inotify_event* first = (const struct inotify_event*)buf;
+    for (ssize_t at = 0; at < got;
+         at += sizeof(struct inotify_event) + ((const struct inotify_event*)(buf + at))->len) {
+      events++;
+    }
+    printf(
+        "inotify: events=%d mask=0x%x name=%s\n",
+        events,
+        got > 0 ? first->mask : 0,
+        got > 0 && first->len > 0 ? first->name : "");
+  }
+  unlink(file);
+  rmdir(dir);
+}
+
 int main(int argc, char** argv) {
   setvbuf(stdout, NULL, _IONBF, 0);
   if (argc != 2) {
-    fprintf(stderr, "usage: %s pipe|stream|eventfd\n", argv[0]);
+    fprintf(stderr, "usage: %s pipe|stream|eventfd|inotify\n", argv[0]);
     return 2;
   }
   if (strcmp(argv[1], "pipe") == 0) {
@@ -381,6 +430,8 @@ int main(int argc, char** argv) {
     stream_mode();
   } else if (strcmp(argv[1], "eventfd") == 0) {
     eventfd_mode();
+  } else if (strcmp(argv[1], "inotify") == 0) {
+    inotify_mode();
   } else {
     fprintf(stderr, "unknown mode %s\n", argv[1]);
     return 2;

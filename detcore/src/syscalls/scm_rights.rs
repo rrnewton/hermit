@@ -1231,9 +1231,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // `EFD_SEMAPHORE` eventfd read twice). Its link names an inotify
         // instance, which is recorded as one, so its reads renumber rename
         // cookies (`crate::syscalls::inotify`); any other is left unrecorded,
-        // as before.
+        // as before. Under record and replay the link is read through the
+        // recording (`Self::received_descriptor_link`), so replay, whose slot
+        // holds a stand-in eventfd, classifies the descriptor as the
+        // recording did.
         let link = if stat.st_mode & libc::S_IFMT == 0 {
-            self.received_descriptor_link(guest, fd).await
+            self.received_descriptor_link(guest, fd).await?
         } else {
             None
         };
@@ -1633,23 +1636,43 @@ impl<T: RecordOrReplay> Detcore<T> {
         });
     }
 
-    /// What descriptor `fd` of the calling thread links to, read in the
-    /// guest (`readlinkat` of `/proc/thread-self/fd/<fd>`, injected), or
-    /// `None` where that read fails or the link is longer than any anonymous
-    /// inode's. The path and the result share one buffer, staged where
-    /// `inject_fstat` stages its own
+    /// What descriptor `fd` of the calling thread links to, or `None` where
+    /// that read fails or the link is longer than any anonymous inode's.
+    ///
+    /// Under record and replay the link is read through the recording
+    /// (`Detcore::recorded_descriptor_link`): replay's slot holds a stand-in
+    /// eventfd until the recording's answers say otherwise, so a live read
+    /// there would name the stand-in. A buffer that cannot be prepared ends
+    /// the run there, as for the received descriptor's `fstat`: no readlink
+    /// ran, so the other phase could consume an event this one did not.
+    ///
+    /// Otherwise it is read in the guest (`readlinkat` of
+    /// `/proc/thread-self/fd/<fd>`, injected). The path and the result share
+    /// one buffer, staged where `inject_fstat` stages its own
     /// ([`crate::syscalls::scratch::inject_with_scratch`]).
     async fn received_descriptor_link<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
-    ) -> Option<Vec<u8>> {
+    ) -> Result<Option<Vec<u8>>, Error> {
+        if self.cfg.recordreplay_modes {
+            return self
+                .recorded_descriptor_link(guest, fd)
+                .await
+                .map_err(|errno| {
+                    Error::Tool(anyhow::anyhow!(
+                        "cannot record descriptor {fd}, received over SCM_RIGHTS, under record \
+                         and replay: no buffer for its link ({errno})"
+                    ))
+                });
+        }
         let mut buffer = [0_u8; LINK_PATH + LINK_TARGET];
         let spelled = format!("/proc/thread-self/fd/{fd}");
-        buffer
-            .get_mut(..spelled.len())?
-            .copy_from_slice(spelled.as_bytes());
-        let (length, bytes) =
+        let Some(slot) = buffer.get_mut(..spelled.len()) else {
+            return Ok(None);
+        };
+        slot.copy_from_slice(spelled.as_bytes());
+        let Ok((length, bytes)) =
             crate::syscalls::scratch::inject_with_scratch(guest, buffer, |base| {
                 // SAFETY: the buffer holds LINK_PATH + LINK_TARGET bytes.
                 let target = unsafe { base.add(LINK_PATH) };
@@ -1661,11 +1684,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .into()
             })
             .await
-            .ok()?;
-        let length = usize::try_from(length)
+        else {
+            return Ok(None);
+        };
+        Ok(usize::try_from(length)
             .ok()
-            .filter(|length| *length < LINK_TARGET)?;
-        Some(bytes[LINK_PATH..LINK_PATH + length].to_vec())
+            .filter(|length| *length < LINK_TARGET)
+            .map(|length| bytes[LINK_PATH..LINK_PATH + length].to_vec()))
     }
 }
 
