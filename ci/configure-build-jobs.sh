@@ -3070,8 +3070,26 @@ fi
 # rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
 # calibrated budget, job width and limits carry unchanged from the 38c3e024
 # entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a13d020537c0e510bd3209af4f0ebc22e4e66152 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a13d020537c0e510bd3209af4f0ebc22e4e66152 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO ab248a36f83edbcb6b8705dad38b094bd61f1c74 (2026-10-27): from
+# a13d020537c0e510bd3209af4f0ebc22e4e66152. Nine commits: 31a9cc27,
+# 1771ebd6, cd162f05 and 9a476775 (Reverie's own CI workflow and its
+# validate_script_source test, .github/workflows/ci.yml and
+# reverie/tests); 1b31c5da, 72f0077d and 7305b315 (precise-timer
+# skid-overshoot records and the ptrace restore_context register order,
+# in reverie/src/timer.rs, reverie/src/pmu_config.rs, reverie-ptrace/src
+# and reverie-ptrace/tests); 86dcfc5d (the LiteInst source-catalog row of
+# reverie/src/pmu_config.rs, in reverie-liteinst-artifact/src/lib.rs); and
+# Reverie 837b955b rebased with its reviews' fixes, as ab248a36 (kvm lane,
+# package K slice P2a:
+# LinuxEmu's synthetic /proc anchor deleted and a Tool-reserved directory
+# on a read-only file system hidden, in reverie-linuxemu/src and
+# reverie-kvm/{src,tests,README.md}). git diff is empty under reverie-dbt/
+# and third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
+# calibrated budget, job width and limits carry unchanged from the
+# a13d0205 entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ab248a36f83edbcb6b8705dad38b094bd61f1c74 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ab248a36f83edbcb6b8705dad38b094bd61f1c74 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

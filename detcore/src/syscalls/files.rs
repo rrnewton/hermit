@@ -3710,9 +3710,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
-        if let Some(stat) = &host_stat {
-            procfs_inode::note_anchor_opened(&guest.config().backend, stat.st_dev, stat.st_mode);
-        }
         guest
             .thread_state()
             .add_fd(fd, flags, ty, host_stat.map(Into::into))?;
@@ -7550,8 +7547,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// https://github.com/rrnewton/hermit/pull/4369). Its block size can (a
     /// FUSE server reports it), so it only rules procfs out: the kernel's
     /// procfs always has 1024-byte blocks, and a directory that may be procfs
-    /// is proved so by naming its entry, as a stat does, and KVM's by its
-    /// device ([`procfs_inode::is_backend_procfs_device`]). Under DBT, where
+    /// is proved so by naming its entry, as a stat does. (KVM's `/proc`
+    /// directories are Detcore's placeholders, which answer `lseek`
+    /// themselves.) Under DBT, where
     /// Detcore names no entries, one with procfs's stat fields keeps the
     /// host's seek unproved ([`procfs_inode::unprovable_procfs_signature`]).
     /// With metadata virtualized every descriptor the guest opened has a stat;
@@ -7564,14 +7562,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Some(stat) = cached.filter(|stat| stat.mode & libc::S_IFMT == libc::S_IFDIR) else {
             return false;
         };
-        if procfs_inode::is_backend_procfs_device(&guest.config().backend, stat.dev, stat.blksize)
-            || procfs_inode::unprovable_procfs_signature(
-                &guest.config().backend,
-                guest.thread_state().physical_tid,
-                stat.dev,
-                stat.blksize,
-            )
-        {
+        if procfs_inode::unprovable_procfs_signature(
+            &guest.config().backend,
+            guest.thread_state().physical_tid,
+            stat.dev,
+            stat.blksize,
+        ) {
             return false;
         }
         !Self::procfs_entry(guest, &stat, StatTarget::Descriptor(fd))
@@ -9657,8 +9653,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (0, or a descriptor count for /proc/<pid>/fd), which Detcore
         // already virtualizes there. Only a proved procfs directory keeps
         // it: one whose entry Detcore names (`ProcfsEntry`, on the backends
-        // whose guest threads are host tasks) or KVM's synthetic procfs
-        // (`procfs_inode::is_backend_procfs_device`). Its stat fields alone
+        // whose guest threads are host tasks). (KVM's `/proc` directories are
+        // Detcore's placeholders, whose stat Detcore answers.) Its stat fields alone
         // prove nothing: an anonymous device with 1024-byte blocks is also
         // devpts, autofs or a FUSE mount reporting those blocks (Codex
         // re-check of https://github.com/rrnewton/hermit/pull/4369). Under
@@ -9669,11 +9665,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         if stat.mode & libc::S_IFMT == libc::S_IFDIR
             && stat.mask.contains(StatxMask::STATX_SIZE)
             && !procfs.is_procfs()
-            && !procfs_inode::is_backend_procfs_device(
-                &guest.config().backend,
-                host_device,
-                stat.blksize,
-            )
             && !procfs_inode::unprovable_procfs_signature(
                 &guest.config().backend,
                 guest.thread_state().physical_tid,
@@ -13880,8 +13871,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         if stat.mode & libc::S_IFMT != libc::S_IFDIR {
             return Ok(None);
         }
-        let backend_procfs =
-            procfs_inode::is_backend_procfs_device(&self.cfg.backend, stat.dev, stat.blksize);
         // Where the kernel numbers processes otherwise than Detcore (DBT),
         // the directory is the one the guest's spelling names, which reached
         // the kernel's directory of the same process (`procfs_numbers`).
@@ -13901,17 +13890,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Some(path) => path,
                 None => return Ok(None),
             }
-        } else if backend_procfs && let Some(spelled) = spelled {
-            spelled
         } else {
             return Ok(None);
         };
         let Some(directory) = listing::classify(&path, pid, tid) else {
             return Ok(None);
         };
-        if backend_procfs && !matches!(directory, ModeledDirectory::System(_)) {
-            return Ok(None);
-        }
         let process = match directory {
             ModeledDirectory::System(_) => None,
             ModeledDirectory::Process(process)
@@ -13935,28 +13919,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Some(names) = listing::entries(&directory, self.cfg.proc_level, &facts) else {
             return Ok(None);
         };
-        // The host's cookies, where the kernel lists the directory. A
-        // backend's own /proc (KVM) lists nothing of it and may not answer
-        // the guest's form of the call (legacy `getdents`), so there only a
-        // position the guest moved before its first read is the kernel's to
-        // keep, as for any other directory.
-        let host = if backend_procfs {
-            let known = guest
-                .thread_state()
-                .with_detfd(fd, |detfd| detfd.has_directory_stream())?;
-            let position = syscalls::Lseek::new()
-                .with_fd(fd)
-                .with_offset(0)
-                .with_whence(Whence::SEEK_CUR);
-            if !known && self.record_or_replay(guest, position).await != Ok(0) {
-                return Ok(None);
-            }
-            Vec::new()
-        } else {
-            let Some(host) = self.snapshot_directory_privately(guest, call).await? else {
-                return Ok(None);
-            };
-            host
+        // The host's cookies, where the kernel lists the directory.
+        let Some(host) = self.snapshot_directory_privately(guest, call).await? else {
+            return Ok(None);
         };
         // A process or thread number the kernel lists is the kernel's (DBT):
         // its cookie is the cookie of the guest's number for it.
@@ -13996,11 +13961,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let session_files = self.rendered_files(guest);
         let host_end = host.last().map_or(0, |entry| entry.off);
         // Looked up from the guest's own descriptor where it names the
-        // kernel's directory, and by the guest's spelling on KVM, whose own
-        // /proc looks up only absolute paths, and on DBT, whose lookup
+        // kernel's directory, and by the guest's spelling on DBT, whose lookup
         // translates the guest's numbers to the kernel's as the guest's own
         // lookup of each would be (`inject_statat`, `procfs_numbers`).
-        let (lookup_dir, spellings): (RawFd, Vec<PathBuf>) = if backend_procfs || translates {
+        let (lookup_dir, spellings): (RawFd, Vec<PathBuf>) = if translates {
             let spellings = names
                 .iter()
                 .map(|(name, _)| path.join(std::ffi::OsStr::from_bytes(name)))
@@ -14033,15 +13997,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     !self.kernel_serves_every_comm(&file)
                         && file.rendered_path(session_files).is_some()
                 });
-                // On a backend's own /proc (KVM), what a lookup finds is the
-                // backend's, at a moment the host decides (a process's
-                // directory goes when its executor learns of the exit), so
-                // there it numbers an entry but decides none.
                 let ino = match looked_up {
                     Ok(ino) => ino,
-                    Err(Errno::ENOENT)
-                        if name != b"." && name != b".." && !rendered && !backend_procfs =>
-                    {
+                    Err(Errno::ENOENT) if name != b"." && name != b".." && !rendered => {
                         return None;
                     }
                     Err(_) => procfs_inode::path_inode(stat.dev, &entry).ino,

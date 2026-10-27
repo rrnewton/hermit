@@ -7073,20 +7073,18 @@ fn detcore_lists_procfs_from_its_model_on_every_backend() {
 
 /// Serve `/proc` and the caller's descriptor directory, as Detcore does in
 /// hermit-cli's container, on `backend`, once in the container (`--strict`)
-/// and once without it (`--no-namespace`), and return how many lines of the
-/// runs' debug logs name KVM's `/proc` anchor (`[detcore] KVM /proc anchor
-/// reached`). Each descriptor Detcore serves is open on `object`, which its
-/// debug log names: procfs's root on ptrace, the placeholder directory on
-/// KVM. Without a container Detcore serves neither directory: ptrace keeps
-/// the kernel's directories, which list the same descriptors, and KVM
-/// refuses an open of either with `EACCES` before it can reach its
-/// executor's own `/proc` handle. Relaxation: `--strict` refuses
-/// `--no-namespace`, so those runs are not strict; the container's runs are.
-fn serve_procfs_directories_in_a_container_only(backend: &str, object: &str) -> usize {
+/// and once without it (`--no-namespace`). Each descriptor Detcore serves is
+/// open on `object`, which its debug log names: procfs's root on ptrace, the
+/// placeholder directory on KVM. Without a container Detcore serves neither
+/// directory: ptrace keeps the kernel's directories, which list the same
+/// descriptors, and KVM refuses an open of either with `EACCES`, as its
+/// executor, which serves no procfs directory, would too. Relaxation:
+/// `--strict` refuses `--no-namespace`, so those runs are not strict; the
+/// container's runs are.
+fn serve_procfs_directories_in_a_container_only(backend: &str, object: &str) {
     let script = "ls -1a /proc/self/fd && ls /proc >/dev/null && echo listed /proc";
     let refused = "for d in /proc/self/fd /proc; do ls \"$d\" 2>&1 >/dev/null | \
                    grep -q 'Permission denied' && echo \"$d EACCES\"; done; echo done";
-    let mut anchor_warnings = 0;
     let mut listings = Vec::new();
     for mode in ["--strict", "--no-namespace"] {
         let refuses = backend == "kvm" && mode == "--no-namespace";
@@ -7104,10 +7102,6 @@ fn serve_procfs_directories_in_a_container_only(backend: &str, object: &str) -> 
         let output = hermit(&args);
         assert_success(&output, &args);
         let log = stderr(&output);
-        anchor_warnings += log
-            .lines()
-            .filter(|line| line.contains("KVM /proc anchor reached"))
-            .count();
         // Detcore's debug line for each: "descriptor N: <directory>
         // served on <object>".
         let served = |directory: &str| {
@@ -7150,7 +7144,6 @@ fn serve_procfs_directories_in_a_container_only(backend: &str, object: &str) -> 
         listings.windows(2).all(|pair| pair[0] == pair[1]),
         "{backend}: the container's listing differs from --no-namespace's: {listings:?}"
     );
-    anchor_warnings
 }
 
 /// On ptrace, whose procfs is the kernel's, Detcore serves `/proc` and the
@@ -7164,10 +7157,7 @@ fn serve_procfs_directories_in_a_container_only(backend: &str, object: &str) -> 
 /// not resolve, is procfs (`statfs`), as on Linux, and no tmpfs of Hermit's.
 #[test]
 fn procfs_directories_are_served_only_in_a_container() {
-    assert_eq!(
-        serve_procfs_directories_in_a_container_only("ptrace", "/proc"),
-        0
-    );
+    serve_procfs_directories_in_a_container_only("ptrace", "/proc");
     let args = [
         "--backend",
         "ptrace",
@@ -7186,23 +7176,18 @@ fn procfs_directories_are_served_only_in_a_container() {
     assert_eq!(stdout(&output), "9fa0\n", "procfs's /proc/fs/nfsd");
 }
 
-/// On KVM, whose procfs is its executor's own, Detcore serves `/proc` and the
-/// caller's descriptor directory in hermit-cli's container, each on a
-/// descriptor on the placeholder directory, an empty read-only tmpfs at
+/// On KVM, whose executor serves no procfs directory, Detcore serves `/proc`
+/// and the caller's descriptor directory in hermit-cli's container, each on
+/// a descriptor on the placeholder directory, an empty read-only tmpfs at
 /// `/proc/fs/nfsd`, and refuses either with `EACCES` without the container
-/// ([`serve_procfs_directories_in_a_container_only`]). No KVM run, in the
-/// container or not, reaches the executor's own `/proc` handle (no
-/// `[detcore] KVM /proc anchor reached` line): the tripwire for its removal
-/// from the executor (slice P2).
+/// ([`serve_procfs_directories_in_a_container_only`]).
 #[test]
 fn run_kvm_procfs_directories_are_served_only_in_a_container() {
     let test = "run_kvm_procfs_directories_are_served_only_in_a_container";
     if kvm_unavailable(test) {
         return;
     }
-    let anchor_warnings = serve_procfs_directories_in_a_container_only("kvm", "/proc/fs/nfsd");
-    assert_eq!(anchor_warnings, 0, "a run reached KVM's /proc anchor");
-    eprintln!("{test}: KVM /proc anchor warnings: {anchor_warnings}");
+    serve_procfs_directories_in_a_container_only("kvm", "/proc/fs/nfsd");
 }
 
 /// The calls on and below a `/proc` directory Detcore serves that Detcore
@@ -7392,17 +7377,12 @@ fn refuse_calls_below_served_procfs_directories(test: &str, backend: &str) {
         log.contains("runs outside Detcore's turn"),
         "{backend} {inherited}: the refusal does not name its reason: {log}"
     );
-    assert!(
-        !log.contains("KVM /proc anchor reached"),
-        "{backend} {inherited}: a run reached KVM's /proc anchor: {log}"
-    );
     compared.push(format!("{backend} {inherited}"));
     eprintln!("{test} compared {compared:?}");
 }
 
 /// Run `guest` in `mode` on `backend` under `--strict`, and require that it
-/// stops with the policy's exit, names `reason`, and reaches no KVM `/proc`
-/// anchor.
+/// stops with the policy's exit and names `reason`.
 fn refuse_procfs_directory_mode(backend: &str, guest: &Path, mode: &str, reason: &str) {
     let args = [
         "--backend",
@@ -7425,10 +7405,6 @@ fn refuse_procfs_directory_mode(backend: &str, guest: &Path, mode: &str, reason:
     assert!(
         log.contains(reason),
         "{backend} {mode}: the refusal does not name its reason: {log}"
-    );
-    assert!(
-        !log.contains("KVM /proc anchor reached"),
-        "{backend} {mode}: a run reached KVM's /proc anchor: {log}"
     );
 }
 
@@ -7456,9 +7432,8 @@ fn run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name() {
 /// (`/proc/fs`, `/proc/fs/nfsd`, and `/proc/fs/nfsd/..`, which is
 /// `/proc/fs`), leaves Detcore no placeholder: Detcore serves neither
 /// directory (no debug line names a directory served on a descriptor), and
-/// refuses an open of the descriptor directory with `EACCES`, before it can
-/// reach the executor's own `/proc` handle (no `[detcore] KVM /proc anchor
-/// reached` line). Without the mount, Detcore serves it: the control. A
+/// refuses an open of the descriptor directory with `EACCES`. Without the
+/// mount, Detcore serves it: the control. A
 /// mount over `/proc` itself is not checked: the container then cannot read
 /// the guest's mount table and stops the run, at the base as here
 /// (https://github.com/rrnewton/hermit/issues/4758).
@@ -7501,10 +7476,6 @@ fn run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none() {
             log.contains(" served on "),
             target.is_none(),
             "{target:?}: whether Detcore served a directory on a placeholder"
-        );
-        assert!(
-            !log.contains("KVM /proc anchor reached"),
-            "{target:?}: a run reached KVM's /proc anchor"
         );
     }
 }
@@ -42660,7 +42631,8 @@ fn a_fuse_directory_with_procfs_block_size_is_not_procfs() {
 
 /// An open procfs directory keeps the host's size, 0, through fstat, and the
 /// host's SEEK_END, 0: on ptrace Detcore proves it procfs by naming its entry,
-/// and on KVM by the backend's synthetic procfs device. An earlier rule keyed
+/// and on KVM `/proc` is Detcore's placeholder, whose fstat and lseek Detcore
+/// answers as Linux answers them for `/proc`. An earlier rule keyed
 /// on procfs naming alone reported 4096 under KVM (Claude review of
 /// https://github.com/rrnewton/hermit/pull/4369), and one that refused SEEK_END
 /// on every directory but KVM's passed every other test (Claude re-check at

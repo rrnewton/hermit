@@ -1373,8 +1373,9 @@ static void check_relative_paths_through_links(void) {
 
 /* /proc/fs/nfsd, procfs's empty mount point, by spellings Hermit's --proc
  * level table does not resolve: through the caller's root link, through a
- * descriptor link to /, and through a symbolic link the guest makes. Linux
- * finds procfs's own empty directory each way (statfs: procfs). */
+ * descriptor link to /, through a symbolic link the guest makes, and relative
+ * to the working directory /. Linux finds procfs's own empty directory each
+ * way (statfs: procfs). */
 static void check_mount_point_by_other_spellings(void) {
   struct stat st;
   struct statx stx;
@@ -1421,11 +1422,30 @@ static void check_mount_point_by_other_spellings(void) {
   int symlink_statx = statx(AT_FDCWD, symlink_path, 0, STATX_BASIC_STATS, &stx);
   int symlink_statx_error = symlink_statx < 0 ? errno : 0;
   unlink(symlink_path);
+  int previous = open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  CHECK(previous >= 0 && chdir("/") == 0, "chdir /: %s", strerror(errno));
+  errno = 0;
+  int relative_open = open("proc/fs/nfsd", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  int relative_open_error = relative_open < 0 ? errno : 0;
+  if (relative_open >= 0) {
+    close(relative_open);
+  }
+  errno = 0;
+  int relative_stat = stat("proc/fs/nfsd", &st);
+  int relative_stat_error = relative_stat < 0 ? errno : 0;
+  errno = 0;
+  int relative_statx = statx(AT_FDCWD, "proc/fs/nfsd", 0, STATX_BASIC_STATS, &stx);
+  int relative_statx_error = relative_statx < 0 ? errno : 0;
+  CHECK(fchdir(previous) == 0, "fchdir back: %s", strerror(errno));
+  close(previous);
   printf("/proc/fs/nfsd by other spellings: root link open=%s stat=%s statfs=%s type=%lx; "
-         "descriptor link to / open=%s; symbolic link open=%s stat=%s statx=%s\n",
+         "descriptor link to / open=%s; symbolic link open=%s stat=%s statx=%s; "
+         "from the working directory / open=%s stat=%s statx=%s\n",
          errno_name(root_open_error), errno_name(root_stat_error), errno_name(root_statfs_error),
          root_type, errno_name(link_open_error), errno_name(symlink_open_error),
-         errno_name(symlink_stat_error), errno_name(symlink_statx_error));
+         errno_name(symlink_stat_error), errno_name(symlink_statx_error),
+         errno_name(relative_open_error), errno_name(relative_stat_error),
+         errno_name(relative_statx_error));
 }
 
 /* The sibling of --send-rewritten-while-blocked: once the main thread waits

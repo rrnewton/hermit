@@ -28,8 +28,8 @@
 //!   below that path after the link (`/proc/self/fd/D/<pid>/fd/<name>`), so
 //!   that every lookup starts where the guest's does, whatever the caller's
 //!   root or PID namespace ([`Detcore::respelled_below_descriptor_directory`]);
-//! - where it is not (KVM, whose `/proc` is its executor's own, which
-//!   Detcore must not open), the placeholder directory, the empty, read-only
+//! - where it is not (KVM, whose executor serves no procfs directory), the
+//!   placeholder directory, the empty, read-only
 //!   tmpfs hermit-cli mounts at the container's `/proc/fs/nfsd`
 //!   (`DetConfig::directory_placeholder`), procfs's own permanently empty
 //!   mount point. A name looked up below the descriptor, or through its
@@ -43,11 +43,30 @@
 //! `fchdir`, `flock` (each directory its own lock, as each has an inode of its
 //! own on Linux), and every call procfs refuses, with procfs's errno, in
 //! Linux's order of checks. Only the object differs, and the guest never sees
-//! it: the placeholder directory is hidden (Detcore's `--proc` level table
-//! hides `/proc/fs` at every level, and any open or stat that reaches the
-//! placeholder by another spelling, which Detcore did not make, fails with
-//! `ENOENT` as `/proc/fs` does: [`Detcore::hidden_placeholder_reached`]), and
-//! on ptrace hermit-cli still mounts it, unused.
+//! it: the placeholder directory is hidden. Detcore's `--proc` level table
+//! hides `/proc/fs` at every level, and KVM's executor hides every other
+//! spelling of the placeholder too, for hermit-cli reserves it there
+//! (`reverie_kvm::KvmBackend::reserve_tool_directory`, which requires a
+//! read-only file system, as the fresh read-only tmpfs is): every lookup by
+//! such a spelling, and every call that changes a name whose parent the
+//! executor does not find on procfs, fails with `ENOENT`, as for the absent
+//! `/proc/fs`. Where Detcore leaves such a spelling to the executor and its
+//! parent is procfs's own `/proc/fs` (a path relative to the working
+//! directory, <https://github.com/rrnewton/hermit/issues/4541>, or a lookup
+//! from an inherited procfs descriptor,
+//! <https://github.com/rrnewton/hermit/issues/4816>), the calls that check
+//! that parent first answer procfs's `EACCES` instead: `mkdir`, `mknod`,
+//! `unlink`, `rmdir`, `rename` (from, over and exchange), `link`,
+//! `symlink`'s new path, `fchmodat` (`chmod`) and `utimensat` (`utimes`). A
+//! creation through a final symbolic link into the placeholder, and the
+//! other cases Reverie's contract names (a race between a check and its
+//! call; a creation below another user's link under
+//! `fs.protected_symlinks`), get the read-only file system's `EROFS` (or
+//! `EXDEV` for a racing `rename`) and create nothing. An open or stat that
+//! reaches it by a spelling Detcore made itself is hidden after the call
+//! ([`Detcore::hidden_placeholder_reached`]). hermit-cli mounts the
+//! placeholder only where the guest's procfs is not the kernel's
+//! ([`crate::needs_directory_placeholder`]): on ptrace there is none.
 //!
 //! The table a descriptor directory lists is Detcore's own, which the tool
 //! keeps for the guest (ptrace, KVM) and F0a made complete: every descriptor
@@ -70,8 +89,9 @@
 //! descriptors). Without a placeholder (`--no-namespace`, library callers,
 //! record and replay, a user mount that covers it) Detcore serves neither
 //! directory: on ptrace each is the kernel's, and where the guest's procfs is
-//! not the kernel's an open of either is refused with `EACCES` before it can
-//! reach the backend's own `/proc` ([`Detcore::refuses_backend_procfs_directory`]).
+//! not the kernel's an open of either is refused with `EACCES` before it
+//! reaches the backend ([`Detcore::refuses_backend_procfs_directory`]), whose
+//! executor would refuse it too.
 
 // TODO-HUMAN-REVIEW(#4604): Review the Detcore-served descriptor directory, a
 // new determinization strategy: on ptrace its listing replaces the kernel's.
@@ -1196,11 +1216,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// the guest's procfs is not the kernel's (KVM) and Detcore serves no new
     /// placeholder to the caller: no placeholder in the run (`--no-namespace`,
     /// a library caller, a user mount over the placeholder), or a caller in a
-    /// nested PID namespace, whose numbers Detcore does not know. The
-    /// backend's own `/proc` there (its executor's anchor,
-    /// `reverie-linuxemu`'s `open_synthetic_proc_directory`) is not opened for
-    /// the guest, so that no run reaches it before its removal (package K
-    /// slice P2): the owner-approved answer for these configurations.
+    /// nested PID namespace, whose numbers Detcore does not know: the
+    /// owner-approved answer for these configurations. The backend's executor
+    /// serves no procfs directory either (reverie-linuxemu refuses `/proc`
+    /// with `EACCES` since package K slice P2); Detcore answers first, so the
+    /// answer is Detcore's on every backend that needs it.
     pub(crate) async fn refuses_backend_procfs_directory<G: Guest<Self>>(
         guest: &mut G,
         observed: &Path,
@@ -3099,9 +3119,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///   by name: either way the working directory changes only if the call
     ///   succeeds, as Linux's `fchdir` changes it;
     /// - on the placeholder (KVM): an injected `chdir` to the directory's
-    ///   path, which the backend's own `/proc` resolves (KVM's executor
-    ///   refuses a working directory on its `/proc` with `EACCES`, as it
-    ///   does for the guest's own `chdir("/proc")`).
+    ///   path, which the backend resolves (KVM's executor refuses a working
+    ///   directory on procfs with `EACCES`, as it does for the guest's own
+    ///   `chdir("/proc")`).
     ///
     /// A descriptor directory whose task is gone (or whose numbers another
     /// task holds now) is one Linux still enters, a directory below which no

@@ -231,63 +231,15 @@ pub(crate) fn may_be_procfs(device: u64, block_size: i64) -> bool {
     libc::major(device) == 0 && block_size == PROC_BLOCK_SIZE
 }
 
-/// The device of the procfs files the KVM backend synthesizes (`/proc` and
-/// its allowlisted files): reverie-kvm's `synthetic_dev(SYNTHETIC_PROC_DEV_MINOR)`
-/// in `reverie-kvm/src/executor.rs`, which reports them with 4096-byte blocks.
-/// `run_kvm_a_procfs_directory_keeps_its_size` fails if the two drift apart.
+/// The device of the regular procfs files the KVM backend's executor still
+/// synthesizes (`/proc/locks`, `/proc/self/status` and `/proc/self/maps`):
+/// reverie-linuxemu's `synthetic_dev(SYNTHETIC_PROC_DEV_MINOR)`, which it
+/// reports with 4096-byte blocks. It keys the inode numbers of the `/proc`
+/// directories Detcore serves on KVM
+/// (`Detcore::procfs_key_device`), so that they are the numbers they were
+/// when the executor's own `/proc` directory reported this device; the
+/// executor serves no procfs directory since package K slice P2.
 pub(crate) const KVM_SYNTHETIC_PROC_DEVICE: u64 = libc::makedev(0, 0xff01);
-
-/// Whether a stat result is the procfs of a backend whose `/proc` is its
-/// own: where the tool cannot name guest descriptors through host procfs
-/// ([`tool_can_name_guest_descriptors`], KVM), the backend serves `/proc`
-/// itself, on [`KVM_SYNTHETIC_PROC_DEVICE`] with 4096-byte blocks, and that
-/// device is the proof. Elsewhere the kernel's procfs is proved by naming the
-/// entry (`ProcfsEntry`), not by its stat fields: an anonymous device with
-/// 1024-byte blocks is also devpts, autofs or a FUSE mount that reports those
-/// blocks (Codex re-check of https://github.com/rrnewton/hermit/pull/4369).
-///
-/// Every caller asks about a directory, and the only directory on that
-/// device is KVM's `/proc` anchor, which no guest descriptor reaches where
-/// Detcore serves `/proc` on a placeholder (package K slice P1): each match
-/// is logged ([`warn_anchor_reached`]) so that a run shows none before the
-/// anchor is deleted from the executor.
-pub(crate) fn is_backend_procfs_device(
-    backend: &BackendCapabilities,
-    device: u64,
-    block_size: i64,
-) -> bool {
-    let anchor = !tool_can_name_guest_descriptors(backend)
-        && device == KVM_SYNTHETIC_PROC_DEVICE
-        && block_size == 4096;
-    if anchor {
-        warn_anchor_reached("a directory stat on the executor's procfs device");
-    }
-    anchor
-}
-
-/// Log, by name, that a guest descriptor or path reached KVM's `/proc`
-/// anchor: the executor's own `/proc` handle (`reverie-linuxemu`'s
-/// `open_synthetic_proc_directory`), which Detcore neither opens nor lets an
-/// open reach (package K slice P1): it serves `/proc` on a placeholder in a
-/// container, and refuses an open of `/proc` with `EACCES` where it serves
-/// none (`--no-namespace`, a library caller, a nested PID namespace). The
-/// tripwire for the anchor's removal from the executor (slice P2): a KVM run
-/// shows no such line.
-pub(crate) fn warn_anchor_reached(what: &str) {
-    tracing::warn!("[detcore] KVM /proc anchor reached: {what}");
-}
-
-/// Whether the stat result a guest descriptor's open recorded is KVM's
-/// `/proc` anchor: a directory on the device of the executor's procfs files
-/// where the backend's `/proc` is its own ([`warn_anchor_reached`]).
-pub(crate) fn note_anchor_opened(backend: &BackendCapabilities, device: u64, mode: u32) {
-    if !tool_can_name_guest_descriptors(backend)
-        && device == KVM_SYNTHETIC_PROC_DEVICE
-        && mode & libc::S_IFMT == libc::S_IFDIR
-    {
-        warn_anchor_reached("a guest descriptor was opened on it");
-    }
-}
 
 /// Whether a stat result must be taken as procfs although Detcore cannot
 /// prove it: where guest thread IDs do not name host tasks
@@ -1418,41 +1370,6 @@ mod tests {
         ] {
             assert_eq!(tasks(path), Vec::<i32>::new(), "{path}");
         }
-    }
-
-    #[test]
-    fn only_kvms_synthetic_procfs_device_is_proved_by_its_stat_fields() {
-        let synthetic = libc::makedev(0, 0xff01);
-        assert!(is_backend_procfs_device(
-            &BackendCapabilities::KVM,
-            synthetic,
-            4096
-        ));
-        assert!(!is_backend_procfs_device(
-            &BackendCapabilities::KVM,
-            synthetic,
-            1024
-        ));
-        assert!(!is_backend_procfs_device(
-            &BackendCapabilities::KVM,
-            PROC_DEVICE,
-            1024
-        ));
-        assert!(!is_backend_procfs_device(
-            &BackendCapabilities::PTRACE,
-            synthetic,
-            4096
-        ));
-        assert!(!is_backend_procfs_device(
-            &BackendCapabilities::PTRACE,
-            PROC_DEVICE,
-            1024
-        ));
-        assert!(!is_backend_procfs_device(
-            &BackendCapabilities::DBT,
-            PROC_DEVICE,
-            1024
-        ));
     }
 
     #[test]

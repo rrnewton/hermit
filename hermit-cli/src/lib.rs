@@ -3869,6 +3869,21 @@ async fn run_kvm(
     // a second copy of the program in host memory for the whole run: 75 MB
     // for node (https://github.com/rrnewton/reverie/issues/1063).
     drop(image);
+    // The placeholder directory Detcore serves `/proc` and the descriptor
+    // directories on (`DetConfig::directory_placeholder`, a container's
+    // empty read-only tmpfs at `/proc/fs/nfsd`): the executor reaches it only
+    // by Detcore's own open and stat of that exact path, and hides it from
+    // every other route a guest could take to it (a symbolic link it makes, a
+    // path relative to its working directory) with ENOENT, as Detcore hides
+    // `/proc/fs`, so that no answer of the tmpfs reaches the guest
+    // (https://github.com/rrnewton/hermit/issues/4781).
+    if let Some(placeholder) = config.directory_placeholder.as_deref() {
+        backend
+            .reserve_tool_directory(placeholder)
+            .map_err(|error| {
+                anyhow!("failed to reserve the KVM placeholder directory {placeholder:?}: {error}")
+            })?;
+    }
     // The KVM backend defaults to Tool-owned guest threads: CLONE_THREAD
     // workers are driven through the Detcore tool loop and their futex/CLEARTID
     // synchronization routes to Detcore, matching the golden ptrace model
