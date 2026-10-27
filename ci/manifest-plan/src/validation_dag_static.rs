@@ -1823,7 +1823,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed with the existing feature selection and exclusions unchanged.
     // Caller-owned DBT private placement adds one library launch regression,
     // measured with the existing feature selection and exclusions unchanged:
-    // 1105 (A5 3c.1e B's seven harness units were reverted with that slice).
+    // 1105.
     // And tests::a_dbt_runtime_without_the_fingerprint_check_is_refused (Hermit
     // refuses a DBT runtime built before its coordinator fingerprint check):
     // 1106, listed.
@@ -1836,7 +1836,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And tests::defined_dynamic_symbols_are_read_from_the_dynamic_segment_alone
     // and tests::the_dynamic_symbol_count_comes_from_the_hash_table (that check
     // reads only the runtime's dynamic symbols): 1112, listed.
-    ("test.hermit_unit", 1114),
+    // And A5 slice 3c.1e B's forced-gate harness (in_guest_delivery_harness):
+    // the_parent_runner_never_forces_the_gate and six forced_gate_* rows:
+    // 1121, listed (1114 on main plus seven).
+    ("test.hermit_unit", 1121),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5613,12 +5616,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Caller-selected DBT environment privacy adds one library regression,
     // listed with the existing feature selection and exclusions unchanged.
     // The same private-placement library regression remains in the hosted
-    // selection, measured with its existing exclusions unchanged: 1105 (A5
-    // 3c.1e B's harness unit was reverted with that slice).
+    // selection, measured with its existing exclusions unchanged: 1105.
     // And the same DBT runtime fingerprint-check unit: 1106, listed.
     // And the same four P1 container units: 1110, listed.
     // And the same two dynamic-symbol units: 1112, listed.
-    ("test.hermit_unit_on_host", 1114),
+    // And A5 slice 3c.1e B's harness unit the_parent_runner_never_forces_the_gate;
+    // its six forced_gate_* rows launch in-guest-trap guests, which need CPUID
+    // faulting, so this hosted twin excludes them by exact name
+    // (validation_dag::HOSTED_PORTABLE_CPUID_FAULTING_HERMIT_UNIT_TESTS) while
+    // test.hermit_unit runs all seven: 1115, listed
+    // (1114 on main plus one).
+    ("test.hermit_unit_on_host", 1115),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
