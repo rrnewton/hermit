@@ -679,6 +679,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         else {
             return Decision::default();
         };
+        // The path Linux's walk reaches: through the caller's descriptor
+        // links to the `/proc` directories Detcore serves on placeholders,
+        // and back through `..` over the directories every procfs has, so
+        // that no spelling a placeholder's respelling or a `..` makes of an
+        // omitted name reaches it (`descriptor_directory`). Not from a
+        // descriptor whose recorded path is a descriptor link's spelling,
+        // which need not name the file it is open on
+        // (`Detcore::starts_at_a_recorded_link`).
+        let observed = if Self::starts_at_a_recorded_link(guest, dirfd, spelling) {
+            observed
+        } else {
+            let observed = match Self::decided_path(guest, &observed) {
+                Ok((decided, _)) => decided,
+                Err(_) => observed,
+            };
+            // A task the spelling names on the way that does not exist ends
+            // the kernel's walk with ENOENT, as every name this refuses does.
+            super::descriptor_directory::resolved_procfs_dotdot(&observed)
+                .map_or(observed, |(resolved, _)| resolved)
+        };
         let in_view = match root {
             None => observed.clone(),
             Some(root) => root.join(observed.strip_prefix("/").unwrap_or(&observed)),
@@ -903,8 +923,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// (`getsockopt(SO_TYPE)`, into a transient page): only such a socket
     /// looks up the address a send gives. `None` where there is no room for
     /// the question. Asked only for a send whose address reaches an omitted
-    /// name, outside record and replay.
-    async fn socket_is_datagram<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) -> Option<bool> {
+    /// name, or leads below a `/proc` directory Detcore serves on a
+    /// placeholder (`Detcore::refuse_lookup_below_placeholder`), outside
+    /// record and replay.
+    pub(super) async fn socket_is_datagram<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Option<bool> {
         const LENGTH: usize = 8;
         let page = map_transient(guest, LENGTH).await?;
         let base = page.as_raw();
@@ -933,6 +959,52 @@ impl<T: RecordOrReplay> Detcore<T> {
                 && i32::from_ne_bytes(contents[..4].try_into().expect("4 bytes"))
                     == libc::SOCK_DGRAM,
         )
+    }
+
+    /// Whether the socket `fd` can pass descriptors over `SCM_RIGHTS`: an
+    /// `AF_UNIX` socket, as the socket says (`getsockopt(SO_DOMAIN)`, into a
+    /// transient page). `false` where the socket does not answer because `fd`
+    /// is no socket or no descriptor, where Linux's send fails before it reads
+    /// the control data (`sockfd_lookup_light`); `true` where Detcore cannot
+    /// ask (no room for the question, or another failure).
+    pub(super) async fn socket_carries_descriptors<G: Guest<Self>>(
+        guest: &mut G,
+        fd: RawFd,
+    ) -> bool {
+        const LENGTH: usize = 8;
+        let Some(page) = map_transient(guest, LENGTH).await else {
+            return true;
+        };
+        let base = page.as_raw();
+        // The domain, an int, then its length, a socklen_t.
+        let mut contents = [0u8; LENGTH];
+        contents[4..].copy_from_slice(&4u32.to_ne_bytes());
+        let carries = if guest.memory().write_exact(page, &contents).is_err() {
+            true
+        } else {
+            match guest
+                .inject(Syscall::from_raw(
+                    Sysno::getsockopt,
+                    raw_args([
+                        fd as usize,
+                        libc::SOL_SOCKET as usize,
+                        libc::SO_DOMAIN as usize,
+                        base,
+                        base + 4,
+                        0,
+                    ]),
+                ))
+                .await
+            {
+                Ok(_) if guest.memory().read_exact(page, &mut contents).is_ok() => {
+                    i32::from_ne_bytes(contents[..4].try_into().expect("4 bytes")) == libc::AF_UNIX
+                }
+                Err(syscalls::Errno::ENOTSOCK | syscalls::Errno::EBADF) => false,
+                _ => true,
+            }
+        };
+        unmap_transient(guest, page, LENGTH).await;
+        carries
     }
 
     /// The guest's root in the tool's view: `Some(None)` where they are the

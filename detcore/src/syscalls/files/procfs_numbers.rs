@@ -271,7 +271,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
         ];
         if Self::may_respell_below_descriptor_directory(guest, call) {
-            let respelled = Self::respelled_below_descriptor_directory(guest, call).await?;
+            // Boxed: the respelling's future is large, and every handler that
+            // injects a path call through this one would carry it inline,
+            // while a path below a placeholder descriptor is rare.
+            let respelled =
+                Box::pin(Self::respelled_below_descriptor_directory(guest, call)).await?;
             if !respelled.is_empty() {
                 let staged = respelled
                     .into_iter()
