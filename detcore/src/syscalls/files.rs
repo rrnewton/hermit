@@ -9662,8 +9662,23 @@ impl<T: RecordOrReplay> Detcore<T> {
         // the host's value unproved
         // (`procfs_inode::unprovable_procfs_signature`). sysfs and cgroup
         // directories, which Linux also reports as 0, report 4096.
+        //
+        // A directory's link count is the same kind of host value: on file
+        // systems that count a directory's links it is two plus the number
+        // of subdirectories, so it changes whenever any process adds or
+        // removes a subdirectory, and file systems that do not count them
+        // (btrfs, tmpfs) report 1 for every directory. The ancestors a build
+        // stats include shared directories such as `/home`, whose
+        // subdirectory count churns under parallel work on a shared machine, so
+        // the host's count broke the same `--verify` comparisons as the
+        // size above, through the hashed stat buffer the io-buffer log
+        // records. Report 1, as the procfs root above already does: a
+        // walker such as `find` then infers nothing from the count, which
+        // is the safe direction (its leaf optimization only ever prunes
+        // when the count proves a directory has no subdirectories).
         if stat.mode & libc::S_IFMT == libc::S_IFDIR
-            && stat.mask.contains(StatxMask::STATX_SIZE)
+            && (stat.mask.contains(StatxMask::STATX_SIZE)
+                || stat.mask.contains(StatxMask::STATX_NLINK))
             && !procfs.is_procfs()
             && !procfs_inode::unprovable_procfs_signature(
                 &guest.config().backend,
@@ -9672,7 +9687,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 stat.blksize,
             )
         {
-            stat.size = 4096;
+            if stat.mask.contains(StatxMask::STATX_SIZE) {
+                stat.size = 4096;
+            }
+            if stat.mask.contains(StatxMask::STATX_NLINK) {
+                stat.nlink = 1;
+            }
             if stat.mask.contains(StatxMask::STATX_BLOCKS) {
                 stat.blocks = 8;
             }
