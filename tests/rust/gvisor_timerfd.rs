@@ -163,7 +163,8 @@ fn main() {
         ("CLOCK_MONOTONIC", libc::CLOCK_MONOTONIC),
         ("CLOCK_BOOTTIME", libc::CLOCK_BOOTTIME),
     ];
-    let cases: [(&str, fn(i32)); 5] = [
+    type ClockCase = (&'static str, fn(i32));
+    let cases: [ClockCase; 5] = [
         ("IsInitiallyStopped", timerfd_test::is_initially_stopped),
         (
             "SetToPastExpiresEventually",
