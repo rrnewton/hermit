@@ -43,6 +43,18 @@ use reverie::syscalls::Sysno;
 use crate::analyze::phases::Departure;
 use crate::analyze::phases::departure;
 use crate::analyze::phases::stack_thread;
+use crate::analyze::race_watch::SideView;
+use crate::analyze::race_watch::WatchStage;
+use crate::analyze::race_watch::WatchedBytes;
+use crate::analyze::race_watch::hits;
+use crate::analyze::race_watch::memory_pairs;
+use crate::analyze::race_watch::name_frames;
+use crate::analyze::race_watch::pass_watches;
+use crate::analyze::race_watch::plan_passes;
+use crate::analyze::race_watch::race_watch_candidates;
+use crate::analyze::race_watch::sanitizer_candidates;
+use crate::analyze::race_watch::trace_candidates;
+use crate::analyze::race_watch::unobserved;
 use crate::analyze::races::CandidateCheck;
 use crate::analyze::races::CheckVerdict;
 use crate::analyze::races::CrossedThread;
@@ -55,6 +67,7 @@ use crate::analyze::races::RacingAccesses;
 use crate::analyze::races::Window;
 use crate::analyze::races::find_racing_accesses;
 use crate::analyze::races::outcome_point;
+use crate::analyze::races::trace_edges;
 use crate::analyze::races::uncounted_signal_outcome;
 use crate::analyze::rundata::RunData;
 use crate::analyze::types::AnalyzeOpts;
@@ -87,6 +100,8 @@ pub struct TracedReplay {
     /// Why the schedule it recorded cannot be read, if it cannot: then
     /// whether it followed its schedule is unknown.
     schedule_error: Option<String>,
+    /// Its guest's stderr, beside its trace.
+    stderr: Option<PathBuf>,
 }
 
 impl TraceRequest {
@@ -124,6 +139,11 @@ impl TraceRequest {
     ) -> TracedReplay {
         TracedReplay {
             role: self.role,
+            stderr: self
+                .trace
+                .as_ref()
+                .ok()
+                .map(|path| path.with_extension("stderr")),
             trace: self.trace,
             departure,
             realized,
@@ -196,15 +216,26 @@ impl AnalyzeOpts {
     /// run's name, `role`, the schedule, how many of its first events are as
     /// that run realized them (whose callback checkpoints still apply), and
     /// `replay`.
-    pub(super) fn racing_accesses(
+    ///
+    /// When no kernel-visible pair decides it (none found, or candidates no
+    /// check confirmed), the watch stage reruns each side with hardware
+    /// watchpoints: `watch_run` builds, under a run name, a rerun of the
+    /// "target" or "baseline" side's run ([`race_watch`](super::race_watch)).
+    /// The three builders come as one tuple: `stack_run`, `check_run`,
+    /// `watch_run`.
+    pub(super) fn racing_accesses<S, C, W>(
         &self,
         decision: usize,
         target: TracedReplay,
         baseline: TracedReplay,
-        target_met: bool,
-        stack_run: impl FnOnce(&str) -> anyhow::Result<RunData>,
-        mut check_run: impl FnMut(&str, &str, &[SchedEvent], usize, usize) -> anyhow::Result<RunData>,
-    ) -> RacingAccesses {
+        (target_met, baseline_met): (bool, bool),
+        (stack_run, mut check_run, watch_run): (S, C, W),
+    ) -> RacingAccesses
+    where
+        S: FnOnce(&str) -> anyhow::Result<RunData>,
+        C: FnMut(&str, &str, &[SchedEvent], usize, usize) -> anyhow::Result<RunData>,
+        W: Fn(&'static str, &str) -> anyhow::Result<RunData>,
+    {
         let mut decision = decision as EventIndex;
         let realized = if target_met {
             realized_window(decision, &target, &baseline)
@@ -302,6 +333,34 @@ impl AnalyzeOpts {
             }
             promote_the_deciding_candidate(&mut result);
         }
+        // No kernel-visible pair decided it: the race may be on memory.
+        if matches!(
+            result.status,
+            RaceStatus::NoneFound | RaceStatus::Candidates
+        ) {
+            result.watch = Some(if !target_met {
+                WatchStage::unavailable(
+                    decision,
+                    "the target replay did not meet the target criteria, so a rerun of it is not \
+                     a run that meets them"
+                        .to_owned(),
+                )
+            } else if baseline_met {
+                WatchStage::unavailable(
+                    decision,
+                    "the baseline replay met the target criteria too, so a rerun of it is not a \
+                     run that misses them"
+                        .to_owned(),
+                )
+            } else {
+                self.watch_stage(
+                    decision,
+                    (&target, &baseline),
+                    &target_trace.trace,
+                    &watch_run,
+                )
+            });
+        }
         if matches!(
             result.status,
             RaceStatus::Found
@@ -312,6 +371,288 @@ impl AnalyzeOpts {
             self.attach_stacks(&mut result, &target_trace.trace, stack_run);
         }
         result
+    }
+
+    /// The first event the watch stage watches from: `--race-watch-window`
+    /// events before `decision`, or the start of either deciding thread's
+    /// turn when that starts earlier (the turn the target runs at `decision`
+    /// in its schedule, and the one the baseline runs in its).
+    fn race_watch_from(
+        &self,
+        decision: EventIndex,
+        target: &[SchedEvent],
+        baseline: &[SchedEvent],
+    ) -> EventIndex {
+        let decision = decision as usize;
+        let turn_start = |schedule: &[SchedEvent]| {
+            let Some(thread) = schedule.get(decision).map(|event| event.dettid) else {
+                return decision;
+            };
+            let mut start = decision;
+            while start > 0 && schedule[start - 1].dettid == thread {
+                start -= 1;
+            }
+            start
+        };
+        decision
+            .saturating_sub(self.race_watch_window as usize)
+            .min(turn_start(target))
+            .min(turn_start(baseline)) as EventIndex
+    }
+
+    /// The watch stage ([`race_watch`](super::race_watch)): the bytes to
+    /// watch, the passes over both sides, and the pairs their hits make.
+    /// Whatever stops it is the stage's reason, never the analysis's.
+    fn watch_stage(
+        &self,
+        decision: EventIndex,
+        (target, baseline): (&TracedReplay, &TracedReplay),
+        target_trace: &AccessTrace,
+        replay: &dyn Fn(&'static str, &str) -> anyhow::Result<RunData>,
+    ) -> WatchStage {
+        let from = self.race_watch_from(decision, &target.realized, &baseline.realized);
+        // The guest program, found from the guest's working directory when
+        // relative: its symbols place --race-watch symbols and name frames.
+        let runopts = RunData::raw_runopts(self);
+        let program = match runopts.launch_workdir() {
+            Some(dir) if runopts.program().is_relative() => dir.join(runopts.program()),
+            _ => runopts.program().to_path_buf(),
+        };
+        let (mut candidates, symbol_notes) = race_watch_candidates(&program, &self.race_watch);
+        if let Some(stderr) = target
+            .stderr
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+        {
+            candidates.extend(sanitizer_candidates(&String::from_utf8_lossy(&stderr)));
+        }
+        candidates.extend(trace_candidates(target_trace, decision));
+        if candidates.is_empty() {
+            let mut stage = WatchStage::unavailable(
+                from,
+                "there are no bytes to watch: no sanitizer report in the target's stderr, no \
+                 fault address and no futex call at the deciding event; name them with \
+                 --race-watch=ADDR[:LEN] or SYM[+OFF][:LEN]"
+                    .to_owned(),
+            );
+            stage.notes = symbol_notes;
+            return stage;
+        }
+        let (passes, unwatched, more_unwatched) = plan_passes(&candidates);
+        let mut stage = WatchStage::unavailable(from, String::new());
+        stage.unwatched = unwatched;
+        stage.more_unwatched = more_unwatched as u64;
+        stage.notes = symbol_notes;
+        let mut pairs = Vec::new();
+        for (index, pass) in passes.iter().enumerate() {
+            let number = index + 1;
+            let mut sides = Vec::new();
+            for side in [target, baseline] {
+                match self.watch_pass(index, side, pass, (from, decision), replay) {
+                    Ok(Ok((ran, note))) => {
+                        stage.notes.extend(note);
+                        sides.push(ran);
+                    }
+                    Ok(Err(note)) => {
+                        stage.notes.push(note);
+                        break;
+                    }
+                    Err(reason) => {
+                        stage.reason = reason;
+                        stage.watched.clear();
+                        stage.pairs.clear();
+                        return stage;
+                    }
+                }
+            }
+            let read = |role: &str, (run, _): &(WatchRun, String)| {
+                let mut read = hits(&run.trace, pass.len())
+                    .map_err(|why| format!("pass {number}'s {role} hits are left out: {why}."))?;
+                if let Some(at) = run.departed_at {
+                    read.cut_at(at);
+                }
+                Ok::<_, String>(read)
+            };
+            let read = match <[_; 2]>::try_from(sides) {
+                Ok([target_side, baseline_side]) => {
+                    match (
+                        read("target", &target_side),
+                        read("baseline", &baseline_side),
+                    ) {
+                        (Ok(t), Ok(b)) => Some((target_side, baseline_side, t, b)),
+                        (Err(why), _) | (_, Err(why)) => {
+                            stage.notes.push(why);
+                            None
+                        }
+                    }
+                }
+                Err(_) => None,
+            };
+            let Some((
+                (target_run, target_file),
+                (baseline_run, baseline_file),
+                target_hits,
+                baseline_hits,
+            )) = read
+            else {
+                stage.dropped.extend(pass.iter().cloned());
+                continue;
+            };
+            let target_edges = trace_edges(&target_run.trace);
+            let baseline_edges = trace_edges(&baseline_run.trace);
+            let (pass_pairs, notes) = memory_pairs(
+                pass,
+                &SideView {
+                    hits: &target_hits,
+                    schedule: &target_run.realized,
+                    edges: &target_edges,
+                },
+                &SideView {
+                    hits: &baseline_hits,
+                    schedule: &baseline_run.realized,
+                    edges: &baseline_edges,
+                },
+            );
+            pairs.extend(pass_pairs);
+            // Accesses the pass did not see that the other lists miss: later
+            // hits not kept in order, threads of unknown process, and a cut
+            // where a pass ran on its own.
+            stage.partial |= [&target_hits, &baseline_hits].iter().any(|hits| {
+                hits.ran_on_own_from.is_some()
+                    || hits.coverage.values().any(|coverage| !coverage.complete())
+                    || hits.hits.iter().any(|hit| hit.space.is_none())
+            });
+            for note in notes {
+                if !stage.notes.contains(&note) {
+                    stage.notes.push(note);
+                }
+            }
+            // A thread is late when it armed after its own first event in
+            // the window: one created later arms at its first stop.
+            for (hits, run) in [(&target_hits, &target_run), (&baseline_hits, &baseline_run)] {
+                for (thread, coverage) in &hits.coverage {
+                    let first = run
+                        .realized
+                        .iter()
+                        .enumerate()
+                        .skip(from as usize)
+                        .find(|(_, event)| event.dettid == *thread)
+                        .map(|(index, _)| index as EventIndex);
+                    if let (Some(armed), Some(first)) = (coverage.armed_before, first)
+                        && armed > first
+                        && !stage.late.iter().any(|(t, _)| t == thread)
+                    {
+                        stage.late.push((*thread, armed));
+                    }
+                }
+            }
+            for run in [&target_run, &baseline_run] {
+                for unarmed in unobserved(&run.trace) {
+                    if !stage.unobserved.contains(&unarmed) {
+                        stage.unobserved.push(unarmed);
+                    }
+                }
+            }
+            stage.watched.extend(pass.iter().cloned());
+            stage.trace_files.extend([target_file, baseline_file]);
+        }
+        if stage.watched.is_empty() {
+            stage.reason = "no watch pass ran to completion on both sides".to_owned();
+            return stage;
+        }
+        stage.pairs = pairs;
+        stage.conclude();
+        if let Some(note) = name_frames(&program, &mut stage) {
+            stage.notes.push(note);
+        }
+        stage
+    }
+
+    /// Replay `side` once more with pass `index`'s watches from event `from`
+    /// and read its trace and realized schedule, with a note when it ran on
+    /// its own after `decision`. A replay of a realized schedule need not
+    /// realize all of it again (a slice the first run ended after a few
+    /// branches can end later), so a pass is kept when it follows the
+    /// schedule through `decision` and meets the outcome as its side did:
+    /// it is then a run of that side, and its hits are its accesses.
+    /// `Ok(Err(note))` drops the pass (it left the schedule before the
+    /// deciding event, its outcome differs, or a bound stopped it);
+    /// `Err(reason)` makes the stage unavailable (Hermit refuses the watch
+    /// here, or a hit may have changed the guest).
+    #[allow(clippy::type_complexity)]
+    fn watch_pass(
+        &self,
+        index: usize,
+        side: &TracedReplay,
+        pass: &[WatchedBytes],
+        (from, decision): (EventIndex, EventIndex),
+        replay: &dyn Fn(&'static str, &str) -> anyhow::Result<RunData>,
+    ) -> Result<Result<((WatchRun, String), Option<String>), String>, String> {
+        let role = side.role;
+        let number = index + 1;
+        let runname = format!("final_race_watch{number}_{role}");
+        let run = replay(role, &runname)
+            .map_err(|error| format!("the {role} watch replay cannot be prepared ({error:#})"))?
+            .with_schedule_recording();
+        let (mut run, trace) = run.with_access_trace(from, self.race_trace_max_records());
+        let trace = trace.map_err(|refused| {
+            format!("the watch replays cannot record an access trace: {refused}")
+        })?;
+        let config = &mut run.runopts.det_opts.det_config;
+        config.watch = pass_watches(pass);
+        config.watch_from = from;
+        if let Err(error) = run.runopts.clone().validate_args() {
+            return Err(format!("hermit run refuses --watch here: {error:#}"));
+        }
+        let met = match run.launch() {
+            Ok(()) => run.is_a_match(),
+            Err(error) if guest_reached_a_refusal(&error) => {
+                return Err(refused_pass(number, role, &runname));
+            }
+            Err(error) if error.downcast_ref::<RunTimeoutMarker>().is_some() => {
+                return Ok(Err(format!(
+                    "pass {number}'s {role} replay did not finish ({error:#}); its hits are left \
+                     out"
+                )));
+            }
+            Err(error) => return Err(format!("pass {number}'s {role} replay failed: {error:#}")),
+        };
+        let realized_path = run.sched_path_out().to_path_buf();
+        let realized = Recording::read(&realized_path)
+            .and_then(|recording| recording.into_legacy("the watch stage"))
+            .map(PreemptionRecord::into_global)
+            .map_err(|error| {
+                format!(
+                    "pass {number}'s {role} replay's realized schedule {} cannot be read \
+                     ({error:#})",
+                    realized_path.display()
+                )
+            })?;
+        let (departed_at, note) =
+            match keep_pass(number, role, met, &realized, &side.realized, decision) {
+                Ok(kept) => kept,
+                Err(note) => return Ok(Err(note)),
+            };
+        let read = File::open(&trace)
+            .map_err(anyhow::Error::from)
+            .and_then(|file| Ok(read_access_trace(BufReader::new(file))?));
+        match read {
+            Ok(trace_records) => Ok(Ok((
+                (
+                    WatchRun {
+                        trace: trace_records,
+                        realized,
+                        departed_at,
+                    },
+                    file_name(&trace),
+                ),
+                note,
+            ))),
+            Err(error) => Err(format!(
+                "pass {number}'s {role} trace {} cannot be read: {error:#}",
+                trace.display()
+            )),
+        }
     }
 
     /// Read one side's trace, or say why the section cannot use it. With
@@ -1029,6 +1370,75 @@ fn read_stack(path: &Path) -> Option<PrettyBacktrace> {
     }
 }
 
+/// Whether two runs realized the same event: every field, the thread,
+/// operation, count, instructions and the time it ended.
+fn same_realized_event(a: &SchedEvent, b: &SchedEvent) -> bool {
+    a == b
+}
+
+/// Whether pass `number`'s `role` replay is a run of its side: it meets the
+/// target criteria as that side did (the target meets them, the baseline
+/// misses them) and realizes the side's schedule event for event through
+/// `decision`. Returns the event from which it ran on its own, if it did
+/// after `decision`, with a note; or why it is left out.
+fn keep_pass(
+    number: usize,
+    role: &str,
+    met: bool,
+    realized: &[SchedEvent],
+    side: &[SchedEvent],
+    decision: EventIndex,
+) -> Result<(Option<EventIndex>, Option<String>), String> {
+    if met != (role == "target") {
+        let did = if met { "met" } else { "missed" };
+        return Err(format!(
+            "pass {number}'s {role} replay {did} the target criteria, unlike the {role} run; its \
+             hits are left out"
+        ));
+    }
+    let differs_at = realized
+        .iter()
+        .zip(side)
+        .position(|(a, b)| !same_realized_event(a, b))
+        .or_else(|| (realized.len() != side.len()).then(|| realized.len().min(side.len())));
+    let Some(at) = differs_at else {
+        return Ok((None, None));
+    };
+    if at as EventIndex <= decision {
+        return Err(format!(
+            "pass {number}'s {role} replay left the {role} schedule at event {at}, at or before \
+             the deciding event; its hits are left out"
+        ));
+    }
+    Ok((
+        Some(at as EventIndex),
+        Some(format!(
+            "Pass {number}'s {role} replay followed the {role} schedule up to event {at} and ran \
+             on its own from there; its hits from there, another execution's, are left out."
+        )),
+    ))
+}
+
+/// One side's watch pass: its trace, the schedule it realized, and the
+/// event from which it ran on its own, past the deciding event, if it did.
+struct WatchRun {
+    trace: AccessTrace,
+    realized: Vec<SchedEvent>,
+    departed_at: Option<EventIndex>,
+}
+
+/// Why the watch stage stopped at a pass Hermit refused. Detcore prints the
+/// refusal, which names the thread and the watch, on Hermit's own stderr as
+/// the run ends (exit 122), not into the guest's output analyze keeps, so
+/// this says where it is.
+fn refused_pass(number: usize, role: &str, runname: &str) -> String {
+    format!(
+        "Hermit refused pass {number}'s {role} replay ({runname}, exit 122): a watch hit may \
+         have changed the guest's SIGTRAP state, or a thread could not be watched as asked; \
+         Hermit printed which on its stderr as that run ended"
+    )
+}
+
 fn file_name(path: &Path) -> String {
     path.file_name()
         .unwrap_or_default()
@@ -1042,6 +1452,7 @@ mod tests {
     use detcore_model::pid::DetTid;
 
     use super::*;
+    use crate::analyze::race_watch::WatchStatus;
 
     /// A traced replay asks the writer to stop after the lookback's records
     /// and the window's, so a long run does not write its whole trace.
@@ -1064,9 +1475,181 @@ mod tests {
         }
     }
 
-    /// A realized schedule that cannot be read makes the section
-    /// unavailable with that reason, not with a departure computed against
-    /// an empty schedule, and does not panic.
+    /// The section runs the watch stage whenever the finder names no
+    /// deciding pair, and only for a target replay that met the target
+    /// criteria; whatever stops the stage is its own reason, never the
+    /// section's.
+    #[test]
+    fn a_section_with_no_deciding_pair_runs_the_watch_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = detcore::types::DetTid::from_raw;
+        let events = |tids: &[i32]| -> Vec<SchedEvent> {
+            tids.iter()
+                .map(|&t| SchedEvent::branches(tid(t), 10))
+                .collect()
+        };
+        // The same two calls in both runs: nothing for the finder.
+        let write_trace = |name: &str| {
+            let path = dir.path().join(name);
+            let lines = [
+                r#"{"kind":"header","format":"hermit-access-trace","version":1,"from":0}"#,
+                r#"{"kind":"syscall","pre":1,"post":2,"tid":3,"pid":3,"nth":1,"sysno":"getpid","args":[0,0,0,0,0,0],"result":3}"#,
+                r#"{"kind":"syscall","pre":4,"post":5,"tid":5,"pid":3,"nth":1,"sysno":"getppid","args":[0,0,0,0,0,0],"result":1}"#,
+                r#"{"kind":"end","events":6,"records":2}"#,
+            ];
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+            path
+        };
+        let replay = |role, realized| TracedReplay {
+            role,
+            trace: Ok(write_trace(&format!("{role}.access"))),
+            departure: None,
+            realized,
+            realized_path: dir.path().join(format!("{role}_out.preempts")),
+            schedule_error: None,
+            stderr: None,
+        };
+        let no_stacks = |_: &str| -> anyhow::Result<RunData> { anyhow::bail!("no stacks here") };
+        let no_checks =
+            |_: &str, _: &str, _: &[SchedEvent], _: usize, _: usize| -> anyhow::Result<RunData> {
+                anyhow::bail!("no checks here")
+            };
+        let no_watch = |_: &'static str, _: &str| -> anyhow::Result<RunData> {
+            anyhow::bail!("no watch runner here")
+        };
+        let section = |args: &[&str], met: (bool, bool)| {
+            let options = AnalyzeOpts::try_parse_from(args).unwrap();
+            options.racing_accesses(
+                3,
+                replay("target", events(&[3, 3, 3, 5, 5, 5])),
+                replay("baseline", events(&[3, 3, 3, 5, 5, 5])),
+                met,
+                (no_stacks, no_checks, no_watch),
+            )
+        };
+        let r = section(
+            &["analyze", "--race-watch=0x1000", "--", "/bin/true"],
+            (true, false),
+        );
+        assert!(
+            matches!(r.status, RaceStatus::NoneFound | RaceStatus::Candidates),
+            "{:?}: {}",
+            r.status,
+            r.reason
+        );
+        let watch = r.watch.expect("the watch stage ran");
+        assert_eq!(watch.status, WatchStatus::Unavailable);
+        assert!(
+            watch.reason.contains("no watch runner here"),
+            "{}",
+            watch.reason
+        );
+
+        let r = section(
+            &["analyze", "--race-watch=0x1000", "--", "/bin/true"],
+            (true, true),
+        );
+        let watch = r.watch.expect("the watch stage is reported");
+        assert!(
+            watch.reason.contains("baseline replay met"),
+            "{}",
+            watch.reason
+        );
+        let r = section(
+            &["analyze", "--race-watch=0x1000", "--", "/bin/true"],
+            (false, false),
+        );
+        let watch = r.watch.expect("the watch stage is reported");
+        assert!(watch.reason.contains("did not meet"), "{}", watch.reason);
+
+        let r = section(&["analyze", "--", "/bin/true"], (true, false));
+        let watch = r.watch.expect("the watch stage ran");
+        assert!(
+            watch.reason.starts_with("there are no bytes to watch"),
+            "{}",
+            watch.reason
+        );
+    }
+
+    /// A pass is kept when it meets the target criteria as its side did and
+    /// realizes its side's schedule, every field of every event, through the
+    /// deciding event; one that leaves it later is kept up to that event.
+    #[test]
+    fn a_pass_is_kept_only_when_it_is_a_run_of_its_side() {
+        let tid = detcore::types::DetTid::from_raw;
+        let side: Vec<SchedEvent> = [3, 3, 5, 5, 3, 5]
+            .iter()
+            .map(|&t| SchedEvent::branches(tid(t), 10))
+            .collect();
+        assert_eq!(
+            keep_pass(1, "target", true, &side, &side, 2),
+            Ok((None, None))
+        );
+        assert_eq!(
+            keep_pass(1, "baseline", false, &side, &side, 2),
+            Ok((None, None))
+        );
+        let outcome = keep_pass(1, "target", false, &side, &side, 2).unwrap_err();
+        assert!(outcome.contains("missed the target criteria"), "{outcome}");
+        let outcome = keep_pass(1, "baseline", true, &side, &side, 2).unwrap_err();
+        assert!(outcome.contains("met the target criteria"), "{outcome}");
+
+        let mut timed = side.clone();
+        timed[1].end_time = Some(detcore_model::time::LogicalTime::from_nanos(100));
+        let early = keep_pass(1, "target", true, &timed, &side, 2).unwrap_err();
+        assert!(
+            early.contains("left the target schedule at event 1"),
+            "{early}"
+        );
+        let mut late = side.clone();
+        late[4] = SchedEvent::branches(tid(5), 10);
+        let (departed_at, note) = keep_pass(1, "target", true, &late, &side, 2).unwrap();
+        assert_eq!(departed_at, Some(4));
+        assert!(note.unwrap().contains("left out"));
+        let short = keep_pass(1, "target", true, &side[..5], &side, 2).unwrap();
+        assert_eq!(short.0, Some(5), "a pass that realized fewer events");
+    }
+
+    /// A refused pass says which run it was and where Hermit printed why,
+    /// since the refusal never reaches the guest's output analyze keeps.
+    #[test]
+    fn a_refused_pass_says_where_the_reason_is() {
+        let reason = refused_pass(2, "baseline", "final_race_watch2_baseline");
+        assert!(reason.contains("pass 2's baseline replay (final_race_watch2_baseline, exit 122)"));
+        assert!(reason.contains("printed which on its stderr"), "{reason}");
+    }
+
+    /// The watch stage starts `--race-watch-window` events before the
+    /// deciding event, or earlier at the start of either side's deciding
+    /// turn: the target's thread 3 has run since event 2 and the baseline's
+    /// thread 5 since event 6.
+    #[test]
+    fn the_watch_window_widens_to_either_deciding_turn() {
+        let t = |n| detcore::types::DetTid::from_raw(n);
+        let schedule = |threads: &[i32]| -> Vec<SchedEvent> {
+            threads
+                .iter()
+                .map(|&n| SchedEvent::branches(t(n), 1))
+                .collect()
+        };
+        let target = schedule(&[1, 1, 3, 3, 3, 3, 3, 3, 3, 3, 3]);
+        let baseline = schedule(&[1, 1, 3, 3, 3, 3, 5, 5, 5, 5, 5]);
+        let options =
+            AnalyzeOpts::try_parse_from(["analyze", "--race-watch-window=1", "--", "/bin/true"])
+                .unwrap();
+        assert_eq!(options.race_watch_from(8, &target, &baseline), 2);
+        let other = schedule(&[1, 1, 3, 3, 3, 3, 5, 5, 3, 3, 3]);
+        assert_eq!(options.race_watch_from(8, &other, &baseline), 6);
+        let wide =
+            AnalyzeOpts::try_parse_from(["analyze", "--race-watch-window=8", "--", "/bin/true"])
+                .unwrap();
+        assert_eq!(wide.race_watch_from(8, &other, &baseline), 0);
+        assert!(
+            AnalyzeOpts::try_parse_from(["analyze", "--race-watch=0x1000:65", "--", "/bin/true"])
+                .is_err()
+        );
+    }
+
     #[test]
     fn an_unreadable_realized_schedule_is_named() {
         let dir = tempfile::tempdir().unwrap();
@@ -1151,6 +1734,7 @@ mod tests {
             realized,
             realized_path: dir.path().join(format!("{role}_out.preempts")),
             schedule_error: None,
+            stderr: None,
         };
         let left = Departure::OtherEvent {
             index: 1,
@@ -1163,6 +1747,9 @@ mod tests {
             |_: &str, _: &str, _: &[SchedEvent], _: usize, _: usize| -> anyhow::Result<RunData> {
                 anyhow::bail!("no checks here")
             };
+        let no_watch = |_: &'static str, _: &str| -> anyhow::Result<RunData> {
+            anyhow::bail!("no watch passes here")
+        };
         let r = options.racing_accesses(
             1,
             replay(
@@ -1177,9 +1764,8 @@ mod tests {
                 None,
                 events(&[3, 3, 3, 7, 5]),
             ),
-            true,
-            no_stacks,
-            no_checks,
+            (true, false),
+            (no_stacks, no_checks, no_watch),
         );
         assert_ne!(r.status, RaceStatus::Unavailable, "{}", r.reason);
         assert_eq!(r.decision, 3);
@@ -1206,9 +1792,8 @@ mod tests {
                 None,
                 Vec::new(),
             ),
-            true,
-            no_stacks,
-            no_checks,
+            (true, false),
+            (no_stacks, no_checks, no_watch),
         );
         assert_eq!(r.status, RaceStatus::Unavailable);
         assert!(
@@ -1234,9 +1819,8 @@ mod tests {
                 None,
                 events(&[3, 3, 3, 7, 5]),
             ),
-            false,
-            no_stacks,
-            no_checks,
+            (false, false),
+            (no_stacks, no_checks, no_watch),
         );
         assert_eq!(r.status, RaceStatus::Unavailable);
         assert!(
@@ -1261,9 +1845,8 @@ mod tests {
                 None,
                 events(&[3, 3, 3, 7, 5]),
             ),
-            true,
-            no_stacks,
-            no_checks,
+            (true, false),
+            (no_stacks, no_checks, no_watch),
         );
         assert_eq!(r.status, RaceStatus::Unavailable);
         assert_eq!(
@@ -1594,6 +2177,7 @@ mod tests {
             realized: realized.clone(),
             realized_path: dir.path().join(format!("{role}.preempts")),
             schedule_error: None,
+            stderr: None,
         };
         let (target, baseline) = (run("target"), run("baseline"));
         let candidate = candidate_at([Some(1), Some(2)], [Some(2), Some(1)]);

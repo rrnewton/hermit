@@ -1989,7 +1989,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And analyze::races::tests::candidates_none_of_which_decides_say_what_that_means: 1367.
     // And run::watch_is_refused_where_it_could_not_arm_or_report (--watch):
     // 1367 + 1 = 1368.
-    ("test.hermit_unit", 1368),
+    // And analyze's watch stage: race_watch's 22 tests and race_report's
+    // the_watch_window_widens_to_either_deciding_turn,
+    // a_section_with_no_deciding_pair_runs_the_watch_stage,
+    // a_pass_is_kept_only_when_it_is_a_run_of_its_side and
+    // a_refused_pass_says_where_the_reason_is: 1394.
+    ("test.hermit_unit", 1394),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6117,7 +6122,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same changed-course order test: 1360.
     // And the same undecided-candidates test: 1361.
     // And the same --watch refusal test: 1362.
-    ("test.hermit_unit_on_host", 1362),
+    // And the same 26 watch-stage tests: 1388.
+    ("test.hermit_unit_on_host", 1388),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

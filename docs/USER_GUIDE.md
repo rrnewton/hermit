@@ -982,7 +982,9 @@ trace, or several together. A reversal that could not be replayed as edited
 (`not realized`), one never tried because its control did not reproduce the
 run, and a candidate not checked leave it untested, not cleared. Either way,
 nothing says the right pair is among the candidates. The report then lists what to try next: `--minimize`, so fewer
-chaos interventions surround the deciding event; a wider `--race-window` when a
+chaos interventions surround the deciding event; `--race-watch` on the memory
+the outcome reads, so the watch stage can report loads and stores on it; a
+wider `--race-window` when a
 trace was cut short; and the unrealized checks' replays
 (`racing_candidate_N.repro`), which show where each left its edit. A report
 file carries the same information in the candidates' `check.verdict` values.

@@ -580,6 +580,12 @@ impl RunData {
         Ok(())
     }
 
+    /// The raw, unvarnished, RunOpts, for a caller that needs the run
+    /// arguments themselves (the guest program, its working directory).
+    pub fn raw_runopts(aopts: &AnalyzeOpts) -> RunOpts {
+        Self::get_raw_runopts(aopts)
+    }
+
     /// The raw, unvarnished, RunOpts.
     fn get_raw_runopts(aopts: &AnalyzeOpts) -> RunOpts {
         // Bogus arg 0 for CLI argument parsing:

@@ -97,6 +97,8 @@ use reverie::syscalls::Sysno;
 use serde::Deserialize;
 use serde::Serialize;
 
+use crate::analyze::race_watch::WatchStage;
+use crate::analyze::race_watch::render_watch_stage;
 use crate::analyze::types::ExitStatusConstraint;
 
 /// What the target and baseline continuations are compared over.
@@ -509,6 +511,10 @@ pub struct RacingAccesses {
     /// in the analysis workspace.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trace_files: Vec<String>,
+    /// For `none_found`: what the replays with hardware watchpoints on chosen
+    /// guest bytes saw ([`race_watch`](super::race_watch)).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WatchStage>,
 }
 
 /// At most this many other flipped pairs are listed.
@@ -540,6 +546,7 @@ impl RacingAccesses {
             truncated: false,
             notes: Vec::new(),
             trace_files: Vec::new(),
+            watch: None,
         }
     }
 
@@ -1439,7 +1446,7 @@ fn replay_channels(
 
 /// Whether an edge chain leads from `from` to `to`, using edges between them
 /// only (the window lemma) and program order.
-fn happens_before(edges: &[HbEdge], from: EventRef, to: EventRef) -> HbVerdict {
+pub fn happens_before(edges: &[HbEdge], from: EventRef, to: EventRef) -> HbVerdict {
     let unordered = HbVerdict {
         ordered: false,
         edges: Vec::new(),
@@ -1489,6 +1496,13 @@ fn happens_before(edges: &[HbEdge], from: EventRef, to: EventRef) -> HbVerdict {
         }
         _ => unordered,
     }
+}
+
+/// The edges [`happens_before`] walks for `trace`: the recorded ones that run
+/// forward and those derived from its syscall results, sorted by `from`
+/// event.
+pub fn trace_edges(trace: &AccessTrace) -> Vec<HbEdge> {
+    Run::new(trace).edges
 }
 
 /// The two traces, aligned, and the window.
@@ -3602,6 +3616,9 @@ pub fn render_racing_accesses(r: &RacingAccesses) -> String {
         lines.extend(candidate_lines(r));
     }
     lines.extend(r.notes.iter().cloned());
+    if let Some(watch) = &r.watch {
+        lines.extend(render_watch_stage(watch));
+    }
     lines.join("\n")
 }
 
@@ -3726,6 +3743,10 @@ fn undecided_lines(r: &RacingAccesses) -> Vec<String> {
     let mut next = vec![
         "rerun with --minimize if the analysis did not use it, so fewer chaos interventions \
          surround the deciding event"
+            .to_string(),
+        "name the memory the outcome reads with --race-watch=ADDR[:LEN] or SYM[+OFF][:LEN], so \
+         the watch stage can report any two threads' loads and stores on it that no edge \
+         Hermit observes orders (an order in memory, which syscalls do not show)"
             .to_string(),
     ];
     if r.truncated {
@@ -6669,7 +6690,7 @@ mod tests {
 
         let all_ran = render_racing_accesses(&with(&[Some(DoesNotDecide); 3]));
         assert!(
-            all_ran.contains("\nNone of the 3 candidates was shown to decide: all 3 reversals ran as edited and left the outcome as it was, so the outcome probably does not turn on any one of these candidates' orders alone (each check reverses one turn order in one run); it may turn on an order not ranked here, an order in memory that syscalls do not show, one outside the trace, or several together.\nTo look further: rerun with --minimize if the analysis did not use it, so fewer chaos interventions surround the deciding event.\n"),
+            all_ran.contains("\nNone of the 3 candidates was shown to decide: all 3 reversals ran as edited and left the outcome as it was, so the outcome probably does not turn on any one of these candidates' orders alone (each check reverses one turn order in one run); it may turn on an order not ranked here, an order in memory that syscalls do not show, one outside the trace, or several together.\nTo look further: rerun with --minimize if the analysis did not use it, so fewer chaos interventions surround the deciding event; name the memory the outcome reads with --race-watch=ADDR[:LEN] or SYM[+OFF][:LEN], so the watch stage can report any two threads' loads and stores on it that no edge Hermit observes orders (an order in memory, which syscalls do not show).\n"),
             "{all_ran}"
         );
 

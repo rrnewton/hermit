@@ -14148,6 +14148,11 @@ impl RunOpts {
         self.build_guest_command(false)
     }
 
+    /// The guest program as the run arguments name it.
+    pub(crate) fn program(&self) -> &Path {
+        &self.program
+    }
+
     /// The guest's working directory as `--workdir` names it, if given
     /// (relative to Hermit's own, as the guest command takes it).
     pub(super) fn launch_workdir(&self) -> Option<&Path> {

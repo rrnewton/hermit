@@ -228,6 +228,34 @@ pub struct AnalyzeOpts {
     #[clap(long, value_name = "RECORDS", default_value = "50000")]
     pub race_window: usize,
 
+    /// Guest bytes the "Racing accesses" section watches, as ADDR[:LEN] (hex 0x... or decimal) or
+    /// SYM[+OFF][:LEN] (a symbol as the program's symbol table spells it, mangled for C++, in a
+    /// program that is not position-independent); LEN up to 64, default 8 for an address and the
+    /// symbol's size for a symbol; repeatable.
+    ///
+    /// A member of a heap or stack object has no symbol. Its address comes from the target's
+    /// deterministic replay: rerun the target's kept command (`--keep-tmp` keeps each final
+    /// run's `.repro`) with `hermit run --gdbserver`, attach a gdb that reads DWARF 5 (gdb 17
+    /// reads current clang output; gdb 9.1 does not), stop where the code reads the variable (at
+    /// an assertion's abort, select the frame that asserts), and `print &object->member`. The
+    /// replay gives the same address each time.
+    ///
+    /// When the syscall finder names no pair that decides the outcome (status none_found, or
+    /// candidates), analyze reruns both sides with `hermit run --watch` on these bytes, and on
+    /// those it finds itself: the addresses a sanitizer report in the target's stderr names, the
+    /// fault address of a SIGSEGV or SIGBUS outcome, and the futex word of a futex call at the
+    /// deciding event with 40 bytes on either side. It then names the loads and stores of two
+    /// threads on those bytes that no edge Hermit observes orders, with their order in each run.
+    /// Hardware watchpoints need the ptrace backend on x86-64; elsewhere the watch stage says it
+    /// is unavailable and why.
+    #[clap(long, value_name = "ADDR[:LEN]")]
+    pub race_watch: Vec<crate::analyze::race_watch::RaceWatchArg>,
+
+    /// How many events before the deciding event the watch stage's replays start watching;
+    /// widened to the start of either deciding thread's turn when that starts earlier.
+    #[clap(long, value_name = "EVENTS", default_value = "200")]
+    pub race_watch_window: u64,
+
     // TODO: run2_schedule
     //
     /// Use to seed the PRNG that supplies randomness to the analyzer when it is making random

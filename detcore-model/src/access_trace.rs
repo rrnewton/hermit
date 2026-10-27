@@ -739,7 +739,7 @@ pub struct EdgeRecord {
 }
 
 /// One frame of a watchpoint hit's stack.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Hash, Eq, Serialize, Deserialize)]
 pub struct StackFrame {
     /// Instruction pointer.
     pub ip: u64,
@@ -806,7 +806,7 @@ pub struct WatchSummaryRecord {
 }
 
 /// Why a thread never armed its watches.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Hash, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WatchUnarmed {
     /// It blocked SIGTRAP at every stop it could have armed at: Linux reports
