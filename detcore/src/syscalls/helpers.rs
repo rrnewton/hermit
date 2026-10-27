@@ -486,8 +486,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut rsrc = Resources::new(guest.thread_state().dettid);
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi(call.name());
-            // Only guests write or read the other end of an internal fd.
-            rsrc.polls_guest_state_only = internal_fd;
+            // Only guests write or read the other end of an internal fd, or of
+            // a guest-held one (`DetFd::is_guest_held`).
+            rsrc.relies_on_guest_held_marks =
+                !internal_fd && syscall_targets_guest_held_fd(guest, wrapped);
+            rsrc.polls_guest_state_only = internal_fd || rsrc.relies_on_guest_held_marks;
             // A pipe read: a recorded private `SIGCHLD` ends it as on Linux.
             rsrc.private_sigchld_decides = reads_a_pipe(guest, wrapped);
             // A read waits for data, a write for room (`--pipe-wake-latency`).
@@ -1446,6 +1449,73 @@ pub fn syscall_targets_internal_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
             .unwrap_or(false),
         None => false,
     }
+}
+
+/// Whether `call`'s one descriptor is guest-held (`DetFd::is_guest_held`):
+/// only guests hold its other end, so only a guest can make the call ready.
+/// It feeds only `Resources::polls_guest_state_only`, never the record/replay
+/// routing `syscall_targets_internal_fd` decides. An epoll wait's descriptor
+/// is its set, which this does not track.
+fn syscall_targets_guest_held_fd<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    call: Syscall,
+) -> bool {
+    if matches!(call, Syscall::EpollWait(_) | Syscall::EpollPwait(_)) {
+        return false;
+    }
+    get_fd(call).is_some_and(|fd| {
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.is_guest_held())
+            .unwrap_or(false)
+    })
+}
+
+/// The most entries a `poll` or `ppoll` may have for
+/// `poll_targets_guest_held` to read them.
+const GUEST_HELD_POLL_MAX_FDS: usize = 1024;
+
+/// Whether only guests can make a `poll` or `ppoll` of the `nfds` entries at
+/// `fds` ready: every entry Linux polls (a non-negative descriptor) names a
+/// guest-held descriptor (`DetFd::is_guest_held`) in the caller's table.
+/// Linux ignores an entry with a negative descriptor. An empty array, one
+/// larger than `GUEST_HELD_POLL_MAX_FDS` or one Detcore cannot read counts as
+/// not guest-held, which keeps the call's classification as it was. It feeds
+/// only `Resources::polls_guest_state_only`.
+pub(crate) fn poll_targets_guest_held<G: Guest<Detcore<T>>, T: RecordOrReplay>(
+    guest: &mut G,
+    fds: Option<usize>,
+    nfds: usize,
+) -> bool {
+    if nfds == 0 || nfds > GUEST_HELD_POLL_MAX_FDS {
+        return false;
+    }
+    let Some(address) = fds.and_then(Addr::<u8>::from_raw) else {
+        return false;
+    };
+    let mut bytes = vec![0u8; nfds * std::mem::size_of::<libc::pollfd>()];
+    if guest.memory().read_exact(address, &mut bytes).is_err() {
+        return false;
+    }
+    let polled = pollfd_descriptors(&bytes);
+    !polled.is_empty()
+        && polled.into_iter().all(|fd| {
+            guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.is_guest_held())
+                .unwrap_or(false)
+        })
+}
+
+/// The descriptors Linux polls in a `pollfd` array's bytes: each entry's
+/// `fd` when it is not negative.
+fn pollfd_descriptors(bytes: &[u8]) -> Vec<i32> {
+    let (entries, _) = bytes.as_chunks::<{ std::mem::size_of::<libc::pollfd>() }>();
+    entries
+        .iter()
+        .map(|entry| i32::from_ne_bytes([entry[0], entry[1], entry[2], entry[3]]))
+        .filter(|fd| *fd >= 0)
+        .collect()
 }
 
 /// Whether `call` is a `read` or `readv` of a descriptor Detcore records as
@@ -6367,6 +6437,41 @@ mod tests {
                 mask_unknown: true,
             }
         ));
+    }
+
+    /// Linux polls every entry with a non-negative descriptor and ignores the
+    /// rest (fs/select.c `do_pollfd`), so only those decide whether a poll is
+    /// guest-held; the `events` and `revents` halves are not descriptors.
+    #[test]
+    fn pollfd_descriptors_are_the_non_negative_entries() {
+        let entries = [
+            libc::pollfd {
+                fd: 7,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: -1,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: 0,
+                events: libc::POLLOUT,
+                revents: libc::POLLHUP,
+            },
+        ];
+        let bytes: Vec<u8> = entries
+            .iter()
+            .flat_map(|entry| {
+                let mut bytes = entry.fd.to_ne_bytes().to_vec();
+                bytes.extend(entry.events.to_ne_bytes());
+                bytes.extend(entry.revents.to_ne_bytes());
+                bytes
+            })
+            .collect();
+        assert_eq!(pollfd_descriptors(&bytes), vec![7, 0]);
+        assert!(pollfd_descriptors(&[]).is_empty());
     }
 
     /// Bracket the millisecond-to-nanosecond timeout conversion in both

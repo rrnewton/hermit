@@ -66,6 +66,7 @@ use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::observe_under_mask;
 use crate::syscalls::helpers::pending_real_time_among;
 use crate::syscalls::helpers::poll_deadline_for;
+use crate::syscalls::helpers::poll_targets_guest_held;
 use crate::syscalls::helpers::publish_wait_mask;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::refuse_held_signal_loss;
@@ -2845,6 +2846,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut rsrc = Resources::new(guest.thread_state().dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("ppoll");
+        rsrc.relies_on_guest_held_marks = poll_targets_guest_held(
+            guest,
+            call.fds().map(|fds| fds.as_raw()),
+            call.nfds() as usize,
+        );
+        rsrc.polls_guest_state_only = rsrc.relies_on_guest_held_marks;
         let result = retry_nonblocking_syscall_with_timeout(guest, call, rsrc, deadline).await;
         if let (Some(timeout_address), Some(timeout), Some(started_at)) =
             (timeout_address, timeout, started_at)
@@ -2904,6 +2911,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("ppoll");
         rsrc.poll_deadline = poll_deadline_for(guest, deadline);
+        rsrc.relies_on_guest_held_marks = poll_targets_guest_held(
+            guest,
+            probe.fds().map(|fds| fds.as_raw()),
+            probe.nfds() as usize,
+        );
+        rsrc.polls_guest_state_only = rsrc.relies_on_guest_held_marks;
         // As for pselect6: a scheduler `Signaled` answer wakes the wait, and
         // the probe and the kernel's state decide whether a signal ends it.
         rsrc.set_signal_interrupt_errno(Errno::EINTR);
@@ -3019,6 +3032,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut rsrc = Resources::new(guest.thread_state().dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("poll");
+        rsrc.relies_on_guest_held_marks = poll_targets_guest_held(
+            guest,
+            call.fds().map(|fds| fds.as_raw()),
+            call.nfds() as usize,
+        );
+        rsrc.polls_guest_state_only = rsrc.relies_on_guest_held_marks;
         let result = retry_nonblocking_syscall_with_timeout(guest, call, rsrc, deadline).await;
         keep_restart_block(guest, &result, RestartCall::Poll(call), deadline).await;
         result
@@ -3954,8 +3973,132 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.classify_socket_peer(guest, fd, SocketRole::Connected)
                 .await;
         }
+        // A connect ends what a guest-held socket was connected to: a datagram
+        // socketpair end reconnected to another process's socket, or
+        // disconnected, is no longer guest-held. A stream connection to a
+        // listener this process made is (`classify_guest_held_peer`).
+        if result.is_ok() {
+            let _ = guest.thread_state().with_detfd(fd, |detfd| {
+                if detfd.is_guest_held() {
+                    detfd.clear_guest_held();
+                }
+            });
+            self.classify_guest_held_peer(guest, fd).await;
+        }
 
         result
+    }
+
+    /// Mark guest-held (`DetFd::is_guest_held`) the pipes and sockets among
+    /// `received`, descriptors a receive on `channel` just recorded from
+    /// `SCM_RIGHTS`, whose object only guests hold. That needs `channel` to be
+    /// guest-held, so the sender was a guest. Then a received descriptor is
+    /// guest-held when this table already names its object, or the other end
+    /// of the same pipe, through a guest-held description (the same host
+    /// device and inode), or when it is a socket whose peer is this process
+    /// (`classify_guest_held_peer`). A received descriptor is a description
+    /// of its own in Detcore's model (`record_received_descriptor`), so it
+    /// does not share the sender's mark. Marks only ever claim that no
+    /// process outside the guest holds the object; once a descriptor may have
+    /// left the guest, the scheduler stops trusting every mark
+    /// (`Scheduler::polls_only_guest_state`).
+    async fn classify_received_descriptors<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        channel: RawFd,
+        received: &[RawFd],
+    ) {
+        if received.is_empty() {
+            return;
+        }
+        let from_a_guest = guest
+            .thread_state()
+            .with_detfd(channel, |detfd| detfd.is_guest_held())
+            .unwrap_or(false);
+        if !from_a_guest {
+            return;
+        }
+        for &fd in received {
+            let Ok((ty, stat)) = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| (detfd.ty(), detfd.stat()))
+            else {
+                continue;
+            };
+            if !matches!(ty, FdType::Pipe | FdType::Socket) {
+                continue;
+            }
+            let known = stat.is_some_and(|stat| {
+                guest
+                    .thread_state()
+                    .names_guest_held_object(fd, stat.dev, stat.inode)
+            });
+            if known {
+                let _ = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_guest_held());
+            } else if ty == FdType::Socket {
+                self.classify_guest_held_peer(guest, fd).await;
+            }
+        }
+    }
+
+    /// Mark socket `fd` guest-held (`DetFd::is_guest_held`) when its peer, as
+    /// `SO_PEERCRED` names it, is the caller's own process, and the peer's
+    /// other end is therefore held by guests only:
+    ///
+    /// - An accepted socket (`accept`, `accept4`): Linux takes its credentials
+    ///   from the task that connected, when it connected, so the connecting
+    ///   end was then in this process.
+    /// - A connected stream or seqpacket socket (`connect`): Linux copies the
+    ///   credentials of whoever called `listen`, so the listener was made in
+    ///   this process, and only a holder of that listener can accept. That is
+    ///   this process, or a process it shared the listener with: a guest,
+    ///   unless the listener left the guest, which revokes every mark
+    ///   (`note_descriptors_passed_out`).
+    /// - A stream or seqpacket socket a guest receives over a guest-held
+    ///   channel (`classify_received_descriptors`).
+    ///
+    /// A datagram socket's credentials are not its peer's, so it is never
+    /// marked here. A peer in another process, guest or not, and a socket with
+    /// no peer credentials (any non-`AF_UNIX` socket, whose peer pid is 0) are
+    /// left as they were. Best-effort and read-only: an injection that fails
+    /// leaves the socket unmarked, and nothing the guest sees changes. Only
+    /// plain runs read the mark (`polls_guest_state_only` feeds the scheduler's
+    /// idle detection; record/replay polls run as external waits), so only
+    /// they pay for it.
+    pub(crate) async fn classify_guest_held_peer<G: Guest<Self>>(&self, guest: &mut G, fd: RawFd) {
+        if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {
+            return;
+        }
+        // A datagram socket's credentials are its creator's, or its
+        // socketpair's, whatever it is connected to now: only a connection's
+        // name its peer.
+        let Some(kind) = socket_option::<libc::c_int, _, _>(guest, fd, libc::SO_TYPE).await else {
+            return;
+        };
+        if kind != libc::SOCK_STREAM && kind != libc::SOCK_SEQPACKET {
+            return;
+        }
+        let Some(credentials) =
+            socket_option::<libc::ucred, _, _>(guest, fd, libc::SO_PEERCRED).await
+        else {
+            return;
+        };
+        let peer = credentials.pid;
+        if peer <= 0 {
+            return;
+        }
+        // The caller's own process id in the same PID namespace that
+        // `SO_PEERCRED` translated the peer's into.
+        let Ok(own) = guest.inject(syscalls::Getpid::new()).await else {
+            return;
+        };
+        if i64::from(peer) == own {
+            let _ = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.set_guest_held());
+        }
     }
 
     /// Handles sendto, sendmsg, and sendmmsg syscalls (MAYHANG).
@@ -4006,6 +4149,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(refusal) => return refusal,
         };
         let in_turn = self.completes_in_turn(guest, call);
+        self.note_descriptors_passed_out(guest, call.fd(), &headers);
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
         guest.thread_state_mut().send_inspection = None;
         if outside_turn
@@ -4074,6 +4218,38 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await?;
         guest.thread_state_mut().send_inspection = Some(inspection);
         Ok((copies, outside_turn))
+    }
+
+    /// Note, for the scheduler, that messages at `headers` may pass
+    /// descriptors over `SCM_RIGHTS` on socket `sockfd` to a process outside
+    /// the guest (`ThreadState::passed_descriptors_out_unreported`). A passed
+    /// descriptor may be, or reach, an object some guest holds a guest-held
+    /// description of, in any process's table, which a process outside
+    /// Detcore's view could then make ready; so from then on the scheduler
+    /// trusts no guest-held mark (`Scheduler::polls_only_guest_state`), and
+    /// that covers polls already waiting. Messages on a guest-held socket go
+    /// to a guest, so they change nothing: it is a stream or seqpacket
+    /// connection, which sends only to its peer whatever `msg_name` says. As
+    /// for `mark_exported_listeners`, this runs before the send and whatever
+    /// it returns, and a message whose control data Detcore cannot read counts
+    /// as passing descriptors.
+    fn note_descriptors_passed_out<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        sockfd: RawFd,
+        headers: &[usize],
+    ) {
+        let reaches_a_guest = guest
+            .thread_state()
+            .with_detfd(sockfd, |detfd| detfd.is_guest_held())
+            .unwrap_or(false);
+        if reaches_a_guest {
+            return;
+        }
+        let (sent, unread) = sent_descriptors(guest, headers);
+        if !sent.is_empty() || unread {
+            guest.thread_state_mut().passed_descriptors_out_unreported = true;
+        }
     }
 
     /// Mark every accept-in-turn listener (`DetFd::is_accept_in_turn_eligible`)
@@ -4266,6 +4442,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(refusal) => return refusal,
         };
         let in_turn = self.completes_in_turn(guest, call);
+        self.note_descriptors_passed_out(guest, call.sockfd(), &headers);
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
         guest.thread_state_mut().send_inspection = None;
         if outside_turn
@@ -4365,6 +4542,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 from,
             )
             .await?;
+        self.classify_received_descriptors(guest, call.sockfd(), &recorded)
+            .await;
         // Where the tool discovers received descriptors, recvmsg's refresh
         // covers every descriptor delivered, as before; elsewhere only those
         // this receipt recorded.
@@ -4785,6 +4964,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 from,
             )
             .await?;
+        self.classify_received_descriptors(guest, call.fd(), &recorded)
+            .await;
         // Only the descriptors this receipt recorded.
         self.refresh_received_locks(guest, &recorded, super::files::LockCall::Recvmmsg)
             .await?;
@@ -4859,6 +5040,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         Ok(result)
     }
+}
+
+/// Read socket option `optname` (`SOL_SOCKET`) of guest socket `fd` through an
+/// injected `getsockopt`, read-only. `None` when the injection fails or Linux
+/// writes less than a whole `T`.
+async fn socket_option<T, D, G>(guest: &mut G, fd: RawFd, optname: libc::c_int) -> Option<T>
+where
+    T: Copy,
+    D: reverie::Tool,
+    G: Guest<D>,
+{
+    let mut stack = guest.stack().await;
+    let value: AddrMut<T> = stack.reserve();
+    let length = stack.push(std::mem::size_of::<T>() as libc::socklen_t);
+    let _guard = stack.commit().ok()?;
+    let length = AddrMut::<libc::socklen_t>::from_raw(length.as_raw())?;
+    let call = syscalls::Getsockopt::new()
+        .with_fd(fd)
+        .with_level(libc::SOL_SOCKET)
+        .with_optname(optname)
+        .with_optval(Some(value.cast()))
+        .with_optlen(Some(length));
+    guest.inject(call).await.ok()?;
+    let written = guest.memory().read_value(length).ok()?;
+    if (written as usize) < std::mem::size_of::<T>() {
+        return None;
+    }
+    guest.memory().read_value(value).ok()
 }
 
 #[cfg(test)]

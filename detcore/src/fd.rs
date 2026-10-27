@@ -678,6 +678,16 @@ struct OpenFileDescription {
     /// `accept(2)` returns.
     #[serde(default)]
     error_queue_never_waits: bool,
+    /// True when only guests hold this object's other end, so only a guest
+    /// can change whether it is readable or writable: a pipe or socketpair a
+    /// guest created, an eventfd, an `AF_UNIX` socket whose peer is the
+    /// holder's own process (a connection it made or accepted), or a pipe or
+    /// socket the process received from itself whose object it already held
+    /// through a guest-held description. Cleared, permanently, when a guest passes the
+    /// object, or any object while it holds one, over `SCM_RIGHTS` on a
+    /// socket that is not guest-held itself. See `is_guest_held`.
+    #[serde(default)]
+    guest_held: bool,
     /// True when record/replay runs a blocking `accept(2)` on this socket in
     /// the caller's turn, one nonblocking attempt at a time. `socket(2)` sets
     /// it for a stream socket the container created. See
@@ -841,6 +851,7 @@ impl std::fmt::Debug for OpenFileDescription {
         debug.field("socketpair_endpoint", &self.socketpair_endpoint);
         debug.field("guest_peer", &self.guest_peer);
         debug.field("accepted_connection", &self.accepted_connection);
+        debug.field("guest_held", &self.guest_held);
         debug.field("accept_in_turn_eligible", &self.accept_in_turn_eligible);
         debug.field("read_shutdown_requested", &self.read_shutdown_requested);
         debug.field("exported", &self.exported);
@@ -1114,6 +1125,7 @@ impl DetFd {
                 guest_peer: false,
                 accepted_connection: false,
                 error_queue_never_waits: false,
+                guest_held: false,
                 accept_in_turn_eligible: false,
                 read_shutdown_requested: false,
                 exported: false,
@@ -2347,6 +2359,26 @@ impl DetFd {
         self.with_description(|d| d.socketpair_endpoint || d.guest_peer)
     }
 
+    /// Mark this open file as one whose other end only guests hold (see
+    /// `is_guest_held`). It applies to the open file description, so dup and
+    /// fork aliases are covered too.
+    pub(crate) fn set_guest_held(&self) {
+        self.with_description(|d| d.guest_held = true);
+    }
+
+    /// Withdraw `set_guest_held`, permanently: a process outside Detcore's
+    /// view may now hold this object or its other end.
+    pub(crate) fn clear_guest_held(&self) {
+        self.with_description(|d| d.guest_held = false);
+    }
+
+    /// Whether only guests hold this object's other end, so that only a guest
+    /// action can change its readiness: what `Resources::polls_guest_state_only`
+    /// asks of every descriptor a poll waits on.
+    pub(crate) fn is_guest_held(&self) -> bool {
+        self.with_description(|d| d.guest_held)
+    }
+
     /// Mark this open file as a connection returned by `accept(2)` or
     /// `accept4(2)`. It applies to the open file description, so dup and fork
     /// aliases are covered too.
@@ -2900,6 +2932,18 @@ mod tests {
         assert!(
             duplicate.is_sock_diag(),
             "sock_diag marking through one alias must be visible through every alias"
+        );
+
+        assert!(!original.is_guest_held());
+        duplicate.set_guest_held();
+        assert!(
+            original.is_guest_held(),
+            "guest-held marking through one alias must be visible through every alias"
+        );
+        original.clear_guest_held();
+        assert!(
+            !duplicate.is_guest_held(),
+            "withdrawing guest-held state through one alias must withdraw it for every alias"
         );
 
         assert!(!original.is_loopback_peer());

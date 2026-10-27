@@ -4864,6 +4864,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // bootstrapping thread, so it starts outside any window.
                     uncharged_bootstrap_syscalls: 0,
                     in_uncharged_bootstrap_syscall: false,
+                    // The parent reports its own export with its next request.
+                    passed_descriptors_out_unreported: false,
                     yield_after_futex_wake: false,
                     pipe_handoff_due: None,
                     own_signal_turn_hold: None,
