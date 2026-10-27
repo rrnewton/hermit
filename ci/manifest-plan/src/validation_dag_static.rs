@@ -3026,7 +3026,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the overlap decision, without global state): 2662, listed.
     // And the five shared runtime-FD readlink handler regressions, including
     // numeric-parent scratch overlap and syscall precedence: 2667, listed.
-    ("test.detcore_unit", 2676),
+    // Fixed 0.5.4 rebase recount also retains the priority-history regressions.
+    ("test.detcore_unit", 2681),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5251,7 +5252,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three P1 round-three units: 2661, listed.
     // And the same overlap-decision unit: 2662, listed.
     // And the same five shared runtime-FD readlink regressions: 2667, listed.
-    ("test.detcore_unit_on_host", 2676),
+    // Fixed 0.5.4 rebase recount also retains the priority-history regressions.
+    ("test.detcore_unit_on_host", 2681),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
