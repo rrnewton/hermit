@@ -123,7 +123,7 @@ prune-stale-release: ## Remove target/release/hermit if stale (not built from cu
 # Keep `validate` as an explicit .PHONY convenience target for the sole Rust
 # validation entrypoint.
 validate: verify-submodules ## Run the full validation suite (Rust driver; pass flags via ARGS)
-	./scripts/validate.rs $(ARGS)
+	./scripts/validate.rs --all $(ARGS)
 
 validate-plan: ## Print the boxed DAG plan (nodes, wall/CPU/memory caps, deps) without running it
 	./scripts/validate.rs --show-plan $(ARGS)
@@ -427,7 +427,7 @@ help: ## Show this help (the list of make targets)
 	@printf '  validate-dbt       DBT manifest cells    (third-party-backends)      not yet timed\n'
 	@printf '  validate-sabre     SaBRe corpus          (needs HERMIT_SABRE_BINARY) ~10-20 min\n'
 	@printf '  validate-e9patch   e9patch corpus        (needs HERMIT_E9PATCH_BACKEND) ~5-20 min\n'
-	@printf '\nThe full multi-backend suite is ./scripts/validate.rs (see ./scripts/validate.rs --help).\n'
+	@printf '\nThe full multi-backend suite is ./scripts/validate.rs --all (see ./scripts/validate.rs --help).\n'
 
 # Detect the native build toolchain (cmake + a C and C++ compiler) that the
 # third-party backends need. reverie-dbt's build.rs CMake-configures DynamoRIO

@@ -21,14 +21,21 @@ implementation issue and link it here.
 
 ## `scripts/validate.rs` levels
 
-`./scripts/validate.rs` accepts one optional validation level. With no level argument,
-it runs `full` for backward compatibility.
+`./scripts/validate.rs` accepts one optional validation level. With no level argument
+and no other mode flag, it runs selective validation: docs-only changes skip,
+a change confined to the DBT crates (`detcore-dbt/**`, `detcore-dbt-cdylib/**`,
+or `reverie-dbt/**` in an expanded Reverie pin) runs the common-core nodes
+plus every E2E bucket containing a DBT cell, and everything else runs the
+full label. It fails safe to the full label when no trustworthy baseline
+exists. Scoped kvm, ptrace, liteinst, sabre and e9patch routes are residual
+future work, not v1 routes. Name `full` or `--all`/`--full-run` for the
+complete suite.
 
 | Level | Typical estimate | Coverage |
 | --- | --- | --- |
 | `quick` | About 3 minutes | Builds the workspace, runs Detcore's core unit tests, and exercises ptrace run, repeat-output, verify, record, and replay smoke tests. It does not execute DBT or KVM or build the optimized binary. |
 | `portable-only` | About 8 minutes | Constructs the portable plan also selected by the integration-branch and manually dispatched GitHub-managed portable workflow: build, portable workspace tests, Hermit and Detcore library/binary tests, docs, Clippy, and rustfmt. It does not require PMU or guest namespaces. |
-| `full` (default) | About 20-70 minutes | Constructs the portable and privileged plan from the committed validation data. This includes the portable product gates plus the focused CPUID, PMU, KVM, and record/replay capability partition. |
+| `full` | About 20-70 minutes | Constructs the portable and privileged plan from the committed validation data. This includes the portable product gates plus the focused CPUID, PMU, KVM, and record/replay capability partition. |
 | `super` | About 30-90 minutes | Builds Hermit and repeats each bounded determinism probe 20 times by default. It reports `passed/total` for every probe and fails if any iteration fails. Available KVM and DBT verify probes join the ptrace strict-verify, pipeline, and record/replay probes. |
 
 Select a level positionally or with `VALIDATE_LEVEL`. The long-form aliases are

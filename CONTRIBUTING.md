@@ -39,6 +39,15 @@ entry point is:
 ./scripts/validate.rs
 ```
 
+A bare invocation runs selective validation: docs-only changes skip,
+a change confined to the DBT crates (`detcore-dbt/**`, `detcore-dbt-cdylib/**`,
+or `reverie-dbt/**` in an expanded Reverie pin) runs the common-core nodes
+plus every E2E bucket containing a DBT cell, and everything else runs the
+full label. It fails safe to the full label when no trustworthy baseline
+exists. Scoped kvm, ptrace, liteinst, sabre and e9patch routes are residual
+future work, not v1 routes. Run `./scripts/validate.rs --all` for the
+complete suite.
+
 `scripts/validate.rs portable-only` is the local mirror of the required
 `.github/workflows/ci-portable.yml` workflow: it runs the same build, lint,
 format, documentation, and test matrix. The focused privileged capability
@@ -72,7 +81,7 @@ Protocol for every PR:
    mapping table in `docs/ci-validate-alignment.md`. See the "Reconciliation
    checklist for test-adding PRs" in that document.
 3. Inside the maintainers' `dev-hermit` harness, a full green
-   `scripts/validate.rs` delegates to `ci-hub apply-local-label` after its
+   `scripts/validate.rs --all` delegates to `ci-hub apply-local-label` after its
    ledger row is written. Do not add **`locally-validated`** by hand there: the
    applier re-reads the counted exact-head row, hashes its log, publishes an
    immutable receipt, and only then comments and labels. The command can also
