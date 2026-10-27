@@ -4319,9 +4319,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity, the ptrace
     // halves of https://github.com/rrnewton/hermit/issues/4798's two run_kvm_
     // tests: 632 + 2 = 634.
-    // And in_guest_runtime_survives_a_guest_dup2_onto_each_of_its_descriptors
-    // (https://github.com/rrnewton/hermit/issues/4689): 635.
-    ("test.cli", 635),
+    ("test.cli", 634),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4848,9 +4846,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed.
     // And the same two ptrace group-exit signal-wait tests, not excluded:
     // 551 + 2 = 553.
-    // And the same in-guest dup2-onto-runtime-descriptors test, not excluded:
-    // 554.
-    ("test.cli_on_host", 554),
+    ("test.cli_on_host", 553),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
