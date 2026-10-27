@@ -680,6 +680,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/futex_pi_owner_end.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/futex_pi_owner_end.c is owned by hermit-cli/tests/cli.rs: the integration test a_pi_owner_that_exits_or_is_killed_is_dead_from_its_committed_end compiles this guest, whose PI futex owner ends by a raw exit or a SIGKILL (its own, or its process group's from another member, telling it to unlock first) while main races it with FUTEX_LOCK_PI, and requires, under ptrace run --strict --verify --verify-strict at bitwise parity, the answers the committed order gives for the default schedule and two chaos seeds; natively the races go either way, so a generic manifest cannot assert them."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/futex_pi_robust_owner_death.c",
       "runner": "hermit-cli/tests/cli.rs",
       "why": "tests/c/futex_pi_robust_owner_death.c is owned by hermit-cli/tests/cli.rs: the integration test a_robust_pi_mutex_reports_its_owners_death_as_linux compiles this guest, whose robust PTHREAD_PRIO_INHERIT mutex is abandoned by its owner with and without a waiter, and requires EOWNERDEAD and the recovery to equal native under ptrace run --strict --verify --verify-strict at bitwise parity."
@@ -694,7 +700,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/futex_requeue_pi_refused.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/futex_requeue_pi_refused.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test futex_requeue_pi_is_refused_by_name compiles this guest, which issues FUTEX_CMP_REQUEUE_PI, and requires the policy-refusal status naming the command under a fail-closed run, and ENOSYS with --allow-unsupported-syscalls (https://github.com/rrnewton/hermit/issues/3958); it remains a guest fixture because a generic manifest cannot assert this exact output or refusal status."
+      "why": "tests/c/futex_requeue_pi_refused.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test futex_requeue_pi_is_refused_by_name compiles this guest, which issues FUTEX_CMP_REQUEUE_PI, and requires the policy-refusal status naming the command under a fail-closed run, and ENOSYS with --allow-unsupported-syscalls (https://github.com/rrnewton/hermit/issues/3958); futex_lock_pi_in_a_nested_pid_namespace_is_refused_by_name runs its nested-pid mode, a FUTEX_LOCK_PI from a nested PID namespace's init, and requires the policy-refusal status naming the command and the reason; it remains a guest fixture because a generic manifest cannot assert this exact output or refusal status."
     },
     {
       "disposition": "guest-fixture",
