@@ -6390,7 +6390,7 @@ pub enum SignalScope {
 /// change to a payload type defined elsewhere (`Resources`,
 /// `CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 1;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 2;
 
 /// This is public only so it can be used in the `GlobalTool` trait.
 /// It should NOT be used by any client outside of this file.
