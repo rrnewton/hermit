@@ -2862,7 +2862,19 @@ fi
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory, SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the ad1af851 entry.
-expected_pin=a28d74243feca0fd7231a4baf0da3de7658dc39f
+# CARRY TO 7982076b85524740a41dd37e9ca949b76734f466 (2026-10-27): from
+# a28d74243feca0fd7231a4baf0da3de7658dc39f. One commit: 7982076b (a LinuxEmu
+# signalfd answers each thread from its own queue and its process's, with
+# UnsupportedOperation::Signalfd in reverie/src/unsupported.rs); no source
+# catalog row changes. git diff is empty under reverie-dbt/ and third-party/
+# and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml; both
+# repository inputs to the DynamoRIO content key are byte-identical by git
+# object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory, SDK and native inputs, calibrated budget, job width
+# and limits carry unchanged from the a28d7424 entry.
+expected_pin=7982076b85524740a41dd37e9ca949b76734f466
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
