@@ -3051,8 +3051,11 @@ fi
 # rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
 # calibrated budget, job width and limits carry unchanged from the 38c3e024
 # entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a90e2acd50051c1dbc5551001fad447b95678810 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a90e2acd50051c1dbc5551001fad447b95678810 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 80d6253bf43056800d190353878a9e27411fa65c (2026-10-27): from
+# a90e2acd50051c1dbc5551001fad447b95678810. LOCAL CONTROL ONLY, never committed for landing: Reverie
+# main without P2a, to learn whether Hermit main qualifies with it.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 80d6253bf43056800d190353878a9e27411fa65c ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 80d6253bf43056800d190353878a9e27411fa65c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
