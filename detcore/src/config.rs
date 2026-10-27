@@ -91,6 +91,8 @@ mod tests {
         (3, "b3d7410a78b56ae0", "9b7e11bf5f08e6ae"),
         // Resources::priority_row extends the positional request payload.
         (4, "b3d7410a78b56ae0", "4e10b2de93d47d64"),
+        // Adds `GlobalRequest::CpuAffinity`, `GlobalRequest::SetCpuAffinity`; adds `GlobalResponse::CpuAffinity` (#4629).
+        (5, "5a4ad14e74501e11", "4e10b2de93d47d64"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
