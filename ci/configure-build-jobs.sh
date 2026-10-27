@@ -3002,8 +3002,22 @@ fi
 #     reverie-dbt/native            164356b3ab65 -> 164356b3ab65
 # so the inventory (1014), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the 66196746 entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != e17bbb01fede8fc2fbf6a20f91bdc62c9c6408fd ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie e17bbb01fede8fc2fbf6a20f91bdc62c9c6408fd (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 02449ed7268c44c885ad988d4bbf45a640e87c6c (2026-10-27): from
+# e17bbb01fede8fc2fbf6a20f91bdc62c9c6408fd. One commit: Reverie 02449ed7, the
+# DBT evidence collector waits in poll on its listener instead of sleeping a
+# fixed millisecond between connections (reverie-dbt/src/evidence.rs serve()
+# and its new serve_tests). No file is added or removed, and git diff is empty
+# under reverie-dbt/vendor, reverie-dbt/native, reverie-dbt/build.rs and
+# third-party/ and for the root Cargo.toml, Cargo.lock and rust-toolchain.toml;
+# the repository inputs to the DynamoRIO content key are byte-identical by git
+# object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+#     reverie-dbt/native            164356b3ab65 -> 164356b3ab65
+# so the inventory (1014), SDK and native inputs, calibrated budget, job width
+# and limits carry unchanged from the 66196746 entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 02449ed7268c44c885ad988d4bbf45a640e87c6c ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 02449ed7268c44c885ad988d4bbf45a640e87c6c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
