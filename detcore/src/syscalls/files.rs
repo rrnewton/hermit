@@ -9829,6 +9829,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::ENOSYS.into());
         }
 
+        // At the current position (-1) and with no flags, `preadv2` is
+        // `readv` (`preadv2` calls `do_readv`). On a descriptor whose blocking
+        // read Detcore runs in turns it is run as one, so it waits as `readv`
+        // does: the single kernel attempt below fails with EAGAIN on the
+        // descriptor Detcore made physically nonblocking
+        // (https://github.com/rrnewton/hermit/issues/4822).
+        if offset == -1 && call.flags() == 0 && self.waits_in_turns(guest, call.fd()) {
+            let readv = syscalls::Readv::new()
+                .with_fd(call.fd())
+                .with_iov(call.iov())
+                .with_len(call.iov_len() as usize);
+            return self
+                .handle_readv_with_output(guest, readv, rng_output)
+                .await;
+        }
+
         let detfd = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.clone())?;
@@ -9962,6 +9978,26 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
+    /// Whether a blocking transfer on `fd` waits in Detcore's turns, or may
+    /// once the `readv` and `writev` handlers look at it: an internal pipe,
+    /// socket or eventfd Detcore made physically nonblocking, whose `readv`
+    /// and `writev` it polls (`execute_nonblockable_fd_syscall`,
+    /// `execute_blocking_pipe_writev`); a blocking FIFO opened by path, which
+    /// those handlers poll as a pipe once they find a guest at its other end
+    /// (`fifo_polls_if_a_guest_holds_its_peer`); or a timerfd on virtual time.
+    /// A descriptor Detcore cannot look up is left to the kernel.
+    fn waits_in_turns<G: Guest<Self>>(&self, guest: &G, fd: RawFd) -> bool {
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| {
+                (detfd.physically_nonblocking()
+                    && matches!(detfd.ty(), FdType::Socket | FdType::Pipe | FdType::Eventfd))
+                    || (detfd.fifo_awaiting_guest_peer() && !detfd.is_nonblocking())
+                    || (detfd.ty() == FdType::Timerfd && crate::syscalls::timerfd::enabled(guest))
+            })
+            .unwrap_or(false)
+    }
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#794)
     /// SYS_pwritev2 system call: `pwritev` with a trailing per-call flags
@@ -9985,6 +10021,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self
                 .writev_timer_slack(guest, call.fd(), iovecs, call.flags())
                 .await;
+        }
+
+        // At the current position (-1) and with no flags, `pwritev2` is
+        // `writev` (`pwritev2` calls `do_writev`): on a descriptor whose
+        // blocking write Detcore runs in turns it is run as one, so it waits
+        // for room and writes in full as `writev` does
+        // (https://github.com/rrnewton/hermit/issues/4822).
+        if vectored_offset(call.pos_l(), call.pos_h()) == -1
+            && call.flags() == 0
+            && self.waits_in_turns(guest, call.fd())
+        {
+            let writev = syscalls::Writev::new()
+                .with_fd(call.fd())
+                .with_iov(call.iov())
+                .with_len(call.iov_len() as usize);
+            return self.handle_writev(guest, writev).await;
         }
 
         let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {

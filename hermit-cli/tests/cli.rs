@@ -173,6 +173,7 @@ static POLL_RECHECK_PARTIAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_TIMER_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static POLL_RECHECK_ENTRY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static IOVEC_IMPORT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static RWF_CURRENT_OFFSET_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RESTARTABLE_TWO_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PRIVATE_SIGCHLD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_BOOKKEEPING_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -53413,4 +53414,85 @@ fn a_descriptor_received_in_a_binder_transaction_is_usable() {
         stdout.starts_with("received fd ") && stdout.trim_end().ends_with(": hello"),
         "{stdout}"
     );
+}
+
+/// `preadv2` and `pwritev2` at offset -1, the current position, with no
+/// flags, on a pipe, socket, eventfd, timerfd or FIFO the guest left blocking, wait as
+/// `readv` and `writev` do, as Linux runs them as those (`preadv2` calls
+/// `do_readv`, `pwritev2` `do_writev`): a read waits for data, a timerfd read
+/// for its expiration, a write for room, and a 70000-byte write into a pipe
+/// with room for 4096 writes in full.
+/// With `RWF_NOWAIT` a read of an empty pipe still fails with `EAGAIN`.
+/// Detcore used to make one kernel attempt on the descriptor it made
+/// physically nonblocking, which failed with `EAGAIN`
+/// (https://github.com/rrnewton/hermit/issues/4822). Each mode of
+/// `tests/c/guest_rwf_current_offset.c` runs natively, then at L2 (`--strict
+/// --verify --verify-strict --verify-json`, `bitwise_parity` with nonzero
+/// compared log counts), and both print the native line; one read and one
+/// write mode also record and replay.
+#[test]
+fn preadv2_and_pwritev2_at_the_current_offset_wait_as_readv_and_writev_do() {
+    let _guard = hermit_run_guard();
+    let guest = poll_recheck_c_guest(&RWF_CURRENT_OFFSET_GUEST, "guest_rwf_current_offset")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    for (mode, result) in [
+        ("preadv2-pipe", "16 0"),
+        ("preadv2-socket", "16 0"),
+        ("preadv2-eventfd", "8 0"),
+        ("preadv2-timerfd", "8 0"),
+        ("preadv2-timerfd-short", "-1 EINVAL"),
+        ("preadv2-fifo", "16 0"),
+        ("preadv2-nowait", "-1 EAGAIN"),
+        ("pwritev2-pipe-full", "16 0"),
+        ("pwritev2-pipe-large", "70000 0"),
+        ("pwritev2-socket-full", "16 0"),
+    ] {
+        let expected = format!("{mode} {result}\n");
+        let native = Command::new(&guest)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run the guest natively");
+        assert!(native.status.success(), "{mode}: native run failed");
+        assert_eq!(stdout(&native), expected, "{mode}: native");
+        let directory = tempfile::tempdir().expect("failed to create report directory");
+        let report = directory.path().join("verify.json");
+        let args = [
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report.to_str().expect("report path is UTF-8"),
+            "--",
+            guest.as_str(),
+            mode,
+        ];
+        let output = hermit(&args);
+        let log = stderr(&output);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{mode}: stderr:\n{log}");
+        let verdict: serde_json::Value =
+            serde_json::from_slice(&fs::read(&report).expect("read the verification report"))
+                .expect("parse the verification report");
+        assert_eq!(verdict["bitwise_parity"], true, "{mode}: {verdict}");
+        let compared = &verdict["compared_log_messages"];
+        assert!(
+            compared["left"].as_u64().is_some_and(|left| left > 0)
+                && compared["left"] == compared["right"],
+            "{mode}: {verdict}"
+        );
+        if matches!(mode, "preadv2-pipe" | "pwritev2-pipe-large") {
+            let record_args = ["record", "--verify", "--", guest.as_str(), mode];
+            let recorded = hermit(&record_args);
+            assert_success(&recorded, &record_args);
+            assert_eq!(stdout(&recorded), expected, "{mode}: record");
+            assert!(
+                stderr(&recorded).contains("Success: replay matched recording."),
+                "{mode}: replay must match the recording: {recorded:?}"
+            );
+        }
+    }
 }
