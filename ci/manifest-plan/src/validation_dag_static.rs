@@ -4489,7 +4489,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scm_rights_receipt_is_the_same_whichever_finishes_first and
     // scm_rights_exited_receivers_queue_goes_with_its_exit (https://github.com/rrnewton/hermit/issues/4930): 742 + 2 = 744.
     // The retry stack adds one cli case: 744 + 1 = 745.
-    ("test.cli", 745),
+    // And no_namespace_bisect_replays_the_schedules_it_writes: 745 + 1 = 746.
+    // And no_namespace_minimize_replays_its_candidate_records: 746 + 1 = 747.
+    ("test.cli", 747),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5062,7 +5064,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two PR 4912 cases: 659 + 2 = 661.
     // The same two SCM_RIGHTS queue cases: 661 + 2 = 663.
     // The same retry-stack cli case: 663 + 1 = 664.
-    ("test.cli_on_host", 664),
+    // And the same --no-namespace bisect test, not excluded: 664 + 1 = 665.
+    // And the same --minimize test, not excluded: 665 + 1 = 666.
+    ("test.cli_on_host", 666),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1932 - 14 = 1918, re-measured 2026-10-31.
     ("test.regular_crates_on_host", 1918),
