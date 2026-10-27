@@ -13,9 +13,9 @@
 //! bound itself would be in the guest's network namespace, which a gdb client
 //! on the host cannot reach while the guest has a private network
 //! (`--network=local`). So the CLI binds the port before it makes the
-//! container ([`GdbPort::bind`]): a socket stays in the network namespace it
+//! container (`GdbPort::bind`): a socket stays in the network namespace it
 //! was made in, and the tracer inherits it at the clone. Just before the
-//! tracer spawns the guest it listens on that socket ([`connection`]), and a
+//! tracer spawns the guest it listens on that socket (`connection`), and a
 //! relay accepts the one client and passes its bytes to the gdbserver, which
 //! listens on an abstract Unix socket in the tracer's own namespace. The guest
 //! keeps the network it was given, and a host gdb client reaches the port
@@ -69,7 +69,7 @@ impl GdbPort {
     /// Binds `127.0.0.1:PORT` in this process's network namespace; port 0
     /// lets the system pick a free one, which [`GdbPort::port`] then names.
     /// The socket is close-on-exec, so no guest inherits it. It listens only
-    /// when the tracer is about to spawn the guest ([`connection`]), so a
+    /// when the tracer is about to spawn the guest (`connection`), so a
     /// client finds the port listening once the gdbserver is moments from
     /// taking it, as when the gdbserver bound the port itself.
     pub fn bind(port: u16) -> Result<Self, Error> {
