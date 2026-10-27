@@ -363,10 +363,15 @@ pub(crate) enum ClonePlan {
     Kernel,
     /// As `clone3` with `set_tid`.
     Chosen(ChosenId),
-    /// As the guest made it, though Detcore chooses the IDs: the kernel is
-    /// expected to refuse it, or its task gets a host ID, for `reason`. A task
-    /// it does create is reported ([`Detcore::gave_host_id`]).
+    /// As the guest made it, though Detcore chooses the IDs: its task gets a
+    /// host ID, for `reason`, which is reported ([`Detcore::gave_host_id`], or
+    /// for a vfork [`Detcore::vfork_gets_host_id`] before the call).
     AsMade { reason: String },
+    /// As the guest made it, though Detcore chooses the IDs: every kernel
+    /// refuses it before creating a task (`ChosenIdCall::Unchanged`), so it
+    /// is reported only if it creates one after all, and a run that needs
+    /// every ID chosen lets the guest have the kernel's error.
+    KernelRefuses,
     /// As the guest made it: a guest `clone3` that names its task's ID in
     /// Hermit's PID namespace itself, or passes a `set_tid` array the kernel
     /// refuses before creating a task.
@@ -503,11 +508,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 }
             }
-            ChosenIdCall::Unchanged => {
-                return Ok(ClonePlan::AsMade {
-                    reason: "Detcore expected the kernel to refuse it".to_owned(),
-                });
-            }
+            ChosenIdCall::Unchanged => return Ok(ClonePlan::KernelRefuses),
             ChosenIdCall::Inexpressible(why) => {
                 return self
                     .host_id_planned(guest, sysno, why, refuse_host_ids, untraced)
@@ -616,6 +617,30 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(ClonePlan::AsMade { reason })
     }
 
+    /// What a refusal for a held chosen ID asks for: a replay takes its
+    /// record's base, so it names the record; any other run can pass another
+    /// base.
+    fn free_base_hint(&self) -> String {
+        let base = self
+            .cfg
+            .guest_ids
+            .base()
+            .map_or_else(|| "?".to_owned(), |base| base.to_string());
+        match self
+            .cfg
+            .replay_preemptions_from
+            .as_ref()
+            .or(self.cfg.replay_schedule_from.as_ref())
+        {
+            Some(record) => format!(
+                "The replayed record {} takes base {base}; replay it where no host task holds \
+                 the IDs from that base",
+                record.display()
+            ),
+            None => "Pass a --pid-base whose IDs no host task holds".to_owned(),
+        }
+    }
+
     /// Report that the guest's clone-family call created task `child` with a
     /// host ID, for `reason`: the end of a run that needs every ID chosen,
     /// else a warning and a count, which the summary shows and which marks
@@ -670,6 +695,30 @@ impl<T: RecordOrReplay> Detcore<T> {
         crate::tool_global::note_host_id_task(guest).await;
     }
 
+    /// Issue the guest's `CLONE_VFORK` call `call` as made, its task's host
+    /// ID reported first, for `reason` ([`Self::vfork_gets_host_id`]). A
+    /// call that then fails, other than for a restart, created no task,
+    /// which a warning says, since the count already has it.
+    async fn issue_reported_vfork<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        reason: &str,
+    ) -> Result<i64, Errno> {
+        self.vfork_gets_host_id(guest, reason).await;
+        let result = guest.inject(call).await;
+        if let Err(errno) = result
+            && !is_restart(errno)
+        {
+            warn!(
+                "[detcore, dtid {}] the vfork reported above failed with {errno} and created no \
+                 task; the run's count of host-ID tasks includes it",
+                guest.thread_state().dettid
+            );
+        }
+        result
+    }
+
     /// Issue the guest's clone-family call `call` as `plan` says; `vfork`
     /// says whether it passes `CLONE_VFORK`.
     pub(crate) async fn inject_clone_planned<G: Guest<Self>>(
@@ -683,12 +732,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             ClonePlan::Kernel | ClonePlan::GuestChosen => guest.inject(call).await,
             ClonePlan::AsMade { reason } => {
                 if vfork {
-                    self.vfork_gets_host_id(guest, &reason).await;
-                    return guest.inject(call).await;
+                    return self.issue_reported_vfork(guest, call, &reason).await;
                 }
                 let result = guest.inject(call).await;
                 if let Ok(child) = result {
                     self.gave_host_id(guest, child, &reason).await;
+                }
+                result
+            }
+            ClonePlan::KernelRefuses => {
+                let result = guest.inject(call).await;
+                if let Ok(child) = result {
+                    self.gave_host_id(guest, child, "Detcore expected the kernel to refuse it")
+                        .await;
                 }
                 result
             }
@@ -809,9 +865,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                                     guest,
                                     format!(
                                         "this {} cannot create its task with its chosen ID: \
-                                         {cause}. The run needs a base whose IDs no host task \
-                                         holds (a replay takes its record's base)",
-                                        call.number()
+                                         {cause}. {}",
+                                        call.number(),
+                                        self.free_base_hint()
                                     ),
                                 )
                                 .await
@@ -871,8 +927,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
         }
         if vfork {
-            self.vfork_gets_host_id(guest, cause).await;
-            return guest.inject(call).await;
+            return self.issue_reported_vfork(guest, call, cause).await;
         }
         let original = guest.inject(call).await;
         if let Ok(child) = original {
