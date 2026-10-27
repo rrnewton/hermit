@@ -13,22 +13,26 @@
 //! the capability to choose IDs (`CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE`
 //! over the host's PID namespace), Detcore gives the guest's first process
 //! the run's base ID and issues every later clone-family call as `clone3`
-//! with `set_tid` naming the next ID, so the kernel itself hands out IDs that
-//! depend only on the base and the guest's own order of creation. The kernel
+//! with a `set_tid` array whose entry for Hermit's PID namespace is the next
+//! ID (after 1 for a new PID namespace's first task, or after the guest's own
+//! entries), so the kernel itself hands out IDs that depend only on the base
+//! and the guest's own order of clone calls. Every call takes an ID, whether
+//! or not it creates a task, so a failed call leaves a gap. The kernel
 //! then writes those IDs wherever it writes a task's ID: clone's return value
 //! and `CLONE_PARENT_SETTID`/`CLONE_CHILD_SETTID` words, `getpid` and
 //! `gettid`, `/proc`, wait results and `si_pid`, PI-futex owner words and
 //! robust-list cleanup. Nothing needs translating.
 //!
 //! `clone3` is given exactly the arguments Linux's own `clone`, `fork` and
-//! `vfork` pass to `kernel_clone` (kernel/fork.c), so the task created is the
-//! one the guest's call would have created, with the chosen ID. A call
-//! `clone3` cannot express, or one whose `clone3` could fare differently
-//! (under a seccomp filter of the guest's own, or creating its task in a PID
-//! namespace of the guest's), goes to the kernel as the guest made it, and
-//! its task gets a host ID: a run that needs every ID chosen (`--strict`, an
-//! explicit `--pid-base`) then ends, and any other run says its IDs are not
-//! deterministic (`GlobalRequest::GaveHostId`).
+//! `vfork` pass to `kernel_clone` (kernel/fork.c), so the kernel validates
+//! the call as it would the guest's, and the task created is the one the
+//! guest's call would have created, with the chosen ID. A call `clone3`
+//! cannot express, one whose `clone3` could fare differently (under a
+//! seccomp filter of the guest's own), or one by a task inside a PID
+//! namespace the guest made, goes to the kernel as the guest made it, and its
+//! task gets a host ID: a run that needs every ID chosen (`--strict`, an
+//! explicit `--pid-base`) then ends before the task exists, and any other run
+//! says its IDs are not deterministic (`GlobalRequest::GaveHostId`).
 
 use reverie::Error;
 use reverie::Guest;
@@ -604,14 +608,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<ClonePlan, Error> {
         let reason = format!("this {sysno} cannot be given a chosen process ID: {why}");
         if untraced {
-            refuse_host_id(
-                guest,
-                format!(
-                    "{reason}, and as made it would create a task the tracer does not follow \
-                     (CLONE_UNTRACED)"
-                ),
-            )
-            .await
+            refuse_untraced(guest, reason).await
         }
         if refuse_host_ids {
             refuse_host_id(guest, reason).await
@@ -646,23 +643,58 @@ impl<T: RecordOrReplay> Detcore<T> {
         crate::tool_global::note_host_id_task(guest).await;
     }
 
-    /// Issue the guest's clone-family call `call` as `plan` says.
+    /// Report, before a `CLONE_VFORK` call issued as made, that its task, if
+    /// it creates one, has a host ID for `reason`. Its parent returns only
+    /// once the task has exec'd or exited, and the run can end while it runs,
+    /// so a report after the call would come too late for the preemption
+    /// record. A call that then fails was reported all the same, which errs
+    /// on the side of a record a replay refuses.
+    async fn vfork_gets_host_id<G: Guest<Self>>(&self, guest: &mut G, reason: &str) {
+        let reason = format!(
+            "this vfork's task gets a host ID, not a chosen one, reported before the call: \
+             {reason}"
+        );
+        if matches!(
+            self.cfg.guest_ids,
+            detcore_model::pid::GuestIds::Chosen {
+                refuse_host_ids: true,
+                ..
+            }
+        ) {
+            refuse_host_id(guest, reason).await
+        }
+        warn!(
+            "[detcore, dtid {}] {reason}; that ID differs from run to run",
+            guest.thread_state().dettid
+        );
+        crate::tool_global::note_host_id_task(guest).await;
+    }
+
+    /// Issue the guest's clone-family call `call` as `plan` says; `vfork`
+    /// says whether it passes `CLONE_VFORK`.
     pub(crate) async fn inject_clone_planned<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: Syscall,
         plan: ClonePlan,
+        vfork: bool,
     ) -> Result<i64, Errno> {
         match plan {
             ClonePlan::Kernel | ClonePlan::GuestChosen => guest.inject(call).await,
             ClonePlan::AsMade { reason } => {
+                if vfork {
+                    self.vfork_gets_host_id(guest, &reason).await;
+                    return guest.inject(call).await;
+                }
                 let result = guest.inject(call).await;
                 if let Ok(child) = result {
                     self.gave_host_id(guest, child, &reason).await;
                 }
                 result
             }
-            ClonePlan::Chosen(chosen) => self.inject_with_chosen_id(guest, call, chosen).await,
+            ClonePlan::Chosen(chosen) => {
+                self.inject_with_chosen_id(guest, call, chosen, vfork).await
+            }
         }
     }
 
@@ -685,6 +717,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: Syscall,
         chosen: ChosenId,
+        vfork: bool,
     ) -> Result<i64, Errno> {
         let refuse_host_ids = matches!(
             self.cfg.guest_ids,
@@ -721,7 +754,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .await
             }
-            return self.issue_as_made(guest, call, &cause, untraced).await;
+            return self
+                .issue_as_made(guest, call, &cause, untraced, vfork)
+                .await;
         }
         let mut entries = [0 as libc::pid_t; MAX_SET_TID];
         entries[..set_tid.len()].copy_from_slice(&set_tid);
@@ -774,7 +809,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                                     guest,
                                     format!(
                                         "this {} cannot create its task with its chosen ID: \
-                                         {cause}. Pass a --pid-base whose IDs no host task holds",
+                                         {cause}. The run needs a base whose IDs no host task \
+                                         holds (a replay takes its record's base)",
                                         call.number()
                                     ),
                                 )
@@ -806,11 +842,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await
         }
-        self.issue_as_made(guest, call, &cause, untraced).await
+        self.issue_as_made(guest, call, &cause, untraced, vfork)
+            .await
     }
 
     /// Issue the guest's own call `call`, whose task, if it creates one, has
-    /// a host ID for `cause` ([`Self::gave_host_id`]). An untraced call is not
+    /// a host ID for `cause` ([`Self::gave_host_id`], or for a `vfork` call
+    /// [`Self::vfork_gets_host_id`] before it). An untraced call is not
     /// issued: its task would run outside Detcore's scheduler, so even a run
     /// that takes host IDs ends.
     async fn issue_as_made<G: Guest<Self>>(
@@ -819,9 +857,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: Syscall,
         cause: &str,
         untraced: bool,
+        vfork: bool,
     ) -> Result<i64, Errno> {
         if untraced {
-            refuse_host_id(
+            refuse_untraced(
                 guest,
                 format!(
                     "this {} cannot create its task with its chosen ID ({cause}), and the guest's \
@@ -830,6 +869,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 ),
             )
             .await
+        }
+        if vfork {
+            self.vfork_gets_host_id(guest, cause).await;
+            return guest.inject(call).await;
         }
         let original = guest.inject(call).await;
         if let Ok(child) = original {
@@ -963,10 +1006,15 @@ fn pid_namespace_depth(tid: i32, flags: u64) -> Option<usize> {
     // ioctl_ns(2): _IO(0xb7, 0x2).
     const NS_GET_PARENT: u64 = 0xb702;
     let new = usize::from(flags & libc::CLONE_NEWPID as u64 != 0);
-    let Ok(own) = std::fs::metadata("/proc/self/ns/pid") else {
-        return std::path::Path::new("/proc/self/ns")
-            .is_dir()
-            .then_some(new);
+    let own = match std::fs::metadata("/proc/self/ns/pid") {
+        Ok(own) => own,
+        // No `pid` entry beside the others: a kernel without PID namespaces.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return std::path::Path::new("/proc/self/ns")
+                .is_dir()
+                .then_some(new);
+        }
+        Err(_) => return None,
     };
     let mut namespace = std::fs::File::open(format!("/proc/{tid}/ns/pid_for_children")).ok()?;
     for depth in 0..=MAX_SET_TID {
@@ -1024,6 +1072,26 @@ where
     let reason = format!(
         "this run needs every guest process ID chosen (--strict or --pid-base), and a task would \
          have, or has, a host ID, which differs from run to run: {reason}"
+    );
+    tracing::error!("[detcore, dtid {}] {reason}", guest.thread_state().dettid);
+    crate::tool_global::report_policy_refusal(guest, reason).await;
+    crate::tool_global::unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT)
+        .await
+}
+
+/// End the run, whatever its guest IDs, because the guest's clone-family
+/// call, as made, would create a task the tracer does not follow
+/// (`CLONE_UNTRACED`), which would run outside Detcore's scheduler, and
+/// Detcore cannot rewrite it without the flag: `reason` says why. The run
+/// ends with Hermit's policy-refusal status.
+async fn refuse_untraced<T, G>(guest: &mut G, reason: String) -> !
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let reason = format!(
+        "a task the tracer does not follow (CLONE_UNTRACED) would run outside Detcore's \
+         scheduler: {reason}"
     );
     tracing::error!("[detcore, dtid {}] {reason}", guest.thread_state().dettid);
     crate::tool_global::report_policy_refusal(guest, reason).await;

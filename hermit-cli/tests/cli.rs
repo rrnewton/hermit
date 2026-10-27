@@ -10479,7 +10479,8 @@ fn no_namespace_gives_a_new_pid_namespace_child_its_chosen_id() {
 
 /// A call that cannot carry a chosen ID is refused by an explicit base
 /// before its task exists, even where Linux would refuse it too: a raw clone
-/// with exit signal 65, which clone accepts and clone3 does not; one with new
+/// with exit signal 65, which clone accepts and clone3 does not (also with
+/// `CLONE_VFORK`, whose host ID a default run reports before the call); one with new
 /// stack pointer 1, which clone3 cannot express; and a fork by a task inside
 /// a PID namespace the guest made (a `CLONE_NEWPID` child), whose new task's
 /// ID in that namespace is the kernel's. A default run issues the first and
@@ -10494,6 +10495,7 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
     let newpid_child = "newpid child: own ID 1\n";
     for (call, reason, before) in [
         ("signal65", "its exit signal 65 is not a signal number", ""),
+        ("vfork65", "its exit signal 65 is not a signal number", ""),
         ("sp1", "its new stack pointer 0x1 has no clone3 form", ""),
         (
             "newpid-fork",
@@ -10518,6 +10520,9 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
     }
     for (call, expected) in [
         ("signal65", "clone signal65: created\n".to_owned()),
+        // A vfork parent returns only once its child has exited, so its host
+        // ID is reported before the call.
+        ("vfork65", "clone vfork65: created\n".to_owned()),
         (
             "newpid-fork",
             format!(
@@ -10529,7 +10534,8 @@ fn no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id() {
         assert_success(&tolerant, &[call]);
         assert!(
             stdout(&tolerant) == expected
-                && stderr(&tolerant).contains("1 task(s) got a host ID instead"),
+                && stderr(&tolerant).contains("1 task(s) got a host ID instead")
+                && (call != "vfork65" || stderr(&tolerant).contains("reported before the call")),
             "{call}: stdout:\n{}\nstderr:\n{}",
             stdout(&tolerant),
             stderr(&tolerant)
