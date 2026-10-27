@@ -33078,8 +33078,11 @@ fn verify_sigkill_cross_process_modes(modes: &[(&str, &str, u32)]) {
     }
 }
 
-/// A SIGKILL to another process, its process group, or a process that has
-/// already exited (see `verify_sigkill_cross_process_modes`).
+/// A SIGKILL to another process or a process group (see
+/// `verify_sigkill_cross_process_modes`); the kills of a child, of the
+/// sender's own process group with itself in it, of a zombie and of a pipe's
+/// writer are in
+/// `a_cross_process_sigkill_of_a_child_or_own_group_verifies_at_bitwise_parity`.
 #[test]
 fn a_cross_process_sigkill_verifies_at_bitwise_parity() {
     verify_sigkill_cross_process_modes(&[
@@ -33092,6 +33095,18 @@ fn a_cross_process_sigkill_verifies_at_bitwise_parity() {
         ),
         ("pgroup", "A killed by signal 9\nB exited 0\n", 5),
         ("selfgroup", "A killed by signal 9\nB exited 0\n", 5),
+    ]);
+}
+
+/// A SIGKILL to the sender's own process group, to a child by its parent
+/// (once or twice), to a zombie, and to a pipe's writer (see
+/// `verify_sigkill_cross_process_modes`). Split from
+/// `a_cross_process_sigkill_verifies_at_bitwise_parity`, whose 50 verified
+/// runs took up to 59 s on a loaded host against nextest's 57 s
+/// slow-timeout (https://github.com/rrnewton/hermit/issues/4783).
+#[test]
+fn a_cross_process_sigkill_of_a_child_or_own_group_verifies_at_bitwise_parity() {
+    verify_sigkill_cross_process_modes(&[
         ("pgself", "A killed by signal 9\n", 5),
         // The sender is the victim's parent, so the kernel's own SIGCHLD is
         // what the parent receives, with Linux's siginfo.
@@ -33270,7 +33285,9 @@ fn a_wait_after_a_sigkill_to_an_exited_leader_is_a_deadlock() {
 
 /// The SIGCHLD notifications of killed children, collected with
 /// sigtimedwait, a handler or a signalfd (see
-/// `verify_sigkill_cross_process_modes`).
+/// `verify_sigkill_cross_process_modes`). The later signalfd reads are in
+/// `a_late_or_vectored_sigkill_notification_read_verifies_at_bitwise_parity`
+/// and `a_positioned_or_self_read_sigkill_notification_verifies_at_bitwise_parity`.
 #[test]
 fn a_cross_process_sigkill_notification_verifies_at_bitwise_parity() {
     verify_sigkill_cross_process_modes(&[
@@ -33293,6 +33310,18 @@ fn a_cross_process_sigkill_notification_verifies_at_bitwise_parity() {
             "signalfd two kills notifications genuine: 1\n",
             3,
         ),
+    ]);
+}
+
+/// The SIGCHLD notifications of killed children collected into a write-only
+/// page, by a signalfd created only after the kills, and by vectored signalfd
+/// reads (see `verify_sigkill_cross_process_modes`). Split from
+/// `a_cross_process_sigkill_notification_verifies_at_bitwise_parity`, whose 45
+/// verified runs took up to 58 s on a loaded host against nextest's 57 s
+/// slow-timeout (https://github.com/rrnewton/hermit/issues/4783).
+#[test]
+fn a_late_or_vectored_sigkill_notification_read_verifies_at_bitwise_parity() {
+    verify_sigkill_cross_process_modes(&[
         (
             "wogroupwait",
             "write-only group notifications genuine: 1\n",
@@ -33320,6 +33349,19 @@ fn a_cross_process_sigkill_notification_verifies_at_bitwise_parity() {
             "signalfd group notifications genuine: 1\n",
             3,
         ),
+    ]);
+}
+
+/// The SIGCHLD notifications of killed children read with preadv2, by a readv
+/// whose one iovec lies in the first bytes of its own destination, with a
+/// high count, and at a position (see
+/// `verify_sigkill_cross_process_modes`). Split from
+/// `a_cross_process_sigkill_notification_verifies_at_bitwise_parity` with
+/// `a_late_or_vectored_sigkill_notification_read_verifies_at_bitwise_parity`
+/// (https://github.com/rrnewton/hermit/issues/4783).
+#[test]
+fn a_positioned_or_self_read_sigkill_notification_verifies_at_bitwise_parity() {
+    verify_sigkill_cross_process_modes(&[
         (
             "latesfdpreadv2group",
             "late signalfd group notifications genuine: 1\n",
@@ -43129,12 +43171,13 @@ fn the_pipe_wake_hand_off_verifies_on_fifos_under_chaos_and_a_nonzero_latency() 
 /// Linux gives it, deterministically, under several chaos seeds too. A FIFO
 /// whose other end only a host process holds still blocks in the kernel, as
 /// before: no guest's progress depends on it, and polling it would make the
-/// schedule depend on when the host writes.
+/// schedule depend on when the host writes. The rows are split across this
+/// test, `a_fifo_shared_by_guests_through_private_tables_does_not_hold_the_turn`
+/// and `a_fifo_with_only_the_host_at_its_other_end_is_never_polled`
+/// (https://github.com/rrnewton/hermit/issues/4783).
 #[test]
 fn a_fifo_shared_by_guests_does_not_hold_the_turn() {
-    let guest = fifo_peer_guest().to_str().unwrap();
-    let scratch = process_build_root("fifo-peer").join("runs");
-    for (mode, expected) in [
+    verify_fifos_shared_by_guests(&[
         ("thread", "thread read: 1 'x'\n"),
         // A signal to the polling reader ends its read, as on Linux
         // (https://github.com/rrnewton/hermit/issues/4200's first report).
@@ -43147,6 +43190,17 @@ fn a_fifo_shared_by_guests_does_not_hold_the_turn() {
             "fill",
             "thread wrote: 196731\nmain read: 196731 bytes, sum 1452010763\n",
         ),
+    ]);
+}
+
+/// The private-table and private-writer rows of
+/// `a_fifo_shared_by_guests_does_not_hold_the_turn`, with the shared and
+/// vectored ones, split from it so that each test fits nextest's slow-timeout
+/// on a loaded host: as one test its 46 Hermit runs timed out at 57 s
+/// (https://github.com/rrnewton/hermit/issues/4783).
+#[test]
+fn a_fifo_shared_by_guests_through_private_tables_does_not_hold_the_turn() {
+    verify_fifos_shared_by_guests(&[
         // The child's read polls the shared read end first; the parent's read
         // must then poll it too, not see EAGAIN.
         ("shared", "child read: 1 'a'\nparent read: 1 'b'\n"),
@@ -43158,36 +43212,18 @@ fn a_fifo_shared_by_guests_does_not_hold_the_turn() {
         ("private-table-guest", "thread read: 1 'g'\n"),
         // The only writer is in a thread's own table (CLONE_FILES unset).
         ("private-writer", "leader read: 1 'w'\n"),
-    ] {
-        let dir = scratch.join(mode);
-        fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
-        let dir = dir.to_str().unwrap();
-        for seed in [None, Some("--seed=1"), Some("--seed=2"), Some("--seed=3")] {
-            let mut args = vec!["run", "--strict"];
-            if let Some(seed) = seed {
-                args.extend(["--chaos", seed]);
-            }
-            args.extend(["--verify", "--verify-strict", "--", guest, mode, dir]);
-            let output = hermit(&args);
-            assert_success(&output, &args);
-            assert_eq!(stdout(&output), expected, "{args:?}");
-            let log = stderr(&output);
-            assert!(
-                log.contains("Success: deterministic. Determinism verified."),
-                "{args:?}: verification failed:\n{log}"
-            );
-        }
-        // The descriptors become internally polled pipes.
-        let args = ["--log", "info", "run", "--strict", "--", guest, mode, dir];
-        let output = hermit(&args);
-        assert_success(&output, &args);
-        assert!(
-            stderr(&output).contains("is a FIFO with a guest at its other end"),
-            "{args:?}: the FIFO was not polled:\n{}",
-            stderr(&output)
-        );
-    }
+    ]);
+}
 
+/// The FIFOs of `a_fifo_shared_by_guests_does_not_hold_the_turn` that only the
+/// host holds at the other end: the guest's call waits for the host in the
+/// kernel and is never polled (split out by
+/// https://github.com/rrnewton/hermit/issues/4783).
+#[test]
+fn a_fifo_with_only_the_host_at_its_other_end_is_never_polled() {
+    let guest = fifo_peer_guest().to_str().unwrap();
+    let scratch = process_build_root("fifo-peer").join("runs");
+    fs::create_dir_all(&scratch).expect("failed to create the FIFO directory");
     // A FIFO with only the host (this test process) at its other end: the
     // guest's call waits for the host, in the kernel, and is never polled.
     // `host`: the guest reads a byte the host writes. `host-rdwr`: the same
@@ -43306,6 +43342,44 @@ fn a_fifo_shared_by_guests_does_not_hold_the_turn() {
         stderr(&output)
     );
     drop(host_end);
+}
+
+/// Runs each `(mode, expected)` of the fifo-peer guest whose FIFO has a guest at
+/// its other end: under `--strict --verify --verify-strict` without chaos and
+/// under chaos seeds 1 to 3, then once under `--log info` to see its descriptors
+/// polled.
+fn verify_fifos_shared_by_guests(modes: &[(&str, &str)]) {
+    let guest = fifo_peer_guest().to_str().unwrap();
+    let scratch = process_build_root("fifo-peer").join("runs");
+    for &(mode, expected) in modes {
+        let dir = scratch.join(mode);
+        fs::create_dir_all(&dir).expect("failed to create the FIFO directory");
+        let dir = dir.to_str().unwrap();
+        for seed in [None, Some("--seed=1"), Some("--seed=2"), Some("--seed=3")] {
+            let mut args = vec!["run", "--strict"];
+            if let Some(seed) = seed {
+                args.extend(["--chaos", seed]);
+            }
+            args.extend(["--verify", "--verify-strict", "--", guest, mode, dir]);
+            let output = hermit(&args);
+            assert_success(&output, &args);
+            assert_eq!(stdout(&output), expected, "{args:?}");
+            let log = stderr(&output);
+            assert!(
+                log.contains("Success: deterministic. Determinism verified."),
+                "{args:?}: verification failed:\n{log}"
+            );
+        }
+        // The descriptors become internally polled pipes.
+        let args = ["--log", "info", "run", "--strict", "--", guest, mode, dir];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert!(
+            stderr(&output).contains("is a FIFO with a guest at its other end"),
+            "{args:?}: the FIFO was not polled:\n{}",
+            stderr(&output)
+        );
+    }
 }
 
 /// On KVM a guest thread's ID is not a host task's, so `/proc/<tid>` cannot
@@ -43454,55 +43528,58 @@ fn run_kvm_costs_one_host_syscall_per_guest_syscall() {
 ///   moves time to the sleeper's deadline instead of crawling there (F3).
 ///
 /// A guest removing the FIFO's name forgets that a guest made it.
+///
+/// The cases are split across this test (the first four modes),
+/// `a_blocking_fifo_open_with_an_unpublished_or_exclusive_peer_runs_as_on_linux`
+/// and `a_shells_blocking_fifo_open_verifies_and_shows_its_poll`
+/// (https://github.com/rrnewton/hermit/issues/4783).
 #[test]
 fn a_blocking_fifo_open_waits_for_its_peer_without_holding_the_turn() {
+    verify_fifo_opens(
+        "open-runs",
+        &[
+            ("open-writer-first", "child read: 1 'z'\nparent wrote 1\n"),
+            ("open-reader-first", "child read: 1 'z'\nparent wrote 1\n"),
+            ("open-beside-pipe", "drained 262144\nparent read: 1 'x'\n"),
+            ("open-reader-closes", "open: ok, write: -1 Broken pipe\n"),
+        ],
+    );
+}
+
+/// The waiting opens of `a_blocking_fifo_open_waits_for_its_peer_without_holding_the_turn`
+/// whose number is not yet published, the exclusive open and the open beside
+/// a sleeping writer, split from it so that each test fits nextest's
+/// slow-timeout on a loaded host: as one test its 37 Hermit runs took up to
+/// 59 s against 57 s (https://github.com/rrnewton/hermit/issues/4783).
+#[test]
+fn a_blocking_fifo_open_with_an_unpublished_or_exclusive_peer_runs_as_on_linux() {
+    verify_fifo_opens(
+        "open-unpublished-runs",
+        &[
+            (
+                "open-unpublished-reader",
+                "pending number: F_GETFD -1 Bad file descriptor\n",
+            ),
+            (
+                "open-unpublished-writer",
+                "pending number: F_GETFD -1 Bad file descriptor\n",
+            ),
+            ("open-exclusive", "exclusive open: -1 File exists\n"),
+            ("open-after-sleep", "parent read: 1 's'\n"),
+        ],
+    );
+}
+
+/// The shell's FIFO open of
+/// `a_blocking_fifo_open_waits_for_its_peer_without_holding_the_turn`, and
+/// what the log shows of an open beside a sleeper: the open polls, the
+/// sleeper's deadline comes at once, and removing the name forgets the FIFO
+/// (split out by https://github.com/rrnewton/hermit/issues/4783).
+#[test]
+fn a_shells_blocking_fifo_open_verifies_and_shows_its_poll() {
     let guest = fifo_peer_guest().to_str().unwrap();
     let scratch = process_build_root("fifo-peer").join("open-runs");
-    let seeds = [None, Some("--seed=1"), Some("--seed=2"), Some("--seed=3")];
-    let verify = |dir: &Path, program: &[&str], expected: &str| {
-        for seed in seeds {
-            // A fresh directory: a FIFO left by an earlier run would change
-            // the guest's first unlink.
-            let _ = fs::remove_dir_all(dir);
-            fs::create_dir_all(dir).expect("failed to create the FIFO directory");
-            let mut args = vec!["run", "--strict"];
-            if let Some(seed) = seed {
-                args.extend(["--chaos", seed]);
-            }
-            args.extend(["--verify", "--verify-strict", "--"]);
-            args.extend(program);
-            let output =
-                hermit_test::hermit_output("hermit run", hermit_command(&args).current_dir(dir));
-            assert_success(&output, &args);
-            assert_eq!(stdout(&output), expected, "{args:?}");
-            assert!(
-                stderr(&output).contains("Success: deterministic. Determinism verified."),
-                "{args:?}: verification failed:\n{}",
-                stderr(&output)
-            );
-        }
-    };
-    for (mode, expected) in [
-        ("open-writer-first", "child read: 1 'z'\nparent wrote 1\n"),
-        ("open-reader-first", "child read: 1 'z'\nparent wrote 1\n"),
-        ("open-beside-pipe", "drained 262144\nparent read: 1 'x'\n"),
-        ("open-reader-closes", "open: ok, write: -1 Broken pipe\n"),
-        (
-            "open-unpublished-reader",
-            "pending number: F_GETFD -1 Bad file descriptor\n",
-        ),
-        (
-            "open-unpublished-writer",
-            "pending number: F_GETFD -1 Bad file descriptor\n",
-        ),
-        ("open-exclusive", "exclusive open: -1 File exists\n"),
-        ("open-after-sleep", "parent read: 1 's'\n"),
-    ] {
-        let dir = scratch.join(mode);
-        let dir_arg = dir.to_str().unwrap().to_owned();
-        verify(&dir, &[guest, mode, &dir_arg], expected);
-    }
-    verify(
+    verify_fifo_open_under_seeds(
         &scratch.join("shell"),
         &[
             "/bin/bash",
@@ -43538,6 +43615,46 @@ fn a_blocking_fifo_open_waits_for_its_peer_without_holding_the_turn() {
         "a guest removed the name of the FIFO it made",
     ] {
         assert!(log.contains(line), "{args:?}: no {line:?} in:\n{log}");
+    }
+}
+
+/// Runs each `(mode, expected)` of the fifo-peer guest in its own directory
+/// under the `runs` scratch directory (`verify_fifo_open_under_seeds`).
+fn verify_fifo_opens(runs: &str, modes: &[(&str, &str)]) {
+    let guest = fifo_peer_guest().to_str().unwrap();
+    let scratch = process_build_root("fifo-peer").join(runs);
+    for &(mode, expected) in modes {
+        let dir = scratch.join(mode);
+        let dir_arg = dir.to_str().unwrap().to_owned();
+        verify_fifo_open_under_seeds(&dir, &[guest, mode, &dir_arg], expected);
+    }
+}
+
+/// Runs `program` in a fresh `dir` under `--strict --verify --verify-strict`,
+/// without chaos and under chaos seeds 1 to 3, and checks its output and
+/// verdict each time.
+fn verify_fifo_open_under_seeds(dir: &Path, program: &[&str], expected: &str) {
+    let seeds = [None, Some("--seed=1"), Some("--seed=2"), Some("--seed=3")];
+    for seed in seeds {
+        // A fresh directory: a FIFO left by an earlier run would change
+        // the guest's first unlink.
+        let _ = fs::remove_dir_all(dir);
+        fs::create_dir_all(dir).expect("failed to create the FIFO directory");
+        let mut args = vec!["run", "--strict"];
+        if let Some(seed) = seed {
+            args.extend(["--chaos", seed]);
+        }
+        args.extend(["--verify", "--verify-strict", "--"]);
+        args.extend(program);
+        let output =
+            hermit_test::hermit_output("hermit run", hermit_command(&args).current_dir(dir));
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{args:?}");
+        assert!(
+            stderr(&output).contains("Success: deterministic. Determinism verified."),
+            "{args:?}: verification failed:\n{}",
+            stderr(&output)
+        );
     }
 }
 

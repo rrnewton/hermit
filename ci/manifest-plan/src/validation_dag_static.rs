@@ -4286,7 +4286,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none
     // (the placeholder is mounted only for KVM), are run_kvm_ tests, which this
     // node skips and privileged-test.cli_kvm runs.
-    ("test.cli", 622),
+    // The 0.5.4 base counts 622.
+    // Splitting four heavy tests so each fits nextest's slow-timeout on a
+    // loaded host (https://github.com/rrnewton/hermit/issues/4783) adds
+    // a_cross_process_sigkill_of_a_child_or_own_group_verifies_at_bitwise_parity,
+    // a_late_or_vectored_sigkill_notification_read_verifies_at_bitwise_parity,
+    // a_positioned_or_self_read_sigkill_notification_verifies_at_bitwise_parity,
+    // a_blocking_fifo_open_with_an_unpublished_or_exclusive_peer_runs_as_on_linux,
+    // a_shells_blocking_fifo_open_verifies_and_shows_its_poll,
+    // a_fifo_shared_by_guests_through_private_tables_does_not_hold_the_turn and
+    // a_fifo_with_only_the_host_at_its_other_end_is_never_polled: 629.
+    ("test.cli", 629),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4802,7 +4812,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two tests split out of the discarded-at-send test, not
     // excluded: 535.
     // And the same four P1 placeholder tests, not excluded: 539.
-    ("test.cli_on_host", 541),
+    // The 0.5.4 base counts 541.
+    // And the same seven tests split out of four heavy ones, not excluded:
+    // 548.
+    ("test.cli_on_host", 548),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
