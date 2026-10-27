@@ -16,19 +16,49 @@ use serde::Serialize;
 
 use crate::syscalls::VIRTUAL_CPUSET_BYTES;
 
-/// A set of virtual CPUs.
-#[derive(
-    Clone,
-    Copy,
-    Debug,
-    Default,
-    Eq,
-    PartialEq,
-    Hash,
-    Serialize,
-    Deserialize
-)]
-pub struct CpuSet(u128);
+/// A set of virtual CPUs: bit `n` of the 128-bit mask is CPU `n`.
+///
+/// The mask is held as its two 64-bit halves, least significant first,
+/// rather than as a `u128`: a `u128` is 16-byte aligned, and a set held
+/// across an `.await` would raise the alignment, and so the size, of every
+/// syscall future that holds one (`syscall_hot_path_tests` bounds them). It
+/// serializes, prints and hashes as the `u128` it is.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub struct CpuSet([u64; 2]);
+
+impl CpuSet {
+    const fn from_bits(bits: u128) -> Self {
+        Self([bits as u64, (bits >> 64) as u64])
+    }
+
+    const fn bits(self) -> u128 {
+        ((self.0[1] as u128) << 64) | self.0[0] as u128
+    }
+}
+
+impl std::fmt::Debug for CpuSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("CpuSet").field(&self.bits()).finish()
+    }
+}
+
+impl std::hash::Hash for CpuSet {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.bits().hash(state)
+    }
+}
+
+impl Serialize for CpuSet {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.bits().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for CpuSet {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        u128::deserialize(deserializer).map(Self::from_bits)
+    }
+}
 
 const _: () = assert!(VIRTUAL_CPUSET_BYTES == std::mem::size_of::<u128>());
 const _: () = assert!(detcore_model::config::MAX_VIRTUAL_CPUS as usize == VIRTUAL_CPUSET_BYTES * 8);
@@ -39,7 +69,7 @@ impl CpuSet {
 
     /// CPUs `0..count`: every CPU of a machine with `count` CPUs.
     pub fn first(count: u32) -> Self {
-        Self(match count {
+        Self::from_bits(match count {
             0 => 0,
             count if count >= Self::BITS => u128::MAX,
             count => (1u128 << count) - 1,
@@ -48,7 +78,7 @@ impl CpuSet {
 
     /// The one CPU `cpu`.
     pub fn only(cpu: u32) -> Self {
-        Self(1u128.checked_shl(cpu).unwrap_or(0))
+        Self::from_bits(1u128.checked_shl(cpu).unwrap_or(0))
     }
 
     /// The set a `sched_setaffinity` mask of `bytes` names, read as the
@@ -58,17 +88,17 @@ impl CpuSet {
         let mut mask = [0u8; VIRTUAL_CPUSET_BYTES];
         let copied = bytes.len().min(VIRTUAL_CPUSET_BYTES);
         mask[..copied].copy_from_slice(&bytes[..copied]);
-        Self(u128::from_le_bytes(mask))
+        Self::from_bits(u128::from_le_bytes(mask))
     }
 
     /// The set as the kernel lays out a `cpumask` in memory.
     pub fn to_mask_bytes(self) -> [u8; VIRTUAL_CPUSET_BYTES] {
-        self.0.to_le_bytes()
+        self.bits().to_le_bytes()
     }
 
     /// The CPUs in both sets.
     pub fn intersection(self, other: Self) -> Self {
-        Self(self.0 & other.0)
+        Self::from_bits(self.bits() & other.bits())
     }
 
     /// Whether `cpu` is in the set.
@@ -78,12 +108,12 @@ impl CpuSet {
 
     /// Whether the set has no CPU.
     pub fn is_empty(self) -> bool {
-        self.0 == 0
+        self.bits() == 0
     }
 
     /// How many CPUs the set has.
     pub fn len(self) -> u32 {
-        self.0.count_ones()
+        self.bits().count_ones()
     }
 
     /// The set's CPUs, from the lowest.
@@ -130,7 +160,7 @@ impl CpuSet {
         };
         while low > 0 {
             low -= 32;
-            let value = (self.0 >> low) as u32 & (u32::MAX >> (32 - width));
+            let value = (self.bits() >> low) as u32 & (u32::MAX >> (32 - width));
             groups.push(format!(
                 "{value:0digits$x}",
                 digits = width.div_ceil(4) as usize
