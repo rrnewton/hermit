@@ -2980,7 +2980,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // listed.
     // And syscalls::inotify's a_read_into_overlapping_buffers_is_left_alone
     // (the overlap decision, without global state): 2623, listed.
-    ("test.detcore_unit", 2623),
+    // And syscalls::inotify's four units for a read that faults (the cookies
+    // found depend only on where the copy ended, only a rename cookie is cut,
+    // a cookie before the fault is whole, and the copy ends at the first
+    // page the guest cannot write): 2627, listed.
+    ("test.detcore_unit", 2627),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5185,7 +5189,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same nine syscalls::inotify and two config units: 2622,
     // listed.
     // And the same overlap-decision unit: 2623, listed.
-    ("test.detcore_unit_on_host", 2623),
+    // And the same four units for a read that faults: 2627, listed.
+    ("test.detcore_unit_on_host", 2627),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

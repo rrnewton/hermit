@@ -32,14 +32,32 @@
 //! KVM refuses blocking inotify reads. A read that carries no rename (every
 //! cookie zero) is left alone and asks global state nothing.
 //!
+//! A read that fails with EFAULT: `inotify_read` copies whole events in order
+//! and returns -EFAULT when a copy faults, after the earlier events were
+//! copied and dequeued (fs/notify/inotify/inotify_user.c), and only the first
+//! nonempty buffer can fault so (a `readv` whose later iovec faults returns
+//! the earlier iovecs' count). Each copy stores every byte up to the first
+//! one the guest cannot write, so Linux wrote exactly that buffer's bytes
+//! before the first page the guest cannot write, which depends only on the
+//! guest's page protections ([`faulted_prefix`]). The events there are
+//! walked by their lengths, never by what a cookie holds
+//! ([`faulted_cookies`]). The cookies Linux wrote whole are renumbered, and a
+//! rename cookie the fault cut short, of which Linux wrote only some bytes,
+//! is written as zeros (any other event's cookie is 0, so its bytes are
+//! left).
+//!
 //! Where host cookies stay in guest memory:
-//! - A read that fails with EFAULT (warned). `inotify_read` copies events one
-//!   at a time and returns -EFAULT when a later copy faults, after the
-//!   earlier events were copied and dequeued (fs/notify/inotify/inotify_user.c),
-//!   and Detcore does not learn how much was written. A `readv` or `preadv2`
-//!   whose later iovec faults returns the earlier iovecs' bytes instead (not
-//!   warned: nothing tells it apart from a short read); the events copied into
-//!   the faulting iovec keep theirs
+//! - A read that faults where Hermit cannot tell where the copy ended
+//!   (warned): a write ends short of a page. Under record and replay too
+//!   (warned): this slice does not establish that a replay reproduces the
+//!   bytes Linux copied before a fault, which the renumbering reads back. The in-process backends cannot
+//!   read a write-only page, so there one is taken for where the copy ended
+//!   (<https://github.com/rrnewton/hermit/issues/4530>), and a page the guest
+//!   protects with a protection key (`pkey_mprotect`) is taken for writable,
+//!   because Hermit's copies do not check protection keys.
+//! - A `readv` or `preadv2` whose count ends at the start of a later iovec
+//!   (warned): Linux may have copied events into that iovec before a fault
+//!   there, and the count does not say whether it did
 //!   (<https://github.com/rrnewton/hermit/issues/4793>).
 //! - A destination Hermit cannot read (warned): a write-only page on the
 //!   in-process backends (<https://github.com/rrnewton/hermit/issues/4530>).
@@ -201,6 +219,12 @@ impl Destination {
         None
     }
 
+    /// The first nonempty buffer: the only one a read that fails with EFAULT
+    /// can have faulted in, or written to.
+    fn first_nonempty(&self) -> Option<(usize, usize)> {
+        self.0.iter().copied().find(|&(_, size)| size > 0)
+    }
+
     /// What [`finish`] does after a read returned `length` bytes: renumber
     /// the events in the buffers it filled, unless those, or the buffer it may
     /// have written before a fault, overlap.
@@ -226,6 +250,105 @@ enum Plan {
     /// buffers the read wrote, or may have written before a fault, overlap,
     /// so the bytes left are not the events it returned.
     LeaveOverlapping(Vec<(usize, usize)>),
+}
+
+/// The bytes of a guest page, for [`faulted_prefix`]: Linux's page
+/// protections are per page.
+const PAGE: usize = 4096;
+
+/// The bytes Linux wrote into the `size` bytes at `address` before a read
+/// faulted there, read back: the buffer's bytes before the first page the
+/// guest cannot write. Linux fills the buffer from its start and stops at the
+/// first byte it cannot write, so which bytes those are depends only on the
+/// guest's page protections, never on what they hold.
+///
+/// Each page is read back, then written again with exactly the bytes read,
+/// through a copy that respects the guest's page protection
+/// (`write_with_user_access`). A page Linux wrote keeps its bytes, and the
+/// first page that copy refuses is where Linux stopped. A page Hermit cannot
+/// read is taken for one the guest cannot write: on ptrace no read reaches
+/// it, so it is unmapped or inaccessible, and on KVM an inaccessible page is
+/// neither readable nor writable, but the in-process backends cannot read a
+/// write-only page either (<https://github.com/rrnewton/hermit/issues/4530>).
+/// `None` when a write ends short of a page or fails otherwise, which tells
+/// nothing.
+fn faulted_prefix<M: MemoryAccess>(memory: &mut M, address: usize, size: usize) -> Option<Vec<u8>> {
+    let mut written = Vec::new();
+    let mut offset = 0usize;
+    while offset < size {
+        let at = address.checked_add(offset)?;
+        let length = (PAGE - at % PAGE).min(size - offset);
+        let start = AddrMut::<u8>::from_raw(at)?;
+        let mut bytes = vec![0u8; length];
+        if crate::io_buffers::read_written(memory, start, &mut bytes).is_err() {
+            break;
+        }
+        match memory.write_with_user_access(start, &bytes) {
+            Ok(copied) if copied == length => written.extend_from_slice(&bytes),
+            Err(Errno::EFAULT) => break,
+            _ => return None,
+        }
+        offset += length;
+    }
+    Some(written)
+}
+
+/// The cookies in `written`, the bytes Linux wrote into a buffer before a
+/// read faulted there ([`faulted_prefix`]), which start at an event boundary.
+#[derive(Debug, PartialEq, Eq)]
+struct FaultedCookies {
+    /// The offset of each cookie Linux wrote whole.
+    whole: Vec<usize>,
+    /// The bytes of a rename cookie the fault cut short: Linux wrote only
+    /// some bytes of the host value, so no virtual one can be found for it.
+    cut: Option<Range<usize>>,
+}
+
+/// [`FaultedCookies`] for `written`. Only where the bytes end, the events'
+/// lengths (which name lengths decide) and the cut event's mask are read: a
+/// cookie's value never decides anything.
+fn faulted_cookies(written: &[u8]) -> FaultedCookies {
+    let end = written.len();
+    let mut whole = Vec::new();
+    let mut offset = 0usize;
+    while offset < end {
+        let cookie = offset + EVENT_COOKIE;
+        if cookie + 4 > end {
+            // Linux sets a cookie only on IN_MOVED_FROM and IN_MOVED_TO
+            // (fsnotify_move); any other event's cookie bytes are zeros. The
+            // mask precedes the cookie, so it was written whole.
+            let rename = cookie < end && {
+                let mask = u32::from_ne_bytes(
+                    written[offset + 4..offset + 8]
+                        .try_into()
+                        .expect("the header holds a 4-byte mask"),
+                );
+                mask & (libc::IN_MOVED_FROM | libc::IN_MOVED_TO) != 0
+            };
+            return FaultedCookies {
+                whole,
+                cut: rename.then_some(cookie..end),
+            };
+        }
+        whole.push(cookie);
+        if offset + EVENT_HEADER > end {
+            // The fault cut the length, after the cookie.
+            break;
+        }
+        let length = u32::from_ne_bytes(
+            written[offset + EVENT_LENGTH..offset + EVENT_HEADER]
+                .try_into()
+                .expect("the header holds a 4-byte length"),
+        ) as usize;
+        match offset
+            .checked_add(EVENT_HEADER)
+            .and_then(|next| next.checked_add(length))
+        {
+            Some(next) => offset = next,
+            None => break,
+        }
+    }
+    FaultedCookies { whole, cut: None }
 }
 
 /// Whether two of `pieces` share a byte.
@@ -364,11 +487,20 @@ where
             _ => return result,
         },
         Err(Error::Errno(Errno::EFAULT)) => {
-            warn!(
-                "[detcore, dtid {dettid}] an inotify {call} failed with EFAULT: any events Linux \
-                 copied before the fault keep their host rename cookies \
-                 (https://github.com/rrnewton/hermit/issues/4793)"
-            );
+            // Without the iovecs, which Linux reads first, nothing was copied.
+            let Some((address, size)) = destination.and_then(|d| d.first_nonempty()) else {
+                return result;
+            };
+            if guest.config().recordreplay_modes {
+                warn!(
+                    "[detcore, dtid {dettid}] the events an inotify {call} copied at {} before \
+                     it failed with EFAULT keep their host rename cookies under record and replay \
+                     (https://github.com/rrnewton/hermit/issues/4793)",
+                    describe(&[(address, size)])
+                );
+            } else {
+                renumber_faulted(guest, call, address, size).await;
+            }
             return result;
         }
         Err(_) => return result,
@@ -409,19 +541,77 @@ where
         .iter()
         .map(|&offset| cookie_at(&records, offset))
         .collect();
-    if host.iter().all(|cookie| *cookie == 0) {
-        return result;
+    if host.iter().any(|cookie| *cookie != 0) {
+        let virtual_cookies =
+            crate::tool_global::virtual_inotify_cookies(guest, host.clone()).await;
+        let changes = changed_cookies(&offsets, &host, &virtual_cookies);
+        if let Err(error) = write_cookies(&mut guest.memory(), &pieces, &changes) {
+            warn!(
+                "[detcore, dtid {dettid}] the events an inotify {call} wrote at {} keep some \
+                 host rename cookies: Hermit cannot write them ({error})",
+                describe(&pieces)
+            );
+        }
     }
-    let virtual_cookies = crate::tool_global::virtual_inotify_cookies(guest, host.clone()).await;
-    let changes = changed_cookies(&offsets, &host, &virtual_cookies);
-    if let Err(error) = write_cookies(&mut guest.memory(), &pieces, &changes) {
+    if let Some(next) = destination.possibly_written(length) {
         warn!(
-            "[detcore, dtid {dettid}] the events an inotify {call} wrote at {} keep some host \
-             rename cookies: Hermit cannot write them ({error})",
-            describe(&pieces)
+            "[detcore, dtid {dettid}] any events an inotify {call} copied at {} before a fault \
+             there keep their host rename cookies: its count ends at that iovec's start, and does \
+             not say whether Linux wrote it (https://github.com/rrnewton/hermit/issues/4793)",
+            describe(&[next])
         );
     }
     result
+}
+
+/// Put virtual cookies in the events `call` copied into the `size` bytes at
+/// `address`, its first nonempty buffer, before it failed with EFAULT there:
+/// renumber the cookies Linux wrote whole, and write a rename cookie it cut
+/// short as zeros ([`faulted_prefix`], [`faulted_cookies`]).
+async fn renumber_faulted<G, T>(guest: &mut G, call: Sysno, address: usize, size: usize)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let dettid = guest.thread_state().dettid;
+    let Some(written) = faulted_prefix(&mut guest.memory(), address, size) else {
+        warn!(
+            "[detcore, dtid {dettid}] the events an inotify {call} copied at {} before it failed \
+             with EFAULT keep their host rename cookies: Hermit cannot tell where the copy ended \
+             (https://github.com/rrnewton/hermit/issues/4793)",
+            describe(&[(address, size)])
+        );
+        return;
+    };
+    let cookies = faulted_cookies(&written);
+    let host: Vec<u32> = cookies
+        .whole
+        .iter()
+        .map(|&offset| cookie_at(&written, offset))
+        .collect();
+    let changes = if host.iter().all(|cookie| *cookie == 0) {
+        Vec::new()
+    } else {
+        let virtual_cookies =
+            crate::tool_global::virtual_inotify_cookies(guest, host.clone()).await;
+        changed_cookies(&cookies.whole, &host, &virtual_cookies)
+    };
+    let piece = [(address, written.len())];
+    let mut memory = guest.memory();
+    let mut written_back = write_cookies(&mut memory, &piece, &changes);
+    if let Some(cut) = cookies.cut {
+        written_back = written_back.and_then(|()| {
+            let at = AddrMut::<u8>::from_raw(address + cut.start).ok_or(Errno::EFAULT)?;
+            memory.write_exact(at, &vec![0u8; cut.len()])
+        });
+    }
+    if let Err(error) = written_back {
+        warn!(
+            "[detcore, dtid {dettid}] the events an inotify {call} copied at {} before it failed \
+             with EFAULT keep some host rename cookies: Hermit cannot write them ({error})",
+            describe(&piece)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -642,6 +832,209 @@ mod tests {
             ..Model::new(BASE, &records, false)
         };
         assert_eq!(gather(&unreadable, &pieces), Err(Errno::EFAULT));
+    }
+
+    /// An event with `mask` and `cookie`, its name padded to `name_length`.
+    fn event_with(mask: u32, cookie: u32, name_length: usize) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_i32.to_ne_bytes());
+        bytes.extend_from_slice(&mask.to_ne_bytes());
+        bytes.extend_from_slice(&cookie.to_ne_bytes());
+        bytes.extend_from_slice(&(name_length as u32).to_ne_bytes());
+        bytes.resize(EVENT_HEADER + name_length, b'n');
+        bytes
+    }
+
+    /// Two renames' four 32-byte events, with the host cookies `first` and
+    /// `second`.
+    fn renames(first: u32, second: u32) -> Vec<u8> {
+        let mut records = event_with(libc::IN_MOVED_FROM, first, 16);
+        records.extend(event_with(libc::IN_MOVED_TO, first, 16));
+        records.extend(event_with(libc::IN_MOVED_FROM, second, 16));
+        records.extend(event_with(libc::IN_MOVED_TO, second, 16));
+        records
+    }
+
+    /// Wherever Linux's copy ended, the cookies found are the same for any
+    /// host cookie values: one counter at 191,669,668, or below 2^24 on a
+    /// freshly booted host. Each cookie Linux wrote whole is found, and a
+    /// rename cookie the fault cut is found as cut.
+    #[test]
+    fn faulted_cookies_depend_only_on_where_the_copy_ended() {
+        let busy = renames(191_669_668, 191_669_669);
+        let fresh = renames(4_242, 4_243);
+        for end in 0..=busy.len() {
+            let found = faulted_cookies(&busy[..end]);
+            assert_eq!(found, faulted_cookies(&fresh[..end]), "copy ended at {end}");
+            let whole: Vec<usize> = [8, 40, 72, 104]
+                .into_iter()
+                .filter(|cookie| cookie + 4 <= end)
+                .collect();
+            assert_eq!(found.whole, whole, "copy ended at {end}");
+            let cut = [8, 40, 72, 104]
+                .into_iter()
+                .find(|&cookie| cookie < end && end < cookie + 4)
+                .map(|cookie| cookie..end);
+            assert_eq!(found.cut, cut, "copy ended at {end}");
+        }
+    }
+
+    /// Only a rename's cookie is ever cut: any other event's cookie is 0, and
+    /// the bytes Linux wrote of it are left alone.
+    #[test]
+    fn only_a_rename_cookie_is_cut() {
+        let ignored = event_with(libc::IN_IGNORED, 0, 0);
+        for end in 9..12 {
+            assert_eq!(
+                faulted_cookies(&ignored[..end]),
+                FaultedCookies {
+                    whole: vec![],
+                    cut: None
+                }
+            );
+        }
+        let created = event_with(libc::IN_CREATE, 0, 16);
+        assert_eq!(faulted_cookies(&created[..10]).cut, None);
+        let renamed = event_with(libc::IN_MOVED_TO | libc::IN_ISDIR, 7, 16);
+        assert_eq!(faulted_cookies(&renamed[..10]).cut, Some(8..10));
+    }
+
+    /// A copy that ends in an event's length or name has written its cookie
+    /// whole; events of any name length are walked by their lengths.
+    #[test]
+    fn a_cookie_before_the_fault_is_whole() {
+        let mut records = event_with(libc::IN_MOVED_FROM, 9, 32);
+        records.extend(event_with(libc::IN_MOVED_TO, 9, 0));
+        records.extend(event_with(libc::IN_MOVED_FROM, 11, 16));
+        // In the first event's length field, then in its name.
+        assert_eq!(faulted_cookies(&records[..14]).whole, [8]);
+        assert_eq!(faulted_cookies(&records[..30]).whole, [8]);
+        // The second event (no name) whole, the third cut in its cookie.
+        let found = faulted_cookies(&records[..48 + 16 + 10]);
+        assert_eq!(found.whole, [8, 56]);
+        assert_eq!(found.cut, Some(72..74));
+    }
+
+    /// Guest pages at BASE, each one readable and writable, read-only, or
+    /// inaccessible. Reads (`process_vm_readv`) stop at a page they cannot
+    /// read, and permission-respecting writes at a page they cannot write.
+    struct Pages {
+        bytes: Vec<u8>,
+        access: Vec<Access>,
+        written: Vec<(usize, usize)>,
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Access {
+        ReadWrite,
+        ReadOnly,
+        None,
+    }
+
+    impl Pages {
+        fn new(access: &[Access]) -> Self {
+            let bytes = (0..access.len() * PAGE).map(|i| (i % 251) as u8).collect();
+            Self {
+                bytes,
+                access: access.to_vec(),
+                written: Vec::new(),
+            }
+        }
+
+        fn page(&self, address: usize) -> Access {
+            address
+                .checked_sub(BASE)
+                .and_then(|offset| self.access.get(offset / PAGE).copied())
+                .unwrap_or(Access::None)
+        }
+    }
+
+    impl MemoryAccess for Pages {
+        fn read_vectored(
+            &self,
+            remote: &[io::IoSlice],
+            local: &mut [io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            let mut total = 0;
+            let mut out = local.iter_mut().flat_map(|piece| piece.iter_mut());
+            for extent in remote {
+                let start = extent.as_ptr() as usize;
+                for address in start..start + extent.len() {
+                    if self.page(address) == Access::None {
+                        return if total == 0 {
+                            Err(Errno::EFAULT)
+                        } else {
+                            Ok(total)
+                        };
+                    }
+                    *out.next().expect("local holds the remote bytes") = self.bytes[address - BASE];
+                    total += 1;
+                }
+            }
+            Ok(total)
+        }
+
+        fn write_vectored(
+            &mut self,
+            _: &[io::IoSlice],
+            _: &mut [io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            panic!("faulted_prefix writes only through write_with_user_access")
+        }
+
+        fn write_with_user_access(
+            &mut self,
+            addr: AddrMut<u8>,
+            buf: &[u8],
+        ) -> Result<usize, Errno> {
+            let start = addr.as_raw();
+            let copied = (start..start + buf.len())
+                .take_while(|&address| self.page(address) == Access::ReadWrite)
+                .count();
+            if copied == 0 && !buf.is_empty() {
+                return Err(Errno::EFAULT);
+            }
+            self.bytes[start - BASE..start - BASE + copied].copy_from_slice(&buf[..copied]);
+            self.written.push((start, copied));
+            Ok(copied)
+        }
+    }
+
+    /// Linux's copy ends at the first page the guest cannot write: a
+    /// read-only page refuses the write-back, an inaccessible one the read.
+    /// Every page before it keeps exactly its bytes, however large the
+    /// buffer.
+    #[test]
+    fn the_faulted_prefix_ends_at_the_first_page_the_guest_cannot_write() {
+        use Access::*;
+        let mut memory = Pages::new(&[ReadWrite, ReadWrite, ReadOnly, ReadWrite]);
+        let before = memory.bytes.clone();
+        let written = faulted_prefix(&mut memory, BASE + 100, 3 * PAGE).unwrap();
+        assert_eq!(written, before[100..2 * PAGE]);
+        assert_eq!(memory.bytes, before, "a page keeps its bytes");
+        assert_eq!(
+            memory.written,
+            [(BASE + 100, PAGE - 100), (BASE + PAGE, PAGE)]
+        );
+
+        let mut memory = Pages::new(&[ReadWrite, None]);
+        let written = faulted_prefix(&mut memory, BASE + PAGE - 40, 64).unwrap();
+        assert_eq!(written.len(), 40);
+
+        // No snapshot limit: seventeen writable pages, then an inaccessible
+        // one.
+        let mut access = vec![ReadWrite; 17];
+        access.push(None);
+        let mut memory = Pages::new(&access);
+        let written = faulted_prefix(&mut memory, BASE + 8, 18 * PAGE - 8).unwrap();
+        assert_eq!(written.len(), 17 * PAGE - 8);
+
+        // A buffer that starts on a page the guest cannot write holds nothing.
+        let mut memory = Pages::new(&[ReadOnly]);
+        assert_eq!(
+            faulted_prefix(&mut memory, BASE, 64).unwrap(),
+            Vec::<u8>::new()
+        );
     }
 
     const BASE: usize = 0x10000;
