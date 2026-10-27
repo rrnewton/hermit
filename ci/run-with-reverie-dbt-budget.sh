@@ -2913,7 +2913,16 @@ fi
 # Existing SDK width and 1050 effective-job-second limits carry without
 # recalibration. This is not whole-runtime equivalence or a new cold-SDK timing
 # sample.
-expected_pin=661967460beee45868e8286df097c617d67fcb6e
+# CARRY TO 1a242a33b927d14a50aeca9488950eac1ad3b4c6 (2026-10-27): from
+# 661967460beee45868e8286df097c617d67fcb6e. The existing standard in-guest
+# installer and DBT prototype retain one typed Config/subscription owner;
+# runtime Rust, tests and a test-only dependency change. SDK build.rs
+# ff1eeb32b140, vendor tree 4ab89708f2e9 and native tree 164356b3ab65 are
+# byte-identical. The DBT inventory grows from 1014 to 1015. Existing SDK
+# width and 1050 effective-job-second limits carry without recalibration;
+# Reviewed source premises and native freshness include the retained owner;
+# this is not whole-runtime equivalence or a new cold-SDK timing sample.
+expected_pin=1a242a33b927d14a50aeca9488950eac1ad3b4c6
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
