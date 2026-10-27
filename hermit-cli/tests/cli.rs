@@ -19522,7 +19522,9 @@ fn happens_before_version_2_without_perf_counters_is_refused_before_stdin() {
 
 /// Run `command` with stdout and stderr redirected to files in `directory`,
 /// waiting at most `limit`, and return its exit status (`None` when it had to
-/// be killed at the deadline) and its stderr. Files rather than pipes: a child
+/// be killed at the deadline) and its stderr. A run killed at the deadline
+/// has [`process_tree_snapshot`] appended to its stderr, so that a wedged run
+/// shows where it waited. Files rather than pipes: a child
 /// that writes more than a pipe holds before it exits would block on the full
 /// pipe and look like a hang. With `open_stdin`, stdin is a pipe whose writer
 /// stays open for the whole wait, so a child that reads its input first never
@@ -19564,10 +19566,12 @@ fn run_with_deadline_once(
     let mut child = command.spawn().expect("failed to spawn hermit");
     let stdin_writer = child.stdin.take();
     let deadline = Instant::now() + limit;
+    let mut snapshot = None;
     let status = loop {
         match child.try_wait().expect("failed to poll hermit") {
             Some(status) => break Some(status),
             None if Instant::now() >= deadline => {
+                snapshot = Some(process_tree_snapshot(child.id()));
                 let _ = child.kill();
                 let _ = child.wait();
                 break None;
@@ -19576,8 +19580,84 @@ fn run_with_deadline_once(
         }
     };
     drop(stdin_writer);
-    let stderr = fs::read_to_string(&stderr_path).expect("failed to read the stderr file");
+    let mut stderr = fs::read_to_string(&stderr_path).expect("failed to read the stderr file");
+    if let Some(snapshot) = snapshot {
+        stderr.push_str(&format!(
+            "\n--- killed at the {limit:?} deadline; the process tree before the kill ---\n{snapshot}"
+        ));
+    }
     (status, stderr)
+}
+
+/// The kernel's view of process `root` and every process below it: each
+/// thread's name, state, wait channel and current syscall number, from
+/// `/proc`. A run that hangs without using CPU shows here which of
+/// Hermit's threads and which guest threads were waiting, and in what.
+/// Descendants are found by each process's parent in `/proc/PID/stat`,
+/// because kernels without CONFIG_PROC_CHILDREN have no `children` file.
+/// Whatever `/proc` refuses to show is left blank.
+fn process_tree_snapshot(root: u32) -> String {
+    let read = |path: &Path| fs::read_to_string(path).unwrap_or_default();
+    // The fields after the parenthesized command name, which may itself
+    // contain spaces or parentheses: the state, then the parent's PID.
+    let after_name = |stat: &str| {
+        stat.rsplit_once(") ")
+            .map(|(_, rest)| rest.split(' ').map(str::to_owned).collect::<Vec<_>>())
+            .unwrap_or_default()
+    };
+    let parents: Vec<(u32, u32)> = fs::read_dir("/proc")
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+                .filter_map(|pid| {
+                    let fields = after_name(&read(&PathBuf::from(format!("/proc/{pid}/stat"))));
+                    Some((pid, fields.get(1)?.parse().ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut snapshot = String::new();
+    let mut pending = vec![root];
+    // The parents come from one scan that is not atomic, so a reused PID
+    // could close a loop; visit each PID once.
+    let mut visited = std::collections::HashSet::new();
+    while let Some(pid) = pending.pop() {
+        if !visited.insert(pid) {
+            continue;
+        }
+        let process = PathBuf::from(format!("/proc/{pid}"));
+        snapshot.push_str(&format!(
+            "pid {pid} {}\n",
+            read(&process.join("cmdline")).replace('\0', " ").trim_end()
+        ));
+        if let Ok(tasks) = fs::read_dir(process.join("task")) {
+            let mut tasks: Vec<_> = tasks.flatten().map(|task| task.path()).collect();
+            tasks.sort();
+            for task in tasks {
+                let fields = after_name(&read(&task.join("stat")));
+                snapshot.push_str(&format!(
+                    "  tid {} {} state={} wchan={} syscall={}\n",
+                    task.file_name().unwrap_or_default().to_string_lossy(),
+                    read(&task.join("comm")).trim(),
+                    fields.first().map_or("?", String::as_str),
+                    read(&task.join("wchan")).trim(),
+                    read(&task.join("syscall"))
+                        .split(' ')
+                        .next()
+                        .unwrap_or("")
+                        .trim(),
+                ));
+            }
+        }
+        pending.extend(
+            parents
+                .iter()
+                .filter(|(_, parent)| *parent == pid)
+                .map(|(child, _)| *child),
+        );
+    }
+    snapshot
 }
 
 /// The most `hermit run` attempts a PMU-preempted spinner case makes when its
@@ -41827,6 +41907,15 @@ fn a_scheduler_timer_signal_removed_without_a_delivery_arms_no_call() {
 /// Runs `tests/c/yield_loop_wait.c` in `mode` under `run --strict` with
 /// `extra` flags, returning its exit code, stdout and Hermit's stderr.
 fn run_yield_loop_guest(mode: &str, extra: &[&str]) -> (Option<i32>, String, String) {
+    run_yield_loop_guest_within(mode, extra, Duration::from_secs(120))
+}
+
+/// [`run_yield_loop_guest`], killing the run after `limit`.
+fn run_yield_loop_guest_within(
+    mode: &str,
+    extra: &[&str],
+    limit: Duration,
+) -> (Option<i32>, String, String) {
     let guest = futex_c_guest(&YIELD_LOOP_WAIT_GUEST, "yield_loop_wait")
         .to_str()
         .unwrap()
@@ -41835,12 +41924,7 @@ fn run_yield_loop_guest(mode: &str, extra: &[&str]) -> (Option<i32>, String, Str
     let mut args = vec!["run", "--strict", "--timeout", "60"];
     args.extend_from_slice(extra);
     args.extend_from_slice(&["--", guest.as_str(), mode]);
-    let (status, log) = run_with_deadline(
-        hermit_command(&args),
-        directory.path(),
-        Duration::from_secs(120),
-        false,
-    );
+    let (status, log) = run_with_deadline(hermit_command(&args), directory.path(), limit, false);
     let stdout = fs::read_to_string(directory.path().join("deadline-run.stdout"))
         .expect("failed to read the guest's stdout");
     (status.and_then(|status| status.code()), stdout, log)
@@ -42379,10 +42463,19 @@ fn run_kvm_a_procfs_directory_keeps_its_size() {
 /// SIGALRM, which only advancing virtual time brings. Both finish on Linux;
 /// an earlier version of this change refused the first
 /// (https://github.com/rrnewton/hermit/issues/4325).
+///
+/// Each run normally takes 1-2 s, and at most 16.3 s was measured on 2 CPUs
+/// shared with 16 CPU-bound spinners. In full validates it has hung until
+/// nextest's 57 s wall bound killed the test with no evidence
+/// (https://github.com/rrnewton/hermit/issues/4784). Hermit was blocked, not
+/// spinning: a spinning run would have hit the 22 CPU-second budget first.
+/// So each run gets a 25 s deadline, which brings both under that bound. A
+/// run killed there fails with Hermit's stderr and
+/// [`process_tree_snapshot`] of where every thread waited.
 #[test]
 fn a_yield_loop_beside_a_signal_or_alarm_wait_completes() {
     for mode in ["signal", "alarm"] {
-        let (code, stdout, log) = run_yield_loop_guest(mode, &[]);
+        let (code, stdout, log) = run_yield_loop_guest_within(mode, &[], Duration::from_secs(25));
         assert_eq!(
             code,
             Some(0),
