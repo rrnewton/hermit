@@ -17,6 +17,10 @@ use detcore::edit_distance::iterable_bubble_sort;
 use detcore::types::Op;
 use detcore::types::SchedEvent;
 
+/// The branch-count difference two replays of one control schedule may show
+/// on a host whose branch counter is not exact ([`Config::max_branch_count_jitter`]).
+pub const INEXACT_COUNTER_BRANCH_JITTER: u32 = 64;
+
 /// User configurable settings.
 pub struct Config {
     pub max_jitter_editdist: usize,
@@ -29,10 +33,13 @@ pub struct Config {
     pub max_replay_attempts: usize,
     /// How many retired conditional branches two replays of one control schedule
     /// may disagree by in a branch event and still count as the same realized
-    /// trace. Hosts whose branch counter is not exact (AMD Zen with SpecLockMap
-    /// enabled, which a VM guest cannot turn off) move a preemption by a few
-    /// branches between runs while the interleaving stays the same.
-    pub max_branch_count_jitter: u32,
+    /// trace, or `None` to require identical traces, event times included. Only
+    /// a host whose branch counter is not exact (AMD Zen with SpecLockMap
+    /// enabled, which a VM guest cannot turn off) moves a preemption by a few
+    /// branches between runs while the interleaving stays the same; elsewhere
+    /// such a difference is replay nondeterminism. analyze sets it on such a
+    /// host only ([`INEXACT_COUNTER_BRANCH_JITTER`]).
+    pub max_branch_count_jitter: Option<u32>,
     /// Try to split a final adjacent event pair into a precise branch boundary.
     pub refine_sub_events: bool,
     pub verbose: bool,
@@ -49,7 +56,7 @@ impl Default for Config {
             max_unmatched_to_print: 10,
             max_needleman_matrix_cells: 4_000_000,
             max_replay_attempts: 2,
-            max_branch_count_jitter: 64,
+            max_branch_count_jitter: None,
             refine_sub_events: true,
             verbose: false,
             needleman_search: false,
@@ -216,6 +223,77 @@ fn same_interleaving(first: &[SchedEvent], second: &[SchedEvent], branch_jitter:
         })
 }
 
+/// How two realized traces of one control schedule compare
+/// ([`replay_agreement`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplayAgreement {
+    /// The same trace, event times included.
+    Identical,
+    /// The same interleaving, whose branch counts differ within the allowed
+    /// jitter, and so whose event times differ too.
+    Within(ReplayDifference),
+    /// Another trace.
+    Different,
+}
+
+/// How far apart two realized traces of one interleaving are.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplayDifference {
+    /// The largest difference in a branch event's count.
+    max_branches: u32,
+    /// The largest difference in an event's end time, in nanoseconds.
+    max_end_time_ns: u64,
+}
+
+/// Whether two realized traces of one control schedule count as the same
+/// trace. Without `branch_jitter` (a host whose branch counter is exact) only
+/// identical traces do, event times included. With it, so does the same
+/// interleaving whose branch counts differ by at most that much
+/// ([`same_interleaving`]).
+fn replay_agreement(
+    first: &[SchedEvent],
+    second: &[SchedEvent],
+    branch_jitter: Option<u32>,
+) -> ReplayAgreement {
+    if first == second {
+        return ReplayAgreement::Identical;
+    }
+    match branch_jitter {
+        Some(jitter) if same_interleaving(first, second, jitter) => {
+            let pairs = || first.iter().zip(second);
+            ReplayAgreement::Within(ReplayDifference {
+                max_branches: pairs()
+                    .map(|(a, b)| a.count.abs_diff(b.count))
+                    .max()
+                    .unwrap_or(0),
+                max_end_time_ns: pairs()
+                    .filter_map(|(a, b)| {
+                        Some(a.end_time?.as_nanos().abs_diff(b.end_time?.as_nanos()))
+                    })
+                    .max()
+                    .unwrap_or(0),
+            })
+        }
+        _ => ReplayAgreement::Different,
+    }
+}
+
+/// What analyze says when it accepts two replays of one control schedule that
+/// are the same interleaving but not the same realized trace.
+fn accepted_replay_difference(
+    attempt: usize,
+    difference: ReplayDifference,
+    branch_jitter: u32,
+) -> String {
+    format!(
+        "Jittered control schedule reproduced the same outcome and interleaving on attempt \
+         {attempt}, but not the same realized trace: branch counts differ by up to {} and \
+         event end times by up to {} ns. Accepted, as this host's branch counter is not exact \
+         (up to {branch_jitter} branches allowed)",
+        difference.max_branches, difference.max_end_time_ns,
+    )
+}
+
 fn test_and_select_stable_point<F>(
     tester: &mut F,
     requested_schedule: &[SchedEvent],
@@ -242,18 +320,34 @@ where
 
     for attempt in 2..=cfg.max_replay_attempts.max(2) {
         let (replayed_passes, replayed_actual) = tester(requested_schedule)?;
-        if replayed_passes == passes
-            && same_interleaving(
-                &replayed_actual,
-                &actual_schedule,
-                cfg.max_branch_count_jitter,
-            )
-        {
-            eprintln!(
-                ":: Jittered control schedule reproduced the same outcome and realized trace on attempt {}",
-                attempt,
-            );
-            return Ok((passes, requested_schedule.to_vec()));
+        if replayed_passes != passes {
+            continue;
+        }
+        match replay_agreement(
+            &replayed_actual,
+            &actual_schedule,
+            cfg.max_branch_count_jitter,
+        ) {
+            ReplayAgreement::Identical => {
+                eprintln!(
+                    ":: Jittered control schedule reproduced the same outcome and realized trace on attempt {}",
+                    attempt,
+                );
+                return Ok((passes, requested_schedule.to_vec()));
+            }
+            ReplayAgreement::Within(difference) => {
+                eprintln!(
+                    ":: {}",
+                    accepted_replay_difference(
+                        attempt,
+                        difference,
+                        cfg.max_branch_count_jitter.unwrap_or(0)
+                    )
+                    .yellow()
+                );
+                return Ok((passes, requested_schedule.to_vec()));
+            }
+            ReplayAgreement::Different => {}
         }
     }
 
@@ -1014,7 +1108,11 @@ mod tests {
             ]
         };
         assert!(
-            same_interleaving(&trace(115, 10), &trace(121, 70), 64),
+            same_interleaving(
+                &trace(115, 10),
+                &trace(121, 70),
+                INEXACT_COUNTER_BRANCH_JITTER
+            ),
             "a few branches of skid and the times it shifts are the same interleaving"
         );
         assert!(
@@ -1026,6 +1124,114 @@ mod tests {
         assert!(
             !same_interleaving(&trace(115, 10), &reordered, 64),
             "another order is another interleaving"
+        );
+    }
+
+    /// Two replays of one control schedule count as the same realized trace
+    /// only when they are identical, event times included, unless the host's
+    /// branch counter is not exact: then a few branches of skid, and the times
+    /// they shift, are accepted, and by how much is said.
+    #[test]
+    fn replays_must_be_identical_unless_the_branch_counter_is_inexact() {
+        let tid = DetTid::from_raw(3);
+        let other = DetTid::from_raw(5);
+        let trace = |count: u32, end_time: u64| {
+            vec![
+                SchedEvent {
+                    end_time: Some(LogicalTime::from_nanos(end_time)),
+                    ..SchedEvent::branches(tid, count)
+                },
+                SchedEvent::syscall(other, Sysno::read, SyscallPhase::Prehook),
+            ]
+        };
+        let inexact = Some(INEXACT_COUNTER_BRANCH_JITTER);
+        for jitter in [None, inexact] {
+            assert_eq!(
+                replay_agreement(&trace(115, 10), &trace(115, 10), jitter),
+                ReplayAgreement::Identical
+            );
+            assert_eq!(
+                replay_agreement(&trace(115, 10), &trace(500, 10), jitter),
+                ReplayAgreement::Different,
+                "a preemption hundreds of branches away is another trace"
+            );
+        }
+        // An exact counter: six branches apart, or only a later end time, is
+        // replay nondeterminism.
+        assert_eq!(
+            replay_agreement(&trace(115, 10), &trace(121, 70), None),
+            ReplayAgreement::Different
+        );
+        assert_eq!(
+            replay_agreement(&trace(115, 10), &trace(115, 70), None),
+            ReplayAgreement::Different
+        );
+        // An inexact one: accepted, with how far apart they are.
+        assert_eq!(
+            replay_agreement(&trace(115, 10), &trace(121, 70), inexact),
+            ReplayAgreement::Within(ReplayDifference {
+                max_branches: 6,
+                max_end_time_ns: 60
+            })
+        );
+        let said = accepted_replay_difference(
+            2,
+            ReplayDifference {
+                max_branches: 6,
+                max_end_time_ns: 60,
+            },
+            INEXACT_COUNTER_BRANCH_JITTER,
+        );
+        assert!(
+            said.contains("not the same realized trace: branch counts differ by up to 6 and event end times by up to 60 ns")
+                && said.contains("up to 64 branches allowed"),
+            "{said}"
+        );
+    }
+
+    /// On a host whose branch counter is exact (the default), a jittered
+    /// control schedule whose two replays differ by a few branches is not
+    /// stable, and no outcome is attached to it; with the inexact counter's
+    /// tolerance the same replays are accepted.
+    #[test]
+    fn a_skidded_replay_is_unstable_on_an_exact_counter() {
+        let tid = DetTid::from_raw(3);
+        let requested = vec![
+            SchedEvent::branches(tid, 100),
+            SchedEvent::syscall(DetTid::from_raw(5), Sysno::read, SyscallPhase::Prehook),
+        ];
+        let replays = |calls: &mut u32| -> TrialOutcome {
+            *calls += 1;
+            // Each replay ends its slice a few branches from the request, and
+            // from the other replay.
+            let mut actual = requested.clone();
+            actual[0].count = 100 + 3 * *calls;
+            Ok((true, actual))
+        };
+        let mut calls = 0;
+        let inexact = Config {
+            max_branch_count_jitter: Some(INEXACT_COUNTER_BRANCH_JITTER),
+            ..Default::default()
+        };
+        let (passes, selected) = test_and_select_stable_point(
+            &mut |_: &[SchedEvent]| replays(&mut calls),
+            &requested,
+            &inexact,
+        )
+        .unwrap();
+        assert!(passes);
+        assert_eq!(selected, requested);
+        let unstable = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut calls = 0;
+            test_and_select_stable_point(
+                &mut |_: &[SchedEvent]| replays(&mut calls),
+                &requested,
+                &Config::default(),
+            )
+        }));
+        assert!(
+            unstable.is_err(),
+            "an exact counter must not accept skidded replays"
         );
     }
 

@@ -1845,7 +1845,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // every_trial_hands_the_guest_the_target_seed_inputs} and
     // schedule_search::tests::{a_failing_schedule_with_extra_events_reduces_to_the_one_swap,
     // replays_differing_only_by_branch_skid_are_one_interleaving}: 1127.
-    ("test.hermit_unit", 1127),
+    // And schedule_search::tests::{replays_must_be_identical_unless_the_branch_counter_is_inexact,
+    // a_skidded_replay_is_unstable_on_an_exact_counter} and
+    // phases::tests::replays_tolerate_branch_skid_only_on_an_inexact_counter: 1130.
+    ("test.hermit_unit", 1130),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5633,7 +5636,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.hermit_unit runs all seven: 1115, listed
     // (1114 on main plus one).
     // And the same six analyze trial-input tests: 1121.
-    ("test.hermit_unit_on_host", 1121),
+    // And the same 3 tests: 1124.
+    ("test.hermit_unit_on_host", 1124),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
