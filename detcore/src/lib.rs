@@ -4029,6 +4029,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             pts.1.changed_root.load(std::sync::atomic::Ordering::SeqCst),
                         ))
                     },
+                    // A thread shares its leader's filesystem information
+                    // where it and every thread before it in its line were
+                    // created with CLONE_FS; a new process leads its own.
+                    fs_apart_from_leader: clone_flags.contains(CloneFlags::CLONE_THREAD)
+                        && (pts.1.fs_apart_from_leader
+                            || !clone_flags.contains(CloneFlags::CLONE_FS)),
                     // A new task runs its creator's image.
                     exe: pts.1.exe.clone(),
                     // POSIX timers are shared among threads of a process but are
@@ -4363,6 +4369,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .load(std::sync::atomic::Ordering::SeqCst);
         guest.thread_state_mut().changed_root =
             Arc::new(std::sync::atomic::AtomicBool::new(changed_root));
+        // The exec'ing thread leads its process now, so its filesystem
+        // information is the leader's.
+        guest.thread_state_mut().fs_apart_from_leader = false;
         // The exec'ing thread is its process's only thread now, and leads
         // it, so the table it holds is the process's. (Where Detcore handles
         // the execve, `handle_execveat` already installed it; a backend that

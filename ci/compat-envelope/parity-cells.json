@@ -8,6 +8,7 @@
   "population_rule": "Every manifest test whose ptrace verify cell full validation selects (Population::Required), crossed with every candidate backend (dbt, in-guest-trap, kvm, liteinst, sabre). A candidate whose verify cell is disabled, enabled but not selected, red, refused or missing is in the population and scores 0. A cell whose ptrace reference left no usable golden log is outside it and is counted apart.",
   "counts": {
     "all": {
+<<<<<<< HEAD
       "cells": 3015,
       "applicable": 1904,
       "selectable": 1430,
@@ -22,38 +23,77 @@
         "applicable": 256,
         "selectable": 255,
         "population": 590,
+=======
+      "cells": 3010,
+      "applicable": 1903,
+      "selectable": 1429,
+      "population": 2945,
+      "population_candidate_selected": 1429,
+      "population_candidate_not_selected": 467,
+      "population_candidate_disabled": 1049
+    },
+    "by_backend": {
+      "dbt": {
+        "cells": 602,
+        "applicable": 256,
+        "selectable": 255,
+        "population": 589,
+>>>>>>> 2cec1fdd516 (Answer the caller's own /proc exe, cwd and root links from Detcore)
         "population_candidate_selected": 255,
         "population_candidate_not_selected": 1,
         "population_candidate_disabled": 334
       },
       "in-guest-trap": {
+<<<<<<< HEAD
         "cells": 603,
         "applicable": 306,
         "selectable": 306,
         "population": 590,
+=======
+        "cells": 602,
+        "applicable": 306,
+        "selectable": 306,
+        "population": 589,
+>>>>>>> 2cec1fdd516 (Answer the caller's own /proc exe, cwd and root links from Detcore)
         "population_candidate_selected": 306,
         "population_candidate_not_selected": 0,
         "population_candidate_disabled": 284
       },
       "kvm": {
+<<<<<<< HEAD
         "cells": 603,
         "applicable": 564,
         "selectable": 562,
         "population": 590,
         "population_candidate_selected": 562,
+=======
+        "cells": 602,
+        "applicable": 563,
+        "selectable": 561,
+        "population": 589,
+        "population_candidate_selected": 561,
+>>>>>>> 2cec1fdd516 (Answer the caller's own /proc exe, cwd and root links from Detcore)
         "population_candidate_not_selected": 0,
         "population_candidate_disabled": 28
       },
       "liteinst": {
+<<<<<<< HEAD
         "cells": 603,
         "applicable": 307,
         "selectable": 307,
         "population": 590,
+=======
+        "cells": 602,
+        "applicable": 307,
+        "selectable": 307,
+        "population": 589,
+>>>>>>> 2cec1fdd516 (Answer the caller's own /proc exe, cwd and root links from Detcore)
         "population_candidate_selected": 307,
         "population_candidate_not_selected": 0,
         "population_candidate_disabled": 283
       },
       "sabre": {
+<<<<<<< HEAD
         "cells": 603,
         "applicable": 471,
         "selectable": 0,
@@ -61,6 +101,15 @@
         "population_candidate_selected": 0,
         "population_candidate_not_selected": 466,
         "population_candidate_disabled": 124
+=======
+        "cells": 602,
+        "applicable": 471,
+        "selectable": 0,
+        "population": 589,
+        "population_candidate_selected": 0,
+        "population_candidate_not_selected": 466,
+        "population_candidate_disabled": 123
+>>>>>>> 2cec1fdd516 (Answer the caller's own /proc exe, cwd and root links from Detcore)
       }
     }
   },
@@ -925,6 +974,11 @@
     {"test_id":"c-programs/proc-locks","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/proc-locks","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/proc-locks","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
+    {"test_id":"c-programs/proc-own-links","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/proc-own-links","backend":"in-guest-trap","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/proc-own-links","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/proc-own-links","backend":"liteinst","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
+    {"test_id":"c-programs/proc-own-links","backend":"sabre","category":"c-programs","applicable":true,"selectable":false,"selected":true,"reason":"in the population, scored 0 unless run: sabre verify is not selected by full validation: Only the archived-nightly run type selects this cell, by its manifest label; full validation does not."},
     {"test_id":"c-programs/proc-stat-comm","backend":"dbt","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
     {"test_id":"c-programs/proc-stat-comm","backend":"in-guest-trap","category":"c-programs","applicable":false,"selectable":false,"selected":true,"reason":"in the population, scored 0: in-guest-trap verify is disabled: NAMED GAP: the guest re-executes itself to name itself, and the in-guest runtime refuses execve and execveat with a typed refusal that ends the run (https://github.com/rrnewton/hermit/issues/4567)."},
     {"test_id":"c-programs/proc-stat-comm","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":true,"reason":"in the population: both verify cells are selected by full validation"},
