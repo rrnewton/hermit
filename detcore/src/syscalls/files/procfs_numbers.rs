@@ -263,6 +263,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: &Syscall,
     ) -> Result<Option<TranslatedCall>, Errno> {
+        Self::translated_call_with_scratch(guest, call, true).await
+    }
+
+    async fn translated_call_with_scratch<G: Guest<Self>>(
+        guest: &mut G,
+        call: &Syscall,
+        allow_scratch: bool,
+    ) -> Result<Option<TranslatedCall>, Errno> {
         if !Self::may_translate_procfs_call(guest, call) {
             return Ok(None);
         }
@@ -288,7 +296,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         (operand.path, bytes)
                     })
                     .collect();
-                return Self::stage_translated(guest, sysno, values, staged)
+                return Self::stage_translated(guest, sysno, values, staged, allow_scratch)
                     .await
                     .map(Some);
             }
@@ -335,7 +343,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if respelled.is_empty() {
             return Ok(None);
         }
-        Self::stage_translated(guest, sysno, values, respelled)
+        Self::stage_translated(guest, sysno, values, respelled, allow_scratch)
             .await
             .map(Some)
     }
@@ -357,8 +365,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         sysno: reverie::syscalls::Sysno,
         values: [usize; 6],
         respelled: Vec<(usize, Vec<u8>)>,
+        allow_scratch: bool,
     ) -> Result<TranslatedCall, Errno> {
-        if let Some(staged) = Self::stage_in_scratch(guest, sysno, values, &respelled).await {
+        if allow_scratch
+            && let Some(staged) = Self::stage_in_scratch(guest, sysno, values, &respelled).await
+        {
             return Ok(staged);
         }
         Self::stage_in_page(guest, sysno, values, respelled).await
@@ -444,6 +455,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: Syscall,
     ) -> Result<i64, Errno> {
         Self::inject_translated_retrying(guest, call, false).await
+    }
+
+    /// An auxiliary lookup whose translated paths must not borrow guest
+    /// stack scratch: the original syscall may still need bytes that are
+    /// absent from this lookup's arguments. Keep the same translation, but
+    /// stage changed paths in the existing transient page instead.
+    pub(crate) async fn inject_translated_in_page<G: Guest<Self>>(
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Errno> {
+        let translated = Self::translated_call_with_scratch(guest, &call, false).await?;
+        let injected = translated
+            .as_ref()
+            .map_or(call, |translated| translated.call);
+        let result = guest.inject(injected).await;
+        if let Some(translated) = translated {
+            Self::finish_translated_call(guest, translated).await;
+        }
+        result
     }
 
     /// [`Self::inject_translated`], made again while a signal interrupts it
