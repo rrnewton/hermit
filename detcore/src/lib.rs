@@ -4973,6 +4973,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // have taken it first.
             crate::syscalls::take_proc_device();
             None
+        } else if sigalrm_refusal.is_none()
+            && let Some(answer) =
+                Box::pin(self.answer_descriptor_directory_call(guest, &call)).await
+        {
+            Some(answer)
         } else if sigalrm_refusal.is_none() {
             match self
                 .refuse_procfs_name_outside_level(guest, &call)

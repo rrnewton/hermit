@@ -3413,6 +3413,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         target: StatTarget<'_>,
     ) -> Result<Option<DetStat>, Error> {
+        // The caller's descriptor directory (`descriptor_directory`).
+        if let Some(stat) = self.descriptor_directory_stat(guest, target).await? {
+            return Ok(Some(stat));
+        }
         let path = match target {
             StatTarget::Descriptor(fd) => {
                 match guest

@@ -82,6 +82,9 @@ mod tests {
         // GlobalRequest::VirtualInotifyCookies and its response, the first
         // revision the fingerprint carries.
         (1, "a61c88ecb1abcb5e"),
+        // GlobalRequest::RegisterDescriptorDirectory and DescriptorDirectory and
+        // their responses (package K slice F1).
+        (2, "caee2c37469869d4"),
     ];
 
     /// The lines of code, without comments or blank lines, of the enum that
@@ -143,9 +146,11 @@ mod tests {
             1,
         );
         assert_ne!(definition_digest(&added), digest);
+        // Retype GlobalRequest's VirtualInotifyCookies wherever it sits: later
+        // revisions append variants after it.
         let retyped = source.replacen(
-            "    VirtualInotifyCookies(Vec<u32>),\n}",
-            "    VirtualInotifyCookies(Vec<u64>),\n}",
+            "    VirtualInotifyCookies(Vec<u32>),\n",
+            "    VirtualInotifyCookies(Vec<u64>),\n",
             1,
         );
         assert_ne!(retyped, source);

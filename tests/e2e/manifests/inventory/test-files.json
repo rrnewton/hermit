@@ -1670,6 +1670,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/proc_fd_directory.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/proc_fd_directory.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Lists and uses the caller's own /proc/self/fd (getdents64 paging and positions, lseek, O_PATH, dup, names below it, the thread and /dev/fd spellings, SCM_RIGHTS, fork, exec, CPython's close-all loop), which Detcore serves from its own descriptor table on every backend"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/proc_fd_link_aliases.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/proc_fd_link_aliases.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
