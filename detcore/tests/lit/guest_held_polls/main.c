@@ -82,6 +82,10 @@
 //               child. A receipt never marks a socket from its credentials,
 //               which name its peer, not every holder of its open file, so
 //               its poll is never classified.
+//   timed       a lone thread polls, with a 50 ms timeout, a pipe nobody
+//               writes: idle, so global time moves to the poll's timeout.
+//   timed-sleeper the same beside a thread asleep for 20 ms: time moves to
+//               the sleeper's deadline, then to the poll's.
 //
 // Use a bogus 'RUN' directive so this test isn't disabled:
 // RUN: true
@@ -307,6 +311,20 @@ static int receive_a_childs_socket(void) {
   int received = receive_descriptor(pair[0]);
   assert(close(pair[0]) == 0);
   return received;
+}
+
+static void* sleep_20_ms(void* arg) {
+  (void)arg;
+  sleep_ms(20);
+  return NULL;
+}
+
+// Polls, with a 50 ms timeout, the read end of a pipe nobody writes.
+static int poll_an_unwritten_pipe(void) {
+  int ends[2];
+  assert(pipe(ends) == 0);
+  struct pollfd entry = {.fd = ends[0], .events = POLLIN};
+  return poll(&entry, 1, 50);
 }
 
 static void reap(pid_t child) {
@@ -607,6 +625,13 @@ int main(int argc, char** argv) {
     assert(pthread_create(&thread, NULL, act_later, &writer) == 0);
     printf("forwarded-socket: revents %#x\n", poll_one(received));
     assert(pthread_join(thread, NULL) == 0);
+  } else if (strcmp(mode, "timed") == 0) {
+    printf("timed: poll %d\n", poll_an_unwritten_pipe());
+  } else if (strcmp(mode, "timed-sleeper") == 0) {
+    pthread_t sleeper;
+    assert(pthread_create(&sleeper, NULL, sleep_20_ms, NULL) == 0);
+    printf("timed-sleeper: poll %d\n", poll_an_unwritten_pipe());
+    assert(pthread_join(sleeper, NULL) == 0);
   } else {
     fprintf(stderr, "unknown mode %s\n", mode);
     return 2;

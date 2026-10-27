@@ -286,6 +286,12 @@ pub struct AnalyzeOpts {
     /// measured before it.
     #[clap(skip)]
     pub endpoints: EndpointMeasurements,
+
+    /// The jumps of global time of every recorded schedule this invocation
+    /// read, which the trial schedules it writes carry
+    /// (`crate::time_skip_carry`). Shared by every copy of these options.
+    #[clap(skip)]
+    pub time_skip_sources: crate::time_skip_carry::SharedTimeSkipSources,
 }
 
 /// `--trial-timeout`.

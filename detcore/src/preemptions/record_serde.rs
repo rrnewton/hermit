@@ -28,6 +28,7 @@ use serde::ser::SerializeMap;
 use super::HostObservedCount;
 use super::PreemptionRecord;
 use super::ThreadHistory;
+use super::TimeSkip;
 use super::callback_history;
 use crate::types::DetTid;
 use crate::types::SchedEvent;
@@ -67,6 +68,10 @@ struct RawRecord {
     host_inputs: Option<HostInputSet>,
     #[serde(default, skip_serializing_if = "HostObservedCount::is_zero")]
     store_exclusive_failures: HostObservedCount,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    format_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "super::lists_no_time_skips")]
+    time_skips: Option<Vec<TimeSkip>>,
 }
 
 struct LegacyFields<'a>(&'a PreemptionRecord);

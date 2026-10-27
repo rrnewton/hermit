@@ -47,6 +47,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::fmt::Write;
 use std::iter::Peekable;
 use std::os::fd::AsRawFd;
@@ -111,7 +112,10 @@ use crate::cpu_set::TaskAffinity;
 use crate::cpu_set::TaskCpus;
 use crate::detlog_debug;
 use crate::ivar::Ivar;
+use crate::preemptions::PREEMPTION_RECORD_FORMAT;
 use crate::preemptions::PreemptionWriter;
+use crate::preemptions::TimeSkip;
+use crate::preemptions::TimeSkipReason;
 use crate::preemptions::boundary_recording::Recording;
 use crate::resources::ExternalOpId;
 use crate::resources::LOOPBACK_POLL_YIELD_FYI;
@@ -1285,6 +1289,35 @@ impl BackgroundReadSignals {
 /// 200 retries.
 const MIN_POLL_UPGRADE_PERIOD_NS: u64 = 200_000_000;
 
+/// A jump of global time that a commit requested (`Scheduler::pending_time_skip`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingTimeSkip {
+    /// Why nothing else could run.
+    reason: TimeSkipReason,
+    /// The earliest timeout among the polls the commit counted as idle, its
+    /// own included: the jump stops there if no timer is due earlier.
+    poll_deadline: Option<LogicalTime>,
+    /// The thread whose commit requested the jump. For an idle poller's
+    /// jump, the pass that makes it checks again that this thread still
+    /// waits in an idle guest-state poll and that nothing else can run
+    /// (`revalidated_idle_poll_jump`).
+    requester: DetTid,
+}
+
+/// Where the scheduler's jumps of global time come from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TimeSkipMode {
+    /// A run that replays no schedule decides its own jumps and records them.
+    Compute,
+    /// A replay of a record that lists its jumps makes exactly those, each
+    /// where the recording did, and computes none (`drive_recorded_time_skips`).
+    Driven(VecDeque<TimeSkip>),
+    /// A replay of a record without a list behaves as before such lists
+    /// existed: no idle-poller jump, and a FIFO open's fast-forward recomputes
+    /// its jump to the next timer, counting only untimed polls as idle.
+    Legacy,
+}
+
 /// The state for the deterministic scheduler.
 #[derive(Debug)]
 pub struct Scheduler {
@@ -1579,11 +1612,31 @@ pub struct Scheduler {
     /// hands a thread held after a traced event its turn back, can fall
     /// between a poller's failed attempt and its retry.
     last_attempt_at: BTreeMap<DetTid, u64>,
-    /// Set at the commit of a FIFO open's poll when nothing else can run but
-    /// a timer is due at a finite deadline: the next pass moves global time
-    /// to that deadline, as an empty run queue does, rather than letting the
-    /// poll crawl there one turn charge at a time (`unblock_guest`).
-    fast_forward_for_alone_poller: bool,
+    /// Set at the commit of a FIFO open's poll, or of an idle guest-state
+    /// poller's retry, when nothing else can run but a deadline is due at a
+    /// finite time (`unblock_guest`): the next pass moves global time to that
+    /// deadline (`fast_forward_to_next_finite_deadline`), as an empty run queue
+    /// does, rather than letting the pollers crawl there one turn charge at a
+    /// time.
+    pending_time_skip: Option<PendingTimeSkip>,
+    /// Where jumps of global time come from (`TimeSkipMode`).
+    time_skip_mode: TimeSkipMode,
+    /// Whether a recorded jump of global time that the replay cannot make as
+    /// recorded stops the run, as `--die-on-desync` stops it for an event.
+    die_on_time_skip_desync: bool,
+    /// How many recorded jumps of global time the replay could not make as
+    /// recorded.
+    time_skip_desyncs: u64,
+    /// The target of the last recorded jump the replay made before any thread
+    /// had registered a deadline there (`check_unconfirmed_time_skip`).
+    unconfirmed_time_skip: Option<TimeSkip>,
+    /// Under a driven replay, the stream position and reason of the latest
+    /// commit that would have requested a jump in a free run: a FIFO open's
+    /// poll or an idle guest-state poller's retry when nothing else can run
+    /// before a finite deadline (`unblock_guest`). A recorded jump is made only
+    /// after such a commit at its position, as the recording made it after
+    /// one (`drive_recorded_time_skips`).
+    jump_request: Option<(u64, TimeSkipReason)>,
 
     /// Run-queue *removals* requested by a global-request handler
     /// (`reconnect_after_exec` -> `logically_kill_thread`), deferred to the same
@@ -4818,12 +4871,24 @@ impl Scheduler {
         let mut boundary_replayer = None;
         let mut boundary_stacktrace_events = BTreeMap::new();
         let mut recorded_host_inputs = None;
+        let mut time_skip_mode = TimeSkipMode::Compute;
+        // The format of the record a replay follows: its run follows that
+        // format's rules, and so says so in its own record.
+        let mut replayed_format = None;
         let (replayer, m_vec) = match &cfg.replay_schedule_from {
             Some(path) => {
                 trace!("Scheduler loading trace from path {}", path.display());
                 // File/JSON failures retain the ordinary loader's panic class.
                 // Only explicit format-policy mismatches below are refusals.
-                let recording = Recording::read(path).unwrap();
+                let recording = Recording::read(path).unwrap_or_else(|error| {
+                    if error
+                        .chain()
+                        .any(|cause| cause.is::<crate::preemptions::RecordFormatRefusal>())
+                    {
+                        exit_on_scheduler_refusal(&format!("{error:#}"));
+                    }
+                    panic!("{error:?}")
+                });
                 recording
                     .require_faithful_replay()
                     .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
@@ -4831,6 +4896,19 @@ impl Scheduler {
                     .require_strict_mode(cfg.strict_schedule_boundaries)
                     .unwrap_or_else(|error| exit_on_scheduler_refusal(&error));
                 recorded_host_inputs = recording.host_inputs().cloned();
+                time_skip_mode = if recording.lists_its_time_skips() {
+                    TimeSkipMode::Driven(
+                        recording
+                            .time_skips()
+                            .unwrap_or_default()
+                            .iter()
+                            .copied()
+                            .collect(),
+                    )
+                } else {
+                    TimeSkipMode::Legacy
+                };
+                replayed_format = Some(recording.format_version());
                 match recording {
                     Recording::Legacy(record) => {
                         callback_checkpoints = record
@@ -4926,6 +5004,15 @@ impl Scheduler {
                 .with_cap_preemption_charge(cfg.cap_preemption_charge)
                 .with_chaos_timeslice(cfg.chaos_timeslice)
                 .with_guest_ids(cfg.guest_ids);
+            // A run that follows no record writes the newest format. A replay
+            // writes the format of the record it follows, whose rules it ran
+            // by. A replay of a format-1 record (`TimeSkipMode::Legacy`) takes
+            // format 2 once it makes a jump, a FIFO fast-forward it recomputes
+            // or a jump past the record's end (`PreemptionWriter::insert_time_skip`):
+            // the jumps must be listed to be replayed, though that record's own
+            // replay then decides a FIFO open by the newer rules.
+            let writer =
+                writer.with_format(replayed_format.unwrap_or(Some(PREEMPTION_RECORD_FORMAT)));
             if boundaries {
                 writer
                     .with_slice_boundaries()
@@ -5066,7 +5153,12 @@ impl Scheduler {
             retired_at: 0,
             guest_state_polled_at: Default::default(),
             last_attempt_at: Default::default(),
-            fast_forward_for_alone_poller: false,
+            pending_time_skip: None,
+            time_skip_mode,
+            die_on_time_skip_desync: cfg.die_on_desync,
+            time_skip_desyncs: 0,
+            unconfirmed_time_skip: None,
+            jump_request: None,
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
             models_signal_targets: cfg.models_signal_targets(),
@@ -9617,8 +9709,12 @@ impl Scheduler {
         if self.replay_waits_before_maintenance() {
             return Err(SkipTurn);
         }
-        if std::mem::take(&mut self.fast_forward_for_alone_poller) {
-            self.fast_forward_to_next_finite_deadline(global_time);
+        self.check_unconfirmed_time_skip();
+        self.end_time_skip_replay_once_exhausted(global_time);
+        if matches!(self.time_skip_mode, TimeSkipMode::Driven(_)) {
+            self.drive_recorded_time_skips(global_time);
+        } else if let Some(pending) = self.pending_time_skip.take() {
+            self.fast_forward_to_next_finite_deadline(global_time, pending);
         }
         // No thread runs until the replayed thread wakes: committed time
         // catches up in the next pass's step 1 (a replay with callback
@@ -9723,27 +9819,282 @@ impl Scheduler {
         deadline > self.committed_time || another_pops_first
     }
 
-    /// Move global time to the earliest finite timed deadline, if it lies
-    /// ahead, so that `step2b_process_timed` fires it once committed time
-    /// catches up (the next pass, after step 1 updates committed time). Requested by a
-    /// FIFO open's poll when nothing else can run but such a timer
-    /// (`fast_forward_for_alone_poller`): as when the run queue is empty
-    /// (`step2d_decide_empty_queue`), no thread could otherwise act before it.
-    fn fast_forward_to_next_finite_deadline(&mut self, global_time: &Arc<Mutex<GlobalTime>>) {
-        let Some(deadline) = self.blocked.timed_waiters.next_deadline() else {
+    /// Move global time to the earliest finite deadline, if it lies ahead: a
+    /// timer's (`timed_waiters`), or the timeout of a poll that the commit
+    /// counted as idle (`PendingTimeSkip::poll_deadline`). `step2b_process_timed`
+    /// then fires the timer once committed time catches up (the next pass,
+    /// after step 1 updates committed time), and `step2b_restore_due_pollers`
+    /// lets the timed poll retry and time out. Requested at the commit of a
+    /// FIFO open's poll or of an idle guest-state poller's retry when nothing
+    /// else can run (`pending_time_skip`): as when the run queue is empty
+    /// (`step2d_decide_empty_queue`), no thread could otherwise act before
+    /// the deadline. An idle poller's jump is checked again here, where it is
+    /// made (`revalidated_idle_poll_jump`): between the commit and this pass
+    /// the requester's attempt ran, and a signal, say, may have ended its
+    /// wait. The target is the deadline itself, to the nanosecond, and the
+    /// jump is recorded where it is made, at the recorded stream's position
+    /// now (`TimeSkip::event`): a replay reaches that position at the same
+    /// point, after the requester's attempt.
+    fn fast_forward_to_next_finite_deadline(
+        &mut self,
+        global_time: &Arc<Mutex<GlobalTime>>,
+        pending: PendingTimeSkip,
+    ) {
+        let poll_deadline = match pending.reason {
+            TimeSkipReason::FifoOpenAlone => pending.poll_deadline,
+            TimeSkipReason::IdleGuestPollers => {
+                let Some(poll_deadline) = self.revalidated_idle_poll_jump(pending.requester) else {
+                    trace!(
+                        "[scheduler] dettid {} no longer waits alone in an idle poll; no jump",
+                        pending.requester
+                    );
+                    return;
+                };
+                poll_deadline
+            }
+        };
+        let timer = self
+            .blocked
+            .timed_waiters
+            .next_deadline()
+            .filter(|deadline| !deadline.is_indefinite());
+        let Some(target) = timer.into_iter().chain(poll_deadline).min() else {
             return;
         };
-        if deadline.is_indefinite() {
-            return;
-        }
         let mut gt = global_time.lock().unwrap();
         let now = gt.as_nanos();
-        if deadline > now {
-            info!(
-                "[scheduler] Nothing but a FIFO open's poll can run; skipping global time ahead to {}.",
-                deadline
-            );
-            gt.add_extra_time(deadline.duration_since(now));
+        if target <= now {
+            return;
+        }
+        info!(
+            "[scheduler] Nothing else can run ({:?}); skipping global time ahead to {}.",
+            pending.reason, target
+        );
+        gt.add_extra_time(target.duration_since(now));
+        drop(gt);
+        let event = self.recording_position();
+        if let Some(writer) = &mut self.preemption_writer {
+            writer.insert_time_skip(TimeSkip {
+                event,
+                target,
+                reason: pending.reason,
+            });
+        }
+    }
+
+    /// Whether idle poller `requester`, whose commit requested a jump, still
+    /// waits in an idle guest-state poll while nothing else can run, checked
+    /// where the jump is made (`fast_forward_to_next_finite_deadline`). Its
+    /// attempt has run since the commit: when it failed, the thread asks to
+    /// retry again, after no progress; when a signal or a peer ended its wait,
+    /// its request now is something else, and no jump is made. Returns the
+    /// earliest timeout of the idle polls, the requester's own included, as
+    /// `alone_until` does.
+    fn revalidated_idle_poll_jump(&self, requester: DetTid) -> Option<Option<LogicalTime>> {
+        let own = self
+            .next_turns
+            .get(&requester)
+            .and_then(|turn| turn.req.try_read())
+            .and_then(Result::ok)
+            .filter(|rs| self.waits_on_guest_state(rs))?;
+        let others = self.alone_until(requester, self.last_attempt_at.get(&requester).copied())?;
+        Some(others.into_iter().chain(own.poll_deadline).min())
+    }
+
+    /// End a schedule replay's control of the jumps of global time once the
+    /// replay has run out of records: the run goes on unguided and decides its
+    /// own jumps, as a run that replays nothing does
+    /// (`TimeSkipMode::Compute`). A recorded jump the replay never reached is
+    /// one it could not make as recorded, a desync. A replay of an older record
+    /// (`TimeSkipMode::Legacy`) makes no idle-poller jump while it replays,
+    /// and none of its jumps went unmade.
+    fn end_time_skip_replay_once_exhausted(&mut self, global_time: &Arc<Mutex<GlobalTime>>) {
+        if matches!(self.time_skip_mode, TimeSkipMode::Compute) || self.replay_has_records_left() {
+            return;
+        }
+        self.drive_recorded_time_skips(global_time);
+        let unmade = match std::mem::replace(&mut self.time_skip_mode, TimeSkipMode::Compute) {
+            TimeSkipMode::Driven(rest) => rest,
+            _ => VecDeque::new(),
+        };
+        // A FIFO-open jump at the very end of the stream still waits for the
+        // open's poll, and the run now decides it itself, as the recording
+        // did; a jump beyond the end was never reached.
+        let end = self.replay_position();
+        for skip in unmade.into_iter().filter(|skip| skip.event > end) {
+            self.time_skip_desync(&format!(
+                "the recording jumped as {skip:?}, but the replay ran out of records first"
+            ));
+        }
+    }
+
+    /// Under replay of a record that lists its jumps of global time, make
+    /// every recorded jump whose place in the stream (`TimeSkip::event`) the
+    /// replay has reached, as replay drives context switches. Each is checked
+    /// where it is made: its target must lie ahead of global time, and no
+    /// finite deadline this replay knows (`earliest_known_deadline`) may come
+    /// before it, or the jump would pass that deadline. The target itself may
+    /// not be known yet: replay releases each thread only when its next
+    /// recorded event is due, so a sleeper whose deadline the recording jumped
+    /// to may register it only after the jump; it then wakes at once, at the
+    /// same instant, and its deadline confirms the jump, while an earlier one
+    /// registered then is a deadline the jump passed
+    /// (`check_unconfirmed_time_skip`). A jump that fails a check is a desync;
+    /// one whose target global time has already passed is not made.
+    fn drive_recorded_time_skips(&mut self, global_time: &Arc<Mutex<GlobalTime>>) {
+        let position = self.replay_position();
+        loop {
+            let TimeSkipMode::Driven(expected) = &mut self.time_skip_mode else {
+                return;
+            };
+            let Some(&skip) = expected.front() else {
+                return;
+            };
+            // The recording made a FIFO open's jump at the first pass after
+            // the open's poll found nothing else could run, at this position.
+            // The open's own turns store no record, so they can lie between
+            // reaching the position and that poll, and the position alone
+            // would jump too early: such a jump waits for the replay's poll to
+            // find the same. An idle poller's jump needs no such wait: the
+            // replay holds every thread that was polling where the recording
+            // stood at its last event, so none of them retries before the jump.
+            let requested = skip.reason != TimeSkipReason::FifoOpenAlone
+                || self.jump_request == Some((skip.event, skip.reason));
+            if skip.event > position || (skip.event == position && !requested) {
+                return;
+            }
+            expected.pop_front();
+            self.jump_request = None;
+            if !requested {
+                self.time_skip_desync(&format!(
+                    "the recording jumped as {skip:?}, but the replay passed that point \
+                     before the FIFO open found nothing else could run"
+                ));
+            }
+            self.make_recorded_time_skip(global_time, skip);
+        }
+    }
+
+    /// Make and check one recorded jump of global time
+    /// (`drive_recorded_time_skips`).
+    fn make_recorded_time_skip(&mut self, global_time: &Arc<Mutex<GlobalTime>>, skip: TimeSkip) {
+        let known = self.earliest_known_deadline();
+        let mut gt = global_time.lock().unwrap();
+        let now = gt.as_nanos();
+        if skip.target <= now || skip.target.is_indefinite() {
+            drop(gt);
+            self.time_skip_desync(&format!(
+                "the recording jumped as {skip:?}, but global time is already {now}"
+            ));
+            return;
+        }
+        info!(
+            "[scheduler] Replaying a recorded jump ({:?}); skipping global time ahead to {}.",
+            skip.reason, skip.target
+        );
+        gt.add_extra_time(skip.target.duration_since(now));
+        drop(gt);
+        // This run records the jump where its own stream stands: a realized
+        // schedule that differs from the replayed one before the jump still
+        // indexes it against its own events.
+        let event = self.recording_position();
+        if let Some(writer) = &mut self.preemption_writer {
+            writer.insert_time_skip(TimeSkip { event, ..skip });
+        }
+        match known {
+            Some(known) if known < skip.target => self.time_skip_desync(&format!(
+                "the recording jumped as {skip:?}, past a finite deadline this replay knows, \
+                 {known}"
+            )),
+            Some(known) if known == skip.target => self.unconfirmed_time_skip = None,
+            _ => self.unconfirmed_time_skip = Some(skip),
+        }
+    }
+
+    /// Check the last recorded jump made before its target was a deadline this
+    /// replay knew (`make_recorded_time_skip`), once a thread registers its
+    /// deadline: in the recording the target was the earliest finite deadline,
+    /// so a deadline registered since that lies before the target is one the
+    /// jump passed, a desync; one at the target confirms the jump. Runs every
+    /// pass until the jump is confirmed or refuted, also after the replay has
+    /// run out of records; one still unconfirmed when the run ends is
+    /// reported in the run summary.
+    fn check_unconfirmed_time_skip(&mut self) {
+        let Some(skip) = self.unconfirmed_time_skip else {
+            return;
+        };
+        match self.earliest_known_deadline() {
+            Some(known) if known < skip.target => {
+                self.unconfirmed_time_skip = None;
+                self.time_skip_desync(&format!(
+                    "the recording jumped as {skip:?}, but a thread then registered an earlier \
+                     deadline, {known}, which the jump passed"
+                ));
+            }
+            Some(known) if known == skip.target => self.unconfirmed_time_skip = None,
+            _ => {}
+        }
+    }
+
+    /// The earliest finite deadline the scheduler knows: a timer's
+    /// (`timed_waiters`), or one a thread's pending request carries, a sleep's
+    /// (`ResourceID::SleepUntil`) or a poll's timeout (`Resources::poll_deadline`).
+    fn earliest_known_deadline(&self) -> Option<LogicalTime> {
+        let timer = self
+            .blocked
+            .timed_waiters
+            .next_deadline()
+            .filter(|deadline| !deadline.is_indefinite());
+        let requests = self.next_turns.values().filter_map(|turn| {
+            turn.req
+                .try_read_with(|req| {
+                    let rs = req.as_ref().ok()?;
+                    let sleep = rs
+                        .resources
+                        .keys()
+                        .filter_map(|resource| match resource {
+                            ResourceID::SleepUntil(deadline) if !deadline.is_indefinite() => {
+                                Some(*deadline)
+                            }
+                            _ => None,
+                        })
+                        .min();
+                    let poll = rs.poll_deadline.filter(|_| Self::is_polling_turn(rs));
+                    sleep.into_iter().chain(poll).min()
+                })
+                .flatten()
+        });
+        timer.into_iter().chain(requests).min()
+    }
+
+    /// Where a schedule replay stands in the recorded stream: the stored
+    /// records it has consumed (`TimeSkip::event`).
+    fn replay_position(&self) -> u64 {
+        if let Some(replayer) = &self.boundary_replayer {
+            replayer.stored_index() as u64
+        } else if let Some(replayer) = &self.replayer {
+            replayer.events_popped
+        } else {
+            0
+        }
+    }
+
+    /// Where the next stored record falls in the stream this run records:
+    /// where a jump made now falls (`TimeSkip::event`).
+    fn recording_position(&self) -> u64 {
+        self.preemption_writer
+            .as_ref()
+            .map_or(0, PreemptionWriter::stream_position)
+    }
+
+    /// A recorded jump of global time the replay cannot make as recorded:
+    /// reported, and fatal under `--die-on-desync`, as an event desync is.
+    fn time_skip_desync(&mut self, complaint: &str) {
+        self.time_skip_desyncs += 1;
+        warn!("[scheduler] schedule replay desynchronized: {complaint}");
+        if self.die_on_time_skip_desync {
+            eprintln!("Replay mode desynchronized from trace, bailing out: {complaint}");
+            immediate_fatal_exit();
         }
     }
 
@@ -16842,20 +17193,24 @@ impl Scheduler {
 
     /// The idle-poller bookkeeping of `dtid`'s committed turn (`unblock_guest`):
     /// its sequence number; a polling grant's attempt (`last_attempt_at`); and
-    /// progress, which any grant but a guest-state-only poll is, and a
-    /// guest-state-only poller's previous grant is unless this request retries
-    /// after an attempt that moved nothing.
+    /// progress, which any grant but a guest-state-only poll and a replayed
+    /// switch-in (`switch_in`) is, and a guest-state-only poller's previous
+    /// grant is unless this request retries after an attempt that moved
+    /// nothing. Returns `dtid`'s latest attempt before this commit.
     fn note_committed_turn(
         &mut self,
         dtid: DetTid,
         polling: bool,
         guest_state_poll: bool,
         fruitless: bool,
-    ) {
+        switch_in: bool,
+    ) -> Option<u64> {
         self.progress_epoch += 1;
-        if polling {
-            self.last_attempt_at.insert(dtid, self.progress_epoch);
-        }
+        let previous_attempt = if polling {
+            self.last_attempt_at.insert(dtid, self.progress_epoch)
+        } else {
+            self.last_attempt_at.get(&dtid).copied()
+        };
         let previous_grant = self.guest_state_polled_at.remove(&dtid);
         if guest_state_poll {
             if let Some(previous) = previous_grant
@@ -16864,9 +17219,21 @@ impl Scheduler {
                 self.last_progress = self.last_progress.max(previous);
             }
             self.guest_state_polled_at.insert(dtid, self.progress_epoch);
-        } else {
+        } else if !switch_in {
+            // A replayed switch-in (`TraceReplay`) only resumes its thread,
+            // which changes guest state, if at all, by a later request that
+            // commits on its own; a replay hands idle pollers such turns
+            // where the recording only skipped them, so counting one would
+            // keep an opener that the recording found alone from ever being so.
             self.last_progress = self.progress_epoch;
         }
+        previous_attempt
+    }
+
+    /// Whether nothing else can run ([`Self::alone_until`] answers `Some`).
+    #[cfg(test)]
+    fn nothing_else_can_run(&self, dtid: DetTid) -> bool {
+        self.alone_until(dtid, Some(u64::MAX)).is_some()
     }
 
     /// Whether no guest thread other than `dtid` can make progress unless a
@@ -16890,15 +17257,57 @@ impl Scheduler {
     /// A thread in neither state is runnable work, is running, or awaits
     /// admission to the run queue, so something else can run; so can a thread
     /// queued after `sched_yield` or polling what a host can change. The answer
-    /// leans to "something else can run", which only keeps a FIFO open
-    /// polling. When it is "nothing", the caller still waits for any timer due
-    /// at a finite deadline first (`unblock_guest`).
-    fn nothing_else_can_run(&self, dtid: DetTid) -> bool {
+    /// leans to "something else can run", which only keeps a FIFO open polling
+    /// and lets pollers reach the next deadline one turn charge at a time.
+    /// When it is "nothing", the caller first moves global time to the
+    /// earliest finite deadline (`unblock_guest`).
+    ///
+    /// `dtid` itself must be idle too: its latest attempt before this commit
+    /// (`own_previous_attempt`, from `last_attempt_at`) is at or after that
+    /// progress. A commit lets `dtid` run its next attempt, and an attempt that
+    /// can see newer progress may succeed and run on into guest code, which
+    /// must never see global time jump.
+    ///
+    /// `None` when something else can run; otherwise the earliest timeout
+    /// among the idle pollers counted (`Resources::poll_deadline`), if any has
+    /// one: a timed poll ends at its deadline on its own, so a jump of global
+    /// time must stop there.
+    fn alone_until(
+        &self,
+        dtid: DetTid,
+        own_previous_attempt: Option<u64>,
+    ) -> Option<Option<LogicalTime>> {
+        self.alone_until_with(dtid, own_previous_attempt, true)
+    }
+
+    /// [`Self::alone_until`], where `timed_polls_idle` false counts a poll with
+    /// a timeout as able to run, as before jumps could stop at a poll's own
+    /// timeout (`TimeSkipMode::Legacy`).
+    fn alone_until_with(
+        &self,
+        dtid: DetTid,
+        own_previous_attempt: Option<u64>,
+        timed_polls_idle: bool,
+    ) -> Option<Option<LogicalTime>> {
         let progress = self.latest_progress(Some(dtid));
-        self.next_turns
-            .keys()
-            .filter(|&&tid| tid != dtid)
-            .all(|&tid| self.is_idle_guest_poller(tid, progress) || self.is_parked(tid))
+        if !own_previous_attempt.is_some_and(|attempt| attempt >= progress) {
+            return None;
+        }
+        let mut earliest_poll_deadline: Option<LogicalTime> = None;
+        for &tid in self.next_turns.keys().filter(|&&tid| tid != dtid) {
+            if self.is_idle_guest_poller(tid, progress) {
+                let deadline = self.requested_poll_deadline(tid);
+                if deadline.is_some() && !timed_polls_idle {
+                    return None;
+                }
+                earliest_poll_deadline = earliest_poll_deadline.into_iter().chain(deadline).min();
+                continue;
+            }
+            if !(self.is_parked(tid) || self.held_by_replay(tid)) {
+                return None;
+            }
+        }
+        Some(earliest_poll_deadline)
     }
 
     /// The latest committed turn an idle poller's failed attempt must not
@@ -16931,17 +17340,36 @@ impl Scheduler {
     /// request retries after an attempt that moved nothing
     /// (`waits_after_a_failed_attempt`), made no earlier than `progress`
     /// (`latest_progress`): its latest attempt (`last_attempt_at`) is at or
-    /// after it.
+    /// after it. A poll with a timeout counts too: it ends at its own deadline
+    /// (`requested_poll_deadline`), where `alone_until` stops a jump of global
+    /// time; the idle-poller deadlock check leaves it out
+    /// (`only_idle_guest_pollers_remain`).
     fn is_idle_guest_poller(&self, tid: DetTid, progress: u64) -> bool {
         self.run_queue.contains_tid(tid)
             && self.attempted_since(tid, progress)
-            // A poll with a timeout ends at its own deadline, which
-            // `fast_forward_to_next_finite_deadline` does not consider, so it is
-            // not idle: jumping over it, or opening in the kernel while it waits,
-            // would end it late.
-            && self.request_satisfies(tid, |rs| {
-                self.waits_on_guest_state(rs) && rs.poll_deadline.is_none()
+            && self.request_satisfies(tid, |rs| self.waits_on_guest_state(rs))
+    }
+
+    /// The timeout of `tid`'s posted request (`Resources::poll_deadline`), if
+    /// it has one.
+    fn requested_poll_deadline(&self, tid: DetTid) -> Option<LogicalTime> {
+        self.next_turns
+            .get(&tid)
+            .and_then(|turn| {
+                turn.req
+                    .try_read_with(|req| req.as_ref().ok().and_then(|rs| rs.poll_deadline))
             })
+            .flatten()
+    }
+
+    /// Whether a driven replay holds `tid` until its next recorded event
+    /// (`TraceReplay`): it cannot act before that event, which no other
+    /// thread's action can bring nearer while every other thread is idle: it
+    /// was an idle poller or parked where the recording stood (`alone_until`).
+    /// An older record's replay decides as before (`TimeSkipMode::Legacy`).
+    fn held_by_replay(&self, tid: DetTid) -> bool {
+        matches!(self.time_skip_mode, TimeSkipMode::Driven(_))
+            && self.request_satisfies(tid, Self::is_internal_turn)
     }
 
     /// A retry, after an attempt that moved nothing, of a poll whose attempts
@@ -17262,8 +17690,8 @@ impl Scheduler {
     ///   virtual time reaches its deadline, and virtual time advances with
     ///   every polling turn, host-timed ones included, so how many of its
     ///   retries come before the timeout can follow host timing. #4692's
-    ///   idle-poller check leaves such a poll out for the same reason
-    ///   (`is_idle_guest_poller`);
+    ///   idle-poller deadlock check leaves such a poll out too
+    ///   (`only_idle_guest_pollers_remain`);
     /// - not a named FIFO (`polls_a_named_fifo`), whose path any process may
     ///   open, and not a FIFO open waiting for a peer
     ///   (`waits_until_nothing_else_can_run`), for the same reason;
@@ -17768,22 +18196,34 @@ impl Scheduler {
         let fatal_alarm = self.in_guest_fatal_alarm_pending(dtid);
         let futex_timed_out = self.blocked.timed_out_futex_waiters.remove(&dtid);
         let now = self.committed_time;
-        let (polling_grant, guest_state_only, fruitless, wants_alone, sleep_due, chaos_sleep_due) =
-            match self
-                .next_turns
-                .get(&dtid)
-                .and_then(|turn| turn.req.try_read())
-            {
-                Some(Ok(rs)) => (
-                    Self::is_polling_turn(&rs),
-                    self.polls_only_guest_state(&rs),
-                    Self::retries_its_call_without_progress(&rs),
-                    rs.waits_until_nothing_else_can_run,
-                    Self::is_due_sleep(&rs, self.committed_time),
-                    ends_a_due_sleep(&rs, now),
-                ),
-                _ => (false, false, false, false, false, false),
-            };
+        let (
+            polling_grant,
+            guest_state_only,
+            fruitless,
+            wants_alone,
+            sleep_due,
+            chaos_sleep_due,
+            idle_poll,
+            own_poll_deadline,
+            switch_in,
+        ) = match self
+            .next_turns
+            .get(&dtid)
+            .and_then(|turn| turn.req.try_read())
+        {
+            Some(Ok(rs)) => (
+                Self::is_polling_turn(&rs),
+                self.polls_only_guest_state(&rs),
+                Self::retries_its_call_without_progress(&rs),
+                rs.waits_until_nothing_else_can_run,
+                Self::is_due_sleep(&rs, self.committed_time),
+                ends_a_due_sleep(&rs, now),
+                self.waits_on_guest_state(&rs),
+                rs.poll_deadline,
+                Self::is_internal_turn(&rs),
+            ),
+            _ => (false, false, false, false, false, false, false, None, false),
+        };
         let guest_state_poll = polling_grant && guest_state_only;
         // Whether this grant ends a timed wait at its deadline
         // (`expired_wait_grant`, read by `bump_global_time`).
@@ -17805,18 +18245,64 @@ impl Scheduler {
                     .and_then(Result::ok)
             })
             .flatten();
-        self.note_committed_turn(dtid, polling_grant, guest_state_poll, fruitless);
-        let mut alone = wants_alone && self.nothing_else_can_run(dtid);
-        if alone
-            && self
+        // The committing thread's latest attempt before this commit: whether
+        // that attempt could see the latest progress.
+        let previous_attempt =
+            self.note_committed_turn(dtid, polling_grant, guest_state_poll, fruitless, switch_in);
+        // A FIFO open's poll asks whether nothing else can run, and so does an
+        // idle guest-state poller's retry: either way, when only a deadline can
+        // still let a thread act, global time moves to it at the next pass. A
+        // replay of a record that lists its jumps answers the same, but makes
+        // only the recorded jumps (`TimeSkipMode::Driven`); a replay of an older
+        // record lets only a FIFO open ask, as before (`TimeSkipMode::Legacy`).
+        let legacy = self.time_skip_mode == TimeSkipMode::Legacy;
+        let reason = if wants_alone {
+            Some(TimeSkipReason::FifoOpenAlone)
+        } else if idle_poll && !legacy {
+            Some(TimeSkipReason::IdleGuestPollers)
+        } else {
+            None
+        };
+        let mut alone = false;
+        let others = reason.and_then(|_| {
+            if legacy {
+                self.alone_until_with(dtid, Some(u64::MAX), false)
+            } else {
+                self.alone_until(dtid, previous_attempt)
+            }
+        });
+        if let (Some(reason), Some(others_poll_deadline)) = (reason, others) {
+            let poll_deadline = if legacy {
+                None
+            } else {
+                others_poll_deadline
+                    .into_iter()
+                    .chain(own_poll_deadline)
+                    .min()
+            };
+            let timer_due = self
                 .blocked
                 .timed_waiters
                 .next_deadline()
-                .is_some_and(|deadline| !deadline.is_indefinite())
-        {
-            // Only a timer can still let another thread run: move to it now.
-            alone = false;
-            self.fast_forward_for_alone_poller = true;
+                .is_some_and(|deadline| !deadline.is_indefinite());
+            if timer_due || poll_deadline.is_some() {
+                if matches!(self.time_skip_mode, TimeSkipMode::Driven(_)) {
+                    // Where the recording requested its jump, at this commit,
+                    // the replay notes the request and makes the recorded jump
+                    // (`drive_recorded_time_skips`).
+                    self.jump_request = Some((self.replay_position(), reason));
+                } else {
+                    self.pending_time_skip = Some(PendingTimeSkip {
+                        reason,
+                        poll_deadline,
+                        requester: dtid,
+                    });
+                }
+            } else {
+                // Only a FIFO open answers that nothing else can run; an idle
+                // poller just retries, as before.
+                alone = wants_alone;
+            }
         }
         if let Err(error) = self.clear_nextturn(dtid) {
             self.fail_parked(dtid, error);
@@ -19417,6 +19903,25 @@ impl Scheduler {
                 .get_or_insert_with(String::new)
                 .push_str(&format!("{message}\n"));
         }
+        let unmade_time_skips = match &self.time_skip_mode {
+            TimeSkipMode::Driven(rest) => rest.len(),
+            _ => 0,
+        };
+        if self.time_skip_desyncs > 0
+            || unmade_time_skips > 0
+            || self.unconfirmed_time_skip.is_some()
+        {
+            let message = format!(
+                "DESYNC recorded jumps of global time: {} desynced, {} not reached, {} unconfirmed",
+                self.time_skip_desyncs,
+                unmade_time_skips,
+                usize::from(self.unconfirmed_time_skip.is_some()),
+            );
+            tracing::warn!("{}", message);
+            desync_descrip
+                .get_or_insert_with(String::new)
+                .push_str(&format!("{message}\n"));
+        }
 
         let (reprio_descrip, info_reprio_descrip) = if let Some(pw) = self.preemption_writer.take()
         {
@@ -20370,27 +20875,45 @@ mod test {
         assert!(sched.nothing_else_can_run(opener));
     }
 
-    /// A guest-state poll with a timeout wakes at its deadline, which the
-    /// alone-poller fast-forward does not consider, so it may still run.
-    #[test]
-    fn a_guest_poller_with_a_timeout_may_still_run() {
-        let mut sched = Scheduler::new(&Config::default());
-        let opener = DetTid::from_raw(3);
-        register_known_thread(&mut sched, opener);
-        let poller = DetTid::from_raw(5);
-        register_known_thread(&mut sched, poller);
-        let mut resources = Resources::new(poller);
+    /// A guest-state poller with a timeout, queued and idle like
+    /// [`queued_poller`].
+    fn timed_queued_poller(sched: &mut Scheduler, tid: DetTid, deadline: LogicalTime) {
+        register_known_thread(sched, tid);
+        let mut resources = Resources::new(tid);
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.poll_attempt = 1;
         resources.polls_guest_state_only = true;
-        resources.poll_deadline = Some(LogicalTime::from_nanos(1_000_000));
-        sched.next_turns[&poller].req.put(Ok(resources));
-        sched.run_queue.push_poller(poller, DEFAULT_PRIORITY, 1);
-        sched.last_attempt_at.insert(poller, sched.progress_epoch);
+        resources.poll_deadline = Some(deadline);
+        sched.next_turns[&tid].req.put(Ok(resources));
+        sched.run_queue.push_poller(tid, DEFAULT_PRIORITY, 1);
+        sched.last_attempt_at.insert(tid, sched.progress_epoch);
         sched
             .guest_state_polled_at
-            .insert(poller, sched.progress_epoch);
-        assert!(!sched.nothing_else_can_run(opener));
+            .insert(tid, sched.progress_epoch);
+    }
+
+    /// A timed guest-state poll is idle like any other, and its deadline bounds
+    /// a jump of global time: the earliest such timeout is reported.
+    #[test]
+    fn a_timed_guest_poller_is_idle_and_its_deadline_bounds_the_jump() {
+        let mut sched = Scheduler::new(&Config::default());
+        let opener = DetTid::from_raw(3);
+        register_known_thread(&mut sched, opener);
+        timed_queued_poller(
+            &mut sched,
+            DetTid::from_raw(5),
+            LogicalTime::from_nanos(9_000_000),
+        );
+        timed_queued_poller(
+            &mut sched,
+            DetTid::from_raw(7),
+            LogicalTime::from_nanos(4_000_000),
+        );
+        queued_poller(&mut sched, DetTid::from_raw(9), true);
+        assert_eq!(
+            sched.alone_until(opener, Some(u64::MAX)),
+            Some(Some(LogicalTime::from_nanos(4_000_000)))
+        );
     }
 
     #[test]
@@ -20420,10 +20943,10 @@ mod test {
         queued_poller(&mut sched, reader, true);
         sched.thread_tree.add_child(reader, reader, true);
         assert!(sched.only_idle_guest_pollers_remain());
-        sched.note_committed_turn(DetTid::from_raw(7), false, false, false);
-        sched.note_committed_turn(reader, false, false, false);
+        sched.note_committed_turn(DetTid::from_raw(7), false, false, false, false);
+        sched.note_committed_turn(reader, false, false, false, false);
         assert!(!sched.only_idle_guest_pollers_remain());
-        sched.note_committed_turn(reader, true, true, true);
+        sched.note_committed_turn(reader, true, true, true, false);
         assert!(sched.only_idle_guest_pollers_remain());
     }
 
@@ -20780,6 +21303,8 @@ mod test {
         resources.polls_guest_state_only = true;
         resources.waits_until_nothing_else_can_run = true;
         sched.next_turns[&tid].req.put(Ok(resources));
+        // Its previous poll, after which nothing moved.
+        sched.last_attempt_at.insert(tid, sched.progress_epoch);
     }
 
     /// A sleeping thread cannot run before its deadline, so it does not keep a
@@ -20800,7 +21325,14 @@ mod test {
         assert!(sched.nothing_else_can_run(opener));
         let answer = turn_answer(&mut sched, opener);
         assert!(matches!(answer, Some(SchedResponse::Go(_))), "{answer:?}");
-        assert!(sched.fast_forward_for_alone_poller);
+        assert_eq!(
+            sched.pending_time_skip,
+            Some(PendingTimeSkip {
+                reason: TimeSkipReason::FifoOpenAlone,
+                poll_deadline: None,
+                requester: opener,
+            })
+        );
     }
 
     /// Beside a wait no time ends (`pause`), the open falls back at once
@@ -20821,7 +21353,571 @@ mod test {
             matches!(answer, Some(SchedResponse::GoAlone(_))),
             "{answer:?}"
         );
-        assert!(!sched.fast_forward_for_alone_poller);
+        assert_eq!(sched.pending_time_skip, None);
+    }
+
+    /// An idle guest-state poller's retry (`queued_poller`) whose request is
+    /// about to commit.
+    fn committing_idle_poller(sched: &mut Scheduler, tid: DetTid, deadline: Option<LogicalTime>) {
+        register_known_thread(sched, tid);
+        let mut resources = Resources::new(tid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.poll_attempt = 2;
+        resources.polls_guest_state_only = true;
+        resources.poll_deadline = deadline;
+        sched.next_turns[&tid].req.put(Ok(resources));
+        // Its previous, failed attempt, after which nothing moved.
+        sched.last_attempt_at.insert(tid, sched.progress_epoch);
+        sched
+            .guest_state_polled_at
+            .insert(tid, sched.progress_epoch);
+    }
+
+    /// A poller whose previous attempt came before another thread's progress
+    /// may succeed now and run on, so its commit requests no jump: the jump
+    /// would land while it runs.
+    #[test]
+    fn a_poller_whose_last_attempt_predates_progress_requests_no_jump() {
+        let mut sched = Scheduler::new(&Config::default());
+        let poller = DetTid::from_raw(3);
+        committing_idle_poller(&mut sched, poller, None);
+        // Another thread's turn committed after the poller's last attempt.
+        sched.progress_epoch += 1;
+        sched.last_progress = sched.progress_epoch;
+        let sleeper = DetTid::from_raw(5);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
+        let _ = turn_answer(&mut sched, poller);
+        assert_eq!(sched.pending_time_skip, None);
+    }
+
+    /// A replayed switch-in (`TraceReplay`) of an idle poller is no progress:
+    /// a FIFO open beside that poller, with no timer, still goes alone, as in
+    /// the recording that only skipped the poller (Claude review, round 2: the
+    /// replay otherwise spun on the open).
+    #[test]
+    fn a_replayed_switch_in_is_no_progress() {
+        let mut sched = Scheduler::new(&Config::default());
+        let opener = DetTid::from_raw(3);
+        fifo_open_poll(&mut sched, opener);
+        let poller = DetTid::from_raw(5);
+        register_known_thread(&mut sched, poller);
+        // Its failed attempt, after which nothing moved; the replay held it
+        // after that attempt.
+        sched.last_attempt_at.insert(poller, sched.progress_epoch);
+        let mut switch_in = Resources::new(poller);
+        switch_in.insert(ResourceID::TraceReplay, Permission::RW);
+        sched.next_turns[&poller].req.put(Ok(switch_in));
+        let _ = turn_answer(&mut sched, poller);
+        // The poller then retries its poll, as fruitlessly as before.
+        let mut retry = Resources::new(poller);
+        retry.insert(ResourceID::InternalIOPolling, Permission::W);
+        retry.poll_attempt = 2;
+        retry.polls_guest_state_only = true;
+        sched.next_turns[&poller].req.put(Ok(retry));
+        sched.run_queue.push_poller(poller, DEFAULT_PRIORITY, 2);
+        let answer = turn_answer(&mut sched, opener);
+        assert!(
+            matches!(answer, Some(SchedResponse::GoAlone(_))),
+            "{answer:?}"
+        );
+    }
+
+    /// The commit of an idle guest-state poller's retry beside a sleeper and
+    /// another idle poller moves time to the sleeper's deadline at the next
+    /// pass; the poller itself is answered as before.
+    #[test]
+    fn an_idle_poller_beside_a_sleeper_moves_time_to_its_deadline() {
+        let mut sched = Scheduler::new(&Config::default());
+        let poller = DetTid::from_raw(3);
+        committing_idle_poller(&mut sched, poller, None);
+        queued_poller(&mut sched, DetTid::from_raw(5), true);
+        let sleeper = DetTid::from_raw(7);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
+        let answer = turn_answer(&mut sched, poller);
+        assert!(matches!(answer, Some(SchedResponse::Go(_))), "{answer:?}");
+        assert_eq!(
+            sched.pending_time_skip,
+            Some(PendingTimeSkip {
+                reason: TimeSkipReason::IdleGuestPollers,
+                poll_deadline: None,
+                requester: poller,
+            })
+        );
+    }
+
+    /// Beside a thread that can still run, an idle poller's commit requests
+    /// nothing.
+    #[test]
+    fn an_idle_poller_beside_a_runnable_thread_requests_no_jump() {
+        let mut sched = Scheduler::new(&Config::default());
+        let poller = DetTid::from_raw(3);
+        committing_idle_poller(&mut sched, poller, None);
+        let sleeper = DetTid::from_raw(5);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
+        // Registered, but running: not queued and not parked.
+        register_known_thread(&mut sched, DetTid::from_raw(7));
+        let _ = turn_answer(&mut sched, poller);
+        assert_eq!(sched.pending_time_skip, None);
+    }
+
+    /// Beside a wait no time ends, an idle poller just retries: no jump, and
+    /// no "nothing else can run" answer, which only a FIFO open takes.
+    #[test]
+    fn an_idle_poller_beside_an_indefinite_wait_just_retries() {
+        let mut sched = Scheduler::new(&Config::default());
+        let poller = DetTid::from_raw(3);
+        committing_idle_poller(&mut sched, poller, None);
+        let paused = DetTid::from_raw(5);
+        register_known_thread(&mut sched, paused);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, paused);
+        let answer = turn_answer(&mut sched, poller);
+        assert!(matches!(answer, Some(SchedResponse::Go(_))), "{answer:?}");
+        assert_eq!(sched.pending_time_skip, None);
+    }
+
+    /// A poll's own timeout bounds the jump: with no timer at all, the
+    /// committing poller's deadline is the target, and a timer due later than
+    /// another idle poller's timeout does not move time past that timeout.
+    #[test]
+    fn a_poll_timeout_earlier_than_the_timer_is_the_jump_target() {
+        let config = Config::default();
+        let mut sched = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let start = global_time.lock().unwrap().as_nanos();
+        let poller = DetTid::from_raw(3);
+        let own = start + LogicalTime::from_nanos(7_000_000);
+        committing_idle_poller(&mut sched, poller, Some(own));
+        let other = start + LogicalTime::from_nanos(3_000_000);
+        timed_queued_poller(&mut sched, DetTid::from_raw(5), other);
+        let sleeper = DetTid::from_raw(7);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(start + LogicalTime::from_nanos(5_000_000), sleeper);
+        let _ = turn_answer(&mut sched, poller);
+        let pending = sched.pending_time_skip.take().expect("a jump is requested");
+        assert_eq!(pending.poll_deadline, Some(other));
+        // Its attempt fails and it asks to retry again.
+        repost_idle_retry(&mut sched, poller, Some(own));
+        sched.fast_forward_to_next_finite_deadline(&global_time, pending);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), other);
+    }
+
+    /// The poller's next request after an attempt that failed: another retry.
+    fn repost_idle_retry(sched: &mut Scheduler, tid: DetTid, deadline: Option<LogicalTime>) {
+        let mut resources = Resources::new(tid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.poll_attempt = 3;
+        resources.polls_guest_state_only = true;
+        resources.poll_deadline = deadline;
+        sched.next_turns[&tid].req.put(Ok(resources));
+    }
+
+    /// An idle poller's jump is checked again where it is made, after the
+    /// poller's attempt: when the poller asks to retry again and nothing else
+    /// can run, time moves; when a signal ended its wait, so that its request
+    /// is now the signal's, or another thread became runnable, no jump is
+    /// made (Codex review, finding 3).
+    #[test]
+    fn a_requested_jump_is_checked_again_where_it_is_made() {
+        let config = Config::default();
+        let setup = || {
+            let mut sched = Scheduler::new(&config);
+            let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+            let start = global_time.lock().unwrap().as_nanos();
+            let poller = DetTid::from_raw(3);
+            committing_idle_poller(&mut sched, poller, None);
+            let sleeper = DetTid::from_raw(7);
+            register_known_thread(&mut sched, sleeper);
+            let deadline = start + LogicalTime::from_nanos(2_000_000);
+            sched.blocked.timed_waiters.insert(deadline, sleeper);
+            let _ = turn_answer(&mut sched, poller);
+            let pending = sched.pending_time_skip.take().expect("a jump is requested");
+            (sched, global_time, start, deadline, poller, pending)
+        };
+
+        let (mut sched, global_time, _, deadline, poller, pending) = setup();
+        repost_idle_retry(&mut sched, poller, None);
+        sched.fast_forward_to_next_finite_deadline(&global_time, pending);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), deadline);
+
+        let (mut sched, global_time, start, _, poller, pending) = setup();
+        let mut signal = Resources::new(poller);
+        signal.insert(
+            ResourceID::InboundSignal(SigWrapper::from(Signal::SIGUSR1)),
+            Permission::W,
+        );
+        sched.next_turns[&poller].req.put(Ok(signal));
+        sched.fast_forward_to_next_finite_deadline(&global_time, pending);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), start);
+
+        let (mut sched, global_time, start, _, poller, pending) = setup();
+        repost_idle_retry(&mut sched, poller, None);
+        let runnable = DetTid::from_raw(9);
+        register_known_thread(&mut sched, runnable);
+        sched.runqueue_push_back(runnable);
+        sched.fast_forward_to_next_finite_deadline(&global_time, pending);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), start);
+    }
+
+    /// A replay of a record that lists its jumps makes each where the
+    /// recording did, once its stream position reaches the jump's, and checks
+    /// it there: a jump past a deadline the replay knows is a desync but is
+    /// still made; one global time has passed is a desync and is not made.
+    /// Its own commits request no jump.
+    #[test]
+    fn a_replay_drives_the_recorded_jumps_and_checks_them() {
+        let config = Config::default();
+        let mut sched = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let start = global_time.lock().unwrap().as_nanos();
+        let at = |ns: u64| start + LogicalTime::from_nanos(ns);
+        let skip = |event, target| TimeSkip {
+            event,
+            target,
+            reason: TimeSkipReason::IdleGuestPollers,
+        };
+        sched.replayer = Some(crate::scheduler::replayer::Replayer::new([]));
+        sched.time_skip_mode = TimeSkipMode::Driven(
+            [
+                skip(4, at(1_000_000)),
+                skip(9, at(2_000_000)),
+                skip(9, at(3_000_000)),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let sleeper = DetTid::from_raw(7);
+        register_known_thread(&mut sched, sleeper);
+        sched.blocked.timed_waiters.insert(at(1_000_000), sleeper);
+
+        // An idle poller beside the sleeper requests nothing: jumps are driven.
+        let poller = DetTid::from_raw(3);
+        committing_idle_poller(&mut sched, poller, None);
+        let _ = turn_answer(&mut sched, poller);
+        assert_eq!(sched.pending_time_skip, None);
+
+        // Before its stream position the recorded jump waits.
+        sched.replayer.as_mut().unwrap().events_popped = 3;
+        sched.drive_recorded_time_skips(&global_time);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), start);
+
+        // At it, the jump is made, and its target is the sleeper's deadline.
+        sched.replayer.as_mut().unwrap().events_popped = 4;
+        sched.drive_recorded_time_skips(&global_time);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), at(1_000_000));
+        assert_eq!(sched.time_skip_desyncs, 0);
+
+        // Past both later jumps at once. The first goes to a deadline this
+        // replay does not know yet, which a thread may register after it: no
+        // desync. The second passes a deadline the replay knows, at 2.5 ms: a
+        // desync, still made.
+        sched.blocked.timed_waiters.remove(sleeper);
+        sched.blocked.timed_waiters.insert(at(2_500_000), sleeper);
+        sched.replayer.as_mut().unwrap().events_popped = 12;
+        sched.drive_recorded_time_skips(&global_time);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), at(3_000_000));
+        assert_eq!(sched.time_skip_desyncs, 1);
+
+        // The second jump's target was not known when it was made. A thread
+        // registering an earlier deadline afterwards shows the jump passed it.
+        sched.unconfirmed_time_skip = Some(skip(9, at(4_000_000)));
+        sched.blocked.timed_waiters.remove(sleeper);
+        sched.blocked.timed_waiters.insert(at(3_500_000), sleeper);
+        sched.check_unconfirmed_time_skip();
+        assert_eq!(sched.time_skip_desyncs, 2);
+        assert_eq!(sched.unconfirmed_time_skip, None);
+        // One registering the target itself confirms it.
+        sched.unconfirmed_time_skip = Some(skip(9, at(3_500_000)));
+        sched.check_unconfirmed_time_skip();
+        assert_eq!(sched.time_skip_desyncs, 2);
+        assert_eq!(sched.unconfirmed_time_skip, None);
+
+        // A recorded jump whose target global time has passed is not made.
+        sched.time_skip_mode =
+            TimeSkipMode::Driven([skip(12, at(2_500_000))].into_iter().collect());
+        sched.blocked.timed_waiters.remove(sleeper);
+        sched.drive_recorded_time_skips(&global_time);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), at(3_000_000));
+        assert_eq!(sched.time_skip_desyncs, 3);
+    }
+
+    /// A recorded FIFO-open jump waits, at its stream position, for the
+    /// replay's open to poll and find nothing else can run, as the recording's
+    /// did before it jumped: the open's turns store no record, so the position
+    /// is reached before them. Moving past the position without that poll is
+    /// a desync, and the jump is made late.
+    #[test]
+    fn a_recorded_fifo_jump_waits_for_the_opens_poll() {
+        let config = Config::default();
+        let mut sched = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let start = global_time.lock().unwrap().as_nanos();
+        let at = |ns: u64| start + LogicalTime::from_nanos(ns);
+        let fifo = |event, target| TimeSkip {
+            event,
+            target,
+            reason: TimeSkipReason::FifoOpenAlone,
+        };
+        sched.replayer = Some(crate::scheduler::replayer::Replayer::new([]));
+        sched.time_skip_mode = TimeSkipMode::Driven(
+            [fifo(4, at(1_000_000)), fifo(6, at(2_000_000))]
+                .into_iter()
+                .collect(),
+        );
+        let sleeper = DetTid::from_raw(5);
+        register_known_thread(&mut sched, sleeper);
+        sched.blocked.timed_waiters.insert(at(1_000_000), sleeper);
+        sched.replayer.as_mut().unwrap().events_popped = 4;
+        sched.drive_recorded_time_skips(&global_time);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), start);
+
+        // The open polls; nothing else can run before the sleeper's deadline.
+        let opener = DetTid::from_raw(3);
+        fifo_open_poll(&mut sched, opener);
+        let _ = turn_answer(&mut sched, opener);
+        assert_eq!(sched.jump_request, Some((4, TimeSkipReason::FifoOpenAlone)));
+        sched.drive_recorded_time_skips(&global_time);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), at(1_000_000));
+        assert_eq!(sched.time_skip_desyncs, 0);
+
+        // Past the next jump's position with no such poll: late, a desync.
+        sched.blocked.timed_waiters.remove(sleeper);
+        sched.replayer.as_mut().unwrap().events_popped = 7;
+        sched.drive_recorded_time_skips(&global_time);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), at(2_000_000));
+        assert_eq!(sched.time_skip_desyncs, 1);
+    }
+
+    /// Once a replay runs out of records, the run decides its own jumps: a
+    /// recorded jump at the end of the stream is still made, one beyond it is
+    /// a desync, and a replay of an older record ends the same way, without
+    /// one.
+    #[test]
+    fn a_replay_that_runs_out_of_records_decides_its_own_jumps() {
+        let config = Config::default();
+        let mut sched = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let start = global_time.lock().unwrap().as_nanos();
+        let at = |ns: u64| start + LogicalTime::from_nanos(ns);
+        let skip = |event, target| TimeSkip {
+            event,
+            target,
+            reason: TimeSkipReason::IdleGuestPollers,
+        };
+        sched.replayer = Some(crate::scheduler::replayer::Replayer::new([]));
+        sched.replayer.as_mut().unwrap().events_popped = 4;
+        sched.time_skip_mode = TimeSkipMode::Driven(
+            [skip(4, at(1_000_000)), skip(20, at(2_000_000))]
+                .into_iter()
+                .collect(),
+        );
+        sched.end_time_skip_replay_once_exhausted(&global_time);
+        assert_eq!(global_time.lock().unwrap().as_nanos(), at(1_000_000));
+        assert_eq!(sched.time_skip_desyncs, 1);
+        assert_eq!(sched.time_skip_mode, TimeSkipMode::Compute);
+
+        let mut sched = Scheduler::new(&config);
+        sched.replayer = Some(crate::scheduler::replayer::Replayer::new([]));
+        sched.time_skip_mode = TimeSkipMode::Legacy;
+        sched.end_time_skip_replay_once_exhausted(&global_time);
+        assert_eq!(sched.time_skip_desyncs, 0);
+        assert_eq!(sched.time_skip_mode, TimeSkipMode::Compute);
+    }
+
+    /// A run that replays nothing records in the current format, which lists
+    /// every jump, also when it made none; a replay of such a record is driven
+    /// by its (possibly empty) list, and a replay of a format-1 record keeps the
+    /// older rules (`TimeSkipMode::Legacy`) and records format 1.
+    #[test]
+    fn a_record_states_its_format_and_its_replay_follows_it() {
+        let recording = Config {
+            record_preemptions: true,
+            ..Config::default()
+        };
+        let written = Scheduler::new(&recording)
+            .preemption_writer
+            .take()
+            .unwrap()
+            .into_string();
+        let record: crate::preemptions::PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert!(record.lists_its_time_skips());
+
+        let dir = tempfile::tempdir().unwrap();
+        let replay = |record: crate::preemptions::PreemptionRecord| {
+            let path = dir.path().join("record.json");
+            std::fs::write(&path, serde_json::to_string(&record).unwrap()).unwrap();
+            Scheduler::new(&Config {
+                replay_schedule_from: Some(path),
+                record_preemptions: true,
+                ..Config::default()
+            })
+        };
+        let empty = crate::preemptions::PreemptionRecord::from_sched_events(Vec::new());
+        let mut current = replay(empty.clone().with_current_format());
+        assert_eq!(
+            current.time_skip_mode,
+            TimeSkipMode::Driven(VecDeque::new())
+        );
+        assert!(
+            current
+                .preemption_writer
+                .take()
+                .unwrap()
+                .into_string()
+                .contains("\"format_version\"")
+        );
+        let mut older = replay(empty);
+        assert_eq!(older.time_skip_mode, TimeSkipMode::Legacy);
+        assert!(
+            !older
+                .preemption_writer
+                .take()
+                .unwrap()
+                .into_string()
+                .contains("format_version")
+        );
+    }
+
+    /// A record whose jump moves to the indefinite deadline is refused, and a
+    /// replay never makes such a jump.
+    #[test]
+    fn a_jump_to_the_indefinite_deadline_is_refused() {
+        let record = crate::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+            .with_time_skips(vec![TimeSkip {
+                event: 0,
+                target: LogicalTime::INDEFINITE,
+                reason: TimeSkipReason::IdleGuestPollers,
+            }]);
+        assert!(record.validate_format().is_err());
+        let config = Config::default();
+        let mut sched = Scheduler::new(&config);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let start = global_time.lock().unwrap().as_nanos();
+        sched.make_recorded_time_skip(
+            &global_time,
+            TimeSkip {
+                event: 0,
+                target: LogicalTime::INDEFINITE,
+                reason: TimeSkipReason::IdleGuestPollers,
+            },
+        );
+        assert_eq!(global_time.lock().unwrap().as_nanos(), start);
+        assert_eq!(sched.time_skip_desyncs, 1);
+    }
+
+    /// A replay of a record without a jump list behaves as before such lists
+    /// existed: an idle poller requests no jump, and a FIFO open counts a
+    /// timed poll as able to run and moves only to a timer.
+    #[test]
+    fn a_replay_of_an_older_record_keeps_the_old_fast_forward() {
+        let mut sched = Scheduler::new(&Config::default());
+        sched.time_skip_mode = TimeSkipMode::Legacy;
+        let sleeper = DetTid::from_raw(7);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
+        let poller = DetTid::from_raw(3);
+        committing_idle_poller(&mut sched, poller, None);
+        let _ = turn_answer(&mut sched, poller);
+        assert_eq!(sched.pending_time_skip, None, "no idle-poller jump");
+
+        let mut sched = Scheduler::new(&Config::default());
+        sched.time_skip_mode = TimeSkipMode::Legacy;
+        queued_poller(&mut sched, DetTid::from_raw(5), true);
+        let sleeper = DetTid::from_raw(7);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
+        let opener = DetTid::from_raw(9);
+        fifo_open_poll(&mut sched, opener);
+        let _ = turn_answer(&mut sched, opener);
+        assert_eq!(
+            sched.pending_time_skip,
+            Some(PendingTimeSkip {
+                reason: TimeSkipReason::FifoOpenAlone,
+                poll_deadline: None,
+                requester: opener,
+            })
+        );
+
+        let mut sched = Scheduler::new(&Config::default());
+        sched.time_skip_mode = TimeSkipMode::Legacy;
+        timed_queued_poller(
+            &mut sched,
+            DetTid::from_raw(5),
+            LogicalTime::from_nanos(9_000_000),
+        );
+        let sleeper = DetTid::from_raw(7);
+        register_known_thread(&mut sched, sleeper);
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::from_nanos(2_000_000_000), sleeper);
+        let opener = DetTid::from_raw(9);
+        fifo_open_poll(&mut sched, opener);
+        let _ = turn_answer(&mut sched, opener);
+        assert_eq!(sched.pending_time_skip, None, "a timed poll can still run");
+    }
+
+    /// The recorder writes every jump into the record, so a replay can check
+    /// it, at the recorded stream's position where the jump is made.
+    #[test]
+    fn a_recorded_run_writes_its_time_skips() {
+        let config = Config::default();
+        let mut sched = Scheduler::new(&config);
+        let mut writer = PreemptionWriter::new(None);
+        for _ in 0..6 {
+            writer.insert_schedevent(SchedEvent::syscall(
+                DetTid::from_raw(3),
+                Sysno::poll,
+                SyscallPhase::Polling,
+            ));
+        }
+        sched.preemption_writer = Some(writer);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        let start = global_time.lock().unwrap().as_nanos();
+        let target = start + LogicalTime::from_nanos(1_500_000);
+        sched.fast_forward_to_next_finite_deadline(
+            &global_time,
+            PendingTimeSkip {
+                reason: TimeSkipReason::FifoOpenAlone,
+                poll_deadline: Some(target),
+                requester: DetTid::from_raw(3),
+            },
+        );
+        let written = sched.preemption_writer.take().unwrap().into_string();
+        let record: crate::preemptions::PreemptionRecord = serde_json::from_str(&written).unwrap();
+        assert_eq!(
+            record.time_skips(),
+            Some(
+                &[TimeSkip {
+                    event: 6,
+                    target,
+                    reason: TimeSkipReason::FifoOpenAlone,
+                }][..]
+            )
+        );
     }
 
     fn register_known_thread(sched: &mut Scheduler, tid: DetTid) {

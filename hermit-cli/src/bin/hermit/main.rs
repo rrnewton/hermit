@@ -81,6 +81,7 @@ mod strace;
 mod terminal_outcome_note;
 #[cfg(test)]
 mod test_isolation;
+mod time_skip_carry;
 mod tracing;
 mod verify;
 mod verify_inputs;
