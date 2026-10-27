@@ -1842,7 +1842,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And analyze's
     // rundata::tests::analyzer_reproducer_starts_in_the_trials_directory:
     // 1122, listed.
-    ("test.hermit_unit", 1122),
+    // rundata::tests::analyzer_reproducer_starts_in_the_trials_directory
+    // and a_reproducers_directory_is_quoted_for_the_shell: 1123, listed.
+    ("test.hermit_unit", 1123),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5630,7 +5632,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.hermit_unit runs all seven: 1115, listed
     // (1114 on main plus one).
     // And the same reproducer unit: 1116, listed.
-    ("test.hermit_unit_on_host", 1116),
+    // And the same two reproducer units: 1117, listed.
+    ("test.hermit_unit_on_host", 1117),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
