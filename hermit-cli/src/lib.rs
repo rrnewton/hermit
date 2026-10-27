@@ -11,6 +11,16 @@
 #![deny(clippy::all)]
 #![allow(clippy::uninlined_format_args)]
 
+// The application and the programmatic API share one library implementation.
+extern crate self as hermit;
+
+#[path = "bin/hermit/mod.rs"]
+pub mod app;
+
+// The actual included native consumer keeps its existing crate-root test hook.
+#[cfg(all(test, feature = "native-exec"))]
+pub(crate) use app::exec_initial;
+
 // This host library retains LiteInst code without becoming an in-guest Tool
 // image. Declare its historical backing explicitly and keep the host allocator;
 // LiteInst's allocation preflight still refuses non-Tool allocations.
@@ -4623,7 +4633,17 @@ pub fn run_with_backend_timeout(
 
 // TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
 #[doc(hidden)]
-pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig {
+pub fn prepare_backend_config(config: DetConfig, backend: Backend) -> DetConfig {
+    prepare_backend_config_with_capabilities(config, backend_capabilities(backend))
+}
+
+/// Prepare the common Detcore configuration from the physical runtime's
+/// declared facts. This is the same normalization used by builtin backends.
+#[doc(hidden)]
+pub fn prepare_backend_config_with_capabilities(
+    mut config: DetConfig,
+    capabilities: reverie::BackendCapabilities,
+) -> DetConfig {
     // Detcore reads what the selected backend can do, never which backend it is.
     // Each backend states its own facts in `Backend::capabilities()`.
     //
@@ -4646,7 +4666,7 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // TODO-HUMAN-REVIEW(PR-1152): KVM defers the vfork child spawn, so the child
     // registers its vfork barrier only after the parent posts BlockedExternalContinue. ptrace keeps
     // the parent kernel-blocked until the child registers.
-    config.backend = backend_capabilities(backend);
+    config.backend = capabilities;
     // Whether the run's process signals are tool-controlled is not decided
     // here: Detcore installs the backend's process signal control when the
     // backend offers it and threads are sequentialized, and reads the installed

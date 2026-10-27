@@ -771,14 +771,16 @@ mod tests {
                     ["--", "/usr/bin/nice", "-n", "1", "/bin/echo", "nice-ok"]
                         .map(std::ffi::OsString::from),
                 );
-                let matches = crate::Args::command().try_get_matches_from(argv).unwrap();
-                let mut args = crate::args_from_matches_with_clock(&matches, || {
+                let matches = crate::app::Args::command()
+                    .try_get_matches_from(argv)
+                    .unwrap();
+                let mut args = crate::app::args_from_matches_with_clock(&matches, || {
                     panic!("explicit epoch must not capture host time")
                 })
                 .unwrap();
-                crate::tracing::enable_log_cap_exit_bound();
+                crate::app::tracing::enable_log_cap_exit_bound();
                 args.global.prepare_log_budget().unwrap();
-                crate::tracing::register_invocation_log_budget(args.global.log_budget());
+                crate::app::tracing::register_invocation_log_budget(args.global.log_budget());
                 args.global.open_log_file().unwrap();
                 let result = args.command.main(&args.global);
                 // A later initialization/exec/verification error stays explicit.

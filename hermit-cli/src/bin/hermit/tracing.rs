@@ -1060,6 +1060,12 @@ pub(super) fn align_tracing_pid_baseline(backend: Backend) {
         return;
     }
 
+    align_namespace_pid_baseline();
+}
+
+/// Reserve the normal Linux tracing task slot before an external physical
+/// runtime starts coordinator tasks in the fresh PID namespace.
+pub(super) fn align_namespace_pid_baseline() {
     // SAFETY: getpid has no preconditions and cannot fail.
     if unsafe { libc::getpid() } != 1 {
         return;
@@ -1826,7 +1832,7 @@ mod tests {
             for run in 0..LOG_CAP_STRESS_RUNS {
                 let output = std::process::Command::new(std::env::current_exe().unwrap())
                     .args([
-                        "tracing::tests::the_final_message_is_the_last_line_when_writers_race_the_crossing",
+                        "app::tracing::tests::the_final_message_is_the_last_line_when_writers_race_the_crossing",
                         "--exact",
                         "--nocapture",
                         "--test-threads=1",

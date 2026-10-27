@@ -448,9 +448,9 @@ pub(crate) fn compare(
             VerificationConclusion {
                 verify_json,
                 comparison_options: comparison_options(record1.comparison),
-                #[cfg(feature = "dbt")]
-                dbt: None,
+                evidence: None,
                 backend,
+                application_backend: None,
                 passthru_opt: record1.passthru_opt,
             },
             CompletedVerificationRun {

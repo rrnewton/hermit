@@ -28824,6 +28824,9 @@ const FAULT_SITES_DRIVEN_ELSEWHERE: [(&str, &str); 2] = [
 #[test]
 fn no_container_site_is_unreachable_by_the_fault_injector() {
     use sha2::Digest;
+    const LIBRARY: &str = include_str!("../src/lib.rs");
+    const MAIN: &str = include_str!("../src/bin/hermit/main.rs");
+    const APP: &str = include_str!("../src/bin/hermit/mod.rs");
     const RECORD: &str = include_str!("../src/bin/hermit/record_start.rs");
     const CONTAINER: &str = include_str!("../src/bin/hermit/container.rs");
     const OWNER: &str = include_str!("../src/bin/hermit/owned_container.rs");
@@ -28831,8 +28834,44 @@ fn no_container_site_is_unreachable_by_the_fault_injector() {
     const REPLAY: &str = include_str!("../src/bin/hermit/replay.rs");
     const LIFECYCLE: &str = include_str!("../src/bin/hermit/cli_owned_lifecycle.rs");
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bin/hermit");
-    let sources = fault_sites::source_inventory(&root).expect("complete binary source inventory");
+    let library_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+    let library_kind = std::fs::symlink_metadata(&library_path)
+        .unwrap()
+        .file_type();
+    assert!(library_kind.is_file() && !library_kind.is_symlink());
+    let library_source = std::fs::read_to_string(&library_path).unwrap();
+    assert_eq!(
+        library_source, LIBRARY,
+        "library source changed since compilation"
+    );
+    assert!(fault_sites::binds_shared_app(&library_source));
+    let app_declaration = "#[path = \"bin/hermit/mod.rs\"]\npub mod app;";
+    assert_eq!(LIBRARY.matches(app_declaration).count(), 1);
+    for replacement in [
+        "#[path = \"bin/hermit/unexamined.rs\"]\npub mod app;",
+        "#[path = \"bin/hermit/../hermit/mod.rs\"]\npub mod app;",
+        "#[cfg(any())]\n#[path = \"bin/hermit/mod.rs\"]\npub mod app;",
+        "#[cfg_attr(unix, path = \"bin/hermit/mod.rs\")]\npub mod app;",
+        "#[path = \"bin/hermit/mod.rs\"]\n#[path = \"bin/hermit/mod.rs\"]\npub mod app;",
+        "pub mod app;",
+        "#[path = \"bin/hermit/mod.rs\"]\nmod app;",
+        "#[path = \"bin/hermit/mod.rs\"]\npub(crate) mod app;",
+        "#[path = \"bin/hermit/mod.rs\"]\npub mod other;",
+        "#[path = \"bin/hermit/mod.rs\"]\npub mod app {}",
+        "include!(\"bin/hermit/mod.rs\");",
+        "// #[path = \"bin/hermit/mod.rs\"] pub mod app;",
+    ] {
+        let mutant = LIBRARY.replacen(app_declaration, replacement, 1);
+        assert_ne!(mutant, LIBRARY);
+        assert!(!fault_sites::binds_shared_app(&mutant), "{replacement}");
+    }
+    let duplicate_app = format!("{LIBRARY}\n{app_declaration}\n");
+    assert!(!fault_sites::binds_shared_app(&duplicate_app));
+    let sources =
+        fault_sites::source_inventory(&root).expect("complete app and binary source inventory");
     for (name, compiled) in [
+        ("main.rs", MAIN),
+        ("mod.rs", APP),
         ("record_start.rs", RECORD),
         ("container.rs", CONTAINER),
         ("owned_container.rs", OWNER),
@@ -28886,6 +28925,10 @@ fn no_container_site_is_unreachable_by_the_fault_injector() {
         "byte-identical inputs must reuse only their pure inspections"
     );
     // These digests bind the exact in-memory bytes parsed above, not a later read.
+    eprintln!(
+        "FAULT_SITE_LIBRARY_SOURCE {}",
+        serde_json::json!({"path": "src/lib.rs", "bytes": library_source.len(), "sha256": format!("{:x}", sha2::Sha256::digest(library_source.as_bytes()))})
+    );
     for (name, source) in &sources {
         eprintln!(
             "FAULT_SITE_SOURCE {}",
@@ -28913,6 +28956,16 @@ fn no_container_site_is_unreachable_by_the_fault_injector() {
     // A newly created nested source is part of the filesystem universe too.
     let fixture = tempfile::tempdir().unwrap();
     std::fs::write(fixture.path().join("main.rs"), &sources["main.rs"]).unwrap();
+    std::fs::write(fixture.path().join("mod.rs"), &sources["mod.rs"]).unwrap();
+    for required in ["main.rs", "mod.rs"] {
+        std::fs::remove_file(fixture.path().join(required)).unwrap();
+        assert!(
+            fault_sites::source_inventory(fixture.path())
+                .unwrap_err()
+                .contains(required)
+        );
+        std::fs::write(fixture.path().join(required), &sources[required]).unwrap();
+    }
     std::fs::create_dir(fixture.path().join("new_module")).unwrap();
     std::fs::write(
         fixture.path().join("new_module/new_caller.rs"),
@@ -29035,6 +29088,7 @@ fn no_container_site_is_unreachable_by_the_fault_injector() {
         ),
         ("container.rs", "fn inject_test_fault(site: &str) {}"),
         ("main.rs", "mod owned_container;"),
+        ("mod.rs", "mod owned_container;"),
     ] {
         let mut changed = sources.clone();
         changed
@@ -29044,6 +29098,17 @@ fn no_container_site_is_unreachable_by_the_fault_injector() {
         assert!(
             check_sources(&changed).is_err(),
             "duplicate declaration: {file}: {extra}"
+        );
+    }
+    // The thin entrypoint and shared root both stay in the production audit.
+    for file in ["main.rs", "mod.rs"] {
+        let mut changed = sources.clone();
+        changed.get_mut(file).unwrap().push_str("\nfn root_boundary_mutant() { super::container::catch_child_panic_at(\"new.uncovered.root\", || Ok(())); }\n");
+        assert!(
+            check_sources(&changed)
+                .unwrap_err()
+                .contains("new.uncovered.root"),
+            "root source escaped coverage: {file}"
         );
     }
 
@@ -29379,6 +29444,11 @@ fn no_container_site_is_unreachable_by_the_fault_injector() {
         fault_sites::source_inventory(&root).unwrap(),
         sources,
         "source inventory changed during guard execution"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&library_path).unwrap(),
+        library_source,
+        "library app binding changed during guard execution"
     );
     let audit = audit.borrow();
     assert!(audit.requests() > audit.inspected_sources());

@@ -368,7 +368,7 @@ pub struct StartOpts {
     /// Why this host's retired-branch counter is inexact, if it is. Only the
     /// `--strict` refusal and the warning without `--strict` consult it; tests
     /// replace it to reach both on a host whose counters pass.
-    #[clap(skip = crate::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
+    #[clap(skip = crate::app::host_capabilities::host_inexact_branch_counter as fn() -> Option<String>)]
     inexact_branch_counter: fn() -> Option<String>,
 }
 
@@ -557,7 +557,7 @@ impl StartOpts {
         if !self.strict {
             return Ok(());
         }
-        crate::run::refuse_an_inexact_branch_counter(
+        crate::app::run::refuse_an_inexact_branch_counter(
             global.backend.unwrap_or_default(),
             self.inexact_branch_counter,
         )
@@ -577,8 +577,8 @@ impl StartOpts {
         warn: &mut dyn FnMut(&str),
     ) -> Result<(), Error> {
         self.refuse_strict_with_inexact_branch_counter(global)?;
-        if let Some(warning) = crate::run::warning_for_an_inexact_branch_counter(
-            crate::run::CounterReader::Recording,
+        if let Some(warning) = crate::app::run::warning_for_an_inexact_branch_counter(
+            crate::app::run::CounterReader::Recording,
             self.inexact_branch_counter,
         ) {
             warn(&warning);
@@ -588,7 +588,7 @@ impl StartOpts {
 
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
         hermit::cpu_profile_admission::check_record_or_replay(self.cpu_profile).map_err(
-            |refusal| Error::new(crate::container::PolicyRefusal).context(refusal.to_string()),
+            |refusal| Error::new(crate::app::container::PolicyRefusal).context(refusal.to_string()),
         )?;
         if self.cpu_profile == detcore_model::cpu_profile::CpuProfile::X86_64V3 {
             super::verify::CPU_PROFILE_V3_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -596,7 +596,7 @@ impl StartOpts {
             // once, and the recorder and replayer reuse the result.
             let request = hermit::cpu_profile_admission::record_or_replay_request(false);
             hermit::cpu_profile_admission::admit(&request).map_err(|refusal| {
-                Error::new(crate::container::PolicyRefusal)
+                Error::new(crate::app::container::PolicyRefusal)
                     .context(format!("--cpu-profile x86-64-v3 refused: {refusal}"))
             })?;
         }
@@ -607,10 +607,10 @@ impl StartOpts {
             validate_log_level(global)?;
             self.record_verify_run(directory, global)
         } else if !self.gdbex.is_empty() {
-            self.admit_branch_counter(global, &mut crate::tracing::write_stderr_diagnostic)?;
+            self.admit_branch_counter(global, &mut crate::app::tracing::write_stderr_diagnostic)?;
             self.record_verify_debug(global)
         } else {
-            self.admit_branch_counter(global, &mut crate::tracing::write_stderr_diagnostic)?;
+            self.admit_branch_counter(global, &mut crate::app::tracing::write_stderr_diagnostic)?;
             let hermit = HermitData::from(self.data_dir.as_ref());
             let record_timeout = self.record_timeout();
             let record_options = self.record_options();
@@ -696,7 +696,9 @@ impl StartOpts {
         // is the retired-branch counter, and installs no PMU configuration of
         // its own, so Reverie's validation can run here.
         if self.verify_json.is_some() {
-            crate::verify::record_exact_branch_counter(crate::run::branch_counter_verdict());
+            crate::app::verify::record_exact_branch_counter(
+                crate::app::run::branch_counter_verdict(),
+            );
         }
         // Stamp an explicit no-result BEFORE any fallible work: the record and
         // replay steps below can fail long before a verdict exists, and a reused
@@ -707,7 +709,7 @@ impl StartOpts {
         }
         // After the pending report carries the counter verdict, so that a
         // refused recording still says which counter it would have read.
-        self.admit_branch_counter(global, &mut crate::tracing::write_stderr_diagnostic)?;
+        self.admit_branch_counter(global, &mut crate::app::tracing::write_stderr_diagnostic)?;
         let strictness = self.verification_strictness();
         let ((global1, log1), (global2, log2)) =
             setup_double_run(global, "record", "replay", strictness)
@@ -819,10 +821,10 @@ impl StartOpts {
         run_global.log = Some(super::verify::verification_log_level(
             global.log, strictness, false,
         ));
-        let exact_branch_counter = crate::run::branch_counter_verdict();
+        let exact_branch_counter = crate::app::run::branch_counter_verdict();
         let result = match &first {
             None => self
-                .admit_branch_counter(global, &mut crate::tracing::write_stderr_diagnostic)
+                .admit_branch_counter(global, &mut crate::app::tracing::write_stderr_diagnostic)
                 .and_then(|()| self.record_into(&writer.path(verify_run::RECORDING), &run_global)),
             Some(first) => {
                 self.replay_from(&first.directory().join(verify_run::RECORDING), &run_global)
@@ -841,7 +843,7 @@ impl StartOpts {
                     Ok(output.status),
                 )
             }
-            Err(error) => (crate::run::verify_run_outcome_of(&error), Err(error)),
+            Err(error) => (crate::app::run::verify_run_outcome_of(&error), Err(error)),
         };
         writer.commit(&verify_run::VerifyRunRecord {
             schema: verify_run::SCHEMA,
@@ -1253,7 +1255,7 @@ mod tests {
         // invocation, and only the plain one may select autopilot (no GDB).
         use clap::CommandFactory;
         for (command, autopilot) in [(&plain, true), (&gdb, false), (&dap, false)] {
-            let matches = crate::Args::command()
+            let matches = crate::app::Args::command()
                 .try_get_matches_from(shell_words::split(command).unwrap())
                 .unwrap_or_else(|e| panic!("{command}: {e}"));
             let replay = matches.subcommand_matches("replay").expect(command);
@@ -1334,7 +1336,7 @@ mod tests {
             let error = options.main(&global).expect_err(path);
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{path}: {error:#}"
             );
@@ -1446,8 +1448,8 @@ mod tests {
         assert!(result.is_ok(), "{result:?}");
         assert_eq!(
             lines,
-            [crate::run::warning_for_an_inexact_branch_counter(
-                crate::run::CounterReader::Recording,
+            [crate::app::run::warning_for_an_inexact_branch_counter(
+                crate::app::run::CounterReader::Recording,
                 inexact
             )
             .unwrap()]
@@ -1458,7 +1460,7 @@ mod tests {
         assert!(
             result.is_err_and(|error| {
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some()
             }),
             "--strict refuses"

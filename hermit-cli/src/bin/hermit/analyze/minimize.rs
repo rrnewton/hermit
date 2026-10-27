@@ -27,8 +27,8 @@ use rand::RngExt as _;
 use rand::SeedableRng;
 use rand_pcg::Pcg64Mcg;
 
-use crate::analyze::types::AnalyzeOpts;
-use crate::global_opts::GlobalOpts;
+use crate::app::analyze::types::AnalyzeOpts;
+use crate::app::global_opts::GlobalOpts;
 
 /// Sanity check that a series of preemptions don't include duplicates and are monotonically increasing.
 fn sanity_preempts(vec: &[(LogicalTime, Priority)]) -> anyhow::Result<()> {
@@ -321,7 +321,7 @@ mod tests {
     use clap::Parser as _;
 
     use super::*;
-    use crate::container::LogCapExceeded;
+    use crate::app::container::LogCapExceeded;
 
     /// A minimization trial that `--max-log-bytes` ended stops the
     /// minimization and returns that error, still a `LogCapExceeded`, so main

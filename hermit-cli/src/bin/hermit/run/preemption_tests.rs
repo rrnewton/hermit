@@ -30,15 +30,15 @@ const TIMERLESS: [Backend; 5] = [
 // Exercise the process-boundary parser, including config expansion and source
 // capture. Derived Parser::parse_from alone deliberately has unknown provenance.
 fn parse_raw(argv: Vec<OsString>) -> RunOpts {
-    let command = crate::Args::command();
-    let expanded = crate::run_config::expand_argv(&command, &argv).unwrap();
+    let command = crate::app::Args::command();
+    let expanded = crate::app::run_config::expand_argv(&command, &argv).unwrap();
     let argv = expanded.as_deref().unwrap_or(&argv);
     let matches = command.try_get_matches_from(argv).unwrap();
-    let args = crate::args_from_matches_with_clock(&matches, || {
+    let args = crate::app::args_from_matches_with_clock(&matches, || {
         UNIX_EPOCH + Duration::from_secs(1_000_000_000)
     })
     .unwrap();
-    let crate::Subcommand::Run(mut run) = args.command else {
+    let crate::app::Subcommand::Run(mut run) = args.command else {
         panic!("expected run subcommand");
     };
     run.backend = args.global.backend;
@@ -252,27 +252,29 @@ fn write_input(directory: &Path, input: &str, stored: Option<&str>) -> std::path
     match input {
         "--config" => {
             let path = directory.join("run.yaml");
-            crate::run_config::write(&path, &saved).unwrap();
+            crate::app::run_config::write(&path, &saved).unwrap();
             path
         }
         "--from" => {
-            let (global, run_inputs) = crate::run_config::to_manifest_parts(&saved).unwrap();
-            let manifest = crate::manifest::Manifest::new(
+            let (global, run_inputs) = crate::app::run_config::to_manifest_parts(&saved).unwrap();
+            let manifest = crate::app::manifest::Manifest::new(
                 hermit::Id::unique(),
-                crate::manifest::Kind::InputsOnly,
-                crate::manifest::Command {
+                crate::app::manifest::Kind::InputsOnly,
+                crate::app::manifest::Command {
                     program: saved.program,
                     args: saved.args,
                     cwd: None,
                 },
-                crate::manifest::Inputs {
+                crate::app::manifest::Inputs {
                     global,
                     run: run_inputs,
                     host_drawn: Default::default(),
                 },
             );
-            let path = directory.join("id").join(crate::manifest::MANIFEST_NAME);
-            crate::manifest::write(&path, &manifest).unwrap();
+            let path = directory
+                .join("id")
+                .join(crate::app::manifest::MANIFEST_NAME);
+            crate::app::manifest::write(&path, &manifest).unwrap();
             path.parent().unwrap().to_path_buf()
         }
         _ => panic!("unexpected input option"),
@@ -367,7 +369,7 @@ fn inherited_maximum_stays_omitted_in_saved_config_and_reports_no_timer() {
         serde_json::to_value(&saved_before).unwrap()
     );
     assert!(!saved.run.contains_key("max-timeslice"));
-    let (_, manifest_inputs) = crate::run_config::to_manifest_parts(&saved).unwrap();
+    let (_, manifest_inputs) = crate::app::run_config::to_manifest_parts(&saved).unwrap();
     assert!(!manifest_inputs.contains_key("max-timeslice"));
     run.validate_args().unwrap();
     assert_eq!(
@@ -390,7 +392,7 @@ fn inherited_maximum_stays_omitted_in_saved_config_and_reports_no_timer() {
     );
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("effective.yaml");
-    crate::run_config::write(&path, &saved).unwrap();
+    crate::app::run_config::write(&path, &saved).unwrap();
     let reloaded = parse_raw(vec![
         "hermit".into(),
         "run".into(),
@@ -530,7 +532,7 @@ fn chaos_seeded_timeslice_refuses_an_explicit_maximum_or_target() {
 
 #[test]
 fn chaos_seeded_timeslice_requires_chaos() {
-    let error = crate::Args::command()
+    let error = crate::app::Args::command()
         .try_get_matches_from(["hermit", "run", "--chaos-seeded-timeslice", "/bin/true"])
         .unwrap_err();
     assert_eq!(
@@ -638,24 +640,24 @@ fn a_seeded_run_saved_without_a_timer_replays_with_its_maximum_disabled() {
     run.validate_args_with_perf_support(false).unwrap();
     assert_eq!(maximum(&run), None);
     let saved = run.saved_run_config().unwrap();
-    let (global, mut run_inputs) = crate::run_config::to_manifest_parts(&saved).unwrap();
+    let (global, mut run_inputs) = crate::app::run_config::to_manifest_parts(&saved).unwrap();
     assert_eq!(
         run_inputs.get("chaos-seeded-timeslice"),
         Some(&serde_json::Value::from(true))
     );
     run_inputs.insert(
-        crate::manifest::MAX_TIMESLICE_KEY.to_owned(),
+        crate::app::manifest::MAX_TIMESLICE_KEY.to_owned(),
         serde_json::Value::from("disabled"),
     );
-    let manifest = crate::manifest::Manifest::new(
+    let manifest = crate::app::manifest::Manifest::new(
         hermit::Id::unique(),
-        crate::manifest::Kind::InputsOnly,
-        crate::manifest::Command {
+        crate::app::manifest::Kind::InputsOnly,
+        crate::app::manifest::Command {
             program: saved.program,
             args: saved.args,
             cwd: None,
         },
-        crate::manifest::Inputs {
+        crate::app::manifest::Inputs {
             global,
             run: run_inputs,
             host_drawn: Default::default(),
@@ -665,8 +667,8 @@ fn a_seeded_run_saved_without_a_timer_replays_with_its_maximum_disabled() {
     let path = directory
         .path()
         .join("id")
-        .join(crate::manifest::MANIFEST_NAME);
-    crate::manifest::write(&path, &manifest).unwrap();
+        .join(crate::app::manifest::MANIFEST_NAME);
+    crate::app::manifest::write(&path, &manifest).unwrap();
     for timer_supported in [false, true] {
         let mut replay = parse_raw(vec![
             "hermit".into(),

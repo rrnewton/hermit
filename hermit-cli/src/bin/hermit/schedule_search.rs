@@ -1031,7 +1031,7 @@ mod tests {
     /// A trial that `--max-log-bytes` ended, as `classify_container_result`
     /// reports it to the trial's caller.
     fn log_cap_trial_error() -> anyhow::Error {
-        anyhow::Error::new(crate::container::LogCapExceeded)
+        anyhow::Error::new(crate::app::container::LogCapExceeded)
     }
 
     /// The search over the flaky_cas fixture, with a trial that fails at every
@@ -1079,7 +1079,7 @@ mod tests {
             let error = result.expect_err("a failed trial must end the search with an error");
             assert!(
                 error
-                    .downcast_ref::<crate::container::LogCapExceeded>()
+                    .downcast_ref::<crate::app::container::LogCapExceeded>()
                     .is_some(),
                 "trial {failing_trial} of {total_trials}: the error lost its type: {error:#}"
             );
@@ -1116,7 +1116,7 @@ mod tests {
 
         assert!(
             error
-                .downcast_ref::<crate::container::LogCapExceeded>()
+                .downcast_ref::<crate::app::container::LogCapExceeded>()
                 .is_some(),
             "{error:#}"
         );

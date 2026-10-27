@@ -27,19 +27,19 @@ use reverie::PrettyBacktrace;
 use reverie::process::ExitStatus;
 use reverie::process::Output;
 
-use crate::analyze::consts::*;
-use crate::analyze::rundata::RunData;
-use crate::analyze::types::AnalyzeOpts;
-use crate::analyze::types::ExitStatusConstraint;
-use crate::analyze::types::Report;
-use crate::analyze::types::ReportCriticalEvent;
-use crate::global_opts::GlobalOpts;
-use crate::logdiff::LogDiffCLIOpts;
-use crate::run::RunOpts;
-use crate::schedule_search::Config;
-use crate::schedule_search::CriticalSchedule;
-use crate::schedule_search::TrialOutcome;
-use crate::schedule_search::search_for_critical_schedule;
+use crate::app::analyze::consts::*;
+use crate::app::analyze::rundata::RunData;
+use crate::app::analyze::types::AnalyzeOpts;
+use crate::app::analyze::types::ExitStatusConstraint;
+use crate::app::analyze::types::Report;
+use crate::app::analyze::types::ReportCriticalEvent;
+use crate::app::global_opts::GlobalOpts;
+use crate::app::logdiff::LogDiffCLIOpts;
+use crate::app::run::RunOpts;
+use crate::app::schedule_search::Config;
+use crate::app::schedule_search::CriticalSchedule;
+use crate::app::schedule_search::TrialOutcome;
+use crate::app::schedule_search::search_for_critical_schedule;
 
 /// Compare only preemptions, not recorded schedules.
 fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
@@ -755,7 +755,7 @@ impl AnalyzeOpts {
         self.refuse_outputs_trials_overwrite()?;
         self.refuse_unqualified_trial_timeout()?;
         self.install_trial_pmu_config()?;
-        self.admit_branch_counter(&mut crate::tracing::write_stderr_diagnostic)?;
+        self.admit_branch_counter(&mut crate::app::tracing::write_stderr_diagnostic)?;
         // `--run1-schedule` and `--run2-schedule` parse but have no
         // implementation. Refuse them before any workspace or trial, rather
         // than panicking here.
@@ -768,7 +768,7 @@ impl AnalyzeOpts {
         .collect();
         if !unimplemented.is_empty() {
             return Err(
-                anyhow::Error::new(crate::container::PolicyRefusal).context(format!(
+                anyhow::Error::new(crate::app::container::PolicyRefusal).context(format!(
                     "hermit analyze does not implement {}. Identify a run by a preemption record \
                  (--run1-preemptions or --run2-preemptions, written by `hermit run \
                  --record-preemptions-to`) or by a seed (--run1-seed or --run2-seed).",
@@ -1049,8 +1049,8 @@ mod tests {
     use clap::Parser as _;
 
     use super::*;
-    use crate::container::LogCapExceeded;
-    use crate::container::PolicyRefusal;
+    use crate::app::container::LogCapExceeded;
+    use crate::app::container::PolicyRefusal;
 
     /// A search round whose trial `--max-log-bytes` ended stops the `--search`
     /// loop and returns that error, still a `LogCapExceeded`, so main reports
@@ -1128,8 +1128,8 @@ mod tests {
         argv.push("--");
         argv.extend(run_args);
         argv.push("/bin/true");
-        let args = crate::Args::try_parse_from(&argv).unwrap();
-        let crate::Subcommand::Analyze(mut options) = args.command else {
+        let args = crate::app::Args::try_parse_from(&argv).unwrap();
+        let crate::app::Subcommand::Analyze(mut options) = args.command else {
             panic!("{argv:?} is not analyze")
         };
         options.prepare(&args.global)?;
@@ -1166,8 +1166,8 @@ mod tests {
             argv.push("--");
             argv.extend(run_args);
             argv.push("/bin/true");
-            let args = crate::Args::try_parse_from(&argv).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let args = super::super::super::Args::try_parse_from(&argv).unwrap();
+            let super::super::super::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.prepare(&args.global).map(|_| options)
@@ -1258,8 +1258,8 @@ mod tests {
             let mut argv = vec!["hermit", "analyze", run1.as_str(), "--"];
             argv.extend(run_args);
             argv.push("/bin/true");
-            let args = crate::Args::try_parse_from(&argv).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let args = crate::app::Args::try_parse_from(&argv).unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.prepare(&args.global).map(|_| options)
@@ -1303,7 +1303,7 @@ mod tests {
             let error = prepare(run1, &run_args).unwrap_err();
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{error:#}"
             );
@@ -1336,8 +1336,8 @@ mod tests {
             let mut argv = vec!["hermit", "analyze", run1.as_str(), "--"];
             argv.extend(run_args);
             argv.push("/bin/true");
-            let args = crate::Args::try_parse_from(&argv).unwrap();
-            let crate::Subcommand::Analyze(mut options) = args.command else {
+            let args = crate::app::Args::try_parse_from(&argv).unwrap();
+            let crate::app::Subcommand::Analyze(mut options) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             options.prepare(&args.global).map(|_| options)
@@ -1361,7 +1361,7 @@ mod tests {
             let error = prepare(run1, &run_args).unwrap_err();
             assert!(
                 error
-                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .downcast_ref::<crate::app::container::PolicyRefusal>()
                     .is_some(),
                 "{error:#}"
             );
@@ -1560,8 +1560,8 @@ mod tests {
             let mut argv = vec!["hermit", "analyze"];
             argv.extend(options);
             argv.extend(["--", "/bin/true"]);
-            let args = crate::Args::try_parse_from(&argv).unwrap();
-            let crate::Subcommand::Analyze(mut analyze) = args.command else {
+            let args = crate::app::Args::try_parse_from(&argv).unwrap();
+            let crate::app::Subcommand::Analyze(mut analyze) = args.command else {
                 panic!("{argv:?} is not analyze")
             };
             let error = analyze.main(&args.global).unwrap_err();

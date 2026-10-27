@@ -177,7 +177,7 @@ fn reverie_timer_support() -> Result<(), TimerUnavailable> {
 }
 
 fn warn_bind_outside_tmp(bind: &Bind) {
-    crate::tracing::diagnostic_eprintln!(
+    crate::app::tracing::diagnostic_eprintln!(
         "WARNING: --bind target {} is outside guest /tmp, so this option has no \
          effect; files outside /tmp are already visible unless another mount hides them",
         bind.target.to_string_lossy()
@@ -203,7 +203,7 @@ fn read_verify_summary(path: &Path) -> Option<RunSummary> {
         Err(error) => {
             // Also runs between the two --verify runs, before run 2 can
             // cross --max-log-bytes.
-            crate::tracing::diagnostic_eprintln!(
+            crate::app::tracing::diagnostic_eprintln!(
                 "WARNING: verification runtime statistics unavailable: {error:#}"
             );
             None
@@ -835,7 +835,7 @@ fn echo_first_run_log(log1_path: &Path) -> Result<(), Error> {
             let _ = detcore::util::DroppingStderr.write_all(&bytes);
         }
         Ok(bytes) => std::io::stderr().write_all(&bytes)?,
-        Err(err) => crate::tracing::diagnostic_eprintln!(
+        Err(err) => crate::app::tracing::diagnostic_eprintln!(
             "WARNING: --print-verify-logs could not read first-run log {}: {}",
             log1_path.display(),
             err
@@ -863,14 +863,14 @@ impl Write for SharedLog {
 /// any comparison, independently of what reached the log: a lost or failed
 /// write can leave a log that reads complete.
 #[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-pub(super) struct RunLatches {
+pub struct RunLatches {
     /// Detcore's determinism-loss latch (`detcore::detlog::determinism_loss`):
     /// a record was lost, or an event happened at a moment the host chose.
     /// Under DBT it comes from the run's evidence instead
     /// (`backends::dbt_run_latches`), since the latch is in the guest.
-    pub(super) determinism_loss: Option<String>,
+    pub determinism_loss: Option<String>,
     /// The first write or flush error of the run's log ([`SharedLog::failure`]).
-    pub(super) log_sink_failure: Option<String>,
+    pub log_sink_failure: Option<String>,
 }
 
 /// One completed physical verification run. DBT's typed statistics remain
@@ -881,6 +881,27 @@ pub(super) struct VerificationRunOutput {
     pub(super) latches: RunLatches,
     #[cfg(feature = "dbt")]
     pub(super) dbt: Option<super::backends::DbtRunCompletion>,
+}
+
+impl VerificationRunOutput {
+    #[cfg(any(test, feature = "dbt"))]
+    pub(super) fn into_physical(
+        self,
+    ) -> super::backend_hook::PhysicalRun<super::backends::BuiltinPending> {
+        #[cfg(feature = "dbt")]
+        let pending = self.dbt.map_or(
+            super::backends::BuiltinPending::Common,
+            super::backends::BuiltinPending::Native,
+        );
+        #[cfg(not(feature = "dbt"))]
+        let pending = super::backends::BuiltinPending::Common;
+        super::backend_hook::PhysicalRun {
+            output: self.output,
+            skid_overshoots: self.skid_overshoots,
+            latches: self.latches,
+            pending,
+        }
+    }
 }
 
 /// A verification run recorded a determinism loss ([`RunLatches`]), so it is
@@ -1170,6 +1191,16 @@ pub struct RunOpts {
     #[clap(skip)]
     backend: Option<Backend>,
 
+    /// A statically selected executable's backend, independent of the built-in
+    /// enum. Ordinary `hermit` never sets this field.
+    #[clap(skip)]
+    application_backend: Option<&'static str>,
+
+    /// The physical adapter's immutable capabilities. Only a
+    /// ContainerScope clone carries it; builtin launch policy is unchanged.
+    #[clap(skip)]
+    adapter_capabilities: Option<reverie::BackendCapabilities>,
+
     /// Program to run. Bare names are resolved using the guest PATH. Paths under host `/tmp` are
     /// hidden by Hermit's isolated `/tmp` unless `--tmp=/tmp` or an explicit mount exposes them.
     #[clap(value_name = "PROGRAM")]
@@ -1324,9 +1355,9 @@ pub struct RunOpts {
     epoch_from_recording: bool,
 
     /// Runtime-only: the options this invocation was given, captured from the
-    /// parsed command line for `--save-config` (see [`crate::run_config::capture`]).
+    /// parsed command line for `--save-config` (see [`crate::app::run_config::capture`]).
     #[clap(skip)]
-    config_capture: Option<crate::run_config::RunConfig>,
+    config_capture: Option<crate::app::run_config::RunConfig>,
 
     /// Clap provenance, captured before values are lowered to DetConfig.
     /// Programmatic callers have an effective configuration and must not have
@@ -1829,7 +1860,7 @@ pub struct RunOpts {
     /// writes none. Without this option, the `manifest` key of `~/.config/hermit/config.yaml`
     /// decides, then the `HERMIT_MANIFEST` environment variable.
     #[clap(long, value_name = "POLICY", value_enum)]
-    manifest: Option<crate::manifest::ManifestPolicy>,
+    manifest: Option<crate::app::manifest::ManifestPolicy>,
 
     /// Runtime-only: where this run's manifest was written, once it is.
     #[clap(skip)]
@@ -1838,7 +1869,7 @@ pub struct RunOpts {
     /// Runtime-only: a network recording's manifest, written only once the
     /// run has written its trace (`finish_manifest`).
     #[clap(skip)]
-    pending_network_manifest: Option<crate::manifest::Manifest>,
+    pending_network_manifest: Option<crate::app::manifest::Manifest>,
 
     /// Read-only overlay that exposes the rewritten ELF at its original guest path.
     #[clap(skip)]
@@ -2524,11 +2555,11 @@ fn vmm_time_warning_silent_for_non_vmm_programs() {
 fn run_opts_for(argv: &[&str]) -> RunOpts {
     use clap::CommandFactory;
     use clap::FromArgMatches;
-    let matches = crate::Args::command()
+    let matches = crate::app::Args::command()
         .try_get_matches_from(argv)
         .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
-    let args = crate::Args::from_arg_matches(&matches).unwrap();
-    let crate::Subcommand::Run(mut run) = args.command else {
+    let args = crate::app::Args::from_arg_matches(&matches).unwrap();
+    let crate::app::Subcommand::Run(mut run) = args.command else {
         panic!("{argv:?} is not a `run` command");
     };
     run.capture_max_timeslice_source(matches.subcommand_matches("run").unwrap());
@@ -2560,8 +2591,8 @@ fn exec_stop_admission_reads_the_global_backend_before_launch() {
             argv.push("--verify");
         }
         argv.extend(["--", "/bin/true"]);
-        let args = crate::Args::try_parse_from(argv).unwrap();
-        let crate::Subcommand::Run(mut run) = args.command else {
+        let args = crate::app::Args::try_parse_from(argv).unwrap();
+        let crate::app::Subcommand::Run(mut run) = args.command else {
             unreachable!()
         };
         assert!(run.backend.is_none(), "backend is a global CLI input");
@@ -2691,7 +2722,7 @@ fn exec_stop_opt_in_is_uniform_and_retained_in_reproducers() {
 
 #[test]
 fn exec_stop_direct_entries_refuse_before_launch_work() {
-    let args = crate::Args::try_parse_from([
+    let args = crate::app::Args::try_parse_from([
         "hermit",
         "run",
         "--in-guest-exec-stop",
@@ -2700,7 +2731,7 @@ fn exec_stop_direct_entries_refuse_before_launch_work() {
         "/nonexistent/guest",
     ])
     .unwrap();
-    let crate::Subcommand::Run(mut options) = args.command else {
+    let crate::app::Subcommand::Run(mut options) = args.command else {
         unreachable!()
     };
     // main must refuse before it can spawn the DAP supervisor; validation
@@ -2931,11 +2962,11 @@ fn saved_config_records_the_seed_seed_from_chose() {
         "--save-config=unused.yaml",
         "/bin/true",
     ];
-    let matches = <crate::Args as clap::CommandFactory>::command()
+    let matches = <crate::app::Args as clap::CommandFactory>::command()
         .try_get_matches_from(argv)
         .unwrap();
-    let args = crate::args_from_matches_with_clock(&matches, SystemTime::now).unwrap();
-    let crate::Subcommand::Run(mut ro) = args.command else {
+    let args = crate::app::args_from_matches_with_clock(&matches, SystemTime::now).unwrap();
+    let crate::app::Subcommand::Run(mut ro) = args.command else {
         panic!("{argv:?} is not a `run` command");
     };
     let before = ro.saved_run_config().unwrap();
@@ -2952,11 +2983,11 @@ fn saved_config_records_the_seed_seed_from_chose() {
 #[test]
 fn saved_config_records_an_epoch_adopted_from_a_recording() {
     let argv = ["hermit", "run", "--save-config=unused.yaml", "/bin/true"];
-    let matches = <crate::Args as clap::CommandFactory>::command()
+    let matches = <crate::app::Args as clap::CommandFactory>::command()
         .try_get_matches_from(argv)
         .unwrap();
-    let mut args = crate::args_from_matches_with_clock(&matches, SystemTime::now).unwrap();
-    let crate::Subcommand::Run(ro) = &mut args.command else {
+    let mut args = crate::app::args_from_matches_with_clock(&matches, SystemTime::now).unwrap();
+    let crate::app::Subcommand::Run(ro) = &mut args.command else {
         panic!("{argv:?} is not a `run` command");
     };
     // What `adopt_replayed_schedule_epoch` leaves behind.
@@ -4724,17 +4755,17 @@ fn a_manifest_leaves_out_the_work_span_report() {
         "--work-span-report=/var/ws.json",
         "/bin/true",
     ];
-    let matches = <crate::Args as clap::CommandFactory>::command()
+    let matches = <crate::app::Args as clap::CommandFactory>::command()
         .try_get_matches_from(argv)
         .unwrap();
-    let args = crate::args_from_matches_with_clock(&matches, SystemTime::now).unwrap();
-    let crate::Subcommand::Run(ro) = args.command else {
+    let args = crate::app::args_from_matches_with_clock(&matches, SystemTime::now).unwrap();
+    let crate::app::Subcommand::Run(ro) = args.command else {
         panic!("{argv:?} is not a `run` command");
     };
     let config = ro.saved_run_config().unwrap();
-    let (mut global, mut run) = crate::run_config::to_manifest_parts(&config).unwrap();
+    let (mut global, mut run) = crate::app::run_config::to_manifest_parts(&config).unwrap();
     assert!(run.contains_key("work-span-report"), "{run:?}");
-    crate::manifest::drop_outputs(&mut global, &mut run);
+    crate::app::manifest::drop_outputs(&mut global, &mut run);
     assert!(!run.contains_key("work-span-report"), "{run:?}");
 }
 
@@ -4988,6 +5019,19 @@ fn cap_preemption_charge_parses_round_trips_and_is_refused_where_inert() {
             && error.contains("Give a --max-timeslice"),
         "{error}"
     );
+
+    let mut application =
+        RunOpts::parse_from(["fakehermit", "--cap-preemption-charge", "fakeprog"]);
+    application.select_application_backend("dynamorio").unwrap();
+    let error = application
+        .refuse_unqualified_application_options()
+        .unwrap_err();
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    assert!(
+        error.to_string().contains("--cap-preemption-charge"),
+        "{error:#}"
+    );
+    assert!(error.to_string().contains("`dynamorio`"), "{error:#}");
 
     for (argv, expected) in [
         (
@@ -5371,9 +5415,9 @@ fn log_cap_refusal_for(global: &[&str], options: &[&str]) -> Result<(), Error> {
     argv.push("run");
     argv.extend_from_slice(options);
     argv.push("fakeprog");
-    let args = crate::Args::try_parse_from(&argv)
+    let args = crate::app::Args::try_parse_from(&argv)
         .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
-    let crate::Subcommand::Run(mut run) = args.command else {
+    let crate::app::Subcommand::Run(mut run) = args.command else {
         panic!("{argv:?} is not a `run` command");
     };
     run.backend = args.global.backend;
@@ -6268,6 +6312,16 @@ fn abstract_bind_notice_is_on_only_for_a_host_network_run_on_ptrace() {
     // Only the ptrace backend: KVM is not covered, and on the in-guest
     // backends Detcore's stderr would be the guest's.
     assert!(!resolved(&["--backend", "kvm"], &["--network=host"]));
+
+    let mut application = RunOpts::parse_from(["fakehermit", "--network=host", "fakeprog"]);
+    application.select_application_backend("dynamorio").unwrap();
+    application.validate_args_with_perf_support(true).unwrap();
+    assert!(
+        !application
+            .det_opts
+            .det_config
+            .notice_host_network_abstract_binds
+    );
 }
 
 /// `--analyze-networking` needs the isolated namespace, which `--gdbserver`
@@ -6540,7 +6594,7 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         !help.contains("--backend <BACKEND>"),
         "run help still offers a subcommand-level --backend:\n{help}"
     );
-    let top_level = crate::Args::command().render_long_help().to_string();
+    let top_level = crate::app::Args::command().render_long_help().to_string();
     for expected in [
         "--backend <BACKEND>",
         "Select the process instrumentation backend",
@@ -6712,7 +6766,7 @@ fn validate_executable(
             );
         }
         let interpreter_host = guest_root
-            .map(|root| crate::image::resolve_in_rootfs(root, &interpreter))
+            .map(|root| crate::app::image::resolve_in_rootfs(root, &interpreter))
             .unwrap_or_else(|| interpreter.clone());
         let interpreter_metadata = fs::metadata(&interpreter_host).with_context(|| {
             format!(
@@ -7390,11 +7444,117 @@ impl RunOpts {
         self.backend.unwrap_or_default()
     }
 
+    pub(super) fn execution_backend_name(&self) -> &str {
+        self.application_backend
+            .unwrap_or_else(|| self.selected_backend().as_str())
+    }
+
+    pub(super) fn adapter_program(&self) -> &Path {
+        &self.program
+    }
+
+    pub(super) fn adapter_arguments(&self) -> &[String] {
+        &self.args
+    }
+
+    pub(super) fn adapter_working_directory(&self) -> Option<&Path> {
+        self.workdir.as_deref().map(Path::new)
+    }
+
+    pub(super) fn adapter_saved_directory(&self) -> Option<&Path> {
+        self.verify_run.as_deref()
+    }
+
+    pub(super) fn adapter_engagement_path(&self) -> Option<&Path> {
+        self.backend_engagement_json.as_deref()
+    }
+
+    pub(super) fn adapter_verbose_verification(&self) -> bool {
+        self.verify_verbose
+    }
+
+    pub(super) fn adapter_verification_json(&self) -> Option<&Path> {
+        self.verify_json.as_deref()
+    }
+
+    pub(super) fn adapter_uses_namespace(&self) -> bool {
+        !self.no_namespace
+    }
+
     /// Apply the global backend selection for a `RunOpts` built outside
     /// [`RunOpts::main`], such as `hermit analyze`'s trial options, so that
     /// validation and reproducers see the backend the run will use.
     pub(crate) fn set_backend(&mut self, backend: Option<Backend>) {
         self.backend = backend;
+    }
+
+    /// An extension executable selects its one linked adapter. It cannot be
+    /// redirected to a built-in backend by a contradictory global option.
+    pub(super) fn select_application_backend(&mut self, name: &'static str) -> Result<(), Error> {
+        super::backend_hook::validate_name(name)?;
+        anyhow::ensure!(
+            self.backend.is_none(),
+            "this executable selects backend `{name}`; do not also pass --backend"
+        );
+        self.application_backend = Some(name);
+        if let Some(config) = &mut self.config_capture {
+            config.global.insert("backend".to_owned(), name.into());
+        }
+        Ok(())
+    }
+
+    /// A new executable does not inherit a ptrace-specific qualification just
+    /// because the built-in default enum still exists in this compatibility
+    /// step. Refuse unsupported core runtime switches before reading stdin.
+    fn refuse_unqualified_application_options(&self) -> Result<(), Error> {
+        let Some(name) = self.application_backend else {
+            return Ok(());
+        };
+        if self.verify_run.is_some() {
+            return Err(Error::new(PolicyRefusal).context(format!(
+                "--verify-run is not yet supported by executable-selected backend `{name}`: \
+                 its saved-record and offline-comparison bridge is not implemented; \
+                 use live --verify instead"
+            )));
+        }
+        let config = &self.det_opts.det_config;
+        let options = [
+            (self.namespace_only, "--namespace-only"),
+            (self.strace_only, "--strace-only"),
+            (self.image.is_some(), "--image"),
+            (self.dap_listen.is_some(), "--dap-listen"),
+            (config.gdbserver, "--gdbserver"),
+            (self.in_guest_exec_stop, "--in-guest-exec-stop"),
+            (self.skid_margin.is_some(), "--skid-margin"),
+            (self.fatal_core_dir.is_some(), "--fatal-core-dir"),
+            (self.happens_before.is_some(), "--happens-before"),
+            (config.futex_wake_yields, "--futex-wake-yields"),
+            (config.cap_preemption_charge, "--cap-preemption-charge"),
+            (config.signal_at.is_some(), "--signal-at"),
+            (config.pipe_wake_latency.is_some(), "--pipe-wake-latency"),
+            (config.work_span_report.is_some(), "--work-span-report"),
+            (self.record_networking.is_some(), "--record-networking"),
+            (self.replay_networking.is_some(), "--replay-networking"),
+            (
+                config.network_trace.mode != NetworkTraceMode::Off,
+                "network tracing",
+            ),
+            (!config.cpu_profile.is_default(), "--cpu-profile"),
+            (config.virtual_cpus.is_some(), "--virtual-cpus"),
+        ];
+        for (requested, option) in options {
+            if requested {
+                return Err(Error::new(PolicyRefusal).context(format!(
+                    "{option} is not qualified for executable-selected backend `{name}`"
+                )));
+            }
+        }
+        #[cfg(feature = "native-exec")]
+        anyhow::ensure!(
+            self.native_exec_inputs.is_none(),
+            "an external physical adapter cannot consume a native exec enrollment"
+        );
+        Ok(())
     }
 
     /// Lower `--strace-only` onto exactly the options its help names: `--tmp=/tmp
@@ -7880,6 +8040,11 @@ impl RunOpts {
         if max_log_bytes.is_none() {
             return Ok(());
         }
+        if let Some(name) = self.application_backend {
+            return Err(Error::new(PolicyRefusal).context(format!(
+                "--max-log-bytes is not qualified to stop executable-selected backend `{name}`"
+            )));
+        }
         let refusal = Self::log_cap_refusal(self.selected_backend(), self.no_namespace);
         match refusal {
             None => Ok(()),
@@ -7921,8 +8086,11 @@ impl RunOpts {
         // constructing Detcore. Reading the pre-normalization CLI value here
         // would let a backend disable an observation while the verdict still
         // reported that it participated.
-        let config =
-            hermit::prepare_backend_config(self.effective_det_config(), self.runtime_backend());
+        let config = if self.application_backend.is_some() {
+            self.effective_det_config()
+        } else {
+            hermit::prepare_backend_config(self.effective_det_config(), self.runtime_backend())
+        };
         ComparisonOptions {
             verbose: self.verify_verbose,
             strictness: self.verification_strictness(),
@@ -8038,6 +8206,19 @@ impl RunOpts {
     }
 
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        self.main_with_backend(global, &super::backends::BuiltinAdapter, ())
+    }
+
+    pub(super) fn main_with_backend<A: super::backend_hook::BackendAdapter>(
+        &mut self,
+        global: &GlobalOpts,
+        adapter: &A,
+        adapter_options: A::Options,
+    ) -> Result<ExitStatus, Error> {
+        // An executable-selected adapter has no DAP/namespace-only dispatch.
+        // Refuse those switches before the built-in dispatcher can launch a
+        // supervisor, lower a shorthand or read any input.
+        self.refuse_unqualified_application_options()?;
         // Admission must see the actual global backend before any launch.
         match self
             .dispatch_before_validation(global.backend, std::env::var_os(DAP_LISTEN_INNER_ENV))?
@@ -8045,7 +8226,7 @@ impl RunOpts {
             RunDispatch::DapSupervisor => return self.serve_dap(),
             RunDispatch::Run => {}
         }
-        let result = self.main_without_core_cleanup(global);
+        let result = self.main_without_core_cleanup(global, adapter, adapter_options);
         if let Ok(status) = &result {
             self.finish_manifest(*status);
         }
@@ -8111,12 +8292,18 @@ impl RunOpts {
         )
     }
 
-    fn main_without_core_cleanup(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+    fn main_without_core_cleanup<A: super::backend_hook::BackendAdapter>(
+        &mut self,
+        global: &GlobalOpts,
+        adapter: &A,
+        adapter_options: A::Options,
+    ) -> Result<ExitStatus, Error> {
         // Set up an early tracing option before we're ready to set the global default:
 
         // The backend is a global option (`hermit --backend X run ...`), the only
         // place it can be given.
         self.set_backend(global.backend);
+        self.refuse_unqualified_application_options()?;
         // Static native-option policy belongs before stdin reservation,
         // availability probes, or backend-specific preprocessing/dispatch.
         #[cfg(feature = "native-exec")]
@@ -8199,7 +8386,7 @@ impl RunOpts {
         // As `--seed-from` prints the seed it chose: the value pins this
         // run's maximum with `--max-timeslice`.
         if let Some(drawn) = self.seeded_chaos_timeslice() {
-            crate::tracing::diagnostic_eprintln!(
+            crate::app::tracing::diagnostic_eprintln!(
                 "[hermit] --chaos-seeded-timeslice: scheduler seed {} drew --max-timeslice={}",
                 self.det_opts.det_config.sched_seed(),
                 drawn
@@ -8225,7 +8412,7 @@ impl RunOpts {
         // beside the warning that already prints the inputs, so a data
         // directory that cannot be written does not stop the run.
         let recording = self.begin_manifest(global).unwrap_or_else(|error| {
-            crate::tracing::diagnostic_eprintln!(
+            crate::app::tracing::diagnostic_eprintln!(
                 "hermit: WARNING: this run's manifest was not written: {error:#}"
             );
             None
@@ -8236,7 +8423,9 @@ impl RunOpts {
         // and before stdin is read.
         self.refuse_liteinst_without_the_feature()?;
         let verification = self.verify || self.verify_run.is_some();
-        let dbt_verification_stdin = if verification && self.selected_backend() == Backend::Dbt {
+        let dbt_verification_stdin = if (verification && self.selected_backend() == Backend::Dbt)
+            || self.application_backend.is_some()
+        {
             // DBT streams this reservation during live or saved-run execution.
             // The common live owner replays it without pre-draining stdin;
             // library output-capturing backends reserve their input below.
@@ -8257,7 +8446,7 @@ impl RunOpts {
         };
 
         if self.allow_unsupported_syscalls {
-            crate::tracing::diagnostic_eprintln!(
+            crate::app::tracing::diagnostic_eprintln!(
                 "WARNING: --allow-unsupported-syscalls permits unmodeled syscalls to reach the \
                  host; a successful exit does not establish complete deterministic execution."
             );
@@ -8294,7 +8483,11 @@ impl RunOpts {
         // different verdict per build
         // (https://github.com/rrnewton/hermit/issues/3418).
         self.ensure_timeout_supported()?;
-        if !self.namespace_only && backend != Backend::Kvm && !self.uses_native_exec() {
+        if !self.namespace_only
+            && backend != Backend::Kvm
+            && !self.uses_native_exec()
+            && self.application_backend.is_none()
+        {
             // E9patch's own availability check covers both its ptrace runtime and
             // the `e9patch` cargo feature (it reports "not included in this build"
             // when the feature is disabled), so it no longer needs a special case.
@@ -8331,10 +8524,10 @@ impl RunOpts {
         if let Some(path) = self.verify_json.as_deref()
             && self.arms_reverie_ptrace_pmu_timer()
         {
-            crate::verify::record_exact_branch_counter(branch_counter_verdict());
-            crate::verify::write_pending_verification_json(path)?;
+            crate::app::verify::record_exact_branch_counter(branch_counter_verdict());
+            crate::app::verify::write_pending_verification_json(path)?;
         }
-        self.admit_branch_counter(&mut crate::tracing::write_stderr_diagnostic)?;
+        self.admit_branch_counter(&mut crate::app::tracing::write_stderr_diagnostic)?;
         // The KVM backend reaches real reverie-kvm code from its dispatch path
         // and reports an accurate, program-specific error there, so it is not
         // pre-empted by the generic availability probe above. E9patch is a CLI
@@ -8359,6 +8552,7 @@ impl RunOpts {
         }
         let private_engagement_summary = if self.backend_engagement_json.is_some()
             && backend == Backend::Ptrace
+            && self.application_backend.is_none()
             && self.summary_json.is_none()
         {
             let file = private_backend_engagement_summary()?;
@@ -8374,60 +8568,43 @@ impl RunOpts {
         // Last, so that a run refused above creates no directory.
         self.open_fatal_core_dir()?;
 
-        // Ordinary DBT execution keeps its physical launcher. Verification
-        // joins the common two-run owner through the same launcher's one-run seam.
-        if backend == Backend::Dbt && !self.verify {
+        // Ordinary and saved operations retain the existing physical launcher's
+        // preparation/writer order. Live pairs join the one common verifier.
+        if (backend == Backend::Dbt || self.application_backend.is_some()) && !self.verify {
             self.warn_no_namespace();
-            #[cfg(feature = "dbt")]
-            {
-                if super::backends::dbt_log_file_is_refused(
-                    global.log_file.is_some(),
-                    self.verify_run.is_some(),
-                ) {
-                    return Err(Error::msg(super::backends::DBT_LOG_FILE_REFUSAL));
-                }
-                let invocation = self.dbt_invocation()?;
-                if let Some(directory) = &self.verify_run {
-                    return invocation.verify_run(
-                        directory,
-                        global.log,
-                        self.verify_verbose,
-                        dbt_verification_stdin,
-                        self,
-                    );
-                }
-                // The coordinator runs in this process, so this is where its
-                // warnings print, the in-guest ones it receives included
-                // (detcore::guest_log). At WARN at most: DBT's own channel
-                // already prints the run's INFO and DEBUG records from the
-                // guest, and printing the coordinator's per-turn records too
-                // would put a stderr write on every scheduler turn, which
-                // slowed loaded runs past their bounds. `--log=error` still
-                // lowers it. A verification run keeps its log in the run's
-                // evidence instead.
-                let mut warnings = global.clone();
-                warnings.log = Some(
-                    global
-                        .log
-                        .unwrap_or(tracing::level_filters::LevelFilter::WARN)
-                        .min(tracing::level_filters::LevelFilter::WARN),
-                );
-                let _tracing = warnings.init_tracing_for_backend(backend);
-                return invocation.run(
-                    self.summary,
-                    self.backend_engagement_json.as_deref(),
-                    global.log,
-                    global.log_file.as_deref(),
-                );
-            }
-            #[cfg(not(feature = "dbt"))]
-            return Err(Error::msg("DBT support was not included in this build"));
+            let mode = if self.verify_run.is_some() {
+                super::backend_hook::Mode::SavedVerification
+            } else {
+                super::backend_hook::Mode::Ordinary
+            };
+            let physical = self
+                .application_backend
+                .map(|_| super::backend_hook::PreparedPhysical::new(self, A::CAPABILITIES));
+            let mut session = adapter.prepare(
+                adapter_options,
+                super::backend_hook::Prepare {
+                    options: self,
+                    global,
+                    mode,
+                    stdin: dbt_verification_stdin,
+                    physical: physical.as_ref(),
+                },
+            )?;
+            return adapter
+                .execute(
+                    &mut session,
+                    super::backend_hook::Execute {
+                        mode,
+                        verification: None,
+                    },
+                )?
+                .finished(mode);
         }
 
         if backend == Backend::Liteinst && self.uses_in_guest_liteinst() {
             // Nothing has started the guest yet, so this names the
             // configuration, not an outcome.
-            crate::tracing::diagnostic_eprintln!(
+            crate::app::tracing::diagnostic_eprintln!(
                 "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool"
             );
         }
@@ -8436,12 +8613,12 @@ impl RunOpts {
             && !self.in_guest_exec_stop
         {
             if self.uses_native_exec() {
-                crate::tracing::diagnostic_eprintln!(
+                crate::app::tracing::diagnostic_eprintln!(
                     "hermit: [in-guest-trap] selected: the embedded native runtime is to host \
                      the Detcore Tool, with syscall site patching off"
                 );
             } else {
-                crate::tracing::diagnostic_eprintln!(
+                crate::app::tracing::diagnostic_eprintln!(
                     "hermit: [in-guest-trap] selected: the guest preload is to host the Detcore Tool, \
                      with syscall site patching off (REVERIE_LITEINST_SITE_PATCHING=0)"
                 );
@@ -8479,7 +8656,7 @@ impl RunOpts {
         if self.namespace_only {
             self.run_with_namespace_only(global)
         } else if self.verify {
-            self.verify(global, dbt_verification_stdin)
+            self.verify(global, dbt_verification_stdin, adapter, adapter_options)
         } else if let Some(directory) = &self.verify_run {
             self.verify_run(directory, global)
         } else {
@@ -8526,7 +8703,8 @@ impl RunOpts {
     /// that runtime even with `--namespace-only`: only `main` dispatches the
     /// flag to `run_with_namespace_only`.
     fn backend_arms_reverie_ptrace_pmu_timer(&self) -> bool {
-        hermit::backend_delivers_preemption_timer(self.selected_backend())
+        self.application_backend.is_none()
+            && hermit::backend_delivers_preemption_timer(self.selected_backend())
     }
 
     /// [`Self::validate_args_with_timer_support`] for tests, with a missing
@@ -8881,7 +9059,7 @@ impl RunOpts {
                 SeedFrom::SystemRandom => rand::random::<u64>(),
             };
             // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
-            crate::tracing::diagnostic_eprintln!(
+            crate::app::tracing::diagnostic_eprintln!(
                 "[hermit] auto setting --seed {0:?} --sched-seed {0:?}",
                 seed
             );
@@ -8917,14 +9095,14 @@ impl RunOpts {
             // the container starts, so a blocked write would keep the run from ever reaching
             // the cap.
             match unavailable {
-                TimerUnavailable::NoPerfEvents => crate::tracing::write_stderr_diagnostic(
+                TimerUnavailable::NoPerfEvents => crate::app::tracing::write_stderr_diagnostic(
                     "WARNING: --max-timeslice requires user-space perf counters, but \
                      perf_event_open is unavailable; continuing with \
                      --max-timeslice=disabled. Check the host perf_event_paranoid value and \
                      container seccomp policy.\n",
                 ),
                 TimerUnavailable::NoPmuProfile(reason) => {
-                    crate::tracing::write_stderr_diagnostic(&format!(
+                    crate::app::tracing::write_stderr_diagnostic(&format!(
                         "WARNING: --max-timeslice requires a performance-counter profile for \
                          this CPU, but {reason}; continuing with --max-timeslice=disabled.\n"
                     ))
@@ -9052,6 +9230,7 @@ impl RunOpts {
             && !self.network.uses_local_namespace(self.analyze_networking)
             && !self.no_namespace
             && !self.det_opts.det_config.gdbserver
+            && self.application_backend.is_none()
             && matches!(backend, Backend::Ptrace | Backend::E9patch);
         if self.record_networking.is_some() {
             self.network = NetworkingMode::Host;
@@ -9066,7 +9245,7 @@ impl RunOpts {
             vmm_time_virtualization_warning(&self.program, &self.args, virtualize_time)
         {
             // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
-            crate::tracing::diagnostic_eprintln!("{warning}");
+            crate::app::tracing::diagnostic_eprintln!("{warning}");
         }
 
         Ok(())
@@ -9423,7 +9602,7 @@ impl RunOpts {
             Ok(resolver) if !resolver.is_empty() => {
                 let unresolved = resolve_program(&mut program, &resolver);
                 if !unresolved.is_empty() {
-                    crate::tracing::diagnostic_eprintln!(
+                    crate::app::tracing::diagnostic_eprintln!(
                         "hermit: {} happens-before anchor(s) with unresolved code locations \
                          (they will never fire): {}",
                         unresolved.len(),
@@ -9437,7 +9616,7 @@ impl RunOpts {
                     .map(|a| a.name.clone())
                     .collect();
                 if !unresolved.is_empty() {
-                    crate::tracing::diagnostic_eprintln!(
+                    crate::app::tracing::diagnostic_eprintln!(
                         "hermit: {} has no usable symbol/debug info; {} code-location anchor(s) \
                          will never fire: {}",
                         host.display(),
@@ -9447,7 +9626,7 @@ impl RunOpts {
                 }
             }
             Err(err) => {
-                crate::tracing::diagnostic_eprintln!(
+                crate::app::tracing::diagnostic_eprintln!(
                     "hermit: could not read debug info from {}: {:#}; code-location anchors will \
                      never fire",
                     host.display(),
@@ -9563,7 +9742,7 @@ impl RunOpts {
         let resolver = match DebugInfoResolver::open(&host) {
             Ok(r) if !r.is_empty() => Some(r),
             Ok(_) => {
-                crate::tracing::diagnostic_eprintln!(
+                crate::app::tracing::diagnostic_eprintln!(
                     "hermit: {} has no usable symbol/debug info; code-location anchors will not \
                      resolve",
                     host.display()
@@ -9571,7 +9750,7 @@ impl RunOpts {
                 None
             }
             Err(err) => {
-                crate::tracing::diagnostic_eprintln!(
+                crate::app::tracing::diagnostic_eprintln!(
                     "hermit: could not read debug info from {}: {:#}",
                     host.display(),
                     err
@@ -9610,7 +9789,7 @@ impl RunOpts {
             println!("  {} {} {}", edge.before, op, edge.after);
         }
         if !unresolved.is_empty() {
-            crate::tracing::diagnostic_eprintln!(
+            crate::app::tracing::diagnostic_eprintln!(
                 "hermit: {} anchor(s) with unresolved code locations: {}",
                 unresolved.len(),
                 unresolved.join(", ")
@@ -9857,7 +10036,7 @@ impl RunOpts {
             // Materialize before building the command: on a cold cache this is
             // what makes the image's Env/WorkingDir available for relative-path
             // resolution during first-run validation.
-            let rootfs = crate::image::materialize_rootfs(image)?;
+            let rootfs = crate::app::image::materialize_rootfs(image)?;
             let command = self.guest_command()?;
             let requested = Path::new(command.get_program());
             // `guest_command()` sets the image working directory (WorkingDir, or
@@ -9871,7 +10050,7 @@ impl RunOpts {
             // `/bin/sh` as a symlink to an absolute `/nix/store/...` target that
             // only resolves under the image root, so a naive host `stat` would
             // follow it against the host `/` and fail.
-            let in_rootfs = crate::image::resolve_in_rootfs(&rootfs, &guest_abs);
+            let in_rootfs = crate::app::image::resolve_in_rootfs(&rootfs, &guest_abs);
             return validate_executable(&in_rootfs, &guest_abs, Some(&rootfs));
         }
 
@@ -9951,7 +10130,7 @@ impl RunOpts {
                 b0_sites: 0,
             });
             self.e9patch_sites = Some(reverie::SiteCounters::default());
-            crate::tracing::diagnostic_eprintln!(
+            crate::app::tracing::diagnostic_eprintln!(
                 ":: Backend: e9patch preprocessing + ptrace runtime; mapped_sites=0; \
                  main_executable=non-ELF; preprocessing=not-applicable"
             );
@@ -9988,7 +10167,7 @@ impl RunOpts {
         } else {
             "miss"
         };
-        crate::tracing::diagnostic_eprintln!(
+        crate::app::tracing::diagnostic_eprintln!(
             ":: Backend: e9patch preprocessing + ptrace runtime; candidate_sites={}; \
              mapped_sites={}; b0_sites={}; \
              instruction_map_cache={:?}; rewrite_cache={}; artifact_sha256={}; \
@@ -10006,7 +10185,7 @@ impl RunOpts {
         // `e9patch` spelling runs on the ptrace runtime, so this measures the
         // preprocessing shape, not any runtime instrumentation cost.
         if let Some(shape) = &prepared.patch_shape {
-            crate::tracing::diagnostic_eprintln!(
+            crate::app::tracing::diagnostic_eprintln!(
                 ":: e9patch patch-shape stats (selected=e9patch, runtime=ptrace, \
                  scope=root-image): {shape}"
             );
@@ -10246,7 +10425,7 @@ impl RunOpts {
         })?;
         // A `--dap-listen` run's supervisor names the attach request instead.
         if self.dap_listen.is_none() {
-            crate::tracing::diagnostic_eprintln!(
+            crate::app::tracing::diagnostic_eprintln!(
                 "hermit run: the guest waits for one gdb client on 127.0.0.1:{0} before it \
                  starts; attach with: gdb -ex 'target remote 127.0.0.1:{0}' {1}",
                 port.port(),
@@ -10497,7 +10676,7 @@ impl RunOpts {
     ) -> verify_run::VerifyRunRecord {
         verify_run::VerifyRunRecord {
             schema: verify_run::SCHEMA,
-            backend: self.selected_backend().as_str().to_string(),
+            backend: self.execution_backend_name().to_string(),
             comparison,
             passthru_opt: self.det_opts.det_config.passthru_opt,
             epoch: self.epoch_rfc3339(),
@@ -10509,55 +10688,122 @@ impl RunOpts {
     }
 
     // Execution mode corresponding to `run --verify`:
-    fn verify(
+    fn verify<A: super::backend_hook::BackendAdapter>(
         &self,
         global: &GlobalOpts,
-        _dbt_stdin: Option<fs::File>,
+        stdin: Option<fs::File>,
+        adapter: &A,
+        adapter_options: A::Options,
     ) -> Result<ExitStatus, Error> {
-        // Stamp an explicit no-result BEFORE any fallible work. Several exits
-        // below (a run that fails to start, a rejected first-run status, a SaBRe
-        // capture with zero DETLOG) return early without ever reaching
-        // `write_verification_json`; without this, reusing a --verify-json path
-        // would leave the PREVIOUS invocation's record -- possibly a green -- to
-        // be read as this invocation's result.
+        // Stamp before fallible snapshot/preparation work, as in the original
+        // physical path. Both runs retain this one ld.so.cache snapshot.
         if let Some(path) = &self.verify_json {
             write_pending_verification_json(path)?;
         }
-        // One /etc/ld.so.cache snapshot for both runs, taken before anything
-        // copies these options -- the DBT adapter keeps its own copy and runs
-        // both executions from it (https://github.com/rrnewton/hermit/issues/4693).
         self.with_verification_ld_so_cache()?
-            .verify_sharing_ld_so_cache(global, _dbt_stdin)
+            .verify_sharing_ld_so_cache(global, stdin, adapter, adapter_options)
     }
 
-    /// [`Self::verify`] once these options carry the snapshot both runs bind.
-    fn verify_sharing_ld_so_cache(
+    pub(super) fn verify_sharing_ld_so_cache<A: super::backend_hook::BackendAdapter>(
         &self,
         global: &GlobalOpts,
-        _dbt_stdin: Option<fs::File>,
+        stdin: Option<fs::File>,
+        adapter: &A,
+        adapter_options: A::Options,
     ) -> Result<ExitStatus, Error> {
-        #[cfg(feature = "dbt")]
-        let mut dbt = if self.selected_backend() == Backend::Dbt {
-            Some(self.dbt_invocation()?.verification(_dbt_stdin)?)
+        use super::backend_hook::EvidenceRequirement;
+        use super::backend_hook::Mode;
+        use super::backend_hook::PairEvidence;
+        use super::backend_hook::PhysicalRun;
+
+        let selected =
+            self.application_backend.is_some() || self.selected_backend() == Backend::Dbt;
+        let requirement = if selected {
+            A::EVIDENCE
+        } else {
+            EvidenceRequirement::Common
+        };
+        let physical = self
+            .application_backend
+            .map(|_| super::backend_hook::PreparedPhysical::new(self, A::CAPABILITIES));
+        let mut session = if selected {
+            Some(adapter.prepare(
+                adapter_options,
+                super::backend_hook::Prepare {
+                    options: self,
+                    global,
+                    mode: Mode::VerificationPair,
+                    stdin,
+                    physical: physical.as_ref(),
+                },
+            )?)
         } else {
             None
         };
-        self.verify_with_execution(|options, log, path, forwarded, run| {
-            options.run_verify(
-                log,
-                path,
-                forwarded,
-                global,
-                run,
-                #[cfg(feature = "dbt")]
-                dbt.as_mut(),
-            )
-        })
+        self.verify_with_evidence(
+            requirement,
+            !(selected && requirement == EvidenceRequirement::NativeCounters),
+            |options, log, path, forwarded, run| {
+                if let Some(session) = &mut session {
+                    let captured = adapter
+                        .execute(
+                            session,
+                            super::backend_hook::Execute {
+                                mode: Mode::VerificationPair,
+                                verification: Some(super::backend_hook::VerificationCapture {
+                                    log,
+                                    path,
+                                    run,
+                                    options,
+                                    physical: physical.as_ref(),
+                                    requested_log: global.log,
+                                }),
+                            },
+                        )?
+                        .verification()?;
+                    return Ok(PhysicalRun {
+                        output: captured.output,
+                        skid_overshoots: captured.skid_overshoots,
+                        latches: captured.latches,
+                        pending: Some(captured.pending),
+                    });
+                }
+                let captured = options.run_verify(
+                    log,
+                    path,
+                    forwarded,
+                    global,
+                    run,
+                    #[cfg(feature = "dbt")]
+                    None,
+                )?;
+                Ok(PhysicalRun {
+                    output: captured.output,
+                    skid_overshoots: captured.skid_overshoots,
+                    latches: captured.latches,
+                    pending: None,
+                })
+            },
+            |pending, output, run| {
+                pending
+                    .map(|pending| {
+                        adapter.finish(pending, super::backend_hook::Observation { output, run })
+                    })
+                    .transpose()
+            },
+            |first, second| match (first, second) {
+                (Some(first), Some(second)) => adapter.pair_evidence(first, second),
+                (None, None) => Ok(PairEvidence::Common),
+                _ => Err(Error::msg(
+                    "physical backend facts changed kind between runs",
+                )),
+            },
+        )
     }
 
-    /// The common two-run owner, after the invocation has been stamped and
-    /// its physical adapter prepared. The callback returns a completed run;
-    /// disposition, deferred facts, comparison and reporting stay here.
+    // Existing injected physical-run tests use the same common owner and the
+    // same default adapter completion. This is not a second comparison path.
+    #[cfg(test)]
     pub(super) fn verify_with_execution(
         &self,
         mut execute: impl FnMut(
@@ -10567,6 +10813,45 @@ impl RunOpts {
             ForwardedDetlogPlan,
             VerificationRun,
         ) -> Result<VerificationRunOutput, Error>,
+    ) -> Result<ExitStatus, Error> {
+        use super::backend_hook::BackendAdapter;
+        use super::backend_hook::EvidenceRequirement;
+        let adapter = super::backends::BuiltinAdapter;
+        let native = self.selected_backend() == Backend::Dbt;
+        self.verify_with_evidence(
+            if native {
+                EvidenceRequirement::NativeCounters
+            } else {
+                EvidenceRequirement::Common
+            },
+            !native,
+            |options, log, path, forwarded, run| {
+                execute(options, log, path, forwarded, run)
+                    .map(VerificationRunOutput::into_physical)
+            },
+            |pending, output, run| {
+                adapter.finish(pending, super::backend_hook::Observation { output, run })
+            },
+            |first, second| adapter.pair_evidence(first, second),
+        )
+    }
+
+    /// The common two-run owner, after the invocation has been stamped and
+    /// its physical adapter prepared. The callback returns a completed run;
+    /// disposition, deferred facts, comparison and reporting stay here.
+    pub(super) fn verify_with_evidence<P, F>(
+        &self,
+        requirement: super::backend_hook::EvidenceRequirement,
+        records_run_metadata: bool,
+        mut execute: impl FnMut(
+            &Self,
+            fs::File,
+            &Path,
+            ForwardedDetlogPlan,
+            VerificationRun,
+        ) -> Result<super::backend_hook::PhysicalRun<P>, Error>,
+        finish: impl Fn(P, &Output, VerificationRun) -> Result<F, Error>,
+        pair_evidence: impl Fn(&F, &F) -> Result<super::backend_hook::PairEvidence, Error>,
     ) -> Result<ExitStatus, Error> {
         self.refuse_unready_exec_stop()?;
         let retained_log_dir = self.retained_verify_log_dir()?;
@@ -10601,7 +10886,6 @@ impl RunOpts {
         // The current physical DBT adapter produces typed native facts, not
         // RunSummary or host-input files. Do not read an old public summary or
         // create a new checkout-path dependency on that path's behalf.
-        let records_run_metadata = self.selected_backend() != Backend::Dbt;
         let summary1_file = records_run_metadata
             .then(private_verify_summary)
             .transpose()?;
@@ -10644,14 +10928,13 @@ impl RunOpts {
         // See the restore call below for the measurement this exists for.
         let fd_flags_before_run1 = standard_fd_status_flags();
 
-        crate::tracing::diagnostic_eprintln!(":: {}", "Run1...".yellow().bold());
+        crate::app::tracing::diagnostic_eprintln!(":: {}", "Run1...".yellow().bold());
 
-        let VerificationRunOutput {
+        let super::backend_hook::PhysicalRun {
             output: out1,
             skid_overshoots: skid_overshoots_run1,
             latches: latches1,
-            #[cfg(feature = "dbt")]
-                dbt: dbt1,
+            pending: pending1,
         } = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run1,
@@ -10709,7 +10992,7 @@ impl RunOpts {
         };
         let mut out1 = out1;
         let mut signal_reports = SignalTerminationReports::default();
-        if self.selected_backend() == Backend::Dbt {
+        if !records_run_metadata {
             signal_reports.prepare("run 1", out1.status, &log1_path);
         }
         // The latches first: a determinism loss is named as one, even when its
@@ -10734,7 +11017,7 @@ impl RunOpts {
             };
         // Prepared now, with the forwarded records in place: the comparison
         // consumes the log. Written if the verification ends unverified.
-        if self.selected_backend() != Backend::Dbt {
+        if records_run_metadata {
             signal_reports.prepare("run 1", out1.status, &log1_path);
         }
 
@@ -10760,11 +11043,7 @@ impl RunOpts {
             return Err(error);
         }
 
-        #[cfg(feature = "dbt")]
-        let dbt1 = match dbt1
-            .map(|facts| facts.finish(&out1, VerificationRun::Run1))
-            .transpose()
-        {
+        let facts1 = match finish(pending1, &out1, VerificationRun::Run1) {
             Ok(facts) => facts,
             Err(error) => {
                 let mut error =
@@ -10833,13 +11112,12 @@ impl RunOpts {
         // housekeeping, and the comparison reports the divergence as before.
         restore_standard_fd_status_flags(fd_flags_before_run1);
 
-        crate::tracing::diagnostic_eprintln!(":: {}", "Run2...".yellow().bold());
-        let VerificationRunOutput {
+        crate::app::tracing::diagnostic_eprintln!(":: {}", "Run2...".yellow().bold());
+        let super::backend_hook::PhysicalRun {
             output: out2,
             skid_overshoots: skid_overshoots_run2,
             latches: latches2,
-            #[cfg(feature = "dbt")]
-                dbt: dbt2,
+            pending: pending2,
         } = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run2,
@@ -10885,7 +11163,7 @@ impl RunOpts {
             }
         };
         let mut out2 = out2;
-        if self.selected_backend() == Backend::Dbt {
+        if !records_run_metadata {
             signal_reports.prepare("run 2", out2.status, &log2_path);
         }
         if let Err(error) = latches2.refuse_comparison("run 2") {
@@ -10928,15 +11206,11 @@ impl RunOpts {
             );
         }
 
-        if self.selected_backend() != Backend::Dbt {
+        if records_run_metadata {
             signal_reports.prepare("run 2", out2.status, &log2_path);
         }
 
-        #[cfg(feature = "dbt")]
-        let dbt2 = match dbt2
-            .map(|facts| facts.finish(&out2, VerificationRun::Run2))
-            .transpose()
-        {
+        let facts2 = match finish(pending2, &out2, VerificationRun::Run2) {
             Ok(facts) => facts,
             Err(error) => {
                 let mut error =
@@ -10950,20 +11224,38 @@ impl RunOpts {
                 return Err(error);
             }
         };
-        #[cfg(feature = "dbt")]
-        let dbt_comparison = dbt1
-            .as_ref()
-            .zip(dbt2.as_ref())
-            .map(|(first, second)| super::backends::DbtVerificationComparison::new(first, second));
+        let evidence = match pair_evidence(&facts1, &facts2)
+            .and_then(|evidence| requirement.validate(evidence))
+        {
+            Ok(super::backend_hook::PairEvidence::Common) => None,
+            Ok(super::backend_hook::PairEvidence::NativeCounters { first, second }) => {
+                Some(super::verify::NativeEvidenceComparison::new(
+                    self.execution_backend_name(),
+                    &first,
+                    &second,
+                ))
+            }
+            Err(error) => {
+                let mut error =
+                    publish_run_failure(self.verify_json.as_deref(), VerificationRun::Run2, error);
+                if self.keep_logs {
+                    error = retain_logs_after_verification_error(
+                        error,
+                        [("run 1", log1_path), ("run 2", log2_path)],
+                    );
+                }
+                return Err(error);
+            }
+        };
 
         let summary2 = summary2_path.and_then(read_verify_summary);
         let outcome = conclude_verification(
             VerificationConclusion {
                 verify_json: self.verify_json.as_deref(),
                 comparison_options: self.verification_comparison_options(),
-                #[cfg(feature = "dbt")]
-                dbt: dbt_comparison,
+                evidence,
                 backend: self.selected_backend(),
+                application_backend: self.application_backend,
                 passthru_opt: self.det_opts.det_config.passthru_opt,
             },
             CompletedVerificationRun {
@@ -11037,6 +11329,10 @@ impl RunOpts {
     /// effect.
     #[cfg(feature = "dbt")]
     pub(super) fn dbt_binds(&self) -> Vec<(PathBuf, PathBuf)> {
+        self.adapter_binds()
+    }
+
+    pub(super) fn adapter_binds(&self) -> Vec<(PathBuf, PathBuf)> {
         let mut binds = Vec::with_capacity(self.bind.len());
         for bind in &self.bind {
             let source = PathBuf::from(OsStr::from_bytes(bind.source.to_bytes()));
@@ -11052,6 +11348,10 @@ impl RunOpts {
     /// the caller's, only for this physical launch.
     #[cfg(feature = "dbt")]
     pub(super) fn with_dbt_mounts(&self, binds: &[Bind], mounts: Vec<MountArg>) -> Self {
+        self.with_adapter_mounts(binds, mounts)
+    }
+
+    pub(super) fn with_adapter_mounts(&self, binds: &[Bind], mounts: Vec<MountArg>) -> Self {
         let mut options = self.clone();
         options.backend_mounts.0 += mounts.len();
         options.backend_mounts.1 += binds.len();
@@ -11063,7 +11363,6 @@ impl RunOpts {
     /// These options with `mount` added after the caller's own, as one of
     /// them (shown in the guest's mount table): the DBT adapter's tmpfs at
     /// the test workdir, which the guest uses as its working directory.
-    #[cfg(feature = "dbt")]
     pub(super) fn with_guest_mount(&self, mount: MountArg) -> Self {
         let mut options = self.clone();
         options.mount.push(mount);
@@ -11072,7 +11371,6 @@ impl RunOpts {
 
     /// Whether the caller's `--mount`s install a fresh tmpfs at guest path
     /// `target` (a mount of type tmpfs: setting that type changes nothing).
-    #[cfg(feature = "dbt")]
     pub(super) fn mounts_tmpfs_at(&self, target: &Path) -> bool {
         self.mount
             .iter()
@@ -11104,7 +11402,6 @@ impl RunOpts {
 
     /// Whether these options carry the `/etc/ld.so.cache` snapshot both runs
     /// of a verification bind.
-    #[cfg(feature = "dbt")]
     pub(super) fn has_ld_so_cache_snapshot(&self) -> bool {
         self.ld_so_cache_snapshot.is_some()
     }
@@ -11252,6 +11549,22 @@ impl RunOpts {
         })
     }
 
+    pub(super) fn with_adapter_capabilities(
+        &self,
+        capabilities: reverie::BackendCapabilities,
+    ) -> Self {
+        let mut options = self.clone();
+        options.adapter_capabilities = Some(capabilities);
+        options
+    }
+
+    pub(super) fn mounts_directory_placeholder(&self) -> bool {
+        let capabilities = self
+            .adapter_capabilities
+            .unwrap_or_else(|| hermit::backend_capabilities(self.runtime_backend()));
+        detcore::needs_directory_placeholder(&capabilities)
+    }
+
     /// Returns a configured container to run a function in.
     ///
     /// The container's setup makes its namespaces, (for `--network=local`)
@@ -11268,11 +11581,9 @@ impl RunOpts {
         // not the kernel's (`detcore::needs_directory_placeholder`): where it
         // is, Detcore serves its `/proc` directories on that procfs's root,
         // and no tmpfs of Hermit's is there for a guest to reach.
-        let mounts_placeholder = detcore::needs_directory_placeholder(
-            &hermit::backend_capabilities(self.runtime_backend()),
-        );
+        let mounts_placeholder = self.mounts_directory_placeholder();
         if let Some(image) = &self.image {
-            let rootfs = crate::image::materialize_rootfs(image)?;
+            let rootfs = crate::app::image::materialize_rootfs(image)?;
             let (mut container, identity_sources) = image_container(
                 &rootfs,
                 tmpfs,
@@ -11329,7 +11640,7 @@ impl RunOpts {
     }
 
     #[cfg(feature = "dbt")]
-    fn dbt_invocation(&self) -> Result<super::backends::DbtInvocation, Error> {
+    pub(super) fn dbt_invocation(&self) -> Result<super::backends::DbtInvocation, Error> {
         super::backends::DbtInvocation::new(
             &self.program,
             &self.args,
@@ -11414,7 +11725,7 @@ impl RunOpts {
         Ok(())
     }
 
-    fn guest_command(&self) -> Result<Command, Error> {
+    pub(super) fn guest_command(&self) -> Result<Command, Error> {
         self.build_guest_command(true)
     }
 
@@ -11448,7 +11759,7 @@ impl RunOpts {
         if let Some(current_dir) = &self.workdir {
             command.current_dir(current_dir);
         } else if let Some(image) = &self.image {
-            let cfg = crate::image::read_image_config(image)?;
+            let cfg = crate::app::image::read_image_config(image)?;
             command.current_dir(cfg.workdir.as_deref().unwrap_or("/"));
         }
 
@@ -11461,7 +11772,7 @@ impl RunOpts {
         // the same hermetic defaults `--base-env=minimal` uses.
         if let Some(image) = &self.image {
             command.env_clear();
-            let cfg = crate::image::read_image_config(image)?;
+            let cfg = crate::app::image::read_image_config(image)?;
             let declares_path = cfg.env.iter().any(|(k, _)| k == "PATH");
             let declares_home = cfg.env.iter().any(|(k, _)| k == "HOME");
             command.env("HOSTNAME", "hermetic-container.local");
@@ -11507,7 +11818,7 @@ impl RunOpts {
     }
 
     /// The top-level parser replaces `hermit run --config FILE` with the
-    /// file's options before parsing (`crate::run_config::expand_argv`), so a
+    /// file's options before parsing (`crate::app::run_config::expand_argv`), so a
     /// `--config` still present here was never applied.
     fn refuse_unapplied_config(&self) -> Result<(), Error> {
         match &self.config {
@@ -11523,7 +11834,7 @@ impl RunOpts {
 
     /// Hands over the options the top-level parser captured for
     /// `--save-config`.
-    pub(crate) fn set_config_capture(&mut self, config: crate::run_config::RunConfig) {
+    pub(crate) fn set_config_capture(&mut self, config: crate::app::run_config::RunConfig) {
         self.config_capture = Some(config);
     }
 
@@ -11608,6 +11919,14 @@ impl RunOpts {
         if self.namespace_only {
             return Ok(());
         }
+        if let Some(name) = self.application_backend {
+            if self.max_timeslice_explicit && self.det_opts.det_config.max_timeslice.is_some() {
+                return Err(Error::new(PolicyRefusal).context(format!(
+                    "--max-timeslice is not qualified to arm a timer for executable-selected backend `{name}`"
+                )));
+            }
+            return Ok(());
+        }
         // The inherited maximum also chooses Detcore's clock accounting and
         // cooperative deadline. Checking a timer request must not rewrite it.
         hermit::preemption_admission::refuse_unsupported_preemption(
@@ -11625,6 +11944,7 @@ impl RunOpts {
             max_timeslice_ns: maximum.map(|maximum| maximum.get()),
             timer_enabled: Some(
                 !self.namespace_only
+                    && self.application_backend.is_none()
                     && maximum.is_some()
                     && hermit::backend_delivers_preemption_timer(self.selected_backend()),
             ),
@@ -11634,10 +11954,10 @@ impl RunOpts {
     /// The run config `--save-config` writes: the captured options with the
     /// implicit inputs this run resolved written out, so that loading it
     /// reproduces the run rather than resolving them again.
-    pub(crate) fn saved_run_config(&self) -> Result<crate::run_config::RunConfig, Error> {
-        use crate::run_config::EPOCH_KEY;
-        use crate::run_config::SEED_FROM_KEY;
-        use crate::run_config::SEED_KEY;
+    pub(crate) fn saved_run_config(&self) -> Result<crate::app::run_config::RunConfig, Error> {
+        use crate::app::run_config::EPOCH_KEY;
+        use crate::app::run_config::SEED_FROM_KEY;
+        use crate::app::run_config::SEED_KEY;
 
         let mut config = self.config_capture.clone().ok_or_else(|| {
             Error::msg(
@@ -11659,7 +11979,7 @@ impl RunOpts {
 
     fn write_saved_config(&self) -> Result<(), Error> {
         match &self.save_config {
-            Some(path) => crate::run_config::write(path, &self.saved_run_config()?),
+            Some(path) => crate::app::run_config::write(path, &self.saved_run_config()?),
             None => Ok(()),
         }
     }
@@ -11673,13 +11993,13 @@ impl RunOpts {
         let mut drawn = BTreeMap::new();
         if self.timer_downgrade.is_some() {
             drawn.insert(
-                crate::manifest::MAX_TIMESLICE_KEY.to_owned(),
+                crate::app::manifest::MAX_TIMESLICE_KEY.to_owned(),
                 "no-usable-performance-counter".to_owned(),
             );
         }
         if self.epoch_captured_from_host {
             drawn.insert(
-                crate::run_config::EPOCH_KEY.to_owned(),
+                crate::app::run_config::EPOCH_KEY.to_owned(),
                 "host-now".to_owned(),
             );
         }
@@ -11687,7 +12007,7 @@ impl RunOpts {
             && matches!(self.seed_from, Some(SeedFrom::SystemRandom))
         {
             drawn.insert(
-                crate::run_config::SEED_KEY.to_owned(),
+                crate::app::run_config::SEED_KEY.to_owned(),
                 "SystemRandom".to_owned(),
             );
         }
@@ -11711,14 +12031,14 @@ impl RunOpts {
             return Ok(());
         }
         let mut drawn = self.host_drawn_inputs();
-        drawn.remove(crate::manifest::MAX_TIMESLICE_KEY);
+        drawn.remove(crate::app::manifest::MAX_TIMESLICE_KEY);
         if drawn.is_empty() {
             return Ok(());
         }
         let remedies = drawn
             .keys()
             .map(|key| match key.as_str() {
-                crate::run_config::EPOCH_KEY => {
+                crate::app::run_config::EPOCH_KEY => {
                     // The host sample this run took, to whole seconds, as an
                     // example a user can paste.
                     let example = self.det_opts.det_config.epoch.format("%Y-%m-%dT%H:%M:%SZ");
@@ -11727,9 +12047,11 @@ impl RunOpts {
                          --epoch={example}) or set HERMIT_EPOCH"
                     )
                 }
-                crate::run_config::SEED_KEY => "the seed, from --seed-from=SystemRandom: pass \
+                crate::app::run_config::SEED_KEY => {
+                    "the seed, from --seed-from=SystemRandom: pass \
                      --seed=N, or --seed-from=Args"
-                    .to_owned(),
+                        .to_owned()
+                }
                 other => format!("{other}: pass it explicitly"),
             })
             .collect::<Vec<_>>()
@@ -11749,11 +12071,11 @@ impl RunOpts {
     fn warn_of_host_drawn_inputs(
         &self,
         global: &GlobalOpts,
-        recording: Option<(hermit::Id, crate::manifest::Kind)>,
+        recording: Option<(hermit::Id, crate::app::manifest::Kind)>,
     ) -> Result<(), Error> {
-        use crate::manifest;
-        use crate::run_config::EPOCH_KEY;
-        use crate::run_config::SEED_KEY;
+        use crate::app::manifest;
+        use crate::app::run_config::EPOCH_KEY;
+        use crate::app::run_config::SEED_KEY;
 
         let drawn = self.host_drawn_inputs();
         let what = match drawn.keys().map(String::as_str).collect::<Vec<_>>()[..] {
@@ -11798,15 +12120,15 @@ impl RunOpts {
     }
 
     /// Writes this run's manifest when the policy asks for one (see
-    /// `crate::manifest`), and remembers its path for `finish_manifest`.
+    /// `crate::app::manifest`), and remembers its path for `finish_manifest`.
     /// Returns the recording's id and kind when it wrote one. Only a
     /// top-level `hermit run`, whose parser captured the options it was
     /// given, writes one.
     fn begin_manifest(
         &mut self,
         global: &GlobalOpts,
-    ) -> Result<Option<(hermit::Id, crate::manifest::Kind)>, Error> {
-        use crate::manifest;
+    ) -> Result<Option<(hermit::Id, crate::app::manifest::Kind)>, Error> {
+        use crate::app::manifest;
 
         if self.config_capture.is_none() {
             return Ok(None);
@@ -11838,7 +12160,8 @@ impl RunOpts {
             (None, manifest::ManifestPolicy::Always, true) => manifest::Kind::History,
         };
         let config = self.saved_run_config()?;
-        let (mut global_inputs, mut run_inputs) = crate::run_config::to_manifest_parts(&config)?;
+        let (mut global_inputs, mut run_inputs) =
+            crate::app::run_config::to_manifest_parts(&config)?;
         manifest::drop_outputs(&mut global_inputs, &mut run_inputs);
         if self.timer_downgrade.is_some() {
             run_inputs.insert(
@@ -11924,11 +12247,11 @@ impl RunOpts {
         let Some(path) = self.manifest_path.take() else {
             return;
         };
-        let exit = crate::manifest::Exit::from_status(status);
+        let exit = crate::app::manifest::Exit::from_status(status);
         let pending = self.pending_network_manifest.take();
         let document = match pending {
             Some(document) => Ok(document),
-            None => crate::manifest::read(&path),
+            None => crate::app::manifest::read(&path),
         };
         let result = document.and_then(|mut document| {
             document.exit = Some(exit);
@@ -11940,38 +12263,42 @@ impl RunOpts {
                 .and_then(|artifacts| artifacts.network_trace.as_mut())
             {
                 let file = path.with_file_name(&trace.path);
-                let (sha256, bytes) = crate::manifest::digest_and_size(&file)?;
-                trace.version = Some(crate::manifest::network_trace_version(&file)?);
+                let (sha256, bytes) = crate::app::manifest::digest_and_size(&file)?;
+                trace.version = Some(crate::app::manifest::network_trace_version(&file)?);
                 trace.sha256 = Some(sha256);
                 trace.bytes = Some(bytes);
             }
-            crate::manifest::write(&path, &document)?;
+            crate::app::manifest::write(&path, &document)?;
             Ok(document)
         });
         let document = match result {
             Ok(document) => document,
             Err(error) => {
-                crate::tracing::diagnostic_eprintln!(
+                crate::app::tracing::diagnostic_eprintln!(
                     "hermit: could not record the exit status in {}: {error:#}",
                     path.display()
                 );
                 return;
             }
         };
-        if document.kind != crate::manifest::Kind::Network {
+        if document.kind != crate::app::manifest::Kind::Network {
             // A run's manifest is the newest run, `last-run`, once the run
             // has ended; `last` stays with the recording the user made.
             if let Ok(id) = document.id.parse() {
-                note_latest(&crate::manifest::data_dir(), id, document.kind.moves_last());
+                note_latest(
+                    &crate::app::manifest::data_dir(),
+                    id,
+                    document.kind.moves_last(),
+                );
             }
             return;
         }
         // A copy in the data directory, naming the trace by its absolute
         // path, makes the recording one that `hermit replay`, `hermit list`
         // and `last` know by its ID.
-        let data_dir = crate::manifest::data_dir();
+        let data_dir = crate::app::manifest::data_dir();
         if let Err(error) = store_network_manifest(&data_dir, &path, document) {
-            crate::tracing::diagnostic_eprintln!(
+            crate::app::tracing::diagnostic_eprintln!(
                 "hermit: could not add the network recording to {}: {error:#}; replay it with: \
                  hermit run --from {}",
                 data_dir.display(),
@@ -11992,7 +12319,7 @@ impl RunOpts {
         Ok(())
     }
 
-    fn effective_det_config(&self) -> DetConfig {
+    pub(super) fn effective_det_config(&self) -> DetConfig {
         let mut config = self.det_opts.det_config.clone();
         if !self.allow_unsupported_syscalls
             && std::env::var(FAIL_CLOSED_ENV).is_ok_and(|value| value == "1")
@@ -12007,7 +12334,11 @@ impl RunOpts {
         config.happens_before = self.resolved_happens_before.clone();
         config.record_host_inputs = self.host_input_log.is_some();
         config.host_input_log = self.host_input_log.clone();
-        config.untraced_code_range = untraced_code_range(self.selected_backend());
+        config.untraced_code_range = self
+            .application_backend
+            .is_none()
+            .then(|| untraced_code_range(self.selected_backend()))
+            .flatten();
         config.fatal_core_capture = self.fatal_core_capture();
         config
     }
@@ -12260,6 +12591,11 @@ impl RunOpts {
     pub(crate) fn ensure_timeout_supported(&self) -> Result<(), Error> {
         if self.timeout.is_none() {
             return Ok(());
+        }
+        if let Some(name) = self.application_backend {
+            return Err(Error::new(PolicyRefusal).context(format!(
+                "--timeout is not qualified to bound executable-selected backend `{name}`; use an outer bound"
+            )));
         }
         let backend = self.runtime_backend();
         // in-guest-trap runs the in-guest LiteInst runtime, so it takes
@@ -12628,10 +12964,10 @@ pub(super) struct VerificationConclusion<'a> {
     pub(super) verify_json: Option<&'a Path>,
     pub(super) comparison_options: ComparisonOptions,
     /// Completed backend facts supplement the common comparison.
-    #[cfg(feature = "dbt")]
-    pub(super) dbt: Option<super::backends::DbtVerificationComparison>,
-    /// The backend both runs used.
+    pub(super) evidence: Option<super::verify::NativeEvidenceComparison>,
+    /// The built-in backend, when no executable-selected adapter is present.
     pub(super) backend: Backend,
+    pub(super) application_backend: Option<&'a str>,
     /// Whether both runs used `--passthru-opt`.
     pub(super) passthru_opt: bool,
 }
@@ -12650,9 +12986,9 @@ pub(super) fn conclude_verification(
     let VerificationConclusion {
         verify_json,
         mut comparison_options,
-        #[cfg(feature = "dbt")]
-        dbt,
+        evidence,
         backend,
+        application_backend,
         passthru_opt,
     } = conclusion;
     let out1 = run1.output;
@@ -12706,8 +13042,7 @@ pub(super) fn conclude_verification(
     // verdict. `--keep-logs` then retains both logs, as every other error
     // path does, instead of the single golden log kept after a match.
     comparison_options.match_overridden |= skid_overshoots > 0;
-    #[cfg(feature = "dbt")]
-    if let Some(comparison) = &dbt {
+    if let Some(comparison) = &evidence {
         comparison.configure(&mut comparison_options);
     }
     // The comparison consumes both logs, so a host file change is placed
@@ -12738,8 +13073,7 @@ pub(super) fn conclude_verification(
         },
         comparison_options,
     )?;
-    #[cfg(feature = "dbt")]
-    let dbt_messages = dbt.map(|comparison| comparison.apply(&mut outcome));
+    let native_messages = evidence.map(|comparison| comparison.apply(&mut outcome));
     outcome.runtime = verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref());
 
     // A divergence that a host file changing during one run explains is
@@ -12760,7 +13094,9 @@ pub(super) fn conclude_verification(
         })
         .map(|(difference, _)| difference.into_infrastructure_error())
         .filter(|change| {
-            let unobserved = unobserved_guest_execution(backend, passthru_opt);
+            let unobserved = application_backend
+                .map(|_| "execution before an external adapter observes the guest is not qualified")
+                .or_else(|| unobserved_guest_execution(backend, passthru_opt));
             if let Some(reason) = unobserved {
                 eprintln!("HERMIT_HOST_INPUT_CHANGE_UNATTRIBUTED {change}; not named as the cause: {reason}");
             }
@@ -12783,12 +13119,13 @@ pub(super) fn conclude_verification(
     if skid_overshoots > 0 {
         return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
     }
-    #[cfg(feature = "dbt")]
-    if let Some(messages) = dbt_messages {
+    if let Some(messages) = native_messages {
         for message in messages {
             eprintln!(":: {message}");
         }
-        eprintln!(":: DBT path confirmed: DynamoRIO client reported tool=Detcore");
+        if application_backend.is_none() && backend == Backend::Dbt {
+            eprintln!(":: DBT path confirmed: DynamoRIO client reported tool=Detcore");
+        }
     }
     announce_verification_outcome(&outcome, SecondRun::Rerun, success_message, failure_message);
     if let Some(change) = &host_input_change {
@@ -12881,7 +13218,7 @@ pub(super) fn complete_container_config(
 /// reachable by its ID.
 fn note_latest(data_dir: &Path, id: hermit::Id, asked: bool) {
     if let Err(error) = hermit::HermitData::with_dir(data_dir).note_latest(&id, asked) {
-        crate::tracing::diagnostic_eprintln!(
+        crate::app::tracing::diagnostic_eprintln!(
             "hermit: could not name recording {id} as the newest in {}: {error:#}",
             data_dir.display()
         );
@@ -12894,7 +13231,7 @@ fn note_latest(data_dir: &Path, id: hermit::Id, asked: bool) {
 fn store_network_manifest(
     data_dir: &Path,
     sibling: &Path,
-    mut document: crate::manifest::Manifest,
+    mut document: crate::app::manifest::Manifest,
 ) -> Result<(), Error> {
     let trace = document
         .artifacts
@@ -12910,14 +13247,14 @@ fn store_network_manifest(
         .id
         .parse()
         .with_context(|| format!("the manifest's id {:?} is not a recording ID", document.id))?;
-    crate::manifest::write(
+    crate::app::manifest::write(
         &data_dir
             .join(id.to_string())
-            .join(crate::manifest::MANIFEST_NAME),
+            .join(crate::app::manifest::MANIFEST_NAME),
         &document,
     )?;
     note_latest(data_dir, id, document.kind.moves_last());
-    crate::manifest::prune(data_dir, crate::manifest::KEEP_MANIFEST_ONLY);
+    crate::app::manifest::prune(data_dir, crate::app::manifest::KEEP_MANIFEST_ONLY);
     Ok(())
 }
 
@@ -13355,8 +13692,7 @@ mod tests {
 
     #[test]
     fn malformed_typed_plain_info_sink_latches_refusal_without_source_reentry() {
-        const NAME: &str =
-            "run::tests::malformed_typed_plain_info_sink_latches_refusal_without_source_reentry";
+        const NAME: &str = "app::run::tests::malformed_typed_plain_info_sink_latches_refusal_without_source_reentry";
         const CHILD: &str = "HERMIT_PLAIN_INFO_SINK_TEST";
         if std::env::var(CHILD).ok().as_deref() != Some(NAME) {
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())

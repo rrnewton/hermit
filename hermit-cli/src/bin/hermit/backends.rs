@@ -91,13 +91,13 @@ use super::record_envelope::RecordEnvelope;
 use super::verify::ComparedRun;
 #[cfg(feature = "dbt")]
 use super::verify::ComparisonOptions;
-#[cfg(feature = "dbt")]
+#[cfg(all(test, feature = "dbt"))]
 use super::verify::DbtCountedBranchComparison;
 #[cfg(feature = "dbt")]
 use super::verify::LogCompareStrictness;
 #[cfg(feature = "dbt")]
 use super::verify::SecondRun;
-#[cfg(feature = "dbt")]
+#[cfg(all(test, feature = "dbt"))]
 use super::verify::Verdict;
 #[cfg(feature = "dbt")]
 use super::verify::VerificationOutcome;
@@ -114,123 +114,268 @@ use super::verify::verification_log_level;
 #[cfg(feature = "dbt")]
 use super::verify::write_verification_json;
 
-#[cfg(feature = "dbt")]
+/// Compatibility adapter for the built-in executable. This is the existing
+/// physical implementation, supplied once to the shared application.
+pub(super) struct BuiltinAdapter;
+
+pub(super) enum BuiltinSession {
+    #[cfg(feature = "dbt")]
+    Single {
+        invocation: Option<DbtInvocation>,
+        mode: super::backend_hook::Mode,
+        options: super::run::RunOpts,
+        global: super::global_opts::GlobalOpts,
+        stdin: Option<std::fs::File>,
+    },
+    #[cfg(feature = "dbt")]
+    Pair {
+        verification: DbtVerification,
+        log: Option<LevelFilter>,
+        verbose: bool,
+        verify_json: Option<PathBuf>,
+    },
+}
+
+pub(super) enum BuiltinPending {
+    #[cfg(any(test, feature = "dbt"))]
+    Common,
+    #[cfg(feature = "dbt")]
+    Native(DbtRunCompletion),
+}
+
+pub(super) enum BuiltinFacts {
+    #[cfg(any(test, feature = "dbt"))]
+    Common,
+    #[cfg(feature = "dbt")]
+    Native(DbtRunFacts),
+}
+
+impl super::backend_hook::BackendAdapter for BuiltinAdapter {
+    const NAME: &'static str = "dbt";
+    const EVIDENCE: super::backend_hook::EvidenceRequirement =
+        super::backend_hook::EvidenceRequirement::NativeCounters;
+    const CAPABILITIES: reverie::BackendCapabilities = reverie::BackendCapabilities::DBT;
+
+    type Options = ();
+    type Session = BuiltinSession;
+    type Pending = BuiltinPending;
+    type Facts = BuiltinFacts;
+
+    fn parse(&self, _: &clap::ArgMatches) -> Result<(), clap::Error> {
+        Ok(())
+    }
+
+    fn prepare(
+        &self,
+        (): (),
+        mut request: super::backend_hook::Prepare<'_>,
+    ) -> Result<Self::Session, Error> {
+        #[cfg(feature = "dbt")]
+        {
+            use super::backend_hook::Mode;
+
+            if request.mode != Mode::VerificationPair
+                && dbt_log_file_is_refused(
+                    request.global.log_file.is_some(),
+                    request.mode == Mode::SavedVerification,
+                )
+            {
+                return Err(Error::msg(DBT_LOG_FILE_REFUSAL));
+            }
+            let invocation = request.options.dbt_invocation()?;
+            if request.mode == Mode::VerificationPair {
+                return Ok(BuiltinSession::Pair {
+                    verification: invocation.verification(request.stdin.take())?,
+                    log: request.global.log,
+                    verbose: request.options.adapter_verbose_verification(),
+                    verify_json: request
+                        .options
+                        .adapter_verification_json()
+                        .map(Path::to_owned),
+                });
+            }
+            Ok(BuiltinSession::Single {
+                invocation: Some(invocation),
+                mode: request.mode,
+                options: request.options.clone(),
+                global: request.global.clone(),
+                stdin: request.stdin.take(),
+            })
+        }
+        #[cfg(not(feature = "dbt"))]
+        {
+            let _ = &mut request;
+            Err(Error::msg("DBT support was not included in this build"))
+        }
+    }
+
+    fn execute(
+        &self,
+        session: &mut Self::Session,
+        request: super::backend_hook::Execute<'_>,
+    ) -> Result<super::backend_hook::Execution<Self::Pending>, Error> {
+        #[cfg(feature = "dbt")]
+        {
+            use super::backend_hook::Execution;
+            use super::backend_hook::Mode;
+
+            match session {
+                BuiltinSession::Single {
+                    invocation,
+                    mode,
+                    options,
+                    global,
+                    stdin,
+                } => {
+                    anyhow::ensure!(request.mode() == *mode, "backend operation mode changed");
+                    let invocation = invocation.take().ok_or_else(|| {
+                        Error::msg("single physical backend operation was already executed")
+                    })?;
+                    if *mode == Mode::SavedVerification {
+                        let directory = options.adapter_saved_directory().ok_or_else(|| {
+                            Error::msg("saved backend verification has no output directory")
+                        })?;
+                        return invocation
+                            .verify_run(
+                                directory,
+                                global.log,
+                                options.adapter_verbose_verification(),
+                                stdin.take(),
+                                options,
+                            )
+                            .map(Execution::Finished);
+                    }
+                    // Same coordinator-only WARN cap and lifetime as the old
+                    // ordinary arm. Guest evidence continues on its own channel.
+                    let mut warnings = global.clone();
+                    warnings.log = Some(
+                        global
+                            .log
+                            .unwrap_or(tracing::level_filters::LevelFilter::WARN)
+                            .min(tracing::level_filters::LevelFilter::WARN),
+                    );
+                    let _tracing = warnings.init_tracing_for_backend(hermit::Backend::Dbt);
+                    invocation
+                        .run(
+                            options.summary,
+                            options.adapter_engagement_path(),
+                            global.log,
+                            global.log_file.as_deref(),
+                        )
+                        .map(Execution::Finished)
+                }
+                BuiltinSession::Pair {
+                    verification,
+                    log,
+                    verbose,
+                    verify_json,
+                } => {
+                    anyhow::ensure!(
+                        request.mode() == Mode::VerificationPair,
+                        "backend operation mode changed"
+                    );
+                    let capture = request.into_verification()?;
+                    verification
+                        .run(
+                            capture.log,
+                            capture.path,
+                            capture.run,
+                            *log,
+                            *verbose,
+                            verify_json.as_deref(),
+                        )
+                        .map(|output| Execution::Verification(output.into_physical()))
+                }
+            }
+        }
+        #[cfg(not(feature = "dbt"))]
+        {
+            let _ = (session, request);
+            Err(Error::msg("DBT support was not included in this build"))
+        }
+    }
+
+    fn finish(
+        &self,
+        pending: Self::Pending,
+        observation: super::backend_hook::Observation<'_>,
+    ) -> Result<Self::Facts, Error> {
+        #[cfg(not(feature = "dbt"))]
+        let _ = observation;
+        match pending {
+            #[cfg(any(test, feature = "dbt"))]
+            BuiltinPending::Common => Ok(BuiltinFacts::Common),
+            #[cfg(feature = "dbt")]
+            BuiltinPending::Native(pending) => pending
+                .finish(observation.output, observation.run)
+                .map(BuiltinFacts::Native),
+        }
+    }
+
+    fn pair_evidence(
+        &self,
+        first: &Self::Facts,
+        second: &Self::Facts,
+    ) -> Result<super::backend_hook::PairEvidence, Error> {
+        #[cfg(any(test, feature = "dbt"))]
+        {
+            use super::backend_hook::PairEvidence;
+            match (first, second) {
+                (BuiltinFacts::Common, BuiltinFacts::Common) => Ok(PairEvidence::Common),
+                #[cfg(feature = "dbt")]
+                (BuiltinFacts::Native(first), BuiltinFacts::Native(second)) => {
+                    Ok(PairEvidence::NativeCounters {
+                        first: first.native_facts(),
+                        second: second.native_facts(),
+                    })
+                }
+                #[cfg(feature = "dbt")]
+                _ => Err(Error::msg(
+                    "physical backend facts changed kind between runs",
+                )),
+            }
+        }
+        #[cfg(not(any(test, feature = "dbt")))]
+        {
+            let _ = second;
+            match *first {}
+        }
+    }
+}
+
+#[cfg(all(test, feature = "dbt"))]
+impl super::verify::NativeStatistics for DbtBackendStatsSnapshot {
+    fn intercepted_syscalls(&self) -> u64 {
+        self.intercepted_syscalls()
+    }
+    fn rewritten_syscalls(&self) -> u64 {
+        self.rewritten_syscalls()
+    }
+    fn stdin_reads(&self) -> u64 {
+        self.stdin_reads()
+    }
+    fn memory_hash_fold(&self) -> u64 {
+        self.memory_hash_fold()
+    }
+}
+
+#[cfg(all(test, feature = "dbt"))]
 fn same_dbt_observable_behavior(
     first: &DbtBackendStatsSnapshot,
     second: &DbtBackendStatsSnapshot,
 ) -> bool {
-    // `counted_branches` is deliberately absent here because the branch clock
-    // is checked separately, with its own typed evidence. It is NOT excluded
-    // because a difference is tolerable.
-    first.intercepted_syscalls() == second.intercepted_syscalls()
-        && first.rewritten_syscalls() == second.rewritten_syscalls()
-        && first.stdin_reads() == second.stdin_reads()
-        && first.memory_hash_fold() == second.memory_hash_fold()
+    super::verify::same_native_observable_behavior(first, second)
 }
 
-/// Describe a counted-branch-clock divergence without conflating it with the
-/// other native summary fields.
-#[cfg(feature = "dbt")]
-fn dbt_branch_clock_mismatch(first: u64, second: u64) -> Option<String> {
-    (first != second).then(|| {
-        format!(
-            "DBT verification failed: counted-branch clocks differed between runs ({first} != {second}); \
-             the clock is a deterministic function of the executed instruction stream"
-        )
-    })
-}
+#[cfg(all(test, feature = "dbt"))]
+use super::verify::NativeSummaryComparison as DbtSummaryComparison;
 
-/// Compare the authenticated number of DBT process images as a typed dimension.
-///
-/// Each process-image initialization record is also compared in the log, at its
-/// stream position, so a differing count diverges there too. This check names
-/// that cause directly instead of leaving it to be inferred from a record diff.
-#[cfg(feature = "dbt")]
-fn dbt_initialization_record_mismatch(first: usize, second: usize) -> Option<String> {
-    (first != second).then(|| {
-        format!(
-            "DBT verification failed: authenticated process-image initialization counts differed between runs ({first} != {second})"
-        )
-    })
-}
-
-#[cfg(feature = "dbt")]
-#[derive(Debug)]
-struct DbtSummaryComparison {
-    failure: Option<String>,
-}
-
-#[cfg(feature = "dbt")]
-impl DbtSummaryComparison {
-    fn compare(
-        first_stats: &DbtBackendStatsSnapshot,
-        second_stats: &DbtBackendStatsSnapshot,
-        first_initialization_records: usize,
-        second_initialization_records: usize,
-    ) -> Self {
-        let mut failures = Vec::new();
-        if !same_dbt_observable_behavior(first_stats, second_stats) {
-            failures.push(format!(
-                "DBT verification failed: typed native Detcore statistics differed \
-                 ({first_stats:?} != {second_stats:?})"
-            ));
-        }
-        if let Some(failure) = dbt_initialization_record_mismatch(
-            first_initialization_records,
-            second_initialization_records,
-        ) {
-            failures.push(failure);
-        }
-        Self {
-            failure: (!failures.is_empty()).then(|| failures.join("; ")),
-        }
-    }
-
-    fn requires_log_retention(&self) -> bool {
-        self.failure.is_some()
-    }
-
-    fn apply(self, outcome: &mut VerificationOutcome) -> Option<String> {
-        if self.failure.is_some() {
-            outcome.verdict = Verdict::Diverged;
-            outcome.no_result_reason = None;
-        }
-        self.failure
-    }
-}
-
-/// Add a backend-observed divergence to the typed verification verdict.
-///
-/// The canonical comparator may have matched its stdout, stderr, status, and
-/// INFO records, or it may have refused a truncated log. Neither can erase a
-/// separately observed difference in the deterministic counted-branch clock.
-/// Mutating the typed outcome before it is serialized ensures `--verify-json`
-/// says `diverged` with `verified=false` and `bitwise_parity=false`, rather than
-/// leaving a false match or the invocation's pending `no_result` record.
-#[cfg(feature = "dbt")]
+#[cfg(all(test, feature = "dbt"))]
 fn record_dbt_branch_clock_comparison(
     outcome: &mut VerificationOutcome,
     comparison: DbtCountedBranchComparison,
 ) -> Option<String> {
-    match dbt_branch_clock_mismatch(comparison.left, comparison.right) {
-        Some(message) => {
-            outcome.dbt_counted_branches = Some(comparison);
-            outcome.verdict = Verdict::Diverged;
-            outcome.no_result_reason = None;
-            Some(message)
-        }
-        None if outcome.verdict == Verdict::NoResult => {
-            // Equal clocks do not turn a refused common comparison into a
-            // verdict. Keep the backend field absent so `no_result` does not
-            // claim that this one successful dimension authorized anything.
-            outcome.dbt_counted_branches = None;
-            None
-        }
-        None => {
-            outcome.dbt_counted_branches = Some(comparison);
-            None
-        }
-    }
+    super::verify::record_native_branch_clock_comparison("DBT", outcome, comparison)
 }
 
 /// Apply Hermit's execution-evidence policy to the shared physical capture.
@@ -1306,44 +1451,46 @@ pub(super) struct DbtRunFacts {
     initialization_records: usize,
 }
 
+#[cfg(feature = "dbt")]
+impl DbtRunFacts {
+    fn native_facts(&self) -> super::backend_hook::NativeFacts {
+        super::backend_hook::NativeFacts {
+            counted_branches: self.stats.counted_branches(),
+            intercepted_syscalls: self.stats.intercepted_syscalls(),
+            rewritten_syscalls: self.stats.rewritten_syscalls(),
+            stdin_reads: self.stats.stdin_reads(),
+            memory_hash_fold: self.stats.memory_hash_fold(),
+            initialization_records: self.initialization_records,
+            statistics_diagnostic: format!("{:?}", self.stats),
+        }
+    }
+}
+
 /// Backend facts supplement the common comparison, never replace it. Decide
 /// retention before the comparator consumes logs; apply facts before reporting.
 #[cfg(feature = "dbt")]
 pub(super) struct DbtVerificationComparison {
-    branches: DbtCountedBranchComparison,
-    summary: DbtSummaryComparison,
+    native: super::verify::NativeEvidenceComparison,
 }
 
 #[cfg(feature = "dbt")]
 impl DbtVerificationComparison {
     pub(super) fn new(first: &DbtRunFacts, second: &DbtRunFacts) -> Self {
         Self {
-            branches: DbtCountedBranchComparison {
-                left: first.stats.counted_branches(),
-                right: second.stats.counted_branches(),
-            },
-            summary: DbtSummaryComparison::compare(
-                &first.stats,
-                &second.stats,
-                first.initialization_records,
-                second.initialization_records,
+            native: super::verify::NativeEvidenceComparison::new(
+                "dbt",
+                &first.native_facts(),
+                &second.native_facts(),
             ),
         }
     }
 
     pub(super) fn configure(&self, options: &mut ComparisonOptions) {
-        // DBT already compared canonically even for plain --verify. Joining
-        // the common owner must not lower that existing observation contract.
-        options.strictness = LogCompareStrictness::Canonical;
-        let mismatch = !self.branches.matched() || self.summary.requires_log_retention();
-        options.keep_logs |= mismatch;
-        options.match_overridden |= mismatch;
+        self.native.configure(options);
     }
 
     pub(super) fn apply(self, outcome: &mut VerificationOutcome) -> Vec<String> {
-        let summary = self.summary.apply(outcome);
-        let branches = record_dbt_branch_clock_comparison(outcome, self.branches);
-        branches.into_iter().chain(summary).collect()
+        self.native.apply(outcome)
     }
 }
 
@@ -1615,7 +1762,7 @@ impl DbtExecution {
             test_workdir && !options.mounts_tmpfs_at(Path::new(hermit_test_workdir::WORKDIR));
         let options = if test_workdir {
             let workdir = format!("type=tmpfs,target={}", hermit_test_workdir::WORKDIR)
-                .parse::<crate::run::MountArg>()
+                .parse::<super::run::MountArg>()
                 .expect("a tmpfs mount at the test workdir parses");
             options.with_guest_mount(workdir)
         } else {
@@ -2700,7 +2847,7 @@ mod tests {
     #[cfg(feature = "dbt")]
     fn dbt_verification_run_path_binds_terminal_verdict_to_branch_stats() {
         let common = include_str!("run.rs")
-            .split_once("    fn verify(")
+            .split_once("    pub(super) fn verify_with_evidence<")
             .unwrap()
             .1
             .split_once("    /// The `--bind`s")
@@ -2733,12 +2880,12 @@ mod tests {
         let signal1 = at("signal_reports.prepare(\"run 1\"");
         let latch1 = at("latches1.refuse_comparison");
         let rejected = at("if let Some(error) = reject_first_run(");
-        let stats1 = at("facts.finish(&out1, VerificationRun::Run1)");
+        let stats1 = at("finish(pending1, &out1, VerificationRun::Run1)");
         let run2 = at("&run2_options,");
         let signal2 = at("signal_reports.prepare(\"run 2\"");
         let latch2 = at("latches2.refuse_comparison");
-        let stats2 = at("facts.finish(&out2, VerificationRun::Run2)");
-        let comparison = at("DbtVerificationComparison::new(first, second)");
+        let stats2 = at("finish(pending2, &out2, VerificationRun::Run2)");
+        let comparison = at("super::verify::NativeEvidenceComparison::new(");
         let conclude = at("let outcome = conclude_verification(");
         let exit = at("return outcome.into_exit_status()");
         assert!(
@@ -2765,7 +2912,7 @@ mod tests {
         let compare = boundary("let mut outcome = compare_two_runs(");
         let apply = boundary("comparison.apply(&mut outcome)");
         let publish = boundary("write_verification_json(path, &outcome)");
-        let announce = boundary("if let Some(messages) = dbt_messages");
+        let announce = boundary("if let Some(messages) = native_messages");
         assert!(retention < compare && compare < apply && apply < publish && publish < announce);
         let offline = include_str!("backends.rs")
             .split_once("pub(super) fn conclude_dbt_verification(")
