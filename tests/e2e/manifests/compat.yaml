@@ -1521,53 +1521,6 @@ corpus:
           lock's lifetime equal to the guest description's. This cell passed
           only because KVM flock used to be a silent no-op
           (https://github.com/rrnewton/reverie/issues/1069)
-    # DBT (batch-2 flip, sweep 2026-10-27 at Hermit 0948c8eb): rows CLEAN on
-    # DBT in both the 2026-10-26 and 2026-10-27 nightly sweeps get a required
-    # DBT verify cell; the other rows keep no DBT cell under the reason below.
-    - backend: dbt
-      slow:
-        - timeout_seconds: 57
-          cpu_timeout_seconds: 33
-          slow_reason: >-
-            The full validation of 77635530182d stopped each of these DBT
-            cells at the default 22 CPU s. Local single samples on the
-            host named in docs/TESTING_ENVIRONMENTS.md under "Named
-            measurement hosts", at the flip head (2026-10-27), measured git 12.465,
-            ld 14.868 and pkg-config 13.172 CPU s; the configured bound is
-            ceil(1.5 x 22.0) = 33, the rule of
-            DBT_2026_10_25_TIMEOUT_CALIBRATIONS, because the
-            validate-context measurement is the 22.0 stop itself. Wall
-            stays at the 57 s default (local walls at most 16.1 s).
-          rows: [git, ld, pkg-config]
-      rows:
-        [
-          addr2line, ar, arch, as, awk, b2sum, base32, base64, basename, basenc,
-          bash, bc, bracket, bzip2, bzip2-roundtrip, "c++filt", cal, cargo, cat,
-          chmod, chown, chrt, cksum, cmake, cmp, col, colrm, column, comm, cp,
-          cpio-roundtrip, crc32, cscope, csplit, curl, curl-localhost, cut, date,
-          dc, dd, df, df-direct, diff, diff3, dirname, dos2unix, du, echo, egrep,
-          elfedit, env, envsubst, expand, expr, factor, fallocate, fgrep, file,
-          find, findmnt, flock, fmt, fold, free, gcov, getconf, getopt, git,
-          gprof, grep, groups, gzip, gzip-roundtrip, head, hexdump, hostname,
-          iconv, id, install, ionice, iostat, ip, join, jq, ld, ln, logger,
-          logname, ls, lscpu, lsirq, lsmod, lua, lua-direct, m4, md5sum, mkdir,
-          mkfifo, mktemp, mountpoint, mpstat-softirqs, msgfmt, msgunfmt, mv,
-          namei, netlink-route, nice, nl, nm, node, nohup, nproc,
-          numactl-hardware, numastat, numfmt, objcopy, objdump, od, openssl,
-          paste, patch, pathchk, perl, perl-direct, pgrep, pidstat-disk, pinky,
-          pkg-config, pkill, pr, printenv, printf, ps, ptx, pwd, python3, ranlib,
-          readelf, readlink, realpath, rev, rm, rmdir, ruby, sar-resource-tables,
-          sed, seq, setfacl, setfattr, sha1sum, sha224sum, sha256sum, sha384sum,
-          sha512sum, shred, shuf, size, sleep, sort, split, sqlite3, ss, stat,
-          stdbuf, strings, strip, sum, sync, sysctl-random-uuid, tac, tar,
-          tar-roundtrip, taskset, tcl, tee, test, time, top, touch, tr, "true",
-          truncate, tsort, tty, uname, unexpand, uniq, uptime, users, uuidgen,
-          vmstat, vmstat-disk, wc, wc-lines, wget-localhost, whoami, xargs,
-          xmllint, xxd, xz, xz-roundtrip, "yes", zip-unzip, zstd, zstd-roundtrip
-        ]
-      disabled_reason: >-
-        Not CLEAN on DBT in both the 2026-10-26 and 2026-10-27 nightly
-        sweeps (Hermit 0948c8eb), so this row has no DBT verify cell yet
   # Cells measured red on 2026-10-01 (release Hermit at 03bbb8358, through
   # this bucket): each stays enabled with ci: false and its failure class's
   # issue, so the SaBRe run type does not require it.

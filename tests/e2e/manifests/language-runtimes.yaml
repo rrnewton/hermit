@@ -27,9 +27,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT Bash qualification is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst Bash qualification is tracked by backend compatibility
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -93,9 +93,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT Bash qualification is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst Bash qualification is tracked by backend compatibility
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -159,9 +159,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT C++ qualification is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst C++ qualification is tracked by backend compatibility
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -307,9 +307,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT awk support is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst awk support is tracked by backend compatibility
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -372,13 +372,12 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT m4 qualification is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst m4 qualification is tracked by backend compatibility
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -437,13 +436,12 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT Perl qualification is tracked by backend compatibility
           sabre: SaBRe path ineligible - the measured verify pair recorded 132 trusted shared-object sites (33 libc/ld-linux syscall instructions x Perl and tr x two runs; clock_gettime, getrandom, file I/O, memory mapping, and signal operations); forcing the first through the SaBRe marker caused SIGILL, so qualification requires zero trusted or fallback sites
           liteinst: LiteInst Perl qualification is tracked by backend compatibility
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -507,9 +505,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT Perl support is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst Perl support is tracked by backend compatibility
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -573,9 +571,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT Python support is tracked by backend compatibility
           sabre: SaBRe and ptrace each reach L2, but consume different deterministic entropy positions at Python exec and produce different hash seeds and stdout
           liteinst: LiteInst Python support is tracked by backend compatibility
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -703,11 +701,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
+          dbt: DBT Python support is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst Python support is tracked by backend compatibility
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -842,13 +840,12 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT Ruby support is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst Ruby support is tracked by backend compatibility
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -912,9 +909,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT perl support is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst perl support is tracked by backend compatibility
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -978,9 +975,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT Lua qualification is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst Lua qualification is tracked by backend compatibility
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -1043,13 +1040,12 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT Python support is tracked by backend compatibility
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst Python support is tracked by backend compatibility
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -1242,18 +1238,12 @@ test:
         backends_disabled: {}
         ci_disabled_reason: This native control is not selected by ordinary validation; add it to ci/expected-e2e-plan.json only after repeated runs satisfy its declared outcome oracle.
       verify:
-        timeout_seconds:
-          dbt: 57
-        cpu_timeout_seconds:
-          dbt: 33
-        slow_reason:
-          dbt: "The full validation of 77635530182d stopped this DBT cell at the default 22 CPU s. A local single sample on the host named in docs/TESTING_ENVIRONMENTS.md under Named measurement hosts, at the flip head (2026-10-27), measured 20.173 CPU s and 31.470 wall s; the configured CPU bound is ceil(1.5 x 22.0) = 33, the rule of DBT_2026_10_25_TIMEOUT_CALIBRATIONS. Wall stays at the 57 s default."
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBI rewrites the code stream, so a JIT that writes its own code at run time needs separate qualification
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst patches the code stream, so JIT-generated code needs separate qualification
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)

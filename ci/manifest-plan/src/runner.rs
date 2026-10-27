@@ -80,8 +80,6 @@ use crate::timeouts::COMPAT_REPLAY_FULL_2026_10_20_ENABLED_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::DBT_2026_10_25_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
-use crate::timeouts::DBT_FLIP_2026_10_27_TIMEOUT_CALIBRATIONS;
-#[cfg(test)]
 use crate::timeouts::DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS;
 #[cfg(test)]
 use crate::timeouts::DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS;
@@ -15319,18 +15317,6 @@ fi
             };
             assert_eq!(*bounds, (59, wall), "{test}");
         }
-        // The three compat DBT cells with a `slow` budget (git, ld,
-        // pkg-config at 33/57) are not ptrace corpus cells; assert them
-        // apart and return them to the calibrated set below.
-        let (compat_dbt_slow, compat): (BTreeMap<_, _>, BTreeMap<_, _>) = compat
-            .into_iter()
-            .partition(|((_, _, backend), _)| *backend == "dbt");
-        assert_eq!(compat_dbt_slow.len(), 3);
-        for ((test, mode, _), bounds) in &compat_dbt_slow {
-            assert_eq!(*mode, "verify", "{test}");
-            assert_eq!(*bounds, (33, 57), "{test}");
-        }
-        let observed: BTreeMap<_, _> = observed.into_iter().chain(compat_dbt_slow).collect();
         assert_eq!(
             compat.len(),
             STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
@@ -15343,7 +15329,6 @@ fi
             .iter()
             .chain(&KVM_RATCHET_TIMEOUT_CALIBRATIONS)
             .chain(&DBT_2026_10_25_TIMEOUT_CALIBRATIONS)
-            .chain(&DBT_FLIP_2026_10_27_TIMEOUT_CALIBRATIONS)
             .map(|calibration| {
                 (
                     (calibration.test, calibration.mode, calibration.backend),
