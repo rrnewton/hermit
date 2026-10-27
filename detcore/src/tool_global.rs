@@ -7507,11 +7507,6 @@ pub enum GlobalResponse {
     /// sent. Unwrapped by `send_and_update_time`, which notes the hand-off
     /// (`ThreadState::note_scheduler_handoff`).
     Granted(Box<GlobalResponse>),
-    /// A granted reply whose grant found the thread the only one able to run
-    /// before it next enters Detcore (`Scheduler::take_lone_grant`).
-    /// Outermost; unwrapped first by `send_and_update_time`, which records it
-    /// in `ThreadState::lone_grant`.
-    WithLoneGrant(Box<GlobalResponse>),
     RequestResources(ResumeStatus),
     ParkedRequest(ResourceReply),
     ResumeParkedRequest(ResourceReply),
@@ -7798,6 +7793,12 @@ pub enum GlobalResponse {
     /// The answer to `GlobalRequest::CpuAffinity` and
     /// `GlobalRequest::SetCpuAffinity`. Appended last.
     CpuAffinity(crate::cpu_set::TaskAffinity),
+    /// A granted reply whose grant found the thread the only one able to run
+    /// before it next enters Detcore (`Scheduler::take_lone_grant`).
+    /// Outermost; unwrapped first by `send_and_update_time`, which records it
+    /// in `ThreadState::lone_grant`.
+    /// Appended last.
+    WithLoneGrant(Box<GlobalResponse>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
