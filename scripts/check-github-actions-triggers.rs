@@ -10,7 +10,11 @@
 //!
 //! Local exact-head validation is the landing authority. The portable workflow
 //! is supplemental evidence and may run automatically only after a commit is
-//! pushed to `integration`. Two owner-approved maintenance workflows also run
+//! pushed to `integration`, and for pull requests not opened by the project bot
+//! (owner decision, 2026-10-27): its `pull_request` trigger must use exactly
+//! PORTABLE_PR_TYPES, and every job that can start without a predecessor or
+//! runs under `always()` must carry PORTABLE_PR_GATE, so a bot or draft pull
+//! request runs nothing. Two owner-approved maintenance workflows also run
 //! at their exact reviewed schedules; every workflow may remain manually
 //! dispatchable. This checker deliberately accepts only the small YAML shape
 //! used here. An unfamiliar or ambiguous trigger block is an error, never a
@@ -29,12 +33,20 @@ const PORTABLE: &str = "ci-portable.yml";
 const VALIDATION_LEVELS: &str = "validation-levels.yml";
 const BUCK2_OSS_NIGHTLY: &str = "buck2-oss-nightly.yml";
 const RUST_SCRIPT_VERSION: &str = "0.36.0";
+/// The only `pull_request` activity types ci-portable.yml may list.
+const PORTABLE_PR_TYPES: [&str; 4] = ["opened", "synchronize", "reopened", "ready_for_review"];
+/// The gate every ci-portable.yml entry job carries: a pull_request run whose
+/// author is hermit-bot3, or whose pull request is a draft, does nothing.
+const PORTABLE_PR_GATE: &str = "github.event_name != 'pull_request' || (github.event.pull_request.user.login != 'hermit-bot3' && !github.event.pull_request.draft)";
+/// The cleanup job deletes artifacts (actions: write), which a fork's token lacks.
+const PORTABLE_FORK_GUARD: &str = "github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository";
 
 #[derive(Debug, PartialEq, Eq)]
 struct Triggers {
     events: BTreeSet<String>,
     push_branches: Option<Vec<String>>,
     schedule_crons: Option<Vec<String>>,
+    pull_request_types: Option<Vec<String>>,
 }
 
 fn indentation(line: &str) -> Result<usize, String> {
@@ -135,6 +147,9 @@ fn parse_triggers(source: &str) -> Result<Triggers, String> {
     let mut schedule_indent = None;
     let mut schedule_child_indent = None;
     let mut schedule_crons = None;
+    let mut pull_request_indent = None;
+    let mut pull_request_child_indent = None;
+    let mut pull_request_types = None;
     for raw in &lines[on_index + 1..] {
         let line = code(raw);
         if line.trim().is_empty() {
@@ -162,6 +177,8 @@ fn parse_triggers(source: &str) -> Result<Triggers, String> {
             push_child_indent = None;
             schedule_indent = (event == "schedule").then_some(indent);
             schedule_child_indent = None;
+            pull_request_indent = (event == "pull_request").then_some(indent);
+            pull_request_child_indent = None;
             if event == "schedule" {
                 schedule_crons = Some(Vec::new());
             }
@@ -188,6 +205,29 @@ fn parse_triggers(source: &str) -> Result<Triggers, String> {
                 } else {
                     return Err(format!(
                         "unsupported direct `push` key; only `branches` is permitted: `{trimmed}`"
+                    ));
+                }
+            }
+        } else if let Some(indent_of_pull_request) = pull_request_indent {
+            if indent > indent_of_pull_request {
+                let direct = *pull_request_child_indent.get_or_insert(indent);
+                if indent != direct {
+                    return Err(format!(
+                        "ambiguous nested structure in `pull_request`: `{}`",
+                        line.trim()
+                    ));
+                }
+                let trimmed = line.trim();
+                if let Some(value) = trimmed.strip_prefix("types:") {
+                    if pull_request_types.is_some() {
+                        return Err("duplicate `pull_request.types` entry".to_string());
+                    }
+                    pull_request_types = Some(inline_list(value).ok_or_else(|| {
+                        "`pull_request.types` must be an explicit inline list".to_string()
+                    })?);
+                } else {
+                    return Err(format!(
+                        "unsupported direct `pull_request` key; only `types` is permitted: `{trimmed}`"
                     ));
                 }
             }
@@ -224,6 +264,7 @@ fn parse_triggers(source: &str) -> Result<Triggers, String> {
         events,
         push_branches,
         schedule_crons,
+        pull_request_types,
     })
 }
 
@@ -239,11 +280,14 @@ fn approved_schedule(name: &str) -> Option<&'static [&'static str]> {
 }
 
 fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
-    let recognized = BTreeSet::from([
+    let mut recognized = BTreeSet::from([
         "push".to_string(),
         "schedule".to_string(),
         "workflow_dispatch".to_string(),
     ]);
+    if name == PORTABLE {
+        recognized.insert("pull_request".to_string());
+    }
     let mut errors = Vec::new();
     for event in triggers.events.difference(&recognized) {
         errors.push(format!("automatic `{event}` trigger is not permitted"));
@@ -283,15 +327,102 @@ fn validate(name: &str, triggers: &Triggers) -> Vec<String> {
     }
 
     if name == PORTABLE {
-        let allowed = BTreeSet::from(["push".to_string(), "workflow_dispatch".to_string()]);
+        let allowed = BTreeSet::from([
+            "pull_request".to_string(),
+            "push".to_string(),
+            "workflow_dispatch".to_string(),
+        ]);
         if triggers.events != allowed {
             errors.push(
-                "ci-portable.yml must have exactly `workflow_dispatch` and `push` triggers"
+                "ci-portable.yml must have exactly `workflow_dispatch`, `push` and `pull_request` triggers"
                     .to_string(),
             );
         }
+        if triggers.events.contains("pull_request")
+            && !triggers
+                .pull_request_types
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(String::as_str)
+                .eq(PORTABLE_PR_TYPES.iter().copied())
+        {
+            errors.push(format!(
+                "ci-portable.yml `pull_request.types` must be exactly [{}]",
+                PORTABLE_PR_TYPES.join(", ")
+            ));
+        }
         if triggers.push_branches.as_deref() != Some(&["integration".to_string()]) {
             errors.push("ci-portable.yml must push-trigger exactly on `integration`".to_string());
+        }
+    }
+    errors
+}
+
+/// Every ci-portable.yml job that can start without a predecessor (no `needs:`)
+/// or that runs under `always()` must carry PORTABLE_PR_GATE in its `if:`; the
+/// cleanup job must also carry PORTABLE_FORK_GUARD. Every other job needs one of
+/// those and is skipped with it.
+fn validate_portable_pr_gate(source: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    let Some(jobs_start) = source.find("\njobs:\n") else {
+        return vec!["ci-portable.yml has no top-level `jobs:` mapping".to_string()];
+    };
+    let jobs = &source[jobs_start + "\njobs:\n".len()..];
+    let mut blocks: Vec<(String, String)> = Vec::new();
+    for line in jobs.lines() {
+        if line.starts_with("  ")
+            && !line.starts_with("   ")
+            && line.trim_end().ends_with(':')
+            && !line.trim().starts_with('#')
+        {
+            blocks.push((line.trim().trim_end_matches(':').to_string(), String::new()));
+        } else if !line.starts_with(' ') && !line.trim().is_empty() && !line.trim().starts_with('#')
+        {
+            break;
+        } else if let Some((_, body)) = blocks.last_mut() {
+            body.push_str(line);
+            body.push('\n');
+        }
+    }
+    if blocks.is_empty() {
+        errors.push("ci-portable.yml declares no jobs".to_string());
+    }
+    for (job, body) in &blocks {
+        let has_needs = body.lines().any(|l| l.starts_with("    needs:"));
+        let condition: String = {
+            let mut text = String::new();
+            let mut inside = false;
+            for l in body.lines() {
+                if let Some(rest) = l.strip_prefix("    if:") {
+                    inside = true;
+                    text.push_str(rest);
+                    continue;
+                }
+                if inside {
+                    if l.starts_with("     ") {
+                        text.push(' ');
+                        text.push_str(l.trim());
+                    } else {
+                        break;
+                    }
+                }
+            }
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        let gate = PORTABLE_PR_GATE
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if (!has_needs || condition.contains("always()")) && !condition.contains(&gate) {
+            errors.push(format!(
+                "ci-portable.yml job `{job}` can start on its own (no needs, or always()) and must carry the pull_request gate: {PORTABLE_PR_GATE}"
+            ));
+        }
+        if job == "cleanup" && !condition.contains(PORTABLE_FORK_GUARD) {
+            errors.push(format!(
+                "ci-portable.yml job `cleanup` deletes artifacts and must skip forks: {PORTABLE_FORK_GUARD}"
+            ));
         }
     }
     errors
@@ -934,6 +1065,13 @@ fn run(dir: &Path) -> Result<usize, Vec<String>> {
             }
             Err(error) => errors.push(format!("{}: {error}", path.display())),
         }
+        if name == PORTABLE {
+            errors.extend(
+                validate_portable_pr_gate(&source)
+                    .into_iter()
+                    .map(|error| format!("{}: {error}", path.display())),
+            );
+        }
         if name == VALIDATION_LEVELS {
             errors.extend(
                 validate_validation_levels_bootstrap(&source)
@@ -963,7 +1101,7 @@ fn main() {
     rust_script_prelude::init();
     match run(Path::new(WORKFLOW_DIR)) {
         Ok(count) => println!(
-            "GitHub Actions triggers OK: {count} workflows; automatic runs are limited to integration and exact approved schedules"
+            "GitHub Actions triggers OK: {count} workflows; automatic runs are limited to integration, non-bot pull requests and exact approved schedules"
         ),
         Err(errors) => {
             for error in errors {
@@ -982,12 +1120,92 @@ mod tests {
         parse_triggers(source).expect("fixture should parse")
     }
 
+    const PORTABLE_ON: &str = "name: portable\non:\n  workflow_dispatch:\n  push:\n    branches: [integration]\n  pull_request:\n    types: [opened, synchronize, reopened, ready_for_review]\njobs:\n";
+
     #[test]
-    fn portable_policy_accepts_integration_and_manual_only() {
+    fn portable_policy_accepts_integration_manual_and_gated_pull_requests() {
+        assert!(validate(PORTABLE, &parsed(PORTABLE_ON)).is_empty());
+    }
+
+    #[test]
+    fn portable_now_requires_its_pull_request_trigger() {
         let triggers = parsed(
             "name: portable\non:\n  workflow_dispatch:\n  push:\n    branches: [integration]\njobs:\n",
         );
-        assert!(validate(PORTABLE, &triggers).is_empty());
+        assert!(!validate(PORTABLE, &triggers).is_empty());
+    }
+
+    #[test]
+    fn portable_pull_request_types_must_be_exact() {
+        for types in [
+            "[opened]",
+            "[opened, synchronize, reopened, ready_for_review, labeled]",
+            "[opened, synchronize, reopened]",
+        ] {
+            let source =
+                PORTABLE_ON.replace("[opened, synchronize, reopened, ready_for_review]", types);
+            assert!(!validate(PORTABLE, &parsed(&source)).is_empty(), "{types}");
+        }
+        let missing = PORTABLE_ON.replace(
+            "    types: [opened, synchronize, reopened, ready_for_review]\n",
+            "",
+        );
+        assert!(!validate(PORTABLE, &parsed(&missing)).is_empty());
+    }
+
+    #[test]
+    fn pull_request_accepts_only_a_types_list() {
+        for extra in [
+            "    branches: [main]\n",
+            "    paths: [src]\n",
+            "    types:\n      - opened\n",
+        ] {
+            let source = PORTABLE_ON.replace(
+                "    types: [opened, synchronize, reopened, ready_for_review]\n",
+                extra,
+            );
+            assert!(
+                parse_triggers(&source).is_err()
+                    || !validate(PORTABLE, &parsed(&source)).is_empty(),
+                "{extra:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_in_portable_workflow_gates_every_entry_job() {
+        let source = include_str!("../.github/workflows/ci-portable.yml");
+        assert!(validate(PORTABLE, &parsed(source)).is_empty());
+        let errors = validate_portable_pr_gate(source);
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn an_ungated_entry_job_or_unguarded_cleanup_is_rejected() {
+        let gate = format!("    if: {PORTABLE_PR_GATE}\n");
+        let ok = format!(
+            "{PORTABLE_ON}  select:\n{gate}    runs-on: x\n  build:\n    needs: select\n    runs-on: x\n  regular:\n    needs: build\n    if: always() && ({PORTABLE_PR_GATE})\n  cleanup:\n    needs: regular\n    if: always() && ({PORTABLE_PR_GATE}) && ({PORTABLE_FORK_GUARD})\n"
+        );
+        assert!(
+            validate_portable_pr_gate(&ok).is_empty(),
+            "{:?}",
+            validate_portable_pr_gate(&ok)
+        );
+        // A new root job without the gate.
+        let new_root = format!("{ok}  newroot:\n    runs-on: x\n");
+        assert!(!validate_portable_pr_gate(&new_root).is_empty());
+        // An always() job that dropped the gate.
+        let dropped = ok.replace(
+            &format!("    if: always() && ({PORTABLE_PR_GATE})\n  cleanup"),
+            "    if: always()\n  cleanup",
+        );
+        assert!(!validate_portable_pr_gate(&dropped).is_empty());
+        // Cleanup without the fork guard.
+        let unguarded = ok.replace(&format!(" && ({PORTABLE_FORK_GUARD})"), "");
+        assert!(!validate_portable_pr_gate(&unguarded).is_empty());
+        // The root job with its gate removed.
+        let bare = ok.replacen(&gate, "", 1);
+        assert!(!validate_portable_pr_gate(&bare).is_empty());
     }
 
     #[test]
