@@ -3130,7 +3130,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4619 adds three detcore units: 2926 + 3 = 2929, re-measured at this integration head.
     // PR 4725 adds twenty-one detcore units: 2929 + 21 = 2950, re-measured at this integration head.
     // PR 4679 adds three detcore units: 2950 + 3 = 2953, re-measured at this integration head.
-    ("test.detcore_unit", 2953),
+    // And this change's post-fork-side scheduler test: 2954.
+    ("test.detcore_unit", 2954),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4448,7 +4449,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4725 adds thirteen cli cases: 714 + 13 = 727, re-measured at this integration head.
     // PR 4679: re-measured at this integration head by the cli binary's own
     // list under the node's skip filters, minus ignored cases: 738.
-    ("test.cli", 738),
+    // And this change's no-namespace schedule replay test: 739.
+    ("test.cli", 739),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5007,7 +5009,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same thirteen PR 4725 cli cases: 633 + 13 = 646.
     // PR 4679: the same re-measurement as test.cli with the hosted
     // exclusions applied: 657.
-    ("test.cli_on_host", 657),
+    // And the same test: 658.
+    ("test.cli_on_host", 658),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5493,7 +5496,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same three PR 4619 units: 2926 + 3 = 2929.
     // The same twenty-one PR 4725 units: 2929 + 21 = 2950.
     // The same three PR 4679 units: 2950 + 3 = 2953.
-    ("test.detcore_unit_on_host", 2953),
+    // And the same test: 2954.
+    ("test.detcore_unit_on_host", 2954),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
