@@ -4392,7 +4392,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured with `cargo nextest list` at 11c35a504a6.
     // And a_chaos_timeslice_range_draws_slices_from_the_seed_and_replays: 704.
     // And a_run_draw_picks_the_timeslice_and_a_replay_runs_under_it: 705.
-    ("test.cli", 705),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
+    // Both of those need the PMU timer: privileged-test.pmu_cli_cases runs
+    // them, and test.cli now skips them by exact name as its hosted twin
+    // test.cli_on_host does (they were skipped only there, which
+    // hosted_nextest_selections_keep_local_cases_and_failure_limits refused):
+    // 705 - 2 = 703.
+    ("test.cli", 703),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
     // sabre_reports_a_replaced_host_file_without_naming_it_the_cause,
