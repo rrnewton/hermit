@@ -152,6 +152,14 @@ pub struct FileMetadata {
     /// keeps the table. The end of a descriptor directory's listing.
     #[serde(default = "default_descriptor_capacity")]
     descriptor_capacity: u64,
+    /// Whether the exec that made this table dropped a close-on-exec
+    /// description whose locks Detcore follows (`DetFd::is_lock_tracked`):
+    /// the post-exec handler then names the surviving ones to
+    /// `procfs::locks::LockLedger` even where none survived, so that the
+    /// ledger releases a placeholder `flock` the exec closed
+    /// (`LockLedger::exec_kept`).
+    #[serde(default)]
+    exec_dropped_lock_tracked: bool,
 }
 
 /// `NR_OPEN_DEFAULT` on 64-bit Linux.
@@ -842,6 +850,7 @@ impl FileMetadata {
             present_unmodelled: BTreeMap::new(),
             unaccounted_receipts: false,
             descriptor_capacity: default_descriptor_capacity(),
+            exec_dropped_lock_tracked: false,
         }
     }
 
@@ -1083,6 +1092,7 @@ impl FileMetadata {
             present_unmodelled: self.present_unmodelled.clone(),
             unaccounted_receipts: self.unaccounted_receipts,
             descriptor_capacity: self.forked_descriptor_capacity(),
+            exec_dropped_lock_tracked: false,
         }
     }
 
@@ -1109,6 +1119,10 @@ impl FileMetadata {
                 .collect(),
             unaccounted_receipts: self.unaccounted_receipts,
             descriptor_capacity: self.descriptor_capacity,
+            exec_dropped_lock_tracked: self
+                .file_handles
+                .values()
+                .any(|detfd| detfd.is_cloexec() && detfd.is_lock_tracked()),
         }
     }
 
@@ -4302,6 +4316,17 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) receive_geometry: Option<Option<crate::syscalls::scm_rights::ReceiveGeometry>>,
 
+    /// The `sendmsg` or `sendmmsg` this thread is running, while its
+    /// `SCM_RIGHTS` descriptors matter to the `/proc` directories Detcore
+    /// serves on placeholders: `Some` from the handler's inspection
+    /// (`Detcore::inspect_placeholder_send`), read before each attempt of the
+    /// internal polling loop, which refuses by name an attempt whose messages
+    /// pass other placeholders than were inspected
+    /// (`retry_nonblocking_syscall_helper`), taken when the call returns.
+    /// Never carried across a fork or a migration.
+    #[serde(skip)]
+    pub(crate) send_inspection: Option<crate::syscalls::SendInspection>,
+
     /// Linux memory address space shared by tasks created with `CLONE_VM`.
     pub mm_id: MmId,
 
@@ -5400,6 +5425,7 @@ impl<T> ThreadState<T> {
             signal_task_identity: None,
             open_file_creator: None,
             receive_geometry: None,
+            send_inspection: None,
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),
             pedigree: Pedigree::new(), // Root thread.
@@ -6376,6 +6402,21 @@ impl<T> ThreadState<T> {
             .filter(|detfd| detfd.open_file_id() == open_file)
             .count();
         u32::try_from(count).unwrap_or(u32::MAX)
+    }
+
+    /// Whether the exec that made this thread's table dropped a close-on-exec
+    /// description whose locks Detcore follows (`FileMetadata::exec_dropped_lock_tracked`).
+    pub(crate) fn exec_dropped_lock_tracked(&self) -> bool {
+        self.metadata().exec_dropped_lock_tracked
+    }
+
+    /// Whether this thread's table holds a descriptor Detcore serves as a
+    /// `/proc` directory on a placeholder (`DetFd::placeholder`).
+    pub(crate) fn holds_placeholder(&self) -> bool {
+        self.metadata()
+            .file_handles
+            .values()
+            .any(|detfd| detfd.placeholder().is_some())
     }
 
     /// The descriptions in this thread's table whose locks

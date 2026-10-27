@@ -214,6 +214,7 @@ static RENDERED_MOUNT_TABLE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGCHLD_ONCE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DIRECTORY_OPENAT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static RECEIVED_DIRECTORY_SWAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static PROC_FD_DIRECTORY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STATX_MOUNT_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_AT_TURN_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STATX_UNIQUE_MOUNT_ID_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -1582,6 +1583,39 @@ fn rendered_mount_table_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "rendered-mount-table guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn proc_fd_directory_guest() -> &'static Path {
+    PROC_FD_DIRECTORY_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("proc-fd-directory");
+        fs::create_dir_all(&build_root).expect("failed to create proc-fd-directory directory");
+        let guest = build_root.join("proc_fd_directory");
+        let output = Command::new("cc")
+            .args([
+                "-O0",
+                "-g",
+                "-Wall",
+                "-Wextra",
+                "-Werror",
+                "-pthread",
+                "-D_GNU_SOURCE",
+            ])
+            .arg(repository.join("tests/c/proc_fd_directory.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile proc-fd-directory guest");
+        assert!(
+            output.status.success(),
+            "proc-fd-directory guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -6785,6 +6819,522 @@ fn detcore_lists_procfs_from_its_model_on_every_backend() {
             .chain(["ptrace/record".to_string()])
             .collect::<Vec<_>>()
     );
+}
+
+/// Serve `/proc` and the caller's descriptor directory, as Detcore does in
+/// hermit-cli's container, on `backend`, once in the container (`--strict`)
+/// and once without it (`--no-namespace`), and return how many lines of the
+/// runs' debug logs name KVM's `/proc` anchor (`[detcore] KVM /proc anchor
+/// reached`). Each descriptor Detcore serves is open on `object`, which its
+/// debug log names: procfs's root on ptrace, the placeholder directory on
+/// KVM. Without a container Detcore serves neither directory: ptrace keeps
+/// the kernel's directories, which list the same descriptors, and KVM
+/// refuses an open of either with `EACCES` before it can reach its
+/// executor's own `/proc` handle. Relaxation: `--strict` refuses
+/// `--no-namespace`, so those runs are not strict; the container's runs are.
+fn serve_procfs_directories_in_a_container_only(backend: &str, object: &str) -> usize {
+    let script = "ls -1a /proc/self/fd && ls /proc >/dev/null && echo listed /proc";
+    let refused = "for d in /proc/self/fd /proc; do ls \"$d\" 2>&1 >/dev/null | \
+                   grep -q 'Permission denied' && echo \"$d EACCES\"; done; echo done";
+    let mut anchor_warnings = 0;
+    let mut listings = Vec::new();
+    for mode in ["--strict", "--no-namespace"] {
+        let refuses = backend == "kvm" && mode == "--no-namespace";
+        let args = [
+            "--log=debug",
+            "--backend",
+            backend,
+            "run",
+            mode,
+            "--",
+            "/bin/sh",
+            "-c",
+            if refuses { refused } else { script },
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let log = stderr(&output);
+        anchor_warnings += log
+            .lines()
+            .filter(|line| line.contains("KVM /proc anchor reached"))
+            .count();
+        // Detcore's debug line for each: "descriptor N: <directory>
+        // served on <object>".
+        let served = |directory: &str| {
+            log.lines().any(|line| {
+                line.ends_with(&format!(" served on {object}"))
+                    && if directory == "/proc" {
+                        line.contains(": /proc served on ")
+                    } else {
+                        line.contains("/fd served on ")
+                    }
+            })
+        };
+        let in_container = mode == "--strict";
+        assert_eq!(
+            served("/proc"),
+            in_container,
+            "{backend} {mode}: whether /proc was served on {object}"
+        );
+        assert_eq!(
+            served("/fd"),
+            in_container,
+            "{backend} {mode}: whether the descriptor directory was served on {object}"
+        );
+        if refuses {
+            assert_eq!(
+                stdout(&output),
+                "/proc/self/fd EACCES\n/proc EACCES\ndone\n",
+                "{backend} {mode}"
+            );
+        } else {
+            let listing = stdout(&output);
+            assert!(
+                listing.starts_with(".\n..\n0\n1\n2\n") && listing.ends_with("\nlisted /proc\n"),
+                "{backend} {mode}: {listing}"
+            );
+            listings.push(listing);
+        }
+    }
+    assert!(
+        listings.windows(2).all(|pair| pair[0] == pair[1]),
+        "{backend}: the container's listing differs from --no-namespace's: {listings:?}"
+    );
+    anchor_warnings
+}
+
+/// On ptrace, whose procfs is the kernel's, Detcore serves `/proc` and the
+/// caller's descriptor directory in hermit-cli's container, each on a
+/// descriptor on the container procfs's root, as slice F1 opened it
+/// (package K slice P1, toward https://github.com/rrnewton/hermit/issues/4604),
+/// and neither without the container
+/// ([`serve_procfs_directories_in_a_container_only`]). No placeholder
+/// directory is mounted for ptrace: procfs's own empty `/proc/fs/nfsd`,
+/// reached through the root link, which Detcore's `--proc` level table does
+/// not resolve, is procfs (`statfs`), as on Linux, and no tmpfs of Hermit's.
+#[test]
+fn procfs_directories_are_served_only_in_a_container() {
+    assert_eq!(
+        serve_procfs_directories_in_a_container_only("ptrace", "/proc"),
+        0
+    );
+    let args = [
+        "--backend",
+        "ptrace",
+        "run",
+        "--strict",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--",
+        "/usr/bin/stat",
+        "-f",
+        "-c",
+        "%t",
+        "/proc/self/root/proc/fs/nfsd",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "9fa0\n", "procfs's /proc/fs/nfsd");
+}
+
+/// On KVM, whose procfs is its executor's own, Detcore serves `/proc` and the
+/// caller's descriptor directory in hermit-cli's container, each on a
+/// descriptor on the placeholder directory, an empty read-only tmpfs at
+/// `/proc/fs/nfsd`, and refuses either with `EACCES` without the container
+/// ([`serve_procfs_directories_in_a_container_only`]). No KVM run, in the
+/// container or not, reaches the executor's own `/proc` handle (no
+/// `[detcore] KVM /proc anchor reached` line): the tripwire for its removal
+/// from the executor (slice P2).
+#[test]
+fn run_kvm_procfs_directories_are_served_only_in_a_container() {
+    let test = "run_kvm_procfs_directories_are_served_only_in_a_container";
+    if kvm_unavailable(test) {
+        return;
+    }
+    let anchor_warnings = serve_procfs_directories_in_a_container_only("kvm", "/proc/fs/nfsd");
+    assert_eq!(anchor_warnings, 0, "a run reached KVM's /proc anchor");
+    eprintln!("{test}: KVM /proc anchor warnings: {anchor_warnings}");
+}
+
+/// The calls on and below a `/proc` directory Detcore serves that Detcore
+/// cannot answer as Linux does are refused by name (ARCHITECTURE.md rule 6),
+/// never reached through the directory's object nor answered with a
+/// plausible errno, on `backend`: an exec of a name below the caller's own
+/// `/proc/self/fd` descriptor (natively the exec follows the descriptor link
+/// and runs /bin/true); an `AF_UNIX` address that goes on below
+/// `/proc/self/fd/<D>/..` (natively it connects through `/proc/<pid>/root`);
+/// `fchdir` to a descriptor directory whose task has exited (natively it
+/// enters the dead directory and `getcwd` names it; no directory of the
+/// backend's can stand for it); a send over `SCM_RIGHTS` of a descriptor
+/// whose open file holds a flock on the directory (natively sent: Linux
+/// keeps the lock while the message is queued); a flock while a copy of the
+/// descriptor is in flight (natively granted); a transfer by `sendfile` and
+/// by `splice` from `/proc` into a pipe (natively `EINVAL` once the pipe has
+/// a reader and room, which Detcore does not model); a send of the
+/// descriptor directory after more control data than Detcore reads
+/// (natively sent); a send that waits for room while a sibling rewrites its
+/// control data to name a locked descriptor directory (natively sent, as
+/// Linux copied the control data first); a send on a connected `AF_UNIX`
+/// socket while the process holds the descriptor directory (natively sent;
+/// in Detcore's turn, also sent), and on the socket it inherited as its
+/// standard input, which blocks in the kernel (natively sent; refused, as
+/// Hermit runs it outside its turn); and, on ptrace, a flock
+/// of a `/proc` descriptor in a process one of whose threads had a descriptor
+/// table of its own (natively granted; Detcore cannot tell that process's
+/// tables apart, and KVM gives no thread a table of its own). Natively as root in new user,
+/// mount and PID namespaces with a procfs of its own; each Hermit run stops
+/// with the policy's exit and names the reason.
+fn refuse_calls_below_served_procfs_directories(test: &str, backend: &str) {
+    let guest = proc_fd_directory_guest();
+    let mut modes = vec![
+        (
+            "--exec-below",
+            "",
+            "leads below a /proc directory Detcore serves",
+        ),
+        (
+            "--unix-below",
+            "connect below the descriptor directory=0 errno=0\nfailures=0\n",
+            "leads below a /proc directory Detcore serves",
+        ),
+        (
+            "--stale-fchdir",
+            "stale fchdir=0 errno=0 getcwd=named\nfailures=0\n",
+            "a descriptor directory whose task has exited",
+        ),
+        (
+            "--send-locked",
+            "send of the descriptor directory holding a lock=1 errno=0\nfailures=0\n",
+            "holds a flock on it, which Linux keeps while the message is queued",
+        ),
+        (
+            "--lock-in-flight",
+            "send of the descriptor directory=1 errno=0\n\
+             lock while its copy is in flight=0 errno=0\nfailures=0\n",
+            "while a copy of its open file is in flight over SCM_RIGHTS",
+        ),
+        (
+            "--transfer-into-pipe",
+            "sendfile from /proc into a pipe=-1 errno=EINVAL\nfailures=0\n",
+            "sendfile from descriptor",
+        ),
+        (
+            "--splice-into-pipe",
+            "splice from /proc into a pipe=-1 errno=EINVAL\nfailures=0\n",
+            "splice from descriptor",
+        ),
+        (
+            "--send-unscanned-control",
+            "send of the descriptor directory after 65520 bytes of other control \
+             data=1 errno=0\nfailures=0\n",
+            "SCM_RIGHTS control data Detcore cannot read in full",
+        ),
+        (
+            "--send-rewritten-while-blocked",
+            "send rewritten while it waits for room=1 errno=0\nfailures=0\n",
+            "changed while the send waited for room",
+        ),
+    ];
+    if backend == "ptrace" {
+        modes.push((
+            "--lock-after-private-table",
+            "lock after a thread with a table of its own=0 errno=0\nfailures=0\n",
+            "where a process that has had a thread with a descriptor table of its own",
+        ));
+    }
+    for &(mode, natively, _) in &modes {
+        let native = Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--pid",
+                "--fork",
+                "--",
+                "/bin/sh",
+                "-c",
+                "mount -t proc -o nosuid,nodev,noexec proc /proc && exec \"$0\" \"$1\"",
+            ])
+            .arg(guest)
+            .arg(mode)
+            .output()
+            .expect("run proc-fd-directory natively");
+        assert!(native.status.success(), "native {mode}: {native:?}");
+        assert_eq!(stdout(&native), natively, "natively {mode}");
+    }
+    let mut compared = Vec::new();
+    for &(mode, _, reason) in &modes {
+        refuse_procfs_directory_mode(backend, guest, mode, reason);
+        compared.push(format!("{backend} {mode}"));
+    }
+    // A send on a connected `AF_UNIX` socket from socket(2) while the process
+    // holds the descriptor directory runs in Detcore's turn, as natively; the
+    // same send on the socket the guest inherited as its standard input,
+    // which blocks in the kernel, runs outside its turn, where another thread
+    // may rewrite its messages before Linux reads them: refused by name.
+    let holding = "--send-holding-the-directory";
+    let natively = "send on a connected socket while holding the descriptor directory=1 \
+                    errno=0\nfailures=0\n";
+    let inherited = "--send-on-stdin-holding-the-directory";
+    let natively_inherited = "send on the inherited socket while holding the descriptor \
+                              directory=1 errno=0\nfailures=0\n";
+    for (mode, expected) in [(holding, natively), (inherited, natively_inherited)] {
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let native = Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--pid",
+                "--fork",
+                "--",
+                "/bin/sh",
+                "-c",
+                "mount -t proc -o nosuid,nodev,noexec proc /proc && exec \"$0\" \"$1\"",
+            ])
+            .arg(guest)
+            .arg(mode)
+            .stdin(Stdio::from(std::os::fd::OwnedFd::from(socket)))
+            .output()
+            .expect("run proc-fd-directory natively");
+        assert!(native.status.success(), "native {mode}: {native:?}");
+        assert_eq!(stdout(&native), expected, "natively {mode}");
+    }
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        holding,
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        natively,
+        "{backend} {holding} under --strict"
+    );
+    compared.push(format!("{backend} {holding}"));
+    let (socket, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    let mut command = hermit_command(&[
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        inherited,
+    ]);
+    command.stdin(Stdio::from(std::os::fd::OwnedFd::from(socket)));
+    let output = hermit_test::hermit_output(&format!("{command:?}"), &mut command);
+    let log = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{backend} {inherited} did not stop with the policy's exit: {log}"
+    );
+    assert!(
+        log.contains("runs outside Detcore's turn"),
+        "{backend} {inherited}: the refusal does not name its reason: {log}"
+    );
+    assert!(
+        !log.contains("KVM /proc anchor reached"),
+        "{backend} {inherited}: a run reached KVM's /proc anchor: {log}"
+    );
+    compared.push(format!("{backend} {inherited}"));
+    eprintln!("{test} compared {compared:?}");
+}
+
+/// Run `guest` in `mode` on `backend` under `--strict`, and require that it
+/// stops with the policy's exit, names `reason`, and reaches no KVM `/proc`
+/// anchor.
+fn refuse_procfs_directory_mode(backend: &str, guest: &Path, mode: &str, reason: &str) {
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        mode,
+    ];
+    let output = hermit(&args);
+    let log = stderr(&output);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "{backend} {mode} did not stop with the policy's exit: {log}"
+    );
+    assert!(
+        log.contains(reason),
+        "{backend} {mode}: the refusal does not name its reason: {log}"
+    );
+    assert!(
+        !log.contains("KVM /proc anchor reached"),
+        "{backend} {mode}: a run reached KVM's /proc anchor: {log}"
+    );
+}
+
+/// [`refuse_calls_below_served_procfs_directories`] on ptrace.
+#[test]
+fn calls_below_a_served_procfs_directory_are_refused_by_name() {
+    refuse_calls_below_served_procfs_directories(
+        "calls_below_a_served_procfs_directory_are_refused_by_name",
+        "ptrace",
+    );
+}
+
+/// [`refuse_calls_below_served_procfs_directories`] on KVM.
+#[test]
+fn run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name() {
+    let test = "run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name";
+    if kvm_unavailable(test) {
+        return;
+    }
+    refuse_calls_below_served_procfs_directories(test, "kvm");
+}
+
+/// On KVM, a user mount that covers the placeholder directory's mount point,
+/// by any spelling that resolves there when the container's setup installs it
+/// (`/proc/fs`, `/proc/fs/nfsd`, and `/proc/fs/nfsd/..`, which is
+/// `/proc/fs`), leaves Detcore no placeholder: Detcore serves neither
+/// directory (no debug line names a directory served on a descriptor), and
+/// refuses an open of the descriptor directory with `EACCES`, before it can
+/// reach the executor's own `/proc` handle (no `[detcore] KVM /proc anchor
+/// reached` line). Without the mount, Detcore serves it: the control. A
+/// mount over `/proc` itself is not checked: the container then cannot read
+/// the guest's mount table and stops the run, at the base as here
+/// (https://github.com/rrnewton/hermit/issues/4758).
+#[test]
+fn run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none() {
+    let test = "run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none";
+    if kvm_unavailable(test) {
+        return;
+    }
+    let source = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let script = "ls -1a /proc/self/fd >/dev/null 2>&1 && echo listed || echo refused";
+    for target in [
+        None,
+        Some("/proc/fs"),
+        Some("/proc/fs/nfsd"),
+        Some("/proc/fs/nfsd/.."),
+    ] {
+        let mount = target.map(|target| {
+            format!(
+                "--mount=type=bind,source={},target={target}",
+                source.path().display()
+            )
+        });
+        let mut args = vec!["--log=debug", "--backend", "kvm", "run"];
+        args.extend(mount.as_deref());
+        args.extend(["--", "/bin/sh", "-c", script]);
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        let log = stderr(&output);
+        assert_eq!(
+            stdout(&output),
+            if target.is_none() {
+                "listed\n"
+            } else {
+                "refused\n"
+            },
+            "{target:?}"
+        );
+        assert_eq!(
+            log.contains(" served on "),
+            target.is_none(),
+            "{target:?}: whether Detcore served a directory on a placeholder"
+        );
+        assert!(
+            !log.contains("KVM /proc anchor reached"),
+            "{target:?}: a run reached KVM's /proc anchor"
+        );
+    }
+}
+
+/// `--namespace-only` runs the guest in the container's namespaces without
+/// Detcore, which serves no placeholder directory there, and hermit-cli
+/// mounts none: the guest's mount table has no `hermit` tmpfs at
+/// `/proc/fs/nfsd`, and so no row with the host's uid.
+#[test]
+fn namespace_only_mounts_no_placeholder_directory() {
+    let args = [
+        "run",
+        "--namespace-only",
+        "--",
+        "/bin/sh",
+        "-c",
+        "grep ' /proc/fs/nfsd ' /proc/self/mountinfo | grep -c ' - tmpfs hermit ' || true",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "0\n");
+}
+
+/// A process that changes its root keeps the `/proc` and the descriptor
+/// directory it holds, and Linux still looks names up in procfs through
+/// them. Detcore keeps serving both after a `chroot` (package K slice P1):
+/// on ptrace each is open on procfs's root, so a name below `/proc` is the
+/// kernel's lookup there, and one below the descriptor directory is looked
+/// up below its path within procfs from the descriptor, whatever the root.
+/// So a fork's child that changes its root to an empty directory opens
+/// `self/status` below the `/proc` it kept and lists the descriptor directory
+/// it kept (its parent's); and a child that changes its root through either
+/// descriptor's own link (`chroot("/proc/self/fd/<it>")`, which follows the
+/// link) gets the directory as its root (`/self`, `/0` there). On ptrace as
+/// natively, as root in new user, mount and PID namespaces with a procfs of
+/// its own. Relaxation: not under `--verify`, which refuses the run, because
+/// Detcore names no procfs inode for a process whose root is not the
+/// container's (a determinism loss). KVM is named as not checked: its
+/// executor refuses `chroot` (ENOSYS).
+#[test]
+fn kept_procfs_directories_are_served_after_a_chroot() {
+    let test = "kept_procfs_directories_are_served_after_a_chroot";
+    let guest = proc_fd_directory_guest();
+    let expected = "chroot: a child that changed its root opens self/status below the /proc it \
+                    kept=1, lists the descriptor directory it kept=1\n\
+                    chroot through the /proc descriptor's link=0 errno=0 finds /self=1\n\
+                    chroot through the /proc/self/fd descriptor's link=0 errno=0 finds /0=1\n\
+                    failures=0\n";
+    let native = Command::new("unshare")
+        .args([
+            "--user",
+            "--map-root-user",
+            "--mount",
+            "--pid",
+            "--fork",
+            "--",
+            "/bin/sh",
+            "-c",
+            "mount -t proc -o nosuid,nodev,noexec proc /proc && exec \"$0\" --chroot-only",
+        ])
+        .arg(guest)
+        .output()
+        .expect("run proc-fd-directory natively");
+    assert!(native.status.success(), "native: {native:?}");
+    assert_eq!(stdout(&native), expected, "natively");
+    let args = [
+        "--backend",
+        "ptrace",
+        "run",
+        "--strict",
+        "--epoch=2026-01-01T00:00:00Z",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        "--chroot-only",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), expected, "ptrace");
+    eprintln!("{test}: kvm: NOT CHECKED: KVM's executor refuses chroot (ENOSYS)");
 }
 
 /// Detcore renders `/proc/sys/kernel/random/uuid`, `/proc/sys/kernel/pty/nr`,
