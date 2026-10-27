@@ -330,3 +330,166 @@ async fn determinize_stat_answers_a_placeholder_only_outside_record_and_replay()
         }
     }
 }
+
+/// A directory's host link count is two plus its subdirectory count on
+/// file systems that count links, so a shared ancestor such as `/home`
+/// reports a different count whenever another process adds or removes a
+/// subdirectory. The determinized stat reports 1, as file systems that do
+/// not count directory links do; a regular file keeps its host count,
+/// which names the guest's own hard links.
+#[tokio::test]
+async fn determinize_stat_reports_one_link_for_directories_only() {
+    let epoch = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let config = config(false, epoch);
+    let process = DetPid::from_raw(7);
+    let global = GlobalState::init_global_state(&config).await;
+    let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
+    let mut thread = crate::ThreadState::new(process, &config, ());
+    thread.detpid = Some(process);
+    let mut guest = StatGuest {
+        config: &config,
+        global: &global,
+        thread,
+        sender: Tid::from_raw(process.as_raw()),
+    };
+    let host_stat = |mode: u32, nlink: u64| {
+        let mut stat = host_uuid_stat();
+        stat.mode = mode;
+        stat.nlink = nlink;
+        stat
+    };
+
+    let directory = tool
+        .determinize_stat(
+            &mut guest,
+            host_stat(libc::S_IFDIR | 0o755, 5),
+            None,
+            ProcfsEntry::NotProcfs,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        directory.nlink, 1,
+        "directory link count must not leak the host's subdirectory count"
+    );
+    assert_eq!(directory.size, 4096);
+
+    let file = tool
+        .determinize_stat(
+            &mut guest,
+            host_stat(libc::S_IFREG | 0o644, 3),
+            None,
+            ProcfsEntry::NotProcfs,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        file.nlink, 3,
+        "a regular file's hard-link count is guest-visible semantics"
+    );
+}
+
+/// Runs one stat through `determinize_stat` under `config`, with the
+/// thread's backend-supplied host ID set as a virtual-ID backend sets it.
+async fn determinized(
+    config: &Config,
+    physical_tid: Option<i32>,
+    stat: DetStat,
+    procfs: ProcfsEntry,
+) -> DetStat {
+    let process = DetPid::from_raw(7);
+    let global = GlobalState::init_global_state(config).await;
+    let tool = Detcore::new(Tid::from_raw(process.as_raw()), config);
+    let mut thread = crate::ThreadState::new(process, config, ());
+    thread.detpid = Some(process);
+    thread.physical_tid = physical_tid;
+    let mut guest = StatGuest {
+        config,
+        global: &global,
+        thread,
+        sender: Tid::from_raw(process.as_raw()),
+    };
+    tool.determinize_stat(&mut guest, stat, None, procfs)
+        .await
+        .unwrap()
+}
+
+/// The nlink pin's edges: it follows the statx mask field by field, it
+/// preserves a deleted directory's zero, it applies to an autofs-like
+/// directory on the DBT path where the size pin abstains, and a proved
+/// procfs directory keeps its host count.
+#[tokio::test]
+async fn determinize_stat_nlink_pin_edges() {
+    let epoch = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+    let cfg = config(false, epoch);
+    let dir_stat = |mask: StatxMask, nlink: u64, size: i64| {
+        let mut stat = host_uuid_stat();
+        stat.mode = libc::S_IFDIR | 0o755;
+        stat.mask = mask;
+        stat.nlink = nlink;
+        stat.size = size;
+        stat
+    };
+
+    // NLINK without SIZE: nlink pinned, size untouched.
+    let stat = determinized(
+        &cfg,
+        None,
+        dir_stat(StatxMask::STATX_NLINK, 5, 12_345),
+        ProcfsEntry::NotProcfs,
+    )
+    .await;
+    assert_eq!(stat.nlink, 1);
+    assert_eq!(stat.size, 12_345, "size pin must not follow the nlink pin");
+
+    // SIZE without NLINK: size pinned, nlink untouched.
+    let stat = determinized(
+        &cfg,
+        None,
+        dir_stat(StatxMask::STATX_SIZE, 5, 999),
+        ProcfsEntry::NotProcfs,
+    )
+    .await;
+    assert_eq!(stat.size, 4096);
+    assert_eq!(stat.nlink, 5, "no STATX_NLINK, no nlink pin");
+
+    // A deleted directory (mkdir, open(O_DIRECTORY), rmdir, fstat) keeps 0.
+    let stat = determinized(
+        &cfg,
+        None,
+        dir_stat(StatxMask::STATX_BASIC_STATS, 0, 4096),
+        ProcfsEntry::NotProcfs,
+    )
+    .await;
+    assert_eq!(
+        stat.nlink, 0,
+        "a deleted directory's zero must be preserved"
+    );
+
+    // An autofs-like directory (anonymous device, 1024-byte blocks) on the
+    // DBT path: the size pin abstains (unprovable procfs signature), the
+    // nlink pin does not.
+    let mut dbt_config = config(false, epoch);
+    dbt_config.backend = reverie::BackendCapabilities::DBT;
+    let mut autofs = dir_stat(StatxMask::STATX_BASIC_STATS, 3, 1234);
+    autofs.dev = libc::makedev(0, 42);
+    autofs.blksize = 1024;
+    let stat = determinized(&dbt_config, Some(4242), autofs, ProcfsEntry::NotProcfs).await;
+    assert_eq!(
+        stat.nlink, 1,
+        "DBT must pin an autofs-like directory's nlink"
+    );
+    assert_eq!(stat.size, 1234, "the size pin still abstains on this path");
+
+    // A proved procfs directory keeps its host count: `/proc/<pid>/fd`
+    // reports nlink 2 and carries its descriptor count in its size.
+    let stat = determinized(
+        &cfg,
+        None,
+        dir_stat(StatxMask::STATX_BASIC_STATS, 2, 7),
+        ProcfsEntry::At("/7/fd".into()),
+    )
+    .await;
+    assert_eq!(stat.nlink, 2, "a proved procfs directory keeps its count");
+    assert_eq!(stat.size, 7, "a proved procfs directory keeps its size");
+}
