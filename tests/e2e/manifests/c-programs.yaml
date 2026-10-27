@@ -13949,6 +13949,221 @@ test:
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
           in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/inotify-blocking-faults
+    description: Strict verification for tests/c/inotify_blocking_faults.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/inotify_blocking_faults.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - sabre
+          - dbt
+          - liteinst
+          - in-guest-trap
+        backends_disabled:
+          kvm: LinuxEmu refuses a blocking inotify instance (inotify_init1 without IN_NONBLOCK answers ENOSYS), and this guest reads one (https://github.com/rrnewton/hermit/issues/4768)
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled, as for c-programs/inotify-watch (https://github.com/rrnewton/hermit/issues/3745)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/inotify-faults
+    description: Strict verification for tests/c/inotify_faults.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/inotify_faults.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - sabre
+          - dbt
+          - liteinst
+          - in-guest-trap
+        backends_disabled:
+          kvm: LinuxEmu renumbers rename cookies itself and puts back the old bytes of a cookie a fault cut short, even an IN_IGNORED event's zero cookie, which the guest checks; the Reverie slice that deletes LinuxEmu's copy (row 9 of section 3 of the LinuxEmu scope document) enables it (https://github.com/rrnewton/hermit/issues/4793)
+        hermit_args:
+          liteinst:
+            - --max-timeslice=disabled
+          in-guest-trap:
+            - --max-timeslice=disabled
+        hermit_args_reason: In-guest LiteInst (liteinst and in-guest-trap) refuses a preemption timer, so these cells run with the maximum timeslice disabled, as for c-programs/inotify-watch (https://github.com/rrnewton/hermit/issues/3745)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): no custom edge-case arguments have been calibrated for this C guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
+          in-guest-trap: No custom edge-case arguments have been calibrated for in-guest-trap
+  - id: c-programs/inotify-protection-key-fault
+    description: Strict verification for tests/c/inotify_protection_key_fault.c
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/inotify_protection_key_fault.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - sabre
+          - dbt
+        backends_disabled:
+          kvm: LinuxEmu has no protection keys (pkey_alloc answers ENOSYS)
+          liteinst: The in-guest runtime refuses protection keys (pkey_alloc answers EOPNOTSUPP)
+          in-guest-trap: The in-guest runtime runs the guest's syscalls with its own protection-key rights, so a read into a page a key keeps the guest from writing is copied anyway (all 12 bytes changed, where Linux changes none)
+      naked:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
+        backends_enabled: []
+        backends_disabled:
+          native: This migration inventories strict verification; it does not assert native nondeterminism
+      replay:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): record/replay qualification is a separate exercise from the initial strict-verification migration and has never been run for this guest.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from the initial strict-verification migration
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+          in-guest-trap: Record/replay is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      chaos:
+        ci: false
+        ci_disabled_reason: 'NOT-EXERCISED (family-wide): chaos scheduling is only meaningful for a guest with an explicit schedule-diversity oracle, and this guest has none.'
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+          in-guest-trap: Chaos scheduling is unsupported by in-guest LiteInst, which in-guest-trap runs with syscall site patching off
+      custom:
+        ci: true
+        args:
+          - --passthru-opt
+          - --allow-unsupported-syscalls
+        assert:
+          runs: 3
+          repeat_identical: true
+        backends_enabled:
+          - ptrace
+          - sabre
+          - dbt
+        backends_disabled:
+          kvm: LinuxEmu has no protection keys (pkey_alloc answers ENOSYS)
+          liteinst: The in-guest runtime refuses protection keys (pkey_alloc answers EOPNOTSUPP)
+          in-guest-trap: The in-guest runtime runs the guest's syscalls with its own protection-key rights, so a read into a page a key keeps the guest from writing is copied anyway (all 12 bytes changed, where Linux changes none)
   - id: c-programs/inotify-received-descriptor
     description: Strict verification for tests/c/inotify_received_descriptor.c
     lane: portable

@@ -37,6 +37,8 @@ pub(crate) use namespace::guest_task_procfs;
 mod network_trace;
 pub(crate) mod robust_list;
 pub(crate) mod scm_rights;
+/// A buffer for an injected syscall, in the stack scratch or a transient page.
+pub(crate) mod scratch;
 mod signal;
 pub(crate) mod signal_shadow;
 /// The guest's virtual SIGALRM blocked bit (signal phase 1).
