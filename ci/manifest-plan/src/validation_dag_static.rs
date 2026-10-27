@@ -1992,7 +1992,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And race_report::tests::{
     // the_first_thread_difference_is_where_realized_schedules_part,
     // a_replay_that_left_its_schedule_is_compared_as_it_ran}: 1261.
-    ("test.hermit_unit", 1261),
+    // And eight race-candidate check tests,
+    // race_report::tests::{
+    // a_reversal_moves_only_the_pair_and_refuses_a_third_thread,
+    // a_check_edits_the_target_or_else_the_baseline,
+    // a_replay_that_leaves_the_edit_is_not_realized_whatever_its_outcome,
+    // exactly_one_deciding_candidate_is_found_by_intervention,
+    // a_check_counts_only_when_its_control_ends_as_the_run_did,
+    // a_missing_empty_or_partial_realized_schedule_gives_none,
+    // a_check_replays_its_control_first_and_counts_only_when_it_reproduces} and
+    // analyze::phases::tests::a_check_keeps_the_checkpoints_of_its_own_runs_prefix: 1269.
+    ("test.hermit_unit", 1269),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6312,7 +6322,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same three restored report-stack units: 1246 + 3 = 1249.
     // And the same four racing-accesses report tests: 1253.
     // And the same two realized-replay report tests: 1255.
-    ("test.hermit_unit_on_host", 1255),
+    // And the same eight race-candidate check tests: 1263.
+    ("test.hermit_unit_on_host", 1263),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
