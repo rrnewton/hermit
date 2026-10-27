@@ -366,6 +366,28 @@ fn access_trace_indices_name_the_runs_own_events() {
             }
         ]
     );
+    // The guest's file is created in the run's own /tmp, which no other run
+    // shares: every run draws the same name for it, and in a shared working
+    // directory a concurrent run's file made the O_EXCL create fail and the
+    // schedule change. The trace names no paths, so read them from the INFO
+    // messages (`openat(-100, <addr> -> "<path>", ...)`).
+    let file_paths: Vec<&str> = traced
+        .info
+        .iter()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once("-> \"")?;
+            let (path, _) = rest.split_once('"')?;
+            path.contains("access_trace_mix.").then_some(path)
+        })
+        .collect();
+    assert!(
+        !file_paths.is_empty(),
+        "no INFO message names the guest's file"
+    );
+    assert!(
+        file_paths.iter().all(|path| path.starts_with("/tmp/")),
+        "{file_paths:?}"
+    );
     // close_range closes both pipe ends, and the channel behind each.
     let close_range = find("close_range");
     assert_eq!(close_range.len(), 1, "{close_range:?}");
