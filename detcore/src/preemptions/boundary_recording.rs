@@ -282,6 +282,12 @@ impl Recording {
         self.metadata().lists_its_time_skips()
     }
 
+    /// Whether a replay of this recording charges a replayed switch-in under
+    /// which guest code runs (`PreemptionRecord::charges_replayed_switch_ins`).
+    pub fn charges_replayed_switch_ins(&self) -> bool {
+        self.metadata().charges_replayed_switch_ins()
+    }
+
     /// The recording's format (`PreemptionRecord::format_version`).
     pub fn format_version(&self) -> Option<u32> {
         self.metadata().format_version()

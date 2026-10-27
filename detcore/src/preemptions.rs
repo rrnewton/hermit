@@ -182,12 +182,30 @@ impl std::hash::Hash for HostObservedCount {
 ///   existed.
 /// - Format 2 ([`TIME_SKIPS_FORMAT`]) lists every jump of global time its run
 ///   made (`time_skips`, absent when there was none).
+/// - Format 3 ([`SWITCH_IN_CHARGE_FORMAT`]) was written by a run that charged
+///   every stretch of guest code a turn, so its replay charges a replayed
+///   switch-in under which guest code runs.
 ///
 /// A record of a newer format is refused (`PreemptionRecord::validate_format`).
-pub const PREEMPTION_RECORD_FORMAT: u32 = TIME_SKIPS_FORMAT;
+pub const PREEMPTION_RECORD_FORMAT: u32 = SWITCH_IN_CHARGE_FORMAT;
 
 /// The format from which a record lists all its jumps of global time.
 pub const TIME_SKIPS_FORMAT: u32 = 2;
+
+/// The format from which a schedule replay charges a scheduler turn for every
+/// replayed switch to a thread that then runs guest code
+/// (`Scheduler::bump_global_time`), as the run that wrote the record charged
+/// the yield turn the switch stands for. A run charges every such stretch when
+/// it follows no record, or follows one of this format. A replay of an older
+/// record charges as before: its writer cannot say whether its own run
+/// followed a schedule, and so left those stretches uncharged.
+///
+/// This makes a replay's global time agree with its recording's at every
+/// resumed slice, not everywhere: a switch-in under which nothing runs still
+/// counts as its thread's previous turn, so a signal delivered next is charged
+/// as the thread's own even where the recording's previous turn was another
+/// thread's, and the replay stays one turn behind from there.
+pub const SWITCH_IN_CHARGE_FORMAT: u32 = 3;
 
 /// A record whose format, or jumps of global time, this Hermit refuses to
 /// replay (`PreemptionRecord::validate_format`): a policy refusal, not a
@@ -457,6 +475,14 @@ impl PreemptionRecord {
     /// The record's format: `None` for format 1.
     pub fn format_version(&self) -> Option<u32> {
         self.format_version
+    }
+
+    /// Whether a schedule replay of this record charges a replayed switch-in
+    /// under which guest code runs (format 3 or later,
+    /// [`SWITCH_IN_CHARGE_FORMAT`]).
+    pub fn charges_replayed_switch_ins(&self) -> bool {
+        self.format_version
+            .is_some_and(|format| format >= SWITCH_IN_CHARGE_FORMAT)
     }
 
     /// Whether the record lists every jump of global time its run made

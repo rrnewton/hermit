@@ -1627,6 +1627,13 @@ pub struct Scheduler {
     /// How many recorded jumps of global time the replay could not make as
     /// recorded.
     time_skip_desyncs: u64,
+    /// Whether this schedule replay charges a replayed switch-in under which
+    /// guest code ran (`PreemptionRecord::charges_replayed_switch_ins`,
+    /// `bump_global_time`).
+    charge_replayed_switch_ins: bool,
+    /// The replay position (`replay_position`) at the commit of the current
+    /// `TraceReplay` turn, while `charge_replayed_switch_ins` holds.
+    switch_in_committed_at: Option<u64>,
     /// The target of the last recorded jump the replay made before any thread
     /// had registered a deadline there (`check_unconfirmed_time_skip`).
     unconfirmed_time_skip: Option<TimeSkip>,
@@ -4875,6 +4882,7 @@ impl Scheduler {
         // The format of the record a replay follows: its run follows that
         // format's rules, and so says so in its own record.
         let mut replayed_format = None;
+        let mut charge_replayed_switch_ins = false;
         let (replayer, m_vec) = match &cfg.replay_schedule_from {
             Some(path) => {
                 trace!("Scheduler loading trace from path {}", path.display());
@@ -4909,6 +4917,7 @@ impl Scheduler {
                     TimeSkipMode::Legacy
                 };
                 replayed_format = Some(recording.format_version());
+                charge_replayed_switch_ins = recording.charges_replayed_switch_ins();
                 match recording {
                     Recording::Legacy(record) => {
                         callback_checkpoints = record
@@ -5157,6 +5166,8 @@ impl Scheduler {
             time_skip_mode,
             die_on_time_skip_desync: cfg.die_on_desync,
             time_skip_desyncs: 0,
+            charge_replayed_switch_ins,
+            switch_in_committed_at: None,
             unconfirmed_time_skip: None,
             jump_request: None,
             pending_run_queue_removals: Default::default(),
@@ -17875,6 +17886,25 @@ impl Scheduler {
         // alike. Record and replay keep the charge, as they keep the deadline
         // cap, so recordings keep their time stream and RECORD_VERSION is
         // unchanged.
+        // A schedule replay resumes a thread with a `TraceReplay` turn where
+        // its recording resumed it with the thread's own yield turn. When the
+        // thread retires recorded events under that turn, it ran guest code
+        // there, as it did under the yield turn the recording charged: under
+        // a format-3 record the replay charges it too, so the guest clock reads
+        // what it read when recorded. A `TraceReplay` turn under which nothing
+        // retired stands for no turn of the recording and stays free
+        // (https://github.com/rrnewton/hermit/issues/4805).
+        // As before, an empty switch-in counts as its thread's previous turn
+        // (`own_signal_delivery`). That matches a recording that had the
+        // thread's own signal announcement in its place, but not one whose
+        // previous turn was another thread's: there a signal delivered next
+        // goes uncharged and the replay stays one turn behind, a case a record
+        // cannot tell apart (`SWITCH_IN_CHARGE_FORMAT`).
+        let replayed_switch_in_ran_guest_code = self
+            .switch_in_committed_at
+            .take()
+            .is_some_and(|committed_at| self.replay_position() > committed_at);
+
         let own_signal_delivery = !self.recordreplay_modes
             && last_turn.as_ref().is_ok_and(|resources| {
                 self.previous_turn_tid == Some(resources.tid)
@@ -17949,6 +17979,7 @@ impl Scheduler {
                 .as_ref()
                 .map(Self::is_internal_turn)
                 .unwrap_or(false)
+                && !replayed_switch_in_ran_guest_code
             {
                 trace!(
                     "[scheduler] skipping scheduler time advance because just-finished turn was an internal book-keeping one"
@@ -18178,6 +18209,9 @@ impl Scheduler {
                     );
                 }
                 self.forget_pipe_handoff(next_dtid);
+                self.switch_in_committed_at = (self.charge_replayed_switch_ins
+                    && Self::is_internal_turn(rsrcs))
+                .then(|| self.replay_position());
                 self.unblock_guest(next_dtid, resp)?;
                 Ok(())
             }
@@ -22056,6 +22090,75 @@ mod test {
                 }][..]
             )
         );
+    }
+
+    /// Under a format-3 record, a replayed switch-in (`TraceReplay` turn) under
+    /// which its thread retired recorded events is charged one scheduler turn,
+    /// as the recording charged the yield turn it stands for. One under which
+    /// nothing retired is free, and every `TraceReplay` turn under an older
+    /// record is free, as before; either way the turn is its thread's
+    /// previous turn, as before.
+    #[test]
+    fn a_replayed_switch_in_is_charged_when_its_thread_ran_guest_code() {
+        let config = Config::default();
+        let thread = DetTid::from_raw(5);
+        let mut switch_in = Resources::new(thread);
+        switch_in.insert(ResourceID::TraceReplay, Permission::RW);
+        // Each run starts from the same global time; return where one bump
+        // leaves it, and which thread counts as the previous turn.
+        let charge = |charging: bool, retired: u64| {
+            let mut sched = Scheduler::new(&config);
+            register_known_thread(&mut sched, thread);
+            sched.runqueue_push_back(thread);
+            sched.replayer = Some(crate::scheduler::replayer::Replayer::new([]));
+            sched.charge_replayed_switch_ins = charging;
+            // As at the commit of the switch-in (`step5_guest_unblock`).
+            sched.switch_in_committed_at = charging.then(|| sched.replay_position());
+            sched.replayer.as_mut().unwrap().events_popped += retired;
+            let time = Mutex::new(GlobalTime::new(&config));
+            sched.bump_global_time(&time, &Ok(switch_in.clone()));
+            assert_eq!(sched.switch_in_committed_at, None);
+            (time.lock().unwrap().as_nanos(), sched.previous_turn_tid)
+        };
+        let start = GlobalTime::new(&config).as_nanos();
+        let mut reference = Scheduler::new(&config);
+        register_known_thread(&mut reference, thread);
+        reference.runqueue_push_back(thread);
+        let time = Mutex::new(GlobalTime::new(&config));
+        reference.bump_global_time(&time, &Ok(Resources::new(thread)));
+        let after_one_turn = time.lock().unwrap().as_nanos();
+        assert!(after_one_turn > start);
+
+        assert_eq!(charge(true, 3), (after_one_turn, Some(thread)));
+        assert_eq!(charge(true, 0), (start, Some(thread)));
+        assert_eq!(charge(false, 3), (start, Some(thread)));
+    }
+
+    /// A format-3 record makes its replay charge replayed switch-ins, and the
+    /// replay writes format 3 again; a format-2 record's replay charges none
+    /// and writes format 2, the rules it ran by.
+    #[test]
+    fn a_replay_charges_switch_ins_by_its_records_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let replay = |format: u32| {
+            let path = dir.path().join("record.json");
+            let record = crate::preemptions::PreemptionRecord::from_sched_events(Vec::new())
+                .with_current_format();
+            let mut value = serde_json::to_value(&record).unwrap();
+            value["format_version"] = serde_json::json!(format);
+            std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+            let mut sched = Scheduler::new(&Config {
+                replay_schedule_from: Some(path),
+                record_preemptions: true,
+                ..Config::default()
+            });
+            let written: crate::preemptions::PreemptionRecord =
+                serde_json::from_str(&sched.preemption_writer.take().unwrap().into_string())
+                    .unwrap();
+            (sched.charge_replayed_switch_ins, written.format_version())
+        };
+        assert_eq!(replay(3), (true, Some(3)));
+        assert_eq!(replay(2), (false, Some(2)));
     }
 
     fn register_known_thread(sched: &mut Scheduler, tid: DetTid) {
