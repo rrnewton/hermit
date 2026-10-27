@@ -314,6 +314,16 @@ pub struct FutexWaiter {
     /// in the queue stops there with `EINVAL` (`futex_wake`,
     /// kernel/futex/waitwake.c:180-199 at v6.16), so none takes it.
     pi: bool,
+    /// A FUTEX_LOCK_PI waiter the scheduler woke for a signal, which has not
+    /// yet run to see whether the signal is still pending. Linux's rt_mutex
+    /// waiter stays queued through such a wake and leaves only when the signal
+    /// is pending in its own context (`rt_mutex_slowlock_block`,
+    /// kernel/locking/rtmutex.c:1604-1656 at v6.16), so this one keeps its
+    /// place: an unlock or owner death meanwhile hands it the lock, which it
+    /// takes in its turn (`Scheduler::take_handed_pi_futex`), and if it finds
+    /// no signal it sleeps again where it was (`Scheduler::park_futex_waiter`).
+    /// It leaves the queue when its call ends (`Scheduler::leave_pi_futex_queue`).
+    woken: bool,
 }
 
 /// The owner of a contended priority-inheritance futex: the thread that holds
@@ -1421,6 +1431,14 @@ pub struct Scheduler {
     /// never part of a deadlock. An entry is dropped when its process is
     /// reaped.
     sigkilled_processes: BTreeSet<DetPid>,
+    /// Processes a SIGKILL was committed against, for priority-inheritance
+    /// futexes (`Scheduler::pi_futex_thread_doomed`): recorded by
+    /// `record_committed_sigkill` alone, after the send or at a reserved
+    /// kill's commit. `sigkilled_processes` also takes a process-group kill's
+    /// notice before the send (`record_unresolved_sigkill`), while its victims
+    /// may still run and unlock. Dropped when the process is reaped or its pid
+    /// registers a new leader.
+    pi_doomed_processes: BTreeSet<DetPid>,
     /// Whether the backend reports every process's children
     /// (`BackendCapabilities::tracks_process_children`). Without it, a wait
     /// may have a child Detcore has no record of, so the children it knows
@@ -4583,6 +4601,7 @@ impl Scheduler {
             released_vfork_barriers: Default::default(),
             vfork_rejoin_edges: Default::default(),
             sigkilled_processes: Default::default(),
+            pi_doomed_processes: Default::default(),
             complete_child_lineage: cfg.backend.tracks_process_children,
             committed_exits: Default::default(),
             retired_exited_leaders: Default::default(),
@@ -4999,8 +5018,32 @@ impl Scheduler {
         match process {
             Some(process) => {
                 self.sigkilled_processes.insert(process);
+                self.pi_doomed_processes.insert(process);
+                self.release_pi_futexes_of_killed(process);
             }
             None => self.unresolved_sigkill = true,
+        }
+    }
+
+    /// A committed SIGKILL doomed `process` (`record_committed_sigkill`,
+    /// never a process group's notice before its send): the PI futexes its threads
+    /// own go to their waiters now, in the sender's turn, as each thread will
+    /// release them in its own exit (`futex_exit_release`) before anything
+    /// later can see it. Their retirement comes at a host-timed moment that no
+    /// turn waits for (https://github.com/rrnewton/hermit/issues/3994), so
+    /// releasing there would admit the waiters at a host-timed drain. A doomed
+    /// thread runs no more guest code, so it cannot unlock meanwhile.
+    // TODO-HUMAN-REVIEW(#4616): Review handing a SIGKILLed process's PI
+    // futexes over at the kill's commit.
+    fn release_pi_futexes_of_killed(&mut self, process: DetPid) {
+        let threads: Vec<DetTid> = self
+            .next_turns
+            .keys()
+            .copied()
+            .filter(|thread| self.thread_tree.process_of(*thread) == Some(process))
+            .collect();
+        for thread in threads {
+            self.release_pi_futexes_of(thread);
         }
     }
 
@@ -5051,11 +5094,29 @@ impl Scheduler {
         )
     }
 
+    /// `dettid`'s own `Exit` (an `exit` or `exit_group`) is granted, in its
+    /// committed turn. Its priority-inheritance futexes go to their waiters
+    /// here, at the grant, rather than when it deregisters at a host-timed
+    /// moment: Linux releases them in the exiting thread's own context
+    /// (`futex_exit_release` from `exit_mm`), before anything a later turn can
+    /// see, and no locker may attach to it any more
+    /// (`Self::pi_futex_live_owner_named`). The waiters it hands a futex are
+    /// admitted at the next drain, as at a deregistration.
+    // TODO-HUMAN-REVIEW(#4616): Review releasing an exiting owner's PI futexes
+    // at its committed Exit grant.
+    fn commit_own_exit(&mut self, dettid: DetTid) {
+        self.committed_exits.insert(dettid);
+        self.release_pi_futexes_of(dettid);
+    }
+
     /// A thread is being registered on `dettid`: any committed exit recorded
     /// for an earlier thread with that tid no longer applies.
     pub(crate) fn forget_committed_exit(&mut self, dettid: DetTid) {
         self.forget_sigkill_receipt(dettid);
         self.committed_exits.remove(&dettid);
+        // A leader registering on a pid names a new process.
+        self.pi_doomed_processes
+            .remove(&DetPid::from_raw(dettid.as_raw()));
         self.retired_exited_leaders.remove(&dettid);
         // A reused pid names a new process, not one a namespace's end or a
         // fatal signal doomed.
@@ -7914,7 +7975,10 @@ impl Scheduler {
         self.park_futex_waiter(dettid, futexid, maybe_timeout, bitset, signal_watch, false);
     }
 
-    /// Park `dettid` in the futex waiter pool, as a PI waiter when `pi`.
+    /// Park `dettid` in the futex waiter pool, as a PI waiter when `pi`. A PI
+    /// waiter still queued from a wake for a signal it did not find
+    /// (`FutexWaiter::woken`) sleeps again in its place; any other joins the
+    /// tail.
     fn park_futex_waiter(
         &mut self,
         dettid: &DetTid,
@@ -7929,13 +7993,21 @@ impl Scheduler {
             .get(dettid)
             .expect("Missing next_turns entry");
         let entry: &mut Vec<_> = self.blocked.futex_waiters.entry(futexid).or_default();
-        entry.push(FutexWaiter {
+        let waiter = FutexWaiter {
             dettid: *dettid,
             response: nxt.resp.clone(),
             bitset,
             signal_watch,
             pi,
-        });
+            woken: false,
+        };
+        match entry
+            .iter_mut()
+            .find(|queued| pi && queued.woken && queued.dettid == *dettid)
+        {
+            Some(queued) => *queued = waiter,
+            None => entry.push(waiter),
+        }
         // When we park, we use a resource request to signal WHAT we're blocking on.  But this is
         // not quite the same as when an active thread in the runqueue blocks on a resource, because
         // we're not actually waiting on the scheduler giving us the resource.  We're waiting in the
@@ -8308,8 +8380,9 @@ impl Scheduler {
         let plain_first = waiters
             .and_then(|waiters| waiters.first())
             .is_some_and(|waiter| !waiter.pi);
-        let next_owner = waiters
-            .and_then(|waiters| waiters.iter().find(|waiter| waiter.pi))
+        let next_owner = self
+            .pi_futex_successor(futex)
+            .and_then(|at| waiters.and_then(|waiters| waiters.get(at)))
             .map(|waiter| waiter.dettid);
         if plain_first && !self.pi_futex_hand_over_pending(futex) {
             return PiFutexState::PlainWaiters;
@@ -8336,10 +8409,21 @@ impl Scheduler {
     /// its futex exit state (kernel/futex/pi.c:427-465 at v6.16). A retired
     /// thread, a zombie leader included, has finished its futex cleanup, so
     /// Linux answers `ESRCH` for it (`handle_exit_race`).
+    ///
+    /// So does a thread that is doomed but has not deregistered yet
+    /// (`Self::pi_futex_thread_doomed`): its own `Exit` was granted, or a
+    /// committed SIGKILL ends its process. Linux makes a locker wait for an
+    /// exiting owner (`handle_exit_race`'s `EBUSY`, `wait_for_owner_exiting`,
+    /// kernel/futex/pi.c:321-331 and 974) and then answers `ESRCH`. A locker
+    /// that attached before the owner reached `exit_mm` would instead queue
+    /// and be handed the lock with `FUTEX_OWNER_DIED`; Detcore orders the
+    /// owner's end at its committed grant or kill, so every later locker takes
+    /// the `ESRCH` branch. The deregistration comes at a host-timed moment, so
+    /// `next_turns` alone would make the answer depend on when it came.
     fn pi_futex_live_owner_named(&self, named: u32) -> Option<DetTid> {
         let raw = i32::try_from(named).ok().filter(|raw| *raw != 0)?;
         let thread = DetTid::from_raw(raw);
-        (self.next_turns.contains_key(&thread) && !self.thread_is_logically_killed(thread))
+        (self.next_turns.contains_key(&thread) && !self.pi_futex_thread_doomed(thread))
             .then_some(thread)
     }
 
@@ -8386,7 +8470,9 @@ impl Scheduler {
     /// `owner`, whom the caller found by `lock_pi_step` in this turn (which
     /// also ruled out a deadlock). The first PI waiter records `owner` as the
     /// state's owner (`attach_to_pi_owner`); later ones join the state already
-    /// there.
+    /// there. A waiter woken for a signal it then did not find pending sleeps
+    /// again in the place it kept (`FutexWaiter::woken`); any other joins the
+    /// tail.
     pub(crate) fn sleep_pi_futex_waiter(
         &mut self,
         dettid: DetTid,
@@ -8401,12 +8487,75 @@ impl Scheduler {
         self.park_futex_waiter(&dettid, futex, maybe_timeout, u32::MAX, signal_watch, true);
     }
 
-    /// Take the longest-waiting PI waiter off `futex` and make it the state's
-    /// owner, which has yet to take the lock, as `pi_state_update_owner` does
-    /// (kernel/futex/pi.c:46-67 at v6.16) before the waiter runs.
-    fn take_pi_futex_successor(&mut self, futex: FutexID, how: PiHandOver) -> Option<FutexWaiter> {
+    /// Take `dettid` off its futex queue if it is parked there as a
+    /// FUTEX_LOCK_PI waiter, with the futex and its place. A thread waits on
+    /// one futex at most, so the answer does not depend on the pool's
+    /// iteration order.
+    fn take_parked_pi_waiter(&mut self, dettid: DetTid) -> Option<(FutexID, usize, FutexWaiter)> {
+        if !self.next_turns.get(&dettid).is_some_and(is_futex_request) {
+            return None;
+        }
+        let (futex, at) = self
+            .blocked
+            .futex_waiters
+            .iter()
+            .find_map(|(futex, waiters)| {
+                waiters
+                    .iter()
+                    .position(|waiter| waiter.pi && waiter.dettid == dettid)
+                    .map(|at| (*futex, at))
+            })?;
         let waiters = self.blocked.futex_waiters.get_mut(&futex)?;
-        let position = waiters.iter().position(|waiter| waiter.pi)?;
+        Some((futex, at, waiters.remove(at)))
+    }
+
+    /// `dettid`'s futex call has ended. A place it kept as a FUTEX_LOCK_PI
+    /// waiter woken for a signal (`FutexWaiter::woken`) is given up: Linux's
+    /// waiter leaves the queue when its call returns, and a restarted or
+    /// repeated call queues at the tail.
+    pub(crate) fn leave_pi_futex_queue(&mut self, dettid: DetTid) {
+        self.blocked.futex_waiters.retain(|_, waiters| {
+            waiters.retain(|waiter| !(waiter.woken && waiter.dettid == dettid));
+            !waiters.is_empty()
+        });
+    }
+
+    /// Whether `thread` will run no more guest code, so it can neither hold
+    /// nor take a PI futex: its own `Exit` was granted (`committed_exits`), a
+    /// committed SIGKILL doomed its process (`pi_doomed_processes`), or it was
+    /// logically killed. Each is decided in a committed turn, while the
+    /// thread's deregistration, which removes it from `next_turns`, comes at a
+    /// host-timed moment.
+    fn pi_futex_thread_doomed(&self, thread: DetTid) -> bool {
+        self.committed_exits.contains(&thread)
+            || self.thread_is_logically_killed(thread)
+            || self
+                .thread_tree
+                .process_of(thread)
+                .is_some_and(|process| self.pi_doomed_processes.contains(&process))
+    }
+
+    /// The longest-waiting PI waiter on `futex` that is not doomed
+    /// (`Self::pi_futex_thread_doomed`). A doomed waiter is passed over: in
+    /// Linux it is leaving the queue with its fatal signal or exit, and in
+    /// Detcore it would otherwise take the lock at a host-timed moment, its
+    /// retirement, only to pass it on.
+    fn pi_futex_successor(&self, futex: FutexID) -> Option<usize> {
+        self.blocked
+            .futex_waiters
+            .get(&futex)?
+            .iter()
+            .position(|waiter| waiter.pi && !self.pi_futex_thread_doomed(waiter.dettid))
+    }
+
+    /// Take the longest-waiting PI waiter that is not doomed off `futex` and
+    /// make it the state's owner, which has yet to take the lock, as
+    /// `pi_state_update_owner` does (kernel/futex/pi.c:46-67 at v6.16) before
+    /// the waiter runs. A successor still `woken` for a signal is already
+    /// runnable, and takes the lock in its turn.
+    fn take_pi_futex_successor(&mut self, futex: FutexID, how: PiHandOver) -> Option<FutexWaiter> {
+        let position = self.pi_futex_successor(futex)?;
+        let waiters = self.blocked.futex_waiters.get_mut(&futex)?;
         let successor = waiters.remove(position);
         if waiters.is_empty() {
             self.blocked.futex_waiters.remove(&futex);
@@ -8421,7 +8570,9 @@ impl Scheduler {
     pub(crate) fn hand_off_pi_futex(&mut self, futex: FutexID) -> Option<DetTid> {
         let successor = self.take_pi_futex_successor(futex, PiHandOver::Unlock)?;
         let to = successor.dettid;
-        self.wake_futex_waiter(successor);
+        if !successor.woken {
+            self.wake_futex_waiter(successor);
+        }
         Some(to)
     }
 
@@ -8444,7 +8595,10 @@ impl Scheduler {
     }
 
     /// Linux's `exit_pi_state_list` (kernel/futex/core.c:1323-1402 at v6.16)
-    /// for `dead`: each PI futex it owns goes to its longest waiter, latest
+    /// for `dead`, at its own committed `Exit` grant (`Self::commit_own_exit`),
+    /// at the commit of a SIGKILL that dooms its process
+    /// (`Self::release_pi_futexes_of_killed`), or else at its retirement: each
+    /// PI futex it owns goes to its longest waiter that is not doomed, latest
     /// acquired first (`PiFutexOwner::since`), and the waiter writes its TID
     /// when it runs (`pi_futex::owner_death_word`). A word with no waiter left
     /// keeps what the owner's exit wrote, and its state is dropped. Linux runs
@@ -8473,7 +8627,9 @@ impl Scheduler {
                         "[detcore] PI futex {:?} owner dtid {} died; handing it to dtid {}",
                         futex, dead, successor.dettid
                     );
-                    if self.backend_failed() {
+                    if successor.woken {
+                        // Already runnable: it takes the lock in its turn.
+                    } else if self.backend_failed() {
                         self.wake_futex_waiter(successor);
                     } else {
                         self.admit_futex_waiter_after_exit(successor);
@@ -10899,6 +11055,7 @@ impl Scheduler {
         self.work_span_forget_exit(parent, child);
         self.completed_physical_process_exits.remove(&child);
         self.sigkilled_processes.remove(&child);
+        self.pi_doomed_processes.remove(&child);
         self.thread_tree.process_parent.remove(&child);
         self.thread_tree.process_wait.remove(&child);
         self.thread_tree.child_subreapers.remove(&child);
@@ -13288,7 +13445,19 @@ impl Scheduler {
             "[dtid {}] removing blocking entries and requeuing thread",
             dettid
         );
+        let pi_waiter = self.take_parked_pi_waiter(dettid);
         self.remove_blocking_entries(&dettid);
+        if let Some((futex, at, waiter)) = pi_waiter {
+            // A PI waiter keeps its place through the wake
+            // (`FutexWaiter::woken`).
+            self.blocked.futex_waiters.entry(futex).or_default().insert(
+                at,
+                FutexWaiter {
+                    woken: true,
+                    ..waiter
+                },
+            );
+        }
         // The substituted request resolves any polling wait the thread was in.
         self.end_sigalrm_polling_wait(dettid);
 
@@ -15250,7 +15419,7 @@ impl Scheduler {
                 self.release_vfork_child(dettid, true);
                 // The thread leaves by its own committed exit, not by dying
                 // with its process (https://github.com/rrnewton/hermit/issues/3904).
-                self.committed_exits.insert(dettid);
+                self.commit_own_exit(dettid);
                 let last_live_thread =
                     !self.live_process_threads(*process).any(|tid| tid != dettid);
                 // An exit that ends its process leaves the host some time after
@@ -18572,6 +18741,7 @@ mod test {
             bitset,
             signal_watch: None,
             pi: false,
+            woken: false,
         }
     }
 
@@ -27972,6 +28142,252 @@ mod test {
             scheduler.pi_futex_state(held_by_a, 100, c),
             contended(a, Some(b))
         );
+    }
+
+    /// The deadlock walk stops where Linux's `rt_mutex_adjust_prio_chain`
+    /// does (kernel/locking/rtmutex.c:704 at v6.16). Linux checks the direct
+    /// owner before the walk (`task_blocks_on_rt_mutex`), then the next owner
+    /// at each of depths 1 to `max_lock_depth`, and answers `EDEADLK` when
+    /// the owner it reached at depth 1024 is itself blocked. So a chain of
+    /// 1025 owners whose last runs is no deadlock, and the same chain whose
+    /// last owner waits on a 1026th is one, though nobody in it is the caller.
+    #[test]
+    fn the_pi_futex_deadlock_walk_stops_at_linuxs_lock_depth() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let caller = DetTid::from_raw(99);
+        let owners: Vec<DetTid> = (1..=1026).map(|n| DetTid::from_raw(1000 + n)).collect();
+        register_known_thread(&mut scheduler, caller);
+        for &owner in &owners {
+            register_known_thread(&mut scheduler, owner);
+        }
+        // Owner i waits on a word owner i + 1 holds, for owners 1 to 1024.
+        for (i, pair) in owners.windows(2).take(1024).enumerate() {
+            scheduler.sleep_pi_futex_waiter(
+                pair[0],
+                pi_futex(0x500000 + 4 * i),
+                None,
+                None,
+                pair[1],
+            );
+        }
+        assert!(!scheduler.pi_futex_wait_deadlocks(owners[0], caller));
+        // Owner 1025 waits on a word owner 1026 holds.
+        scheduler.sleep_pi_futex_waiter(owners[1024], pi_futex(0x600000), None, None, owners[1025]);
+        assert!(scheduler.pi_futex_wait_deadlocks(owners[0], caller));
+    }
+
+    /// A thread whose own `Exit` was granted has not deregistered yet, which
+    /// it does at a host-timed moment; a word naming it already names a dead
+    /// owner, as Linux answers `ESRCH` once the exiting owner is gone
+    /// (`handle_exit_race`).
+    #[test]
+    fn a_pi_futex_word_naming_a_thread_whose_exit_was_granted_names_a_dead_owner() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let [owner, caller] = [100, 101].map(DetTid::from_raw);
+        for tid in [owner, caller] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let futex = pi_futex(0x404110);
+        assert_eq!(scheduler.pi_futex_state(futex, 100, caller), unqueued(true));
+        scheduler.commit_own_exit(owner);
+        assert!(scheduler.next_turns.contains_key(&owner));
+        assert_eq!(
+            scheduler.pi_futex_state(futex, 100, caller),
+            unqueued(false)
+        );
+    }
+
+    /// An owner's PI futexes go to their longest waiters at its own `Exit`
+    /// grant, before it deregisters, and its later deregistration hands over
+    /// nothing more.
+    #[test]
+    fn an_exit_grant_hands_the_exiting_owners_pi_futexes_to_their_waiters() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let owner = DetTid::from_raw(99);
+        let detpid = DetPid::from_raw(99);
+        let [first, second] = [100, 101].map(DetTid::from_raw);
+        scheduler.thread_tree.add_child(owner, owner, true);
+        for tid in [owner, first, second] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let futex = pi_futex(0x404110);
+        scheduler.sleep_pi_futex_waiter(first, futex, None, None, owner);
+        scheduler.sleep_pi_futex_waiter(second, futex, None, None, owner);
+
+        scheduler.commit_own_exit(owner);
+        assert!(scheduler.admission_pending(first));
+        assert!(scheduler.is_parked_futex_waiter(second));
+        assert_eq!(
+            scheduler.pi_futex_state(futex, 0, second),
+            contended(first, Some(second))
+        );
+
+        scheduler.logically_kill_thread(&owner, &detpid, MmId::initial(detpid));
+        assert!(scheduler.is_parked_futex_waiter(second));
+        assert_eq!(
+            scheduler.take_handed_pi_futex(futex, first),
+            Some(PiHandOver::OwnerDeath)
+        );
+        assert_eq!(
+            scheduler.pi_futex_state(futex, 100, second),
+            contended(first, Some(second))
+        );
+    }
+
+    /// Wake the parked `tid` for a signal, as the scheduler's signal paths do.
+    fn wake_pi_waiter_for_a_signal(scheduler: &mut Scheduler, tid: DetTid) {
+        let mut signal = Resources::new(tid);
+        signal.insert(
+            ResourceID::InboundSignal(SigWrapper(libc::SIGUSR1)),
+            Permission::W,
+        );
+        assert!(scheduler.force_unblock_thread_at(tid, signal, true));
+    }
+
+    /// `tid`, woken, has run its turn and asks again.
+    fn finish_woken_turn(scheduler: &mut Scheduler, tid: DetTid) {
+        assert!(scheduler.run_queue.remove_tid(tid));
+        let turn = scheduler.next_turns.get_mut(&tid).unwrap();
+        turn.req = Ivar::new();
+        turn.resp = Ivar::new();
+    }
+
+    /// A FUTEX_LOCK_PI waiter the scheduler woke for a signal stays queued in
+    /// its place, as Linux's rt_mutex waiter does, and sleeps again there when
+    /// it finds nothing pending. When its call ends (a restart after the
+    /// signal), it leaves the queue, and the next call queues at the tail.
+    #[test]
+    fn a_pi_waiter_woken_for_a_signal_it_did_not_find_keeps_its_place() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let owner = DetTid::from_raw(99);
+        let [a, b, c] = [100, 101, 102].map(DetTid::from_raw);
+        for tid in [owner, a, b, c] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let futex = pi_futex(0x404110);
+        for tid in [a, b, c] {
+            scheduler.sleep_pi_futex_waiter(tid, futex, None, None, owner);
+        }
+
+        wake_pi_waiter_for_a_signal(&mut scheduler, b);
+        assert!(!scheduler.is_parked_futex_waiter(b));
+        assert_eq!(scheduler.futex_waiters_for_test(futex), vec![a, b, c]);
+        finish_woken_turn(&mut scheduler, b);
+        scheduler.sleep_pi_futex_waiter(b, futex, None, None, owner);
+        assert!(scheduler.is_parked_futex_waiter(b));
+        assert_eq!(scheduler.futex_waiters_for_test(futex), vec![a, b, c]);
+
+        wake_pi_waiter_for_a_signal(&mut scheduler, b);
+        finish_woken_turn(&mut scheduler, b);
+        scheduler.leave_pi_futex_queue(b);
+        assert_eq!(scheduler.futex_waiters_for_test(futex), vec![a, c]);
+        scheduler.sleep_pi_futex_waiter(b, futex, None, None, owner);
+        assert_eq!(scheduler.futex_waiters_for_test(futex), vec![a, c, b]);
+    }
+
+    /// An unlock, or the owner's death, while the longest PI waiter is woken
+    /// for a signal and has not yet run hands that waiter the lock, which it
+    /// takes in its turn; it is already runnable, so nothing wakes it again.
+    #[test]
+    fn a_pi_waiter_woken_for_a_signal_is_still_handed_the_lock() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let owner = DetTid::from_raw(99);
+        let detpid = DetPid::from_raw(99);
+        let [a, b, c] = [100, 101, 102].map(DetTid::from_raw);
+        scheduler.thread_tree.add_child(owner, owner, true);
+        for tid in [owner, a, b, c] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let [unlocked, abandoned] = [0x404110, 0x404120].map(pi_futex);
+        scheduler.sleep_pi_futex_waiter(a, unlocked, None, None, owner);
+        scheduler.sleep_pi_futex_waiter(b, unlocked, None, None, owner);
+        scheduler.sleep_pi_futex_waiter(c, abandoned, None, None, owner);
+
+        wake_pi_waiter_for_a_signal(&mut scheduler, a);
+        assert_eq!(
+            scheduler.pi_futex_state(unlocked, 99, owner),
+            PiFutexState::Contended {
+                owner,
+                next_owner: Some(a),
+                queueing_deadlocks: true,
+            }
+        );
+        assert_eq!(scheduler.hand_off_pi_futex(unlocked), Some(a));
+        assert_eq!(
+            scheduler.take_handed_pi_futex(unlocked, a),
+            Some(PiHandOver::Unlock)
+        );
+        assert_eq!(scheduler.futex_waiters_for_test(unlocked), vec![b]);
+        assert!(scheduler.is_parked_futex_waiter(b));
+
+        wake_pi_waiter_for_a_signal(&mut scheduler, c);
+        scheduler.logically_kill_thread(&owner, &detpid, MmId::initial(detpid));
+        assert!(!scheduler.admission_pending(c));
+        assert_eq!(
+            scheduler.take_handed_pi_futex(abandoned, c),
+            Some(PiHandOver::OwnerDeath)
+        );
+    }
+
+    /// A committed SIGKILL dooms its process's threads for PI futexes before
+    /// they deregister, which comes at a host-timed moment: a word naming one
+    /// names a dead owner, the futexes they own go to their waiters at the
+    /// kill's commit, and a doomed waiter is passed over. A process-group
+    /// kill's notice before its send dooms nothing.
+    #[test]
+    fn a_sigkilled_process_is_dead_to_pi_futexes_from_the_kill() {
+        let mut scheduler = Scheduler::new(&Config::default());
+        let [killed, doomed, live] = [90, 91, 92].map(DetTid::from_raw);
+        let [waiter, other, caller] = [100, 101, 102].map(DetTid::from_raw);
+        for process in [killed, doomed] {
+            scheduler.thread_tree.add_child(process, process, true);
+        }
+        for tid in [killed, doomed, live, waiter, other, caller] {
+            register_known_thread(&mut scheduler, tid);
+        }
+        let [held, unqueued_word, shared] = [0x404110, 0x404120, 0x404130].map(pi_futex);
+        scheduler.sleep_pi_futex_waiter(waiter, held, None, None, killed);
+        scheduler.sleep_pi_futex_waiter(doomed, shared, None, None, live);
+        scheduler.sleep_pi_futex_waiter(other, shared, None, None, live);
+        assert_eq!(
+            scheduler.pi_futex_state(unqueued_word, 90, caller),
+            unqueued(true)
+        );
+
+        // A process-group kill's notice comes before its send, while a victim
+        // may still run and unlock: it dooms nothing for PI futexes.
+        let group = DetPid::from_raw(77);
+        assert!(
+            scheduler
+                .thread_tree
+                .set_process_group(DetPid::from_raw(90), group)
+        );
+        scheduler.record_unresolved_sigkill(Some(group));
+        assert!(scheduler.sigkill_recorded(DetPid::from_raw(90)).0);
+        assert_eq!(
+            scheduler.pi_futex_state(unqueued_word, 90, caller),
+            unqueued(true)
+        );
+        assert!(!scheduler.admission_pending(waiter));
+
+        scheduler.record_committed_sigkill(killed, Some(DetPid::from_raw(90)));
+        assert!(scheduler.next_turns.contains_key(&killed));
+        assert_eq!(
+            scheduler.pi_futex_state(unqueued_word, 90, caller),
+            unqueued(false)
+        );
+        assert!(scheduler.admission_pending(waiter));
+        assert_eq!(
+            scheduler.take_handed_pi_futex(held, waiter),
+            Some(PiHandOver::OwnerDeath)
+        );
+
+        scheduler.record_committed_sigkill(doomed, Some(DetPid::from_raw(91)));
+        assert_eq!(
+            scheduler.pi_futex_state(shared, 92, caller),
+            contended(live, Some(other))
+        );
+        assert_eq!(scheduler.hand_off_pi_futex(shared), Some(other));
     }
 
     /// A thread's retirement hands each PI futex it owns to that futex's longest

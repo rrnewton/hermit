@@ -185,6 +185,7 @@ static FUTEX_PI_COMMANDS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_PI_MUTEX_CONTENDED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_PI_ROBUST_OWNER_DEATH_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_PI_CONDVAR_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static FUTEX_PI_OWNER_END_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_KEYED_ACCESS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_WAKE_OP_FILE_SHARED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FUTEX_REWAIT_CHANGED_WORD_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -46133,6 +46134,46 @@ fn futex_requeue_pi_is_refused_by_name() {
     assert_eq!(stdout, "cmp_requeue_pi: -1 ENOSYS\n", "stderr:\n{log}");
 }
 
+/// FUTEX_LOCK_PI from the init of a nested PID namespace is refused by name:
+/// the TID a PI word holds is the caller's namespace's, which Detcore does not
+/// translate into the thread IDs it keys PI ownership by. Natively the call
+/// takes the free word (0).
+#[test]
+fn futex_lock_pi_in_a_nested_pid_namespace_is_refused_by_name() {
+    let guest = futex_c_guest(&FUTEX_REQUEUE_PI_REFUSED_GUEST, "futex_requeue_pi_refused")
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (status, log) = run_with_deadline(
+        hermit_command(&[
+            "--log=error",
+            "run",
+            "--strict",
+            "--timeout",
+            "60",
+            "--",
+            guest.as_str(),
+            "nested-pid",
+        ]),
+        directory.path(),
+        Duration::from_secs(120),
+        false,
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "a fail-closed run must stop with the policy-refusal status:\nstderr:\n{log}"
+    );
+    assert!(
+        log.contains(
+            "futex command FUTEX_LOCK_PI is not supported: the caller is in a nested PID \
+             namespace"
+        ),
+        "the refusal must name the command and the reason:\nstderr:\n{log}"
+    );
+}
+
 /// `guest` under ptrace `run --strict --verify --verify-strict` with `schedule`
 /// (the default one, or a chaos seed): the two runs must agree at bitwise parity
 /// with INFO messages compared on both sides. Returns the guest's stdout.
@@ -46302,6 +46343,71 @@ fn a_robust_pi_mutex_reports_its_owners_death_as_linux() {
         assert_eq!(
             futex_pi_guest_at_bitwise_parity(guest, schedule),
             expected,
+            "{schedule:?}"
+        );
+    }
+}
+
+/// A PI word whose owner ends while the word still names it, and a
+/// FUTEX_LOCK_PI that nothing orders after that end but the schedule: an owner
+/// thread's raw `exit` raced by main spinning on a flag it sets just before,
+/// and a child process holding a process-shared word that main SIGKILLs and
+/// then locks. Natively either order happens. Under Hermit each schedule gives
+/// one answer at bitwise parity, following the committed order, whenever the
+/// owner's thread deregisters: the lock with FUTEX_OWNER_DIED where main
+/// queued behind the owner first (`exit_pi_state_list`), and ESRCH with
+/// FUTEX_WAITERS left where the owner's exit was granted, or its SIGKILL
+/// committed, first (`handle_exit_race`). A waiter already queued when the
+/// SIGKILL comes is handed the lock, natively and under Hermit. When another
+/// member of the owner's process group sends the SIGKILL, telling the owner
+/// to unlock just before, the owner is alive until the kill commits: its
+/// FUTEX_UNLOCK_PI hands the waiter the lock or never runs, and never fails.
+#[test]
+fn a_pi_owner_that_exits_or_is_killed_is_dead_from_its_committed_end() {
+    let guest = futex_c_guest(&FUTEX_PI_OWNER_END_GUEST, "futex_pi_owner_end");
+    let raw_exit = "lock_pi on a word whose owner left by a raw exit";
+    let killed = "lock_pi right after a SIGKILL ended the owner's process";
+    let waiter = "the waiter queued when a SIGKILL ended the owner's process: \
+                  0, word waiter|OWNER_DIED|WAITERS";
+    let group_waiter = "the waiter queued when a member's group SIGKILL ended the owner's process";
+    let group_unlock = "the owner's unlock_pi before the kill";
+    let handed = "0, word main|OWNER_DIED|WAITERS";
+    let dead = "-1 ESRCH, word owner|WAITERS";
+    // The group kill's two lines: the owner unlocked first and handed the
+    // waiter the lock, or the kill ended it first.
+    let unlocked_first = format!("{group_waiter}: 0, word waiter|WAITERS\n{group_unlock}: 0");
+    let killed_first =
+        format!("{group_waiter}: 0, word waiter|OWNER_DIED|WAITERS\n{group_unlock}: not reached");
+    let native = native_stdout(guest);
+    let lines: Vec<&str> = native.lines().collect();
+    assert_eq!(lines.len(), 5, "natively: {native}");
+    for (line, what) in lines.iter().zip([raw_exit, killed]) {
+        assert!(
+            [handed, dead]
+                .iter()
+                .any(|answer| *line == format!("{what}: {answer}")),
+            "natively: {native}"
+        );
+    }
+    assert_eq!(lines[2], waiter, "natively");
+    // Natively the owner can also unlock and die before it records that it
+    // did, so the hand-over can come with "not reached". It never fails.
+    let unlocked_unrecorded =
+        format!("{group_waiter}: 0, word waiter|WAITERS\n{group_unlock}: not reached");
+    let group = lines[3..].join("\n");
+    assert!(
+        [&unlocked_first, &killed_first, &unlocked_unrecorded].contains(&&group),
+        "natively: {native}"
+    );
+    let guest = guest.to_str().expect("guest path should be UTF-8");
+    for (schedule, first, group) in [
+        (&[][..], handed, &unlocked_first),
+        (&["--chaos", "--sched-seed=1"][..], dead, &killed_first),
+        (&["--chaos", "--sched-seed=2"][..], dead, &killed_first),
+    ] {
+        assert_eq!(
+            futex_pi_guest_at_bitwise_parity(guest, schedule),
+            format!("{raw_exit}: {first}\n{killed}: {dead}\n{waiter}\n{group}\n"),
             "{schedule:?}"
         );
     }

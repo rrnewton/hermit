@@ -6138,6 +6138,7 @@ impl GlobalState {
                     // block on ivar, below
                 }
                 FutexAction::WaitFinished => {
+                    sched.leave_pi_futex_queue(dettid);
                     return None;
                 }
                 FutexAction::WakeRequest(num_threads) => {
