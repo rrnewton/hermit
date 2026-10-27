@@ -10250,6 +10250,34 @@ fn no_namespace_refuses_a_held_pid_base() {
     assert!(stdout(&output).is_empty(), "{}", stdout(&output));
 }
 
+/// A chosen ID at pid_max is not one `set_tid` can give. With an explicit
+/// base, the run is refused when the guest's clone reaches it, before the
+/// guest's own call could create a task with a host ID: the base three below
+/// pid_max covers the first process and the fixture's two threads, and its
+/// fork is the first call past it.
+#[test]
+fn no_namespace_refuses_a_chosen_id_at_pid_max_before_any_task() {
+    let pid_max: i32 = fs::read_to_string("/proc/sys/kernel/pid_max")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let base = format!("--pid-base={}", pid_max - 3);
+    let output = no_namespace_in_own_pid_namespace(&[&base], &[]);
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains(&format!("ID {pid_max} is not below pid_max, {pid_max}")),
+        "{}",
+        stderr(&output)
+    );
+}
+
 /// `--no-namespace` runs the guest in Hermit's own namespace, where Hermit
 /// installs no mount. Detcore still renders the guest's mount files there, on
 /// every backend, from the table of that namespace's launch mounts (the ones

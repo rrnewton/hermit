@@ -1861,7 +1861,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // validate at 24fbff99c7a saw 1224 before 11c35a504a6 added one):
     // 1202 + 23 = 1225.
     // And guest_ids' six --pid-base resolution units: 1160 + 6 = 1227, listed.
-    ("test.hermit_unit", 1227),    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
+    // And guest_ids' a_pid_max_under_two_windows_leaves_no_default_window and
+    // run's a_base_or_host_ids_the_host_decided_are_host_drawn and
+    // saved_config_records_the_guest_id_base_hermit_chose: 1166 + 3 = 1230, listed.
+    ("test.hermit_unit", 1230),    // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
     // Four process-retirement fence controls and four uncontrolled-retirement
@@ -3085,7 +3088,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And syscalls::chosen_ids' eight clone3-form units and preemptions'
     // the_guest_numbering_round_trips_and_is_compared: 2695 + 9 = 2907, listed.
     // And chosen_ids' an_untraced_clone_is_not_given_a_chosen_id: 2908, listed.
-    ("test.detcore_unit", 2908),
+    // And chosen_ids' a_restarted_clone_keeps_its_id_only_for_the_same_call,
+    // a_new_pid_namespace_is_one_set_tid_cannot_number_for_hermit and
+    // eperm_and_resource_errors_are_attributed_to_their_cause: 2705 + 3 = 2911, listed.
+    ("test.detcore_unit", 2911),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4395,7 +4401,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // no_namespace_reports_its_guest_numbering, no_namespace_refuses_a_taken_chosen_id_only_when_asked,
     // no_namespace_refuses_a_held_pid_base) and
     // no_namespace_concurrent_runs_take_different_windows: 637 + 5 = 708.
-    ("test.cli", 708),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
+    // And no_namespace_refuses_a_chosen_id_at_pid_max_before_any_task: 642 + 1 = 709.
+    ("test.cli", 709),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
     // sabre_reports_a_replaced_host_file_without_naming_it_the_cause,
@@ -4946,7 +4953,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two TracerPid cli tests: 619 + 2 = 621.
     // And the same two 11c35a504a6 tests: 621 + 2 = 623.
     // And the same five --no-namespace chosen-ID tests, not excluded: 556 + 5 = 627.
-    ("test.cli_on_host", 627),
+    // And the same pid_max refusal test, not excluded: 561 + 1 = 628.
+    ("test.cli_on_host", 628),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5424,7 +5432,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same TracerPid unit: 2898.
     // And the same nine chosen-ID units: 2695 + 9 = 2907.
     // And the same untraced-clone unit: 2908.
-    ("test.detcore_unit_on_host", 2908),
+    // And the same three chosen_ids units: 2705 + 3 = 2911.
+    ("test.detcore_unit_on_host", 2911),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -5797,7 +5806,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 1181.
     // The same 23, keeping the six local-only cases: 1196 + 23 = 1219.
     // And the same six --pid-base resolution units: 1154 + 6 = 1221.
-    ("test.hermit_unit_on_host", 1221),
+    // And the same three units: 1160 + 3 = 1224.
+    ("test.hermit_unit_on_host", 1224),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
