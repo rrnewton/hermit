@@ -3546,9 +3546,74 @@ impl<T: RecordOrReplay> Detcore<T> {
             .into_iter()
             .collect();
         self.refuse_sending_virtual_timerfds(guest, &headers);
-        let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
+        // The placeholder descriptions it sends, counted in flight, and what
+        // each attempt checks again, or its refusal by name
+        // (`Detcore::inspect_placeholder_send`).
+        let (copies, outside_turn) = match self
+            .inspect_send_placeholders(guest, Sysno::sendmsg, call.fd(), &headers, call)
+            .await
+        {
+            Ok(inspected) => inspected,
+            Err(refusal) => return refusal,
+        };
+        let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+        guest.thread_state_mut().send_inspection = None;
+        if outside_turn
+            && Self::may_send_placeholders(guest)
+            && let Some(refusal) =
+                Box::pin(self.placeholder_send_after(guest, Sysno::sendmsg, call.fd())).await
+        {
+            return refusal;
+        }
+        if result.is_err() && !copies.is_empty() {
+            let _ = crate::tool_global::placeholder_copies(
+                guest,
+                crate::procfs::locks::PlaceholderCopies::Unsent(copies),
+            )
+            .await;
+        }
+        let result = result?;
         guest.thread_state().forget_flock_modes();
         Ok(result)
+    }
+
+    /// The placeholder step of a send `call` (`sysno`, on `socket`), whose
+    /// messages' headers are at the guest addresses `headers`, where its
+    /// `SCM_RIGHTS` descriptors can matter to the `/proc` directories Detcore
+    /// serves (`Detcore::may_send_placeholders`): the inspection
+    /// (`Detcore::inspect_placeholder_send`), kept for the attempts the call
+    /// makes (`ThreadState::send_inspection`), with the descriptions it
+    /// counted in flight, or the refusal by name; and, for every send,
+    /// whether the call runs outside this thread's turn in a run that
+    /// sequentializes threads (a blocking call), after which
+    /// `Detcore::placeholder_send_after` checks what joined the table. The
+    /// inspection is boxed: only a send that may pass a placeholder carries
+    /// it.
+    async fn inspect_send_placeholders<G, C>(
+        &self,
+        guest: &mut G,
+        sysno: Sysno,
+        socket: RawFd,
+        headers: &[usize],
+        call: C,
+    ) -> Result<(Vec<crate::types::OpenFileId>, bool), Result<i64, Error>>
+    where
+        G: Guest<Self>,
+        C: SyscallInfo + Into<Syscall> + Copy,
+    {
+        // Without sequentialized threads no thread has a turn: every check
+        // Detcore makes may race the guest's other threads, that mode's named
+        // residual, which a refusal here would not narrow.
+        let outside_turn =
+            self.cfg.sequentialize_threads && self.nonblockable_call_runs_outside_turn(guest, call);
+        if !Self::may_send_placeholders(guest) {
+            return Ok((Vec::new(), outside_turn));
+        }
+        let (copies, inspection) =
+            Box::pin(self.inspect_placeholder_send(guest, sysno, socket, headers, outside_turn))
+                .await?;
+        guest.thread_state_mut().send_inspection = Some(inspection);
+        Ok((copies, outside_turn))
     }
 
     /// Mark every accept-in-turn listener (`DetFd::is_accept_in_turn_eligible`)
@@ -3626,7 +3691,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 /// The descriptors the messages at `headers` name in `SCM_RIGHTS`, and
 /// whether a header or control buffer could not be read in full, in which case
 /// the list may be incomplete (`mark_exported_listeners`).
-fn sent_descriptors<T, G>(guest: &G, headers: &[usize]) -> (Vec<RawFd>, bool)
+pub(crate) fn sent_descriptors<T, G>(guest: &G, headers: &[usize]) -> (Vec<RawFd>, bool)
 where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
@@ -3696,7 +3761,26 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .collect()
         });
         self.refuse_sending_virtual_timerfds(guest, &headers);
-        let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
+        // A placeholder sent in a batch is refused by name: which of its
+        // messages the batch sent is not known (`descriptor_directory`). Each
+        // attempt checks again that the batch passes none.
+        let outside_turn = match self
+            .inspect_send_placeholders(guest, Sysno::sendmmsg, call.sockfd(), &headers, call)
+            .await
+        {
+            Ok((_, outside_turn)) => outside_turn,
+            Err(refusal) => return refusal,
+        };
+        let result = self.execute_nonblockable_fd_syscall(guest, call).await;
+        guest.thread_state_mut().send_inspection = None;
+        if outside_turn
+            && Self::may_send_placeholders(guest)
+            && let Some(refusal) =
+                Box::pin(self.placeholder_send_after(guest, Sysno::sendmmsg, call.sockfd())).await
+        {
+            return refusal;
+        }
+        let result = result?;
         if result > 0 {
             guest.thread_state().forget_flock_modes();
         }

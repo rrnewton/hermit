@@ -21,6 +21,7 @@ pub mod helpers;
 /// Re-exported so `procfs` can report the SAME ceiling that `F_SETPIPE_SZ`
 /// enforces. Two constants that must agree are one constant.
 pub(crate) use files::DETERMINISTIC_PIPE_CAPACITY_BYTES;
+pub(crate) use files::descriptor_directory::SendInspection;
 pub(crate) use files::may_name_file_or_descriptor;
 pub(crate) use files::procfs_levels::take_proc_device;
 pub(crate) use files::read_guest_exact;

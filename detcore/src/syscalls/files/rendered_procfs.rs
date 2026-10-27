@@ -565,6 +565,19 @@ pub(super) fn guest_procfs_mount_id() -> Result<u64, Error> {
     GuestProcfs::mount_id()
 }
 
+/// The mode, owner and group of the guest's procfs root, `/proc` itself, as
+/// the guest's user namespace sees them, read once: the tool runs in the
+/// guest's mount and user namespaces outside record and replay
+/// ([`GuestProcfs`]), where Detcore serves `/proc` on a placeholder.
+pub(super) fn guest_procfs_root() -> Result<(u32, u32, u32), Errno> {
+    static ROOT: std::sync::OnceLock<(u32, u32, u32)> = std::sync::OnceLock::new();
+    if let Some(root) = ROOT.get() {
+        return Ok(*root);
+    }
+    let stat = GuestProcfs::stat(c"/proc")?;
+    Ok(*ROOT.get_or_init(|| (stat.st_mode, stat.st_uid, stat.st_gid)))
+}
+
 /// The metadata Linux gives the procfs file at `path`, owned by `owner`,
 /// with Detcore's procfs device, the inode its path names, and every time at
 /// `epoch`, on every backend.
@@ -901,6 +914,19 @@ impl FileAccess {
         dac_override: false,
         sys_admin: false,
     };
+
+    /// The caller's own descriptor directory (mode 0500), which it owns and
+    /// may also write as a thread of the directory's task
+    /// (`proc_fd_permission`), with `CAP_SYS_ADMIN` from the caller's
+    /// `capabilities` (a `capget` set).
+    fn own_descriptor_directory(capabilities: u64) -> Self {
+        Self {
+            owner: true,
+            readable: true,
+            dac_override: true,
+            sys_admin: capabilities & (1 << CAP_SYS_ADMIN) != 0,
+        }
+    }
 
     /// A per-process file, which the caller owns, with the capabilities
     /// `capabilities` (a `capget` set) of the caller.
@@ -3413,8 +3439,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         target: StatTarget<'_>,
     ) -> Result<Option<DetStat>, Error> {
-        // The caller's descriptor directory (`descriptor_directory`).
-        if let Some(stat) = self.descriptor_directory_stat(guest, target).await? {
+        // A placeholder directory Detcore serves (`descriptor_directory`).
+        if let Some(stat) = self.placeholder_stat(guest, target).await? {
             return Ok(Some(stat));
         }
         let path = match target {
@@ -3617,19 +3643,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         if c.flags().contains(MapFlags::MAP_ANONYMOUS) {
             return None;
         }
+        // A rendered file, or a placeholder directory Detcore serves
+        // (`descriptor_directory`), which has no `mmap` method either.
         let (path, status_flags) = guest
             .thread_state()
             .with_detfd(c.fd(), |detfd| {
                 (detfd.status_flags() & libc::O_PATH == 0)
-                    .then(|| detfd.procfs_rendered_path())
+                    .then(|| {
+                        detfd
+                            .procfs_rendered_path()
+                            .map(Some)
+                            .or_else(|| detfd.placeholder().map(|_| None))
+                    })
                     .flatten()
                     .map(|path| (path, detfd.status_flags()))
             })
             .ok()
             .flatten()?;
         // A per-process file has no `mmap` method, as a sysctl file has none.
-        let seq_file = crate::procfs::rendered_path_is_seq_file(path)
-            && !crate::procfs::rendered_path_is_per_process(path);
+        let seq_file = path.is_some_and(|path| {
+            crate::procfs::rendered_path_is_seq_file(path)
+                && !crate::procfs::rendered_path_is_per_process(path)
+        });
         let access_mode = status_flags & libc::O_ACCMODE;
         // Exactly: access mode 3 can neither read nor write.
         let mode = (
@@ -4385,6 +4420,83 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
             .await),
         }
+    }
+
+    /// Linux's answer to an extended-attribute call (`fgetxattr`,
+    /// `flistxattr`, `fsetxattr`, `fremovexattr`) through a placeholder
+    /// directory Detcore serves (`descriptor_directory`): procfs's, which has
+    /// no attribute handlers, as for the files it renders. `owned` is the
+    /// process whose descriptor directory it is, which the caller owns and,
+    /// as one of its threads, may write; `None` for `/proc`, which global
+    /// root owns.
+    pub(super) async fn placeholder_xattr_answer<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+        owned: Option<i32>,
+    ) -> Result<i64, Error> {
+        let (_, args) = call.into_parts();
+        let answer = match call {
+            Syscall::Fgetxattr(c) => match c.name().map(|name| name.read(&guest.memory())) {
+                Some(Ok(name)) => xattr_get_answer(name.as_bytes(), true),
+                Some(Err(errno)) => Err(errno),
+                None => Err(Errno::EFAULT),
+            },
+            Syscall::Flistxattr(_) => Ok(0),
+            Syscall::Fsetxattr(c)
+                if c.flags() & !(libc::XATTR_CREATE | libc::XATTR_REPLACE) != 0 =>
+            {
+                Err(Errno::EINVAL)
+            }
+            Syscall::Fsetxattr(c) => match c.name().map(|name| name.read(&guest.memory())) {
+                Some(Ok(name)) => {
+                    let access =
+                        Self::placeholder_xattr_access(guest, name.as_bytes(), owned).await?;
+                    xattr_change_answer(
+                        name.as_bytes(),
+                        Some(c.size()),
+                        read_value(&guest.memory(), args.arg2 as u64, c.size()).as_deref(),
+                        access,
+                    )
+                }
+                Some(Err(errno)) => Err(errno),
+                None => Err(Errno::EFAULT),
+            },
+            Syscall::Fremovexattr(c) => match c.name().map(|name| name.read(&guest.memory())) {
+                Some(Ok(name)) => {
+                    let access =
+                        Self::placeholder_xattr_access(guest, name.as_bytes(), owned).await?;
+                    xattr_change_answer(name.as_bytes(), None, None, access)
+                }
+                Some(Err(errno)) => Err(errno),
+                None => Err(Errno::EFAULT),
+            },
+            _ => Err(Errno::ENOSYS),
+        };
+        Ok(answer?)
+    }
+
+    /// What decides Linux's answer to a change of the extended attribute
+    /// `name` through a placeholder directory (see
+    /// [`Self::placeholder_xattr_answer`]): global root's `/proc`, or the
+    /// caller's own descriptor directory, with `CAP_SYS_ADMIN` from its
+    /// effective set, read only for a `security.` attribute.
+    async fn placeholder_xattr_access<G: Guest<Self>>(
+        guest: &mut G,
+        name: &[u8],
+        owned: Option<i32>,
+    ) -> Result<FileAccess, Error> {
+        if owned.is_none() {
+            return Ok(FileAccess::GLOBAL_ROOT);
+        }
+        let capabilities = if name.starts_with(b"security.") {
+            Self::inject_capget(guest, CapabilitySet::Effective)
+                .await?
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(FileAccess::own_descriptor_directory(capabilities))
     }
 
     /// Answer `call` if it must not reach the placeholder behind a rendered
@@ -5228,6 +5340,7 @@ fn descriptor_positions(sysno: Sysno) -> Option<DescriptorPositions> {
         | Sysno::fallocate
         | Sysno::fsync
         | Sysno::fdatasync
+        | Sysno::syncfs
         | Sysno::fadvise64
         | Sysno::readahead
         | Sysno::sync_file_range

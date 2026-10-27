@@ -207,11 +207,13 @@ struct InodePool {
     /// Detcore keeps for the files it renders, by their inode number (see
     /// [`Self::rendered_file_state`]).
     rendered_file_states: HashMap<u64, crate::procfs::listing::RenderedFileState>,
-    /// The descriptor directories the run's guests opened, by registration
+    /// The placeholder directories the run's guests opened, by registration
     /// order: the `index`th is the one whose descriptor's kernel position is
-    /// `procfs::fd_directory::tag(index)` (see
-    /// [`Self::register_descriptor_directory`]).
-    descriptor_directories: Vec<crate::procfs::fd_directory::DescriptorDirectoryBinding>,
+    /// `procfs::fd_directory::tag(index)` (see [`Self::register_placeholder`]).
+    placeholders: Vec<(
+        crate::procfs::fd_directory::PlaceholderDirectory,
+        OpenFileId,
+    )>,
 }
 
 /// How a numbering request reached its file, which decides whether a retired
@@ -400,38 +402,42 @@ impl InodePool {
             incarnations: HashMap::new(),
             threads_counted: 0,
             rendered_file_states: HashMap::new(),
-            descriptor_directories: Vec::new(),
+            placeholders: Vec::new(),
         }
     }
 
-    /// Register a descriptor directory a guest opened, bound to `binding`,
-    /// and return the kernel position that tags its descriptor
-    /// (`procfs::fd_directory::tag`), or `None` once the tags are used up.
-    /// Every registration comes in its guest thread's turn, so the tags
-    /// follow the scheduler's order. Registrations are kept for the run: a
-    /// descriptor can carry its tag to another process or image (over
-    /// `SCM_RIGHTS`, or across an in-guest backend's `exec`) at any later
-    /// time, and one entry per open is bounded by the opens.
+    /// Register a placeholder directory a guest opened (`/proc`, or a
+    /// descriptor directory and its binding), and return the kernel position
+    /// that tags its descriptor (`procfs::fd_directory::tag`), or `None` once
+    /// the tags are used up. Every registration comes in its guest thread's
+    /// turn, so the tags follow the scheduler's order. Registrations are kept
+    /// for the run: a descriptor can carry its tag to another process (over
+    /// `SCM_RIGHTS`) at any later time, and one entry per open is bounded by
+    /// the opens.
     // TODO-HUMAN-REVIEW(#4604): Review the run-wide registry of descriptor
     // directories, keyed by the kernel position of the descriptor on `/proc`
     // that stands for each.
-    fn register_descriptor_directory(
+    fn register_placeholder(
         &mut self,
-        binding: crate::procfs::fd_directory::DescriptorDirectoryBinding,
+        directory: crate::procfs::fd_directory::PlaceholderDirectory,
+        open_file: OpenFileId,
     ) -> Option<u64> {
-        let tag = crate::procfs::fd_directory::tag(self.descriptor_directories.len())?;
-        self.descriptor_directories.push(binding);
+        let tag = crate::procfs::fd_directory::tag(self.placeholders.len())?;
+        self.placeholders.push((directory, open_file));
         Some(tag)
     }
 
-    /// The descriptor directory a kernel position tags, if one was
-    /// registered with it.
-    fn descriptor_directory(
+    /// The placeholder directory a kernel position tags, and the open file
+    /// description it was opened in, if one was registered with it.
+    fn placeholder(
         &self,
         tag: u64,
-    ) -> Option<crate::procfs::fd_directory::DescriptorDirectoryBinding> {
+    ) -> Option<(
+        crate::procfs::fd_directory::PlaceholderDirectory,
+        OpenFileId,
+    )> {
         let index = crate::procfs::fd_directory::tag_index(tag)?;
-        self.descriptor_directories.get(index).copied()
+        self.placeholders.get(index).copied()
     }
 
     /// How many guest threads have been given task ID `tid` in this run (see
@@ -4583,18 +4589,42 @@ impl GlobalState {
                     .set_rss_limit(process, limit);
                 R::SetRssLimit(())
             }
-            GlobalRequest::RegisterDescriptorDirectory(binding) => {
+            GlobalRequest::RegisterPlaceholder(directory, open_file) => {
                 let _sched = self.lock_rpc_scheduler(false).await;
-                R::RegisterDescriptorDirectory(
+                R::RegisterPlaceholder(
                     self.inodes
                         .lock()
                         .unwrap()
-                        .register_descriptor_directory(binding),
+                        .register_placeholder(directory, open_file),
                 )
             }
-            GlobalRequest::DescriptorDirectory(tag) => {
+            GlobalRequest::Placeholder(tag) => {
                 let _sched = self.lock_rpc_scheduler(false).await;
-                R::DescriptorDirectory(self.inodes.lock().unwrap().descriptor_directory(tag))
+                R::Placeholder(self.inodes.lock().unwrap().placeholder(tag))
+            }
+            GlobalRequest::PlaceholderFlock(request) => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                let process = sched.registered_process(dtid).unwrap_or(dtid);
+                let mut ledger = self.lock_ledger.lock().unwrap();
+                // The tables of processes that have exited, reaped or not,
+                // released their descriptions with them, and so the flocks
+                // those held on placeholder directories, as Linux's exit
+                // releases them (`procfs::locks::LockLedger::prune`).
+                ledger.prune(|process| sched.process_is_alive(process));
+                R::PlaceholderFlock(ledger.placeholder_flock(process, request))
+            }
+            GlobalRequest::PlaceholderWriteHint(key, hint) => {
+                let _sched = self.lock_rpc_scheduler(false).await;
+                R::PlaceholderWriteHint(
+                    self.lock_ledger
+                        .lock()
+                        .unwrap()
+                        .placeholder_write_hint(key, hint),
+                )
+            }
+            GlobalRequest::PlaceholderCopies(change) => {
+                let _sched = self.lock_rpc_scheduler(false).await;
+                R::PlaceholderCopies(self.lock_ledger.lock().unwrap().placeholder_copies(change))
             }
             GlobalRequest::RenderedFileState(inode, change) => R::RenderedFileState(
                 self.inodes
@@ -5259,12 +5289,16 @@ impl GlobalState {
                     );
                 }
                 // A thread with a table of its own: the ledger counts its
-                // calls as its process's, so that process's table can no
-                // longer be followed (`procfs::locks::LockLedger::mark_opaque`).
+                // calls as its process's, so that process's tables can no
+                // longer be told apart
+                // (`procfs::locks::LockLedger::mark_private_tables`).
                 if !is_group_leader
                     && flags.is_some_and(|flags| !flags.contains(CloneFlags::CLONE_FILES))
                 {
-                    self.lock_ledger.lock().unwrap().mark_opaque(parent_detpid);
+                    self.lock_ledger
+                        .lock()
+                        .unwrap()
+                        .mark_private_tables(parent_detpid);
                 }
             }
 
@@ -6391,7 +6425,7 @@ pub enum SignalScope {
 /// change to a payload type defined elsewhere (`Resources`,
 /// `CommittedSendWindow`, ...) changes what is on the wire without changing
 /// the digest, and needs a revision appended by hand.
-pub(crate) const GLOBAL_RPC_REVISION: u32 = 2;
+pub(crate) const GLOBAL_RPC_REVISION: u32 = 3;
 
 /// This is public only so it can be used in the `GlobalTool` trait.
 /// It should NOT be used by any client outside of this file.
@@ -7070,12 +7104,27 @@ pub enum GlobalRequest {
     /// order (`crate::syscalls::inotify`). Answered in the sender's own turn
     /// with no scheduling decision. Appended last.
     VirtualInotifyCookies(Vec<u32>),
-    /// Register a descriptor directory a guest opened
-    /// (`InodePool::register_descriptor_directory`). Appended last.
-    RegisterDescriptorDirectory(crate::procfs::fd_directory::DescriptorDirectoryBinding),
-    /// The descriptor directory a kernel position tags
-    /// (`InodePool::descriptor_directory`). Appended last.
-    DescriptorDirectory(u64),
+    /// Register a placeholder directory a guest opened, and the open file
+    /// description it opened it in (`InodePool::register_placeholder`).
+    /// Appended last.
+    RegisterPlaceholder(
+        crate::procfs::fd_directory::PlaceholderDirectory,
+        OpenFileId,
+    ),
+    /// The placeholder directory a kernel position tags
+    /// (`InodePool::placeholder`). Appended last.
+    Placeholder(u64),
+    /// A `flock` through a placeholder descriptor
+    /// (`procfs::locks::LockLedger::placeholder_flock`). Appended last.
+    PlaceholderFlock(crate::procfs::locks::PlaceholderFlock),
+    /// Set (`Some`) or read the write hint of a placeholder directory's
+    /// inode (`procfs::locks::LockLedger::placeholder_write_hint`). Appended
+    /// last.
+    PlaceholderWriteHint(crate::procfs::fd_directory::PlaceholderLockKey, Option<u64>),
+    /// A change to the copies of placeholder descriptions in flight over
+    /// `SCM_RIGHTS` (`procfs::locks::LockLedger::placeholder_copies`).
+    /// Appended last.
+    PlaceholderCopies(crate::procfs::locks::PlaceholderCopies),
 }
 
 /// Responses from the global object
@@ -7359,11 +7408,25 @@ pub enum GlobalResponse {
     /// The answer to `GlobalRequest::VirtualInotifyCookies`: one virtual
     /// cookie per host cookie, in order. Appended last.
     VirtualInotifyCookies(Vec<u32>),
-    /// The answer to `GlobalRequest::RegisterDescriptorDirectory`: the tag,
-    /// if one was left. Appended last.
-    RegisterDescriptorDirectory(Option<u64>),
-    /// The answer to `GlobalRequest::DescriptorDirectory`. Appended last.
-    DescriptorDirectory(Option<crate::procfs::fd_directory::DescriptorDirectoryBinding>),
+    /// The answer to `GlobalRequest::RegisterPlaceholder`: the tag, if one
+    /// was left. Appended last.
+    RegisterPlaceholder(Option<u64>),
+    /// The answer to `GlobalRequest::Placeholder`: the directory and the
+    /// open file description it was opened in. Appended last.
+    Placeholder(
+        Option<(
+            crate::procfs::fd_directory::PlaceholderDirectory,
+            OpenFileId,
+        )>,
+    ),
+    /// The answer to `GlobalRequest::PlaceholderFlock`. Appended last.
+    PlaceholderFlock(crate::procfs::locks::PlaceholderFlockOutcome),
+    /// The answer to `GlobalRequest::PlaceholderWriteHint`: the inode's write
+    /// hint after the request. Appended last.
+    PlaceholderWriteHint(u64),
+    /// The answer to `GlobalRequest::PlaceholderCopies`: a send's locked
+    /// description, if any. Appended last.
+    PlaceholderCopies(Result<(), OpenFileId>),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -10212,41 +10275,110 @@ where
     assert_eq!(response, GlobalResponse::RecordExternalParent(()));
 }
 
-/// Register the descriptor directory bound to `binding` that the calling
-/// guest thread opened, and return the kernel position that tags its
-/// descriptor (`InodePool::register_descriptor_directory`).
-pub(crate) async fn register_descriptor_directory<G, T>(
+/// Register the placeholder directory `directory` that the calling guest
+/// thread opened, and return the kernel position that tags its descriptor
+/// (`InodePool::register_placeholder`).
+pub(crate) async fn register_placeholder<G, T>(
     guest: &mut G,
-    binding: crate::procfs::fd_directory::DescriptorDirectoryBinding,
+    directory: crate::procfs::fd_directory::PlaceholderDirectory,
+    open_file: OpenFileId,
 ) -> Option<u64>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    match send_and_update_time(guest, GlobalRequest::RegisterDescriptorDirectory(binding))
-        .await
-        .1
+    match send_and_update_time(
+        guest,
+        GlobalRequest::RegisterPlaceholder(directory, open_file),
+    )
+    .await
+    .1
     {
-        GlobalResponse::RegisterDescriptorDirectory(tag) => tag,
+        GlobalResponse::RegisterPlaceholder(tag) => tag,
         _ => unreachable!(),
     }
 }
 
-/// The descriptor directory the kernel position `tag` tags, if any
-/// (`InodePool::descriptor_directory`).
-pub(crate) async fn descriptor_directory<G, T>(
+/// The placeholder directory the kernel position `tag` tags, if any
+/// (`InodePool::placeholder`).
+pub(crate) async fn placeholder<G, T>(
     guest: &mut G,
     tag: u64,
-) -> Option<crate::procfs::fd_directory::DescriptorDirectoryBinding>
+) -> Option<(
+    crate::procfs::fd_directory::PlaceholderDirectory,
+    OpenFileId,
+)>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    match send_and_update_time(guest, GlobalRequest::DescriptorDirectory(tag))
+    match send_and_update_time(guest, GlobalRequest::Placeholder(tag))
         .await
         .1
     {
-        GlobalResponse::DescriptorDirectory(binding) => binding,
+        GlobalResponse::Placeholder(directory) => directory,
+        _ => unreachable!(),
+    }
+}
+
+/// A `flock` through a placeholder descriptor of the calling thread's table
+/// (`procfs::locks::LockLedger::placeholder_flock`).
+pub(crate) async fn placeholder_flock<G, T>(
+    guest: &mut G,
+    request: crate::procfs::locks::PlaceholderFlock,
+) -> crate::procfs::locks::PlaceholderFlockOutcome
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::PlaceholderFlock(request))
+        .await
+        .1
+    {
+        GlobalResponse::PlaceholderFlock(outcome) => outcome,
+        _ => unreachable!(),
+    }
+}
+
+/// A change to the copies of placeholder descriptions in flight over
+/// `SCM_RIGHTS` (`procfs::locks::LockLedger::placeholder_copies`): for a
+/// send, the description it would send that holds a placeholder `flock`, if
+/// any (the send is then refused by name and nothing counts).
+pub(crate) async fn placeholder_copies<G, T>(
+    guest: &mut G,
+    change: crate::procfs::locks::PlaceholderCopies,
+) -> Result<(), OpenFileId>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::PlaceholderCopies(change))
+        .await
+        .1
+    {
+        GlobalResponse::PlaceholderCopies(result) => result,
+        _ => unreachable!(),
+    }
+}
+
+/// Set the write hint of the inode of the placeholder directory `key` names
+/// to `hint`, or read it with `None`, as `F_SET_RW_HINT` and `F_GET_RW_HINT`
+/// do (`procfs::locks::LockLedger::placeholder_write_hint`): the hint after
+/// the request.
+pub(crate) async fn placeholder_write_hint<G, T>(
+    guest: &mut G,
+    key: crate::procfs::fd_directory::PlaceholderLockKey,
+    hint: Option<u64>,
+) -> u64
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    match send_and_update_time(guest, GlobalRequest::PlaceholderWriteHint(key, hint))
+        .await
+        .1
+    {
+        GlobalResponse::PlaceholderWriteHint(hint) => hint,
         _ => unreachable!(),
     }
 }
