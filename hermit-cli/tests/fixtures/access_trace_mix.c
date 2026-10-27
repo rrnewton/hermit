@@ -64,7 +64,11 @@ int main(void) {
   must(pipe(pipe_fds) == 0, "pipe");
   must(signal(SIGUSR1, on_usr1) != SIG_ERR, "signal");
 
-  char path[] = "access_trace_mix.XXXXXX";
+  // In the run's own /tmp, never the directory Hermit was started in: every
+  // run draws the same name here, so concurrent runs sharing a working
+  // directory found one another's file, and the O_EXCL create failed in one
+  // of them and retried with another name.
+  char path[] = "/tmp/access_trace_mix.XXXXXX";
   int fd = mkstemp(path);
   must(fd >= 0, "mkstemp");
   must(unlink(path) == 0, "unlink");
