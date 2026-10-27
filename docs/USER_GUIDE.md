@@ -327,7 +327,7 @@ The `dbt`, `sabre`, and `e9patch` selections require optional CLI features as
 well as their runtime resources. Build and stage both with:
 
 ```bash
-cargo build --release --workspace --features hermit-run/third-party-backends
+cargo build --release --workspace --features hermit-run/third-party-backends,hermit-install/third-party-backends
 ./target/install_pkg/hermit --backend=dbt run -- /bin/echo hello
 ```
 
