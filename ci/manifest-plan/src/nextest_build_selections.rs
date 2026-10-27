@@ -1120,6 +1120,14 @@ mod tests {
             narrowed.contains("must end with its unified workspace build"),
             "{narrowed}"
         );
+        // The CLI opt-in alone does not enable the installer package's full
+        // bundle. A producer that drops only that opt-in is not the union.
+        let core_installer =
+            mutated(&|cmd| cmd.replace("hermit-install/third-party-backends,", ""));
+        assert!(
+            core_installer.contains("must end with its unified workspace build"),
+            "{core_installer}"
+        );
 
         // A union that no longer carries the third-party backends: every
         // selection drops the feature, and the producer follows the union, so

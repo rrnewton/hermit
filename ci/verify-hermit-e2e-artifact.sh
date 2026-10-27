@@ -74,7 +74,7 @@ function require_runtime_closure {
 # newer than the oldest supported host's: glibc 2.34, measured on the host
 # recorded for GUEST_PRELOAD_GLIBC_MINOR_FLOOR in docs/TESTING_ENVIRONMENTS.md
 # under "Named measurement hosts". detcore-sabre/build.rs,
-# detcore-liteinst/build.rs, detcore-sabre/src/glibc_compat.rs and Reverie's
+# detcore-liteinst/build.rs, common/inguest/glibc_compat.rs and Reverie's
 # reverie-liteinst/build.rs build them that way. ci/test_guest_preload_gate.py
 # runs this gate on real ELF files and checks that both scripts apply it to all
 # three.
