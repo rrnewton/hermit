@@ -3211,7 +3211,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // stream and its record/replay hand-off, preemptions' offset rows, the
     // kept timer, the replay target, a scheduler-recorded offset, and the
     // hooks arming, recording and replaying one offset slice: 3356.
-    ("test.detcore_unit", 3356),
+    // And a_published_instruction_offset_dies_with_its_thread: 3357.
+    ("test.detcore_unit", 3357),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5715,7 +5716,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same recount at 4e916633ca as test.detcore_unit: 3279 + 42 = 3321.
     // The same twenty-seven N3 detcore units: 3321 + 27 = 3348.
     // And the same eight --chaos-instruction-offset units: 3356.
-    ("test.detcore_unit_on_host", 3356),
+    // And the same published-offset unit: 3357.
+    ("test.detcore_unit_on_host", 3357),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
