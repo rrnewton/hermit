@@ -562,3 +562,74 @@ fn analyze_bounds_trials_that_never_end() {
 fn analyze_rejects_a_baseline_that_never_ends() {
     assert_spin_trial_stops_analysis(&[], "run2_baseline");
 }
+/// (https://github.com/rrnewton/hermit/issues/4812). The guest is named by a
+/// path relative to analyze's working directory, so a reproducer that does
+/// not start in that directory cannot even find its program. The test reads
+/// the baseline run's reproducer, which analyze writes before its search, so
+/// it does not depend on how the search ends.
+#[test]
+#[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
+fn analyze_reproducer_runs_from_another_directory() {
+    let label = "analyze reproducer from another directory";
+    let _guard = analyze_lock();
+    let guest = &workloads().hello_race;
+    let guest_dir = guest.parent().unwrap();
+    let guest_name = Path::new(".").join(guest.file_name().unwrap());
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hermit"));
+    command.current_dir(guest_dir).arg("analyze");
+    add_calibrated_skid_margin(&mut command, label);
+    command
+        .args([
+            "--analyze-seed=0",
+            "--search",
+            "--run-arg=--base-env=host",
+            "--",
+        ])
+        .args(["--chaos", "--summary", "--max-timeslice=400000", "--"])
+        .arg(&guest_name);
+    let output = command.output().expect("failed to run hermit analyze");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let workspace = stderr
+        .lines()
+        .find_map(|line| line.strip_prefix(":: Temp workspace: "))
+        .unwrap_or_else(|| panic!("{label}: no workspace in analyze's output\n{stderr}"));
+    let repro = Path::new(workspace).join("run2_baseline.repro");
+    let line = fs::read_to_string(&repro)
+        .unwrap_or_else(|error| panic!("{label}: {}: {error}\n{stderr}", repro.display()));
+
+    // The line names `hermit` as a command; run it with this build, from the
+    // guest's directory and from another one, and compare the two runs.
+    let bin_dir = Path::new(env!("CARGO_BIN_EXE_hermit")).parent().unwrap();
+    let path = format!(
+        "{}:{}",
+        bin_dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let elsewhere = tempfile::tempdir().unwrap();
+    let run_from = |dir: &Path| {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(line.trim())
+            .current_dir(dir)
+            .env("PATH", &path);
+        command.output().unwrap()
+    };
+    let here = run_from(guest_dir);
+    let there = run_from(elsewhere.path());
+    assert!(
+        here.status.success(),
+        "{label}: {} failed from the guest's directory\n{}",
+        repro.display(),
+        String::from_utf8_lossy(&here.stderr),
+    );
+    assert_eq!(
+        (there.status.code(), &there.stdout),
+        (here.status.code(), &here.stdout),
+        "{label}: {} reproduced its run from the guest's directory but not from {}\n{}",
+        repro.display(),
+        elsewhere.path().display(),
+        String::from_utf8_lossy(&there.stderr),
+    );
+}
