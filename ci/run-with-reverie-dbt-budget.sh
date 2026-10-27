@@ -3017,18 +3017,14 @@ fi
 # rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
 # calibrated budget, job width and limits carry unchanged from the
 # a13d0205 entry.
-# CARRY TO 882c91c02b981f56370a2912f0832b04fefc46ec (2026-10-27): from
-# ab248a36f83edbcb6b8705dad38b094bd61f1c74. Two commits (in-guest runtime
-# descriptors invisible to the guest, and the fixes from its delta review):
-# reverie-inguest places, records and moves its descriptors, reverie gains a
-# counter descriptor move, reverie-rpc-transport gains
-# BlockingRpcClient::replace_stream, and the LiteInst source catalog rows
-# for the edited files are refreshed. git diff is empty under reverie-dbt/
-# and third-party/ and for the root Cargo.toml, Cargo.lock and
-# rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
-# calibrated budget, job width and limits carry unchanged from the
-# ab248a36 entry.
-expected_pin=882c91c02b981f56370a2912f0832b04fefc46ec
+# CARRY TO ce9afbd47b0aa3d247844ac3d3e853ebc082a088 (2026-10-27): from
+# ab248a36f83edbcb6b8705dad38b094bd61f1c74. Three commits whose net tree change is
+# empty: 72e73f10 and 882c91c0 (in-guest runtime descriptors invisible to
+# the guest, pinned by Hermit 330a8b84) and ce9afbd4, their revert, whose
+# tree equals ab248a36. git diff is empty for the whole repository, so the
+# inventory (1015), SDK and native inputs, calibrated budget, job width and
+# limits carry unchanged from the ab248a36 entry.
+expected_pin=ce9afbd47b0aa3d247844ac3d3e853ebc082a088
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
