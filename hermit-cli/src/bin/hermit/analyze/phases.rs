@@ -2961,6 +2961,9 @@ impl AnalyzeOpts {
         println!(
             "\n------------------------------ hermit analyze report ------------------------------"
         );
+        if let Some(warning) = &self.branch_counter_warning {
+            println!("{warning}");
+        }
         println!("{verdict}");
         self.write_report_file(&Report {
             verdict: verdict.verdict(),
@@ -2970,6 +2973,7 @@ impl AnalyzeOpts {
             baseline_run: false,
             critical_event1: None,
             critical_event2: None,
+            branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event: None,
         });
         eprintln!("{}", verdict.class_line());
