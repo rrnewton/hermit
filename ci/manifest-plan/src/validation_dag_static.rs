@@ -2008,8 +2008,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // copy, shared content-named copies, a changed shared copy not joined,
     // the root and path-length refusals, stale and held copies) and
     // host_input_change's snapshot-copy unit (PR #4791):
-    // 1273 + 6 = 1279.
-    ("test.hermit_unit", 1279),
+    // 1273 + 12 = 1285.
+    ("test.hermit_unit", 1285),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3420,7 +3420,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // with metadata virtualization on and off; mappings that read no
     // property file not refused; a file the area gained after its snapshot
     // refused, PR #4791): 209 + 4 = 213.
-    ("test.detcore_misc", 213),
+    // And a file without a copy refused through an outside hard link:
+    // 213 + 1 = 214.
+    ("test.detcore_misc", 214),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -5532,7 +5534,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same tight-stack received-inotify test: 164.
     // And the same seventeen SCM_RIGHTS queue tests: 191 + 17 = 208.
     // And the four property snapshot tests (PR #4791): 209 + 4 = 213.
-    ("test.detcore_misc_on_host", 213),
+    // And the uncopied-file alias refusal: 213 + 1 = 214.
+    ("test.detcore_misc_on_host", 214),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -6402,8 +6405,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // bisection-checkpoint, workspace-source and guest-log units): +8.
     // And the same five concurrent-probe xstate_probe tests as
     // test.hermit_unit (dh-jqhfx, PR 5182): 1262 + 5 = 1267.
-    // And the same six property snapshot units (PR #4791): 1267 + 6 = 1273.
-    ("test.hermit_unit_on_host", 1273),
+    // And the same twelve property snapshot units (PR #4791):
+    // 1267 + 12 = 1279.
+    ("test.hermit_unit_on_host", 1279),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
