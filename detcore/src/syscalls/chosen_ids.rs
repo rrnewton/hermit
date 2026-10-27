@@ -368,7 +368,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         };
         let flags = u64::from_ne_bytes(args[..8].try_into().unwrap());
-        if let Some(why) = self.clone3_could_fare_otherwise(guest, flags) {
+        if let Some(why) =
+            untraced_clone(flags).or_else(|| self.clone3_could_fare_otherwise(guest, flags))
+        {
             return self
                 .host_id_planned(guest, sysno, why, refuse_host_ids)
                 .await;
@@ -592,6 +594,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         original
     }
+}
+
+/// Why a clone-family call with `flags` cannot be given a chosen ID, if it
+/// creates a task the tracer does not follow (`CLONE_UNTRACED`): Detcore sees
+/// none of that task's own clone calls, so its descendants would take host IDs
+/// that nothing reports. The call is issued as made instead, and its task's
+/// host ID is reported (`gave_host_id`), which marks the run's record
+/// `GuestIds::Host`, or ends a run that needs every ID chosen before the task
+/// exists.
+fn untraced_clone(flags: u64) -> Option<String> {
+    (flags & libc::CLONE_UNTRACED as u64 != 0).then(|| {
+        "it creates a task the tracer does not follow (CLONE_UNTRACED), whose own clones \
+         Detcore cannot number"
+            .to_owned()
+    })
 }
 
 /// The namespace flags of `clone`, any of which may need a capability.
@@ -920,6 +937,19 @@ mod tests {
                     .unwrap()
             ),
             1
+        );
+    }
+
+    /// A call creating a task the tracer does not follow cannot be given a
+    /// chosen ID: its descendants' clones would never reach Detcore.
+    #[test]
+    fn an_untraced_clone_is_not_given_a_chosen_id() {
+        let thread = (libc::CLONE_VM | libc::CLONE_THREAD | libc::CLONE_SIGHAND) as u64;
+        assert_eq!(super::untraced_clone(thread), None);
+        let untraced = super::untraced_clone(thread | libc::CLONE_UNTRACED as u64);
+        assert!(
+            untraced.is_some_and(|why| why.contains("CLONE_UNTRACED")),
+            "an untraced clone must take the host-ID path"
         );
     }
 }
