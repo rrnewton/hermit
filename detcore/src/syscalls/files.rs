@@ -82,6 +82,7 @@ use crate::tool_local::Detcore;
 use crate::tool_local::finish_partial_record_or_replay_write;
 use crate::types::*;
 
+pub(crate) mod descriptor_directory;
 #[cfg(test)]
 mod determinize_stat_tests;
 #[cfg(test)]
@@ -2802,27 +2803,33 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A nonblocking FIFO open never waits, so an injection a signal
         // interrupts did not run, and is made again; the signal is delivered
         // as the guest resumes.
-        let pending = match guest.inject_with_retry(nonblocking).await {
-            // A writer found a reader: Linux's open completes at once.
-            Ok(fd) if !reading => return Ok(self.make_blocking(guest, fd as RawFd).await?),
-            Ok(fd) if guest_peer_ready() => {
-                crate::fifo_peer::stand_in_for_waiting_writers(fifo, path);
-                return Ok(self.make_blocking(guest, fd as RawFd).await?);
-            }
-            Ok(fd) => {
-                // The tracer's reader opens before the guest's try closes, so
-                // the FIFO keeps a reader throughout.
-                let pending = crate::fifo_peer::PendingOpen::begin(fifo, path, call.flags().bits());
-                guest
-                    .inject_with_retry(syscalls::Close::new().with_fd(fd as RawFd))
-                    .await?;
-                pending
-            }
-            Err(Errno::ENXIO) if !reading => {
-                crate::fifo_peer::PendingOpen::begin(fifo, path, call.flags().bits())
-            }
-            Err(errno) => return Err(errno.into()),
-        };
+        // Each try is one injection, its path respelled for that injection
+        // alone where it leads below a descriptor directory
+        // (`Self::inject_translated`): nothing staged outlives a try, or the
+        // polling turns between them.
+        let pending =
+            match Self::inject_translated_retrying(guest, Syscall::from(nonblocking), true).await {
+                // A writer found a reader: Linux's open completes at once.
+                Ok(fd) if !reading => return Ok(self.make_blocking(guest, fd as RawFd).await?),
+                Ok(fd) if guest_peer_ready() => {
+                    crate::fifo_peer::stand_in_for_waiting_writers(fifo, path);
+                    return Ok(self.make_blocking(guest, fd as RawFd).await?);
+                }
+                Ok(fd) => {
+                    // The tracer's reader opens before the guest's try closes, so
+                    // the FIFO keeps a reader throughout.
+                    let pending =
+                        crate::fifo_peer::PendingOpen::begin(fifo, path, call.flags().bits());
+                    guest
+                        .inject_with_retry(syscalls::Close::new().with_fd(fd as RawFd))
+                        .await?;
+                    pending
+                }
+                Err(Errno::ENXIO) if !reading => {
+                    crate::fifo_peer::PendingOpen::begin(fifo, path, call.flags().bits())
+                }
+                Err(errno) => return Err(errno.into()),
+            };
         info!("[detcore] the FIFO open polls for a guest peer");
         // A waiting open is an end on Linux: it readies the opens waiting for
         // this end (`--pipe-wake-latency`).
@@ -2999,11 +3006,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // The name was checked by the first try, and reaches the FIFO:
             // nothing is created.
             let open = call.with_flags(flags - (OFlag::O_CREAT | OFlag::O_EXCL));
-            let fd = if retry {
-                guest.inject_with_retry(open).await?
-            } else {
-                guest.inject(open).await?
-            };
+            let fd = Self::inject_translated_retrying(guest, Syscall::from(open), retry).await?;
             if self
                 .inject_fstat(guest, fd as RawFd)
                 .await
@@ -3433,8 +3436,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         let Some(translated) = Self::procfs_translated_call(guest, &probe).await? else {
             return Self::inject_statat_as_spelled(guest, dirfd, path, inputs, flags).await;
         };
-        // The one path is staged at the start of the transient page.
-        let respelled = PathPtr::from_ptr(translated.page.as_raw() as *const libc::c_char);
+        // The one path, where the translation staged it, looked up from the
+        // directory it gives (`AT_FDCWD` for a path respelled below a
+        // descriptor directory).
+        let (_, staged) = translated.call.into_parts();
+        let respelled = PathPtr::from_ptr(staged.arg1 as *const libc::c_char);
+        let dirfd = staged.arg0 as RawFd;
         let looked_up = match respelled {
             Some(respelled) => {
                 Self::inject_statat_as_spelled(
@@ -4181,7 +4188,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_dirfd(call.dirfd())
             .with_path(call.path())
             .with_flags(OFlag::O_PATH | OFlag::O_CLOEXEC);
-        let probed = guest.inject(probe).await?;
+        let probed = Self::inject_translated(guest, Syscall::from(probe)).await?;
         let _ = guest
             .inject(syscalls::Close::new().with_fd(probed as RawFd))
             .await;
@@ -4259,6 +4266,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         let observed_path = Self::observed_path(guest, call.dirfd(), &path)?;
         // The spelling Detcore's own lookups of the files it renders see.
         let procfs_spelling = self.procfs_spelling_at(guest, call.dirfd(), &path).await?;
+        // A path below a descriptor directory Detcore serves is decided about
+        // as the path Linux resolves it to, which its injection respells it to
+        // (`descriptor_directory`).
+        let below_descriptor_directory =
+            Self::path_below_descriptor_directory(guest, call.dirfd(), &path, &observed_path);
+        // The guest's own spelling is kept for the open of a descriptor
+        // directory, which counts the links the spelling leads through.
+        let (observed_path, procfs_spelling, guest_spelled) = match &below_descriptor_directory {
+            Some(below) => (
+                below.clone(),
+                below.clone(),
+                Some((observed_path, procfs_spelling)),
+            ),
+            None => (observed_path, procfs_spelling, None),
+        };
         crate::race_probe::delay(crate::race_probe::PROCFS_SPELLING_RESOLVED).await;
         if guest.config().record_host_inputs && call.flags().contains(OFlag::O_CREAT) {
             // It may create the file it opens. Reported before the open runs,
@@ -4308,6 +4330,32 @@ impl<T: RecordOrReplay> Detcore<T> {
             !(target.via_link && call.flags().contains(OFlag::O_PATH | OFlag::O_NOFOLLOW))
         }) {
             let result = self.open_rendered_procfs(guest, call.flags(), target).await;
+            resource_release_all(guest).await;
+            return result;
+        }
+        // The caller's own descriptor directory, which Detcore lists from its
+        // own table on every backend (`descriptor_directory`).
+        if !path.as_os_str().is_empty()
+            && let Some(opened) = self
+                .descriptor_directory_opened(
+                    guest,
+                    guest_spelled
+                        .as_ref()
+                        .map_or(&observed_path, |(observed, _)| observed),
+                    guest_spelled
+                        .as_ref()
+                        .map_or(&procfs_spelling, |(_, spelling)| spelling),
+                    call.flags(),
+                )
+                .await
+        {
+            let result = match opened {
+                Ok(opened) => {
+                    self.open_descriptor_directory(guest, call.flags(), opened)
+                        .await
+                }
+                Err(errno) => Err(errno.into()),
+            };
             resource_release_all(guest).await;
             return result;
         }
@@ -4365,17 +4413,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A blocking open, for reading or for writing, of a FIFO a guest made
         // waits in polling turns for a guest at the other end
         // (https://github.com/rrnewton/hermit/issues/2203).
+        let own_ids = self.procfs_caller_ids(guest);
         let fifo = (self.cfg.use_nonblocking_sockets()
             && !self.cfg.recordreplay_modes
             && !call.flags().intersects(OFlag::O_NONBLOCK | OFlag::O_PATH)
             && call.flags().bits() & libc::O_ACCMODE != libc::O_RDWR)
             .then(|| {
+                // The tracer looks a path below a descriptor directory up as
+                // the guest's injection is respelled.
+                let (dirfd, path) = match &below_descriptor_directory {
+                    Some(below) => (libc::AT_FDCWD, below.as_path()),
+                    None => (call.dirfd(), path.as_path()),
+                };
                 crate::fifo_peer::fifo_at(
                     &self.cfg.backend,
                     guest.thread_state().physical_tid,
                     guest.tid().as_raw(),
-                    call.dirfd(),
-                    &path,
+                    own_ids,
+                    dirfd,
+                    path,
                 )
             })
             .flatten()
@@ -7547,6 +7603,20 @@ impl<T: RecordOrReplay> Detcore<T> {
             // guest's control flow and desynchronizing the event stream. Routing
             // through record_or_replay records the offset once and substitutes
             // the recorded value on replay, keeping the two runs identical.
+            // A descriptor on procfs's root is never moved into the range
+            // of the positions that tag a descriptor directory's descriptor
+            // (`descriptor_directory`), which would pass for one.
+            if self
+                .seek_would_place_a_tag(
+                    guest,
+                    call.fd() as RawFd,
+                    call.offset(),
+                    Syscall::Lseek(call).into_parts().1.arg2 as i32,
+                )
+                .await
+            {
+                return Err(Errno::EINVAL.into());
+            }
             let position = self.record_or_replay(guest, call).await?;
             if host_order && position == 0 {
                 // Back at the start, the next `getdents` can read the whole
@@ -9297,7 +9367,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<RawFd, String> {
         let mut last = Errno::EINTR.to_string();
         for _ in 0..OBJECT_DESCRIPTOR_ATTEMPTS {
-            match procfs_inode::read_open(guest.inject(open).await) {
+            // The guest's path, respelled for this injection where it leads
+            // below a descriptor directory, as the guest's own call is
+            // (`Self::inject_translated`).
+            match procfs_inode::read_open(Self::inject_translated(guest, Syscall::from(open)).await)
+            {
                 procfs_inode::Injected::Ran(fd) => return Ok(fd),
                 procfs_inode::Injected::NotRun(reported) => last = reported,
                 procfs_inode::Injected::Failed(reason) => return Err(reason),
@@ -9891,9 +9965,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             F_SETFD(flags) => {
                 let result = self.record_or_replay(guest, call).await?;
-                guest.thread_state().with_detfd(fd, |detfd| {
-                    detfd.set_cloexec(flags & libc::FD_CLOEXEC != 0);
-                })?;
+                let cloexec = flags & libc::FD_CLOEXEC != 0;
+                // A descriptor Detcore lists without modelling keeps its flag
+                // too (`FileMetadata::present_unmodelled`).
+                if !guest.thread_state().set_unmodelled_cloexec(fd, cloexec) {
+                    guest.thread_state().with_detfd(fd, |detfd| {
+                        detfd.set_cloexec(cloexec);
+                    })?;
+                }
                 Ok(result)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -10888,7 +10967,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let result = self.record_or_replay(guest, call).await?;
-        if cloexec.is_some() || nonblocking.is_some() {
+        // A descriptor Detcore lists without modelling keeps its
+        // close-on-exec flag too (`FileMetadata::present_unmodelled`).
+        let unmodelled =
+            cloexec.is_some_and(|enabled| guest.thread_state().set_unmodelled_cloexec(fd, enabled));
+        if !unmodelled && (cloexec.is_some() || nonblocking.is_some()) {
             guest.thread_state().with_detfd(fd, |detfd| {
                 if let Some(enabled) = cloexec {
                     detfd.set_cloexec(enabled);
@@ -11229,7 +11312,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let closed_end = (old_fd != new_fd)
             .then(|| self.pipe_channel_end(guest, new_fd))
             .flatten();
-        let res = self.record_or_replay(guest, call).await?;
+        let res = self
+            .record_or_replay(guest, call)
+            .await
+            .inspect_err(|errno| Self::note_failed_dup(guest, old_fd, new_fd, *errno))?;
         // Reported as soon as the kernel replaced `new_fd`, before Detcore's
         // own table update, which can still fail for a descriptor it does not
         // track (`Scheduler::note_descriptors_replaced`).
@@ -11252,6 +11338,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.report_lock_references(guest, lock_tracked).await;
         self.note_channel_end_closed(guest, closed_end).await;
         Ok(res)
+    }
+
+    /// A `dup2` or `dup3` of `old_fd` to `new_fd` that failed with `errno`:
+    /// one that failed with `EBADF` for an old descriptor that is not open
+    /// grew the table to hold `new_fd` first, as `ksys_dup3` expands it
+    /// before it looks `old_fd` up
+    /// (<https://github.com/torvalds/linux/blob/v6.17/fs/file.c#L1408-L1415>),
+    /// unless `new_fd` was at or above `RLIMIT_NOFILE`, which it refuses
+    /// first (`ThreadState::note_failed_dup_target`). The flags, and the same
+    /// descriptor twice, are refused before (`EINVAL`).
+    fn note_failed_dup<G: Guest<Self>>(guest: &G, old_fd: RawFd, new_fd: RawFd, errno: Errno) {
+        if errno == Errno::EBADF && old_fd != new_fd {
+            guest.thread_state().note_failed_dup_target(new_fd);
+        }
     }
 
     /// Detcore's table update after the kernel's `dup2` or `dup3` put
@@ -11323,7 +11423,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         let closed_end = (old_fd != new_fd)
             .then(|| self.pipe_channel_end(guest, new_fd))
             .flatten();
-        let res = self.record_or_replay(guest, call).await?;
+        let res = self
+            .record_or_replay(guest, call)
+            .await
+            .inspect_err(|errno| Self::note_failed_dup(guest, old_fd, new_fd, *errno))?;
         // Reported before Detcore's own table update, as for `dup2`.
         if let Ok(new_fd) = u32::try_from(new_fd) {
             crate::tool_global::descriptors_replaced(guest, new_fd, new_fd).await;
