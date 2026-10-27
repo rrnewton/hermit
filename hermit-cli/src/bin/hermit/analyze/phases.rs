@@ -63,7 +63,7 @@ fn yellow_msg(msg: &str) {
 /// the outcome change at such a pair comes from the replay falling off the schedule.
 /// Trials that timed out were counted as not reaching the target, which can steer
 /// the search onto exactly such a pair.
-fn critical_pair_caveat(crit: &CriticalSchedule, timed_out: usize) -> Option<String> {
+fn critical_pair_caveat(crit: &CriticalSchedule) -> Option<String> {
     let index = crit.critical_event_index;
     let schedule = &crit.failing_schedule;
     let same_thread =
@@ -73,11 +73,26 @@ fn critical_pair_caveat(crit: &CriticalSchedule, timed_out: usize) -> Option<Str
     }
     Some(format!(
         "the critical events #{} and #{index} both belong to thread {}, so swapping them is \
-         not an interleaving and this pair is not a race. {timed_out} trial(s) timed out and \
-         were counted as the baseline condition.",
+         not an interleaving and this pair is not a race.",
         index - 1,
         schedule[index].dettid,
     ))
+}
+
+/// The warnings a default search's result carries: how many trials the run
+/// arguments' `--timeout` stopped, whenever any did, and why a critical pair
+/// of one thread is not a race ([`critical_pair_caveat`]).
+fn search_warnings(crit: &CriticalSchedule, timed_out: usize) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if timed_out > 0 {
+        warnings.push(format!(
+            "{timed_out} trial(s) did not finish within the run arguments' --timeout. Each was \
+             counted as the baseline condition, with the schedule it was asked to replay taken \
+             as the one it realized, so the critical pair may rest on them."
+        ));
+    }
+    warnings.extend(critical_pair_caveat(crit));
+    warnings
 }
 
 impl AnalyzeOpts {
@@ -588,8 +603,8 @@ impl AnalyzeOpts {
             "Critical event of final on-target schedule is {}",
             crit.critical_event_index
         );
-        if let Some(caveat) = critical_pair_caveat(&crit, timed_out) {
-            eprintln!(":: {} {caveat}", "WARNING:".yellow().bold());
+        for warning in search_warnings(&crit, timed_out) {
+            eprintln!(":: {} {warning}", "WARNING:".yellow().bold());
         }
         Ok(crit)
     }
@@ -1173,16 +1188,40 @@ mod tests {
 
     #[test]
     fn a_same_thread_critical_pair_is_flagged_and_a_cross_thread_one_is_not() {
-        let caveat = critical_pair_caveat(&critical(&[3, 3, 5], 1), 2)
+        let caveat = critical_pair_caveat(&critical(&[3, 3, 5], 1))
             .expect("two events of thread 3 cannot be reordered");
         assert!(caveat.contains("both belong to thread 3"), "{caveat}");
-        assert!(caveat.contains("2 trial(s) timed out"), "{caveat}");
 
         assert_eq!(
-            critical_pair_caveat(&critical(&[3, 3, 5], 2), 0),
+            critical_pair_caveat(&critical(&[3, 3, 5], 2)),
             None,
             "3 then 5 is a race"
         );
+    }
+
+    /// Trials the run arguments' `--timeout` stopped are counted on a line of
+    /// their own whenever there are any, whatever the critical pair; the
+    /// same-thread caveat is its own line too.
+    #[test]
+    fn timed_out_trials_are_reported_on_their_own_line() {
+        let race = critical(&[3, 3, 5], 2);
+        let warnings = search_warnings(&race, 2);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0]
+                .starts_with("2 trial(s) did not finish within the run arguments' --timeout"),
+            "{warnings:?}"
+        );
+        assert!(search_warnings(&race, 0).is_empty());
+
+        let same_thread = critical(&[3, 3, 5], 1);
+        let warnings = search_warnings(&same_thread, 0);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("both belong to thread 3"),
+            "{warnings:?}"
+        );
+        assert_eq!(search_warnings(&same_thread, 3).len(), 2);
     }
 
     /// A search round whose trial `--max-log-bytes` ended stops the `--search`
