@@ -1347,10 +1347,6 @@ pub(super) fn identity_hardening_mounts(
     ))
 }
 
-fn choose_affinity_core(allowed: &[usize]) -> Option<usize> {
-    (!allowed.is_empty()).then(|| allowed[rand::random_range(0..allowed.len())])
-}
-
 fn cpu_ids(affinity: &CpuSet) -> Vec<usize> {
     (0..CpuSet::count())
         .filter(|cpu| affinity.is_set(*cpu).unwrap_or(false))
@@ -1362,10 +1358,10 @@ pub(super) fn apply_affinity(container: &mut Container, pin_threads: bool) {
         let affinity = sched_getaffinity(Pid::from_raw(0))
             .expect("failed to query the tracer's allowed CPU affinity mask");
         let allowed = cpu_ids(&affinity);
-        let rand_core = choose_affinity_core(&allowed)
+        let (core, basis) = super::pinned_cpu::choose(&allowed)
             .expect("the tracer's allowed CPU affinity mask is empty");
-        tracing::info!("Pinning tracer and guest threads to core {}", rand_core);
-        container.affinity(rand_core);
+        tracing::info!("Pinning tracer and guest threads to core {core} ({basis})");
+        container.affinity(core);
     }
 }
 
@@ -6537,10 +6533,15 @@ mod tests {
         let allowed = cpu_ids(&affinity);
         assert_eq!(allowed, [7, 31, 211]);
         for _ in 0..128 {
-            let selected = choose_affinity_core(&allowed).expect("non-empty mask");
-            assert!(allowed.contains(&selected), "selected CPU {selected}");
+            // Without a /proc/stat reading, the draw is over every allowed CPU.
+            let (selected, basis) =
+                super::super::pinned_cpu::choose_with(&allowed, |_| None).expect("non-empty mask");
+            assert!(
+                allowed.contains(&selected),
+                "selected CPU {selected} ({basis})"
+            );
         }
-        assert_eq!(choose_affinity_core(&[]), None);
+        assert_eq!(super::super::pinned_cpu::choose(&[]), None);
     }
 
     /// How the candidate init in [`arm_after_the_parent_crossed`] ended: its
