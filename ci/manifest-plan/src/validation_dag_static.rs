@@ -3084,7 +3084,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the TracerPid unit (32e9ef22f60): 2897 + 1 = 2898.
     // And syscalls::chosen_ids' eight clone3-form units and preemptions'
     // the_guest_numbering_round_trips_and_is_compared: 2695 + 9 = 2907, listed.
-    ("test.detcore_unit", 2907),
+    // And chosen_ids' an_untraced_clone_is_not_given_a_chosen_id: 2908, listed.
+    ("test.detcore_unit", 2908),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5422,7 +5423,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured with `cargo nextest list` at this head.
     // And the same TracerPid unit: 2898.
     // And the same nine chosen-ID units: 2695 + 9 = 2907.
-    ("test.detcore_unit_on_host", 2907),
+    // And the same untraced-clone unit: 2908.
+    ("test.detcore_unit_on_host", 2908),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
