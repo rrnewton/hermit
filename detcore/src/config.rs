@@ -93,6 +93,8 @@ mod tests {
         (4, "b3d7410a78b56ae0", "4e10b2de93d47d64"),
         // Adds `GlobalRequest::CpuAffinity`, `GlobalRequest::SetCpuAffinity`; adds `GlobalResponse::CpuAffinity` (#4629).
         (5, "5a4ad14e74501e11", "4e10b2de93d47d64"),
+        // Adds `Resources.slice_expired` (#4653).
+        (5, "b3d7410a78b56ae0", "6a1b176897e67771"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
