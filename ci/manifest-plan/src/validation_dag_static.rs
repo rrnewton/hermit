@@ -3439,7 +3439,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And random_determinism's
     // a_schedule_replay_hands_the_guest_the_recorded_random_values (a replay
     // adopts the recorded --rng-seed and refuses another): 347, listed.
-    ("test.hermit_integration_3", 347),
+    // Explicit source/registry package identity adds seven version_provenance cases: 354.
+    ("test.hermit_integration_3", 354),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -5449,7 +5450,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Name the optional e9patch consumer leg separately; all ten legs remain (+1): 692.
     // And the same two-run syscall-histogram test: 693, listed.
     // And the same random_determinism schedule-replay test: 694, listed.
-    ("test.hermit_integration_on_host", 694),
+    // And the same seven explicit package-identity cases in version_provenance: 701.
+    ("test.hermit_integration_on_host", 701),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),

@@ -29,7 +29,7 @@ PRIVATE_INVENTORY_SHA256 = 'f825b66769fb55bee298b0a41277b38767970e5cad4beca8400f
 CODEGEN = '-C relocation-model=pic -C code-model=small -C target-feature=+crt-static -C link-self-contained=yes'
 STREAM = 64 * 1024 * 1024
 RUNTIME_COHORT = D / 'runtime_cohort.py'
-RUNTIME_COHORT_SHA256 = '3e8303fe0eb6f4132bea9962329323e2f5362e3cd7e65ce6708f307bb6f9fdcb'
+RUNTIME_COHORT_SHA256 = 'ea164ac6a7dc7ae44eff7764443559b60b541f84ce3c33b63caadfdf11d28b80'
 REQUIRED_HANDOFF_SOURCE_SHA256 = '85abd905256f3bc5b526840cf3cd5e090238e4aa770f03d320c2ae907ee7ae75'
 
 
