@@ -5835,6 +5835,34 @@ pub fn ledger_row_counts(rows: &[ParityLedgerSource]) -> String {
         .join(", ")
 }
 
+/// [`append_ledger_rows`]'s outcome with whether the writer accepted every
+/// row: `accepted` is true only for the writer's exit status 0 on the rows
+/// themselves, false for every line [`append_ledger_rows`] calls a refusal,
+/// an `ERROR:` or a writer without `append-parity`. A caller that must not
+/// count unaccepted rows as published (the pressure test's series-emitted
+/// marker) reads it rather than the line's words.
+pub struct LedgerAppendOutcome {
+    pub line: String,
+    pub accepted: bool,
+}
+
+pub fn append_ledger_rows_outcome(
+    append: &LedgerAppend<'_>,
+    rows: &[ParityLedgerSource],
+    bounds: AppendBounds,
+) -> LedgerAppendOutcome {
+    match append_ledger_rows_checked(append, rows, bounds) {
+        Ok(line) => LedgerAppendOutcome {
+            line,
+            accepted: true,
+        },
+        Err(line) => LedgerAppendOutcome {
+            line,
+            accepted: false,
+        },
+    }
+}
+
 /// Send `rows` to `series.py append-parity` and return the one `parity:`
 /// line that reports the outcome. Parity is measured after determinism and
 /// decides nothing, so no outcome here is an error for the caller.
@@ -5862,13 +5890,23 @@ pub fn append_ledger_rows(
     rows: &[ParityLedgerSource],
     bounds: AppendBounds,
 ) -> String {
+    append_ledger_rows_outcome(append, rows, bounds).line
+}
+
+/// [`append_ledger_rows`] with its outcome typed: `Ok` only for the writer's
+/// acceptance of the rows, `Err` for every other line.
+fn append_ledger_rows_checked(
+    append: &LedgerAppend<'_>,
+    rows: &[ParityLedgerSource],
+    bounds: AppendBounds,
+) -> Result<String, String> {
     let counts = ledger_row_counts(rows);
-    let left = |why: &str| {
-        format!(
+    let left = |why: &str| -> Result<String, String> {
+        Err(format!(
             "parity: {why}; {} rows left in {} ({counts})",
             rows.len(),
             append.source.display()
-        )
+        ))
     };
     for row in rows {
         if let Err(error) = check_producer_class(
@@ -5976,7 +6014,7 @@ pub fn append_ledger_rows(
     }
     let said = String::from_utf8_lossy(&stdout);
     let said = said.trim();
-    format!(
+    Ok(format!(
         "parity: append-parity accepted {} row(s) from {} ({counts}): {}",
         rows.len(),
         append.source.display(),
@@ -5985,7 +6023,7 @@ pub fn append_ledger_rows(
         } else {
             said
         }
-    )
+    ))
 }
 
 /// A file holding `bytes`, positioned at its start and already unlinked, to
