@@ -376,64 +376,66 @@ fn decode_relr(section: &[u8]) -> Vec<(u64, u64)> {
     covered
 }
 
+/// A minimal aarch64 ELF image: one read-and-execute `PT_LOAD` covering
+/// the file, and a `.text` section holding `words` at file offset and
+/// address 0x100. Shared with the in-memory rewrite's tests, which map
+/// such an image.
+#[cfg(test)]
+pub(crate) fn elf_with_text(words: &[u32]) -> Vec<u8> {
+    const TEXT: usize = 0x100;
+    let text_len = 4 * words.len();
+    let strtab = b"\0.text\0.shstrtab\0";
+    let strtab_at = TEXT + text_len;
+    let shoff = (strtab_at + strtab.len()).next_multiple_of(8);
+    let total = shoff + 3 * 64;
+    let mut bytes = vec![0u8; total];
+    let put = |bytes: &mut Vec<u8>, at: usize, value: &[u8]| {
+        bytes[at..at + value.len()].copy_from_slice(value)
+    };
+    // ELF header: ELFCLASS64, little-endian, ET_DYN, EM_AARCH64.
+    put(&mut bytes, 0, b"\x7fELF\x02\x01\x01");
+    put(&mut bytes, 16, &3u16.to_le_bytes());
+    put(&mut bytes, 18, &183u16.to_le_bytes());
+    put(&mut bytes, 20, &1u32.to_le_bytes());
+    put(&mut bytes, 32, &64u64.to_le_bytes()); // e_phoff
+    put(&mut bytes, 40, &(shoff as u64).to_le_bytes());
+    put(&mut bytes, 52, &64u16.to_le_bytes()); // e_ehsize
+    put(&mut bytes, 54, &56u16.to_le_bytes()); // e_phentsize
+    put(&mut bytes, 56, &1u16.to_le_bytes()); // e_phnum
+    put(&mut bytes, 58, &64u16.to_le_bytes()); // e_shentsize
+    put(&mut bytes, 60, &3u16.to_le_bytes()); // e_shnum
+    put(&mut bytes, 62, &2u16.to_le_bytes()); // e_shstrndx
+    // PT_LOAD, PF_R | PF_X, the whole file at address 0.
+    put(&mut bytes, 64, &1u32.to_le_bytes());
+    put(&mut bytes, 68, &5u32.to_le_bytes());
+    put(&mut bytes, 64 + 32, &(total as u64).to_le_bytes()); // p_filesz
+    put(&mut bytes, 64 + 40, &(total as u64).to_le_bytes()); // p_memsz
+    put(&mut bytes, 64 + 48, &0x1000u64.to_le_bytes());
+    for (i, word) in words.iter().enumerate() {
+        put(&mut bytes, TEXT + 4 * i, &word.to_le_bytes());
+    }
+    put(&mut bytes, strtab_at, strtab);
+    // Section headers: null, .text (PROGBITS, ALLOC | EXECINSTR), .shstrtab.
+    let text = shoff + 64;
+    put(&mut bytes, text, &1u32.to_le_bytes());
+    put(&mut bytes, text + 4, &1u32.to_le_bytes());
+    put(&mut bytes, text + 8, &6u64.to_le_bytes());
+    put(&mut bytes, text + 16, &(TEXT as u64).to_le_bytes());
+    put(&mut bytes, text + 24, &(TEXT as u64).to_le_bytes());
+    put(&mut bytes, text + 32, &(text_len as u64).to_le_bytes());
+    put(&mut bytes, text + 48, &4u64.to_le_bytes());
+    let names = shoff + 128;
+    put(&mut bytes, names, &7u32.to_le_bytes());
+    put(&mut bytes, names + 4, &3u32.to_le_bytes());
+    put(&mut bytes, names + 24, &(strtab_at as u64).to_le_bytes());
+    put(&mut bytes, names + 32, &(strtab.len() as u64).to_le_bytes());
+    put(&mut bytes, names + 48, &1u64.to_le_bytes());
+    bytes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A minimal aarch64 ELF image: one read-and-execute `PT_LOAD` covering
-    /// the file, and a `.text` section holding `words` at file offset and
-    /// address 0x100.
-    fn elf_with_text(words: &[u32]) -> Vec<u8> {
-        const TEXT: usize = 0x100;
-        let text_len = 4 * words.len();
-        let strtab = b"\0.text\0.shstrtab\0";
-        let strtab_at = TEXT + text_len;
-        let shoff = (strtab_at + strtab.len()).next_multiple_of(8);
-        let total = shoff + 3 * 64;
-        let mut bytes = vec![0u8; total];
-        let put = |bytes: &mut Vec<u8>, at: usize, value: &[u8]| {
-            bytes[at..at + value.len()].copy_from_slice(value)
-        };
-        // ELF header: ELFCLASS64, little-endian, ET_DYN, EM_AARCH64.
-        put(&mut bytes, 0, b"\x7fELF\x02\x01\x01");
-        put(&mut bytes, 16, &3u16.to_le_bytes());
-        put(&mut bytes, 18, &183u16.to_le_bytes());
-        put(&mut bytes, 20, &1u32.to_le_bytes());
-        put(&mut bytes, 32, &64u64.to_le_bytes()); // e_phoff
-        put(&mut bytes, 40, &(shoff as u64).to_le_bytes());
-        put(&mut bytes, 52, &64u16.to_le_bytes()); // e_ehsize
-        put(&mut bytes, 54, &56u16.to_le_bytes()); // e_phentsize
-        put(&mut bytes, 56, &1u16.to_le_bytes()); // e_phnum
-        put(&mut bytes, 58, &64u16.to_le_bytes()); // e_shentsize
-        put(&mut bytes, 60, &3u16.to_le_bytes()); // e_shnum
-        put(&mut bytes, 62, &2u16.to_le_bytes()); // e_shstrndx
-        // PT_LOAD, PF_R | PF_X, the whole file at address 0.
-        put(&mut bytes, 64, &1u32.to_le_bytes());
-        put(&mut bytes, 68, &5u32.to_le_bytes());
-        put(&mut bytes, 64 + 32, &(total as u64).to_le_bytes()); // p_filesz
-        put(&mut bytes, 64 + 40, &(total as u64).to_le_bytes()); // p_memsz
-        put(&mut bytes, 64 + 48, &0x1000u64.to_le_bytes());
-        for (i, word) in words.iter().enumerate() {
-            put(&mut bytes, TEXT + 4 * i, &word.to_le_bytes());
-        }
-        put(&mut bytes, strtab_at, strtab);
-        // Section headers: null, .text (PROGBITS, ALLOC | EXECINSTR), .shstrtab.
-        let text = shoff + 64;
-        put(&mut bytes, text, &1u32.to_le_bytes());
-        put(&mut bytes, text + 4, &1u32.to_le_bytes());
-        put(&mut bytes, text + 8, &6u64.to_le_bytes());
-        put(&mut bytes, text + 16, &(TEXT as u64).to_le_bytes());
-        put(&mut bytes, text + 24, &(TEXT as u64).to_le_bytes());
-        put(&mut bytes, text + 32, &(text_len as u64).to_le_bytes());
-        put(&mut bytes, text + 48, &4u64.to_le_bytes());
-        let names = shoff + 128;
-        put(&mut bytes, names, &7u32.to_le_bytes());
-        put(&mut bytes, names + 4, &3u32.to_le_bytes());
-        put(&mut bytes, names + 24, &(strtab_at as u64).to_le_bytes());
-        put(&mut bytes, names + 32, &(strtab.len() as u64).to_le_bytes());
-        put(&mut bytes, names + 48, &1u64.to_le_bytes());
-        bytes
-    }
 
     /// The plan names each rewritten sequence by file offset with its bytes
     /// before and after, those bytes are the rewriter's, and applying the
