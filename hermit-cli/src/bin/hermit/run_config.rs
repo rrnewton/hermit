@@ -516,6 +516,8 @@ pub(crate) fn expand_argv(
 /// identity: only the matching executable may consume it without a built-in
 /// `--backend` enum. Ordinary Hermit still parses the value normally and
 /// refuses an unknown backend instead of silently choosing ptrace.
+/// An external executable also refuses files with no saved backend identity;
+/// the ordinary executable retains its implicit builtin default.
 pub(super) fn expand_argv_for_application(
     command: &Command,
     argv: &[OsString],
@@ -572,9 +574,14 @@ pub(super) fn expand_argv_for_application(
             paths.len()
         ),
     };
-    if let Some(application) = application_backend
-        && let Some(backend) = config.global.remove("backend")
-    {
+    if let Some(application) = application_backend {
+        let backend = config.global.remove("backend").with_context(|| {
+            format!(
+                "{} has no saved backend identity, but this executable selects `{application}`; \
+                 use the executable for the saved backend instead",
+                path.display(),
+            )
+        })?;
         anyhow::ensure!(
             backend.as_str() == Some(application),
             "{} selects backend {}, but this executable selects `{application}`; \
