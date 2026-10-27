@@ -1343,6 +1343,9 @@ impl AnalyzeOpts {
         println!(
             "\n------------------------------ hermit analyze report ------------------------------"
         );
+        if let Some(warning) = &self.branch_counter_warning {
+            println!("{warning}");
+        }
         println!("{}", header);
         println!("Thread {thread} at the deciding event #{decision}:");
         Self::print_stack("the deciding thread's stack", deciding);
@@ -1362,6 +1365,7 @@ impl AnalyzeOpts {
                 event_index: event2,
                 stack: stack2,
             },
+            branch_counter_warning: self.branch_counter_warning.clone(),
             deciding_event: Some(ReportCriticalEvent {
                 event_index: decision,
                 stack: deciding.clone(),
