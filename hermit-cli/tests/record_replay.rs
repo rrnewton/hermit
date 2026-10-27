@@ -4771,9 +4771,10 @@ fn record_replay_registers_descriptors_received_over_scm_rights() {
 /// while replay reserved it when the receive rejoined the schedule, in thread
 /// order and after other threads' opens; every replay stopped with "replay FD
 /// namespace diverged". A socket whose peer is a guest is now polled in the
-/// caller's turn, as a socketpair end is, and so is an infinite poll on a
-/// received pipe end and such a socket. Each replay of each of three
-/// recordings must print what a native run prints.
+/// caller's turn, as a socketpair end is. The first receiver's infinite poll
+/// on a received pipe end and its socket is a `poll` call, which still runs
+/// as before (polling such a `poll` in the turn is left out). Each replay of
+/// each of three recordings must print what a native run prints.
 #[test]
 fn record_replay_receives_descriptors_over_a_guests_own_unix_listener() {
     let _guard = hermit_record_lock();
@@ -4817,6 +4818,27 @@ fn record_replay_keeps_eventfds_received_over_scm_rights_coherent() {
          eventfd closed sender: received read=-1 errno=EBADF\n\
          eventfd child: exit=0\n\
          eventfd child: received read=-1 errno=EBADF\n",
+    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// An inotify instance received over `SCM_RIGHTS` after its sender closed its
+/// copy (see `tests/c/record_replay_scm_rights.c inotify`). `fstat` cannot
+/// tell one anonymous inode from another, so Detcore reads the received
+/// descriptor's link to find an inotify instance, which it records as one.
+/// That link was read live in both phases, and replay, whose slot holds a
+/// stand-in eventfd, read `anon_inode:[eventfd]`, left the descriptor
+/// unrecorded and stopped at the read the recording served. The link is now
+/// read through the recording. Both phases must print what a native run
+/// prints: the one `IN_CREATE` event for the created file.
+#[test]
+fn record_replay_reads_an_inotify_instance_received_over_scm_rights() {
+    let _guard = hermit_record_lock();
+    let failures = record_replay_output_failures(
+        "scm-rights-inotify",
+        &workload("c_record_replay_scm_rights").path,
+        &["inotify"],
+        "inotify: events=1 mask=0x100 name=created\n",
     );
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

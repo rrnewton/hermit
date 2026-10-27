@@ -6801,24 +6801,48 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// What descriptor `fd` of the calling process names, as its
-    /// `/proc/self/fd` link reads, through the recording: the recording reads
-    /// the kernel's link and keeps its bytes, and replay, whose descriptor is
-    /// an eventfd, returns the same bytes. `None` for a deleted or anonymous
-    /// target, a link that cannot be read, or one too long for the 256 bytes
-    /// read: every path Detcore classifies is far shorter, and a truncated
-    /// one must not match.
-    ///
-    /// The link's name and the buffer go in the guest stack scratch, below the
-    /// red zone, or, where that memory is not writable (a stack pointer just
-    /// above a guard page or the lowest page of the main-thread stack), in a
-    /// transient private page, as `inject_fstat` does
-    /// (<https://github.com/rrnewton/hermit/issues/3328>): Detcore's
-    /// bookkeeping must never fail the guest's open.
+    /// `/proc/thread-self/fd` link reads, through the recording
+    /// ([`Self::recorded_descriptor_link`]): `None` for an anonymous target,
+    /// a link that cannot be read, one too long for the 256 bytes read (every
+    /// path Detcore classifies is far shorter, and a truncated one must not
+    /// match), or one Detcore had no buffer to read into, which must never
+    /// fail the guest's open.
     async fn recorded_open_path<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
     ) -> Result<Option<PathBuf>, Error> {
+        let bytes = self
+            .recorded_descriptor_link(guest, fd)
+            .await
+            .unwrap_or(None);
+        Ok(bytes.and_then(|bytes| {
+            let path = PathBuf::from(
+                <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes),
+            );
+            path.is_absolute().then_some(path)
+        }))
+    }
+
+    /// The bytes of descriptor `fd`'s `/proc/thread-self/fd` link, through the
+    /// recording ([`Self::recorded_readlink`]): the recording reads the
+    /// kernel's link and keeps its bytes, and replay, whose slot may hold a
+    /// stand-in eventfd, returns the same bytes. `None` for a link that cannot
+    /// be read or fills the 256 bytes read.
+    ///
+    /// The link's name and the buffer go in the guest stack scratch, below the
+    /// red zone, or, where that memory is not writable (a stack pointer just
+    /// above a guard page or the lowest page of the main-thread stack), in a
+    /// transient private page, as `inject_fstat` does
+    /// (<https://github.com/rrnewton/hermit/issues/3328>). Neither placement
+    /// consumes an event. `Err` when neither could be prepared: no readlink
+    /// ran, so no event was recorded or consumed, and a caller under record
+    /// and replay decides whether that may end the run.
+    pub(crate) async fn recorded_descriptor_link<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<Option<Vec<u8>>, Errno> {
         const LINK_CAPACITY: usize = 32;
         const TARGET_CAPACITY: usize = 256;
         let link_name = rendered_procfs::c_string::<LINK_CAPACITY>(
@@ -6827,13 +6851,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut stack = guest.stack().await;
         let link = stack.push(link_name);
         let target = stack.reserve::<[u8; TARGET_CAPACITY]>();
-        let bytes = match stack.commit() {
+        match stack.commit() {
             Ok(stack_guard) => {
                 let bytes = self
                     .recorded_readlink(guest, link.as_raw(), target.as_raw(), TARGET_CAPACITY)
                     .await;
                 drop(stack_guard);
-                bytes
+                Ok(bytes)
             }
             Err(_) => {
                 info!(
@@ -6853,23 +6877,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .with_offset(0),
                     ))
                     .await;
-                let Some(page) = mapped
-                    .ok()
-                    .and_then(|mapped| usize::try_from(mapped).ok())
-                    .and_then(AddrMut::<u8>::from_raw)
-                else {
-                    return Ok(None);
-                };
-                let bytes = if guest.memory().write_exact(page, &link_name).is_ok() {
-                    self.recorded_readlink(
-                        guest,
-                        page.as_raw(),
-                        page.as_raw() + LINK_CAPACITY,
-                        TARGET_CAPACITY,
-                    )
-                    .await
+                let page = mapped.and_then(|mapped| {
+                    usize::try_from(mapped)
+                        .ok()
+                        .and_then(AddrMut::<u8>::from_raw)
+                        .ok_or(Errno::ENOMEM)
+                })?;
+                let bytes = if let Err(errno) = guest.memory().write_exact(page, &link_name) {
+                    Err(errno)
                 } else {
-                    None
+                    Ok(self
+                        .recorded_readlink(
+                            guest,
+                            page.as_raw(),
+                            page.as_raw() + LINK_CAPACITY,
+                            TARGET_CAPACITY,
+                        )
+                        .await)
                 };
                 if let Err(errno) = guest
                     .inject_with_retry(Syscall::Munmap(
@@ -6886,18 +6910,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
                 bytes
             }
-        };
-        Ok(bytes.and_then(|bytes| {
-            let path = PathBuf::from(
-                <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes),
-            );
-            path.is_absolute().then_some(path)
-        }))
+        }
     }
 
     /// `readlink(link, target, capacity)` through the recording, both at guest
     /// addresses: the bytes it read, or `None` if it failed or filled the
-    /// buffer (a link that may be truncated).
+    /// buffer (a link that may be truncated). Retried while a signal stops it
+    /// before it runs; every attempt is an event, so replay retries as the
+    /// recording did.
     async fn recorded_readlink<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -6905,17 +6925,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         target: usize,
         capacity: usize,
     ) -> Option<Vec<u8>> {
+        const ATTEMPTS: usize = 64;
         let target = AddrMut::<u8>::from_raw(target)?;
-        let length = self
-            .record_or_replay(
-                guest,
-                syscalls::Readlink::new()
-                    .with_path(PathPtr::from_ptr(link as *const libc::c_char))
-                    .with_buf(Some(target.cast::<libc::c_char>()))
-                    .with_bufsize(capacity),
-            )
-            .await
-            .ok()?;
+        let readlink = syscalls::Readlink::new()
+            .with_path(PathPtr::from_ptr(link as *const libc::c_char))
+            .with_buf(Some(target.cast::<libc::c_char>()))
+            .with_bufsize(capacity);
+        let mut answer = Err(Errno::ERESTARTSYS);
+        for _ in 0..ATTEMPTS {
+            answer = self.record_or_replay(guest, readlink).await;
+            if !matches!(answer, Err(Errno::EINTR | Errno::ERESTARTSYS)) {
+                break;
+            }
+        }
+        let length = answer.ok()?;
         let length = usize::try_from(length)
             .ok()
             .filter(|length| *length < capacity)?;

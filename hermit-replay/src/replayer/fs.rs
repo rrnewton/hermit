@@ -42,7 +42,6 @@ use reverie::syscalls::ioctl;
 
 use super::ReplayOutputs;
 use super::Replayer;
-use super::holds_received_stand_in;
 use crate::event::FileCloneImage;
 use crate::event::ReplayFdKind;
 use crate::event::deterministic_ioctl_error;
@@ -768,7 +767,6 @@ impl Replayer {
             _ => unreachable!("readv-family handler received {syscall:?}"),
         };
         match event.replay_fd_kind {
-            ReplayFdKind::Eventfd if holds_received_stand_in(guest.tid(), fd) => {}
             ReplayFdKind::Eventfd => {
                 let actual = inject_kernel_side_effect(guest, fd, syscall).await?;
                 assert_eq!(
@@ -797,7 +795,6 @@ impl Replayer {
     ) -> Result<i64, Error> {
         let event = next_event!(guest, ReadV2)?;
         match event.replay_fd_kind {
-            ReplayFdKind::Eventfd if holds_received_stand_in(guest.tid(), syscall.fd()) => {}
             ReplayFdKind::Eventfd => {
                 let actual = inject_kernel_side_effect(guest, syscall.fd(), syscall.into()).await?;
                 assert_eq!(
@@ -1011,7 +1008,6 @@ impl Replayer {
         let event = next_event!(guest, WriteV2)?;
         let successful_count = successful_replay_write_count(event.result)?;
         match event.replay_fd_kind {
-            ReplayFdKind::Eventfd if holds_received_stand_in(guest.tid(), syscall.fd()) => {}
             ReplayFdKind::Eventfd => {
                 let actual =
                     inject_kernel_side_effect(guest, syscall.fd(), Syscall::from(syscall)).await?;
