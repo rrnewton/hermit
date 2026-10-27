@@ -1903,7 +1903,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Its detlog correction adds one hermit-run unit: 1287 + 1 = 1288, re-measured at this integration head.
     // PR 4912 adds one hermit-run unit: 1288 + 1 = 1289, re-measured at this integration head.
     // H1 host-input evidence adds one hermit-run unit: 1289 + 1 = 1290.
-    ("test.hermit_unit", 1290),
+    // And this change's two no-namespace analyze tests: 1290 + 2 = 1292.
+    ("test.hermit_unit", 1292),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5966,7 +5967,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same detlog correction unit: 1281 + 1 = 1282.
     // The same PR 4912 unit: 1282 + 1 = 1283.
     // The same H1 path-fallback unit: 1283 + 1 = 1284.
-    ("test.hermit_unit_on_host", 1284),
+    // And the same two: 1284 + 2 = 1286.
+    ("test.hermit_unit_on_host", 1286),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
