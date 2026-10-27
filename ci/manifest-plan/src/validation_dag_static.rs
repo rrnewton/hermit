@@ -3036,7 +3036,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the scheduler unit
     // a_replayed_sigchld_waits_behind_genuine_work_but_not_a_replay_held_poller: 2683,
     // listed.
-    ("test.detcore_unit", 2683),
+    // And the scheduler units
+    // a_replayed_sigchld_waits_behind_genuine_work_but_not_a_replay_held_poller
+    // and a_pending_poll_backoff_keeps_a_replayed_sigchld_parked: 2684, listed.
+    ("test.detcore_unit", 2684),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5264,7 +5267,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Fixed 0.5.4 rebase recount also retains the priority-history regressions.
     // And the same 3c.1e B unit: 2682, listed.
     // And the same replayed-SIGCHLD scheduler unit: 2683, listed.
-    ("test.detcore_unit_on_host", 2683),
+    // And the same two replayed-SIGCHLD scheduler units: 2684, listed.
+    ("test.detcore_unit_on_host", 2684),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
