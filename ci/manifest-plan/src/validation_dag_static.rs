@@ -1959,7 +1959,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_check_replays_its_control_first_and_counts_only_when_it_reproduces} and
     // analyze::phases::tests::a_check_keeps_the_checkpoints_of_its_own_runs_prefix: 1282.
     // And analyze::races::tests::a_changed_course_is_ordered_by_its_baseline_counterpart: 1283.
-    ("test.hermit_unit", 1283),
+    // And analyze::races::tests::candidates_none_of_which_decides_say_what_that_means: 1284.
+    ("test.hermit_unit", 1284),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5914,7 +5915,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two realized-replay report tests: 1268.
     // And the same eight race-candidate check tests: 1276.
     // And the same changed-course order test: 1277.
-    ("test.hermit_unit_on_host", 1277),
+    // And the same undecided-candidates test: 1278.
+    ("test.hermit_unit_on_host", 1278),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
