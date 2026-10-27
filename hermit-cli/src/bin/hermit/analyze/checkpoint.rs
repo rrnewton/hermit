@@ -246,7 +246,8 @@ pub enum RecordedEnd {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seconds: Option<u64>,
     },
-    /// Hermit refused it at an operation its guest reached.
+    /// Hermit refused it at an operation its guest reached, deterministically
+    /// (a host-timed refusal is not journaled).
     Refusal,
 }
 
@@ -283,6 +284,10 @@ pub struct JournalEntry {
     /// [`RunData::departure`]: crate::analyze::rundata::RunData::departure
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub departure: Option<ScheduleDeparture>,
+    /// The reason Detcore filed for refusing it, for a run Hermit refused
+    /// ([`RecordedEnd::Refusal`]) after filing one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_reason: Option<String>,
 }
 
 struct JournalState {
@@ -719,6 +724,7 @@ mod tests {
             }],
             recording_replays_input: None,
             departure: None,
+            refusal_reason: None,
         };
         let journal = Journal::open(dir.path()).unwrap();
         assert!(journal.is_on());

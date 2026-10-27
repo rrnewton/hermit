@@ -32,6 +32,8 @@ use detcore_model::summary::RunSummary;
 use detcore_model::summary::ScheduleDeparture;
 use hermit::process::Bind;
 use reverie::process::Output;
+use serde::Deserialize;
+use serde::Serialize;
 use tracing::metadata::LevelFilter;
 
 use crate::analyze::budget::BudgetExpired;
@@ -65,32 +67,70 @@ pub enum TrialEnd {
     Missed,
 }
 
-/// Whether Hermit refused a run after its guest started, at an operation it
-/// does not support: the container's exit-122 arm returns a bare
-/// `PolicyRefusal`, whose reason Detcore logged before exiting. A refusal
-/// decided before the guest starts (an option or a backend Hermit does not
-/// admit) carries its reason as context instead. [`RunData::run_error`] puts
-/// its diagnostics over every refusal a trial's run returns, so it decides
-/// this before it adds them and records the answer in the context it adds
-/// ([`RefusedTrial`]), which is what a trial's launch is read by.
-pub fn guest_reached_a_refusal(error: &anyhow::Error) -> bool {
-    if let Some(refused) = error.downcast_ref::<RefusedTrial>() {
-        return refused.guest_started;
+/// How Hermit refused a run after its guest started ([`guest_refusal`]),
+/// from the typed error the refusal arrives as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Refusal {
+    /// The precise PMU timer passed its target (a skid overshoot,
+    /// `cause=skid-overshoot`): whether it does depends on the host's timing,
+    /// so the same trial may finish when it runs again.
+    HostTimed,
+    /// The guest reached an operation Hermit refuses under the run's
+    /// configuration, an unsupported syscall say (the exit-122 status, with
+    /// the reason Detcore filed): the same in every run of the trial.
+    Deterministic,
+}
+
+/// A run Hermit refused, for a report: how, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct RefusedRun {
+    pub refusal: Refusal,
+    /// The refusal's reason: the skid overshoots, or the reason Detcore
+    /// filed (an unsupported syscall names itself), or where to read it.
+    pub reason: String,
+}
+
+impl std::fmt::Display for RefusedRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.refusal {
+            Refusal::HostTimed => write!(f, "a host-timed refusal: {}", self.reason),
+            Refusal::Deterministic => write!(f, "{}", self.reason),
+        }
     }
-    error.chain().count() == 1
-        && error
-            .downcast_ref::<crate::container::PolicyRefusal>()
-            .is_some()
+}
+
+/// How Hermit refused a run after its guest started, if it did. A skid
+/// overshoot arrives as a `PolicyRefusal` over a `SkidOvershootError`: the
+/// precise timer passed its target, which the host's timing decides. The
+/// container's exit-122 arm returns a bare `PolicyRefusal`, whose reason
+/// Detcore filed before exiting (`refusal_note`): an operation the guest
+/// reached that the run's configuration refuses. A refusal decided before the
+/// guest starts (an option or a backend Hermit does not admit) carries its
+/// reason as context instead; it is the same for every trial, so it is
+/// `None` here and ends the analysis. [`RunData::run_error`] puts its
+/// diagnostics over every refusal a trial's run returns, so it decides this
+/// before it adds them and records the answer in the context it adds
+/// ([`RefusedTrial`]), which is what a trial's launch is read by.
+pub fn guest_refusal(error: &anyhow::Error) -> Option<Refusal> {
+    if let Some(refused) = error.downcast_ref::<RefusedTrial>() {
+        return refused.refusal;
+    }
+    error.downcast_ref::<crate::container::PolicyRefusal>()?;
+    if error.downcast_ref::<hermit::SkidOvershootError>().is_some() {
+        return Some(Refusal::HostTimed);
+    }
+    (error.chain().count() == 1).then_some(Refusal::Deterministic)
 }
 
 /// The context [`RunData::run_error`] puts over a refusal of a trial's run:
-/// its diagnostic message, and whether the guest had started when Hermit
-/// refused it ([`guest_reached_a_refusal`], decided on the refusal as the
-/// run returned it).
+/// its diagnostic message, and how Hermit refused it after its guest started,
+/// if it did ([`guest_refusal`], decided on the refusal as the run returned
+/// it).
 #[derive(Debug)]
 pub struct RefusedTrial {
     message: String,
-    guest_started: bool,
+    refusal: Option<Refusal>,
 }
 
 impl std::fmt::Display for RefusedTrial {
@@ -181,6 +221,12 @@ pub struct RunData {
     /// Where the run's schedule replay first ran another thread than the
     /// schedule names, from its summary or the journal.
     departure: Option<ScheduleDeparture>,
+    /// The reason Detcore filed for refusing the run, if it refused it and
+    /// filed one (`refusal_note`), or as the journal recorded it.
+    refusal_reason: Option<String>,
+    /// How Hermit refused the run, once a launch it refused ended
+    /// ([`RunData::launch`]).
+    refused: Option<RefusedRun>,
     /// How long the run took, once it finished.
     wall: Option<Duration>,
     /// The log file the run wrote, once it launched (`--verbose` or
@@ -401,6 +447,7 @@ impl RunData {
             if answered.is_ok() {
                 self.note_finished();
             }
+            self.note_refusal(&answered);
             return answered;
         }
         let own_timeout = self.runopts.run_timeout_seconds();
@@ -417,6 +464,7 @@ impl RunData {
         {
             return Err(self.analyze_opts.budget.cut(&self.runname).into());
         }
+        self.note_refusal(&launched);
         if let Some(key) = key {
             self.journal_outcome(&journal, key, &launched)?;
         }
@@ -542,6 +590,7 @@ impl RunData {
         self.logged_to = self.trial_global_opts().log_file;
         self.journaled_log_bytes = entry.log_bytes;
         self.departure = entry.departure;
+        self.refusal_reason = entry.refusal_reason.clone();
         eprintln!(
             ":: {} answered from the journal of an earlier invocation: {}",
             self.runname,
@@ -597,7 +646,12 @@ impl RunData {
                     seconds: self.runopts.run_timeout_seconds().map(NonZeroU64::get),
                 }
             }
-            Err(error) if guest_reached_a_refusal(error) => RecordedEnd::Refusal,
+            // A host-timed refusal is not journaled, as analyze's own bound
+            // is not: whether it happens is the host's, so a resume runs the
+            // trial again.
+            Err(error) if guest_refusal(error) == Some(Refusal::Deterministic) => {
+                RecordedEnd::Refusal
+            }
             Err(_) => return Ok(()),
         };
         let workspace = self.analyze_opts.get_tmp()?.to_path_buf();
@@ -645,6 +699,7 @@ impl RunData {
             outputs,
             recording_replays_input,
             departure: self.departure,
+            refusal_reason: self.refusal_reason.clone(),
         })
     }
 
@@ -694,11 +749,17 @@ impl RunData {
                 "cannot map the schedule-departure note ({error}); reading summaries only"
             );
         }
+        // Likewise the reason Detcore files for a refusal, which the
+        // refusal's exit status cannot carry.
+        if let Err(error) = crate::refusal_note::arm() {
+            tracing::warn!("cannot map the refusal note ({error}); refusals name no reason");
+        }
         let ran = match self.analyze_opts.hermit_run.0.clone() {
             Some(run) => run(self),
             None => self.runopts.run(&gopts, true),
         };
         self.departure = crate::departure_note::take().or_else(|| self.read_departure());
+        self.refusal_reason = crate::refusal_note::take();
         stop::check()?;
         let (_, output, terminal_outcome) = ran.map_err(|error| {
             self.run_error(self.name_the_trial_bound(error), gopts.log_file.as_deref())
@@ -761,12 +822,45 @@ impl RunData {
         self.ran_under_backstop() && error.downcast_ref::<RunTimeoutMarker>().is_some()
     }
 
+    /// Keep how and why Hermit refused this run, if `launched` (what its
+    /// launch returned) says it did ([`RunData::refused`]).
+    fn note_refusal(&mut self, launched: &anyhow::Result<()>) {
+        self.refused = match launched {
+            Err(error) => guest_refusal(error).map(|refusal| RefusedRun {
+                refusal,
+                reason: match (refusal, &self.refusal_reason) {
+                    (Refusal::HostTimed, _) => error
+                        .downcast_ref::<hermit::SkidOvershootError>()
+                        .map_or_else(String::new, ToString::to_string),
+                    (Refusal::Deterministic, Some(reason)) => reason.clone(),
+                    (Refusal::Deterministic, None) => format!(
+                        "an operation the guest reached that the run's configuration refuses; \
+                         the reason is in {}",
+                        self.logged_to
+                            .as_ref()
+                            .map_or("hermit's output above".to_owned(), |log| log
+                                .display()
+                                .to_string())
+                    ),
+                },
+            }),
+            Ok(()) => None,
+        };
+    }
+
     /// Whether the `--timeout` in force was analyze's own bound rather than
     /// the run arguments', for a run that ran rather than one the journal
     /// answered.
     fn ran_under_backstop(&self) -> bool {
         self.trial_bound.is_some() && !self.from_journal
     }
+
+    /// How Hermit refused this run and why, when its last launch was refused
+    /// after the guest started.
+    pub fn refused(&self) -> Option<&RefusedRun> {
+        self.refused.as_ref()
+    }
+
     /// The `--trial-timeout` bound this run took, in seconds, when it is
     /// shorter than the run arguments' own `--timeout`.
     pub fn trial_bound(&self) -> Option<u64> {
@@ -855,6 +949,13 @@ impl RunData {
         self.departure = Some(departure);
     }
 
+    /// A test's trial runner ([`TrialRunner`]) has the run carry the reason
+    /// Detcore files for refusing it ([`RunData::refused`]).
+    #[cfg(test)]
+    pub(crate) fn refuse_for_test(&mut self, reason: &str) {
+        self.refusal_reason = Some(reason.to_owned());
+    }
+
     /// Where the run's schedule replay first ran another thread than the
     /// schedule names, if it did: the run is then not that schedule's.
     pub fn departure(&self) -> Option<ScheduleDeparture> {
@@ -876,10 +977,10 @@ impl RunData {
 
     /// Keep every failure typed. A policy refusal has no completed guest
     /// outcome, whether its reason arrived as context or was logged separately.
-    /// Whether the guest had started when Hermit refused the run is decided
-    /// here, on the refusal as the run returned it, and kept in the context
-    /// added over it ([`RefusedTrial`]): the journal admits only such a
-    /// refusal, and that context would otherwise hide the answer.
+    /// How Hermit refused the run after its guest started, if it did, is
+    /// decided here, on the refusal as the run returned it, and kept in the
+    /// context added over it ([`RefusedTrial`]): the journal admits only a
+    /// deterministic one, and that context would otherwise hide the answer.
     fn run_error(&self, error: anyhow::Error, log: Option<&Path>) -> anyhow::Error {
         if error
             .downcast_ref::<crate::container::PolicyRefusal>()
@@ -887,7 +988,7 @@ impl RunData {
         {
             return error;
         }
-        let guest_started = guest_reached_a_refusal(&error);
+        let refusal = guest_refusal(&error);
         let diagnostics = log.map_or_else(
             || "Hermit's stderr above".to_owned(),
             |path| format!("the trial log {}", path.display()),
@@ -899,7 +1000,7 @@ impl RunData {
                  configuration before retrying.",
                 self.runname,
             ),
-            guest_started,
+            refusal,
         })
     }
 
@@ -965,6 +1066,8 @@ impl RunData {
             own_timeout: None,
             from_journal: false,
             departure: None,
+            refusal_reason: None,
+            refused: None,
             wall: None,
             logged_to: None,
             journaled_log_bytes: None,
@@ -1182,6 +1285,8 @@ impl RunData {
             own_timeout: None,
             from_journal: false,
             departure: None,
+            refusal_reason: None,
+            refused: None,
             wall: None,
             logged_to: None,
             journaled_log_bytes: None,
@@ -1213,6 +1318,8 @@ impl RunData {
             own_timeout: None,
             from_journal: false,
             departure: None,
+            refusal_reason: None,
+            refused: None,
             wall: None,
             logged_to: None,
             journaled_log_bytes: None,
@@ -4296,6 +4403,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(options.journal.lookup(&key), None);
+        // Nor is a host-timed refusal: whether it happens is the host's, so a
+        // resume runs the trial again.
+        let mut skid = RunData::new_baseline(&options, "bisect_round_004".into()).unwrap();
+        let key = skid.journal_key();
+        let overshoot = anyhow::Error::msg("the run reported a skid overshoot")
+            .context(hermit::SkidOvershootError::new(1))
+            .context(crate::container::PolicyRefusal);
+        skid.journal_outcome(&options.journal, key.clone(), &Err(overshoot))
+            .unwrap();
+        assert_eq!(options.journal.lookup(&key), None);
+        // A deterministic refusal keeps the reason Detcore filed.
+        let reason = "openat2: RESOLVE_IN_ROOT cannot be serviced on this backend";
+        let mut refused = RunData::new_baseline(&options, "bisect_round_005".into()).unwrap();
+        refused.refusal_reason = Some(reason.to_owned());
+        let key = refused.journal_key();
+        refused
+            .journal_outcome(
+                &options.journal,
+                key,
+                &Err(anyhow::Error::new(crate::container::PolicyRefusal)),
+            )
+            .unwrap();
+        let mut again = RunData::new_baseline(&options, "bisect_round_005".into()).unwrap();
+        assert_eq!(
+            again.launch_trial().unwrap(),
+            TrialEnd::Unfinished(Stop::Refusal(Refusal::Deterministic))
+        );
+        assert_eq!(
+            again.refused(),
+            Some(&RefusedRun {
+                refusal: Refusal::Deterministic,
+                reason: reason.to_owned(),
+            })
+        );
     }
 
     /// A refusal the guest reached arrives from `hermit run` as a bare

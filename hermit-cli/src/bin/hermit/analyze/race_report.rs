@@ -56,8 +56,9 @@ use crate::analyze::races::Window;
 use crate::analyze::races::find_racing_accesses;
 use crate::analyze::races::outcome_point;
 use crate::analyze::races::uncounted_signal_outcome;
+use crate::analyze::rundata::Refusal;
 use crate::analyze::rundata::RunData;
-use crate::analyze::rundata::guest_reached_a_refusal;
+use crate::analyze::rundata::guest_refusal;
 use crate::analyze::types::AnalyzeOpts;
 use crate::container::RunTimeoutMarker;
 
@@ -442,7 +443,7 @@ impl AnalyzeOpts {
             Ok(()) => {}
             Err(error)
                 if error.downcast_ref::<RunTimeoutMarker>().is_some()
-                    || guest_reached_a_refusal(&error) =>
+                    || guest_refusal(&error) == Some(Refusal::Deterministic) =>
             {
                 eprintln!(
                     ":: {} the racing-access stack replay did not finish ({error:#}); using the \

@@ -53,8 +53,10 @@ use crate::analyze::consts::*;
 use crate::analyze::race_report::TracedReplay;
 use crate::analyze::races::RacingAccesses;
 use crate::analyze::races::render_racing_accesses;
+use crate::analyze::rundata::Refusal;
 use crate::analyze::rundata::RunData;
 use crate::analyze::rundata::TrialEnd;
+use crate::analyze::rundata::guest_refusal;
 use crate::analyze::stop;
 use crate::analyze::stop::StopSignals;
 use crate::analyze::stop::Stopped;
@@ -1431,29 +1433,40 @@ impl AnalyzeOpts {
         let mut run = make(name)?;
         self.show_trial_repro(&run);
         let launched = run.launch();
+        // A host-timed refusal (a skid overshoot) is the host's as much as
+        // analyze's own bound is, so it runs again too.
+        let host_timed = |run: &RunData, error: &anyhow::Error| {
+            run.backstopped(error) || guest_refusal(error) == Some(Refusal::HostTimed)
+        };
         match &launched {
-            Err(error) if run.backstopped(error) && !settled(&run) => {}
+            Err(error) if host_timed(&run, error) && !settled(&run) => {}
             _ => return Ok((launched, run)),
         }
         let retry_name = format!("{name}_retry");
         let mut retry = make(&retry_name)?.with_bound_factor(CONFIRM_BOUND_FACTOR);
         let seconds = |bound: Option<u64>| bound.map_or("?".to_owned(), |bound| bound.to_string());
-        eprintln!(
-            ":: {name} did not finish within hermit analyze's wall-clock bound of {} s. When \
-             that bound fires is the host's, so the trial has no outcome; running it again as \
-             {retry_name} with a bound of {} s",
-            seconds(run.trial_bound()),
-            seconds(
-                retry
-                    .runopts
-                    .run_timeout_seconds()
-                    .map(std::num::NonZeroU64::get)
+        match run.refused() {
+            Some(refused) => eprintln!(
+                ":: Hermit refused {name} ({refused}). Whether it does is the host's, so the \
+                 trial has no outcome; running it again as {retry_name}"
             ),
-        );
+            None => eprintln!(
+                ":: {name} did not finish within hermit analyze's wall-clock bound of {} s. When \
+                 that bound fires is the host's, so the trial has no outcome; running it again \
+                 as {retry_name} with a bound of {} s",
+                seconds(run.trial_bound()),
+                seconds(
+                    retry
+                        .runopts
+                        .run_timeout_seconds()
+                        .map(std::num::NonZeroU64::get)
+                ),
+            ),
+        }
         self.show_trial_repro(&retry);
         let launched = retry.launch();
         if let Err(error) = launched {
-            if retry.backstopped(&error) && !settled(&retry) {
+            if host_timed(&retry, &error) && !settled(&retry) {
                 return Err(incomplete_trial(error, &retry.root_path()));
             }
             return Ok((Err(error), retry));
@@ -7319,6 +7332,337 @@ mod tests {
                 .map(|i| SchedEvent::branches(DetTid::from_raw(3 + (i % 2) as i32), 1))
                 .collect(),
         )
+    }
+
+    /// A trial runner for a prefix search over [`two_thread_schedule`] whose
+    /// prefixes longer than `deciding` meet the target, unless
+    /// `refuses(run, prefix)` says how Hermit refuses that run: host-timed
+    /// (a skid overshoot) or deterministically, with the reason Detcore
+    /// files.
+    fn refusing_runner(
+        deciding: usize,
+        refuses: impl Fn(&RunData, usize) -> Option<Refusal> + Send + Sync + 'static,
+        ran: RanTrials,
+    ) -> crate::analyze::rundata::TrialRunner {
+        crate::analyze::rundata::TrialRunner(Some(std::sync::Arc::new(move |run: &mut RunData| {
+            ran.lock().unwrap().push((
+                run.name().to_owned(),
+                run.runopts
+                    .run_timeout_seconds()
+                    .map(std::num::NonZeroU64::get),
+            ));
+            let replayed = run
+                .runopts
+                .det_opts
+                .det_config
+                .replay_schedule_from
+                .clone()
+                .unwrap();
+            let prefix = PreemptionReader::new(&replayed)
+                .load_all()
+                .schedevents()
+                .len();
+            match refuses(run, prefix) {
+                Some(Refusal::HostTimed) => {
+                    return Err(anyhow::Error::msg("the run reported 2 skid overshoots")
+                        .context(hermit::SkidOvershootError::new(2))
+                        .context(crate::container::PolicyRefusal));
+                }
+                Some(Refusal::Deterministic) => {
+                    run.refuse_for_test(
+                        "openat2: RESOLVE_IN_ROOT cannot be serviced on this backend",
+                    );
+                    return Err(anyhow::Error::new(crate::container::PolicyRefusal));
+                }
+                None => {}
+            }
+            run.finish_for_test(prefix > deciding, std::time::Duration::from_secs(1));
+            Ok(())
+        })))
+    }
+
+    /// A trial runner for runs that replay no schedule (`--search` rounds,
+    /// `--minimize`'s replays): `refuses(name)` says how Hermit refuses the
+    /// run of that name, if it does; the others finish, meeting the target
+    /// if `met`.
+    fn refusing_named_runner(
+        refuses: fn(&str) -> Option<Refusal>,
+        met: bool,
+        ran: RanTrials,
+    ) -> crate::analyze::rundata::TrialRunner {
+        crate::analyze::rundata::TrialRunner(Some(std::sync::Arc::new(move |run: &mut RunData| {
+            ran.lock().unwrap().push((run.name().to_owned(), None));
+            match refuses(run.name()) {
+                Some(Refusal::HostTimed) => {
+                    return Err(anyhow::Error::msg("the run reported a skid overshoot")
+                        .context(hermit::SkidOvershootError::new(1))
+                        .context(crate::container::PolicyRefusal));
+                }
+                Some(Refusal::Deterministic) => {
+                    run.refuse_for_test("openat2: RESOLVE_IN_ROOT cannot be serviced");
+                    return Err(anyhow::Error::new(crate::container::PolicyRefusal));
+                }
+                None => {}
+            }
+            run.finish_for_test(met, std::time::Duration::from_secs(1));
+            Ok(())
+        })))
+    }
+
+    /// A `--search` round or a `--minimize` replay that Hermit refused is no
+    /// end either: a host-timed refusal runs it again and the rerun counts,
+    /// and a deterministic one (or a second refusal) stops the analysis as
+    /// inconclusive, naming the refusal, rather than counting it as a run
+    /// that missed the target.
+    #[test]
+    fn a_refused_search_round_or_minimize_replay_is_never_an_end() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        let parent = tempfile::tempdir().unwrap();
+        let (mut options, _workspace) =
+            analysis_in(&parent.path().join("analysis"), &["--target-stdout=FAILED"]);
+        let record = parent.path().join("record.preempts");
+        two_thread_schedule(8).write_to_disk(&record).unwrap();
+        for (runname, launch) in [
+            (
+                "search_round_001",
+                (|options: &AnalyzeOpts, _: &Path| {
+                    options
+                        .launch_search(1, 17)
+                        .map(|found| found.map(|run| run.name().to_owned()).unwrap_or_default())
+                }) as fn(&AnalyzeOpts, &Path) -> anyhow::Result<String>,
+            ),
+            (
+                "minimize_round_001",
+                |options: &AnalyzeOpts, record: &Path| {
+                    options
+                        .launch_from_preempts_to_sched("minimize_round_001", record, None)
+                        .map(|(met, _)| met.to_string())
+                },
+            ),
+        ] {
+            // Refused once by a skid overshoot: the rerun's end counts.
+            let ran = Arc::new(Mutex::new(Vec::new()));
+            options.trial_runner = refusing_named_runner(
+                |name| (!name.ends_with("_retry")).then_some(Refusal::HostTimed),
+                true,
+                ran.clone(),
+            );
+            let found = launch(&options, &record).unwrap();
+            assert_eq!(
+                found,
+                if runname.starts_with("search") {
+                    format!("{runname}_retry")
+                } else {
+                    "true".to_owned()
+                }
+            );
+            assert_eq!(
+                ran.lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(name, _)| name.clone())
+                    .collect::<Vec<_>>(),
+                [runname.to_owned(), format!("{runname}_retry")]
+            );
+            // Refused deterministically: inconclusive at once.
+            let ran = Arc::new(Mutex::new(Vec::new()));
+            options.trial_runner =
+                refusing_named_runner(|_| Some(Refusal::Deterministic), true, ran.clone());
+            let error = launch(&options, &record).unwrap_err();
+            let inconclusive = error.downcast_ref::<TrialInconclusive>().unwrap();
+            assert_eq!(inconclusive.runs, [runname.to_owned()]);
+            assert_eq!(
+                inconclusive.refused().map(|refused| refused.refusal),
+                Some(Refusal::Deterministic)
+            );
+            assert!(
+                inconclusive
+                    .to_string()
+                    .contains("openat2: RESOLVE_IN_ROOT")
+            );
+        }
+    }
+
+    /// A boundary recheck Hermit refused has no outcome to compare with the
+    /// search's: the decision stands, and the report says that recheck was
+    /// refused.
+    #[test]
+    fn a_refused_recheck_is_noted_in_the_report() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        let (len, deciding) = (200, 137);
+        let target = two_thread_schedule(len);
+        let parent = tempfile::tempdir().unwrap();
+        let (mut options, _workspace) = analysis_in(
+            &parent.path().join("analysis"),
+            &["--target-stdout=FAILED", "--prefix-search"],
+        );
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        // The search's own trial of the first prefix that meets the target
+        // finishes; any later one (the recheck) is refused.
+        let seen = Arc::new(Mutex::new(0));
+        let seen_in = seen.clone();
+        options.trial_runner = refusing_runner(
+            deciding,
+            move |_, prefix| {
+                if prefix != deciding + 1 {
+                    return None;
+                }
+                let mut seen = seen_in.lock().unwrap();
+                *seen += 1;
+                (*seen > 1).then_some(Refusal::Deterministic)
+            },
+            ran.clone(),
+        );
+        let decided = options.phase5_prefix_search(&target).unwrap();
+        assert_eq!(decided.decision, deciding);
+        assert_eq!(*seen.lock().unwrap(), 2);
+        let note = decided.refused_rechecks.clone().unwrap();
+        assert!(
+            note.starts_with(&format!(
+                "the final recheck of the prefix of {} events (openat2: RESOLVE_IN_ROOT",
+                deciding + 1
+            )) && note.contains("was refused by Hermit"),
+            "{note}"
+        );
+        // The report says so: its stack-trace replays here are not refused.
+        options.trial_runner = backstop_runner(deciding, |_, _| false, ran.clone());
+        let report = options.phase6_record_prefix_outputs(decided).unwrap();
+        assert!(
+            report.header.contains(&format!("Note: {note}\n")),
+            "{}",
+            report.header
+        );
+    }
+
+    /// A trial Hermit refused in a way the host's timing decides (a skid
+    /// overshoot) has no outcome: it runs again at once under its own name
+    /// plus `_retry`, and the rerun's end counts. With the first run of every
+    /// trial refused, the search decides the same event as one in which no
+    /// trial was refused. Before, a skid overshoot was taken for a refusal
+    /// decided before the guest started, and ended the analysis.
+    #[test]
+    fn a_host_timed_refusal_runs_again_and_does_not_change_the_answer() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        let (len, deciding) = (200, 137);
+        let target = two_thread_schedule(len);
+        let search = ["--target-stdout=FAILED", "--prefix-search"];
+        let parent = tempfile::tempdir().unwrap();
+        let (mut plain, _first) = analysis_in(&parent.path().join("plain"), &search);
+        let plain_runs = Arc::new(Mutex::new(Vec::new()));
+        plain.trial_runner = refusing_runner(deciding, |_, _| None, plain_runs.clone());
+        let expected = plain.phase5_prefix_search(&target).unwrap();
+        assert_eq!(expected.decision, deciding);
+
+        let (mut refusing, _second) = analysis_in(&parent.path().join("refusing"), &search);
+        let refused_runs = Arc::new(Mutex::new(Vec::new()));
+        refusing.trial_runner = refusing_runner(
+            deciding,
+            |run, _| (!run.name().ends_with("_retry")).then_some(Refusal::HostTimed),
+            refused_runs.clone(),
+        );
+        let decided = refusing.phase5_prefix_search(&target).unwrap();
+        assert_eq!(decided.decision, expected.decision);
+        let plain_runs = plain_runs.lock().unwrap();
+        let refused_runs = refused_runs.lock().unwrap();
+        assert_eq!(refused_runs.len(), 2 * plain_runs.len());
+        for (pair, (name, _)) in refused_runs.chunks(2).zip(plain_runs.iter()) {
+            assert_eq!(pair[0].0, *name);
+            assert_eq!(pair[1].0, format!("{name}_retry"));
+        }
+    }
+
+    /// A refusal is never an outcome. A trial Hermit refused again when it
+    /// ran once more, or refused deterministically (at once, with no rerun:
+    /// it would be refused again), ends the search with a partial report
+    /// (exit 120, `trial-inconclusive`) that names the runs and the refusal,
+    /// with Detcore's reason; the advice says what a resume would do.
+    #[test]
+    fn a_refusal_refused_again_or_deterministic_ends_the_search_with_a_partial_report() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        let (len, deciding) = (200, 137);
+        let target = two_thread_schedule(len);
+        let parent = tempfile::tempdir().unwrap();
+        for (label, refusal, runs, says) in [
+            (
+                "host-timed",
+                Refusal::HostTimed,
+                &["prefix_round_003", "prefix_round_003_retry"][..],
+                &[
+                    "prefix_round_003 was refused by Hermit (a host-timed refusal: observed 2",
+                    "; then prefix_round_003_retry was refused by Hermit (a host-timed refusal",
+                    "depends on the host's timing rather than the guest's",
+                    "Continue the analysis, which runs the refused trial again",
+                ][..],
+            ),
+            (
+                "deterministic",
+                Refusal::Deterministic,
+                &["prefix_round_003"][..],
+                &[
+                    "prefix_round_003 was refused by Hermit (openat2: RESOLVE_IN_ROOT cannot be \
+                     serviced on this backend)",
+                    "Hermit refuses that in every run of the trial, so the trial cannot be \
+                     evaluated",
+                    "A resumed analysis would run the same trial into the same refusal",
+                ][..],
+            ),
+        ] {
+            let report_file = parent.path().join(format!("{label}.json"));
+            let report = format!("--report-file={}", report_file.display());
+            let (mut options, _workspace) = analysis_in(
+                &parent.path().join(label),
+                &["--target-stdout=FAILED", "--prefix-search", report.as_str()],
+            );
+            let ran = Arc::new(Mutex::new(Vec::new()));
+            // The empty prefix misses, the whole schedule meets, and every
+            // run of the first search trial, of 100 events, is refused.
+            options.trial_runner = refusing_runner(
+                deciding,
+                move |_, prefix| (prefix == 100).then_some(refusal),
+                ran.clone(),
+            );
+            let result = options
+                .phase5_prefix_search(&target)
+                .map(|_| ExitStatus::SUCCESS);
+            let status = options.end_on_budget(result).unwrap();
+            assert_eq!(
+                status,
+                ExitStatus::Exited(hermit::HERMIT_ANALYZE_PARTIAL_EXIT),
+                "{label}"
+            );
+            let ran: Vec<String> = ran
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect();
+            assert_eq!(
+                ran[2..],
+                runs.iter().map(|run| run.to_string()).collect::<Vec<_>>(),
+                "{label}"
+            );
+            let written: Report =
+                serde_json::from_str(&std::fs::read_to_string(&report_file).unwrap()).unwrap();
+            let partial = written.partial.unwrap();
+            assert_eq!(partial.reason, PartialReason::TrialInconclusive, "{label}");
+            let inconclusive = partial.inconclusive.unwrap();
+            assert_eq!(
+                inconclusive.refused().map(|refused| refused.refusal),
+                Some(refusal),
+                "{label}"
+            );
+            for said in says {
+                assert!(
+                    written.header.contains(said),
+                    "{label}: {said}\n{}",
+                    written.header
+                );
+            }
+        }
     }
 
     /// A prefix trial that analyze's own wall-clock bound stopped has no

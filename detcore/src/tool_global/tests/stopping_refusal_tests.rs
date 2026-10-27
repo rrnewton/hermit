@@ -373,3 +373,29 @@ async fn with_the_gate_off_a_stopping_refusal_is_recorded_and_answered_without_t
     assert_eq!(reply, GlobalResponse::PolicyRefusal(()));
     assert_eq!(state.policy_refusal(), Some(reason));
 }
+
+/// The first refusal reason filed goes to the installed hook
+/// (`crate::set_policy_refusal_hook`), once; a later one replaces neither
+/// it nor the kept reason.
+#[test]
+fn the_first_refusal_reason_is_handed_to_the_hook_once() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    // The hook is process-wide: count only this test's reasons.
+    static CALLS: AtomicUsize = AtomicUsize::new(0);
+    fn count(reason: &str) {
+        if reason.starts_with("refusal-hook-test") {
+            CALLS.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let kept = std::sync::Mutex::new(None);
+    crate::set_policy_refusal_hook(Some(count));
+    crate::tool_global::keep_policy_refusal(&kept, "refusal-hook-test: first".to_owned());
+    crate::tool_global::keep_policy_refusal(&kept, "refusal-hook-test: second".to_owned());
+    crate::set_policy_refusal_hook(None);
+    assert_eq!(CALLS.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        kept.into_inner().unwrap().as_deref(),
+        Some("refusal-hook-test: first")
+    );
+}

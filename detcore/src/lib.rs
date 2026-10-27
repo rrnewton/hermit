@@ -130,6 +130,25 @@ pub fn schedule_departure_hook() -> Option<fn(detcore_model::summary::ScheduleDe
         .and_then(|hook| *hook)
 }
 
+/// Install `hook`, which Detcore calls with the first reason its fail-closed
+/// policy refuses a run for, as the reason is filed, rather than only in a
+/// message printed before the run exits with the policy-refusal status,
+/// which is all that crosses the exit. `None` removes it.
+pub fn set_policy_refusal_hook(hook: Option<fn(&str)>) {
+    if let Ok(mut installed) = tool_global::POLICY_REFUSAL_HOOK.write() {
+        *installed = hook;
+    }
+}
+
+/// The hook [`set_policy_refusal_hook`] installed, for a test to check.
+#[doc(hidden)]
+pub fn policy_refusal_hook() -> Option<fn(&str)> {
+    tool_global::POLICY_REFUSAL_HOOK
+        .read()
+        .ok()
+        .and_then(|hook| *hook)
+}
+
 /// Keep each traced thread's `/proc/<pid>/task/<tid>/status` open in this
 /// process and re-read it with pread(2), instead of opening it for every
 /// signal-state read. Call it only from a process that never shares a guest's
