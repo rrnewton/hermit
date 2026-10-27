@@ -1571,6 +1571,12 @@ pub fn unified_selection(
                 .map(|feature| format!("{package}/{feature}")),
         );
     }
+    // The full workspace builds both the CLI and its installable bundle. Their
+    // backend opt-ins are package-owned, so enabling the CLI alone leaves the
+    // independently built installer core-only.
+    if features.contains("hermit-run/third-party-backends") {
+        features.insert("hermit-install/third-party-backends".into());
+    }
     let mut union = vec!["--workspace".to_string(), "--all-targets".to_string()];
     if !features.is_empty() {
         union.push("--features".into());
@@ -2360,6 +2366,11 @@ mod tests {
             unified_selection(&only).unwrap(),
             args("-p hermit-detcore --lib")
         );
+        let featured = selections(&["-p hermit-run --features third-party-backends --lib --bins"]);
+        assert_eq!(
+            unified_selection(&featured).unwrap(),
+            args("-p hermit-run --features third-party-backends --lib --bins")
+        );
     }
 
     #[test]
@@ -2373,13 +2384,29 @@ mod tests {
         assert_eq!(
             unified_selection(&several).unwrap(),
             args(
-                "--workspace --all-targets --features hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/third-party-backends"
+                "--workspace --all-targets --features hermit-install/third-party-backends,hermit-run/kvm-execution-tests,hermit-run/kvm-native-test-support,hermit-run/third-party-backends"
             )
         );
         let unfeatured = selections(&["-p a --lib", "-p b --test t"]);
         assert_eq!(
             unified_selection(&unfeatured).unwrap(),
             args("--workspace --all-targets")
+        );
+        let core = selections(&[
+            "-p hermit-run --features kvm-native-test-support --lib --bins",
+            "-p hermit-detcore-tests --test tests_misc",
+        ]);
+        assert_eq!(
+            unified_selection(&core).unwrap(),
+            args("--workspace --all-targets --features hermit-run/kvm-native-test-support")
+        );
+        let unrelated = selections(&[
+            "-p another-package --features third-party-backends --lib",
+            "-p hermit-run --lib --bins",
+        ]);
+        assert_eq!(
+            unified_selection(&unrelated).unwrap(),
+            args("--workspace --all-targets --features another-package/third-party-backends")
         );
     }
 
@@ -2393,6 +2420,13 @@ mod tests {
             let plan = listings(profile, &several).unwrap();
             assert_eq!(plan.len(), 1, "{profile}");
             assert_eq!(plan[0].0, unified_selection(&several).unwrap());
+            assert_eq!(
+                plan[0].0,
+                args(
+                    "--workspace --all-targets --features hermit-install/third-party-backends,hermit-run/third-party-backends"
+                ),
+                "{profile} must build the full installer with the CLI"
+            );
             assert_eq!(plan[0].1.len(), 2);
         }
         // The dev-profile producers build far less than the workspace, so

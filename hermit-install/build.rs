@@ -365,9 +365,13 @@ fn build_liteinst_runtime(
     // `rsrcs/` while the loader resolved `target/release/libreverie_liteinst.so`,
     // found no sidecar beside it, and refused with "records no Reverie revision".
     // The artifact was never stale; only one of its two homes carried provenance.
-    // That made the printed remedy -- `cargo build --release -p hermit-install` --
-    // regenerate exactly the state that was already failing, so following the
-    // error message looped instead of resolving.
+    // That made the printed LiteInst remedy --
+    // `cargo build --release -p hermit-install` -- regenerate exactly the state
+    // that was already failing, so following the error message looped instead
+    // of resolving.
+    // The default core installer still stages LiteInst with that command.
+    // Full backend staging additionally selects
+    // `--features hermit-install/third-party-backends`.
     let pin = reverie_pin(repository);
     for staged in [&runtime, &resources.join("libreverie_liteinst.so")] {
         let marker = PathBuf::from(format!("{}.revision", staged.display()));
