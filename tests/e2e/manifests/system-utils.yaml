@@ -1669,12 +1669,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
+          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled:
-          dbt: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away
+        backends_disabled: {}
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
