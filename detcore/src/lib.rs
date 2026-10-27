@@ -5996,6 +5996,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 self.observe_sigreturn_mask(guest).await;
                 self.passthrough(guest, call).await
             }
+            // An address space that allocates or applies a protection key may
+            // hold pages its guest cannot write although Hermit's copies can
+            // (`MemoryMetadata::protection_keys`).
+            SyscallClassification::PassThrough
+                if matches!(call.number(), Sysno::pkey_alloc | Sysno::pkey_mprotect) =>
+            {
+                guest.thread_state().note_protection_keys();
+                self.passthrough(guest, call).await
+            }
             SyscallClassification::PassThrough => self.passthrough(guest, call).await,
             // The kernel's restart of a wait Detcore emulates resumes it; any other
             // `restart_syscall` keeps the unsupported-syscall policy below.

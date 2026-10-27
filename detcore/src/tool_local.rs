@@ -5922,6 +5922,23 @@ impl<T> ThreadState<T> {
         }
     }
 
+    /// Record that the address space allocated or applied a protection key
+    /// (`MemoryMetadata::protection_keys`).
+    pub(crate) fn note_protection_keys(&self) {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .protection_keys = true;
+    }
+
+    /// Whether the address space has allocated or applied a protection key.
+    pub(crate) fn may_use_protection_keys(&self) -> bool {
+        self.memory_metadata
+            .lock()
+            .expect("memory metadata mutex poisoned")
+            .protection_keys
+    }
+
     /// Record an anonymous shared mapping.
     pub(crate) fn map_shared_anonymous(&self, start: usize, len: usize) {
         self.memory_metadata
