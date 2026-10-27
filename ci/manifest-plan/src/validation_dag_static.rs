@@ -4406,7 +4406,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And no_namespace_refuses_a_chosen_id_at_pid_max_before_any_task: 642 + 1 = 709.
     // And no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base and
     // no_namespace_takes_a_guest_set_tid_as_chosen_only_if_it_reaches_hermits_namespace: 643 + 2 = 711.
-    ("test.cli", 711),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
+    // no_namespace_completes_a_guest_set_tid_with_the_chosen_id: 643 + 2 = 645.
+    // And no_namespace_gives_a_new_pid_namespace_child_its_chosen_id and
+    // no_namespace_refuses_before_the_task_a_call_that_cannot_carry_a_chosen_id: 645 + 2 = 713.
+    ("test.cli", 713),    // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
     // sabre_reports_a_replaced_host_file_without_naming_it_the_cause,
@@ -4959,7 +4962,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same five --no-namespace chosen-ID tests, not excluded: 556 + 5 = 627.
     // And the same pid_max refusal test, not excluded: 561 + 1 = 628.
     // And the same two clone tests, not excluded: 562 + 2 = 630.
-    ("test.cli_on_host", 630),
+    // And the same two tests, not excluded: 564 + 2 = 632.
+    ("test.cli_on_host", 632),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

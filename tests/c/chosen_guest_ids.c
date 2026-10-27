@@ -27,15 +27,32 @@
  * CAP_SYS_ADMIN for, and keeps it alive across the fork, so that Hermit's
  * choice for the fork is taken.
  *
- * With the argument `sighand`, `own-tid 1`, `own-tid 2`, `bad-tid` or
- * `bad-size`, it makes one call instead and prints its outcome:
+ * With one of these arguments it makes one call instead and prints its
+ * outcome:
  * - `sighand`: a raw clone with CLONE_SIGHAND but not CLONE_VM, which Linux
  *   refuses with EINVAL;
+ * - `newpid`: a clone3 with CLONE_NEWPID and no set_tid; the child prints its
+ *   own ID, 1 in its namespace;
+ * - `newpid-fork`, `newpid-set-tid`: `newpid`, whose child then forks, or
+ *   makes a clone3 with CLONE_NEWPID and set_tid [1], from inside its new
+ *   namespace;
  * - `own-tid N`: a clone3 with CLONE_NEWPID and its own set_tid of N entries,
  *   [1] (the new namespace's ID only) or [1, first + 100] (also the ID in the
  *   guest's own namespace); the child checks it is 1 in its namespace;
+ * - `unknown-flag`: `own-tid 1` with an unknown flag bit too (EINVAL);
+ * - `nested`: `own-tid 1` after unshare(CLONE_NEWPID), so that the array is
+ *   two levels short of the guest's own namespace;
+ * - `no-caps`: `own-tid 1` with CLONE_NEWUSER too, after the guest gives up
+ *   every capability: Linux lets it make the user namespace and choose the
+ *   ID inside it;
  * - `bad-tid`: a clone3 whose set_tid points at an unmapped address (EFAULT);
- * - `bad-size`: a clone3 with set_tid but set_tid_size 0 (EINVAL).
+ * - `bad-size`: a clone3 with set_tid but set_tid_size 0 (EINVAL);
+ * - `seccomp`: a fork after the guest installs a seccomp filter of its own
+ *   (one that allows everything);
+ * - `signal65`: a raw clone with exit signal 65, which clone accepts and
+ *   clone3 does not;
+ * - `sp1`: a raw clone with new stack pointer 1, which clone3 cannot express
+ *   (its child would fault at once).
  *
  * Every line is the ID's offset from the first process's, so a run whose IDs
  * are chosen from a base prints the same bytes whatever the base, with the
@@ -46,7 +63,10 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <linux/capability.h>
+#include <linux/filter.h>
 #include <linux/sched.h>
+#include <linux/seccomp.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -54,6 +74,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -125,14 +146,69 @@ static int one_call(int argc, char** argv) {
     printf("clone(CLONE_SIGHAND): %s\n", child < 0 ? strerror(errno) : "created");
     return 0;
   }
+  if (strcmp(what, "seccomp") == 0) {
+    struct sock_filter allow = BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+    struct sock_fprog program = {1, &allow};
+    if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 ||
+        syscall(SYS_seccomp, SECCOMP_SET_MODE_FILTER, 0, &program) != 0) {
+      printf("seccomp: %s\n", strerror(errno));
+      return 1;
+    }
+    pid_t child = fork();
+    if (child == 0) {
+      _exit(0);
+    }
+    wait_for(child, "fork");
+    printf("fork after seccomp: child %+ld\n", (long)child - first);
+    return 0;
+  }
+  if (strcmp(what, "signal65") == 0 || strcmp(what, "sp1") == 0) {
+    int sp1 = strcmp(what, "sp1") == 0;
+    long child = syscall(SYS_clone, sp1 ? SIGCHLD : 65, sp1 ? 1 : 0, 0, 0, 0);
+    if (child == 0) {
+      syscall(SYS_exit, 0);
+    }
+    if (child > 0) {
+      waitpid((pid_t)child, NULL, __WALL);
+    }
+    printf("clone %s: %s\n", what, child < 0 ? strerror(errno) : "created");
+    return 0;
+  }
   pid_t tids[2] = {1, first + 100};
   struct clone_args args;
   memset(&args, 0, sizeof args);
   args.exit_signal = SIGCHLD;
   args.set_tid = (uint64_t)(uintptr_t)tids;
-  if (strcmp(what, "own-tid") == 0 && argc > 2) {
+  int nested_call = 0;
+  if (strncmp(what, "newpid", 6) == 0) {
+    args.flags = CLONE_NEWPID;
+    args.set_tid = 0;
+    nested_call = strcmp(what, "newpid-fork") == 0   ? 1
+                  : strcmp(what, "newpid-set-tid") == 0 ? 2
+                                                        : 0;
+  } else if (strcmp(what, "own-tid") == 0 && argc > 2) {
     args.flags = CLONE_NEWPID;
     args.set_tid_size = strtoul(argv[2], NULL, 10);
+  } else if (strcmp(what, "unknown-flag") == 0) {
+    args.flags = CLONE_NEWPID | (1ULL << 40);
+    args.set_tid_size = 1;
+  } else if (strcmp(what, "nested") == 0) {
+    if (unshare(CLONE_NEWPID) != 0) {
+      printf("unshare: %s\n", strerror(errno));
+      return 1;
+    }
+    args.flags = CLONE_NEWPID;
+    args.set_tid_size = 1;
+  } else if (strcmp(what, "no-caps") == 0) {
+    struct __user_cap_header_struct header = {_LINUX_CAPABILITY_VERSION_3, 0};
+    struct __user_cap_data_struct none[2];
+    memset(none, 0, sizeof none);
+    if (syscall(SYS_capset, &header, none) != 0) {
+      printf("capset: %s\n", strerror(errno));
+      return 1;
+    }
+    args.flags = CLONE_NEWUSER | CLONE_NEWPID;
+    args.set_tid_size = 1;
   } else if (strcmp(what, "bad-tid") == 0) {
     args.set_tid = 8;
     args.set_tid_size = 1;
@@ -144,6 +220,28 @@ static int one_call(int argc, char** argv) {
   }
   long child = syscall(SYS_clone3, &args, sizeof args);
   if (child == 0) {
+    if (args.set_tid == 0) {
+      printf("newpid child: own ID %ld\n", (long)getpid());
+    }
+    if (nested_call != 0) {
+      pid_t inner_tids[1] = {1};
+      struct clone_args inner;
+      memset(&inner, 0, sizeof inner);
+      inner.exit_signal = SIGCHLD;
+      if (nested_call == 2) {
+        inner.flags = CLONE_NEWPID;
+        inner.set_tid = (uint64_t)(uintptr_t)inner_tids;
+        inner.set_tid_size = 1;
+      }
+      long grandchild = syscall(SYS_clone3, &inner, sizeof inner);
+      if (grandchild == 0) {
+        _exit(0);
+      }
+      if (grandchild > 0) {
+        waitpid((pid_t)grandchild, NULL, 0);
+      }
+      printf("newpid child's clone3: %s\n", grandchild < 0 ? strerror(errno) : "created");
+    }
     _exit(getpid() == 1 ? 0 : 1);
   }
   if (child < 0) {
