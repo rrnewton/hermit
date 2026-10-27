@@ -1964,6 +1964,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// resumes (as `Detcore::inject_fstat`,
     /// <https://github.com/rrnewton/hermit/issues/3328>). No descriptor is
     /// opened.
+    // GNU declares this kernel word as i64, musl as u64; retain its bits in
+    // the common signed result, including filesystem magic values with bit 63 set.
+    #[allow(clippy::unnecessary_cast)]
     async fn inject_fstatfs_type<G: Guest<Self>>(guest: &mut G, fd: RawFd) -> Result<i64, Errno> {
         let fstatfs = |buf: AddrMut<'_, libc::statfs>| {
             syscalls::Fstatfs::new().with_fd(fd).with_buf(Some(buf))
@@ -1974,7 +1977,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             match stack.commit() {
                 Ok(guard) => {
                     let result = match guest.inject_with_retry(fstatfs(buf)).await {
-                        Ok(_) => guest.memory().read_value(buf).map(|statfs| statfs.f_type),
+                        Ok(_) => guest
+                            .memory()
+                            .read_value(buf)
+                            .map(|statfs| statfs.f_type as i64),
                         Err(errno) => Err(errno),
                     };
                     drop(guard);
@@ -1993,7 +1999,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             .ok_or(Errno::ENOMEM)?;
         let buf = page.cast::<libc::statfs>();
         let result = match guest.inject_with_retry(fstatfs(buf)).await {
-            Ok(_) => guest.memory().read_value(buf).map(|statfs| statfs.f_type),
+            Ok(_) => guest
+                .memory()
+                .read_value(buf)
+                .map(|statfs| statfs.f_type as i64),
             Err(errno) => Err(errno),
         };
         super::procfs_levels::unmap_transient(guest, page, length).await;
