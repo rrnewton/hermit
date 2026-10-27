@@ -256,7 +256,11 @@ pub struct RunSummary {
 
     /// How many guest tasks were created with a host ID although their IDs
     /// were to be chosen (`guest_ids`): nonzero means the run's IDs are not
-    /// deterministic. Shown in the full report beside `guest_ids`.
+    /// deterministic. Shown in the full report beside `guest_ids`. A vfork
+    /// is counted before its call, since its parent returns only once the
+    /// child has exec'd or exited, so one that then fails, or each attempt of
+    /// one that is restarted, is counted too: the count is of calls reported,
+    /// and can exceed the tasks created.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub host_id_tasks: u64,
 }

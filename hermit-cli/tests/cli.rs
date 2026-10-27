@@ -10237,7 +10237,8 @@ fn no_namespace_refuses_a_taken_chosen_id_only_when_asked() {
 /// `EFAULT`, and one with `set_tid` but no size `EINVAL`, from the kernel;
 /// and, in both kinds of run, a `CLONE_NEWPID` call with a one-entry
 /// `set_tid` and an unknown flag gets `EINVAL` from the rewrite that adds
-/// Hermit's entry.
+/// Hermit's entry, and a vfork every kernel refuses (`CLONE_PIDFD` with
+/// `CLONE_DETACHED`) gets `EINVAL` as made, with no host ID reported.
 #[test]
 fn no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base() {
     for (base, call, expected) in [
@@ -10266,11 +10267,22 @@ fn no_namespace_keeps_the_guests_own_clone_errors_under_a_pid_base() {
             &["unknown-flag"],
             "clone3 unknown-flag: Invalid argument",
         ),
+        (
+            "--pid-base=5000",
+            &["vfork-detached"],
+            "clone vfork-detached: Invalid argument",
+        ),
+        (
+            "--summary",
+            &["vfork-detached"],
+            "clone vfork-detached: Invalid argument",
+        ),
     ] {
         let output = no_namespace_in_own_pid_namespace(&[base], call);
         assert_success(&output, call);
         assert!(
-            stdout(&output).starts_with(&format!("{expected}\n")),
+            stdout(&output).starts_with(&format!("{expected}\n"))
+                && !stderr(&output).contains("got a host ID"),
             "{base} {call:?}: {}",
             stderr(&output)
         );
