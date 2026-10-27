@@ -146,6 +146,25 @@ fn send_fds(socket: c_int, fds: &[c_int]) {
 /// Sends `payload` carrying `fds` in a single `SCM_RIGHTS` message and
 /// returns how many of its bytes Linux took.
 fn send_fds_with(socket: c_int, fds: &[c_int], payload: &mut [u8]) -> usize {
+    send_fds_with_name(socket, fds, payload, None)
+}
+
+/// As [`send_fds`], to the socket `address` names (`msg_name`).
+fn send_fds_to(socket: c_int, fds: &[c_int], address: &(libc::sockaddr_un, u32)) {
+    let mut payload = *b"f";
+    assert_eq!(
+        send_fds_with_name(socket, fds, &mut payload, Some(address)),
+        1
+    );
+}
+
+/// As [`send_fds_with`], naming the destination `name` where given.
+fn send_fds_with_name(
+    socket: c_int,
+    fds: &[c_int],
+    payload: &mut [u8],
+    name: Option<&(libc::sockaddr_un, u32)>,
+) -> usize {
     let mut iov = libc::iovec {
         iov_base: payload.as_mut_ptr().cast(),
         iov_len: payload.len(),
@@ -160,6 +179,10 @@ fn send_fds_with(socket: c_int, fds: &[c_int], payload: &mut [u8]) -> usize {
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
     message.msg_controllen = unsafe { libc::CMSG_SPACE(data_len) } as _;
+    if let Some((address, length)) = name {
+        message.msg_name = (&raw const *address).cast_mut().cast();
+        message.msg_namelen = *length;
+    }
     // SAFETY: the control buffer has room for one message of `data_len` bytes.
     unsafe {
         let header = libc::CMSG_FIRSTHDR(&message);
@@ -621,6 +644,293 @@ fn descriptors_over_a_connection_to_an_own_listener_share_their_open_files() {
     );
 }
 
+/// The status flags of descriptor `received`, an eventfd, as a line to
+/// print: Linux gives the sender's blocking open file, and Detcore, where it
+/// cannot tell which eventfd it is, refuses the descriptor (`F_GETFL` fails
+/// with EBADF, as main fails it); what it must never do is give another
+/// sender's nonblocking one.
+fn blocking_eventfd_status(received: c_int, what: &str) -> String {
+    let status = unsafe { libc::fcntl(received, libc::F_GETFL) };
+    let errno = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    assert!(
+        status < 0 || status & libc::O_NONBLOCK == 0,
+        "{what}: the received eventfd took another sender's nonblocking open file"
+    );
+    format!(
+        "{what}: F_GETFL={} errno={}",
+        status.max(-1),
+        if status < 0 { errno } else { 0 }
+    )
+}
+
+/// A connection made through a relative path reaches the listener Detcore
+/// knows by its absolute path without Detcore seeing it queued there. Linux
+/// gives the first `accept` that connection (the oldest,
+/// `unix_stream_connect` and `unix_accept`), so a blocking eventfd its
+/// connecting socket sends arrives there; the nonblocking eventfd the
+/// connection through the absolute path sends must not be taken for it.
+/// Detcore leaves the listener's pairing unknown instead of pairing the
+/// first accept with the absolute connect.
+fn a_connection_through_a_relative_path_does_not_shift_the_pairing() {
+    let directory = c"/tmp/hermit-detcore-scm-rights-relative";
+    let path = c"/tmp/hermit-detcore-scm-rights-relative/listener";
+    unsafe {
+        libc::mkdir(directory.as_ptr(), 0o700);
+        libc::unlink(path.as_ptr());
+    }
+    let address_of = |path: &[u8]| {
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (slot, byte) in address.sun_path.iter_mut().zip(path) {
+            *slot = *byte as libc::c_char;
+        }
+        let length = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len()) as u32;
+        (address, length)
+    };
+    let absolute = address_of(path.to_bytes());
+    let relative = address_of(b"listener");
+    let at = |(address, _): &(libc::sockaddr_un, u32)| (&raw const *address).cast();
+    let listener = unix_stream_socket();
+    check(
+        unsafe { libc::bind(listener, at(&absolute), absolute.1) },
+        "bind",
+    );
+    check(unsafe { libc::listen(listener, 2) }, "listen");
+    check(unsafe { libc::chdir(directory.as_ptr()) }, "chdir");
+    let through_relative = unix_stream_socket();
+    check(
+        unsafe { libc::connect(through_relative, at(&relative), relative.1) },
+        "connect through the relative path",
+    );
+    let through_absolute = unix_stream_socket();
+    check(
+        unsafe { libc::connect(through_absolute, at(&absolute), absolute.1) },
+        "connect through the absolute path",
+    );
+    let accept = || {
+        check(
+            unsafe { libc::accept(listener, ptr::null_mut(), ptr::null_mut()) },
+            "accept",
+        )
+    };
+    let (first, second) = (accept(), accept());
+    send_fds(through_absolute, &[eventfd(0, libc::EFD_NONBLOCK)]);
+    send_fds(through_relative, &[eventfd(0, 0)]);
+    let [received] = recv_fds(first, 0)[..] else {
+        panic!("expected one descriptor");
+    };
+    println!(
+        "{}",
+        blocking_eventfd_status(received, "first accepted connection")
+    );
+    let [_] = recv_fds(second, 0)[..] else {
+        panic!("expected one descriptor");
+    };
+    unsafe {
+        libc::unlink(path.as_ptr());
+        libc::chdir(c"/".as_ptr());
+        libc::rmdir(directory.as_ptr());
+    }
+}
+
+/// A child that changed its root with `chroot` connects through the same
+/// absolute path that names the parent's first listener outside, and reaches
+/// the listener at that path inside its root, the parent's second. Linux
+/// gives the first listener's `accept` the parent's own later connection,
+/// so the blocking eventfd that connection sends arrives there; the
+/// nonblocking eventfd the child sends over its connection must not be taken
+/// for it. Detcore leaves pairing unknown after a connect through an
+/// absolute path from a changed root. The child calls only functions that
+/// allocate nothing.
+fn a_connection_from_a_chroot_does_not_shift_the_pairing() {
+    let jail = c"/tmp/hermit-detcore-scm-rights-jail";
+    let jail_tmp = c"/tmp/hermit-detcore-scm-rights-jail/tmp";
+    let outside = c"/tmp/hermit-detcore-scm-rights-chroot-listener";
+    let inside =
+        c"/tmp/hermit-detcore-scm-rights-jail/tmp/hermit-detcore-scm-rights-chroot-listener";
+    unsafe {
+        libc::mkdir(jail.as_ptr(), 0o755);
+        libc::mkdir(jail_tmp.as_ptr(), 0o755);
+        libc::unlink(outside.as_ptr());
+        libc::unlink(inside.as_ptr());
+    }
+    let address_of = |path: &[u8]| {
+        let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        for (slot, byte) in address.sun_path.iter_mut().zip(path) {
+            *slot = *byte as libc::c_char;
+        }
+        let length = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + path.len()) as u32;
+        (address, length)
+    };
+    let (outer, inner) = (
+        address_of(outside.to_bytes()),
+        address_of(inside.to_bytes()),
+    );
+    let at = |(address, _): &(libc::sockaddr_un, u32)| (&raw const *address).cast();
+    let listen_at = |address: &(libc::sockaddr_un, u32), path: &std::ffi::CStr| {
+        let listener = unix_stream_socket();
+        check(
+            unsafe { libc::bind(listener, at(address), address.1) },
+            "bind",
+        );
+        // The child's user namespace maps no user, so it needs the others bits.
+        check(unsafe { libc::chmod(path.as_ptr(), 0o777) }, "chmod");
+        check(unsafe { libc::listen(listener, 2) }, "listen");
+        listener
+    };
+    let first_listener = listen_at(&outer, outside);
+    let second_listener = listen_at(&inner, inside);
+    let (sent, go) = (pipe(), pipe());
+    // A fork into a user namespace of its own, where the child may chroot.
+    let child = unsafe {
+        libc::syscall(
+            libc::SYS_clone,
+            (libc::CLONE_NEWUSER | libc::SIGCHLD) as libc::c_ulong,
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+    assert!(child >= 0, "clone: {}", io::Error::last_os_error());
+    if child == 0 {
+        // Only the parent writes `go`, so the child sees its end of file if
+        // the parent stops early.
+        unsafe {
+            libc::close(go.1);
+            libc::close(sent.0);
+        }
+        let ok = unsafe { libc::chroot(jail.as_ptr()) } == 0
+            && unsafe { libc::chdir(c"/".as_ptr()) } == 0;
+        let client = unix_stream_socket();
+        // The outside listener's path, which names the inside one here.
+        if !ok || unsafe { libc::connect(client, at(&outer), outer.1) } != 0 {
+            unsafe { libc::_exit(2) };
+        }
+        let nonblocking = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK) };
+        write_all(sent.1, b"c");
+        // Send only once the parent's own connection is queued and accepted.
+        let mut byte = [0u8];
+        unsafe { libc::read(go.0, byte.as_mut_ptr().cast(), 1) };
+        send_fds(client, &[nonblocking]);
+        // Keep the eventfd until the parent has received.
+        unsafe { libc::read(go.0, byte.as_mut_ptr().cast(), 1) };
+        unsafe { libc::_exit(0) };
+    }
+    unsafe {
+        libc::close(go.0);
+        libc::close(sent.1);
+    }
+    assert_eq!(read_exact(sent.0, 1), b"c");
+    let own = unix_stream_socket();
+    check(
+        unsafe { libc::connect(own, at(&outer), outer.1) },
+        "connect",
+    );
+    let accepted = check(
+        unsafe { libc::accept(first_listener, ptr::null_mut(), ptr::null_mut()) },
+        "accept",
+    );
+    write_all(go.1, b"s");
+    let child_side = check(
+        unsafe { libc::accept(second_listener, ptr::null_mut(), ptr::null_mut()) },
+        "accept",
+    );
+    let [_] = recv_fds(child_side, 0)[..] else {
+        panic!("expected one descriptor from the child");
+    };
+    send_fds(own, &[eventfd(0, 0)]);
+    let [received] = recv_fds(accepted, 0)[..] else {
+        panic!("expected one descriptor");
+    };
+    println!(
+        "{}",
+        blocking_eventfd_status(received, "outside listener's connection")
+    );
+    write_all(go.1, b"e");
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(child as libc::pid_t, &mut status, 0) },
+        child as libc::pid_t
+    );
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "the child could not chroot and connect"
+    );
+    unsafe {
+        libc::unlink(outside.as_ptr());
+        libc::unlink(inside.as_ptr());
+        libc::rmdir(jail_tmp.as_ptr());
+        libc::rmdir(jail.as_ptr());
+    }
+}
+
+/// A datagram the first socket of a `socketpair` sends to a socket it names
+/// (`msg_name`) reaches that socket, not its peer (`unix_dgram_sendmsg`):
+/// the nonblocking eventfd it carried must not be taken for the blocking one
+/// the next datagram brings the peer.
+fn an_addressed_datagram_does_not_take_the_peers_queue() {
+    let (left, right) = socketpair(libc::SOCK_DGRAM);
+    let named = abstract_address(b"\0hermit-detcore-scm-rights-addressed");
+    let other = check(
+        unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) },
+        "socket",
+    );
+    check(
+        unsafe { libc::bind(other, (&raw const named.0).cast(), named.1) },
+        "bind",
+    );
+    send_fds_to(left, &[eventfd(0, libc::EFD_NONBLOCK)], &named);
+    send_fds(left, &[eventfd(0, 0)]);
+    let [received] = recv_fds(right, 0)[..] else {
+        panic!("expected one descriptor");
+    };
+    println!("{}", blocking_eventfd_status(received, "peer"));
+    let [_] = recv_fds(other, 0)[..] else {
+        panic!("expected one descriptor");
+    };
+}
+
+/// A `socketpair` datagram socket that connects to another socket sends to
+/// it (`unix_dgram_connect`); connected back to its old peer, it reaches the
+/// peer again. The nonblocking eventfd it sent while connected elsewhere
+/// must not be taken for the blocking one it sends the peer afterwards.
+fn a_reconnected_datagram_socket_does_not_take_the_peers_queue() {
+    let (left, right) = socketpair(libc::SOCK_DGRAM);
+    let right_name = abstract_address(b"\0hermit-detcore-scm-rights-reconnected-peer");
+    let other_name = abstract_address(b"\0hermit-detcore-scm-rights-reconnected-other");
+    check(
+        unsafe { libc::bind(right, (&raw const right_name.0).cast(), right_name.1) },
+        "bind",
+    );
+    let other = check(
+        unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) },
+        "socket",
+    );
+    check(
+        unsafe { libc::bind(other, (&raw const other_name.0).cast(), other_name.1) },
+        "bind",
+    );
+    check(
+        unsafe { libc::connect(left, (&raw const other_name.0).cast(), other_name.1) },
+        "connect to another socket",
+    );
+    send_fds(left, &[eventfd(0, libc::EFD_NONBLOCK)]);
+    check(
+        unsafe { libc::connect(left, (&raw const right_name.0).cast(), right_name.1) },
+        "connect back to the peer",
+    );
+    send_fds(left, &[eventfd(0, 0)]);
+    let [received] = recv_fds(right, 0)[..] else {
+        panic!("expected one descriptor");
+    };
+    println!("{}", blocking_eventfd_status(received, "peer"));
+    let [_] = recv_fds(other, 0)[..] else {
+        panic!("expected one descriptor");
+    };
+}
+
 /// An eventfd received after a receive with no room released an earlier
 /// eventfd's message: every eventfd has one file identity, so only order
 /// could tell the two apart, and the socket's queue no longer follows its
@@ -812,6 +1122,26 @@ fn scm_rights_over_a_connection_to_an_own_listener() {
 #[test]
 fn scm_rights_over_a_connection_from_a_child() {
     run_deterministically(descriptors_over_a_connection_from_a_child_share_their_open_files);
+}
+
+#[test]
+fn scm_rights_connection_through_a_relative_path() {
+    run_deterministically(a_connection_through_a_relative_path_does_not_shift_the_pairing);
+}
+
+#[test]
+fn scm_rights_connection_from_a_chroot() {
+    run_deterministically(a_connection_from_a_chroot_does_not_shift_the_pairing);
+}
+
+#[test]
+fn scm_rights_addressed_datagram() {
+    run_deterministically(an_addressed_datagram_does_not_take_the_peers_queue);
+}
+
+#[test]
+fn scm_rights_reconnected_datagram_socket() {
+    run_deterministically(a_reconnected_datagram_socket_does_not_take_the_peers_queue);
 }
 
 #[test]

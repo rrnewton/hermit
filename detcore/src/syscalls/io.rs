@@ -3821,19 +3821,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             resource_request(guest, req).await;
         }
 
-        // The AF_UNIX name connected to, read before the call as Linux reads
-        // it, and whether the connection completes in this turn.
-        let unix_name = uservaddr.and_then(|address| {
-            crate::syscalls::scm_rights::unix_socket_name(
-                &guest.memory(),
-                address.as_raw(),
-                usize::try_from(addrlen).unwrap_or(0),
-            )
-        });
+        // What the address names, read before the call as Linux reads it,
+        // and whether the connection completes in this turn.
+        let unix_address = uservaddr.map_or(
+            crate::syscalls::scm_rights::UnixAddress::Unnamed,
+            |address| {
+                crate::syscalls::scm_rights::unix_address(
+                    &guest.memory(),
+                    address.as_raw(),
+                    usize::try_from(addrlen).unwrap_or(0),
+                )
+            },
+        );
         let in_turn = self.completes_in_turn(guest, call);
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
-        if let (Some(name), Ok(0)) = (&unix_name, &result) {
-            self.note_unix_connect(guest, fd, name, in_turn);
+        if let Ok(0) = &result {
+            self.note_unix_connect(guest, fd, &unix_address, in_turn);
         }
         if self.cfg.backend.loopback_pollers_yield_to_peers
             && connect_result_allows_peer_classification(&result)
@@ -4094,7 +4097,14 @@ where
     for &header in headers {
         match sent_descriptors(guest, &[header]) {
             (_, true) => rights.unread = true,
-            (sent, false) if !sent.is_empty() => rights.messages.push((sent, sent_bytes(header))),
+            (sent, false) if !sent.is_empty() => {
+                // Whether the message named its destination: a header whose
+                // name length cannot be read counts as one that did.
+                let addressed = Addr::<Msghdr>::from_raw(header)
+                    .and_then(|header| guest.memory().read_value::<_, Msghdr>(header).ok())
+                    .is_none_or(|header| header.msg_namelen != 0);
+                rights.messages.push((sent, sent_bytes(header), addressed));
+            }
             _ => {}
         }
     }
