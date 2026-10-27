@@ -1145,7 +1145,13 @@ mod tests {
         const SENTINEL: i32 = 4242;
         nix::errno::Errno::set_raw(SENTINEL);
         let inside = futures::executor::block_on(preserving_errno(async {
-            assert!(std::fs::symlink_metadata("/proc/self/fd/-1").is_err());
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: the path is NUL-terminated and stat is writable output
+            // storage. The failed call's output is never read.
+            assert_eq!(
+                unsafe { libc::lstat(c"/proc/self/fd/-1".as_ptr(), stat.as_mut_ptr()) },
+                -1
+            );
             nix::errno::Errno::last_raw()
         }));
         assert_eq!(inside, libc::ENOENT, "the failed call set errno");
