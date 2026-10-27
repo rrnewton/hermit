@@ -326,6 +326,18 @@ impl RunQueue {
         }
     }
 
+    /// [`Self::has_runnable_besides`], with the queued threads for which
+    /// `passed_over` holds not counted as work either. Read-only.
+    pub fn has_runnable_besides_unless(
+        &self,
+        exclude: DetTid,
+        passed_over: impl Fn(DetTid) -> bool,
+    ) -> bool {
+        self.queue.iter().any(|(k, v)| {
+            v.tid != exclude && !v.counts_as_poller(k.priority) && !passed_over(v.tid)
+        })
+    }
+
     /// True if any thread other than `exclude` is runnable at ordinary
     /// (non-poller) priority, where a thread `restore_poller_priority` restored
     /// still counts as a poller until it runs. This is the "deterministic work still runnable"
