@@ -274,7 +274,13 @@ impl AnalyzeOpts {
             }
             None => builder.tempdir()?,
         };
-        let tmpdir_path = dir.keep(); // For now always keep the temporary results.
+        // For now always keep the temporary results. Trials name the workspace
+        // by its canonical path, so that a relative --tmp-dir, or one through
+        // a symlink, names the same directory inside their container, where
+        // only a workspace under host /tmp is bound.
+        let kept = dir.keep();
+        let tmpdir_path = std::fs::canonicalize(&kept)
+            .with_context(|| format!("cannot resolve the workspace {}", kept.display()))?;
         eprintln!(":: Temp workspace: {}", tmpdir_path.display());
         self.tmp_dir = Some(tmpdir_path);
         Ok(())
@@ -1168,8 +1174,28 @@ mod tests {
             AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
         options.phase0_initialize().unwrap();
         let workspace = options.get_tmp().unwrap();
-        assert_eq!(workspace.parent(), Some(requested.as_path()));
+        assert_eq!(
+            workspace.parent(),
+            Some(std::fs::canonicalize(&requested).unwrap().as_path())
+        );
         assert!(workspace.is_dir(), "{}", workspace.display());
+
+        // Through a symlink, the workspace is named by its canonical path.
+        let real = parent.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let tmp_dir = format!("--tmp-dir={}", link.display());
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
+        options.phase0_initialize().unwrap();
+        let workspace = options.get_tmp().unwrap();
+        assert_eq!(
+            workspace.parent(),
+            Some(std::fs::canonicalize(&real).unwrap().as_path()),
+            "{}",
+            workspace.display()
+        );
     }
 
     /// Two replays of one schedule may differ by a few branches and still
