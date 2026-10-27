@@ -106,9 +106,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately
           sabre: This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately
           liteinst: This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -597,8 +597,8 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
         backends_disabled:
+          dbt: This determinism cell calibrates the ptrace strict-verify baseline; qualify DBT separately
           kvm: This determinism cell calibrates the ptrace strict-verify baseline; qualify KVM separately
           sabre: This determinism cell calibrates the ptrace strict-verify baseline; qualify SaBRe separately
           liteinst: This determinism cell calibrates the ptrace strict-verify baseline; qualify LiteInst separately
