@@ -150,11 +150,13 @@ fn copied_source_checks(case: &Path, original: &Path, runner: &mut Runner) -> Re
             .as_array()
             .unwrap()
             .len(),
-        // The reviewed catalog binds 64 runtime/artifact inputs, including the
-        // pidfd-self modules and their lifecycle and Guest entry points, and
-        // the signal-mask gate's runtime_mask module and its callers.
+        // The reviewed catalog binds 66 runtime/artifact inputs, including the
+        // pidfd-self modules and their lifecycle and Guest entry points, the
+        // signal-mask gate's runtime_mask module and its callers, and the
+        // typed Tool configuration (reverie/src/tool_configuration.rs and
+        // reverie-inguest/src/guest/rpc.rs, added by Reverie 38c3e024).
         // The separately bound qualifier source adds one input.
-        65
+        67
     );
     let alias = case.join("cargo-alias");
     let private_home = case.join("cargo-home");
