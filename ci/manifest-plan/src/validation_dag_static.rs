@@ -1221,7 +1221,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Its detlog correction adds one more detcore-model unit: 1928 + 1 = 1929, re-measured at this integration head.
     // And detcore-model's summary::tests::desync_notes_round_trip_through_summary_json
     // (https://github.com/rrnewton/hermit/issues/4876): 1930.
-    ("test.regular_crates", 1930),
+    // And detcore-model's summary::tests::desync_notes_round_trip_through_summary_json
+    // (https://github.com/rrnewton/hermit/issues/4876, #4878): 1931.
+    ("test.regular_crates", 1931),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3195,7 +3197,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And format_version_round_trips_through_the_record_serde and
     // background_starts_round_trip_through_the_record_serde, for main's
     // record serde: 3068.
-    ("test.detcore_unit", 3068),
+    // And scheduler::callback_history_scheduler_tests::summarized_desyncs_name_their_recorded_event,
+    // preemptions::tests::callback_checkpoints_are_placed_at_the_event_ending_their_slice
+    // and scheduler::callback_history_scheduler_tests::desync_notes_collect_every_producers_note
+    // (https://github.com/rrnewton/hermit/issues/4876, #4878): 3071.
+    ("test.detcore_unit", 3071),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5620,7 +5626,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two untaken-background-start units: 3065.
     // And the same prefix-record unit: 3066.
     // And the same two record-serde round-trip units: 3068.
-    ("test.detcore_unit_on_host", 3068),
+    // And the same three summarized-desync units: 3071.
+    ("test.detcore_unit_on_host", 3071),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
