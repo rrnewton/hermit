@@ -3624,7 +3624,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // pin): 293 + 1 = 294, re-measured at this tip.
     // The split moves the copied-child TTY case to its required DynamoRIO
     // owner: 294 - 1 = 293. Composed source count; re-measure.
-    ("test.hermit_integration_2", 296),
+    // And lit's chaos_schedule_replay fixture (a --chaos recording replayed
+    // with --die-on-desync): 293, listed.
+    // Rebased onto main fcd62385f: 296 + 1 = 297.
+    ("test.hermit_integration_2", 297),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -5967,7 +5970,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The split retains seven package-identity cases in version_provenance
     // and moves the copied-child TTY case to its DynamoRIO owner:
     // 713 + 7 - 1 = 719. Composed source count; re-measure.
-    ("test.hermit_integration_on_host", 722),
+    // And the same chaos_schedule_replay lit fixture: 703, listed.
+    // Rebased onto main fcd62385f: 722 + 1 = 723.
+    ("test.hermit_integration_on_host", 723),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
