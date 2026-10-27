@@ -8304,14 +8304,30 @@ impl Scheduler {
     /// deterministic-work-first gate as `step2c_process_io_blockers`: a deferred
     /// signal is delivered only once the run queue holds no ordinary (non-poller)
     /// guest work, so its commit order is fixed by the scheduler rather than by
-    /// host signal-arrival timing. Runs after external-IO harvesting so a ready
-    /// IO continuation is always ordered ahead of a deferred signal.
+    /// host signal-arrival timing. Where that gate keeps the deliveries parked,
+    /// a schedule replay still readmits the one whose thread its recorded
+    /// schedule runs next once only polling retries are queued
+    /// (`replay_readmits_parked_sigchld`). Runs after external-IO harvesting so
+    /// a ready IO continuation is always ordered ahead of a deferred signal.
     fn step2e_process_signal_deferred(&mut self) {
         if self.blocked.sigchld_deferred.is_empty() {
             return;
         }
         let only_pollers = self.run_queue.only_pollers() && !self.vfork_child_runs_turn();
         if !self.run_queue.is_empty() && !only_pollers {
+            // Where this gate keeps the deliveries parked, a schedule replay
+            // still readmits the one whose thread its recorded schedule runs
+            // next once nothing but polling retries is queued, the test a
+            // delivery takes before it is parked (`sigchld_waits_behind_work`):
+            // replay-held pollers count as work for `only_pollers`, so the
+            // gate would keep it parked past its turn. Where the gate admits
+            // every parked delivery, below, nothing changes.
+            if let Some(next) = self.replay_readmits_parked_sigchld() {
+                info!("[step2] Re-admit deferred SIGCHLD for dtid {:?}", next);
+                self.blocked.sigchld_deferred.remove(&next);
+                self.blocked.sigchld_ready.insert(next);
+                self.readmit_ready_thread(next);
+            }
             return;
         }
         // BTreeSet drains in sorted DetTid order, giving a canonical admission
@@ -14438,6 +14454,19 @@ impl Scheduler {
         } else {
             self.run_queue.has_runnable_besides(dettid)
         }
+    }
+
+    /// Under a schedule replay, the thread with a parked `SIGCHLD` delivery
+    /// (`sigchld_deferred`) that the recorded schedule runs next, once its
+    /// delivery no longer waits behind work (`sigchld_waits_behind_work`) and
+    /// no vfork child is to run its turn first.
+    fn replay_readmits_parked_sigchld(&self) -> Option<DetTid> {
+        let (next, _) = self.replay_next_resume()?;
+        (self.has_schedule_replay()
+            && self.blocked.sigchld_deferred.contains(&next)
+            && !self.vfork_child_runs_turn()
+            && !self.sigchld_waits_behind_work(next))
+        .then_some(next)
     }
 
     /// Under a schedule replay, whether the recorded schedule's next record
@@ -24863,8 +24892,9 @@ mod test {
     /// the recording did not run that retry first, or its polling attempt would
     /// be the next record. It is still parked behind genuine work, here a
     /// queued kernel-run blocking call, which records no event and so keeps its
-    /// run-queue order; and behind the poller when the schedule runs the poller
-    /// next.
+    /// run-queue order, and step 2e readmits it past the poller once that call
+    /// has left the queue; and behind the poller when the schedule runs the
+    /// poller next.
     #[test]
     fn a_replayed_sigchld_waits_behind_genuine_work_but_not_a_replay_held_poller() {
         let poller = DetTid::from_raw(3);
@@ -24926,23 +24956,60 @@ mod test {
                 granted,
                 !scheduler.blocked.sigchld_deferred.contains(&signaled)
             );
-            !granted
+            (scheduler, !granted)
         };
         // The schedule runs the signaled thread next: the poller does not
         // hold the delivery back.
-        assert!(!deferred(SchedEvent::branches(signaled, 76), false));
-        // A queued kernel-run blocking call still does.
-        assert!(deferred(SchedEvent::branches(signaled, 76), true));
-        // The schedule runs the poller next: deferred as before.
-        assert!(deferred(SchedEvent::branches(poller, 3), false));
+        assert!(!deferred(SchedEvent::branches(signaled, 76), false).1);
+
+        // A queued kernel-run blocking call still does. Once it has left the
+        // queue, step 2e readmits the delivery past the poller, which counts
+        // as work for `only_pollers`.
+        let (mut behind_blocker, parked) = deferred(SchedEvent::branches(signaled, 76), true);
+        assert!(parked);
+        behind_blocker.step2e_process_signal_deferred();
+        assert!(behind_blocker.blocked.sigchld_deferred.contains(&signaled));
+        assert!(behind_blocker.run_queue.remove_tid(blocker));
+        behind_blocker.step2e_process_signal_deferred();
+        assert!(!behind_blocker.blocked.sigchld_deferred.contains(&signaled));
+        assert!(behind_blocker.blocked.sigchld_ready.contains(&signaled));
+        assert!(behind_blocker.run_queue.contains_tid(signaled));
+
+        // The schedule runs the poller next: deferred as before, and step 2e
+        // keeps it parked.
+        let (mut poller_next, parked) = deferred(SchedEvent::branches(poller, 3), false);
+        assert!(parked);
+        poller_next.step2e_process_signal_deferred();
+        assert!(poller_next.blocked.sigchld_deferred.contains(&signaled));
+
+        // With another delivery parked too, the replay readmits only the one
+        // the schedule runs next while the poller is queued, and the other
+        // stays parked; once the queue is empty, step 2e's own gate admits
+        // every parked delivery at once, as before.
+        let other = DetTid::from_raw(9);
+        let (mut two_parked, parked) = deferred(SchedEvent::branches(signaled, 76), true);
+        assert!(parked);
+        register_known_thread(&mut two_parked, other);
+        two_parked.blocked.sigchld_deferred.insert(other);
+        assert!(two_parked.run_queue.remove_tid(blocker));
+        two_parked.step2e_process_signal_deferred();
+        assert!(two_parked.run_queue.contains_tid(signaled));
+        assert!(two_parked.blocked.sigchld_deferred.contains(&other));
+        assert!(two_parked.run_queue.remove_tid(signaled));
+        assert!(two_parked.run_queue.remove_tid(poller));
+        two_parked.blocked.sigchld_deferred.insert(signaled);
+        two_parked.step2e_process_signal_deferred();
+        assert!(two_parked.blocked.sigchld_deferred.is_empty());
+        assert!(two_parked.run_queue.contains_tid(signaled));
+        assert!(two_parked.run_queue.contains_tid(other));
     }
 
     /// A polling request with `poll_attempt > 0` is a pending backoff: step 4
     /// requeues it without a grant and records nothing. So a replay counts it
-    /// as work for a SIGCHLD delivery to the thread its schedule runs next.
-    /// Once the backoff has run, the poller sits in the last band, and step
-    /// 2e's own gate admits the delivery (Codex review of the readmission
-    /// follow-up).
+    /// as work for a SIGCHLD delivery to the thread its schedule runs next,
+    /// both when the delivery arrives and in step 2e's rescue. Once the backoff
+    /// has run, the poller sits in the last band, and step 2e's own gate admits
+    /// the delivery (Codex review of the readmission change).
     #[test]
     fn a_pending_poll_backoff_keeps_a_replayed_sigchld_parked() {
         let poller = DetTid::from_raw(3);
@@ -24994,6 +25061,7 @@ mod test {
                 .is_err()
         );
         assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
+        assert_eq!(scheduler.replay_readmits_parked_sigchld(), None);
         scheduler.step2e_process_signal_deferred();
         assert!(scheduler.blocked.sigchld_deferred.contains(&signaled));
 
@@ -25010,6 +25078,42 @@ mod test {
         scheduler.step2e_process_signal_deferred();
         assert!(!scheduler.blocked.sigchld_deferred.contains(&signaled));
         assert!(scheduler.run_queue.contains_tid(signaled));
+    }
+
+    /// Step 2e's own gate still admits every parked SIGCHLD delivery at once
+    /// where it is eligible, with an empty queue or one of real pollers, also
+    /// under a schedule replay whose next record is one of their threads. The
+    /// replay's rescue of the next-scheduled thread applies only where that
+    /// gate keeps the deliveries parked (Codex review of the readmission
+    /// change).
+    #[test]
+    fn a_replay_keeps_step2e_batch_admission_of_parked_sigchlds() {
+        let first = DetTid::from_raw(7);
+        let second = DetTid::from_raw(9);
+        let poller = DetTid::from_raw(3);
+        for real_pollers in [false, true] {
+            let mut scheduler = Scheduler::new(&Config::default());
+            scheduler.replayer = Some(Replayer::new(vec![SchedEvent::branches(first, 76)]));
+            for tid in [first, second] {
+                register_known_thread(&mut scheduler, tid);
+                scheduler.priorities.insert(tid, REPLAY_DEFERRED_PRIORITY);
+                scheduler.blocked.sigchld_deferred.insert(tid);
+            }
+            if real_pollers {
+                register_known_thread(&mut scheduler, poller);
+                scheduler
+                    .run_queue
+                    .push_poller(poller, DEFAULT_PRIORITY, u32::MAX);
+                assert!(scheduler.run_queue.only_pollers());
+            }
+            scheduler.step2e_process_signal_deferred();
+            assert!(
+                scheduler.blocked.sigchld_deferred.is_empty(),
+                "real pollers: {real_pollers}"
+            );
+            assert!(scheduler.run_queue.contains_tid(first));
+            assert!(scheduler.run_queue.contains_tid(second));
+        }
     }
 
     /// The control for the two tests above: a queue of real pollers alone still
