@@ -263,11 +263,17 @@ fn resolve_with(
     // and down, then from the top down to the cursor's own, last.
     let first = (RESERVED_PIDS + size - 1) / size;
     let last = pid_max / size - 1;
-    let own = (cursor / size).clamp(first, last);
-    let order = (first..own).rev().chain((own..=last).rev());
-    let free = order
-        .filter(|index| holder_in(index * size).is_none())
-        .find(|index| host.reserve(*index, size).is_ok());
+    // A pid_max under two windows (Linux allows down to 301) leaves no whole
+    // window past the reserved IDs: no base is chosen, as when none is free.
+    let free = if first > last {
+        None
+    } else {
+        let own = (cursor / size).clamp(first, last);
+        let order = (first..own).rev().chain((own..=last).rev());
+        order
+            .filter(|index| holder_in(index * size).is_none())
+            .find(|index| host.reserve(*index, size).is_ok())
+    };
     match free {
         Some(index) => Ok((
             GuestIds::Chosen {
@@ -456,6 +462,31 @@ mod tests {
             (GuestIds::Namespace, None)
         );
         assert!(host.probed.borrow().is_empty());
+    }
+
+    /// A pid_max under two windows (Linux allows down to 301) leaves no whole
+    /// window past the reserved IDs: the default run warns and takes host
+    /// IDs instead of panicking; from two windows on, the second is chosen.
+    #[test]
+    fn a_pid_max_under_two_windows_leaves_no_default_window() {
+        for pid_max in [301, 1024, 2047] {
+            let mut host = FakeHost::new();
+            host.pid_max = pid_max;
+            host.cursor = Some(pid_max / 2);
+            let (ids, warning) = resolve_with(true, None, false, &host).unwrap();
+            assert_eq!(ids, GuestIds::Host, "pid_max {pid_max}");
+            assert!(
+                warning.is_some_and(|warning| warning.contains("no window of 1024 IDs")),
+                "pid_max {pid_max}"
+            );
+        }
+        let mut host = FakeHost::new();
+        host.pid_max = 2048;
+        host.cursor = Some(1500);
+        assert_eq!(
+            resolve_with(true, None, false, &host).unwrap(),
+            (chosen(1024, false), None)
+        );
     }
 
     /// Windows are 1024 IDs where pid_max is at most 65536, else 256.

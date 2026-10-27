@@ -1375,6 +1375,13 @@ pub struct RunOpts {
     #[clap(skip)]
     epoch_captured_from_host: bool,
 
+    /// How the host decided this `--no-namespace` run's guest IDs, if it did
+    /// (`resolve_guest_ids`): `free-window` for a base taken from the windows
+    /// free on this host, `host-ids` for the host's own IDs. A base given by
+    /// `--pid-base` or required by `--strict` is not drawn from the host.
+    #[clap(skip)]
+    guest_ids_drawn_from_host: Option<&'static str>,
+
     /// Whether neither `--epoch` nor `HERMIT_EPOCH` supplied the epoch, whether
     /// or not virtual time then sampled the host clock for it.
     #[clap(skip)]
@@ -3201,6 +3208,74 @@ impl RunOpts {
         options.pending_network_manifest = None;
         format!("{options:#?}")
     }
+}
+
+/// How the host decided a `--no-namespace` run's guest IDs `ids`, if it did:
+/// `free-window` for a base taken from the windows free on this host (unless
+/// `--pid-base` or `--strict` `required` it), `host-ids` for the host's own
+/// IDs. `None` in a PID namespace.
+fn guest_ids_drawn_from_host(
+    no_namespace: bool,
+    ids: detcore_model::pid::GuestIds,
+    required: bool,
+) -> Option<&'static str> {
+    use detcore_model::pid::GuestIds;
+    match ids {
+        _ if !no_namespace => None,
+        GuestIds::Host => Some("host-ids"),
+        GuestIds::Chosen { .. } if !required => Some("free-window"),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_base_or_host_ids_the_host_decided_are_host_drawn() {
+    use detcore_model::pid::GuestIds;
+    let chosen = GuestIds::Chosen {
+        base: 7168,
+        refuse_host_ids: false,
+    };
+    assert_eq!(
+        guest_ids_drawn_from_host(true, chosen, false),
+        Some("free-window")
+    );
+    assert_eq!(guest_ids_drawn_from_host(true, chosen, true), None);
+    assert_eq!(
+        guest_ids_drawn_from_host(true, GuestIds::Host, false),
+        Some("host-ids")
+    );
+    assert_eq!(
+        guest_ids_drawn_from_host(false, GuestIds::Namespace, false),
+        None
+    );
+}
+
+/// A base Hermit chose for a `--no-namespace` run is saved as if given by
+/// `--pid-base`, so the saved run takes the same IDs.
+#[test]
+fn saved_config_records_the_guest_id_base_hermit_chose() {
+    let argv = [
+        "hermit",
+        "run",
+        "--no-namespace",
+        "--save-config=unused.yaml",
+        "/bin/true",
+    ];
+    let matches = <crate::Args as clap::CommandFactory>::command()
+        .try_get_matches_from(argv)
+        .unwrap();
+    let mut args = crate::args_from_matches_with_clock(&matches, SystemTime::now).unwrap();
+    let crate::Subcommand::Run(ro) = &mut args.command else {
+        panic!("{argv:?} is not a `run` command");
+    };
+    assert_eq!(ro.saved_run_config().unwrap().run.get("pid-base"), None);
+    // What `resolve_guest_ids` leaves behind for a default base.
+    ro.det_opts.det_config.guest_ids = detcore_model::pid::GuestIds::Chosen {
+        base: 7168,
+        refuse_host_ids: false,
+    };
+    let saved = ro.saved_run_config().unwrap();
+    assert_eq!(saved.run["pid-base"], 7168, "{saved:?}");
 }
 
 /// `--save-config` writes the seed `--seed-from` chose in its place, so the
@@ -8988,6 +9063,10 @@ impl RunOpts {
                 self.preemption_summary()
             ))?;
         }
+        // How the guest's process IDs are numbered is an implicit input too: a
+        // base chosen from the free windows is saved and reported with the
+        // others, and a refusal here comes before stdin is read.
+        self.resolve_guest_ids()?;
         // Once every implicit input it records is resolved, and before the
         // guest starts, so a run that fails or hangs still leaves it.
         self.write_saved_config()?;
@@ -9251,7 +9330,6 @@ impl RunOpts {
             capture.require_initial(&command)?;
             self.native_exec_capture = Some(capture);
         }
-        self.resolve_guest_ids()?;
         self.warn_no_namespace();
 
         if self.namespace_only {
@@ -10956,6 +11034,11 @@ impl RunOpts {
             use std::io::Write as _;
             let _ = writeln!(std::io::stderr(), "{warning}");
         }
+        self.guest_ids_drawn_from_host = guest_ids_drawn_from_host(
+            self.no_namespace,
+            ids,
+            self.pid_base.is_some() || self.strict,
+        );
         self.det_opts.det_config.guest_ids = ids;
         Ok(())
     }
@@ -12629,6 +12712,7 @@ impl RunOpts {
     /// reproduces the run rather than resolving them again.
     pub(crate) fn saved_run_config(&self) -> Result<crate::run_config::RunConfig, Error> {
         use crate::run_config::EPOCH_KEY;
+        use crate::run_config::PID_BASE_KEY;
         use crate::run_config::SEED_FROM_KEY;
         use crate::run_config::SEED_KEY;
 
@@ -12646,6 +12730,14 @@ impl RunOpts {
         if let Some(seed) = self.seed_from_resolved {
             config.run.remove(SEED_FROM_KEY);
             config.run.insert(SEED_KEY.to_owned(), seed.into());
+        }
+        // A base Hermit chose for this run (from a free window) is saved as if
+        // given, so the saved run takes the same IDs or is refused, instead of
+        // choosing another base.
+        if self.pid_base.is_none()
+            && let Some(base) = self.det_opts.det_config.guest_ids.base()
+        {
+            config.run.insert(PID_BASE_KEY.to_owned(), base.into());
         }
         Ok(config)
     }
@@ -12682,6 +12774,14 @@ impl RunOpts {
             drawn.insert(
                 crate::run_config::SEED_KEY.to_owned(),
                 "SystemRandom".to_owned(),
+            );
+        }
+        // A `--no-namespace` guest's IDs, when the host decided them: a base
+        // taken from the windows free on this host, or the host's own IDs.
+        if let Some(source) = self.guest_ids_drawn_from_host {
+            drawn.insert(
+                crate::run_config::PID_BASE_KEY.to_owned(),
+                source.to_owned(),
             );
         }
         drawn
