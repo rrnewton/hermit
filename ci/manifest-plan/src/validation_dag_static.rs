@@ -1264,7 +1264,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1971 pin: 1971 + 2 = 1973, measured by that run.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 1944 + 2 = 1946 (Train 5 delta +2).
-    ("test.regular_crates", 1951),
+    // And detcore-model's summary::tests::desync_notes_round_trip_through_summary_json
+    // (https://github.com/rrnewton/hermit/issues/4876, #4878): 1963.
+    // Rebased onto main fcd62385f: 1951 + 1 = 1952.
+    ("test.regular_crates", 1952),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -3256,7 +3259,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 216dbc929a full validate.
     // Train 5 recount (measured by the ccb5080910 full validate):
     // Composed on measured main ffe313b1: 3395 + 44 = 3439 (Train 5 delta +44).
-    ("test.detcore_unit", 3465),
+    // And scheduler::callback_history_scheduler_tests::summarized_desyncs_name_their_recorded_event,
+    // preemptions::tests::callback_checkpoints_are_placed_at_the_event_ending_their_slice
+    // and scheduler::callback_history_scheduler_tests::desync_notes_collect_every_producers_note
+    // (https://github.com/rrnewton/hermit/issues/4876, #4878): 3392.
+    // Rebased onto main fcd62385f: 3465 + 3 = 3468.
+    ("test.detcore_unit", 3468),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5814,7 +5822,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Measured 3363 by compiled nextest list at the integration head.
     // Train 1 recount (same growth as test.detcore_unit): 3363 + 21 = 3384.
     // Train 5 recount (same growth as test.detcore_unit), composed on measured main: 3395 + 44 = 3439.
-    ("test.detcore_unit_on_host", 3465),
+    // And the same three summarized-desync units: 3392.
+    // Rebased onto main fcd62385f: 3465 + 3 = 3468.
+    ("test.detcore_unit_on_host", 3468),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
