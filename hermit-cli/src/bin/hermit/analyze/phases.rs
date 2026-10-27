@@ -112,6 +112,24 @@ impl AnalyzeOpts {
         Some(INEXACT_COUNTER_BRANCH_JITTER)
     }
 
+    /// The default search's configuration: `--verbose`, `--run-needleman`,
+    /// `--jitter-dist`, and the branch-count difference two replays of one
+    /// control schedule may show, on a host whose branch counter is not exact
+    /// only ([`Self::replay_branch_jitter`]).
+    fn bisect_config(&self) -> Config {
+        let mut cfg = Config {
+            verbose: self.verbose,
+            needleman_search: self.run_needleman,
+            max_branch_count_jitter: self.replay_branch_jitter(),
+            ..Default::default()
+        };
+        if let Some(dist) = self.jitter_dist {
+            cfg.max_jitter_editdist = dist;
+            cfg.max_jitter_swapdist = dist * dist;
+        }
+        cfg
+    }
+
     pub fn get_tmp(&self) -> anyhow::Result<&Path> {
         if let Some(pb) = &self.tmp_dir {
             Ok(pb.as_path())
@@ -594,16 +612,7 @@ impl AnalyzeOpts {
 
         let target = target.to_vec(); // TODO: have search_for_critical_schedule borrow only.
         let baseline = baseline.to_vec();
-        let mut cfg = Config {
-            verbose: self.verbose,
-            needleman_search: self.run_needleman,
-            max_branch_count_jitter: self.replay_branch_jitter(),
-            ..Default::default()
-        };
-        if let Some(dist) = self.jitter_dist {
-            cfg.max_jitter_editdist = dist;
-            cfg.max_jitter_swapdist = dist * dist;
-        }
+        let cfg = self.bisect_config();
         let crit = search_for_critical_schedule(test_fn, baseline, target, &cfg)?;
         eprintln!(
             "Critical event of final on-target schedule is {}",
@@ -1190,16 +1199,21 @@ mod tests {
         );
     }
 
-    /// Two replays of one schedule may differ by a few branches and still
-    /// count as one trace only on a host whose branch counter is not exact.
+    /// The configuration the default search runs with lets two replays of
+    /// one schedule differ by a few branches and still count as one trace
+    /// only on a host whose branch counter is not exact.
     #[test]
     fn replays_tolerate_branch_skid_only_on_an_inexact_counter() {
         let mut options = AnalyzeOpts::try_parse_from(["analyze", "--", "/bin/true"]).unwrap();
         options.inexact_branch_counter = || None;
-        assert_eq!(options.replay_branch_jitter(), None, "an exact counter");
+        assert_eq!(
+            options.bisect_config().max_branch_count_jitter,
+            None,
+            "an exact counter"
+        );
         options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
         assert_eq!(
-            options.replay_branch_jitter(),
+            options.bisect_config().max_branch_count_jitter,
             Some(INEXACT_COUNTER_BRANCH_JITTER)
         );
     }
