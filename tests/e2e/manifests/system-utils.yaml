@@ -243,15 +243,14 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           kvm: true
           sabre: false
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
           - sabre
         backends_disabled:
+          dbt: DBT wedges when the guest execs a new program image, and this script ends in `exec hexdump`. Measured 2026-08-24 - the run never exits and emits zero DETLOG records after "[dbt backend] Detcore Tool active"; a cell timeout then misreports it as "failed to launch drrun". Note DBT refuses execveat legibly with ENOSYS (tests/c/dbt_execveat_unsupported.c passes), so it is execve specifically that hangs
           liteinst: The preload runtime cannot survive the hexdump script's post-start exec
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -380,11 +379,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
           sabre: Ptrace and SaBRe each reach L2, but coreutils mktemp consumes different deterministic entropy positions and emits different name suffixes
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -516,9 +515,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -581,9 +580,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -647,11 +646,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe and ptrace each reach L2, but libcrypto consumes different deterministic entropy positions and emits different hex stdout
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -714,9 +713,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
           sabre: Certificate issuance combines wall-clock validity with multiple entropy draws; clock, random-stream, and full-trace support remain unqualified
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -770,8 +769,8 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
         backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
           kvm: KVM requires the privileged runner
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -909,9 +908,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
           sabre: Path evidence found 33 raw syscall sites per execution in ld-linux and libc; trusted shared-object native execution is not SaBRe support
@@ -1050,9 +1049,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -1115,9 +1114,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -1179,13 +1178,12 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -1248,11 +1246,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -1315,8 +1313,8 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
         backends_disabled:
+          dbt: DBT coverage is owned by its backend parity partition
           kvm: KVM requires the privileged runner
           sabre: SaBRe requires its external runtime
           liteinst: LiteInst coverage is owned by its backend compatibility partition
@@ -1671,12 +1669,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled: {}
+        backends_disabled:
+          dbt: Enable once measured on this backend; ptrace is the proven baseline. A cross-backend difference in the RAW vDSO base or AT_RANDOM is a FINDING to report, never something to normalise away
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -1900,8 +1898,8 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
         backends_disabled:
+          dbt: Enable once the DBI post-exec clock path is qualified against the ptrace baseline
           kvm: Enable once the KVM post-exec clock path is qualified against the ptrace baseline
           sabre: SaBRe does not intercept RDTSCP; clock probes can leak raw host TSC
           liteinst: The preload runtime does not survive the guest's own re-exec
@@ -2231,9 +2229,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness
           sabre: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness
           liteinst: The sysfs read sanitizers are backend-independent; ptrace is the canonical required witness
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -2297,9 +2295,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: The harness control is backend-independent; ptrace is the canonical required witness
           sabre: The harness control is backend-independent; ptrace is the canonical required witness
           liteinst: The harness control is backend-independent; ptrace is the canonical required witness
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)

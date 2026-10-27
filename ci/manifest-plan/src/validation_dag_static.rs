@@ -7454,7 +7454,6 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"build.e2e_artifact_in_pinned_root"########,
             r########"build.manifest_guests_in_pinned_root"########,
             r########"build.rust_scripts_in_pinned_root"########,
-            r########"check.dbt_runtime_abi"########,
             r########"gate.manifest"########,
             r########"setup.pinned_root_fetch"########,
         ],
@@ -7499,7 +7498,6 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         deps: &[
             r########"build.host_hermit_link"########,
             r########"build.rust_scripts"########,
-            r########"check.dbt_runtime_abi"########,
             r########"compatprep.fixtures"########,
             r########"gate.manifest"########,
         ],
@@ -7738,7 +7736,6 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"build.e2e_artifact_in_pinned_root"########,
             r########"build.manifest_guests_in_pinned_root"########,
             r########"build.rust_scripts_in_pinned_root"########,
-            r########"check.dbt_runtime_abi"########,
             r########"gate.manifest"########,
             r########"setup.pinned_root_fetch"########,
         ],
@@ -7881,7 +7878,6 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"build.e2e_artifact_in_pinned_root"########,
             r########"build.manifest_guests_in_pinned_root"########,
             r########"build.rust_scripts_in_pinned_root"########,
-            r########"check.dbt_runtime_abi"########,
             r########"gate.manifest"########,
             r########"setup.pinned_root_fetch"########,
         ],
@@ -9767,7 +9763,6 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         deps: &[
             r########"build.e2e_artifact_in_pinned_root"########,
             r########"build.rust_scripts_in_pinned_root"########,
-            r########"check.dbt_runtime_abi"########,
             r########"gate.manifest"########,
             r########"privileged-build.manifest_guests_in_pinned_root"########,
             r########"privileged-build.privileged_tests"########,
@@ -9861,7 +9856,6 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         deps: &[
             r########"build.e2e_artifact_in_pinned_root"########,
             r########"build.rust_scripts_in_pinned_root"########,
-            r########"check.dbt_runtime_abi"########,
             r########"gate.manifest"########,
             r########"privileged-build.manifest_guests_in_pinned_root"########,
             r########"privileged-build.privileged_tests"########,

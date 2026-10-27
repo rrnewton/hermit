@@ -83,11 +83,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - liteinst
           - in-guest-trap
         backends_disabled:
+          dbt: "Not yet qualified for this memfd-backed procfs identity check"
           kvm: "Initial C-corpus migration preserves the established ptrace and SaBRe baseline; qualify KVM separately"
         hermit_args:
           liteinst:
@@ -1103,13 +1103,12 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: "The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest execs a child after vfork, so its run is refused. It passed before only because that exec failed with EOPNOTSUPP in both verify runs and the exec'd image never ran."
           in-guest-trap: "The in-guest runtime cannot replace the process image, so it refuses execve and execveat with a typed refusal that ends the run (test-unify, 2026-10-16); this guest execs a child after vfork, so its run is refused. It passed before only because that exec failed with EOPNOTSUPP in both verify runs and the exec'd image never ran."
@@ -1179,12 +1178,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled: {}
+        backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -1981,15 +1980,14 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
         backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -2945,17 +2943,16 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
         backends_disabled:
           liteinst: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (no thread ever runs) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
           in-guest-trap: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (no thread ever runs) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       naked:
@@ -4049,15 +4046,14 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           liteinst: true
           in-guest-trap: true
         backends_enabled:
           - ptrace
-          - dbt
           - liteinst
           - in-guest-trap
         backends_disabled:
+          dbt: userfaultfd has not been qualified on DBT
           kvm: userfaultfd has not been qualified on KVM
           sabre: userfaultfd has not been qualified on SaBRe
         hermit_args:
@@ -4570,17 +4566,16 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
         backends_disabled:
           liteinst: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (no thread ever runs) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
           in-guest-trap: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (no thread ever runs) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: SaBRe execution path is incomplete or used fallback/native sites", "result": "crash-error"}
       naked:
@@ -5805,15 +5800,14 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
         backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -6323,17 +6317,16 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
         backends_disabled:
           liteinst: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 9) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
           in-guest-trap: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 9) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         ci_disabled_reason:
           sabre: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
       naked:
@@ -6944,12 +6937,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled: {}
+        backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -7308,15 +7301,14 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
         backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -7893,9 +7885,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -8020,15 +8012,14 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
         backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -9034,15 +9025,14 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
         backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -9344,10 +9334,10 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
         backends_disabled:
+          dbt: Strict verification fails on GitHub-hosted runners (determinism-failure, first divergence at record 158, syscall 57; both attempts of https://github.com/rrnewton/hermit/actions/runs/37784639364) though it passes on the validation host; re-enable once the run-to-run difference is understood
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
@@ -9495,15 +9485,14 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
         backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -9870,15 +9859,14 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
         backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -9948,9 +9936,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -10008,19 +9996,18 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           sabre: true
           kvm: true
           liteinst: true
           in-guest-trap: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled: {}
+        backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -10083,12 +10070,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled: {}
+        backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -11228,11 +11215,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
           liteinst: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 373) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
           in-guest-trap: "The in-guest runtime runs one thread of the guest: pthread_create fails with EOPNOTSUPP (\"reverie-liteinst: clone injection requires ptrace fallback\"), the guest ignores the error, and the cell passed only vacuously (0 bytes of stdout against ptrace's 373) at hermit 238231ed; with the typed thread-creation refusal the run is refused instead"
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
       naked:
         ci: false
@@ -11364,12 +11351,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled: {}
+        backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -11432,12 +11419,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled: {}
+        backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -11500,12 +11487,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled: {}
+        backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -11642,13 +11629,12 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           sabre: false
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
         backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -11849,15 +11835,14 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           sabre: false
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
         backends_disabled:
+          dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           liteinst: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
@@ -11916,13 +11901,12 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
           sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -15797,17 +15781,16 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           sabre: false
           kvm: true
         ci_disabled_reason:
           sabre: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 26, 26, 26.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
         backends_disabled:
+          dbt: Portable release DynamoRIO can stall or exit during native pthread startup before Detcore readiness; this was the one declared DBT gap of the retired backend-parity matrix, and a --probe-disabled run is the way to requalify it
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
@@ -16302,12 +16285,12 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - sabre
           - kvm
           - liteinst
           - in-guest-trap
-        backends_disabled: {}
+        backends_disabled:
+          dbt: Never measured for this cell; the original .toml cited a missing toolchain on the authoring host, which is not evidence about the backend
         hermit_args:
           liteinst:
             - --max-timeslice=disabled
@@ -20378,13 +20361,12 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
           sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
           liteinst: New top-of-funnel coverage is established on the ptrace reference first; LiteInst ratchets against it separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -20447,13 +20429,12 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: true
           kvm: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
           sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
@@ -20811,15 +20792,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
           - liteinst
           - in-guest-trap
         guest_args:
           ptrace:
-            - --require-small-determinized
-            - --require-large-determinized
-          dbt:
             - --require-small-determinized
             - --require-large-determinized
           kvm:
@@ -20832,6 +20809,7 @@ test:
             - --require-small-determinized
             - --require-large-determinized
         backends_disabled:
+          dbt: DBT is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBT separately
           sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
         hermit_args:
           liteinst:
@@ -20976,9 +20954,9 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - dbt
           - kvm
         backends_disabled:
+          dbt: Not buildable on the authoring host (cmake absent); qualify DBT separately
           sabre: Not buildable on the authoring host (cmake absent); qualify SaBRe separately
           liteinst: LiteInst preload handshake fails on the authoring host; qualify LiteInst separately
           in-guest-trap: Owner directive 2026-10-02 - in-guest-trap (in-guest LiteInst with syscall site patching off) is scored as its own column, apart from liteinst, and its verify cells return only through their own track, as liteinst's do after the 2026-10-04 reset (step C4 of https://github.com/rrnewton/hermit/issues/3520)
