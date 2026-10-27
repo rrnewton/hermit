@@ -6,14 +6,12 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#[allow(dead_code)]
-#[path = "../../build.rs"]
-mod build_script;
-
 use std::fs;
 
 use tempfile::TempDir;
 use toml::Value;
+
+use super::build_script;
 
 const SOURCE_MANIFEST: &str = include_str!("../../Cargo.toml");
 
@@ -41,7 +39,7 @@ fn classified(manifest: &Value) -> bool {
 fn actual_source_package_has_explicit_source_identity() {
     let dir = fixture(SOURCE_MANIFEST);
     assert!(!build_script::registry_build_in(dir.path()).unwrap());
-    assert!(!cfg!(hermit_registry_build));
+    const { assert!(!cfg!(hermit_registry_build)) };
 }
 
 #[test]
