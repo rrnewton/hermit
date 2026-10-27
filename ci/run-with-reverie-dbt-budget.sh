@@ -2903,7 +2903,17 @@ fi
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory (1013), SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the b64a10cc entry.
-expected_pin=edda7ede9bc5f869974ee7eed81abf3cb3c9fa6b
+# CARRY TO 661967460beee45868e8286df097c617d67fcb6e (2026-10-27): from
+# edda7ede9bc5f869974ee7eed81abf3cb3c9fa6b. One commit (DBT lane), Reverie
+# 47bd02e3 rebased onto edda7ede with an identical patch-id: the caller-owned
+# RPC guest can now enter the existing protected returning/tail syscall driver.
+# Legacy preparation and transport are preserved; runtime Rust and tests
+# change. SDK build.rs ff1eeb32b140, vendor tree 4ab89708f2e9 and native tree
+# 164356b3ab65 are byte-identical; the DBT inventory grows from 1013 to 1014.
+# Existing SDK width and 1050 effective-job-second limits carry without
+# recalibration. This is not whole-runtime equivalence or a new cold-SDK timing
+# sample.
+expected_pin=661967460beee45868e8286df097c617d67fcb6e
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
