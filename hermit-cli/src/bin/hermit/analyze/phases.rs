@@ -62,7 +62,7 @@ fn yellow_msg(msg: &str) {
 /// `schedule` and then scheduling without chaos misses the target, while
 /// replaying event `decision` too meets it.
 pub struct PrefixDecision {
-    pub schedule: Vec<SchedEvent>,
+    pub schedule: PreemptionRecord,
     pub decision: usize,
 }
 
@@ -279,17 +279,20 @@ impl AnalyzeOpts {
     }
 
     /// One `--prefix-search` trial: replay the first `len` events of `target`,
-    /// then let the scheduler go on without chaos.
+    /// then let the scheduler go on without chaos. The trial's record keeps
+    /// the callback checkpoints within the prefix
+    /// ([`PreemptionRecord::schedule_prefix`]), so its slices end where the
+    /// recording's did.
     fn prefix_trial(
         &self,
         runname: &str,
-        target: &[SchedEvent],
+        target: &PreemptionRecord,
         len: usize,
     ) -> anyhow::Result<RunData> {
         let mut run = RunData::new_baseline(self, runname.to_string())?;
         run.runopts.det_opts.det_config.chaos = false;
         let path = run.sched_path_in().to_path_buf();
-        self.write_trial_schedule(target[..len].to_vec(), &path)?;
+        self.write_trial_record(target.schedule_prefix(len), &path)?;
         Ok(run.with_schedule_replay_from(path))
     }
 
@@ -319,11 +322,16 @@ impl AnalyzeOpts {
     /// `--prefix-search`: find the shortest prefix of the target schedule that,
     /// replayed and then continued without chaos, still meets the target
     /// criteria. Returns the index of that prefix's last event.
-    pub fn phase5_prefix_search(&self, target: &[SchedEvent]) -> anyhow::Result<PrefixDecision> {
+    pub fn phase5_prefix_search(
+        &self,
+        target_record: &PreemptionRecord,
+    ) -> anyhow::Result<PrefixDecision> {
+        let target = target_record.schedevents();
         let mut trial = 0;
         let mut meets_target = |len: usize| -> anyhow::Result<bool> {
             trial += 1;
-            let mut run = self.prefix_trial(&format!("prefix_round_{trial:03}"), target, len)?;
+            let mut run =
+                self.prefix_trial(&format!("prefix_round_{trial:03}"), target_record, len)?;
             let is_match = self.launch_prefix_trial(&mut run)?;
             eprintln!(
                 ":: Prefix of {len} of {} events => {}",
@@ -354,7 +362,7 @@ impl AnalyzeOpts {
             target[passing]
         );
         Ok(PrefixDecision {
-            schedule: target.to_vec(),
+            schedule: target_record.clone(),
             decision: passing,
         })
     }
@@ -366,7 +374,7 @@ impl AnalyzeOpts {
     fn prefix_stack(
         &self,
         runname: &str,
-        schedule: &[SchedEvent],
+        schedule: &PreemptionRecord,
         len: usize,
         position: usize,
     ) -> anyhow::Result<(bool, Option<PrettyBacktrace>)> {
@@ -394,7 +402,7 @@ impl AnalyzeOpts {
     /// them. Empty if the trial wrote no schedule (it timed out).
     fn prefix_continuation(
         &self,
-        schedule: &[SchedEvent],
+        schedule: &PreemptionRecord,
         len: usize,
     ) -> anyhow::Result<Vec<SchedEvent>> {
         let mut run = self
@@ -426,9 +434,16 @@ impl AnalyzeOpts {
         // schedule's first decision + 1 events.
         let continued = self.prefix_continuation(&schedule, decision)?;
         let (baseline_met, instead) = if continued.len() > decision {
+            // The continuation replayed the target's first `decision` events
+            // under their checkpoints, but a replay records none: give its
+            // events those checkpoints back, unless they no longer fit.
+            let baseline = schedule
+                .schedule_prefix(decision)
+                .with_schedule(continued.clone())
+                .unwrap_or_else(|| PreemptionRecord::from_sched_events(continued.clone()));
             self.prefix_stack(
                 "final_baseline_for_stacktraces",
-                &continued,
+                &baseline,
                 decision + 1,
                 decision,
             )?
@@ -455,7 +470,7 @@ impl AnalyzeOpts {
             "The scheduling decision at event #{decision} of the target schedule decides the \
              outcome.\nReplaying the first {decision} events and then scheduling without chaos \
              does not meet the target criteria; replaying event #{decision} too ({}) does ({}).\n",
-            schedule[decision],
+            schedule.schedevents()[decision],
             self.display_criteria()
         );
         header.push_str(
@@ -464,7 +479,11 @@ impl AnalyzeOpts {
              depends on which of the two runs first: add synchronization that makes the order \
              irrelevant, or that enforces the passing order.\n",
         );
-        let context = Self::generate_context(&schedule, decision.max(1), self.execution_context);
+        let context = Self::generate_context(
+            schedule.schedevents(),
+            decision.max(1),
+            self.execution_context,
+        );
 
         println!(
             "\n------------------------------ hermit analyze report ------------------------------"
@@ -1272,13 +1291,13 @@ impl AnalyzeOpts {
         &self,
         target_endpoint_run: &mut RunData,
     ) -> anyhow::Result<ExitStatus> {
-        let target = target_endpoint_run.sched_out().clone();
+        let target = target_endpoint_run.preempts_out().clone();
         eprintln!(
             ":: {} ({} events): {}",
             "Beginning prefix search within the target schedule"
                 .yellow()
                 .bold(),
-            target.len(),
+            target.schedevents().len(),
             target_endpoint_run.sched_out_file_name(),
         );
         let decision = self.phase5_prefix_search(&target)?;
@@ -1484,6 +1503,60 @@ mod tests {
             failing_schedule: schedule.clone(),
             passing_schedule: schedule,
             critical_event_index: index,
+        }
+    }
+
+    /// A `--prefix-search` trial replays the target record's first events
+    /// together with the callback checkpoints those events reach, so its
+    /// slices end where the recording's did; a checkpoint past the prefix is
+    /// dropped.
+    #[test]
+    fn a_prefix_trial_keeps_the_target_checkpoints_within_its_prefix() {
+        let parent = tempfile::tempdir().unwrap();
+        let tmp_dir = format!("--tmp-dir={}", parent.path().display());
+        let mut options =
+            AnalyzeOpts::try_parse_from(["analyze", tmp_dir.as_str(), "--", "/bin/true"]).unwrap();
+        options.phase0_initialize().unwrap();
+        let branches = |count: u32| {
+            serde_json::json!({
+                "dettid": 3, "op": "Branch", "count": count,
+                "start_rip": null, "end_rip": null, "end_time": null
+            })
+        };
+        let checkpoint = |row: usize, progress: u64, time: u64| {
+            serde_json::json!({
+                "history_index": row,
+                "origin": {
+                    "callback": "PmuTimer", "site": "Prehook", "progress": progress,
+                    "last_op": "Branch", "time": time, "rcbs": progress
+                }
+            })
+        };
+        let target: PreemptionRecord = serde_json::from_value(serde_json::json!({
+            "per_thread": {"3": {
+                "final_prio": 1000,
+                "prio_changes": [[100, 1000], [200, 1000]],
+                "preemption_rcbs": [10, 15]
+            }},
+            "global": [branches(10), branches(5)],
+            "callback_checkpoints": {"3": [checkpoint(0, 10, 100), checkpoint(1, 15, 200)]}
+        }))
+        .unwrap();
+        target.validate().unwrap();
+        for (len, kept) in [(0, 0), (1, 1), (2, 2)] {
+            let mut run = options.prefix_trial("prefix_round", &target, len).unwrap();
+            let written: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(run.sched_path_in()).unwrap())
+                    .unwrap();
+            assert_eq!(written["global"].as_array().unwrap().len(), len);
+            let points = written["callback_checkpoints"]["3"]
+                .as_array()
+                .map_or(0, |points| points.len());
+            assert_eq!(points, kept, "prefix of {len}: {written}");
+            PreemptionReader::new(run.sched_path_in())
+                .load_all()
+                .validate()
+                .unwrap();
         }
     }
 
