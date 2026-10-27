@@ -3958,7 +3958,7 @@ fn edge_kind_text(kind: HbEdgeKind) -> &'static str {
     }
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use detcore_model::access_trace::CursorOp;
     use detcore_model::access_trace::EdgeRecord;
     use detcore_model::access_trace::FutexOp;
@@ -4148,7 +4148,7 @@ mod tests {
 
     /// Thread 7 opens fd 6 before the window; with the deciding event,
     /// thread 9 closes it before thread 7 reads it.
-    fn close_then_read() -> (AccessTrace, AccessTrace) {
+    pub(crate) fn close_then_read() -> (AccessTrace, AccessTrace) {
         let mine = Some(file(7, 1));
         let open = call(
             90,

@@ -76,6 +76,10 @@ use crate::analyze::races::happens_before;
 /// At most this many passes, each one replay of each side.
 pub const MAX_PASSES: usize = 8;
 
+/// A fault address below this (the first page) is a null dereference's,
+/// not an object's: it is not watched.
+pub const NULL_PAGE: u64 = 4096;
+
 /// At most this many unwatched pieces are listed by name; the rest are
 /// counted.
 pub const MAX_UNWATCHED_LISTED: usize = 16;
@@ -436,7 +440,8 @@ pub fn trace_candidates(target: &AccessTrace, decision: EventIndex) -> Vec<Candi
                 if matches!(signal.signo, libc::SIGSEGV | libc::SIGBUS)
                     && signal.event >= decision =>
             {
-                if let Some(addr) = signal.addr {
+                // A null or near-null fault address names no object.
+                if let Some(addr) = signal.addr.filter(|addr| *addr >= NULL_PAGE) {
                     out.extend(Candidate::new(
                         addr,
                         8,
@@ -1256,6 +1261,10 @@ pub struct WatchStage {
     /// used): not watched after all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub dropped: Vec<WatchedBytes>,
+    /// The syscall finder named a pair, and only the bytes --race-watch names
+    /// were watched, beside it.
+    #[serde(default)]
+    pub beside_finder: bool,
     /// Some accesses were not seen for reasons the other lists do not show:
     /// a thread's later hits not kept in order, a thread whose process is
     /// unknown, or a pass cut where it ran on its own (the notes say which).
@@ -1297,6 +1306,7 @@ impl WatchStage {
             unwatched: Vec::new(),
             more_unwatched: 0,
             dropped: Vec::new(),
+            beside_finder: false,
             partial: false,
             late: Vec::new(),
             pairs: Vec::new(),
@@ -1505,7 +1515,17 @@ pub fn render_watch_stage(stage: &WatchStage) -> Vec<String> {
         WatchStatus::NoneFound => "none found",
         WatchStatus::Unavailable => "unavailable",
     };
-    lines.push(format!("Watched memory: {status}: {}.", stage.reason));
+    let scope = if stage.beside_finder {
+        " (only the bytes --race-watch names, beside the syscall finder's pair above; a \
+         synchronization pair can decide when a race is exposed without being its memory root \
+         cause, and a watched pair need not be what decides the outcome)"
+    } else {
+        ""
+    };
+    lines.push(format!(
+        "Watched memory{scope}: {status}: {}.",
+        stage.reason
+    ));
     if !stage.watched.is_empty() {
         lines.push(format!(
             "  Watched from event {} on, in both runs:",
@@ -1645,7 +1665,8 @@ pub fn render_watch_stage(stage: &WatchStage) -> Vec<String> {
             WatchUnarmed::NoStop => "it made no stop at which it could arm",
         };
         lines.push(format!(
-            "  Thread {thread} never armed its watches ({why}), so its accesses are not seen."
+            "  Thread {thread} never armed its watches ({why}): it was not observed, so that the \
+             passes show no access of it is no evidence it made none."
         ));
     }
     for (thread, armed_before) in &stage.late {
@@ -2732,5 +2753,27 @@ WARNING: ThreadSanitizer: data race on vptr (ctor/dtor vs virtual call) (pid=3)
             notes.iter().any(|n| n.starts_with("2 later access(es)")),
             "{notes:?}"
         );
+    }
+
+    /// A SIGSEGV at a null or near-null address names no object to watch;
+    /// one at a real address does.
+    #[test]
+    fn a_null_fault_address_is_not_watched() {
+        let fault = |addr| {
+            TraceRecord::Signal(detcore_model::access_trace::SignalRecord {
+                event: 10,
+                tid: tid(5),
+                signo: libc::SIGSEGV,
+                code: 1,
+                addr: Some(addr),
+                sender: None,
+                delivery: detcore_model::access_trace::SignalDelivery::Fatal,
+            })
+        };
+        assert!(trace_candidates(&trace(vec![fault(0)]), 10).is_empty());
+        assert!(trace_candidates(&trace(vec![fault(0x10)]), 10).is_empty());
+        let real = trace_candidates(&trace(vec![fault(0x2cb4a70)]), 10);
+        assert_eq!(real.len(), 1);
+        assert_eq!(real[0].addr, 0x2cb4a70);
     }
 }

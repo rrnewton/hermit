@@ -1994,7 +1994,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_section_with_no_deciding_pair_runs_the_watch_stage,
     // a_pass_is_kept_only_when_it_is_a_run_of_its_side and
     // a_refused_pass_says_where_the_reason_is: 1394.
-    ("test.hermit_unit", 1394),
+    // And the watch stage's named_bytes_are_watched_whatever_the_finder_found,
+    // named_bytes_alone_are_watched_beside_a_found_pair and
+    // a_null_fault_address_is_not_watched: 1397.
+    ("test.hermit_unit", 1397),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6123,7 +6126,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same undecided-candidates test: 1361.
     // And the same --watch refusal test: 1362.
     // And the same 26 watch-stage tests: 1388.
-    ("test.hermit_unit_on_host", 1388),
+    // And the same three: 1391.
+    ("test.hermit_unit_on_host", 1391),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

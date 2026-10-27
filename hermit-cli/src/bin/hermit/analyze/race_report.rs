@@ -43,6 +43,7 @@ use reverie::syscalls::Sysno;
 use crate::analyze::phases::Departure;
 use crate::analyze::phases::departure;
 use crate::analyze::phases::stack_thread;
+use crate::analyze::race_watch::Candidate;
 use crate::analyze::race_watch::SideView;
 use crate::analyze::race_watch::WatchStage;
 use crate::analyze::race_watch::WatchedBytes;
@@ -333,11 +334,10 @@ impl AnalyzeOpts {
             }
             promote_the_deciding_candidate(&mut result);
         }
-        // No kernel-visible pair decided it: the race may be on memory.
-        if matches!(
-            result.status,
-            RaceStatus::NoneFound | RaceStatus::Candidates
-        ) {
+        // The stage runs when no kernel-visible pair decided it (the race
+        // may be on memory), and for bytes the user names whatever the
+        // finder found.
+        if let Some(scope) = watch_scope(result.status, !self.race_watch.is_empty()) {
             result.watch = Some(if !target_met {
                 WatchStage::unavailable(
                     decision,
@@ -356,7 +356,7 @@ impl AnalyzeOpts {
                 self.watch_stage(
                     decision,
                     (&target, &baseline),
-                    &target_trace.trace,
+                    (&target_trace.trace, scope),
                     &watch_run,
                 )
             });
@@ -407,7 +407,7 @@ impl AnalyzeOpts {
         &self,
         decision: EventIndex,
         (target, baseline): (&TracedReplay, &TracedReplay),
-        target_trace: &AccessTrace,
+        (target_trace, scope): (&AccessTrace, WatchScope),
         replay: &dyn Fn(&'static str, &str) -> anyhow::Result<RunData>,
     ) -> WatchStage {
         let from = self.race_watch_from(decision, &target.realized, &baseline.realized);
@@ -418,28 +418,29 @@ impl AnalyzeOpts {
             Some(dir) if runopts.program().is_relative() => dir.join(runopts.program()),
             _ => runopts.program().to_path_buf(),
         };
-        let (mut candidates, symbol_notes) = race_watch_candidates(&program, &self.race_watch);
-        if let Some(stderr) = target
-            .stderr
-            .as_ref()
-            .and_then(|path| std::fs::read(path).ok())
-        {
-            candidates.extend(sanitizer_candidates(&String::from_utf8_lossy(&stderr)));
-        }
-        candidates.extend(trace_candidates(target_trace, decision));
+        let (candidates, symbol_notes) =
+            self.watch_candidates(&program, scope, target, (target_trace, decision));
         if candidates.is_empty() {
-            let mut stage = WatchStage::unavailable(
-                from,
-                "there are no bytes to watch: no sanitizer report in the target's stderr, no \
-                 fault address and no futex call at the deciding event; name them with \
-                 --race-watch=ADDR[:LEN] or SYM[+OFF][:LEN]"
-                    .to_owned(),
-            );
+            let reason = match scope {
+                // Beside a found pair only the named bytes are candidates:
+                // the automatic sources were not looked at.
+                WatchScope::Named => {
+                    "none of the --race-watch ranges could be placed; see the placement notes"
+                }
+                WatchScope::Found => {
+                    "there are no bytes to watch: no sanitizer report in the target's stderr, no \
+                     fault address and no futex call at the deciding event; name them with \
+                     --race-watch=ADDR[:LEN] or SYM[+OFF][:LEN]"
+                }
+            };
+            let mut stage = WatchStage::unavailable(from, reason.to_owned());
             stage.notes = symbol_notes;
+            stage.beside_finder = scope == WatchScope::Named;
             return stage;
         }
         let (passes, unwatched, more_unwatched) = plan_passes(&candidates);
         let mut stage = WatchStage::unavailable(from, String::new());
+        stage.beside_finder = scope == WatchScope::Named;
         stage.unwatched = unwatched;
         stage.more_unwatched = more_unwatched as u64;
         stage.notes = symbol_notes;
@@ -566,6 +567,32 @@ impl AnalyzeOpts {
             stage.notes.push(note);
         }
         stage
+    }
+
+    /// The bytes the watch stage watches: those --race-watch names, and,
+    /// when the finder named no deciding pair ([`WatchScope::Found`]), those
+    /// the analysis finds (a sanitizer report in the target's stderr, a
+    /// fault address, the futex word at `decision`); with notes on named
+    /// symbols that could not be placed.
+    fn watch_candidates(
+        &self,
+        program: &Path,
+        scope: WatchScope,
+        target: &TracedReplay,
+        (target_trace, decision): (&AccessTrace, EventIndex),
+    ) -> (Vec<Candidate>, Vec<String>) {
+        let (mut candidates, notes) = race_watch_candidates(program, &self.race_watch);
+        if scope == WatchScope::Found {
+            if let Some(stderr) = target
+                .stderr
+                .as_ref()
+                .and_then(|path| std::fs::read(path).ok())
+            {
+                candidates.extend(sanitizer_candidates(&String::from_utf8_lossy(&stderr)));
+            }
+            candidates.extend(trace_candidates(target_trace, decision));
+        }
+        (candidates, notes)
     }
 
     /// Replay `side` once more with pass `index`'s watches from event `from`
@@ -1370,6 +1397,30 @@ fn read_stack(path: &Path) -> Option<PrettyBacktrace> {
     }
 }
 
+/// Which bytes the watch stage watches, when it runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WatchScope {
+    /// The finder named no deciding pair: every candidate, those the
+    /// analysis finds and those --race-watch names.
+    Found,
+    /// The finder named one: only the bytes --race-watch names.
+    Named,
+}
+
+/// Whether the watch stage runs for a section whose finder ended with
+/// `status`, and on which bytes: when no kernel-visible pair decides the
+/// outcome, on every candidate; otherwise only when the user named bytes
+/// (`--race-watch`), on those, beside the finder's pair. Nothing to read
+/// (an unavailable section) runs nothing.
+fn watch_scope(status: RaceStatus, named: bool) -> Option<WatchScope> {
+    match status {
+        RaceStatus::NoneFound | RaceStatus::Candidates => Some(WatchScope::Found),
+        RaceStatus::Unavailable => None,
+        _ if named => Some(WatchScope::Named),
+        _ => None,
+    }
+}
+
 /// Whether two runs realized the same event: every field, the thread,
 /// operation, count, instructions and the time it ended.
 fn same_realized_event(a: &SchedEvent, b: &SchedEvent) -> bool {
@@ -1608,6 +1659,176 @@ mod tests {
         assert!(note.unwrap().contains("left out"));
         let short = keep_pass(1, "target", true, &side[..5], &side, 2).unwrap();
         assert_eq!(short.0, Some(5), "a pass that realized fewer events");
+    }
+
+    /// The stage watches every candidate when no kernel-visible pair decides
+    /// the outcome, and the bytes the user names whatever the finder found;
+    /// an unavailable section runs nothing.
+    #[test]
+    fn named_bytes_are_watched_whatever_the_finder_found() {
+        use RaceStatus::*;
+        for status in [NoneFound, Candidates] {
+            assert_eq!(watch_scope(status, false), Some(WatchScope::Found));
+            assert_eq!(watch_scope(status, true), Some(WatchScope::Found));
+        }
+        for status in [Found, Timing, FoundByIntervention] {
+            assert_eq!(watch_scope(status, false), None);
+            assert_eq!(watch_scope(status, true), Some(WatchScope::Named));
+        }
+        assert_eq!(watch_scope(Unavailable, true), None);
+    }
+
+    /// When the finder names a pair, the bytes --race-watch names are still
+    /// watched, they alone, beside it: the finder's status and pair stay
+    /// the section's, and the stage's headline says what it watched and why
+    /// the two can differ. Without --race-watch the stage does not run.
+    #[test]
+    fn named_bytes_alone_are_watched_beside_a_found_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        let tid = detcore::types::DetTid::from_raw;
+        let (mut target, baseline) = crate::analyze::races::tests::close_then_read();
+        // Thread 7 then ends the process with a nonzero code: the outcome.
+        target.records.push(TraceRecord::Syscall(SyscallRecord {
+            pre: 105,
+            post: None,
+            tid: tid(7),
+            pid: DetPid::from_raw(3),
+            nth: 21,
+            sysno: Sysno::exit_group,
+            args: [1, 0, 0, 0, 0, 0],
+            result: None,
+            accesses: Vec::new(),
+            returned: None,
+            out_bytes: None,
+        }));
+        let write = |name: &str, trace: &AccessTrace| {
+            let path = dir.path().join(name);
+            let mut out = Vec::new();
+            TraceRecord::Header(trace.header.clone())
+                .write_line(&mut out)
+                .unwrap();
+            for record in &trace.records {
+                record.write_line(&mut out).unwrap();
+            }
+            if let Some(end) = &trace.end {
+                TraceRecord::End(end.clone()).write_line(&mut out).unwrap();
+            }
+            std::fs::write(&path, out).unwrap();
+            path
+        };
+        let stderr = dir.path().join("target.stderr");
+        std::fs::write(
+            &stderr,
+            "  Write of size 8 at 0x000000005000 by thread T1:\n  Read of size 8 at 0x000000006000 by main thread:\n",
+        )
+        .unwrap();
+        let replay = |role: &'static str, trace: &AccessTrace| TracedReplay {
+            role,
+            trace: Ok(write(&format!("{role}.access"), trace)),
+            departure: None,
+            realized: (0..110).map(|_| SchedEvent::branches(tid(3), 10)).collect(),
+            realized_path: dir.path().join(format!("{role}_out.preempts")),
+            schedule_error: None,
+            stderr: (role == "target").then(|| stderr.clone()),
+        };
+        let section = |args: &[&str]| {
+            let options = AnalyzeOpts::try_parse_from(args).unwrap();
+            let r = options.racing_accesses(
+                100,
+                replay("target", &target),
+                replay("baseline", &baseline),
+                (true, false),
+                (
+                    |_: &str| -> anyhow::Result<RunData> { anyhow::bail!("no stacks here") },
+                    |_: &str,
+                     _: &str,
+                     _: &[SchedEvent],
+                     _: usize,
+                     _: usize|
+                     -> anyhow::Result<RunData> {
+                        anyhow::bail!("no checks here")
+                    },
+                    |_: &'static str, _: &str| -> anyhow::Result<RunData> {
+                        anyhow::bail!("no watch runner here")
+                    },
+                ),
+            );
+            (options, r)
+        };
+        let base = ["analyze", "--target-exit-code=nonzero"];
+        let (_, plain) = section(&[&base[..], &["--", "/bin/true"]].concat());
+        assert_eq!(plain.status, RaceStatus::Found, "{}", plain.reason);
+        assert!(plain.watch.is_none(), "no --race-watch, no stage");
+
+        let (options, named) =
+            section(&[&base[..], &["--race-watch=0x1000:8", "--", "/bin/true"]].concat());
+        assert_eq!(named.status, plain.status);
+        assert_eq!(named.accesses, plain.accesses, "the finder's pair stays");
+        let watch = named.watch.as_ref().expect("the named bytes are watched");
+        assert!(watch.beside_finder);
+        assert!(
+            watch.reason.contains("no watch runner here"),
+            "{}",
+            watch.reason
+        );
+        let text = crate::analyze::races::render_racing_accesses(&named);
+        assert!(
+            text.contains(
+                "Watched memory (only the bytes --race-watch names, beside the syscall finder's \
+                 pair above;"
+            ),
+            "{text}"
+        );
+
+        // Beside a found pair only the named bytes are candidates; with no
+        // deciding pair, the sanitizer's are too.
+        let target_replay = replay("target", &target);
+        let futex_trace = AccessTrace {
+            header: target.header.clone(),
+            records: Vec::new(),
+            end: target.end.clone(),
+        };
+        let pick = |scope| {
+            options
+                .watch_candidates(
+                    Path::new("/nonexistent"),
+                    scope,
+                    &target_replay,
+                    (&futex_trace, 100),
+                )
+                .0
+                .iter()
+                .map(|c| c.addr)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pick(WatchScope::Named), vec![0x1000]);
+        assert_eq!(pick(WatchScope::Found), vec![0x1000, 0x5000, 0x6000]);
+
+        // A named symbol that cannot be placed leaves nothing to watch
+        // beside the pair, and the stage says so, not that the sanitizer's
+        // bytes (there in the target's stderr) are absent.
+        let (_, unplaced) = section(
+            &[
+                &base[..],
+                &["--race-watch=no_such_symbol", "--", "/nonexistent/program"],
+            ]
+            .concat(),
+        );
+        assert_eq!(unplaced.status, RaceStatus::Found);
+        let watch = unplaced.watch.as_ref().expect("the stage reports");
+        assert_eq!(watch.status, WatchStatus::Unavailable);
+        assert_eq!(
+            watch.reason,
+            "none of the --race-watch ranges could be placed; see the placement notes"
+        );
+        assert!(
+            watch
+                .notes
+                .iter()
+                .any(|n| n.starts_with("--race-watch=no_such_symbol: not watched")),
+            "{:?}",
+            watch.notes
+        );
     }
 
     /// A refused pass says which run it was and where Hermit printed why,
