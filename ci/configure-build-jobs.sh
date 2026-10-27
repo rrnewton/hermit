@@ -2984,8 +2984,18 @@ fi
 # Existing SDK width and 1050 effective-job-second limits carry without
 # recalibration. This is not whole-runtime equivalence or a new cold-SDK timing
 # sample.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 661967460beee45868e8286df097c617d67fcb6e ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 661967460beee45868e8286df097c617d67fcb6e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO e9aa3e4393627655e6ac08516f1295683fdfd7d1 (2026-10-27): from
+# 661967460beee45868e8286df097c617d67fcb6e. Two commits: 431b2cc5 (a KVM
+# preemption timer in reverie-kvm that nothing arms yet, with a doc comment
+# in reverie/src/pmu_config.rs and its source catalog row) and e9aa3e43 (a
+# LinuxEmu signalfd answers each thread from its own queue and its
+# process's, with UnsupportedOperation::Signalfd in
+# reverie/src/unsupported.rs). git diff is empty under reverie-dbt/ and
+# third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory, SDK and native inputs, calibrated
+# budget, job width and limits carry unchanged from the 66196746 entry.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != e9aa3e4393627655e6ac08516f1295683fdfd7d1 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie e9aa3e4393627655e6ac08516f1295683fdfd7d1 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
