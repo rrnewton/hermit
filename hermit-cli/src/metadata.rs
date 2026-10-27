@@ -878,15 +878,15 @@ impl RecordVersion {
 // signal's delivery Detcore now retires the process's other threads in that
 // turn, where it left them to the host. An older recording's schedule has
 // those threads running on, so it is refused here.
-// 0x190 -> 0x191 (ledger-assigned for this change; PMU-H moves to 0x192):
-// a send or receive with MSG_DONTWAIT on a socketpair end the guest
-// left blocking runs once, as on Linux, where Detcore polled it until it
-// stopped failing with EAGAIN. A recording of such a call that polled until
-// another thread wrote holds those retries and the data, while this build
-// returns the first EAGAIN to the guest and falls out of step. One that
-// succeeded at once also took a polling turn that this build no longer
-// takes, so its schedule differs. Both are refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x191);
+// 0x191 -> 0x193 (ledger-assigned 0x193 for this change; 0x192 is reserved
+// for PMU-H): every /proc status file Detcore renders now shows TracerPid 0,
+// by any path to the task, where it showed 1 on a task's own paths
+// (/proc/self, /proc/thread-self). Detcore renders the status file over the
+// recorded procfs bytes during recording and replay, so an older stream
+// replayed under the new rendering would show the guest 0 where it read 1,
+// and a guest that branches on the value, as a death test that looks for a
+// debugger does, would diverge. It is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x193);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -911,7 +911,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x191);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x191;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x193;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,

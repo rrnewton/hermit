@@ -14,10 +14,13 @@
 // with raise(SIGTRAP); otherwise it calls abort(). Run outside a debugger, the
 // child dies of SIGABRT.
 //
-// Under Hermit the child read TracerPid 1 and raised SIGTRAP, which the ptrace
-// backend did not deliver. A statement that went on to wait then hung its
-// parent for good. This child writes googletest's "lived" byte and exits
-// instead, so a regression fails at once rather than hanging.
+// Under Hermit the child read TracerPid 1 and raised SIGTRAP. The ptrace
+// backend used not to deliver a SIGTRAP a guest sends itself, so a statement
+// that went on to wait hung its parent for good; this child writes
+// googletest's "lived" byte and exits instead, so that failure shows at once
+// rather than as a hang. Now that the backend delivers it, a child that reads
+// TracerPid 1 dies of SIGTRAP (signal 5) rather than SIGABRT. Either way the
+// output differs from a native run's.
 
 #include <errno.h>
 #include <signal.h>
