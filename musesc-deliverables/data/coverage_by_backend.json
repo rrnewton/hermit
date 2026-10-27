@@ -1,0 +1,14 @@
+[
+ {"backend": "ptrace", "kind": "exercised", "count": 260},
+ {"backend": "ptrace", "kind": "never", "count": 113},
+ {"backend": "kvm", "kind": "exercised", "count": 257},
+ {"backend": "kvm", "kind": "never", "count": 116},
+ {"backend": "sabre", "kind": "exercised", "count": 246},
+ {"backend": "sabre", "kind": "never", "count": 127},
+ {"backend": "liteinst", "kind": "exercised", "count": 233},
+ {"backend": "liteinst", "kind": "never", "count": 140},
+ {"backend": "in-guest-trap", "kind": "exercised", "count": 233},
+ {"backend": "in-guest-trap", "kind": "never", "count": 140},
+ {"backend": "dbt", "kind": "exercised", "count": 0},
+ {"backend": "dbt", "kind": "never", "count": 373}
+]

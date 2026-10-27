@@ -1,0 +1,2626 @@
+[
+ {
+  "run_id": "disabled-liteinst-a1",
+  "producer": "pressure-test",
+  "cell": "system-utils/procfs-sanitized-paths/verify/liteinst",
+  "reason": "cell attempt 1 matched report is internally inconsistent",
+  "values": [
+   {
+    "test": "system-utils/procfs-sanitized-paths",
+    "mode": "verify",
+    "backend": "liteinst",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "canonical verification did not match: verified=true verdict=matched bitwise_parity=false"
+    ]
+   },
+   {
+    "test": "system-utils/procfs-sanitized-paths",
+    "mode": "verify",
+    "backend": "liteinst",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "canonical verification did not match: verified=true verdict=matched bitwise_parity=false"
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "disabled-liteinst-a1",
+  "producer": "pressure-test",
+  "cell": "system-utils/procfs-sanitized-paths/verify/liteinst",
+  "reason": "cell attempt 1 matched report is internally inconsistent",
+  "values": [
+   {
+    "test": "system-utils/procfs-sanitized-paths",
+    "mode": "verify",
+    "backend": "liteinst",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "canonical verification did not match: verified=true verdict=matched bitwise_parity=false"
+    ]
+   },
+   {
+    "test": "system-utils/procfs-sanitized-paths",
+    "mode": "verify",
+    "backend": "liteinst",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "canonical verification did not match: verified=true verdict=matched bitwise_parity=false"
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-0948c8ebf9ab-20261027T054848Z-survey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/syscall-file-metadata/replay/ptrace",
+  "reason": "cell attempt 1 reason claims a failed declared expected output that contradicts its evidence: only a verify cell declares expected stdout, and this is a replay cell",
+  "values": [
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-0948c8ebf9ab-20261027T054848Z-survey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/syscall-file-metadata/replay/ptrace",
+  "reason": "cell attempt 1 reason claims a failed declared expected output that contradicts its evidence: only a verify cell declares expected stdout, and this is a replay cell",
+  "values": [
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051230Z-resurvey-dbt",
+  "producer": "pressure-test",
+  "cell": "c-programs/ipc-determinism/chaos/dbt",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/ipc-determinism",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "c-programs/thread-sync-determinism",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "determinism-stress-c/thread-contention",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051230Z-resurvey-dbt",
+  "producer": "pressure-test",
+  "cell": "c-programs/thread-sync-determinism/chaos/dbt",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/ipc-determinism",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "c-programs/thread-sync-determinism",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "determinism-stress-c/thread-contention",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051230Z-resurvey-dbt",
+  "producer": "pressure-test",
+  "cell": "determinism-stress-c/thread-contention/chaos/dbt",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/ipc-determinism",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "c-programs/thread-sync-determinism",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "determinism-stress-c/thread-contention",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051230Z-resurvey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/nanosleep-threads-simple/replay/ptrace",
+  "reason": "cell attempt 1 matched report is internally inconsistent",
+  "values": [
+   {
+    "test": "c-programs/nanosleep-threads-simple",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   },
+   {
+    "test": "shared-futex-c/qemu-hello",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   },
+   {
+    "test": "system-utils/sh-exit-status",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051230Z-resurvey-ptrace",
+  "producer": "pressure-test",
+  "cell": "shared-futex-c/qemu-hello/replay/ptrace",
+  "reason": "cell attempt 1 matched report is internally inconsistent",
+  "values": [
+   {
+    "test": "c-programs/nanosleep-threads-simple",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   },
+   {
+    "test": "shared-futex-c/qemu-hello",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   },
+   {
+    "test": "system-utils/sh-exit-status",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051230Z-resurvey-ptrace",
+  "producer": "pressure-test",
+  "cell": "system-utils/sh-exit-status/replay/ptrace",
+  "reason": "cell attempt 1 matched report is internally inconsistent",
+  "values": [
+   {
+    "test": "c-programs/nanosleep-threads-simple",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   },
+   {
+    "test": "shared-futex-c/qemu-hello",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   },
+   {
+    "test": "system-utils/sh-exit-status",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051230Z-resurvey-ptrace",
+  "producer": "pressure-test",
+  "cell": "util-c/pmu-skid/replay/ptrace",
+  "reason": "cell attempt 1 matched report is internally inconsistent",
+  "values": [
+   {
+    "test": "c-programs/nanosleep-threads-simple",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   },
+   {
+    "test": "shared-futex-c/qemu-hello",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   },
+   {
+    "test": "system-utils/sh-exit-status",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051230Z-resurvey-sabre",
+  "producer": "pressure-test",
+  "cell": "c-programs/thread-sync-determinism/chaos/sabre",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/thread-sync-determinism",
+    "mode": "chaos",
+    "backend": "sabre",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "determinism-stress-c/thread-contention",
+    "mode": "chaos",
+    "backend": "sabre",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "determinism-stress/order-violation",
+    "mode": "chaos",
+    "backend": "sabre",
+    "result": "determinism-failure",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "FAIL",
+     "FAIL",
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "",
+     "canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051230Z-resurvey-sabre",
+  "producer": "pressure-test",
+  "cell": "determinism-stress-c/thread-contention/chaos/sabre",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/thread-sync-determinism",
+    "mode": "chaos",
+    "backend": "sabre",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "determinism-stress-c/thread-contention",
+    "mode": "chaos",
+    "backend": "sabre",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "determinism-stress/order-violation",
+    "mode": "chaos",
+    "backend": "sabre",
+    "result": "determinism-failure",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "FAIL",
+     "FAIL",
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "",
+     "canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051230Z-resurvey-sabre",
+  "producer": "pressure-test",
+  "cell": "determinism-stress/order-violation/chaos/sabre",
+  "reason": "cell attempt 25 matched report is internally inconsistent",
+  "values": [
+   {
+    "test": "c-programs/thread-sync-determinism",
+    "mode": "chaos",
+    "backend": "sabre",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "determinism-stress-c/thread-contention",
+    "mode": "chaos",
+    "backend": "sabre",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "determinism-stress/order-violation",
+    "mode": "chaos",
+    "backend": "sabre",
+    "result": "determinism-failure",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "FAIL",
+     "FAIL",
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "",
+     "canonical verification did not match: verified=false verdict=diverged bitwise_parity=false"
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051932Z-resurvey-dbt",
+  "producer": "pressure-test",
+  "cell": "c-programs/ipc-determinism/chaos/dbt",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/ipc-determinism",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "c-programs/thread-sync-determinism",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "determinism-stress-c/thread-contention",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051932Z-resurvey-dbt",
+  "producer": "pressure-test",
+  "cell": "c-programs/thread-sync-determinism/chaos/dbt",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/ipc-determinism",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "c-programs/thread-sync-determinism",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "determinism-stress-c/thread-contention",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051932Z-resurvey-dbt",
+  "producer": "pressure-test",
+  "cell": "determinism-stress-c/thread-contention/chaos/dbt",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/ipc-determinism",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "c-programs/thread-sync-determinism",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "determinism-stress-c/thread-contention",
+    "mode": "chaos",
+    "backend": "dbt",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051932Z-resurvey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/nanosleep-threads-simple/replay/ptrace",
+  "reason": "cell attempt 1 matched report is internally inconsistent",
+  "values": [
+   {
+    "test": "c-programs/nanosleep-threads-simple",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   },
+   {
+    "test": "shared-futex-c/qemu-hello",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   },
+   {
+    "test": "system-utils/sh-exit-status",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051932Z-resurvey-ptrace",
+  "producer": "pressure-test",
+  "cell": "shared-futex-c/qemu-hello/replay/ptrace",
+  "reason": "cell attempt 1 matched report is internally inconsistent",
+  "values": [
+   {
+    "test": "c-programs/nanosleep-threads-simple",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   },
+   {
+    "test": "shared-futex-c/qemu-hello",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   },
+   {
+    "test": "system-utils/sh-exit-status",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051932Z-resurvey-ptrace",
+  "producer": "pressure-test",
+  "cell": "system-utils/sh-exit-status/replay/ptrace",
+  "reason": "cell attempt 1 matched report is internally inconsistent",
+  "values": [
+   {
+    "test": "c-programs/nanosleep-threads-simple",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   },
+   {
+    "test": "shared-futex-c/qemu-hello",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   },
+   {
+    "test": "system-utils/sh-exit-status",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051932Z-resurvey-ptrace",
+  "producer": "pressure-test",
+  "cell": "util-c/pmu-skid/replay/ptrace",
+  "reason": "cell attempt 1 matched report is internally inconsistent",
+  "values": [
+   {
+    "test": "c-programs/nanosleep-threads-simple",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   },
+   {
+    "test": "shared-futex-c/qemu-hello",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   },
+   {
+    "test": "system-utils/sh-exit-status",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "pass",
+    "failure_class": null,
+    "outcome": "PASS",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "PASS"
+    ],
+    "attempt_reasons": [
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051932Z-resurvey-sabre",
+  "producer": "pressure-test",
+  "cell": "c-programs/ipc-determinism/chaos/sabre",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/ipc-determinism",
+    "mode": "chaos",
+    "backend": "sabre",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "determinism-stress-c/thread-contention",
+    "mode": "chaos",
+    "backend": "sabre",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-7903351de45b-20261025T051932Z-resurvey-sabre",
+  "producer": "pressure-test",
+  "cell": "determinism-stress-c/thread-contention/chaos/sabre",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/ipc-determinism",
+    "mode": "chaos",
+    "backend": "sabre",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "determinism-stress-c/thread-contention",
+    "mode": "chaos",
+    "backend": "sabre",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-cbbe4c757611-20261027T051422Z-survey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/syscall-file-metadata/replay/ptrace",
+  "reason": "cell attempt 1 reason claims a failed declared expected output that contradicts its evidence: only a verify cell declares expected stdout, and this is a replay cell",
+  "values": [
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/threads-fd-churn",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (14 bytes, sha256 7c7e3ef39c92fbd1c324f054a32498dd87361f11757c365d71b392ecebfb3a8a) differs from"
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-cbbe4c757611-20261027T051422Z-survey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/syscall-file-metadata/replay/ptrace",
+  "reason": "cell attempt 1 reason claims a failed declared expected output that contradicts its evidence: only a verify cell declares expected stdout, and this is a replay cell",
+  "values": [
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/threads-fd-churn",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (14 bytes, sha256 7c7e3ef39c92fbd1c324f054a32498dd87361f11757c365d71b392ecebfb3a8a) differs from"
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-cbbe4c757611-20261027T051422Z-survey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/threads-fd-churn/replay/ptrace",
+  "reason": "cell attempt 1 reason claims a failed declared expected output that contradicts its evidence: only a verify cell declares expected stdout, and this is a replay cell",
+  "values": [
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/threads-fd-churn",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (14 bytes, sha256 7c7e3ef39c92fbd1c324f054a32498dd87361f11757c365d71b392ecebfb3a8a) differs from"
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-ebf077bc2554-20261026T054214Z-survey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/syscall-file-io/replay/ptrace",
+  "reason": "cell attempt 1 reason claims a failed declared expected output that contradicts its evidence: only a verify cell declares expected stdout, and this is a replay cell",
+  "values": [
+   {
+    "test": "c-programs/syscall-file-io",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-ebf077bc2554-20261026T054214Z-survey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/syscall-file-metadata/replay/ptrace",
+  "reason": "cell attempt 1 reason claims a failed declared expected output that contradicts its evidence: only a verify cell declares expected stdout, and this is a replay cell",
+  "values": [
+   {
+    "test": "c-programs/syscall-file-io",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-ebf077bc2554-20261026T054214Z-survey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/syscall-file-metadata/replay/ptrace",
+  "reason": "cell attempt 1 reason claims a failed declared expected output that contradicts its evidence: only a verify cell declares expected stdout, and this is a replay cell",
+  "values": [
+   {
+    "test": "c-programs/syscall-file-io",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-ebf077bc2554-20261026T054214Z-survey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/threads-fd-churn/replay/ptrace",
+  "reason": "cell attempt 1 reason claims a failed declared expected output that contradicts its evidence: only a verify cell declares expected stdout, and this is a replay cell",
+  "values": [
+   {
+    "test": "c-programs/syscall-file-io",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-ebf077bc2554-20261026T054214Z-survey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/threads-fd-churn/replay/ptrace",
+  "reason": "cell attempt 1 reason claims a failed declared expected output that contradicts its evidence: only a verify cell declares expected stdout, and this is a replay cell",
+  "values": [
+   {
+    "test": "c-programs/syscall-file-io",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-ebf077bc2554-20261026T054829Z-survey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/syscall-file-io/replay/ptrace",
+  "reason": "cell attempt 1 reason claims a failed declared expected output that contradicts its evidence: only a verify cell declares expected stdout, and this is a replay cell",
+  "values": [
+   {
+    "test": "c-programs/syscall-file-io",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-ebf077bc2554-20261026T054829Z-survey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/syscall-file-metadata/replay/ptrace",
+  "reason": "cell attempt 1 reason claims a failed declared expected output that contradicts its evidence: only a verify cell declares expected stdout, and this is a replay cell",
+  "values": [
+   {
+    "test": "c-programs/syscall-file-io",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-ebf077bc2554-20261026T054829Z-survey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/syscall-file-metadata/replay/ptrace",
+  "reason": "cell attempt 1 reason claims a failed declared expected output that contradicts its evidence: only a verify cell declares expected stdout, and this is a replay cell",
+  "values": [
+   {
+    "test": "c-programs/syscall-file-io",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-ebf077bc2554-20261026T054829Z-survey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/threads-fd-churn/replay/ptrace",
+  "reason": "cell attempt 1 reason claims a failed declared expected output that contradicts its evidence: only a verify cell declares expected stdout, and this is a replay cell",
+  "values": [
+   {
+    "test": "c-programs/syscall-file-io",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "pressure-ebf077bc2554-20261026T054829Z-survey-ptrace",
+  "producer": "pressure-test",
+  "cell": "c-programs/threads-fd-churn/replay/ptrace",
+  "reason": "cell attempt 1 reason claims a failed declared expected output that contradicts its evidence: only a verify cell declares expected stdout, and this is a replay cell",
+  "values": [
+   {
+    "test": "c-programs/syscall-file-io",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   },
+   {
+    "test": "c-programs/syscall-file-metadata",
+    "mode": "replay",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "disabled",
+    "attempts_n": 1,
+    "attempt_outcomes": [
+     "FAIL"
+    ],
+    "attempt_reasons": [
+     "verify first run stdout (0 bytes, sha256 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855) differs from "
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "validate-claude-coord-9c18b120af28-1791765894369532025-3665073-8e73f01d",
+  "producer": "validate",
+  "cell": "c-programs/fp-reduction-nondeterminism/chaos/ptrace",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "validate-crash-eval-f482ab01dc76-1791756268730623251-574793-807d8faa",
+  "producer": "validate",
+  "cell": "c-programs/fp-reduction-nondeterminism/chaos/ptrace",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "validate-hermit-lander-8e313ad26332-1791760277556895082-2927703-1dc1feda",
+  "producer": "validate",
+  "cell": "c-programs/fp-reduction-nondeterminism/chaos/ptrace",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "validate-netreplay-rework-36b347bc16ed-1791743333056954719-366915-7390b2e5",
+  "producer": "validate",
+  "cell": "c-programs/fp-reduction-nondeterminism/chaos/ptrace",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "validate-qemu-rcb-282fddb9c9d2-1791716039251966502-640191-19b3774b",
+  "producer": "validate",
+  "cell": "c-programs/fp-reduction-nondeterminism/chaos/ptrace",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "validate-qemu-rcb-c2a16c51cd71-1791771897670812167-1794599-84fcabe4",
+  "producer": "validate",
+  "cell": "c-programs/fp-reduction-nondeterminism/chaos/ptrace",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "validate-qemu-rcb-f766f56a71a0-1791743396986624746-435097-089dedd9",
+  "producer": "validate",
+  "cell": "c-programs/fp-reduction-nondeterminism/chaos/ptrace",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "validate-qemu-rcb-f766f56a71a0-1791743396986624746-435097-089dedd9",
+  "producer": "validate",
+  "cell": "c-programs/fp-reduction-nondeterminism/chaos/ptrace",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "validate-tick-buck-cargo-repro-9d04f8b2963f-20261011T193854Z",
+  "producer": "validate",
+  "cell": "c-programs/fp-reduction-nondeterminism/chaos/ptrace",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "validate-tick-buck-cargo-repro-9d04f8b2963f-20261011T193854Z",
+  "producer": "validate",
+  "cell": "c-programs/fp-reduction-nondeterminism/chaos/ptrace",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "validate-tick-buck-cargo-repro-de1e4f3c2697-20261012T020242Z",
+  "producer": "validate",
+  "cell": "c-programs/fp-reduction-nondeterminism/chaos/ptrace",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "validate-tick-buck-cargo-repro-de1e4f3c2697-20261012T020242Z",
+  "producer": "validate",
+  "cell": "c-programs/fp-reduction-nondeterminism/chaos/ptrace",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "validate-tick-buck-cargo-repro-e6cd3889b389-20261010T192957Z",
+  "producer": "validate",
+  "cell": "c-programs/fp-reduction-nondeterminism/chaos/ptrace",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched']",
+  "values": [
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": null,
+    "failure_class": "understood_infrastructure_failure",
+    "outcome": "ERROR",
+    "classification": "required",
+    "attempts_n": 10,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "validate-tickhub-ops-2-fd34c308bbbc-1791758902281802915-1207894-a8a5a423",
+  "producer": "validate",
+  "cell": "c-programs/fp-reduction-nondeterminism/chaos/ptrace",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ },
+ {
+  "run_id": "validate-tickhub-ops-2-fd34c308bbbc-1791758902281802915-1207894-a8a5a423",
+  "producer": "validate",
+  "cell": "c-programs/fp-reduction-nondeterminism/chaos/ptrace",
+  "reason": "framework result has no supporting canonical typed attempt: projected='errored' dispositions=['matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched', 'matched'",
+  "values": [
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   },
+   {
+    "test": "c-programs/fp-reduction-nondeterminism",
+    "mode": "chaos",
+    "backend": "ptrace",
+    "result": "crash-error",
+    "failure_class": "product_failure",
+    "outcome": "FAIL",
+    "classification": "required",
+    "attempts_n": 32,
+    "attempt_outcomes": [
+     "PASS",
+     "PASS",
+     "PASS",
+     "PASS"
+    ],
+    "attempt_reasons": [
+     "",
+     ""
+    ]
+   }
+  ]
+ }
+]

@@ -1,0 +1,26 @@
+diff --git a/ci-hub/series/tests/test_mirror.py b/ci-hub/series/tests/test_mirror.py
+index 1bb8c4b..dd156b1 100644
+--- a/ci-hub/series/tests/test_mirror.py
++++ b/ci-hub/series/tests/test_mirror.py
+@@ -2263,8 +2263,10 @@ class DirectLedgerFixture(unittest.TestCase):
+         self.refuse_quarantine_pushes()
+         with mock.patch.object(mirror.publisher, "QUARANTINE_SHARD_CEILING_BYTES", size - 1):
+             report = self.publish(publish_only=True, attempts=3)["raw_publication"]["quarantine"]
+-        self.assertIn(f"{self.QUARANTINE_SHARD}: shard would be ", report["error"])
+-        self.assertIn(f"over the {size - 1}-byte ceiling", report["error"])
++        self.assertIn(
++            f"{self.QUARANTINE_SHARD}: one series-quarantine row is ", report["error"])
++        self.assertIn(
++            f"over the {size - 1}-byte shard ceiling; spool retained", report["error"])
+         self.assertNotIn("deliberate-quarantine-refusal", report["error"])
+         self.assertEqual((0, 1), (report["published"], report["pending_records"]))
+         self.assertEqual(exact, local.read_bytes())
+@@ -2830,7 +2832,7 @@ class DirectLedgerFixture(unittest.TestCase):
+         writer = self.parent / mirror.WRITER_RELATIVE
+         # The source root reads the row but not its file: the copy stays.
+         with mock.patch.object(mirror.publisher, "_published_input_files",
+-                               side_effect=lambda repo, commit, paths: dict.fromkeys(paths)):
++                               side_effect=lambda repo, commit, paths, files=None: dict.fromkeys(paths)):
+             mirror.publish_quarantine(self.parent, self.ledger, writer,
+                                       net_wrapper="/usr/bin/env", attempts=1)
+         self.assertTrue(retained.exists(), "kept while its input file is not readable")

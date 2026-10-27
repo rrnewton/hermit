@@ -1,0 +1,207 @@
+diff --git a/ci-hub/series/series.py b/ci-hub/series/series.py
+index 4fbe4d6..784c3d1 100644
+--- a/ci-hub/series/series.py
++++ b/ci-hub/series/series.py
+@@ -7260,6 +7260,10 @@ def _expected_output_failure_reason(
+     it out, so the attempt is a failed match. MalformedRow: it claims such a
+     failure that the evidence contradicts.
+ 
++    A replay cell inherits its verify recipe's declarations, exactly as it
++    inherits ``expected_guest_exit`` (``runner::expectation_recipe``), so a
++    replay attempt may carry this reason and is judged on the same evidence.
++
+     The evidence is what the runner decided from. For an exact
+     ``expected_stdout`` that is the matched report's per-run stdout identity,
+     so the captured ``stdout`` is not consulted. For
+@@ -7290,9 +7294,9 @@ def _expected_output_failure_reason(
+             f"that contradicts its evidence: {why}"
+         )
+ 
+-    if mode != "verify":
++    if mode not in ("verify", "replay"):
+         raise contradiction(
+-            f"only a verify cell declares expected stdout, and this is a {mode} cell"
++            f"only a verify or replay cell declares expected stdout, and this is a {mode} cell"
+         )
+     status = attempt.get("status")
+     signal = attempt.get("signal")
+@@ -7938,7 +7942,10 @@ def _typed_comparison_attempt(
+                     and attempt.get("signal") is None
+                 )
+             else:
+-                disposition_consistent = mode == "verify" and guest == expected_guest_exit
++                # A replay cell inherits the declaration (see
++                # ``_expected_guest_exit``), so it credits it exactly as
++                # verify does; any other mode never reaches here with one.
++                disposition_consistent = mode in ("verify", "replay") and guest == expected_guest_exit
+             if attempt.get("outcome") == "PASS":
+                 if (
+                     attempt.get("timed_out") is not False
+diff --git a/ci-hub/series/tests/test_replay_declaration_and_chaos_floor.py b/ci-hub/series/tests/test_replay_declaration_and_chaos_floor.py
+index f5992db..53e1580 100644
+--- a/ci-hub/series/tests/test_replay_declaration_and_chaos_floor.py
++++ b/ci-hub/series/tests/test_replay_declaration_and_chaos_floor.py
+@@ -59,6 +59,141 @@ class ReplayRowCarriesInheritedDeclaration(unittest.TestCase):
+         self.assertFalse(admits("chaos", replay))
+ 
+ 
++class ReplayDeclaredStdout(unittest.TestCase):
++    """A replay attempt's failed declared stdout is judged, not refused for its mode.
++
++    Mirrors the refused pressure-survey inputs of 2026-10-26/27
++    (``c-programs/syscall-file-metadata/replay/ptrace`` and siblings): the
++    runner inherits the verify recipe's ``expected_stdout`` into replay
++    (``runner::expectation_recipe``) and writes this exact reason, which the
++    projection used to refuse with "only a verify cell declares".
++    """
++
++    EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
++
++    def _attempt(self):
++        return {
++            "reason": (
++                f"verify first run stdout (0 bytes, sha256 {self.EMPTY_SHA256}) differs "
++                f"from the declared expected_stdout (3 bytes, sha256 {'a' * 64})"
++            ),
++            "status": 0,
++            "signal": None,
++            "timed_out": False,
++            "error_kind": None,
++        }
++
++    def _report(self):
++        side = {
++            "exit_code": 0,
++            "signal": None,
++            "stdout_bytes": 0,
++            "stdout_sha256": self.EMPTY_SHA256,
++            "stderr_bytes": 0,
++            "stderr_sha256": self.EMPTY_SHA256,
++        }
++        return {"compared_outputs": {"left": dict(side), "right": dict(side)}}
++
++    def test_replay_and_verify_reasons_are_recognised(self):
++        for mode in ("verify", "replay"):
++            attempt = self._attempt()
++            self.assertEqual(
++                series._expected_output_failure_reason(attempt, self._report(), mode=mode, index=1),
++                attempt["reason"],
++                mode,
++            )
++
++    def test_other_modes_still_refuse_the_reason(self):
++        with self.assertRaisesRegex(
++            series.MalformedRow, "only a verify or replay cell declares expected stdout"
++        ):
++            series._expected_output_failure_reason(
++                self._attempt(), self._report(), mode="chaos", index=1
++            )
++
++
++class ReplayDeclaredGuestExitDisposition(unittest.TestCase):
++    """A replay PASS that ends as its inherited declaration allows is ``matched``.
++
++    Mirrors the refused 2026-10-25 resurvey inputs (``qemu-hello`` code 7,
++    ``sh-exit-status`` code 23, ``pmu-skid`` code 3, ``nanosleep-threads-simple``
++    signal 11, all ``replay/ptrace``): the projection credited the declaration
++    only in verify mode, so every such replay pass was refused as an
++    internally inconsistent matched report.
++    """
++
++    def _attempt(self):
++        import hashlib
++        import json
++
++        side = {
++            "exit_code": 7,
++            "signal": None,
++            "stdout_bytes": 0,
++            "stdout_sha256": ReplayDeclaredStdout.EMPTY_SHA256,
++            "stderr_bytes": 0,
++            "stderr_sha256": ReplayDeclaredStdout.EMPTY_SHA256,
++        }
++        report = {
++            "verified": True,
++            "bitwise_parity": True,
++            "verdict": "matched",
++            "no_result_reason": None,
++            "infrastructure_error": None,
++            "comparison": {
++                "strictness": "canonical",
++                "display_name": "BitwiseInfoV1",
++                "compare_logs": True,
++                "compare_io_buffers": True,
++                "log_scope": "info",
++                "record_envelope": "all_records_v1",
++                "virtualize_time": False,
++                "strip_lines": False,
++                "canonicalize_addresses": True,
++                "full_trace": True,
++                "exact_remainder": True,
++                "stripped_prefixes": ["real-wall-clock-prefix/v1"],
++                "canonicalizations": ["host-address-to-first-appearance-ordinal/v1"],
++                "ignore_lines": False,
++                "skip_commit": False,
++                "skip_detlog": False,
++            },
++            "compared_log_messages": {"left": 17, "right": 17},
++            "compared_outputs": {"left": dict(side), "right": dict(side)},
++            "runtime": None,
++            "guest_exit_code": 7,
++            "guest_signal": None,
++            "first_divergent_scheduler_turn": None,
++            "first_divergent_virtual_nanoseconds": None,
++            "first_divergent_record": None,
++            "first_divergent_syscall": None,
++            "first_divergent_left_message": None,
++            "first_divergent_right_message": None,
++        }
++        raw = json.dumps(report, sort_keys=True, separators=(",", ":"))
++        return {
++            "outcome": "PASS",
++            "error_kind": None,
++            "status": 7,
++            "signal": None,
++            "timed_out": False,
++            "argv": [
++                "hermit-verify-pair", "hermit", "log-diff", "--verify-allow=both",
++                "hermit", "record", "start", "--", "/bin/true",
++            ],
++            "verification_report": raw,
++            "verification_report_sha256": hashlib.sha256(raw.encode()).hexdigest(),
++        }
++
++    def test_replay_declared_exit_pass_is_matched(self):
++        self.assertEqual(
++            series._typed_comparison_attempt(
++                self._attempt(), mode="replay", index=1, expected_guest_exit=(7, None)
++            ),
++            "matched",
++        )
++
++
+ class ChaosFloorFailure(unittest.TestCase):
+     """``_cell_outcome`` projects and polices the named chaos floor failure."""
+ 
+diff --git a/ci-hub/series/tests/test_series_invariants.py b/ci-hub/series/tests/test_series_invariants.py
+index 3e50a48..e1ffcd2 100644
+--- a/ci-hub/series/tests/test_series_invariants.py
++++ b/ci-hub/series/tests/test_series_invariants.py
+@@ -6670,7 +6670,7 @@ class CellResultProjection(unittest.TestCase):
+             ("no compared outputs", edited(edit=no_compared_outputs),
+              f"{contradicts}: the matched report has no identical"),
+             ("a chaos cell", edited(edit=chaos),
+-             f"{contradicts}: only a verify cell declares expected stdout"),
++             f"{contradicts}: only a verify or replay cell declares expected stdout"),
+             ("an error kind", edited(edit=with_error_kind),
+              f"{contradicts}: the runner fails declared stdout only"),
+             ("no process disposition", edited(edit=no_disposition),
+@@ -9206,7 +9206,7 @@ class CellResultProjection(unittest.TestCase):
+             ("reason of a failed declared stdout",
+              {"reason": self._exact_stdout_reason()},
+              "cell attempt 2 reason claims a failed declared expected output that "
+-             "contradicts its evidence: only a verify cell declares expected stdout, "
++             "contradicts its evidence: only a verify or replay cell declares expected stdout, "
+              "and this is a chaos cell"),
+         ):
+             with self.subTest(label):

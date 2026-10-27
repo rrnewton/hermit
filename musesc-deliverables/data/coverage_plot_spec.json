@@ -1,0 +1,18 @@
+{
+  "data": "coverage_by_backend.json",
+  "kind": "bar",
+  "x": "backend",
+  "y": "count",
+  "series": "kind",
+  "aggregate": "sum",
+  "title": "Syscalls exercised per backend (published series rows, 2026-10, devbig014)",
+  "xlabel": "backend",
+  "ylabel": "named syscalls (of 373)",
+  "x_order": ["ptrace", "kvm", "sabre", "liteinst", "in-guest-trap", "dbt"],
+  "series_order": ["exercised", "never"],
+  "bar_labels": true,
+  "value_format": "{:.0f}",
+  "legend": "below",
+  "width": 7,
+  "height": 4.2
+}
