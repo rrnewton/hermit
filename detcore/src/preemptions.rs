@@ -1902,6 +1902,24 @@ impl PreemptionWriter {
         history.final_prio = next_prio;
     }
 
+    /// The time of the last change point recorded for `tid`, if any. A new one
+    /// must be strictly later ([`Self::insert_reprioritization`]).
+    pub fn last_reprioritization_time(&self, tid: DetTid) -> Option<LogicalTime> {
+        self.inner
+            .per_thread
+            .get(&tid)
+            .and_then(|history| history.prio_changes.last())
+            .map(|(time, _)| *time)
+    }
+
+    /// How many change points are recorded for `tid`.
+    pub(crate) fn reprioritization_count(&self, tid: DetTid) -> usize {
+        self.inner
+            .per_thread
+            .get(&tid)
+            .map_or(0, |history| history.prio_changes.len())
+    }
+
     /// Attach only an observed callback expiry to the row the original helper just wrote.
     pub(crate) fn insert_callback_checkpoint(
         &mut self,

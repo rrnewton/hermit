@@ -2280,6 +2280,9 @@ pub struct Scheduler {
 
     /// An instance of replayer that is responsible for replaying events in case --replay-preemptions-from is specified
     pub replayer: Option<Replayer>,
+    /// Whether the run replays a preemption record (`--replay-preemptions-from`),
+    /// whose threads can diverge from it ([`Scheduler::perform_priority_changepoint`]).
+    replays_preemptions: bool,
     /// Fixed by recording configuration or the loaded legacy annotations,
     /// never by whether the mutable per-thread checkpoint queues are empty.
     pub(crate) callback_history_active: bool,
@@ -4391,6 +4394,30 @@ enum ThreadStatus {
     NotRunning,
 }
 
+/// Reports a preemption replay's change point for `dettid` at `time`, not
+/// after its last recorded one at `last` ([`Scheduler::perform_priority_changepoint`]):
+/// a skid overshoot, counted where every overshoot is
+/// (`reverie::record_skid_overshoot`) so the run ends in the skid-overshoot
+/// policy refusal, and named with `reverie::SKID_OVERSHOOT_MARKER`. One
+/// departure from the record can be detected both here and where the replay
+/// passes a recorded end (`report_replay_slice_overshoot` in tool_local), so
+/// the refusal's count is of detections, as it already is for the timer's
+/// own overshoot check, not of distinct departures.
+#[cold]
+fn report_stale_replay_change_point(dettid: DetTid, time: LogicalTime, last: LogicalTime) {
+    reverie::record_skid_overshoot();
+    tracing::error!(
+        "{} preemption replay: thread {} changed priority at {}, not after its last change \
+         point at {}: a slice closed at the instant the last one did, which the replayed \
+         record never does. The change point is left out of the new record; the rest of this \
+         run does not replay the record exactly.",
+        reverie::SKID_OVERSHOOT_MARKER,
+        dettid,
+        time,
+        last,
+    );
+}
+
 fn validate_strict_boundary_config(cfg: &Config) -> Result<(), &'static str> {
     if !cfg.strict_schedule_boundaries {
         return Ok(());
@@ -4557,6 +4584,7 @@ impl Scheduler {
             priority_rows: BTreeMap::new(),
             priority_births: BTreeSet::new(),
             replayer,
+            replays_preemptions: cfg.replay_preemptions_from.is_some(),
             boundary_replayer,
             boundary_stacktrace_events,
             recorded_host_inputs,
@@ -14986,9 +15014,16 @@ impl Scheduler {
             } else {
                 *prio
             };
+            let rows = self
+                .preemption_writer
+                .as_ref()
+                .map(|writer| writer.reprioritization_count(dettid));
             let answer = self.perform_priority_changepoint(dettid, priority, *time, *rcbs, epochs);
+            // Only onto the row this change point wrote: one kept out of the
+            // record (`report_stale_replay_change_point`) has none.
             if !self.has_schedule_replay()
                 && let Some(writer) = &mut self.preemption_writer
+                && rows.is_none_or(|rows| writer.reprioritization_count(dettid) > rows)
             {
                 writer.insert_callback_checkpoint(dettid, origin.clone());
             }
@@ -15943,10 +15978,39 @@ impl Scheduler {
                 "[dtid {}] Recording preemption point, current time {} prior priority {} (next priority {})",
                 dettid, guest_time, old_prio, new_priority
             );
-            for transition in chaos_epochs {
-                pw.insert_chaos_epoch(dettid, *transition);
+            // A recording's change points are strictly increasing in time.
+            // A preemption replay whose thread diverged from its record can
+            // reach one at or before the instant of the thread's last, where
+            // a slice closed with no time between: the record never did that,
+            // so the replay is not exact. That is reported as one (the run
+            // ends in the skid-overshoot refusal), and neither the change
+            // point nor the epoch transitions it carries are written: the new
+            // record's rows and epochs must stay increasing, and its writer
+            // asserts both. `set_current` still runs, so the next row's
+            // prior priority is the one the scheduler holds; the record
+            // already describes a run that did not replay exactly. A
+            // recording that is not a preemption replay keeps the writer's
+            // assertions. A schedule replay writes no rows at all (above).
+            match pw
+                .last_reprioritization_time(dettid)
+                .filter(|last| guest_time <= *last)
+            {
+                Some(last) if self.replays_preemptions => {
+                    report_stale_replay_change_point(dettid, guest_time, last);
+                }
+                _ => {
+                    for transition in chaos_epochs {
+                        pw.insert_chaos_epoch(dettid, *transition);
+                    }
+                    pw.insert_reprioritization(
+                        dettid,
+                        guest_time,
+                        guest_rcbs,
+                        old_prio,
+                        new_priority,
+                    );
+                }
             }
-            pw.insert_reprioritization(dettid, guest_time, guest_rcbs, old_prio, new_priority);
             pw.set_current(dettid, new_priority);
         }
 
@@ -28958,6 +29022,109 @@ mod test {
             assert!(left.resources.is_empty());
             assert_eq!(left.slice_expired, expired);
         }
+    }
+
+    /// Two change points of one thread at one instant, as a diverged
+    /// preemption replay files them when a slice closes at the instant the
+    /// last one did (rrnewton/hermit#4830, and an Android replay whose
+    /// timeout cleanup tripped `&time > last` on its stalled second one).
+    /// The scheduler and the re-recording writer, on a run that replays a
+    /// preemption record and records a new one.
+    fn replaying_and_recording_spinner(replays: bool) -> (Scheduler, DetTid) {
+        let cfg = Config {
+            chaos: true,
+            record_preemptions: true,
+            replay_preemptions_from: replays.then(|| PathBuf::from("history.json")),
+            ..Config::default()
+        };
+        let (mut scheduler, spinner, _waiter) =
+            chaos_spinner_and_waiter(cfg, DEFAULT_PRIORITY, DEFAULT_PRIORITY);
+        scheduler
+            .preemption_writer
+            .as_mut()
+            .unwrap()
+            .register_thread(spinner, DEFAULT_PRIORITY);
+        (scheduler, spinner)
+    }
+
+    /// In a replay, the second is a replay divergence: reported as a skid
+    /// overshoot (the run ends in that refusal, exit 122) and kept out of the
+    /// new record, which stays strictly increasing, instead of the writer's
+    /// assertion. The thread's priority still changes.
+    #[test]
+    fn a_replay_change_point_at_the_last_ones_instant_is_an_overshoot() {
+        let (mut scheduler, spinner) = replaying_and_recording_spinner(true);
+
+        spinner_changepoint(&mut scheduler, spinner, DEFAULT_PRIORITY + 1, 500);
+        // Reported through `report_stale_replay_change_point`; the
+        // process-wide overshoot count is not asserted here, since tests
+        // running beside this one take it too.
+        spinner_changepoint(&mut scheduler, spinner, DEFAULT_PRIORITY + 2, 500);
+
+        let writer = scheduler.preemption_writer.as_ref().unwrap();
+        assert_eq!(writer.reprioritization_count(spinner), 1);
+        assert_eq!(
+            writer.last_reprioritization_time(spinner),
+            Some(LogicalTime::from_nanos(500))
+        );
+        assert_eq!(scheduler.priorities[&spinner], DEFAULT_PRIORITY + 2);
+        // A later one is recorded after it as usual.
+        spinner_changepoint(&mut scheduler, spinner, DEFAULT_PRIORITY + 3, 600);
+        assert_eq!(
+            scheduler
+                .preemption_writer
+                .as_ref()
+                .unwrap()
+                .reprioritization_count(spinner),
+            2
+        );
+    }
+
+    /// A stale change point that carries a slowdown-epoch transition writes
+    /// neither: the writer's epoch assertions (strictly later time and
+    /// epoch) would otherwise fire on it first.
+    #[test]
+    fn a_replay_change_point_at_the_last_ones_instant_writes_no_epoch() {
+        let (mut scheduler, spinner) = replaying_and_recording_spinner(true);
+        let epoch = |epoch, at| crate::resources::ChaosEpochTransition {
+            logical_time: LogicalTime::from_nanos(at),
+            epoch,
+            factor: crate::types::RcbTimeMultiplier::ONE,
+        };
+        assert_eq!(
+            scheduler.run_queue.tentative_pop_tid(spinner),
+            Some(spinner)
+        );
+        let _ = scheduler.perform_priority_changepoint(
+            spinner,
+            DEFAULT_PRIORITY + 1,
+            LogicalTime::from_nanos(500),
+            500,
+            &[epoch(1, 500)],
+        );
+        assert_eq!(
+            scheduler.run_queue.tentative_pop_tid(spinner),
+            Some(spinner)
+        );
+        let _ = scheduler.perform_priority_changepoint(
+            spinner,
+            DEFAULT_PRIORITY + 2,
+            LogicalTime::from_nanos(500),
+            500,
+            &[epoch(1, 500)],
+        );
+        let writer = scheduler.preemption_writer.as_ref().unwrap();
+        assert_eq!(writer.reprioritization_count(spinner), 1);
+    }
+
+    /// A recording that is not a replay keeps the writer's assertion: there
+    /// the scheduler itself would have filed the two.
+    #[test]
+    #[should_panic(expected = "&time > last")]
+    fn a_recording_change_point_at_the_last_ones_instant_still_asserts() {
+        let (mut scheduler, spinner) = replaying_and_recording_spinner(false);
+        spinner_changepoint(&mut scheduler, spinner, DEFAULT_PRIORITY + 1, 500);
+        spinner_changepoint(&mut scheduler, spinner, DEFAULT_PRIORITY + 2, 500);
     }
 
     /// Two threads, spinner and waiter, at the given priorities, both queued,
