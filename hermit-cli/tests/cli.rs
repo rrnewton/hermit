@@ -257,6 +257,7 @@ static PARENT_DEATH_SIGNAL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CLONE_PIDFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHILD_WAIT_DEADLOCK_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static SIGNAL_THEN_SIBLING_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static GROUP_EXIT_SIGNAL_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PARKED_WAIT_THEN_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static PARKED_READ_SIGNAL_THEN_EXEC_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static CHAOS_SPINNER_AND_NEW_THREAD_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -2947,6 +2948,32 @@ fn sigsuspend_shared_mask_rewrite_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "sigsuspend-shared-mask-rewrite guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn group_exit_signal_wait_guest() -> &'static Path {
+    GROUP_EXIT_SIGNAL_WAIT_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = process_build_root("group-exit-signal-wait");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the group-exit-signal-wait guest directory");
+        let guest = build_root.join("group_exit_signal_wait");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(repository.join("tests/c/group_exit_signal_wait.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the group-exit-signal-wait guest");
+        assert!(
+            output.status.success(),
+            "group-exit-signal-wait guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -45103,6 +45130,162 @@ fn run_kvm_rt_sigtimedwait_writes_its_siginfo_as_ptrace_does() {
             stderr(&output)
         );
     }
+}
+
+/// tests/c/group_exit_signal_wait.c's modes and the line each prints. One
+/// thread waits for a signal that never comes (`sigwaitinfo`, or
+/// `sigtimedwait` with a 100 s timeout) while another thread of the process
+/// calls `exit(0)`, which on Linux ends every thread of the group, the waiter
+/// included: native Linux 7.1.3 exits 0 with the line, in about 0.1 s. The
+/// exiting thread first waits for the waiter's readiness byte, sent just
+/// before its wait, and any return from the wait exits 7 before the line.
+const GROUP_EXIT_SIGNAL_WAIT_CASES: [(&str, &str); 3] = [
+    (
+        "worker-sigwaitinfo",
+        "main: exiting while a worker waits in sigwaitinfo\n",
+    ),
+    (
+        "main-sigwaitinfo",
+        "worker: exiting while main waits in sigwaitinfo\n",
+    ),
+    (
+        "worker-sigtimedwait",
+        "main: exiting while a worker waits in sigtimedwait\n",
+    ),
+];
+
+/// The relaxations under which Detcore neither schedules the threads nor
+/// preempts them, and polls a signal wait with zero-timeout injections that
+/// only a signal or the thread's death can end.
+const GROUP_EXIT_SIGNAL_WAIT_UNSEQUENTIALIZED: [&str; 3] =
+    ["--no-sequentialize-threads", "--max-timeslice", "disabled"];
+
+/// Run every [`GROUP_EXIT_SIGNAL_WAIT_CASES`] mode on `backend` with
+/// [`GROUP_EXIT_SIGNAL_WAIT_UNSEQUENTIALIZED`]: each must exit 0 with its
+/// line within 10 s. A hung run is killed at 30 s and fails as `None`.
+fn assert_group_exit_ends_unsequentialized_signal_waits(backend: &str) {
+    let guest = group_exit_signal_wait_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    for (mode, expected) in GROUP_EXIT_SIGNAL_WAIT_CASES {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let mut args = vec![backend, "run", "--epoch=2026-01-01T00:00:00Z"];
+        args.extend(GROUP_EXIT_SIGNAL_WAIT_UNSEQUENTIALIZED);
+        args.extend(["--", guest, mode]);
+        let started = Instant::now();
+        let (status, log) = run_with_deadline(
+            hermit_command(&args),
+            directory.path(),
+            Duration::from_secs(30),
+            false,
+        );
+        let elapsed = started.elapsed();
+        let output = fs::read_to_string(directory.path().join("deadline-run.stdout"))
+            .expect("failed to read the stdout file");
+        assert_eq!(
+            status.and_then(|status| status.code()),
+            Some(0),
+            "{backend} {mode}: the exit must end the waiting thread (None is a kill at the \
+             30 s deadline) after {elapsed:?}\nstdout:\n{output}\nstderr:\n{log}"
+        );
+        assert_eq!(output, expected, "{backend} {mode}: stderr:\n{log}");
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "{backend} {mode}: took {elapsed:?}\nstderr:\n{log}"
+        );
+    }
+}
+
+/// Run every [`GROUP_EXIT_SIGNAL_WAIT_CASES`] mode on `backend` under
+/// `--strict --verify --verify-strict`: each must print its line and reach
+/// bitwise parity with INFO messages compared.
+fn assert_group_exit_ends_signal_waits_at_bitwise_parity(backend: &str) {
+    let guest = group_exit_signal_wait_guest()
+        .to_str()
+        .expect("guest path should be UTF-8");
+    for (mode, expected) in GROUP_EXIT_SIGNAL_WAIT_CASES {
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let report = directory.path().join("verify.json");
+        let report_arg = report.to_str().expect("report path should be UTF-8");
+        let args = [
+            backend,
+            "run",
+            "--strict",
+            "--epoch=2026-01-01T00:00:00Z",
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report_arg,
+            "--",
+            guest,
+            mode,
+        ];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{backend} {mode}");
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(
+            verdict["bitwise_parity"], true,
+            "{backend} {mode}: {verdict}"
+        );
+        for side in ["left", "right"] {
+            assert!(
+                verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+                "{backend} {mode}: no INFO messages compared: {verdict}"
+            );
+        }
+    }
+}
+
+/// On KVM without sequentialized threads, an exit while a sibling waits in
+/// sigwaitinfo or sigtimedwait ended the waiter only on ptrace: Detcore polls
+/// the wait with zero-timeout injections, and the KVM backend let every
+/// injection after the group exit return, so the waiter's callback spun
+/// forever and the run never ended
+/// (https://github.com/rrnewton/hermit/issues/4798; on main 4d1824b1 each mode
+/// was killed by its deadline). Reverie now cancels any injection made after
+/// the thread's group has exited, as the host kernel kills the thread on
+/// ptrace. Each mode must exit 0 with its line within 10 s.
+#[test]
+fn run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM group-exit signal-wait case: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    assert_group_exit_ends_unsequentialized_signal_waits("--backend=kvm");
+}
+
+/// The same three modes on KVM under `--strict`, where Detcore's scheduler
+/// kills the waiter at the group exit: each reaches bitwise parity.
+#[test]
+fn run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping the KVM group-exit signal-wait parity case: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    assert_group_exit_ends_signal_waits_at_bitwise_parity("--backend=kvm");
+}
+
+/// The ptrace reference for
+/// `run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing`:
+/// the host kernel kills the waiter inside its injected syscall.
+#[test]
+fn a_group_exit_ends_a_sibling_signal_wait_without_sequentializing() {
+    let _guard = hermit_run_guard();
+    assert_group_exit_ends_unsequentialized_signal_waits("--backend=ptrace");
+}
+
+/// The ptrace reference for
+/// `run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity`.
+#[test]
+fn a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity() {
+    let _guard = hermit_run_guard();
+    assert_group_exit_ends_signal_waits_at_bitwise_parity("--backend=ptrace");
 }
 
 /// A kept SIGUSR1 wakes a precise futex wait, and before the waiter's turn

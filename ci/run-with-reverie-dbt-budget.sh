@@ -2913,7 +2913,25 @@ fi
 # Existing SDK width and 1050 effective-job-second limits carry without
 # recalibration. This is not whole-runtime equivalence or a new cold-SDK timing
 # sample.
-expected_pin=661967460beee45868e8286df097c617d67fcb6e
+# CARRY TO e17bbb01fede8fc2fbf6a20f91bdc62c9c6408fd (2026-10-27): from
+# 661967460beee45868e8286df097c617d67fcb6e. Two commits (kvm lane): Reverie 431b2cc5, a dormant KVM
+# preemption timer (reverie-kvm clock.rs, lib.rs, README.md, the new
+# preemption_timer.rs and its tests, a doc comment in reverie/src/pmu_config.rs
+# and that file's source-catalog row), and Reverie 20f7ca00 rebased onto
+# 431b2cc5 with an identical patch-id as e17bbb01: an injection made after the
+# caller's thread group has exited, or after the caller was cancelled, is
+# answered Cancelled before it runs (reverie-kvm runtime.rs, vm.rs and two new
+# test files, doc comments in reverie/src/guest.rs and provider.rs, and
+# guest.rs's source-catalog row in reverie-liteinst-artifact/src/lib.rs). git
+# diff is empty under reverie-dbt/ and third-party/ and for the root
+# Cargo.toml, Cargo.lock and rust-toolchain.toml; the repository inputs to the
+# DynamoRIO content key are byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+#     reverie-dbt/native            164356b3ab65 -> 164356b3ab65
+# so the inventory (1014), SDK and native inputs, calibrated budget, job width
+# and limits carry unchanged from the 66196746 entry.
+expected_pin=e17bbb01fede8fc2fbf6a20f91bdc62c9c6408fd
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

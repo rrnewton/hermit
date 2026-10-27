@@ -17651,7 +17651,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "94");
+            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "96");
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -17730,16 +17730,19 @@ mod nextest_timeout_tests {
         // run_kvm_procfs_directories_are_served_only_in_a_container,
         // run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name and
         // run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none
-        // (https://github.com/rrnewton/hermit/issues/4604): 94. The spinner is
+        // (https://github.com/rrnewton/hermit/issues/4604): 94. And
+        // run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing
+        // and run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity
+        // (https://github.com/rrnewton/hermit/issues/4798): 96. The spinner is
         // retained but ignored and excluded because its explicit maximum
-        // requests an unavailable timer: 93 selected CLI tests remain.
+        // requests an unavailable timer: 95 selected CLI tests remain.
         assert_eq!(
             names.len(),
-            94,
+            96,
             "update the exact CI inventory with new KVM tests"
         );
         names.retain(|name| name != excluded);
-        assert_eq!(names.len(), 93);
+        assert_eq!(names.len(), 95);
         let required_cases = [
             "run_kvm_self_sigkill_from_nonleader_is_group_fatal",
             "run_kvm_synchronous_root_segv_preserves_guest_exit",
@@ -17766,6 +17769,8 @@ mod nextest_timeout_tests {
             "run_kvm_procfs_directories_are_served_only_in_a_container",
             "run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name",
             "run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none",
+            "run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing",
+            "run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity",
         ];
         for required in required_cases {
             assert!(names.iter().any(|name| name == required));
@@ -18856,7 +18861,10 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         // run_kvm_calls_below_a_served_procfs_directory_are_refused_by_name and
         // run_kvm_a_user_mount_covering_the_placeholder_by_any_spelling_leaves_none
         // (https://github.com/rrnewton/hermit/issues/4604): 94 selected.
-        ("privileged-only-test.cli_kvm", 94usize),
+        // run_kvm_a_group_exit_ends_a_sibling_signal_wait_without_sequentializing
+        // and run_kvm_a_group_exit_ends_a_sibling_signal_wait_at_bitwise_parity
+        // (https://github.com/rrnewton/hermit/issues/4798): 96 selected.
+        ("privileged-only-test.cli_kvm", 96usize),
     ] {
         let step = privileged
             .steps
