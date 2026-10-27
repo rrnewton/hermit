@@ -104,6 +104,9 @@ mod tests {
         // Adds `GlobalResponse::WithLoneGrant`
         // (https://github.com/rrnewton/hermit/pull/4662).
         (9, "ebfd2b59a97e1d7a", "dafaa96d8b8cb3ad"),
+        // Adds `GlobalRequest::ProcessSignalReceiver`; adds `GlobalResponse::ProcessSignalReceiver`
+        // (https://github.com/rrnewton/hermit/pull/4625, renumbered to 10 at landing).
+        (10, "1899cf7ab14698ae", "dafaa96d8b8cb3ad"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
