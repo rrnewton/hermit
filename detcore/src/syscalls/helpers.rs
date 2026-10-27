@@ -378,7 +378,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     pub(crate) fn nonblockable_call_runs_outside_turn<G, C>(&self, guest: &mut G, call: C) -> bool
     where
         G: Guest<Self>,
-        C: SyscallInfo + Into<Syscall> + Copy,
+        C: NonblockableSyscall + Into<Syscall> + Copy,
     {
         let wrapped: Syscall = call.into();
         match ioaction_based_on_fd_status(guest, call) {
