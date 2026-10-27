@@ -4596,10 +4596,10 @@ pub struct ThreadState<T> {
     pub pending_vfork: Option<PendingVfork>,
 
     /// The ID this thread's restarted clone-family call took when Detcore
-    /// chooses the IDs (`GuestIds::Chosen`): the call comes back after the
-    /// signal that interrupted it, and keeps its ID
-    /// (`Detcore::plan_clone_id`).
-    pub(crate) restarted_clone_id: Option<i32>,
+    /// chooses the IDs (`GuestIds::Chosen`), and the call it is for: the call
+    /// comes back after the signal that interrupted it, and keeps its ID
+    /// (`Detcore::plan_clone_id`). Any other call retires it.
+    pub(crate) restarted_clone_id: Option<crate::syscalls::chosen_ids::RestartedCloneId>,
 
     /// Shared file metadata among all threads in the same process.
     /// Initialized for new threads (shared or fresh), and then overwritten again on `execve`.

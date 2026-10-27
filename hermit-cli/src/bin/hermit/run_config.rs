@@ -94,6 +94,7 @@ const ARGS_ID: &str = "args";
 pub(crate) const EPOCH_KEY: &str = "epoch";
 pub(crate) const SEED_KEY: &str = "seed";
 pub(crate) const SEED_FROM_KEY: &str = "seed-from";
+pub(crate) const PID_BASE_KEY: &str = "pid-base";
 const REPLAY_NETWORKING_KEY: &str = "replay-networking";
 
 /// One run config document. See the module documentation for the format.
