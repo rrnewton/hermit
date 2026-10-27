@@ -2888,7 +2888,15 @@ fi
 # inventory grows from 1012 to 1013. Existing SDK width and 1050 effective-job-
 # second limits carry without recalibration; Rust compatibility is checked
 # separately. This is not whole-DBT source or runtime equivalence.
-expected_pin=b64a10cc1a99e66df5b195d7304ccee4a517d131
+# CARRY TO 47bd02e3ccb42019d44a6aa038b47ee817df057a (2026-10-27): from
+# b64a10cc1a99e66df5b195d7304ccee4a517d131. The caller-owned RPC guest can now enter
+# the existing protected returning/tail syscall driver. Legacy preparation and
+# transport are preserved; runtime Rust and tests change. SDK build.rs
+# ff1eeb32b140, vendor tree 4ab89708f2e9 and native tree 164356b3ab65 are
+# byte-identical; the DBT inventory grows from 1013 to 1014. Existing SDK width
+# and 1050 effective-job-second limits carry without recalibration. This is not
+# whole-runtime equivalence or a new cold-SDK timing sample.
+expected_pin=47bd02e3ccb42019d44a6aa038b47ee817df057a
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
