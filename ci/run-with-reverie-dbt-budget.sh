@@ -3017,14 +3017,14 @@ fi
 # rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
 # calibrated budget, job width and limits carry unchanged from the
 # a13d0205 entry.
-# CARRY TO ce9afbd47b0aa3d247844ac3d3e853ebc082a088 (2026-10-27): from
+# CARRY TO e48dfa99b1a784534d692ae1a4a989ef118e95d4 (2026-10-27): from
 # ab248a36f83edbcb6b8705dad38b094bd61f1c74. Three commits whose net tree change is
 # empty: 72e73f10 and 882c91c0 (in-guest runtime descriptors invisible to
 # the guest, pinned by Hermit 330a8b84) and ce9afbd4, their revert, whose
 # tree equals ab248a36. git diff is empty for the whole repository, so the
 # inventory (1015), SDK and native inputs, calibrated budget, job width and
 # limits carry unchanged from the ab248a36 entry.
-expected_pin=ce9afbd47b0aa3d247844ac3d3e853ebc082a088
+expected_pin=e48dfa99b1a784534d692ae1a4a989ef118e95d4
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
