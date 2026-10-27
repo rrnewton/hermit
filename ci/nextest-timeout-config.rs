@@ -70,11 +70,21 @@ const STANDALONE_ALLOCATOR_CPU_SECONDS: u64 = 33;
 // Earlier CPU22 timeouts stay censored, not successful completion samples.
 const DETCORE_STACK_CPU_SECONDS: u64 = 51;
 const RENDERED_PROCFS_WRAPPER_NAME: &str = "hermit-rendered-procfs-cpu";
-// hermit-run::cli detcore_renders_its_procfs_files_on_every_backend runs a
-// --verify of one guest on every backend this build has, DBT's among them, plus
-// a DBT chroot run. Completed cgroup CPU seconds in the 13 full validations of
-// 2026-10-15/16 that ran it: 4.5 to 14.9 (12.8, 12.9 and 14.6 at 2f640c23,
-// 90dec733 and d7efd4cb), at 18-24 s wall. dbbbdc86's was stopped by the
+// hermit-run::cli detcore_renders_its_procfs_files_on_dbt_as_on_ptrace runs
+// DBT's --verify of one guest and ptrace's, to compare them. Until 2026-10-26
+// both ran in detcore_renders_its_procfs_files_on_every_backend, which also
+// verified the guest on KVM and e9patch and ran a DBT chroot run and a forged
+// placeholder run on each backend; that test now leaves DBT's verified run to
+// this one and DBT's other two runs to a third
+// (https://github.com/rrnewton/hermit/issues/4783). This test does a part of
+// the whole test's work, so the whole test's measurements below bound it.
+// Measured 2026-10-26, one test at a time: quiet, the whole test took 18.1 s
+// and 5.9 CPU seconds, this part 14.9 s and 3.9; pinned to 2 CPUs shared with
+// 16 CPU-bound spinners, the whole test took 54.9 to 58.1 s (three of five
+// runs past 57 s, the one under nextest stopped there), this part 35.4 to
+// 36.8 s. The whole test's completed cgroup CPU seconds in the 13 full
+// validations of 2026-10-15/16 that ran it: 4.5 to 14.9 (12.8, 12.9 and 14.6
+// at 2f640c23, 90dec733 and d7efd4cb), at 18-24 s wall. dbbbdc86's was stopped by the
 // 22-second cap at 23.6 (32.9 s wall), in a run where every DBT test cost more
 // (detcore_fixes_the_virtual_kernel_files_on_dbt 17.6 against 14.0-15.6).
 // ceil(1.5 * 23.6) = 36 covers that censored run with half again; the
@@ -264,7 +274,7 @@ const MEASURED_CPU_ALLOWANCES: [MeasuredCpuAllowance; 30] = [
         wrapper_name: RENDERED_PROCFS_WRAPPER_NAME,
         package: "hermit-run",
         binary: "hermit-run::cli",
-        test: "detcore_renders_its_procfs_files_on_every_backend",
+        test: "detcore_renders_its_procfs_files_on_dbt_as_on_ptrace",
         cpu_seconds: RENDERED_PROCFS_CPU_SECONDS,
         wall_seconds: None,
     },
@@ -2425,7 +2435,7 @@ mod tests {
             "package(=hermit-run) & binary_id(=hermit-run::liteinst_allocator) & test(=genuine_detcore_leaf_keeps_scope_free_work_private)",
             "package(=hermit-run) & binary_id(=hermit-run::liteinst_stacks) & test(=cold_constructor::genuine_detcore_constructor_uses_retained_disjoint_bootstrap_stack)",
             "package(=hermit-run) & binary_id(=hermit-run::liteinst_allocator) & test(=genuine_standalone_leaf_keeps_scope_free_work_private)",
-            "package(=hermit-run) & binary_id(=hermit-run::cli) & test(=detcore_renders_its_procfs_files_on_every_backend)",
+            "package(=hermit-run) & binary_id(=hermit-run::cli) & test(=detcore_renders_its_procfs_files_on_dbt_as_on_ptrace)",
             "package(=hermit-run) & binary_id(=hermit-run::liteinst_stacks) & test(=genuine_detcore_reaches_fixed_guarded_callback_and_altstack)",
         ];
         for mask in 0..(1 << names.len()) {

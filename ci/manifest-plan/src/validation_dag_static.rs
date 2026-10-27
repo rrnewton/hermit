@@ -4296,7 +4296,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_shells_blocking_fifo_open_verifies_and_shows_its_poll,
     // a_fifo_shared_by_guests_through_private_tables_does_not_hold_the_turn and
     // a_fifo_with_only_the_host_at_its_other_end_is_never_polled: 629.
-    ("test.cli", 629),
+    // Moving DBT's runs out of detcore_renders_its_procfs_files_on_every_backend
+    // and detcore_omits_the_procfs_names_outside_the_level_on_every_backend
+    // (https://github.com/rrnewton/hermit/issues/4783) adds
+    // detcore_renders_its_procfs_files_on_dbt_as_on_ptrace,
+    // detcore_keeps_its_procfs_files_across_a_chroot_and_trusts_no_forged_placeholder_on_dbt
+    // and detcore_omits_the_procfs_names_outside_the_level_on_dbt: 632, listed.
+    ("test.cli", 632),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -4815,7 +4821,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 0.5.4 base counts 541.
     // And the same seven tests split out of four heavy ones, not excluded:
     // 548.
-    ("test.cli_on_host", 548),
+    // And the same three tests holding DBT's procfs runs, not excluded: 551,
+    // listed.
+    ("test.cli_on_host", 551),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux

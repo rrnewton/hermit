@@ -5267,8 +5267,37 @@ const PROCFS_NOT_YET: &[(&str, &str, &str)] = &[
 /// `PROCFS_BACKENDS` that this build has and this host can run, except those
 /// `PROCFS_NOT_YET` lists for `test`. Each one left out is named, with why.
 fn procfs_backends(test: &str) -> Vec<&'static str> {
+    procfs_backends_among(test, &PROCFS_BACKENDS)
+}
+
+/// Every backend in `PROCFS_BACKENDS` but `excluded`, which its own test
+/// checks: so a backend added to `PROCFS_BACKENDS` is checked by the test
+/// that takes the rest.
+fn procfs_backends_except(excluded: &str) -> Vec<&'static str> {
+    assert!(
+        PROCFS_BACKENDS.contains(&excluded),
+        "{excluded} is not one of PROCFS_BACKENDS"
+    );
     PROCFS_BACKENDS
         .into_iter()
+        .filter(|backend| *backend != excluded)
+        .collect()
+}
+
+/// `procfs_backends(test)`, of the backends in `among` only, for a test that
+/// checks some of the backends and leaves the others to other tests. Every
+/// one of `among` must be one of `PROCFS_BACKENDS`, so a misspelled name
+/// refuses rather than going unchecked.
+fn procfs_backends_among(test: &str, among: &[&str]) -> Vec<&'static str> {
+    for backend in among {
+        assert!(
+            PROCFS_BACKENDS.contains(backend),
+            "{test}: {backend} is not one of PROCFS_BACKENDS"
+        );
+    }
+    PROCFS_BACKENDS
+        .into_iter()
+        .filter(|backend| among.contains(backend))
         .filter(|backend| {
             if let Some((_, _, why)) = PROCFS_NOT_YET.iter().find(|(name, backends, _)| {
                 *name == test && backends.split(", ").any(|listed| listed == *backend)
@@ -6234,6 +6263,14 @@ fn host_kernel_at_least(major: u32, minor: u32) -> bool {
 /// `--proc=minimal` the standard level's names go too. Every backend that runs
 /// Detcore is compared (`procfs_backends`), but one not available here, named
 /// as not compared, and one `PROCFS_NOT_YET` lists, named with its issue.
+///
+/// This test runs every backend but DBT at both levels, and ptrace's runs
+/// without virtualized metadata, under record and replay at both levels, and
+/// chrooted into /proc. DBT's three runs (both levels, and chrooted into /proc
+/// unverified) are in `detcore_omits_the_procfs_names_outside_the_level_on_dbt`,
+/// so that each test fits the 57-second wall bound on a loaded host
+/// (https://github.com/rrnewton/hermit/issues/4783). Every run is checked
+/// alone, against the output expected of it, so no run needs another's.
 #[test]
 fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
     let guest = omitted_procfs_names_guest();
@@ -6254,6 +6291,45 @@ fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
             "the host has no {path}: {native}"
         );
     }
+    let compared = detcore_omits_the_procfs_names_outside_the_level_on(
+        "detcore_omits_the_procfs_names_outside_the_level_on_every_backend",
+        &procfs_backends_except("dbt"),
+    );
+    // DBT has its own test now; e9patch is the backend this test has whenever
+    // its feature is built.
+    assert!(
+        compared.iter().any(|run| !run.starts_with("ptrace/")) || !cfg!(feature = "e9patch"),
+        "only ptrace was compared: {compared:?}"
+    );
+}
+
+/// DBT's runs of `detcore_omits_the_procfs_names_outside_the_level_on_every_backend`:
+/// verified at both levels, and chrooted into /proc unverified
+/// (https://github.com/rrnewton/hermit/issues/4783).
+#[test]
+fn detcore_omits_the_procfs_names_outside_the_level_on_dbt() {
+    let test = "detcore_omits_the_procfs_names_outside_the_level_on_dbt";
+    let compared = detcore_omits_the_procfs_names_outside_the_level_on(test, &["dbt"]);
+    assert!(
+        compared
+            == [
+                "dbt/standard",
+                "dbt/minimal",
+                "dbt/standard/chroot-into-proc-unverified"
+            ]
+            || !cfg!(feature = "dbt"),
+        "{test}: dbt was not compared: {compared:?}"
+    );
+}
+
+/// The omitted-names guest on the backends of `among` that `test` runs on
+/// here (`procfs_backends_among`), at both levels, each run's output
+/// compared with what Linux gives for it; with ptrace among them, also
+/// ptrace's runs without virtualized metadata, under record and replay and
+/// chrooted into /proc, and with DBT, DBT's run chrooted into /proc. Returns
+/// the runs made, as `backend/level[/mode]`.
+fn detcore_omits_the_procfs_names_outside_the_level_on(test: &str, among: &[&str]) -> Vec<String> {
+    let guest = omitted_procfs_names_guest();
     let omitted = [
         "/proc/kallsyms",
         "/proc/kcore",
@@ -6355,8 +6431,7 @@ fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
     };
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let mut compared = Vec::new();
-    let backends =
-        procfs_backends("detcore_omits_the_procfs_names_outside_the_level_on_every_backend");
+    let backends = procfs_backends_among(test, among);
     let mut runs = Vec::new();
     for level in ["standard", "minimal"] {
         runs.extend(
@@ -6365,12 +6440,14 @@ fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
                 .map(|backend| (*backend, level, Mode::Verified)),
         );
     }
-    runs.extend([
-        ("ptrace", "standard", Mode::NoMetadata),
-        ("ptrace", "standard", Mode::Recorded),
-        ("ptrace", "minimal", Mode::Recorded),
-        ("ptrace", "standard", Mode::IntoProc),
-    ]);
+    if backends.contains(&"ptrace") {
+        runs.extend([
+            ("ptrace", "standard", Mode::NoMetadata),
+            ("ptrace", "standard", Mode::Recorded),
+            ("ptrace", "minimal", Mode::Recorded),
+            ("ptrace", "standard", Mode::IntoProc),
+        ]);
+    }
     if backends.contains(&"dbt") {
         runs.push(("dbt", "standard", Mode::IntoProcUnverified));
     }
@@ -6461,18 +6538,14 @@ fn detcore_omits_the_procfs_names_outside_the_level_on_every_backend() {
             }
         ));
     }
-    assert!(
-        compared.len() > 4 || !cfg!(feature = "dbt"),
-        "only ptrace was compared"
-    );
-    eprintln!(
-        "detcore_omits_the_procfs_names_outside_the_level_on_every_backend compared {compared:?}"
-    );
+    eprintln!("{test} compared {compared:?}");
+    compared
 }
 
 /// The omitted-names guest's two removals (`--removals`: `unlink` of
 /// /proc/kallsyms and `rmdir` of /proc/sysvipc) in `runs`, each `(backend,
 /// level, mode)` as `detcore_omits_the_procfs_names_outside_the_level_on_every_backend`
+/// or, for DBT, `detcore_omits_the_procfs_names_outside_the_level_on_dbt`
 /// runs it: both fail as Linux fails them for a name procfs does not have
 /// (ENOENT), with that test's verification and record checks.
 fn check_omitted_procfs_removals(
@@ -6560,8 +6633,10 @@ fn check_omitted_procfs_removals(
 
 /// Removing a `/proc` name in no `--proc` level fails as Linux fails it for a
 /// name procfs does not have (ENOENT), in every run of
-/// `detcore_omits_the_procfs_names_outside_the_level_on_every_backend` that
-/// makes changes on Hermit's procfs mount: its backends but KVM (whose own
+/// `detcore_omits_the_procfs_names_outside_the_level_on_every_backend` and
+/// `detcore_omits_the_procfs_names_outside_the_level_on_dbt` (its DBT runs,
+/// moved there by https://github.com/rrnewton/hermit/issues/4783) that
+/// makes changes on Hermit's procfs mount: their backends but KVM (whose own
 /// /proc is checked by
 /// `detcore_refuses_removing_the_procfs_names_outside_the_level_on_kvm`) at
 /// both levels, ptrace without virtualized metadata, and ptrace's record and
@@ -6570,7 +6645,9 @@ fn check_omitted_procfs_removals(
 #[test]
 fn detcore_refuses_removing_the_procfs_names_outside_the_level_on_every_backend() {
     // The original test's selection, so exactly its backends run and the same
-    // ones are named as not yet or not compared.
+    // ones are named as not yet or not compared. It still includes DBT, whose
+    // runs that test now leaves to
+    // detcore_omits_the_procfs_names_outside_the_level_on_dbt.
     let backends =
         procfs_backends("detcore_omits_the_procfs_names_outside_the_level_on_every_backend");
     let mut runs = Vec::new();
@@ -7491,6 +7568,20 @@ fn kept_procfs_directories_are_served_after_a_chroot() {
 /// names. Linux's own answers are checked natively first. Every backend that
 /// runs Detcore is compared (`procfs_backends`), but one not available here,
 /// named as not compared, and one `PROCFS_NOT_YET` lists, named with its issue.
+///
+/// This test checks every backend in `PROCFS_BACKENDS` but DBT
+/// (`procfs_backends_except`): today ptrace, KVM and e9patch, with SaBRe,
+/// LiteInst and in-guest-trap named as not yet.
+/// DBT's runs, the longest, are in two tests, so that each test fits the
+/// 57-second wall bound on a loaded host
+/// (https://github.com/rrnewton/hermit/issues/4783):
+/// `detcore_renders_its_procfs_files_on_dbt_as_on_ptrace`, DBT's verified run,
+/// which compares DBT with a ptrace run of its own, and
+/// `detcore_keeps_its_procfs_files_across_a_chroot_and_trusts_no_forged_placeholder_on_dbt`,
+/// DBT's chroot checks and forged placeholder. This test and
+/// `detcore_renders_its_procfs_files_on_dbt_as_on_ptrace` each check ptrace's
+/// output line by line and require every other backend's output to equal it
+/// (`detcore_renders_its_procfs_files_on`).
 #[test]
 fn detcore_renders_its_procfs_files_on_every_backend() {
     let guest = rendered_procfs_files_guest();
@@ -7525,9 +7616,124 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
     }
     let native = native.output().expect("run rendered-procfs-files natively");
     assert!(native.status.success(), "native: {native:?}");
+    let compared = detcore_renders_its_procfs_files_on(
+        "detcore_renders_its_procfs_files_on_every_backend",
+        &procfs_backends_except("dbt"),
+    );
+    // DBT, which the whole test once required beside ptrace, has its own test
+    // now; e9patch is the backend this test has whenever its feature is built.
+    assert!(
+        compared.len() > 1 || !cfg!(feature = "e9patch"),
+        "only ptrace was compared: {compared:?}"
+    );
+}
+
+/// DBT's verified run of `detcore_renders_its_procfs_files_on_every_backend`,
+/// its output compared with a verified ptrace run's and ptrace's checked line
+/// by line (https://github.com/rrnewton/hermit/issues/4783). DBT's unverified
+/// runs are in
+/// `detcore_keeps_its_procfs_files_across_a_chroot_and_trusts_no_forged_placeholder_on_dbt`.
+#[test]
+fn detcore_renders_its_procfs_files_on_dbt_as_on_ptrace() {
+    let test = "detcore_renders_its_procfs_files_on_dbt_as_on_ptrace";
+    let compared = detcore_renders_its_procfs_files_on(test, &["dbt"]);
+    assert!(
+        compared == ["ptrace", "dbt"] || !cfg!(feature = "dbt"),
+        "{test}: dbt was not compared with ptrace: {compared:?}"
+    );
+}
+
+/// DBT's unverified runs of `detcore_renders_its_procfs_files_on_every_backend`,
+/// which DBT's verified run (`detcore_renders_its_procfs_files_on_dbt_as_on_ptrace`)
+/// does not need (https://github.com/rrnewton/hermit/issues/4783): the
+/// chroot checks DBT cannot yet verify, and the forged placeholder.
+#[test]
+fn detcore_keeps_its_procfs_files_across_a_chroot_and_trusts_no_forged_placeholder_on_dbt() {
+    let test =
+        "detcore_keeps_its_procfs_files_across_a_chroot_and_trusts_no_forged_placeholder_on_dbt";
+    let compared = procfs_backends_among(test, &["dbt"]);
+    assert!(
+        compared == ["dbt"] || !cfg!(feature = "dbt"),
+        "{test}: dbt was not compared: {compared:?}"
+    );
+    if compared.is_empty() {
+        return;
+    }
+    // The chroot checks DBT cannot yet verify, run once: a descriptor
+    // opened before a chroot is still the file, and neither file exists
+    // inside it. (Not a thread's chroot, which hangs under DBT:
+    // https://github.com/rrnewton/hermit/issues/4254.)
+    let guest = rendered_procfs_files_guest();
+    let args = [
+        "--backend",
+        "dbt",
+        "run",
+        "--strict",
+        "--proc=standard",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        "--chroot-only",
+        "--require-chroot",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(stdout(&output), "chroot checks passed\n", "dbt chroot");
+    check_forged_cpuinfo_placeholder("dbt");
+    eprintln!("{test} compared {compared:?}");
+}
+
+/// In a run that does not render /proc/cpuinfo, a memfd the guest names
+/// and seals as Detcore names and seals a /proc/cpuinfo placeholder is
+/// an ordinary memfd, reopened through its descriptor link and after
+/// exec: Detcore made no placeholder there, so the name is not trusted
+/// (Codex review of https://github.com/rrnewton/hermit/issues/4213).
+fn check_forged_cpuinfo_placeholder(backend: &str) {
+    let guest = rendered_procfs_files_guest();
+    let args = [
+        "--backend",
+        backend,
+        "run",
+        "--strict",
+        "--no-virtualize-cpuid",
+        "--base-env=minimal",
+        "--",
+        guest.to_str().expect("guest path is UTF-8"),
+        "--forged-cpuinfo-placeholder",
+    ];
+    let output = hermit(&args);
+    assert_success(&output, &args);
+    assert_eq!(
+        stdout(&output),
+        "forged cpuinfo placeholder: an ordinary memfd\n",
+        "{backend}"
+    );
+}
+
+/// The backends of `among` that `test` runs on here (`procfs_backends_among`),
+/// each verified, its output compared with ptrace's, and ptrace's output
+/// checked line by line. ptrace runs first: as one of the backends checked,
+/// or, where `among` does not name it, only for the output the others are
+/// compared with (its forged-placeholder run is then left to the test that
+/// checks ptrace). Each checked backend but DBT also runs
+/// `check_forged_cpuinfo_placeholder`. Returns the backends whose outputs
+/// were compared, ptrace's first; none when no backend of `among` runs here.
+fn detcore_renders_its_procfs_files_on(test: &str, among: &[&str]) -> Vec<&'static str> {
+    let guest = rendered_procfs_files_guest();
+    let xattr_arguments_first = host_kernel_at_least(6, 13);
+    let checked = procfs_backends_among(test, among);
+    if checked.is_empty() {
+        return Vec::new();
+    }
+    let reference_only = !checked.contains(&"ptrace");
+    let backends = reference_only
+        .then_some("ptrace")
+        .into_iter()
+        .chain(checked)
+        .collect::<Vec<_>>();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let mut identities = Vec::new();
-    for backend in procfs_backends("detcore_renders_its_procfs_files_on_every_backend") {
+    for backend in backends {
         let report = directory.path().join(format!("{backend}.json"));
         let report_arg = report.to_str().expect("report path is UTF-8").to_owned();
         let mut args = vec![
@@ -7602,62 +7808,17 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
             "{backend} compared no INFO messages: {verdict}"
         );
         identities.push((backend, stdout(&output)));
-        // The chroot checks DBT cannot yet verify, run once: a descriptor
-        // opened before a chroot is still the file, and neither file exists
-        // inside it. (Not a thread's chroot, which hangs under DBT:
-        // https://github.com/rrnewton/hermit/issues/4254.)
-        if backend == "dbt" {
-            let args = [
-                "--backend",
-                "dbt",
-                "run",
-                "--strict",
-                "--proc=standard",
-                "--base-env=minimal",
-                "--",
-                guest.to_str().expect("guest path is UTF-8"),
-                "--chroot-only",
-                "--require-chroot",
-            ];
-            let output = hermit(&args);
-            assert_success(&output, &args);
-            assert_eq!(stdout(&output), "chroot checks passed\n", "dbt chroot");
+        // DBT's chroot checks and forged placeholder are
+        // `detcore_keeps_its_procfs_files_across_a_chroot_and_trusts_no_forged_placeholder_on_dbt`.
+        if backend != "dbt" && !(backend == "ptrace" && reference_only) {
+            check_forged_cpuinfo_placeholder(backend);
         }
-        // In a run that does not render /proc/cpuinfo, a memfd the guest names
-        // and seals as Detcore names and seals a /proc/cpuinfo placeholder is
-        // an ordinary memfd, reopened through its descriptor link and after
-        // exec: Detcore made no placeholder there, so the name is not trusted
-        // (Codex review of https://github.com/rrnewton/hermit/issues/4213).
-        let args = [
-            "--backend",
-            backend,
-            "run",
-            "--strict",
-            "--no-virtualize-cpuid",
-            "--base-env=minimal",
-            "--",
-            guest.to_str().expect("guest path is UTF-8"),
-            "--forged-cpuinfo-placeholder",
-        ];
-        let output = hermit(&args);
-        assert_success(&output, &args);
-        assert_eq!(
-            stdout(&output),
-            "forged cpuinfo placeholder: an ordinary memfd\n",
-            "{backend}"
-        );
     }
-    assert!(
-        identities.len() > 1 || !cfg!(feature = "dbt"),
-        "only ptrace was compared: {identities:?}"
-    );
-    eprintln!(
-        "detcore_renders_its_procfs_files_on_every_backend compared {:?}",
-        identities
-            .iter()
-            .map(|(backend, _)| *backend)
-            .collect::<Vec<_>>()
-    );
+    let compared = identities
+        .iter()
+        .map(|(backend, _)| *backend)
+        .collect::<Vec<_>>();
+    eprintln!("{test} compared {compared:?}");
     let (_, first) = &identities[0];
     let lines = first.lines().collect::<Vec<_>>();
     // The guest's lines, in order: each file's contents (/proc/stat's and
@@ -7784,6 +7945,7 @@ fn detcore_renders_its_procfs_files_on_every_backend() {
             identities[0].0
         );
     }
+    compared
 }
 
 /// A name relative to a directory descriptor the guest received over
