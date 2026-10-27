@@ -107,6 +107,9 @@ mod tests {
         // Adds `GlobalRequest::ProcessSignalReceiver`; adds `GlobalResponse::ProcessSignalReceiver`
         // (https://github.com/rrnewton/hermit/pull/4625, renumbered to 10 at landing).
         (10, "1899cf7ab14698ae", "dafaa96d8b8cb3ad"),
+        // Adds `GlobalRequest::StoreExclusive` and `GlobalResponse::StoreExclusive`
+        // (https://github.com/rrnewton/hermit/pull/4740, renumbered to 11 at landing).
+        (11, "8bb87305b1bd45a3", "dafaa96d8b8cb3ad"),
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
