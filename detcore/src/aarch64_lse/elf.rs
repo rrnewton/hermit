@@ -161,6 +161,7 @@ fn refusal_name(reason: &Refusal) -> &'static str {
         Refusal::UnsupportedMappingSymbol(_) => "unsupported-mapping-symbol",
         Refusal::CompareExit => "compare-exit",
         Refusal::UnknownDirectBranch => "unknown-direct-branch",
+        Refusal::NewValueAfterCompare => "new-value-after-compare",
     }
 }
 
