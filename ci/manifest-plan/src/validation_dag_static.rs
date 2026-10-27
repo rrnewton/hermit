@@ -3066,7 +3066,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
-    ("test.detcore_unit", 2877),
+    // And tool_local's replay_slice_overshoot_classifies_by_branches_then_time,
+    // a_replay_past_a_recorded_slice_end_reports_an_overshoot and
+    // a_replay_overshoot_panics_when_asked_to and
+    // a_replay_past_several_recorded_ends_follows_the_first_ahead: 2881, listed.
+    ("test.detcore_unit", 2881),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5382,7 +5386,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 2788.
     // The P0 traced-index fix (ae8ffa4b) removes the schedule-position
     // replayer test and keeps the population at 2787.
-    ("test.detcore_unit_on_host", 2877),
+    // And the same four replay-overshoot units: 2881, listed.
+    ("test.detcore_unit_on_host", 2881),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -18671,8 +18671,9 @@ fn run_chaos_preemption_replay_reuses_the_recorded_epoch() {
             .stdin(Stdio::null()),
     );
     let replay_stderr = stderr(&replayed);
+    // The replay never finds a thread past a recorded slice end.
     assert!(
-        !replay_stderr.contains("Cannot set end of timeslice"),
+        !replay_stderr.contains("HERMIT_SKID_OVERSHOOT preemption replay"),
         "{replay_stderr}"
     );
     assert_success(&replayed, &replay_args);
