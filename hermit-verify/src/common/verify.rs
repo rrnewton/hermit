@@ -224,7 +224,9 @@ impl<P: AsRef<OsStr>> Verify<P> {
             "::  Checking that per-thread priority histories and callback checkpoints match".bold()
         );
         let read = |path: &Path| -> anyhow::Result<serde_json::Value> {
-            Ok(serde_json::from_reader(std::fs::File::open(path)?)?)
+            Ok(serde_json::from_reader(BufReader::new(
+                std::fs::File::open(path)?,
+            ))?)
         };
         let (left, right) = (read(&left.schedule_file)?, read(&right.schedule_file)?);
         // Name what was compared, so an exact agreement of two empty
@@ -247,7 +249,7 @@ impl<P: AsRef<OsStr>> Verify<P> {
 
     fn format_json<TPath: AsRef<Path>>(path: TPath) -> anyhow::Result<String> {
         let value: serde_json::Value =
-            serde_json::from_reader(std::fs::File::open(path.as_ref())?)?;
+            serde_json::from_reader(BufReader::new(std::fs::File::open(path.as_ref())?))?;
         let schedules = match &value {
             serde_json::Value::Object(sched_file) => sched_file.get("global").ok_or_else(|| {
                 anyhow::Error::msg("expecting \"global\" key in the target json file")
