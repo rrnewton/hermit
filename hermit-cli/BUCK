@@ -139,8 +139,9 @@ rust_library(
     ]),
     crate = "hermit",
     env = hermit_build_env,
-    # LiteInst is an optional cargo feature so the published crate leaves out
-    # reverie-liteinst; the internal build keeps the backend.
+    # The shared application deliberately uses LiteInst in this internal debug
+    # build, unlike Cargo's empty default feature set. Backend cfgs and their app
+    # tests now belong to this library, not the thin executable.
     features = ["liteinst"],
     # iced-x86 decoder tables are process-lifetime globals.
     test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
@@ -252,6 +253,8 @@ rust_binary(
     },
     srcs = glob(["src/bin/hermit/main.rs"]),
     env = hermit_build_env,
+    # Backend cfgs are owned by :libhermit. This thin entry contains only
+    # executable preinitialization and fbinit, so it needs no backend feature list.
     # Signal-handler messages intentionally live for the process lifetime.
     test_env = {"LSAN_OPTIONS": "detect_leaks=0"},
     test_srcs = glob(["src/bin/hermit/main.rs"]),

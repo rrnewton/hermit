@@ -120,20 +120,26 @@ pub(super) struct BuiltinAdapter;
 
 pub(super) enum BuiltinSession {
     #[cfg(feature = "dbt")]
-    Single {
-        invocation: Option<DbtInvocation>,
-        mode: super::backend_hook::Mode,
-        options: super::run::RunOpts,
-        global: super::global_opts::GlobalOpts,
-        stdin: Option<std::fs::File>,
-    },
+    Single(Box<BuiltinSingleSession>),
     #[cfg(feature = "dbt")]
-    Pair {
-        verification: DbtVerification,
-        log: Option<LevelFilter>,
-        verbose: bool,
-        verify_json: Option<PathBuf>,
-    },
+    Pair(Box<BuiltinPairSession>),
+}
+
+#[cfg(feature = "dbt")]
+pub(super) struct BuiltinSingleSession {
+    invocation: Option<DbtInvocation>,
+    mode: super::backend_hook::Mode,
+    options: super::run::RunOpts,
+    global: super::global_opts::GlobalOpts,
+    stdin: Option<std::fs::File>,
+}
+
+#[cfg(feature = "dbt")]
+pub(super) struct BuiltinPairSession {
+    verification: DbtVerification,
+    log: Option<LevelFilter>,
+    verbose: bool,
+    verify_json: Option<PathBuf>,
 }
 
 pub(super) enum BuiltinPending {
@@ -184,7 +190,7 @@ impl super::backend_hook::BackendAdapter for BuiltinAdapter {
             }
             let invocation = request.options.dbt_invocation()?;
             if request.mode == Mode::VerificationPair {
-                return Ok(BuiltinSession::Pair {
+                return Ok(BuiltinSession::Pair(Box::new(BuiltinPairSession {
                     verification: invocation.verification(request.stdin.take())?,
                     log: request.global.log,
                     verbose: request.options.adapter_verbose_verification(),
@@ -192,15 +198,15 @@ impl super::backend_hook::BackendAdapter for BuiltinAdapter {
                         .options
                         .adapter_verification_json()
                         .map(Path::to_owned),
-                });
+                })));
             }
-            Ok(BuiltinSession::Single {
+            Ok(BuiltinSession::Single(Box::new(BuiltinSingleSession {
                 invocation: Some(invocation),
                 mode: request.mode,
                 options: request.options.clone(),
                 global: request.global.clone(),
                 stdin: request.stdin.take(),
-            })
+            })))
         }
         #[cfg(not(feature = "dbt"))]
         {
@@ -220,13 +226,14 @@ impl super::backend_hook::BackendAdapter for BuiltinAdapter {
             use super::backend_hook::Mode;
 
             match session {
-                BuiltinSession::Single {
-                    invocation,
-                    mode,
-                    options,
-                    global,
-                    stdin,
-                } => {
+                BuiltinSession::Single(session) => {
+                    let BuiltinSingleSession {
+                        invocation,
+                        mode,
+                        options,
+                        global,
+                        stdin,
+                    } = session.as_mut();
                     anyhow::ensure!(request.mode() == *mode, "backend operation mode changed");
                     let invocation = invocation.take().ok_or_else(|| {
                         Error::msg("single physical backend operation was already executed")
@@ -264,12 +271,13 @@ impl super::backend_hook::BackendAdapter for BuiltinAdapter {
                         )
                         .map(Execution::Finished)
                 }
-                BuiltinSession::Pair {
-                    verification,
-                    log,
-                    verbose,
-                    verify_json,
-                } => {
+                BuiltinSession::Pair(session) => {
+                    let BuiltinPairSession {
+                        verification,
+                        log,
+                        verbose,
+                        verify_json,
+                    } = session.as_mut();
                     anyhow::ensure!(
                         request.mode() == Mode::VerificationPair,
                         "backend operation mode changed"
@@ -3040,6 +3048,23 @@ mod tests {
     #[test]
     #[cfg(feature = "dbt")]
     fn dbt_facts_preserve_canonical_comparison_and_force_mismatch_retention() {
+        let distinct = DbtRunFacts {
+            stats: dbt_stats(101, 23, 7, 3, 53),
+            initialization_records: 2,
+        }
+        .native_facts();
+        assert_eq!(
+            (
+                distinct.counted_branches,
+                distinct.intercepted_syscalls,
+                distinct.rewritten_syscalls,
+                distinct.stdin_reads,
+                distinct.memory_hash_fold,
+                distinct.initialization_records,
+            ),
+            (101, 23, 7, 3, 53, 2),
+            "the production facts mapping must keep every observation in its own dimension"
+        );
         let first = DbtRunFacts {
             stats: dbt_stats(100, 7, 7, 0, 42),
             initialization_records: 2,

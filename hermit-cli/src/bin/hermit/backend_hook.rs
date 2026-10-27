@@ -1339,6 +1339,62 @@ mod tests {
                 "ordinary Hermit must refuse an external identity, never default to ptrace"
             );
         }
+
+        // The implicit builtin default is intentionally absent from ordinary
+        // saved files. An extension must not reinterpret that omission.
+        let implicit =
+            super::super::run_config::parse("schema: hermit-run-config/v1\nprogram: /bin/true\n")
+                .unwrap();
+        let implicit_config = directory.path().join("implicit-config.yaml");
+        let implicit_manifest = directory.path().join("implicit-manifest.json");
+        super::super::run_config::write(&implicit_config, &implicit).unwrap();
+        let (global, run) = super::super::run_config::to_manifest_parts(&implicit).unwrap();
+        let document = manifest::Manifest::new(
+            hermit::Id::unique(),
+            manifest::Kind::History,
+            manifest::Command {
+                program: implicit.program.clone(),
+                args: implicit.args.clone(),
+                cwd: None,
+            },
+            manifest::Inputs {
+                global,
+                run,
+                host_drawn: BTreeMap::new(),
+            },
+        );
+        manifest::write(&implicit_manifest, &document).unwrap();
+        let builtin_schema = super::super::Args::command();
+        for (flag, path) in [("--config", implicit_config), ("--from", implicit_manifest)] {
+            let argv = [
+                "hermit-dynamorio".into(),
+                "run".into(),
+                flag.into(),
+                path.into_os_string(),
+            ];
+            let error = super::super::run_config::expand_argv_for_application(
+                &schema,
+                &argv,
+                Some(StaticAdapter::NAME),
+            )
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("no saved backend identity"));
+
+            let expanded = super::super::run_config::expand_argv(&builtin_schema, &argv)
+                .unwrap()
+                .unwrap();
+            let matches = builtin_schema
+                .clone()
+                .try_get_matches_from(expanded)
+                .unwrap();
+            let builtin = super::super::args_from_matches_with_schema(
+                &matches,
+                || std::time::UNIX_EPOCH,
+                &builtin_schema,
+            )
+            .unwrap();
+            assert!(builtin.global.backend.is_none());
+        }
     }
 
     #[test]
