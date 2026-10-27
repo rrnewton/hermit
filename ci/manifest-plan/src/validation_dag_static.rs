@@ -1836,7 +1836,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And tests::defined_dynamic_symbols_are_read_from_the_dynamic_segment_alone
     // and tests::the_dynamic_symbol_count_comes_from_the_hash_table (that check
     // reads only the runtime's dynamic symbols): 1112, listed.
-    ("test.hermit_unit", 1114),
+    // And the eight pinned_cpu::tests units (https://github.com/rrnewton/hermit/issues/4824): 1122, listed.
+    ("test.hermit_unit", 1122),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5614,7 +5615,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same DBT runtime fingerprint-check unit: 1106, listed.
     // And the same four P1 container units: 1110, listed.
     // And the same two dynamic-symbol units: 1112, listed.
-    ("test.hermit_unit_on_host", 1114),
+    // And the same eight pinned_cpu::tests units (https://github.com/rrnewton/hermit/issues/4824): 1122, listed.
+    ("test.hermit_unit_on_host", 1122),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
