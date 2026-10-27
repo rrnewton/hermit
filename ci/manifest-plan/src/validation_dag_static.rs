@@ -1195,7 +1195,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // capability_clear_image_readiness_preserves_legacy_conditions: 1883, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1894.
     // Train 6 recount (measured on 21f770f6 base): 1899.
-    ("test.regular_crates", 1899),
+    // And detcore-model's
+    // config::tests::one_rcb_minimum_multiplies_like_detcores_pmu_epsilon (the
+    // one-RCB --max-timeslice minimum multiplies like Detcore's PMU epsilon):
+    // 1881 (1880 on main plus one).
+    ("test.regular_crates", 1900),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5965,7 +5969,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hosted exclusions unchanged: 1869, listed.
     // RPC6 strict-loader union re-listed with this node's unchanged selection: 1880.
     // Train 6 recount (measured on 21f770f6 base): 1885.
-    ("test.regular_crates_on_host", 1885),
+    // And the same one-RCB minimum unit: 1867 (1866 on main plus one).
+    ("test.regular_crates_on_host", 1886),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

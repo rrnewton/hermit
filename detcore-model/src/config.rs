@@ -860,7 +860,7 @@ pub struct Config {
     /// thousands of times slower than at the default (a pipeline test took 0.3 s at the default and
     /// 994 s at 1000), and a `--timeout` that expires may mean a slow run rather than a hung one.
     /// `hermit run`, `hermit analyze` and `hermit bisect` say so on stderr when a slice is at most
-    /// ten skid margins long, so that at least a tenth of it is stepped (100000 virtual
+    /// ten skid margins long, so that at least a tenth of it is stepped (1000000 virtual
     /// nanoseconds at the default clock multiplier on a processor with a 10000-RCB margin); a
     /// preemption replay, whose recording sets the slices, and `--imprecise-timers`, which steps
     /// nothing, say nothing. `--summary` reports how many timeslices the run had.
@@ -1456,13 +1456,22 @@ impl Config {
     /// chaos per-thread slowdown, at its largest factor: the most any thread's
     /// RCB takes, so a timeslice of `n` virtual nanoseconds is at least
     /// `n / largest_nanos_per_rcb()` RCBs for every thread.
+    ///
+    /// The two multipliers are combined first and then applied to
+    /// `NANOS_PER_RCB`, the order of the one-RCB PMU epsilon that Detcore's
+    /// post-hook compares with the end of the maximum
+    /// (`post_handler_hook_observed` and `callback_checkpoint_expiry_due` in
+    /// `detcore/src/lib.rs`), which [`Self::minimum_max_timeslice_nanos`]
+    /// bounds. Floating-point multiplication is not associative: at a clock
+    /// multiplier of 2.5 and a largest factor of 4.4, `(10 * 2.5) * 4.4` is one
+    /// unit in the last place above 110, which would raise that minimum to 111.
     pub fn largest_nanos_per_rcb(&self) -> f64 {
         let slowdown = if self.chaos && self.chaos_per_thread_slowdown {
             self.chaos_slowdown_max_factor
         } else {
             1.0
         };
-        NANOS_PER_RCB * self.clock_multiplier.unwrap_or(1.0) * slowdown
+        NANOS_PER_RCB * (self.clock_multiplier.unwrap_or(1.0) * slowdown)
     }
 
     /// Smallest PMU-backed maximum representable by one RCB at this clock multiplier.
@@ -6471,6 +6480,55 @@ mod tests {
             ..Default::default()
         };
         config.validate();
+    }
+
+    /// The one-RCB minimum multiplies like the PMU epsilon of Detcore's
+    /// post-hook, `NANOS_PER_RCB * (clock_multiplier * factor)` in
+    /// `detcore/src/lib.rs`, bit for bit. Every pair below rounds differently
+    /// when multiplied left to right; in the first three that moves the
+    /// minimum: at `--clock-multiplier=2.5` and
+    /// `--chaos-slowdown-max-factor=4.4` the left-to-right product refused
+    /// `--max-timeslice=110` as below "at least 111".
+    #[test]
+    fn one_rcb_minimum_multiplies_like_detcores_pmu_epsilon() {
+        let slowed = |clock_multiplier: f64, factor: f64, max_timeslice: u64| Config {
+            chaos: true,
+            chaos_per_thread_slowdown: true,
+            chaos_slowdown_max_factor: factor,
+            clock_multiplier: Some(clock_multiplier),
+            max_timeslice: NonZeroU64::new(max_timeslice),
+            ..Default::default()
+        };
+
+        let mut config = slowed(2.5, 4.4, 110);
+        assert_eq!(config.minimum_max_timeslice_nanos(), 110);
+        config.validate();
+
+        for (clock_multiplier, factor, minimum) in [
+            (2.5, 4.4, 110),
+            (2.5, 2.2, 55),
+            (7.0, 1.1, 78),
+            (0.7, 3.0, 21),
+            (1.1, 5.5, 61),
+        ] {
+            let detcore = NANOS_PER_RCB * (clock_multiplier * factor);
+            assert_ne!(
+                (NANOS_PER_RCB * clock_multiplier * factor).to_bits(),
+                detcore.to_bits(),
+                "{clock_multiplier} x {factor} does not tell the orders apart"
+            );
+            let config = slowed(clock_multiplier, factor, 1_000_000);
+            assert_eq!(
+                config.largest_nanos_per_rcb().to_bits(),
+                detcore.to_bits(),
+                "{clock_multiplier} x {factor}"
+            );
+            assert_eq!(
+                config.minimum_max_timeslice_nanos(),
+                minimum,
+                "{clock_multiplier} x {factor}"
+            );
+        }
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
