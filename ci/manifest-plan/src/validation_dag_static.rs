@@ -3343,7 +3343,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And container_init_deadline's
     // container_init_exits_when_its_hermit_parent_died_before_it_armed:
     // 61 + 263 + 252 = 576, listed.
-    ("test.hermit_integration", 61),
+    ("test.hermit_integration", 62),
     // And proc_locks_determinism's two host-lock controls and two
     // description-scenario tests (ptrace and DBT each), its address-space
     // refusal test and its record/replay test, in the second shard:
@@ -5365,7 +5365,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And two pure declared-Redis input controls in redis_strict: 691, listed.
     // Name the optional e9patch consumer leg separately; all ten legs remain (+1): 692.
     // And the same two-run syscall-histogram test: 693, listed.
-    ("test.hermit_integration_on_host", 693),
+    ("test.hermit_integration_on_host", 694),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
