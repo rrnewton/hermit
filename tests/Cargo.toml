@@ -179,6 +179,21 @@ path = "rust/stack_ptr.rs"
 test = false
 
 [[bin]]
+name = "rustbin_gvisor_eventfd"
+path = "rust/gvisor_eventfd.rs"
+test = false
+
+[[bin]]
+name = "rustbin_gvisor_timerfd"
+path = "rust/gvisor_timerfd.rs"
+test = false
+
+[[bin]]
+name = "rustbin_gvisor_tkill"
+path = "rust/gvisor_tkill.rs"
+test = false
+
+[[bin]]
 name = "rustbin_thread_random"
 path = "rust/thread_random.rs"
 test = false
@@ -198,4 +213,5 @@ detcore = { package = "hermit-detcore", version = "0.5.4", path = "../detcore" }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
 regex = "1.13.1"
+googletest = "0.14.4"
 tempfile = "3.27.0"
