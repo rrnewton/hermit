@@ -1394,20 +1394,35 @@ fn cpu_ids(affinity: &CpuSet) -> Vec<usize> {
         .collect()
 }
 
-pub(super) fn apply_affinity(container: &mut Container, pin_threads: bool) {
+/// Pin the container to the CPU [`super::pinned_cpu::choose_for_run`] chooses
+/// and reserves, when `pin_threads`. `cpu_profile_source` is the CPU a
+/// `--cpu-profile host-no-rdrand` run verified CPUID faulting on
+/// (`Config::cpu_profile_source`): its launch guard pins the tracer there, so
+/// that CPU is the one chosen and reserved, not another the run never uses.
+pub(super) fn apply_affinity(
+    container: &mut Container,
+    pin_threads: bool,
+    cpu_profile_source: Option<usize>,
+) {
     if pin_threads {
         let affinity = sched_getaffinity(Pid::from_raw(0))
             .expect("failed to query the tracer's allowed CPU affinity mask");
-        let allowed = cpu_ids(&affinity);
-        let (core, basis) = super::pinned_cpu::choose(&allowed)
+        let mut allowed = cpu_ids(&affinity);
+        if let Some(source) = cpu_profile_source.filter(|cpu| allowed.contains(cpu)) {
+            allowed = vec![source];
+        }
+        let choice = super::pinned_cpu::choose_for_run(&allowed)
             .expect("the tracer's allowed CPU affinity mask is empty");
-        tracing::info!("Pinning tracer and guest threads to core {core} ({basis})");
-        container.affinity(core);
+        tracing::info!(
+            "Pinning tracer and guest threads to core {} ({choice})",
+            choice.cpu
+        );
+        container.affinity(choice.cpu);
     }
 }
 
 pub fn default_container(pin_threads: bool) -> Container {
-    let mut container = namespace_container(pin_threads);
+    let mut container = namespace_container(pin_threads, None);
     container.mount(container_proc_mount());
     container
 }
@@ -1415,7 +1430,10 @@ pub fn default_container(pin_threads: bool) -> Container {
 /// [`default_container`] without its `/proc`: the namespaces and the private
 /// `/`, for a container given a mount plan, `/proc` first, which its setup
 /// installs and its init records (`IdentityGuard::set_plan`).
-pub(super) fn namespace_container(pin_threads: bool) -> Container {
+pub(super) fn namespace_container(
+    pin_threads: bool,
+    cpu_profile_source: Option<usize>,
+) -> Container {
     let mut container = Container::new();
     container
         .unshare(Namespace::PID)
@@ -1427,7 +1445,7 @@ pub(super) fn namespace_container(pin_threads: bool) -> Container {
         // guest's mount table during a run. Cut that propagation first.
         .mount(Mount::new("/").rprivate());
 
-    apply_affinity(&mut container, pin_threads);
+    apply_affinity(&mut container, pin_threads, cpu_profile_source);
     container
 }
 
@@ -1459,6 +1477,7 @@ pub(super) fn image_container(
     rootfs: &Path,
     tmpfs: &Path,
     pin_threads: bool,
+    cpu_profile_source: Option<usize>,
     private_tmp: bool,
     placeholder: bool,
 ) -> Result<(Container, IdentityGuard), Error> {
@@ -1554,7 +1573,7 @@ pub(super) fn image_container(
     // (mounts first, then chroot).
     container.chroot(rootfs);
 
-    apply_affinity(&mut container, pin_threads);
+    apply_affinity(&mut container, pin_threads, cpu_profile_source);
     let mut identity_sources = IdentityGuard::empty();
     if private_tmp {
         identity_sources.add_private_tmp(tmpfs)?;
@@ -6043,7 +6062,7 @@ mod tests {
             .checked_run(|| {
                 readonly_proc::deny_writable_mounts().map_err(|error| error.to_string())?;
                 let (mut container, _identity) =
-                    image_container(rootfs.path(), tmpfs.path(), false, true, true)
+                    image_container(rootfs.path(), tmpfs.path(), false, None, true, true)
                         .map_err(|error| error.to_string())?;
                 // This closure is already loaded, so the image needs no executable
                 // or libraries. It reads the proc mount after entering the chroot.
@@ -6103,7 +6122,7 @@ mod tests {
                 }
                 fs::create_dir(&tmpfs).map_err(|e| e.to_string())?;
                 let (mut container, _identity) =
-                    image_container(&rootfs, &tmpfs, false, true, true)
+                    image_container(&rootfs, &tmpfs, false, None, true, true)
                         .map_err(|error| error.to_string())?;
                 container
                     .checked_run(root_mount_flags)
@@ -6479,12 +6498,14 @@ mod tests {
     fn image_container_registers_only_an_automatic_private_tmp() {
         let rootfs = tempfile::TempDir::new().expect("create image rootfs");
         let private_tmp = tempfile::TempDir::new().expect("create private tmp");
-        let (_, generated) = image_container(rootfs.path(), private_tmp.path(), false, true, true)
-            .expect("construct image container with generated tmp");
+        let (_, generated) =
+            image_container(rootfs.path(), private_tmp.path(), false, None, true, true)
+                .expect("construct image container with generated tmp");
         assert_eq!(generated.mountinfo_roots.len(), 1);
 
-        let (_, supplied) = image_container(rootfs.path(), private_tmp.path(), false, false, true)
-            .expect("construct image container with user tmp");
+        let (_, supplied) =
+            image_container(rootfs.path(), private_tmp.path(), false, None, false, true)
+                .expect("construct image container with user tmp");
         assert!(supplied.mountinfo_roots.is_empty());
     }
 
@@ -6619,7 +6640,7 @@ mod tests {
                 "selected CPU {selected} ({basis})"
             );
         }
-        assert_eq!(super::super::pinned_cpu::choose(&[]), None);
+        assert_eq!(super::super::pinned_cpu::choose_with(&[], |_| None), None);
     }
 
     /// How the candidate init in [`arm_after_the_parent_crossed`] ended: its
