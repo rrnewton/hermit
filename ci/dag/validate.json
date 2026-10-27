@@ -24585,7 +24585,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1112",
+        "NEXTEST_EXPECTED_EXECUTED": "1119",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -48363,7 +48363,7 @@
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends,kvm-native-test-support --lib --bins -j 1 -- --skip ptrace_completion::tests::real_random_ --skip kvm_execution_tests::",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit-run --features third-party-backends,kvm-native-test-support --lib --bins -j 1 -E 'not (test(=in_guest_delivery_harness::forced_gate_a_managed_wait4_publishes_the_guests_own_mask) | test(=in_guest_delivery_harness::forced_gate_a_masked_waits_arrivals_are_removed) | test(=in_guest_delivery_harness::forced_gate_a_send_to_a_vfork_parent_is_refused_by_name) | test(=in_guest_delivery_harness::forced_gate_d37_removal_runs_through_the_tools_injection) | test(=in_guest_delivery_harness::forced_gate_mask_calls_act_on_the_saved_mask_in_linuxs_order) | test(=in_guest_delivery_harness::forced_gate_the_polled_guest_sigtimedwait_runs))' -- --skip ptrace_completion::tests::real_random_ --skip kvm_execution_tests::",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -48380,7 +48380,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1112",
+        "NEXTEST_EXPECTED_EXECUTED": "1113",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
