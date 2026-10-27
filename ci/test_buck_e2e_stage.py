@@ -60,6 +60,7 @@ from pathlib import Path
 
 STAGE = Path(__file__).resolve().parent / "buck-e2e" / "stage"
 RETRY = Path(__file__).resolve().parent / "retry-on-compiler-crash.sh"
+REFRESH = Path(__file__).resolve().parent / "buck-e2e" / "refresh_copy.py"
 TOOLS = ("patchelf", "readelf", "strip", "cmake")
 LIBS = ("libunwind.so.8", "libunwind-x86_64.so.8")
 # Commands stage runs on its way to the check and just after it.
@@ -325,6 +326,8 @@ class StageCargoOverlapTest(unittest.TestCase):
         # stage runs each cargo build through this wrapper; a clean or plainly
         # failing fake cargo passes through it unchanged.
         shutil.copy2(RETRY, tree / "ci" / "retry-on-compiler-crash.sh")
+        # Reproducible staging refreshes its copy with this helper, from the checkout.
+        shutil.copy2(REFRESH, self.stage.parent / "refresh_copy.py")
         (tree / ".gitignore").write_text("ci/buck-e2e/staged/\n")
         git = ["git", "-C", str(tree), "-c", "user.email=t@example.invalid", "-c", "user.name=t",
                "-c", "commit.gpgsign=false"]
@@ -659,9 +662,108 @@ class StageReproducibleTest(unittest.TestCase):
         (self.fixed / "src" / ".stage-born").write_text("")
         proc = self.run_stage(FAKE_CARGO_FAIL="release")
         self.assertEqual(proc.returncode, 3, proc.stderr)
-        self.assertIn("has no record of what was copied; this stage is cold", proc.stderr)
+        self.assertIn("it has no record of what was copied; this stage is cold", proc.stderr)
         self.assertFalse(junk.exists())
         self.assertTrue((self.fixed / "src.copied").is_file())
+
+    def test_a_tracked_file_that_becomes_a_directory_and_back_is_copied_each_way(self) -> None:
+        src = self.fixed / "src"
+        (self.tree / "foo").write_text("a file\n")
+        self.commit_tree("foo is a file")
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertEqual((src / "foo").read_text(), "a file\n")
+        # File to directory: cleanup must not delete the directory it just copied.
+        (self.tree / "foo").unlink()
+        (self.tree / "foo").mkdir()
+        (self.tree / "foo" / "bar").write_text("in a directory\n")
+        self.commit_tree("foo is a directory")
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertEqual((src / "foo" / "bar").read_text(), "in a directory\n")
+        # Directory to file, with something the stage's build wrote in it: rsync
+        # cannot replace a nonempty directory, so it is cleared first.
+        (src / "foo" / "generated").write_text("written by a build\n")
+        shutil.rmtree(self.tree / "foo")
+        (self.tree / "foo").write_text("a file again\n")
+        self.commit_tree("foo is a file again")
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertEqual((src / "foo").read_text(), "a file again\n")
+        self.assertNotIn("this stage is cold", proc.stderr)
+
+    def test_a_git_directory_then_a_git_link_replaces_the_copy(self) -> None:
+        # The shared copy moves from a checkout whose .git is a directory to a
+        # linked worktree, whose .git is a file.
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertTrue((self.fixed / "src" / ".git").is_dir(), proc.stderr)
+        worktree = self.tmp / "linked"
+        subprocess.run(["git", "-C", str(self.tree), "worktree", "add", "-q", "--detach", str(worktree)],
+                       check=True)
+        base = {"PATH": str(self.bin), "HOME": str(self.tmp), "HERMIT_STAGE_HOST_LIBDIR": str(self.libdir),
+                "FAKE_CARGO_LOG": str(self.log), "CARGO_HOME": str(self.cargo_home),
+                "FAKE_CARGO_FAIL": "release"}
+        proc = subprocess.run(["/bin/bash", str(worktree / "ci" / "buck-e2e" / "stage"), "--from-cargo"],
+                              env=base, capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        git_link = self.fixed / "src" / ".git"
+        self.assertTrue(git_link.is_file(), proc.stderr)
+        self.assertTrue(git_link.read_text().startswith("gitdir: "))
+        # And back: the directory replaces the link.
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertTrue(git_link.is_dir(), proc.stderr)
+
+    def test_a_refresh_that_did_not_finish_wipes_the_copy_at_the_next_stage(self) -> None:
+        # rsync copies new.txt, then fails on an unreadable tracked file: the
+        # refresh did not finish and its record still names the old tree. A later
+        # checkout that tracks neither must not keep new.txt as though the stage
+        # had written it.
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        (self.tree / "new.txt").write_text("copied before the failure\n")
+        (self.tree / "unreadable.txt").write_text("rsync cannot read this\n")
+        self.commit_tree("two new files")
+        (self.tree / "unreadable.txt").chmod(0)
+        self.log.unlink(missing_ok=True)
+        try:
+            proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        finally:
+            (self.tree / "unreadable.txt").chmod(0o644)
+        self.assertNotIn(proc.returncode, (0, 3), proc.stderr)
+        self.assertFalse(self.log.exists(), "a build ran after a failed refresh")
+        self.assertTrue((self.fixed / "src" / "new.txt").exists(), "the failed refresh copied nothing")
+        self.assertTrue((self.fixed / "src.refreshing").exists())
+        (self.tree / "new.txt").unlink()
+        (self.tree / "unreadable.txt").unlink()
+        self.commit_tree("neither")
+        proc = self.run_stage(FAKE_CARGO_FAIL="release")
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertIn("an earlier refresh of it did not finish; this stage is cold", proc.stderr)
+        self.assertFalse((self.fixed / "src" / "new.txt").exists())
+        self.assertFalse((self.fixed / "src.refreshing").exists())
+
+    def test_a_failing_submodule_listing_fails_the_stage_before_any_later_entry(self) -> None:
+        # A submodule whose gitdir is gone, then another tracked entry after it,
+        # and status told to ignore the submodule: the listing must still fail.
+        git = ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t", "-c", "commit.gpgsign=false"]
+        sub = self.tree / "sub"
+        sub.mkdir()
+        (sub / "file").write_text("sub\n")
+        subprocess.run(git + ["init", "-q", f"--separate-git-dir={self.tmp / 'sub-gitdir'}", str(sub)], check=True)
+        subprocess.run(git + ["-C", str(sub), "add", "file"], check=True)
+        subprocess.run(git + ["-C", str(sub), "commit", "-qm", "sub"], check=True)
+        (self.tree / "zzz-after-sub.txt").write_text("listed after sub\n")
+        subprocess.run(git + ["-C", str(self.tree), "add", "sub", "zzz-after-sub.txt"], check=True)
+        subprocess.run(git + ["-C", str(self.tree), "commit", "-qm", "add sub"], check=True)
+        subprocess.run(["git", "-C", str(self.tree), "config", "submodule.sub.ignore", "all"], check=True)
+        shutil.rmtree(self.tmp / "sub-gitdir")
+        proc = self.run_stage()
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        self.assertIn(f"ci/buck-e2e/stage: cannot list the files Git tracks in {self.tree}", proc.stderr)
+        self.assertFalse(self.log.exists(), "a build ran without a complete listing")
+        self.assertFalse((self.fixed / "src" / "zzz-after-sub.txt").exists())
 
     def test_an_old_or_large_kept_copy_is_wiped_and_that_stage_is_cold(self) -> None:
         for bound, value in (("HERMIT_BUCK_STAGE_MAX_AGE_SECONDS", "86400"), ("HERMIT_BUCK_STAGE_MAX_BYTES", "1")):

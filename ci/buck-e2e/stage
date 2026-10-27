@@ -88,10 +88,17 @@ fi
 #     are unchanged keeps the time of the stage that copied it, older than every
 #     build since, and a changed or new file is written now, newer than every
 #     build, so Cargo's mtime freshness rebuilds exactly the crates and build
-#     scripts whose inputs changed. A file an earlier stage copied that Git no
-#     longer tracks is removed (each stage records what it copied in
-#     $HERMIT_BUCK_STAGE_DIR/src.copied); what the stage's own builds write into
-#     the copy stays. Only tracked files are read: the validation's other nodes
+#     scripts whose inputs changed. ci/buck-e2e/refresh_copy.py does the
+#     refresh: it removes a path an earlier stage copied that Git no longer
+#     tracks (each completed refresh records what it copied in
+#     $HERMIT_BUCK_STAGE_DIR/src.copied) and anything standing where a tracked
+#     path now goes (a file that became a directory or the reverse, a .git
+#     directory that became a .git link) before it copies; what the stage's own
+#     builds write into the copy otherwise stays. It journals the refresh
+#     ($HERMIT_BUCK_STAGE_DIR/src.refreshing, written before the copy is
+#     touched and removed once the record is replaced), so a refresh that did
+#     not finish wipes the copy at the next stage instead of leaving a path it
+#     copied unrecorded. Only tracked files are read: the validation's other nodes
 #     build into the checkout while this stage runs (build.rust_scripts writes
 #     agent-utils/rs/target), and copying that tree, as the first version of
 #     this did with rsync --delete over everything but target/ and ignored/,
@@ -109,9 +116,10 @@ fi
 #     (default a day), which bounds how long an input some build script reads
 #     without declaring it could leave an output stale, or larger than
 #     HERMIT_BUCK_STAGE_MAX_BYTES (default 64 GiB; about 5.5 GiB after one
-#     stage), or when it has no record of what an earlier stage copied (a
+#     stage), when it has no record of what an earlier stage copied (a
 #     directory the first version of this left, holding copies of other nodes'
-#     build output). Only staged/ is copied back into this checkout.
+#     build output), or when an earlier refresh did not finish. Only staged/ is
+#     copied back into this checkout.
 # One stage at a time holds the fixed directory: concurrent validations on a host
 # wait for the lock (about three minutes, one stage's length), up to
 # HERMIT_BUCK_STAGE_LOCK_TIMEOUT seconds (default 1200). flock releases the lock
@@ -141,47 +149,27 @@ if [[ $mode == cargo && -z ${HERMIT_BUCK_STAGE_INNER:-} && ${HERMIT_BUCK_STAGE_R
     max_age=${HERMIT_BUCK_STAGE_MAX_AGE_SECONDS:-86400}
     born=$fixed_src/.stage-born
     copied=$fixed/src.copied
+    journal=$fixed/src.refreshing
     if [[ -d $fixed_src ]]; then
         held=$(du -sb "$fixed_src" 2>/dev/null | cut -f1) || held=0
         age=$(($(date +%s) - $(stat -c %Y "$born" 2>/dev/null || echo 0)))
-        if [[ ${held:-0} -gt $max_bytes || $age -gt $max_age || ! -f $copied ]]; then
-            echo "ci/buck-e2e/stage: $fixed_src holds ${held:-0} bytes (bound $max_bytes), is ${age} s old (bound $max_age)" \
-                "and $([[ -f $copied ]] && echo has || echo has no) record of what was copied; this stage is cold" >&2
-            rm -rf "${fixed_src:?}" "${copied:?}"
+        cold=
+        [[ ${held:-0} -gt $max_bytes ]] && cold="it holds ${held:-0} bytes, over $max_bytes"
+        [[ $age -gt $max_age ]] && cold="it is ${age} s old, over $max_age"
+        [[ -f $copied ]] || cold="it has no record of what was copied"
+        [[ -e $journal ]] && cold="an earlier refresh of it did not finish"
+        if [[ -n $cold ]]; then
+            echo "ci/buck-e2e/stage: $fixed_src is wiped because $cold; this stage is cold" >&2
+            rm -rf "${fixed_src:?}" "${copied:?}" "${journal:?}"
         fi
     fi
     mkdir -p "$fixed_src"
     [[ -e $born ]] || : >"$born"
-    # The files Git tracks, refreshed by content (above), and the .git links of
-    # the checkout and its submodules, which hermit-install's build script reads
-    # through `git -C`. Nothing untracked is read, so no other node's build
-    # output can vanish under the copy.
-    wanted=$fixed/src.wanted
-    # list_tracked DIR PREFIX: DIR's tracked files, NUL-terminated and named from
-    # the checkout's root; an initialized submodule (a mode-160000 entry) gives
-    # its .git link and, recursively, its own files.
-    list_tracked() {
-        local dir=$1 prefix=$2 entry path
-        git -C "$dir" ls-files -z --stage | while IFS= read -r -d '' entry; do
-            path=${entry#*$'\t'}
-            if [[ $entry == 160000\ * ]]; then
-                if [[ -e $dir/$path/.git ]]; then
-                    printf '%s\0' "$prefix$path/.git"
-                    list_tracked "$dir/$path" "$prefix$path/"
-                fi
-            else
-                printf '%s\0' "$prefix$path"
-            fi
-        done
-    }
-    { printf '.git\0' && list_tracked "$root" ""; } >"$wanted" ||
-        { echo "ci/buck-e2e/stage: cannot list the files Git tracks in $root" >&2; exit 2; }
-    rsync -rlp --checksum --from0 --files-from="$wanted" "$root"/ "$fixed_src"/
-    if [[ -f $copied ]]; then
-        LC_ALL=C comm -z -23 <(LC_ALL=C sort -z "$copied") <(LC_ALL=C sort -z "$wanted") |
-            (cd "$fixed_src" && xargs -0 -r rm -rf --)
-    fi
-    mv "$wanted" "$copied"
+    # The files Git tracks, refreshed by content (above), journaled, with
+    # obsolete paths and file/directory changes reconciled before the copy:
+    # ci/buck-e2e/refresh_copy.py. Nothing untracked is read, so no other node's
+    # build output can vanish under the copy.
+    python3 "$root/ci/buck-e2e/refresh_copy.py" "$root" "$fixed_src" "$copied" "$journal"
     ln -sfn "$(realpath -m "${CARGO_HOME:-$HOME/.cargo}")" "$fixed/cargo"
     status=0
     HERMIT_BUCK_STAGE_INNER=1 HERMIT_BUCK_STAGE_GIT_ROOT=$root CARGO_HOME=$fixed/cargo \
