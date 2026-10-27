@@ -201,6 +201,24 @@ pub struct MountNamespaceIdentity {
     pub inode: u64,
 }
 
+/// What `--detlog-anon` records for each anonymous mapping.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    clap::ValueEnum
+)]
+pub enum DetlogAnon {
+    /// One digest per mapping.
+    Mappings,
+    /// One digest per mapping, and a short one for each of its 4 KiB pages that is not all zero.
+    Pages,
+}
+
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
 pub struct Config {
@@ -1049,6 +1067,34 @@ pub struct Config {
     #[clap(long)]
     pub detlog_stack: bool,
 
+    /// Log a hash of every private, writable anonymous mapping at each syscall, for memory
+    /// determinism checking: allocator arenas (scudo's, jemalloc's, glibc's mmap chunks), thread
+    /// stacks and TLS blocks, none of which `--detlog-heap` (the brk heap) or `--detlog-stack`
+    /// (the main thread's stack) covers. A mapping named by `PR_SET_VMA_ANON_NAME`
+    /// (`[anon:<name>]`) counts as anonymous. `--detlog-anon=pages` adds a short digest for each
+    /// 4 KiB page that is not all zero, to find the page where two runs part.
+    ///
+    /// ptrace backend only (also with e9patch preprocessing): the mappings come from the guest
+    /// task's own `/proc/<tid>/maps`, which an in-guest tool shares and a VMM's does not hold.
+    /// Other backends refuse the flag. EXPENSIVE: every byte of every such mapping is read at
+    /// every syscall, in 1 MiB pieces, so a guest with a large heap pays for its whole size each
+    /// time; a mapping over 256 MiB (a sanitizer's shadow, a heap reserved up front) is recorded
+    /// by its size alone. Reading an untouched page maps the shared zero page there, which
+    /// `mincore` then reports resident, as with `--detlog-heap` and `--detlog-stack`. A thread
+    /// stack holds thread IDs and, below its stack pointer, the scratch Hermit writes when it
+    /// injects a call, so runs whose IDs differ differ there legitimately. Page indices count
+    /// from the mapping's start, so a mapping that merges or moves renumbers its pages.
+    #[clap(
+        long,
+        value_enum,
+        value_name = "pages",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "mappings"
+    )]
+    #[serde(default)]
+    pub detlog_anon: Option<DetlogAnon>,
+
     /// Log a hash of the guest REGISTER FILE at guest-logical-control points, for determinism
     /// checking. stdout, the INFO log, the stack and the heap are all hashed today; the register
     /// file is not, so two backends can differ in register state and every existing check still
@@ -1808,6 +1854,11 @@ impl fmt::Display for Config {
         }
         if self.detlog_stack {
             write!(f, " --detlog-stack")?;
+        }
+        match self.detlog_anon {
+            Some(DetlogAnon::Mappings) => write!(f, " --detlog-anon")?,
+            Some(DetlogAnon::Pages) => write!(f, " --detlog-anon=pages")?,
+            None => {}
         }
         if self.detlog_regs {
             write!(f, " --detlog-regs")?;

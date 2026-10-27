@@ -1464,6 +1464,7 @@ mod event_tests {
             detlog_io_buffers: true,
             detlog_heap: false,
             detlog_stack: false,
+            detlog_anon: None,
             detlog_regs: false,
             ..Config::default().with_backend(|backend| {
                 // The two behaviours the old `backend_is_kvm` identity flag
