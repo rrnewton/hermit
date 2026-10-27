@@ -22,6 +22,7 @@ mod cli_owned_lifecycle;
 mod container;
 mod container_clone;
 mod dap_adapter;
+mod departure_note;
 #[cfg(test)]
 mod exec_stop_launch_tests;
 mod gdb_client;

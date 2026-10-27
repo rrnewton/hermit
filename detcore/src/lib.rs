@@ -110,6 +110,26 @@ mod tool_global;
 #[cfg(feature = "physical-mm-test-support")]
 pub use tool_global::initial_mm_probe;
 
+/// Install `hook`, which a schedule replay calls with its first departure
+/// from its schedule (where it first ran another thread than the schedule
+/// names) when that happens, rather than only in the run's summary at its
+/// end: a run that a timeout kills, or that Hermit refuses, writes no
+/// summary. `None` removes it.
+pub fn set_schedule_departure_hook(hook: Option<fn(detcore_model::summary::ScheduleDeparture)>) {
+    if let Ok(mut installed) = scheduler::replayer::SCHEDULE_DEPARTURE_HOOK.write() {
+        *installed = hook;
+    }
+}
+
+/// The hook [`set_schedule_departure_hook`] installed, for a test to check.
+#[doc(hidden)]
+pub fn schedule_departure_hook() -> Option<fn(detcore_model::summary::ScheduleDeparture)> {
+    scheduler::replayer::SCHEDULE_DEPARTURE_HOOK
+        .read()
+        .ok()
+        .and_then(|hook| *hook)
+}
+
 /// Keep each traced thread's `/proc/<pid>/task/<tid>/status` open in this
 /// process and re-read it with pread(2), instead of opening it for every
 /// signal-state read. Call it only from a process that never shares a guest's

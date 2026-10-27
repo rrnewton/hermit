@@ -932,7 +932,20 @@ guest exit 122 remains a completed guest outcome, classified by the target
 criteria; its numeric status alone is not a refusal.
 
 By default analyze bisects between the failing schedule and a passing one from
-another run. When the two runs differ in events only one of them executed (for
+another run. Each round replays a splice of the two orders, matching each
+event of one run with an event of the other. The matching keeps each thread's
+events in the order both runs executed them, and a syscall's entry with its
+return; where the two runs' per-thread traces disagree at all (one thread made
+two calls in opposite orders, or polled a different number of times between
+them), splices are not feasible, and analyze searches within the failing
+schedule instead (`--prefix-search`), saying why in the report. A splice can
+still ask for an order this execution cannot take across threads, such as a
+switch to a thread that is blocked at that point. A round whose replay runs another thread than its
+schedule names there has no outcome: the search tries other schedules between
+the same pair, and when none in a pass can be followed it ends with a partial
+report (`class=trial-inconclusive`, below) that lists them, says where each
+left its schedule and gives the `--prefix-search` command. When the two runs
+differ in events only one of them executed (for
 example timeslices that end at other points, or extra iterations of a polling
 loop), no single swap may separate the outcomes. `--prefix-search` searches
 within the failing schedule instead: each trial replays its first K events and

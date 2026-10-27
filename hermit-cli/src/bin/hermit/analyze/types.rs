@@ -38,6 +38,7 @@ use crate::analyze::rundata::HermitRun;
 use crate::analyze::rundata::TrialRunner;
 use crate::analyze::verdict::Verdict;
 use crate::analyze::verdict::VerdictReason;
+use crate::schedule_search::NoFeasibleSchedule;
 
 /// Repeat a run multiple times in a controlled search to find concurrency bugs.
 ///
@@ -754,6 +755,11 @@ pub struct PartialReport {
     pub runs_from_journal: u64,
     /// The run the time budget cut short, whose outcome was not counted.
     pub cut_run: Option<String>,
+    /// The schedules between the default search's pair that it tried and
+    /// could not replay, when that ended the analysis (`reason`
+    /// `trial-inconclusive`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub infeasible: Option<NoFeasibleSchedule>,
     /// The default search's interval, if it got that far.
     pub interval: Option<BisectInterval>,
     /// `--prefix-search`'s bracket, if it got that far.

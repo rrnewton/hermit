@@ -82,11 +82,15 @@ use crate::logdiff::LogDiffCLIOpts;
 use crate::run::RunOpts;
 use crate::schedule_search::Config;
 use crate::schedule_search::CriticalSchedule;
+use crate::schedule_search::DivergentTraces;
 use crate::schedule_search::INEXACT_COUNTER_BRANCH_JITTER;
+use crate::schedule_search::InfeasibleSchedule;
+use crate::schedule_search::NoFeasibleSchedule;
 use crate::schedule_search::NoSingleSwap;
 use crate::schedule_search::SearchStart;
 use crate::schedule_search::TrialOutcome;
 use crate::schedule_search::search_for_critical_schedule_observed;
+use crate::schedule_search::trace_divergence;
 
 /// Compare only preemptions, not recorded schedules.
 fn preempt_files_equal(path1: &Path, path2: &Path) -> bool {
@@ -474,6 +478,9 @@ pub struct PrefixDecision {
     pub schedule: PreemptionRecord,
     pub decision: usize,
     pub continuation: MaybeTimeslice,
+    /// Why analyze searched the prefixes instead of bisecting between two
+    /// runs, when it says so in the report ([`DivergentTraces`]).
+    pub fallback: Option<String>,
 }
 
 /// The outcome and recorded schedule of a trial that completed.
@@ -1407,11 +1414,25 @@ impl AnalyzeOpts {
         name: &str,
         make: impl Fn(&str) -> anyhow::Result<RunData>,
     ) -> anyhow::Result<(anyhow::Result<()>, RunData)> {
+        self.decisive_trial_unless(name, make, |_| false)
+    }
+
+    /// [`Self::decisive_trial`], except that a run `settled` says is
+    /// settled already, however it ended, is not run again: the bisection's
+    /// round that left its spliced schedule has no outcome for that schedule
+    /// whether or not it finished, and a rerun would leave it at the same
+    /// event.
+    pub(super) fn decisive_trial_unless(
+        &self,
+        name: &str,
+        make: impl Fn(&str) -> anyhow::Result<RunData>,
+        settled: impl Fn(&RunData) -> bool,
+    ) -> anyhow::Result<(anyhow::Result<()>, RunData)> {
         let mut run = make(name)?;
         self.show_trial_repro(&run);
         let launched = run.launch();
         match &launched {
-            Err(error) if run.backstopped(error) => {}
+            Err(error) if run.backstopped(error) && !settled(&run) => {}
             _ => return Ok((launched, run)),
         }
         let retry_name = format!("{name}_retry");
@@ -1432,7 +1453,7 @@ impl AnalyzeOpts {
         self.show_trial_repro(&retry);
         let launched = retry.launch();
         if let Err(error) = launched {
-            if retry.backstopped(&error) {
+            if retry.backstopped(&error) && !settled(&retry) {
                 return Err(incomplete_trial(error, &retry.root_path()));
             }
             return Ok((Err(error), retry));
@@ -1546,6 +1567,7 @@ impl AnalyzeOpts {
             schedule: target_record.clone(),
             decision: passing,
             continuation,
+            fallback: None,
         })
     }
 
@@ -1722,6 +1744,7 @@ impl AnalyzeOpts {
             schedule,
             decision,
             continuation: timeslice,
+            fallback,
         } = found;
         self.progress.phase(Phase::StackTraces);
         let trace_from = self.race_trace_from(decision);
@@ -1760,7 +1783,7 @@ impl AnalyzeOpts {
         if continued
             .get(decision)
             .is_some_and(|event| event.dettid == schedule.schedevents()[decision].dettid)
-            && let Some(report) = self.report_timing_decision(
+            && let Some(mut report) = self.report_timing_decision(
                 &schedule,
                 decision,
                 timeslice,
@@ -1768,6 +1791,9 @@ impl AnalyzeOpts {
                 (&continued, &continued_path, &mut baseline_trace),
             )?
         {
+            if let Some(note) = &fallback {
+                report.header.push_str(&format!("Note: {note}\n"));
+            }
             return Ok(report);
         }
         let instead = if continued.len() > decision {
@@ -1805,13 +1831,16 @@ impl AnalyzeOpts {
             target_met,
         );
 
-        let report = self.prefix_report(
+        let mut report = self.prefix_report(
             schedule.schedevents(),
             decision,
             &continued,
             ([chosen, instead], racing_accesses),
             timeslice,
         );
+        if let Some(note) = &fallback {
+            report.header.push_str(&format!("Note: {note}\n"));
+        }
         println!("{}", prefix_report_banner(&report));
         println!("{}", report.header);
         Self::print_stack(
@@ -2676,14 +2705,34 @@ impl AnalyzeOpts {
     ) -> anyhow::Result<CriticalSchedule> {
         self.phase5_bisect_traces_with(target, baseline, |i, sched| {
             let runname = format!("bisect_round_{:0wide$}", i, wide = 3);
-            let mut newrun = self.completed_trial(&runname, |name| {
-                let mut run = RunData::new_baseline(self, name.to_owned())?
-                    .with_schedule_replay() // Default input path
-                    .with_schedule_recording(); // Default output path
-                // Prepare the next synthetic schedule on disk:
-                self.write_trial_schedule(sched.to_owned(), run.sched_path_in())?;
-                Ok(run)
-            })?;
+            let (launched, mut newrun) = self.decisive_trial_unless(
+                &runname,
+                |name| {
+                    let mut run = RunData::new_baseline(self, name.to_owned())?
+                        .with_schedule_replay() // Default input path
+                        .with_schedule_recording(); // Default output path
+                    // Prepare the next synthetic schedule on disk:
+                    self.write_trial_schedule(sched.to_owned(), run.sched_path_in())?;
+                    Ok(run)
+                },
+                // A round that left its schedule is not run again when a
+                // bound stopped it: it would leave it at the same event.
+                |run| run.departure().is_some(),
+            )?;
+            // A replay that could not follow the spliced schedule ran
+            // another one, whatever its outcome, finished or stopped: it has
+            // none for this schedule, and the search tries another.
+            if let Some(departure) = newrun.departure() {
+                return Err(InfeasibleSchedule {
+                    run: newrun.name().to_owned(),
+                    event: departure.event,
+                    expected: departure.expected.as_raw(),
+                    running: departure.running.as_raw(),
+                    passed: launched.is_err() || !newrun.is_a_match(),
+                }
+                .into());
+            }
+            launched.map_err(|error| incomplete_trial(error, &newrun.root_path()))?;
             let path = newrun.sched_path_out().to_path_buf();
             let record = PreemptionReader::try_new(&path)?.into_inner();
             RunData::require_complete_record(&record, &path)?;
@@ -3452,6 +3501,7 @@ impl AnalyzeOpts {
                 trial_budget: budget.trial_limit(),
                 runs_from_journal,
                 cut_run: expired.cut.clone(),
+                infeasible: None,
                 interval: progress.interval.clone(),
                 bracket: progress.bracket.clone(),
                 stacks,
@@ -3629,14 +3679,25 @@ impl AnalyzeOpts {
         let mut target_endpoint_run = self.save_final_target_sched_events(min_run)?;
 
         if self.prefix_search {
-            return self.prefix_search_and_report(&mut target_endpoint_run);
+            return self.prefix_search_and_report(&mut target_endpoint_run, None);
         }
 
         // The other endpoint of the bisection search:
         // What we thought was the final_pr can change here:
-        let mut baseline_endpoint_run =
-            self.phase4_choose_baseline_sched_events(target_preempts)?;
+        let baseline_endpoint_run = self.phase4_choose_baseline_sched_events(target_preempts)?;
 
+        self.bisect_endpoints_and_report(target_endpoint_run, baseline_endpoint_run)
+    }
+
+    /// The default search between the target and baseline endpoint runs, and
+    /// its report; the target's prefix search instead when the two runs'
+    /// per-thread traces diverge ([`DivergentTraces`]) or no single swap
+    /// separates them.
+    fn bisect_endpoints_and_report(
+        &mut self,
+        mut target_endpoint_run: RunData,
+        mut baseline_endpoint_run: RunData,
+    ) -> anyhow::Result<ExitStatus> {
         let baseline_sched_name = baseline_endpoint_run.sched_out_file_name();
         let target_sched_name = target_endpoint_run.sched_out_file_name();
         let target = target_endpoint_run.sched_out()?;
@@ -3650,6 +3711,26 @@ impl AnalyzeOpts {
             baseline_sched_name,
             target_sched_name,
         );
+        // Splices of the two runs' orders keep each thread's events in
+        // program order only when the runs' per-thread traces agree; where
+        // they diverge, every spliced round may leave its schedule, and the
+        // decision is still within the failing schedule.
+        let divergence = trace_divergence(baseline, target);
+        if divergence.diverges() {
+            let why = DivergentTraces(divergence);
+            eprintln!(
+                ":: {} {why}\n:: Searching within the failing schedule instead \
+                 (--prefix-search).",
+                "No splice:".yellow().bold(),
+            );
+            return self.prefix_search_and_report(
+                &mut target_endpoint_run,
+                Some(format!(
+                    "the default search did not bisect between the two runs: {why}. analyze \
+                     searched within the failing schedule instead (--prefix-search)."
+                )),
+            );
+        }
         let crit_sched = match own_bisection_end(self.phase5_bisect_traces(target, baseline))? {
             OwnBisectionEnd::Critical(crit_sched) => crit_sched,
             OwnBisectionEnd::SearchPrefixes(error) => {
@@ -3658,7 +3739,7 @@ impl AnalyzeOpts {
                      (--prefix-search).",
                     "No single swap separates the endpoints:".yellow().bold(),
                 );
-                return self.prefix_search_and_report(&mut target_endpoint_run);
+                return self.prefix_search_and_report(&mut target_endpoint_run, None);
             }
         };
 
@@ -3667,10 +3748,12 @@ impl AnalyzeOpts {
         self.write_report_and_exit(report)
     }
 
-    /// `--prefix-search` over the target endpoint's schedule, and its report.
+    /// `--prefix-search` over the target endpoint's schedule, and its report,
+    /// which notes `fallback`, why analyze searched the prefixes, if given.
     fn prefix_search_and_report(
         &self,
         target_endpoint_run: &mut RunData,
+        fallback: Option<String>,
     ) -> anyhow::Result<ExitStatus> {
         let target = target_endpoint_run.preempts_out().clone();
         eprintln!(
@@ -3681,7 +3764,12 @@ impl AnalyzeOpts {
             target.schedevents().len(),
             target_endpoint_run.sched_out_file_name(),
         );
-        let searched = self.phase5_prefix_search(&target);
+        let searched = self
+            .phase5_prefix_search(&target)
+            .map(|decision| PrefixDecision {
+                fallback,
+                ..decision
+            });
         self.finish_prefix_search(searched)
     }
 
@@ -7549,6 +7637,350 @@ mod tests {
         }
         assert_eq!(found[0], found[1]);
         assert_eq!(counts[1], 2 * counts[0]);
+    }
+
+    /// A round that leaves its schedule and is then stopped (by analyze's
+    /// bound, by the run arguments' own `--timeout`, or by a refusal) has no
+    /// outcome either: it is not run again, the search tries another
+    /// schedule between the pair, and it settles on the pair a search in
+    /// which every round is followed finds. The departure is known without
+    /// the run's summary (`departure_note`).
+    #[test]
+    fn a_round_that_left_its_schedule_and_then_stopped_never_decides() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        let events = |tids: &[i32]| -> Vec<SchedEvent> {
+            tids.iter()
+                .map(|&tid| SchedEvent::branches(DetTid::from_raw(tid), 1))
+                .collect()
+        };
+        // Thread 5 running before thread 3 finishes meets the target.
+        let target = events(&[3, 3, 5, 3, 3, 5, 3, 3]);
+        let baseline = events(&[3, 3, 3, 3, 3, 3, 5, 5]);
+        let departure = detcore_model::summary::ScheduleDeparture {
+            event: 2,
+            expected: DetTid::from_raw(5),
+            running: DetTid::from_raw(3),
+        };
+        // The first spliced round leaves its schedule and then ends with
+        // `stop()`; every other round is followed.
+        let runner = |stop: Option<fn() -> anyhow::Error>, ran: Arc<Mutex<Vec<String>>>| {
+            crate::analyze::rundata::TrialRunner(Some(Arc::new(move |run: &mut RunData| {
+                ran.lock().unwrap().push(run.name().to_owned());
+                if let Some(stop) = stop
+                    && run.name().starts_with("bisect_round_003")
+                {
+                    run.depart_for_test(departure);
+                    return Err(stop());
+                }
+                let input = run.sched_path_in().to_path_buf();
+                let schedule = PreemptionReader::new(&input).load_all().into_global();
+                let last_of_3 = schedule
+                    .iter()
+                    .rposition(|event| event.dettid == DetTid::from_raw(3));
+                let first_of_5 = schedule
+                    .iter()
+                    .position(|event| event.dettid == DetTid::from_raw(5));
+                let met =
+                    matches!((first_of_5, last_of_3), (Some(five), Some(three)) if five < three);
+                std::fs::copy(&input, run.sched_path_out()).unwrap();
+                run.finish_for_test(met, std::time::Duration::from_secs(1));
+                Ok(())
+            })))
+        };
+        let parent = tempfile::tempdir().unwrap();
+        let bisect = |label: &str, extra: &[&str], stop: Option<fn() -> anyhow::Error>| {
+            let tmp_dir = format!("--tmp-dir={}", parent.path().join(label).display());
+            let mut argv = vec!["analyze", tmp_dir.as_str(), "--target-stdout=FAILED"];
+            argv.extend(extra);
+            argv.push("/bin/true");
+            let mut options = AnalyzeOpts::try_parse_from(argv).unwrap();
+            let workspace = options.phase0_initialize(Retention::Remove).unwrap();
+            let ran = Arc::new(Mutex::new(Vec::new()));
+            options.trial_runner = runner(stop, ran.clone());
+            let crit = options.phase5_bisect_traces(&target, &baseline).unwrap();
+            drop(workspace);
+            let ran = ran.lock().unwrap().clone();
+            (crit, ran)
+        };
+        let (followed, _) = bisect("followed", &["--", "--chaos"], None);
+        for (label, extra, stop) in [
+            (
+                "backstop",
+                &["--trial-timeout=10", "--", "--chaos"][..],
+                (|| anyhow::Error::new(crate::container::RunTimeoutMarker))
+                    as fn() -> anyhow::Error,
+            ),
+            ("own-timeout", &["--", "--chaos", "--timeout=5"][..], || {
+                anyhow::Error::new(crate::container::RunTimeoutMarker)
+            }),
+            ("refused", &["--", "--chaos"][..], || {
+                anyhow::Error::new(crate::container::PolicyRefusal)
+            }),
+        ] {
+            let (found, ran) = bisect(label, extra, Some(stop));
+            assert!(
+                ran.contains(&"bisect_round_003".to_owned()),
+                "{label}: {ran:?}"
+            );
+            assert!(
+                !ran.iter().any(|name| name.ends_with("_retry")),
+                "{label}: a round that left its schedule ran again: {ran:?}"
+            );
+            assert_eq!(
+                (
+                    found.critical_event_index,
+                    &found.failing_schedule,
+                    &found.passing_schedule
+                ),
+                (
+                    followed.critical_event_index,
+                    &followed.failing_schedule,
+                    &followed.passing_schedule
+                ),
+                "{label}"
+            );
+        }
+    }
+
+    /// Endpoints whose per-thread traces diverge are not bisected: the
+    /// analysis runs the target's prefix search instead, starts no bisection
+    /// round, and its report says why.
+    #[test]
+    fn diverging_endpoints_go_to_the_prefix_search() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+
+        use detcore::types::SyscallPhase;
+        use reverie::syscalls::Sysno;
+        let t = DetTid::from_raw;
+        let syscall = |sysno, phase| SchedEvent::syscall(t(3), sysno, phase);
+        let read = [
+            syscall(Sysno::read, SyscallPhase::Prehook),
+            syscall(Sysno::read, SyscallPhase::Posthook),
+        ];
+        let write = [
+            syscall(Sysno::write, SyscallPhase::Prehook),
+            syscall(Sysno::write, SyscallPhase::Posthook),
+        ];
+        let target: Vec<SchedEvent> = (0..10)
+            .flat_map(|_| [read.as_slice(), &[SchedEvent::branches(t(5), 1)], &write].concat())
+            .collect();
+        // The baseline run made thread 3's first write before its first read.
+        let mut baseline = target.clone();
+        baseline.splice(
+            ..5,
+            [
+                write[0].clone(),
+                write[1].clone(),
+                SchedEvent::branches(t(5), 1),
+                read[0].clone(),
+                read[1].clone(),
+            ],
+        );
+        assert!(crate::schedule_search::trace_divergence(&baseline, &target).diverges());
+
+        let parent = tempfile::tempdir().unwrap();
+        let report_file = parent.path().join("report.json");
+        let report = format!("--report-file={}", report_file.display());
+        let (mut options, _workspace) = analysis_in(
+            &parent.path().join("analysis"),
+            &["--target-stdout=FAILED", &report],
+        );
+        let ran = Arc::new(Mutex::new(Vec::new()));
+        options.trial_runner = backstop_runner(20, |_, _| false, ran.clone());
+        let endpoint = |name: &str, events: &[SchedEvent]| {
+            let mut run = RunData::new_baseline(&options, name.to_owned()).unwrap();
+            PreemptionRecord::from_sched_events(events.to_vec())
+                .write_to_disk(run.sched_path_out())
+                .unwrap();
+            run
+        };
+        let target_run = endpoint("run1_target", &target);
+        let baseline_run = endpoint("run2_baseline", &baseline);
+        let status = options
+            .bisect_endpoints_and_report(target_run, baseline_run)
+            .unwrap();
+        assert_eq!(status, ExitStatus::SUCCESS);
+        let ran = ran.lock().unwrap();
+        assert!(
+            !ran.iter().any(|(name, _)| name.starts_with("bisect_round")),
+            "{ran:?}"
+        );
+        assert!(
+            ran.iter().any(|(name, _)| name.starts_with("prefix_round")),
+            "{ran:?}"
+        );
+        let written: Report =
+            serde_json::from_str(&std::fs::read_to_string(&report_file).unwrap()).unwrap();
+        assert!(
+            written.header.contains(
+                "Note: the default search did not bisect between the two runs: the two runs' \
+                 per-thread traces diverge, so splices are not feasible"
+            ),
+            "{}",
+            written.header
+        );
+    }
+
+    /// When analyze searches the prefixes because the two runs' per-thread
+    /// traces diverge, its report says so, with what it counted.
+    #[test]
+    fn a_prefix_search_after_divergent_traces_says_why() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        let parent = tempfile::tempdir().unwrap();
+        let (mut options, _workspace) = analysis_in(
+            parent.path(),
+            &["--target-stdout=FAILED", "--prefix-search"],
+        );
+        options.trial_runner = backstop_runner(137, |_, _| false, Arc::new(Mutex::new(Vec::new())));
+        let why =
+            crate::schedule_search::DivergentTraces(crate::schedule_search::TraceDivergence {
+                reordered: 81,
+                split_syscalls: 1,
+            });
+        let decision = PrefixDecision {
+            fallback: Some(format!(
+                "the default search did not bisect between the two runs: {why}."
+            )),
+            ..options
+                .phase5_prefix_search(&two_thread_schedule(200))
+                .unwrap()
+        };
+        assert_eq!(decision.decision, 137);
+        let report = options.phase6_record_prefix_outputs(decision).unwrap();
+        assert!(
+            report.header.contains(
+                "Note: the default search did not bisect between the two runs: the two runs' \
+                 per-thread traces diverge, so splices are not feasible: matching the two \
+                 schedules' events would move 81 of them"
+            ),
+            "{}",
+            report.header
+        );
+    }
+
+    /// A bisection round whose replay could not follow its spliced schedule
+    /// has no outcome: the search tries another schedule between the pair and
+    /// settles on the same critical pair as a search in which every round is
+    /// followed. When no schedule between the pair can be followed, the
+    /// analysis ends with a partial report (exit 120, `trial-inconclusive`)
+    /// that lists the rounds and gives the `--prefix-search` command.
+    #[test]
+    fn a_bisection_round_that_left_its_schedule_never_decides() {
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        let events = |tids: &[i32]| -> Vec<SchedEvent> {
+            tids.iter()
+                .map(|&tid| SchedEvent::branches(DetTid::from_raw(tid), 1))
+                .collect()
+        };
+        // Thread 5 running before thread 3 finishes meets the target.
+        let target = events(&[3, 3, 5, 3, 3, 5, 3, 3]);
+        let baseline = events(&[3, 3, 3, 3, 3, 3, 5, 5]);
+        let departure = detcore_model::summary::ScheduleDeparture {
+            event: 2,
+            expected: DetTid::from_raw(5),
+            running: DetTid::from_raw(3),
+        };
+        // `departs(name)`: whether the round of that name cannot follow its
+        // schedule.
+        let runner = |departs: fn(&str) -> bool, ran: Arc<Mutex<Vec<String>>>| {
+            crate::analyze::rundata::TrialRunner(Some(Arc::new(move |run: &mut RunData| {
+                ran.lock().unwrap().push(run.name().to_owned());
+                let input = run.sched_path_in().to_path_buf();
+                let schedule = PreemptionReader::new(&input).load_all().into_global();
+                let last_of_3 = schedule
+                    .iter()
+                    .rposition(|event| event.dettid == DetTid::from_raw(3));
+                let first_of_5 = schedule
+                    .iter()
+                    .position(|event| event.dettid == DetTid::from_raw(5));
+                let met =
+                    matches!((first_of_5, last_of_3), (Some(five), Some(three)) if five < three);
+                let output = run.sched_path_out().to_path_buf();
+                std::fs::copy(&input, &output).unwrap();
+                // A run that left its schedule finishes with some outcome;
+                // the opposite one shows that it is not read.
+                run.finish_for_test(
+                    met != departs(run.name()),
+                    std::time::Duration::from_secs(1),
+                );
+                if departs(run.name()) {
+                    run.depart_for_test(departure);
+                }
+                Ok(())
+            })))
+        };
+        let parent = tempfile::tempdir().unwrap();
+        let bisect = |label: &str, departs: fn(&str) -> bool| {
+            let report_file = parent.path().join(format!("{label}.json"));
+            let report = format!("--report-file={}", report_file.display());
+            let (mut options, workspace) = analysis_in(
+                &parent.path().join(label),
+                &["--target-stdout=FAILED", report.as_str()],
+            );
+            let ran = Arc::new(Mutex::new(Vec::new()));
+            options.trial_runner = runner(departs, ran.clone());
+            let crit = options.phase5_bisect_traces(&target, &baseline);
+            (options, workspace, crit, ran, report_file)
+        };
+
+        let (_, _w1, followed, followed_ran, _) = bisect("followed", |_| false);
+        let followed = followed.unwrap();
+        // The first spliced round, the first pass's midpoint, cannot be
+        // followed.
+        let (_, _w2, found, ran, _) = bisect("departed", |name| name == "bisect_round_003");
+        let found = found.unwrap();
+        assert_eq!(found.critical_event_index, followed.critical_event_index);
+        assert_eq!(found.failing_schedule, followed.failing_schedule);
+        assert_eq!(found.passing_schedule, followed.passing_schedule);
+        let ran = ran.lock().unwrap();
+        assert!(ran.contains(&"bisect_round_003".to_owned()));
+        assert!(followed_ran.lock().unwrap().len() >= 4 && ran.len() >= 4);
+        drop(ran);
+
+        // No spliced round can be followed.
+        let (mut options, _w3, stopped, ran, report_file) = bisect("none", |name| {
+            name != "bisect_round_001" && name != "bisect_round_002"
+        });
+        let status = options
+            .end_on_budget(stopped.map(|_| ExitStatus::SUCCESS))
+            .unwrap();
+        assert_eq!(
+            status,
+            ExitStatus::Exited(hermit::HERMIT_ANALYZE_PARTIAL_EXIT)
+        );
+        let written: Report =
+            serde_json::from_str(&std::fs::read_to_string(&report_file).unwrap()).unwrap();
+        let partial = written.partial.unwrap();
+        assert_eq!(partial.reason, PartialReason::TrialInconclusive);
+        assert_eq!(partial.phase, Phase::Bisect);
+        let infeasible = partial.infeasible.unwrap();
+        assert_eq!(infeasible.pass, 0);
+        assert_eq!(infeasible.tried.len() + 2, ran.lock().unwrap().len());
+        assert_eq!(
+            infeasible.tried[0],
+            InfeasibleSchedule {
+                run: "bisect_round_003".to_owned(),
+                event: 2,
+                expected: 5,
+                running: 3,
+                passed: false,
+            }
+        );
+        assert!(
+            written
+                .header
+                .contains("because no schedule between the closest pair could be replayed")
+                && written
+                    .header
+                    .contains("A resumed analysis would replay the same schedules"),
+            "{}",
+            written.header
+        );
+        assert!(partial.resume_command.contains("--prefix-search"));
     }
 
     /// The default search's partial report names its pair of schedules, the

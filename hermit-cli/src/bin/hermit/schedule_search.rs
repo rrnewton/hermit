@@ -10,12 +10,17 @@ use std::ops::Range;
 
 use anyhow::bail;
 use colored::Colorize;
+use detcore::edit_distance::BubbleSortIter;
+use detcore::edit_distance::ExpandedPermResult;
 use detcore::edit_distance::NeedlemanWunsch;
 use detcore::edit_distance::NeedlemanWunschError;
+use detcore::edit_distance::PermutationResult;
+use detcore::edit_distance::generate_expanded_permutation;
 use detcore::edit_distance::generate_permutation;
-use detcore::edit_distance::iterable_bubble_sort;
+use detcore::edit_distance::iterable_bubble_sort_from_perm;
 use detcore::types::Op;
 use detcore::types::SchedEvent;
+use detcore::types::SyscallPhase;
 
 /// The branch-count difference two replays of one control schedule may show
 /// on a host whose branch counter is not exact ([`Config::max_branch_count_jitter`]).
@@ -72,8 +77,150 @@ impl Default for Config {
 /// and the schedule the run actually realized. An `Err` is a trial that could
 /// not finish, for example one that `--max-log-bytes` ended; the search makes
 /// no further trial and returns that error unchanged, so its type (such as
-/// `LogCapExceeded`) still reaches the top-level handler.
+/// `LogCapExceeded`) still reaches the top-level handler. The exception is
+/// [`InfeasibleSchedule`]: a trial whose replay could not follow the schedule
+/// has no outcome, and the search tries another schedule instead.
 pub type TrialOutcome = anyhow::Result<(bool, Vec<SchedEvent>)>;
+
+/// A trial whose replay could not follow the schedule it was given: at event
+/// `event` the run ran thread `running` where the schedule names thread
+/// `expected`. A spliced schedule can ask for an order this execution cannot
+/// take, such as a switch to a thread that is blocked there, and from that
+/// point on the run is not that schedule's, so its outcome says nothing about
+/// the schedule. The search scores such a trial inconclusive: it never decides.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub struct InfeasibleSchedule {
+    /// The trial's run, in the workspace.
+    pub run: String,
+    /// The run's event at which it left the schedule, counted from 0.
+    pub event: u64,
+    /// The thread the schedule names there.
+    pub expected: i32,
+    /// The thread that ran instead.
+    pub running: i32,
+    /// Whether the run passed. It says nothing about the schedule; only an
+    /// endpoint, the order a run took, keeps it ([`search_for_critical_schedule_observed`]).
+    #[serde(skip)]
+    pub passed: bool,
+}
+
+impl std::fmt::Display for InfeasibleSchedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} could not follow its schedule: at event #{} the schedule runs thread {}, but \
+             thread {} ran (an order this execution cannot take, such as a switch to a thread \
+             that is blocked there), so its outcome is not that schedule's",
+            self.run, self.event, self.expected, self.running
+        )
+    }
+}
+
+impl std::error::Error for InfeasibleSchedule {}
+
+/// The default search could not narrow its pair of schedules: every schedule
+/// it tried between them in pass `pass` was infeasible ([`InfeasibleSchedule`]),
+/// so no trial between them has an outcome.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize
+)]
+pub struct NoFeasibleSchedule {
+    pub pass: usize,
+    /// How far apart the pair was, in edits and in swaps.
+    pub edit_distance: usize,
+    pub swap_distance: usize,
+    /// The schedules tried, each one's departure from its schedule.
+    pub tried: Vec<InfeasibleSchedule>,
+}
+
+impl std::fmt::Display for NoFeasibleSchedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no schedule between the closest pair could be replayed: in pass {}, all {} \
+             schedules the search tried between the passing and the failing schedule ({} edits \
+             and {} swaps apart) left their schedule",
+            self.pass,
+            self.tried.len(),
+            self.edit_distance,
+            self.swap_distance,
+        )?;
+        if let Some(first) = self.tried.first() {
+            write!(f, ", the first because {first}")?;
+        }
+        write!(
+            f,
+            ". The two runs' orders cannot be spliced there, so the default search cannot narrow \
+             the pair further. `hermit analyze --prefix-search` replays only prefixes of the \
+             failing run, an order this execution has taken."
+        )
+    }
+}
+
+impl std::error::Error for NoFeasibleSchedule {}
+
+/// The trial's outcome, or the [`InfeasibleSchedule`] that says it has none;
+/// any other error is returned as it is.
+fn decided(
+    outcome: TrialOutcome,
+) -> anyhow::Result<Result<(bool, Vec<SchedEvent>), InfeasibleSchedule>> {
+    match outcome {
+        Ok(decided) => Ok(Ok(decided)),
+        Err(error) => error.downcast::<InfeasibleSchedule>().map(Err),
+    }
+}
+
+/// The schedule `from_passing` swaps from `passing` toward `failing` along
+/// their bubble sort, of the events the two share (the midpoint is
+/// `swap_distance - swap_distance / 2` swaps from `passing`).
+fn schedule_between(
+    passing: &[SchedEvent],
+    failing: &[SchedEvent],
+    from_passing: usize,
+) -> Vec<SchedEvent> {
+    let mut bubbles = align(passing, failing);
+    // The sort's cursor starts at its end, the passing order.
+    bubbles.skip_back(from_passing.min(bubbles.swap_distance()));
+    bubbles.current().cloned().collect()
+}
+
+/// The schedules a pass of the event-level search tries, as swaps from the
+/// passing schedule of `swap_distance`, in order: the midpoint, then, while
+/// the ones tried are infeasible, halfway again toward the passing schedule
+/// (whose order this execution took) down to one swap from it, then halfway
+/// toward the failing schedule up to one swap from it. Every one lies strictly
+/// between the two, so the first that has an outcome narrows the pair.
+fn candidate_swaps(swap_distance: usize) -> Vec<usize> {
+    let midpoint = swap_distance - swap_distance / 2;
+    let mut candidates = vec![midpoint];
+    let mut toward_passing = midpoint;
+    while toward_passing > 1 {
+        toward_passing /= 2;
+        candidates.push(toward_passing);
+    }
+    let mut toward_failing = midpoint;
+    while swap_distance - toward_failing > 1 {
+        toward_failing += (swap_distance - toward_failing) / 2;
+        candidates.push(toward_failing);
+    }
+    candidates.retain(|&swaps| swaps > 0 && swaps < swap_distance);
+    candidates.dedup();
+    candidates
+}
 
 struct EventLevelSearchResult {
     passing_schedule: Vec<SchedEvent>,
@@ -232,14 +379,32 @@ where
             // The endpoints are the search's inputs (`hermit bisect`'s --good and
             // --bad too): one that does not reproduce its outcome ends the search as
             // an `AnalyzePrecondition`, not as a failure of Hermit.
-            let (passing_endpoint_passes, _) = tester(&initial_passing_schedule)?;
+            // An endpoint is the order a run took, which the replay left only
+            // where it does not reproduce that run exactly: its outcome is
+            // still that run's, and the search goes on with a warning.
+            let endpoint = |which: &str, outcome: TrialOutcome| -> anyhow::Result<bool> {
+                Ok(match decided(outcome)? {
+                    Ok((passes, _)) => passes,
+                    Err(infeasible) => {
+                        eprintln!(
+                            ":: {} the {which} schedule endpoint's replay did not follow its \
+                             own recorded schedule: {infeasible}. Its outcome is taken as the \
+                             run's; schedules spliced near that event may not be followed either \
+                             (check that the run replays: --selfcheck)",
+                            "WARNING:".yellow().bold()
+                        );
+                        infeasible.passed
+                    }
+                })
+            };
+            let passing_endpoint_passes = endpoint("passing", tester(&initial_passing_schedule))?;
             if !passing_endpoint_passes {
                 return Err(AnalyzePrecondition::baseline_not_reproduced(
                     "the passing schedule endpoint did not reproduce a passing outcome",
                 )
                 .into());
             }
-            let (failing_endpoint_passes, _) = tester(&initial_failing_schedule)?;
+            let failing_endpoint_passes = endpoint("failing", tester(&initial_failing_schedule))?;
             if failing_endpoint_passes {
                 return Err(AnalyzePrecondition::target_not_reproduced(
                     "the failing schedule endpoint did not reproduce the target failure",
@@ -303,9 +468,222 @@ where
     })
 }
 
+/// How far apart two schedules' per-thread traces are under the matching of
+/// their events by occurrence (the k-th occurrence of an event in one with its
+/// k-th occurrence in the other): what [`order_preserving`] has to take out of
+/// that matching. A thread's own events run in program order in every
+/// execution, so a matching that reorders them, or that keeps a syscall's
+/// entry but not its return, pairs events the two runs did not execute in the
+/// same order, and the schedules spliced from it are orders no execution
+/// takes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TraceDivergence {
+    /// Matched events that would have to move against their own thread's
+    /// order.
+    pub reordered: usize,
+    /// Syscalls whose entry and return are not matched together.
+    pub split_syscalls: usize,
+}
+
+impl TraceDivergence {
+    /// Whether the traces diverge at all. The threshold is zero: any
+    /// reordering or split syscall is a pair of events the two runs executed
+    /// in different program orders, and no count of them is safe to splice
+    /// across (a reproduction whose runs differed by a polling iteration
+    /// left its schedule in every spliced round).
+    pub fn diverges(&self) -> bool {
+        self.reordered + self.split_syscalls > 0
+    }
+}
+
+impl std::fmt::Display for TraceDivergence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "matching the two schedules' events would move {} of them against their own \
+             thread's order and separate {} syscalls from their returns",
+            self.reordered, self.split_syscalls
+        )
+    }
+}
+
+/// The two runs' per-thread traces diverge ([`TraceDivergence::diverges`]):
+/// splices of their orders are not feasible, so analyze searches within the
+/// failing schedule instead, as it does when no single swap separates the
+/// endpoints ([`NoSingleSwap`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DivergentTraces(pub TraceDivergence);
+
+impl std::fmt::Display for DivergentTraces {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the two runs' per-thread traces diverge, so splices are not feasible: {}. A \
+             thread's own events run in program order in every execution, so the two runs took \
+             different paths there (often a different number of polling iterations), and the \
+             default search would splice orders no execution takes",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for DivergentTraces {}
+
+/// For each event of `schedule`, the other end of its syscall: an entry's
+/// return, the next event of its thread that is that syscall's `Posthook`
+/// (past any `Polling` retries of it), and a return's entry.
+fn syscall_partners(schedule: &[SchedEvent]) -> Vec<Option<usize>> {
+    let mut partners = vec![None; schedule.len()];
+    let mut open: std::collections::HashMap<detcore::types::DetTid, usize> =
+        std::collections::HashMap::new();
+    for (index, event) in schedule.iter().enumerate() {
+        let entered = open.remove(&event.dettid);
+        match (event.op, entered.map(|entry| (entry, schedule[entry].op))) {
+            (Op::Syscall(sysno, SyscallPhase::Polling), Some((entry, Op::Syscall(entered, _))))
+                if sysno == entered =>
+            {
+                open.insert(event.dettid, entry);
+            }
+            (
+                Op::Syscall(sysno, SyscallPhase::Posthook),
+                Some((entry, Op::Syscall(entered, _))),
+            ) if sysno == entered => {
+                partners[entry] = Some(index);
+                partners[index] = Some(entry);
+            }
+            (Op::Syscall(_, SyscallPhase::Prehook), _) => {
+                open.insert(event.dettid, index);
+            }
+            _ => {}
+        }
+    }
+    partners
+}
+
+/// The matching of `source`'s events to `target`'s (`expanded`, by
+/// occurrence) made order-preserving per thread: of each thread's matched
+/// events, the longest run whose positions in `target` increase in `source`
+/// order stays matched, and a syscall's entry and return stay matched only
+/// together, to the other run's entry and return of that one syscall; every
+/// other event becomes unmatched. A splice along the bubble sort of this
+/// matching keeps each thread's own events in the order both runs executed
+/// them and never separates a syscall's entry from its return. Also returns
+/// what had to be taken out ([`TraceDivergence`]).
+fn order_preserving(
+    source: &[SchedEvent],
+    target: &[SchedEvent],
+    expanded: ExpandedPermResult,
+) -> (PermutationResult, TraceDivergence) {
+    let mut matched_to: Vec<Option<usize>> = vec![None; source.len()];
+    for (target_index, source_index) in expanded.perm.iter().enumerate() {
+        if let Some(source_index) = source_index {
+            matched_to[*source_index] = Some(target_index);
+        }
+    }
+    let mut divergence = TraceDivergence::default();
+
+    // Per thread, the longest run of matched events whose target positions
+    // increase (patience sorting), in source order.
+    let mut threads: std::collections::BTreeMap<detcore::types::DetTid, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (index, event) in source.iter().enumerate() {
+        if matched_to[index].is_some() {
+            threads.entry(event.dettid).or_default().push(index);
+        }
+    }
+    for events in threads.values() {
+        let positions: Vec<usize> = events.iter().map(|&i| matched_to[i].unwrap()).collect();
+        // `tails[k]`: the index in `positions` ending the best run of length
+        // k + 1 so far; `previous[i]`: the element before `i` in its run.
+        let mut tails: Vec<usize> = Vec::new();
+        let mut previous: Vec<Option<usize>> = vec![None; positions.len()];
+        for (i, &position) in positions.iter().enumerate() {
+            let at = tails.partition_point(|&tail| positions[tail] < position);
+            previous[i] = at.checked_sub(1).map(|before| tails[before]);
+            if at == tails.len() {
+                tails.push(i);
+            } else {
+                tails[at] = i;
+            }
+        }
+        let mut kept = vec![false; positions.len()];
+        let mut at = tails.last().copied();
+        while let Some(i) = at {
+            kept[i] = true;
+            at = previous[i];
+        }
+        for (i, &source_index) in events.iter().enumerate() {
+            if !kept[i] {
+                matched_to[source_index] = None;
+                divergence.reordered += 1;
+            }
+        }
+    }
+
+    // A syscall's entry and return together, or neither.
+    let source_partners = syscall_partners(source);
+    let target_partners = syscall_partners(target);
+    for index in 0..source.len() {
+        let Some(target_index) = matched_to[index] else {
+            continue;
+        };
+        let together = match (source_partners[index], target_partners[target_index]) {
+            (None, None) => true,
+            (Some(partner), Some(target_partner)) => matched_to[partner] == Some(target_partner),
+            _ => false,
+        };
+        if !together {
+            matched_to[index] = None;
+            if let Some(partner) = source_partners[index] {
+                matched_to[partner] = None;
+            }
+            divergence.split_syscalls += 1;
+        }
+    }
+
+    let mut matched_from: Vec<Option<usize>> = vec![None; target.len()];
+    for (source_index, target_index) in matched_to.iter().enumerate() {
+        if let Some(target_index) = target_index {
+            matched_from[*target_index] = Some(source_index);
+        }
+    }
+    let permutation = PermutationResult {
+        perm: matched_from.iter().flatten().copied().collect(),
+        unmatched_source_indices: (0..source.len())
+            .filter(|&i| matched_to[i].is_none())
+            .collect(),
+        unmatched_target_indices: (0..target.len())
+            .filter(|&i| matched_from[i].is_none())
+            .collect(),
+    };
+    (permutation, divergence)
+}
+
+/// Bubble sort `source` into `target`'s order over their order-preserving
+/// matching ([`order_preserving`]).
+fn align<'a>(source: &'a [SchedEvent], target: &[SchedEvent]) -> BubbleSortIter<'a, SchedEvent> {
+    let (permutation, _) = order_preserving(
+        source,
+        target,
+        generate_expanded_permutation(source, target),
+    );
+    iterable_bubble_sort_from_perm(source, permutation)
+}
+
+/// How far `passing`'s and `failing`'s per-thread traces diverge
+/// ([`TraceDivergence`]).
+pub fn trace_divergence(passing: &[SchedEvent], failing: &[SchedEvent]) -> TraceDivergence {
+    order_preserving(
+        passing,
+        failing,
+        generate_expanded_permutation(passing, failing),
+    )
+    .1
+}
+
 // Return edit distance and swap distance.
 fn just_distance(sched1: &[SchedEvent], sched2: &[SchedEvent]) -> (usize, usize) {
-    let bubbles = iterable_bubble_sort(sched1, sched2);
+    let bubbles = align(sched1, sched2);
     (bubbles.edit_distance(), bubbles.swap_distance())
 }
 
@@ -585,8 +963,27 @@ where
             return event_level_search(tester, passing_schedule, failing_schedule, cfg, 0, observe);
         }
 
-        let (midpoint_passes, selected_new_point) =
-            test_and_select_stable_point(tester, &requested_midpoint_schedule, cfg)?;
+        let (midpoint_passes, selected_new_point) = match decided(test_and_select_stable_point(
+            tester,
+            &requested_midpoint_schedule,
+            cfg,
+        ))? {
+            Ok(decided) => decided,
+            Err(infeasible) => {
+                eprintln!(
+                    ":: {infeasible}; falling back to event permutation search, which tries \
+                     other schedules between the pair"
+                );
+                return event_level_search(
+                    tester,
+                    passing_schedule,
+                    failing_schedule,
+                    cfg,
+                    0,
+                    observe,
+                );
+            }
+        };
 
         if midpoint_passes {
             passing_schedule = selected_new_point;
@@ -660,7 +1057,7 @@ where
 
     for pass_number in first_pass..cfg.max_event_level_search_passes {
         let (swap_dist, edit_dist, requested_midpoint_schedule) = {
-            let mut bubbles = iterable_bubble_sort(&passing_schedule, &failing_schedule);
+            let mut bubbles = align(&passing_schedule, &failing_schedule);
             (
                 bubbles.swap_distance(),
                 bubbles.edit_distance(),
@@ -731,13 +1128,15 @@ where
                     ":: Schedules are one swap apart; testing the failing schedule without its {} events the passing one lacks",
                     failing_schedule.len() - trimmed.len(),
                 );
-                let (trimmed_passes, selected) =
-                    test_and_select_stable_point(tester, &trimmed, cfg)?;
-                if !trimmed_passes {
-                    return Ok(EventLevelSearchResult {
-                        passing_schedule,
-                        failing_schedule: selected,
-                    });
+                match decided(test_and_select_stable_point(tester, &trimmed, cfg))? {
+                    Ok((false, selected)) => {
+                        return Ok(EventLevelSearchResult {
+                            passing_schedule,
+                            failing_schedule: selected,
+                        });
+                    }
+                    Ok((true, _)) => {}
+                    Err(infeasible) => eprintln!(":: {infeasible}"),
                 }
                 trimmed_failing_passed = true;
             }
@@ -748,8 +1147,43 @@ where
             }));
         }
 
-        let (midpoint_passes, selected_new_point) =
-            test_and_select_stable_point(tester, &requested_midpoint_schedule, cfg)?;
+        // The midpoint, or, while the schedules tried cannot be followed,
+        // another schedule between the pair: an infeasible one never decides.
+        let mut infeasible = Vec::new();
+        let mut tried = None;
+        let candidates = candidate_swaps(swap_dist);
+        for (index, &swaps) in candidates.iter().enumerate() {
+            let requested = if index == 0 {
+                requested_midpoint_schedule.clone()
+            } else {
+                schedule_between(&passing_schedule, &failing_schedule, swaps)
+            };
+            match decided(test_and_select_stable_point(tester, &requested, cfg))? {
+                Ok(decided) => {
+                    tried = Some((requested, decided));
+                    break;
+                }
+                Err(departure) => {
+                    eprintln!(
+                        ":: {departure}; no outcome, so trying the schedule {} swaps from the \
+                         passing one instead",
+                        candidates
+                            .get(index + 1)
+                            .map_or_else(|| "none left".to_owned(), |next| next.to_string())
+                    );
+                    infeasible.push(departure);
+                }
+            }
+        }
+        let Some((requested_midpoint_schedule, (midpoint_passes, selected_new_point))) = tried
+        else {
+            return Err(anyhow::Error::new(NoFeasibleSchedule {
+                pass: pass_number,
+                edit_distance: edit_dist,
+                swap_distance: swap_dist,
+                tried: infeasible,
+            }));
+        };
         if cfg.verbose {
             let (jitter_edit, jitter_swap) =
                 just_distance(&requested_midpoint_schedule, &selected_new_point);
@@ -1027,7 +1461,13 @@ fn test_exact_replay<F>(tester: &mut F, requested: &[SchedEvent]) -> anyhow::Res
 where
     F: FnMut(&[SchedEvent]) -> TrialOutcome,
 {
-    let (passes, actual) = tester(requested)?;
+    let (passes, actual) = match decided(tester(requested))? {
+        Ok(decided) => decided,
+        Err(infeasible) => {
+            eprintln!(":: Skipping sub-event refinement: {infeasible}");
+            return Ok(None);
+        }
+    };
     if actual != requested {
         eprintln!(
             ":: Skipping sub-event refinement: replay did not realize a requested branch boundary exactly (requested {} events, realized {})",
@@ -1886,6 +2326,372 @@ mod tests {
         assert_eq!(thread_7_other_branches.dettid.as_raw(), 7);
         assert_eq!(thread_7_other_branches.op, Op::Branch,);
         assert_eq!(thread_7_other_branches.count, 16);
+    }
+
+    /// A trial whose replay could not follow the schedule, as the trial's
+    /// caller reports it.
+    fn infeasible(run: &str) -> anyhow::Error {
+        anyhow::Error::new(InfeasibleSchedule {
+            run: run.to_owned(),
+            event: 580,
+            expected: 5,
+            running: 3,
+            passed: false,
+        })
+    }
+
+    /// Whether a mocked replay cannot follow `sched`: a fixed third of the
+    /// schedules between the endpoints, chosen by a hash of their events, so
+    /// that the same schedule is infeasible however the search reaches it.
+    fn mock_infeasible(
+        sched: &[SchedEvent],
+        endpoints: &(Vec<SchedEvent>, Vec<SchedEvent>),
+    ) -> bool {
+        use std::hash::Hash as _;
+        use std::hash::Hasher as _;
+        if sched == endpoints.0 || sched == endpoints.1 {
+            return false;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        sched.hash(&mut hasher);
+        hasher.finish().is_multiple_of(3)
+    }
+
+    /// The candidates a pass tries: the midpoint first, then halfway again
+    /// toward the passing schedule down to one swap from it, then toward the
+    /// failing schedule up to one swap from it, every one strictly between
+    /// the two. The midpoint is the bubble sort's, and zero swaps from the
+    /// passing schedule is the passing order.
+    #[test]
+    fn the_candidates_lie_between_the_pair_midpoint_first() {
+        assert_eq!(
+            candidate_swaps(100),
+            [50, 25, 12, 6, 3, 1, 75, 87, 93, 96, 98, 99]
+        );
+        assert_eq!(candidate_swaps(2), [1]);
+        assert_eq!(candidate_swaps(3), [2, 1]);
+        assert!(candidate_swaps(1).is_empty());
+
+        let (passing, failing) = flaky_cas_endpoints();
+        let mut bubbles = align(&passing, &failing);
+        let swaps = bubbles.swap_distance();
+        let midpoint: Vec<SchedEvent> = bubbles.midpoint().cloned().collect();
+        assert_eq!(
+            schedule_between(&passing, &failing, candidate_swaps(swaps)[0]),
+            midpoint
+        );
+        // The events the two share, in the passing order and in the failing
+        // one: no swap from each.
+        let shared_passing = schedule_between(&passing, &failing, 0);
+        assert_eq!(just_distance(&passing, &shared_passing).1, 0);
+        assert_eq!(
+            just_distance(&schedule_between(&passing, &failing, swaps), &failing).1,
+            0
+        );
+        assert_eq!(
+            just_distance(&shared_passing, &schedule_between(&passing, &failing, 1)),
+            (1, 1)
+        );
+    }
+
+    /// A schedule the replay cannot follow never decides: the search never
+    /// takes it as an end of its pair, tries another schedule between the pair
+    /// instead, and, the outcome depending only on the order of the critical
+    /// events, finds the critical pair a search in which every schedule is
+    /// followed finds (the events around it, and the pair's branch counts,
+    /// can differ: the search took other schedules on its way there).
+    #[test]
+    fn an_infeasible_schedule_never_decides() {
+        let endpoints = flaky_cas_endpoints();
+        let followed = search_for_critical_schedule(
+            |sched: &[SchedEvent]| -> TrialOutcome {
+                Ok((flaky_cas_passes(sched), sched.to_owned()))
+            },
+            endpoints.0.clone(),
+            endpoints.1.clone(),
+            &Default::default(),
+        )
+        .unwrap();
+
+        let rejected = std::cell::RefCell::new(Vec::new());
+        let mut poles = Vec::new();
+        let found = search_for_critical_schedule_observed(
+            |sched: &[SchedEvent]| -> TrialOutcome {
+                if mock_infeasible(sched, &endpoints) {
+                    rejected.borrow_mut().push(sched.to_vec());
+                    return Err(infeasible("bisect_round_007"));
+                }
+                Ok((flaky_cas_passes(sched), sched.to_owned()))
+            },
+            endpoints.0.clone(),
+            endpoints.1.clone(),
+            &Default::default(),
+            SearchStart::Endpoints,
+            &mut |interval| poles.push((interval.passing.to_vec(), interval.failing.to_vec())),
+        )
+        .unwrap();
+        let rejected = rejected.into_inner();
+        assert!(!rejected.is_empty(), "no schedule was infeasible");
+        // The critical pair's threads and operations; their branch counts
+        // may differ, as the sub-event refinement gives up on a sample it
+        // cannot follow.
+        let index = found.critical_event_index;
+        assert_eq!(index, followed.critical_event_index);
+        for at in [index - 1, index] {
+            let (found, followed) = (&found.failing_schedule[at], &followed.failing_schedule[at]);
+            assert_eq!(
+                (found.dettid, found.op),
+                (followed.dettid, followed.op),
+                "event #{at}: {found} vs {followed}"
+            );
+        }
+        for (passing, failing) in &poles {
+            assert!(!rejected.contains(passing) && !rejected.contains(failing));
+        }
+        assert!(!rejected.contains(&found.passing_schedule));
+        assert!(!rejected.contains(&found.failing_schedule));
+    }
+
+    /// When no schedule between the pair can be followed, the search ends
+    /// with every one it tried, without taking any as an end: it says the two
+    /// orders cannot be spliced there and names `--prefix-search`.
+    #[test]
+    fn a_pass_without_a_feasible_schedule_ends_the_search() {
+        let endpoints = flaky_cas_endpoints();
+        let swaps = just_distance(&endpoints.0, &endpoints.1).1;
+        let trials = std::cell::Cell::new(0);
+        let error = search_for_critical_schedule(
+            |sched: &[SchedEvent]| -> TrialOutcome {
+                trials.set(trials.get() + 1);
+                if sched != endpoints.0 && sched != endpoints.1 {
+                    return Err(infeasible(&format!("bisect_round_{:03}", trials.get())));
+                }
+                Ok((flaky_cas_passes(sched), sched.to_owned()))
+            },
+            endpoints.0.clone(),
+            endpoints.1.clone(),
+            &Default::default(),
+        )
+        .unwrap_err();
+        let stopped = error.downcast_ref::<NoFeasibleSchedule>().unwrap();
+        assert_eq!(stopped.pass, 0);
+        assert_eq!(stopped.swap_distance, swaps);
+        assert_eq!(stopped.tried.len(), candidate_swaps(swaps).len());
+        assert_eq!(trials.get(), 2 + stopped.tried.len());
+        assert_eq!(stopped.tried[0].run, "bisect_round_003");
+        let said = error.to_string();
+        assert!(
+            said.contains("no schedule between the closest pair could be replayed")
+                && said.contains("the first because bisect_round_003 could not follow its schedule: at event #580 the schedule runs thread 5, but thread 3 ran")
+                && said.contains("--prefix-search"),
+            "{said}"
+        );
+    }
+
+    /// An endpoint is an order a run took: a replay of it that leaves it
+    /// still has that run's outcome, so the search keeps the outcome (with a
+    /// warning) and finds what it finds when the endpoint is followed; an
+    /// outcome that is not the endpoint's is still an error.
+    #[test]
+    fn an_endpoint_the_replay_leaves_keeps_its_outcome() {
+        let endpoints = flaky_cas_endpoints();
+        let followed = search_for_critical_schedule(
+            |sched: &[SchedEvent]| -> TrialOutcome {
+                Ok((flaky_cas_passes(sched), sched.to_owned()))
+            },
+            endpoints.0.clone(),
+            endpoints.1.clone(),
+            &Default::default(),
+        )
+        .unwrap();
+        for which in [0, 1] {
+            let departing = |passed: bool| {
+                let endpoints = &endpoints;
+                move |sched: &[SchedEvent]| -> TrialOutcome {
+                    let endpoint = if which == 0 {
+                        &endpoints.0
+                    } else {
+                        &endpoints.1
+                    };
+                    if sched == endpoint {
+                        return Err(anyhow::Error::new(InfeasibleSchedule {
+                            passed,
+                            ..infeasible("bisect_round_001")
+                                .downcast::<InfeasibleSchedule>()
+                                .unwrap()
+                        }));
+                    }
+                    Ok((flaky_cas_passes(sched), sched.to_owned()))
+                }
+            };
+            // Its own outcome: the same answer.
+            let found = search_for_critical_schedule(
+                departing(which == 0),
+                endpoints.0.clone(),
+                endpoints.1.clone(),
+                &Default::default(),
+            )
+            .unwrap();
+            assert_eq!(found.critical_event_index, followed.critical_event_index);
+            assert_eq!(found.failing_schedule, followed.failing_schedule);
+            // The other outcome: the endpoint does not reproduce.
+            let error = search_for_critical_schedule(
+                departing(which != 0),
+                endpoints.0.clone(),
+                endpoints.1.clone(),
+                &Default::default(),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(&format!(
+                    "the {} schedule endpoint did not reproduce",
+                    ["passing", "failing"][which]
+                )),
+                "{error}"
+            );
+        }
+    }
+
+    /// Whether each thread's events in `schedule` keep their order in
+    /// `reference` (as a subsequence of that thread's events there), and every
+    /// syscall entry in `schedule` is followed, among its thread's events, by
+    /// that syscall's return.
+    fn keeps_each_threads_order(schedule: &[SchedEvent], reference: &[SchedEvent]) -> bool {
+        let threads: std::collections::BTreeSet<_> = schedule.iter().map(|e| e.dettid).collect();
+        threads.iter().all(|&thread| {
+            let mine = schedule.iter().filter(|e| e.dettid == thread);
+            let mut theirs = reference.iter().filter(|e| e.dettid == thread);
+            let ordered = mine.clone().all(|event| theirs.any(|other| other == event));
+            let events: Vec<_> = mine.collect();
+            let whole = events
+                .iter()
+                .zip(events.iter().skip(1).map(Some).chain([None]))
+                .all(|(event, next)| {
+                    match event.op {
+                    Op::Syscall(sysno, SyscallPhase::Prehook) => next.is_some_and(|next| {
+                        matches!(next.op, Op::Syscall(n, SyscallPhase::Posthook) if n == sysno)
+                    }),
+                    _ => true,
+                }
+                });
+            ordered && whole
+        })
+    }
+
+    /// The matching the bisection splices along keeps each thread's events
+    /// in the order both runs executed them and a syscall's entry with its
+    /// return: of two runs whose thread 3 made its read and its write in
+    /// opposite orders, one of the two syscalls stays matched, whole; of
+    /// thread 5's branch events and futex, those in one order in both runs;
+    /// and a syscall whose return differs between the runs is unmatched whole.
+    /// Every schedule between the two then keeps both properties.
+    #[test]
+    fn the_matching_keeps_each_threads_order_and_its_syscalls_whole() {
+        let t = DetTid::from_raw;
+        let pre = |tid, sysno| SchedEvent::syscall(t(tid), sysno, SyscallPhase::Prehook);
+        let post = |tid, sysno| SchedEvent::syscall(t(tid), sysno, SyscallPhase::Posthook);
+        let passing = vec![
+            pre(3, Sysno::read),
+            post(3, Sysno::read),
+            pre(3, Sysno::write),
+            post(3, Sysno::write),
+            SchedEvent::branches(t(5), 1),
+            SchedEvent::branches(t(5), 2),
+            pre(5, Sysno::futex),
+            post(5, Sysno::futex),
+        ];
+        let failing = vec![
+            SchedEvent::branches(t(5), 1),
+            pre(3, Sysno::write),
+            post(3, Sysno::write),
+            pre(3, Sysno::read),
+            post(3, Sysno::read),
+            pre(5, Sysno::futex),
+            SchedEvent {
+                end_rip: std::num::NonZeroUsize::new(0x1234),
+                ..post(5, Sysno::futex)
+            },
+            SchedEvent::branches(t(5), 2),
+        ];
+        let divergence = trace_divergence(&passing, &failing);
+        assert_eq!(
+            divergence,
+            TraceDivergence {
+                reordered: 3,
+                split_syscalls: 1,
+            }
+        );
+        assert!(divergence.diverges());
+        let (permutation, _) = order_preserving(
+            &passing,
+            &failing,
+            generate_expanded_permutation(&passing, &failing),
+        );
+        // Thread 3's write and thread 5's first branch event stay matched:
+        // thread 3's read is out of order, and so is thread 5's second branch
+        // event, which the failing run takes after its futex.
+        assert_eq!(permutation.perm, [4, 2, 3]);
+        let swaps = align(&passing, &failing).swap_distance();
+        assert_eq!(swaps, 2);
+        for from_passing in 0..=swaps {
+            let between = schedule_between(&passing, &failing, from_passing);
+            assert!(
+                keeps_each_threads_order(&between, &passing)
+                    && keeps_each_threads_order(&between, &failing),
+                "{from_passing} swaps: {between:?}"
+            );
+        }
+
+        // The same per-thread traces in another interleaving: nothing to
+        // take out.
+        let interleaved = vec![
+            SchedEvent::branches(t(5), 1),
+            pre(3, Sysno::read),
+            post(3, Sysno::read),
+            SchedEvent::branches(t(5), 2),
+            pre(5, Sysno::futex),
+            pre(3, Sysno::write),
+            post(3, Sysno::write),
+            post(5, Sysno::futex),
+        ];
+        let none = trace_divergence(&passing, &interleaved);
+        assert_eq!(none, TraceDivergence::default());
+        assert!(!none.diverges());
+        // Every event matched: only swaps separate the two.
+        let (edits, swaps) = just_distance(&passing, &interleaved);
+        assert!(swaps > 0);
+        assert_eq!(edits, swaps);
+    }
+
+    /// The threshold is zero: one reordered event or one split syscall is a
+    /// divergence, and says what it counted.
+    #[test]
+    fn one_reordered_event_or_split_syscall_is_a_divergence() {
+        for divergence in [
+            TraceDivergence {
+                reordered: 1,
+                split_syscalls: 0,
+            },
+            TraceDivergence {
+                reordered: 0,
+                split_syscalls: 1,
+            },
+        ] {
+            assert!(divergence.diverges());
+        }
+        let said = DivergentTraces(TraceDivergence {
+            reordered: 81,
+            split_syscalls: 1,
+        })
+        .to_string();
+        assert!(
+            said.starts_with(
+                "the two runs' per-thread traces diverge, so splices are not feasible: matching \
+                 the two schedules' events would move 81 of them against their own thread's \
+                 order and separate 1 syscalls from their returns"
+            ),
+            "{said}"
+        );
     }
 
     /// A trial that `--max-log-bytes` ended, as `classify_container_result`
