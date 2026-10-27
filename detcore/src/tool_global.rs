@@ -53,7 +53,7 @@ use detcore_model::procfs::mount_ids_are_ordered_subset;
 use detcore_model::summary::PreemptionSummary;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
-use detcore_model::syscall_histogram::SyscallHistogram;
+use detcore_model::syscall_histogram::SparseSyscallHistogram;
 pub use detcore_model::syscall_histogram::SyscallObservationGap;
 use detcore_model::syscall_histogram::SyscallObservationScope;
 pub(crate) use exec_identity::reconnect_exec;
@@ -6240,8 +6240,9 @@ pub struct ThreadDeregistration {
     pub(crate) vfork_origin: Option<ExternalOpId>,
     pub(crate) timeslice_stats: TimesliceStats,
     pub(crate) syscall_count: u64,
-    /// The thread's syscall entries and outcomes; its total is `syscall_count`.
-    pub(crate) syscall_histogram: SyscallHistogram,
+    /// The thread's syscall entries and outcomes, its nonzero slots only; its
+    /// total is `syscall_count`.
+    pub(crate) syscall_histogram: SparseSyscallHistogram,
     pub(crate) chaos_epochs: Vec<ChaosEpochTransition>,
 }
 

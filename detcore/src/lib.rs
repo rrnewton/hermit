@@ -6272,7 +6272,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             vfork_origin: thread_state.vfork_origin,
             timeslice_stats: thread_state.stats.timeslice_stats,
             syscall_count: thread_state.stats.syscall_count,
-            syscall_histogram: std::mem::take(&mut thread_state.stats.syscall_histogram),
+            syscall_histogram: (&thread_state.stats.syscall_histogram).into(),
             chaos_epochs: pending_chaos_epochs,
         };
         if transferred_exec {

@@ -1187,7 +1187,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And detcore-dbt's
     // tests::startup_refuses_another_trees_coordinator_before_reading_its_frame
     // (the DBT runtime checks the coordinator's fingerprint): 1866, listed.
-    ("test.regular_crates", 1866),
+    // And detcore-model's
+    // syscall_histogram::tests::the_finished_form_keeps_only_nonzero_slots_and_sums_back_exactly
+    // (finished threads keep sparse histograms): 1867, listed.
+    ("test.regular_crates", 1867),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -5742,7 +5745,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two chaos-floor-failure tests: 1850, listed.
     // The same native-client publication regression is included on the host.
     // And the same detcore-dbt fingerprint test: 1852, listed.
-    ("test.regular_crates_on_host", 1852),
+    // And the same finished-thread sparse histogram unit: 1853, listed.
+    ("test.regular_crates_on_host", 1853),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

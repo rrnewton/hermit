@@ -12,7 +12,8 @@
 //! Detcore counts every syscall entry by number, at the same accounting point
 //! as the run summary's scalar `syscalls` count, and at the end of its handler
 //! records one [`SyscallOutcome`]. Each thread keeps its own
-//! [`SyscallHistogram`] and hands it to the scheduler with its other final
+//! [`SyscallHistogram`] and hands its nonzero slots
+//! ([`SparseSyscallHistogram`]) to the scheduler with its other final
 //! statistics when it deregisters, so a run's histogram covers exactly the
 //! calls of the `syscalls` total. The run summary reports the merged histogram
 //! as a [`SyscallHistogramSummary`]: sparse, ordered by x86-64 syscall number,
@@ -277,8 +278,9 @@ pub const SYSCALL_TABLE_SIZE: usize = Sysno::table_size();
 /// A histogram indexed by x86-64 syscall number, as Detcore collects it: a
 /// dense array with one [`SyscallOutcomes`] per table slot, allocated once
 /// when the thread's state is created, so counting a syscall is two array
-/// increments with no allocation and no lookup. Threads' histograms are added
-/// slot by slot when they exit ([`SyscallHistogram::merge`]).
+/// increments with no allocation and no lookup. A thread that exits hands
+/// over only its nonzero slots ([`SparseSyscallHistogram`]), and the run's
+/// total sums those back into one dense histogram.
 ///
 /// It serializes sparsely, as `(number, counts)` pairs for the nonzero slots in
 /// ascending order, so the thread-exit message and any saved thread state stay
@@ -404,6 +406,78 @@ impl<'de> Deserialize<'de> for SyscallHistogram {
             histogram.counts[index] = counts;
         }
         Ok(histogram)
+    }
+}
+
+/// A finished thread's histogram: only its nonzero slots, `(number, counts)`
+/// by ascending number.
+///
+/// A thread counts into a dense [`SyscallHistogram`], which costs a fixed
+/// 14,784 bytes; a thread that has exited reports this form instead, so the
+/// scheduler keeps a few hundred bytes per finished thread rather than the
+/// whole array (a 4,000-thread run kept 59 MB of dense arrays). The run's
+/// total is summed back into one dense histogram
+/// ([`SparseSyscallHistogram::add_to`]).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+pub struct SparseSyscallHistogram {
+    entries: Vec<(i32, SyscallOutcomes)>,
+}
+
+impl From<&SyscallHistogram> for SparseSyscallHistogram {
+    fn from(histogram: &SyscallHistogram) -> Self {
+        Self {
+            entries: histogram
+                .nonzero()
+                .map(|(nr, counts)| (nr, *counts))
+                .collect(),
+        }
+    }
+}
+
+impl SparseSyscallHistogram {
+    /// Add every count of `other` to this histogram, keeping number order.
+    pub fn merge(&mut self, other: &SparseSyscallHistogram) {
+        let mut merged = Vec::with_capacity(self.entries.len() + other.entries.len());
+        let (mut mine, mut theirs) = (
+            self.entries.iter().peekable(),
+            other.entries.iter().peekable(),
+        );
+        loop {
+            let next = match (mine.peek(), theirs.peek()) {
+                (Some((left, _)), Some((right, _))) if left < right => *mine.next().unwrap(),
+                (Some((left, _)), Some((right, _))) if right < left => *theirs.next().unwrap(),
+                (Some(_), Some(_)) => {
+                    let (nr, mut counts) = *mine.next().unwrap();
+                    counts.merge(&theirs.next().unwrap().1);
+                    (nr, counts)
+                }
+                (Some(_), None) => *mine.next().unwrap(),
+                (None, Some(_)) => *theirs.next().unwrap(),
+                (None, None) => break,
+            };
+            merged.push(next);
+        }
+        self.entries = merged;
+    }
+
+    /// Add every count of this histogram to the dense `total`. A number
+    /// outside the pinned table, which no [`SyscallHistogram`] can produce,
+    /// is skipped.
+    pub fn add_to(&self, total: &mut SyscallHistogram) {
+        for (nr, counts) in &self.entries {
+            if let Some(slot) = nr
+                .checked_sub(Sysno::first().id())
+                .and_then(|slot| usize::try_from(slot).ok())
+                .filter(|slot| *slot < SYSCALL_TABLE_SIZE)
+            {
+                total.counts[slot].merge(counts);
+            }
+        }
+    }
+
+    /// Total entries over every syscall.
+    pub fn total_calls(&self) -> u64 {
+        self.entries.iter().map(|(_, counts)| counts.calls).sum()
     }
 }
 
@@ -624,6 +698,40 @@ mod tests {
         }
         let unknown = r#"{"architecture":"x86_64","observation_scope":{"kind":"complete"},"counts":[],"names":[]}"#;
         assert!(serde_json::from_str::<CompactSyscallHistogram>(unknown).is_err());
+    }
+
+    #[test]
+    fn the_finished_form_keeps_only_nonzero_slots_and_sums_back_exactly() {
+        let mut first = SyscallHistogram::default();
+        first.enter(Sysno::read);
+        first.finish(Sysno::read, SyscallOutcome::Backend);
+        first.enter(Sysno::exit);
+        let mut second = SyscallHistogram::default();
+        second.enter(Sysno::read);
+        second.finish(Sysno::read, SyscallOutcome::Detcore);
+        second.enter(Sysno::getpid);
+        second.enter(Sysno::exit);
+
+        let mut sparse = SparseSyscallHistogram::from(&first);
+        assert_eq!(sparse.entries.len(), 2);
+        sparse.merge(&SparseSyscallHistogram::from(&second));
+        assert_eq!(
+            sparse.entries.iter().map(|(nr, _)| *nr).collect::<Vec<_>>(),
+            [Sysno::read.id(), Sysno::getpid.id(), Sysno::exit.id()]
+        );
+        assert_eq!(sparse.total_calls(), 5);
+
+        let mut dense = first.clone();
+        dense.merge(&second);
+        let mut total = SyscallHistogram::default();
+        sparse.add_to(&mut total);
+        assert_eq!(total, dense);
+        // Merging with nothing on either side changes nothing.
+        let mut empty = SparseSyscallHistogram::default();
+        empty.merge(&sparse);
+        assert_eq!(empty, sparse);
+        empty.merge(&SparseSyscallHistogram::default());
+        assert_eq!(empty, sparse);
     }
 
     #[test]
