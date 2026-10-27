@@ -566,14 +566,8 @@ impl RunData {
     /// with `--workdir`. Only when analyze's directory cannot be named
     /// (removed, or not UTF-8) is the line the bare command.
     pub fn to_repro(&self) -> String {
-        let command = self.repro_command();
-        match std::env::current_dir() {
-            Ok(dir) => match dir.to_str() {
-                Some(dir) => format!("cd {} && {command}", shell_words::quote(dir)),
-                None => command,
-            },
-            Err(_) => command,
-        }
+        let dir = std::env::current_dir().ok();
+        reproducer_line(dir.as_deref().and_then(Path::to_str), self.repro_command())
     }
 
     /// The `hermit ... run ...` command that reproduces this run, without
@@ -600,6 +594,15 @@ impl RunData {
 
     pub fn into_runopts(self) -> RunOpts {
         self.runopts
+    }
+}
+
+/// `cd <dir> && <command>` with `dir` quoted for the shell, or the bare
+/// command when there is no directory to name ([`RunData::to_repro`]).
+fn reproducer_line(dir: Option<&str>, command: String) -> String {
+    match dir {
+        Some(dir) => format!("cd {} && {command}", shell_words::quote(dir)),
+        None => command,
     }
 }
 
@@ -1529,6 +1532,31 @@ mod tests {
     /// The printed reproducer carries `--timeout`, which every trial applies
     /// (`run_in_container` reads it), so the reproducer is bounded as the
     /// trial was.
+    /// A reproducer's directory is quoted for the shell: one with spaces and
+    /// an apostrophe splits back to itself, and `sh` lands in it.
+    #[test]
+    fn a_reproducers_directory_is_quoted_for_the_shell() {
+        let parent = tempfile::tempdir().unwrap();
+        let dir = parent.path().join("it's a dir");
+        std::fs::create_dir(&dir).unwrap();
+        let dir = dir.to_str().unwrap();
+        let line = reproducer_line(Some(dir), "pwd -P".to_owned());
+        let words = shell_words::split(&line).unwrap();
+        assert_eq!(words[..3], ["cd", dir, "&&"], "{line}");
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&line)
+            .current_dir(parent.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            Path::new(String::from_utf8(output.stdout).unwrap().trim()),
+            Path::new(dir).canonicalize().unwrap()
+        );
+        assert_eq!(reproducer_line(None, "hermit run".to_owned()), "hermit run");
+    }
+
     /// A reproducer changes to the directory its trial ran in before it runs
     /// the command, so the guest starts in the trial's working directory
     /// wherever the line is run (#4812). It does so with `--workdir` too,
