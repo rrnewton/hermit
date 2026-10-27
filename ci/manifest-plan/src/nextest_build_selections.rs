@@ -957,7 +957,8 @@ mod tests {
             // third shard executed 349 (347 + 2), all passed: 700.
             // Recount at 360e99b2e24: shard 2 grew to 292 (61 + 292 +
             // 349), so the on-host population is 702.
-            assert_eq!(population, 702);
+            // And lit's chaos_schedule_replay fixture (+1): 703.
+            assert_eq!(population, 703);
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

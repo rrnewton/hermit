@@ -3505,7 +3505,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Recount at 360e99b2e24: a81e8a3fbfd (PR 4862) added two lit tests
     // without moving this pin; the shard executed 292, all passing, in
     // the full validate at that head.
-    ("test.hermit_integration_2", 292),
+    // And lit's chaos_schedule_replay fixture (a --chaos recording replayed
+    // with --die-on-desync): 293, listed.
+    ("test.hermit_integration_2", 293),
     // And standalone's 13 internal standalone targets, one ignored for the
     // per-test CPU budget, in the third shard: 60 + 263 + 244 = 567.
     // Less no_networking_network_bind_full, ignored for the per-test CPU
@@ -5675,7 +5677,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // `cargo nextest list --profile ci` (the local shards' 61 + 290 + 349).
     // Recount at 360e99b2e24: shard 2 grew to 292 (see its pin), so the
     // whole-node twin executes 61 + 292 + 349 = 702.
-    ("test.hermit_integration_on_host", 702),
+    // And the same chaos_schedule_replay lit fixture: 703, listed.
+    ("test.hermit_integration_on_host", 703),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
