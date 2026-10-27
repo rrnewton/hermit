@@ -1700,6 +1700,12 @@
     },
     {
       "disposition": "manifest-test",
+      "path": "tests/c/proc_own_links.c",
+      "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
+      "why": "tests/c/proc_own_links.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Reads the caller's own /proc/<pid>/exe, cwd and root links by every spelling (truncation, EINVAL, EFAULT, followed spellings, chdir, a removed directory, a thread, a fork, an exited leader, an exec'd copy that unlinks itself), which Detcore answers from its own knowledge on every backend"
+    },
+    {
+      "disposition": "manifest-test",
       "path": "tests/c/proc_stat_comm.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml",
       "why": "tests/c/proc_stat_comm.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Reads its own /proc/<pid>/stat (52 fields) by every spelling, a thread's task stat, a fork child's and a descriptor kept across an exec, and checks the name stat shows after PR_SET_NAME, comm writes, pthread_setname_np, an exec through a long symbolic link and execveat(AT_EMPTY_PATH), comparing the comm file with stat and PR_GET_NAME and reading it by seq_file positions (c-programs/proc-stat-comm); Detcore renders a process's own stat, and on KVM its own comm reads"
