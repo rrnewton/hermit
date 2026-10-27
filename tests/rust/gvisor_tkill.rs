@@ -25,9 +25,9 @@
  *   TkillTest.ValidTIDAndRealSignal -> tkill_test::valid_tid_and_real_signal
  * Excluded: none. Note: ValidTIDAndRealSignal kills the guest on
  * Hermit's ptrace backend at this commit (the SIGRTMAX handler does
- * not run; the process exits as if by the default disposition), the
- * compatibility finding drafted on 2026-10-27. On native Linux all
- * three cases pass.
+ * not run; the process exits as if by the default disposition):
+ * https://github.com/rrnewton/hermit/issues/4851
+ * On native Linux all three cases pass.
  */
 
 use std::panic::AssertUnwindSafe;
