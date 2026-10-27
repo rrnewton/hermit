@@ -11,6 +11,8 @@
 #[cfg(test)]
 #[path = "namespace/own_getters_tests.rs"]
 mod own_getters_tests;
+#[path = "namespace/own_links.rs"]
+mod own_links;
 
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -1989,6 +1991,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return answer;
         }
+        if let Some(result) = self
+            .readlink_own_task_link(
+                guest,
+                reverie::syscalls::Sysno::readlink,
+                &path,
+                (call.buf(), call.bufsize()),
+            )
+            .await?
+        {
+            return Ok(result);
+        }
         if let Some(exe) = self
             .launched_exe(guest, (libc::AT_FDCWD, &path), false)
             .await
@@ -2121,6 +2134,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return answer;
         }
+        if path.is_absolute()
+            && let Some(result) = self
+                .readlink_own_task_link(
+                    guest,
+                    reverie::syscalls::Sysno::readlinkat,
+                    &path,
+                    (call.buf(), call.buf_len()),
+                )
+                .await?
+        {
+            return Ok(result);
+        }
         if let Some(exe) = self.launched_exe(guest, (call.dirfd(), &path), false).await {
             let saved = saved_exe_link_bytes(guest, call.buf(), call.buf_len());
             let result = self.record_or_replay(guest, call).await?;
@@ -2214,6 +2239,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 && recorded
                     .as_deref()
                     .is_some_and(|directory| directory == Path::new("/proc")));
+        // The caller's own `exe`, `cwd` and `root` links, by a name below a
+        // descriptor on `/proc` or one of its process directories.
+        if decidable
+            && !path.is_absolute()
+            && let Some(result) = self
+                .readlink_own_task_link(
+                    guest,
+                    reverie::syscalls::Sysno::readlinkat,
+                    &observed_path,
+                    (call.buf(), call.buf_len()),
+                )
+                .await?
+        {
+            return Ok(result);
+        }
         if decidable
             && let Some(result) = self
                 .readlink_decided_link(
