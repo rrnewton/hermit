@@ -21,7 +21,7 @@
 //! work under Buck.
 
 #[path = "build_support.rs"]
-mod build_support;
+pub(crate) mod build_support;
 
 use build_support::build_date;
 use build_support::emit_git_revision;
