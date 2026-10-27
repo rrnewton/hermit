@@ -30454,7 +30454,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1290",
+        "NEXTEST_EXPECTED_EXECUTED": "1293",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -37306,7 +37306,7 @@
       "group": "super",
       "job": "weekly_portable_chaos_cases",
       "desc": "Weekly portable chaos cases",
-      "description": "Runs the non-ignored tests of hermit-cli/tests/stress_suite.rs on one thread: chaos_finds_and_reproduces_order_violation and schedule_bisect_localizes_publish_ordering_race (the --skip of slow_cas_search_and_replay has no effect, as that test is ignored). Both use `hermit run --base-env=minimal --chaos --sched-heuristic=random --max-timeslice=disabled --no-virtualize-cpuid --seed=N` on the default ptrace backend with a 10-second timeout per run, so no PMU is needed. The first requires tests/chaos/order_violation.c to print \"Hello world!\" without chaos, one of seeds 0-15 to expose the race, and the first such seed to reproduce \"ERROR! global_str is null at use.\" twice. It names no seed, because the seed depends on the guest binary: 9 when built on the validation host, 8 in the pinned validate root. The second records preemptions, under one fixed epoch, for a passing and a failing publish-ordering seed among seeds 0-39 (all of 0-9 expose the race in the pinned root), then requires `hermit bisect` to localize the divergence to two adjacent events with stack traces. The binary also runs in test.hermit_integration. A failure is blocking for the super validation.",
+      "description": "Runs the non-ignored tests of hermit-cli/tests/stress_suite.rs on one thread: chaos_finds_and_reproduces_order_violation and schedule_bisect_localizes_publish_ordering_race (the --skip of slow_cas_search_and_replay has no effect, as that test is ignored). Both use `hermit run --base-env=minimal --chaos --sched-heuristic=random --max-timeslice=disabled --no-virtualize-cpuid --seed=N` on the default ptrace backend with a 10-second timeout per run, so no PMU is needed. The first requires tests/chaos/order_violation.c to print \"Hello world!\" without chaos, one of seeds 0-15 to expose the race, and the first such seed to reproduce \"ERROR! global_str is null at use.\" twice. It names no seed, because the seed depends on the guest binary: 9 when built on the validation host, 8 in the pinned validate root. The second records preemptions, under one fixed epoch and with --rng-seed=0 (bisect refuses records made under two guest random seeds), for a passing and a failing publish-ordering seed among seeds 0-39 (all of 0-9 exposed the race in the pinned root when measured without --rng-seed; the guest reads no randomness), then requires `hermit bisect` to localize the divergence to two adjacent events with stack traces. The binary also runs in test.hermit_integration. A failure is blocking for the super validation.",
       "labels": [
         "super"
       ],
@@ -58761,7 +58761,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "1284",
+        "NEXTEST_EXPECTED_EXECUTED": "1287",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-run\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
