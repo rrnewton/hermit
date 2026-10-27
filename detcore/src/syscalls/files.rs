@@ -14251,11 +14251,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             return false;
         }
         let link = format!("{}/fd/{fd}", self.caller_proc_directory(guest));
-        let directory_metadata = std::fs::metadata(link).ok();
-        let on_procfs = match (&directory_metadata, rendered_procfs::proc_device()) {
-            (Some(metadata), Some(device)) => metadata.dev() == device,
-            _ => false,
-        };
+        std::fs::metadata(link).is_ok_and(|metadata| {
+            self.is_caller_descriptor_identity(
+                guest,
+                (metadata.dev(), metadata.ino()),
+                &["fd", "fdinfo"],
+            )
+        })
+    }
+
+    /// The same object test for an opened directory or a pathname lookup.
+    /// Readlink accepts only `fd`; listings also accept `fdinfo`.
+    fn is_caller_descriptor_identity<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        identity: (u64, u64),
+        kinds: &[&str],
+    ) -> bool {
+        if rendered_procfs::proc_device() != Some(identity.0) {
+            return false;
+        }
         let state = guest.thread_state();
         let holds_process_table =
             state.dettid == self.own_detpid(guest) || state.holds_process_files();
@@ -14264,14 +14279,87 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             format!("/proc/{}", guest.pid().as_raw())
         };
-        on_procfs
-            && directory_metadata.as_ref().is_some_and(|metadata| {
-                is_caller_descriptor_directory(
-                    metadata,
-                    &self.caller_proc_directory(guest),
-                    holds_process_table.then_some(process.as_str()),
-                )
-            })
+        caller_descriptor_identity_matches(
+            identity,
+            &self.caller_proc_directory(guest),
+            holds_process_table.then_some(process.as_str()),
+            kinds,
+        )
+    }
+
+    /// Hide an owner-reported descriptor only after the original pathname's
+    /// parent resolves to this caller's actual FD directory. A recorded
+    /// `/proc/self/fd` spelling alone cannot authenticate an inherited,
+    /// replaced, or invalid directory descriptor.
+    pub(crate) async fn readlink_names_runtime_fd<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        dirfd: RawFd,
+        path: &Path,
+    ) -> bool {
+        use std::os::unix::ffi::OsStrExt;
+
+        use super::namespace::decimal_fd;
+
+        let bytes = path.as_os_str().as_bytes();
+        if self.cfg.recordreplay_modes
+            || !crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend)
+            || guest.thread_state().changed_root.load(Ordering::SeqCst)
+            || bytes.is_empty()
+            || bytes.len() >= libc::PATH_MAX as usize
+            || bytes.ends_with(b"/")
+        {
+            return false;
+        }
+        // Only parse the final raw component. The actual parent object,
+        // rather than an absolute or recognized spelling, proves whose
+        // descriptor table this is. In particular, retain interior `..`
+        // and symlinks for Linux to resolve in order.
+        let name = bytes.rsplit(|byte| *byte == b'/').next().unwrap();
+        let Some(fd) = decimal_fd(std::ffi::OsStr::from_bytes(name)) else {
+            return false;
+        };
+        // Keep the original relative lookup and its dirfd, including errors
+        // such as EBADF and ENOTDIR. The translated injection handles guest
+        // PID spellings and placeholder directories just as the original
+        // readlink does. Do not inspect the protected descriptor itself.
+        let parent = match bytes.iter().rposition(|byte| *byte == b'/') {
+            Some(0) => &b"/"[..],
+            Some(end) => &bytes[..end],
+            None => &b"."[..],
+        };
+        let stat_size = std::mem::size_of::<libc::stat>();
+        let length = stat_size + parent.len() + 1;
+        let Some(page) = procfs_levels::map_transient(guest, length).await else {
+            return false;
+        };
+        // SAFETY: the mapping contains stat_size + parent.len() + 1 bytes,
+        // so this u8 offset remains within the successfully mapped region.
+        let parent_address = unsafe { page.add(stat_size) };
+        let mut staged = parent.to_vec();
+        staged.push(0);
+        let stat = StatPtr(page.cast());
+        let observed = if guest.memory().write_exact(parent_address, &staged).is_ok() {
+            let call = syscalls::Newfstatat::new()
+                .with_dirfd(dirfd)
+                .with_path(PathPtr::from_ptr(
+                    parent_address.as_raw() as *const libc::c_char
+                ))
+                .with_stat(Some(stat))
+                .with_flags(AtFlags::empty());
+            match Self::inject_translated_in_page(guest, Syscall::from(call)).await {
+                Ok(_) => stat.read(&guest.memory()).ok(),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        procfs_levels::unmap_transient(guest, page, length).await;
+        observed.is_some_and(|stat| {
+            stat.st_mode & libc::S_IFMT == libc::S_IFDIR
+                && self.is_caller_descriptor_identity(guest, (stat.st_dev, stat.st_ino), &["fd"])
+                && guest.is_runtime_owned_fd(fd)
+        })
     }
 
     /// Answer `getdents` without a directory stream by issuing the guest's own
@@ -14975,16 +15063,30 @@ fn user_address_end() -> usize {
 
 /// Authenticate the current task's FD/fdinfo directory by kernel object
 /// identity, including symlink/bind aliases, without interpreting guest PIDs.
+#[cfg(test)]
 fn is_caller_descriptor_directory(
     observed: &std::fs::Metadata,
     caller: &str,
     process: Option<&str>,
 ) -> bool {
+    caller_descriptor_identity_matches(
+        (observed.dev(), observed.ino()),
+        caller,
+        process,
+        &["fd", "fdinfo"],
+    )
+}
+
+fn caller_descriptor_identity_matches(
+    observed: (u64, u64),
+    caller: &str,
+    process: Option<&str>,
+    kinds: &[&str],
+) -> bool {
     [Some(caller), process].into_iter().flatten().any(|owner| {
-        ["fd", "fdinfo"].into_iter().any(|kind| {
-            std::fs::metadata(format!("{owner}/{kind}")).is_ok_and(|expected| {
-                observed.dev() == expected.dev() && observed.ino() == expected.ino()
-            })
+        kinds.iter().any(|kind| {
+            std::fs::metadata(format!("{owner}/{kind}"))
+                .is_ok_and(|expected| observed == (expected.dev(), expected.ino()))
         })
     })
 }
@@ -16974,6 +17076,8 @@ mod test {
 mod inject_fstat_scratch {
     use std::os::fd::IntoRawFd;
     use std::os::fd::RawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
@@ -17034,8 +17138,13 @@ mod inject_fstat_scratch {
         fn capacity(&self) -> usize {
             panic!("inject_fstat must not query the scratch capacity")
         }
-        fn push<'stack, T>(&mut self, _: T) -> Addr<'stack, T> {
-            panic!("inject_fstat reserves its buffer rather than pushing one")
+        fn push<'stack, T>(&mut self, value: T) -> Addr<'stack, T> {
+            assert!(std::mem::size_of::<T>() <= self.capacity);
+            assert!(std::mem::align_of::<T>() <= std::mem::align_of::<u64>());
+            // SAFETY: this mock's arena is aligned and large enough for the
+            // one pathname the readlink handler stages before its injection.
+            unsafe { (self.arena as *mut T).write(value) };
+            Addr::from_raw(self.arena).unwrap()
         }
         fn reserve<'stack, T>(&mut self) -> AddrMut<'stack, T> {
             assert!(std::mem::size_of::<T>() <= self.capacity);
@@ -17095,6 +17204,12 @@ mod inject_fstat_scratch {
         /// Descriptors closed through injection.
         closed: Vec<RawFd>,
         runtime_fd: Option<RawFd>,
+        backend_ids: Option<(Pid, Pid)>,
+        /// Explicit guest-to-kernel process/thread mapping for proc translation.
+        procfs_ids: Option<[(i32, i32); 2]>,
+        rsp: Option<usize>,
+        /// Paths actually handed to the kernel for parent authentication.
+        statat_paths: Vec<Vec<u8>>,
         directory_batches: std::collections::VecDeque<Result<Vec<u8>, Errno>>,
         /// Scripted refusals of injected opens, in order; an open with none
         /// left opens a real file.
@@ -17154,6 +17269,10 @@ mod inject_fstat_scratch {
                 unmapped: Vec::new(),
                 closed: Vec::new(),
                 runtime_fd: None,
+                backend_ids: None,
+                procfs_ids: None,
+                rsp: None,
+                statat_paths: Vec::new(),
                 directory_batches: Default::default(),
                 open_errors: Default::default(),
                 opened_paths: Vec::new(),
@@ -17214,6 +17333,24 @@ mod inject_fstat_scratch {
             &self,
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
+            if let GlobalRequest::ProcfsIds(to_kernel, ids) = &message.2
+                && let Some(mapping) = self.procfs_ids
+            {
+                let resolved = ids
+                    .iter()
+                    .map(|id| {
+                        mapping.iter().find_map(|&(guest, kernel)| {
+                            let (from, to) = if *to_kernel {
+                                (guest, kernel)
+                            } else {
+                                (kernel, guest)
+                            };
+                            (*id == from).then_some(to)
+                        })
+                    })
+                    .collect();
+                return (None, GlobalResponse::ProcfsIds(resolved));
+            }
             panic!("fd registration must not send an RPC: {:?}", message.2)
         }
         fn config(&self) -> &Config {
@@ -17227,10 +17364,10 @@ mod inject_fstat_scratch {
         type Stack = ScriptedStack;
 
         fn tid(&self) -> Pid {
-            Pid::from_raw(1)
+            self.backend_ids.map_or(Pid::from_raw(1), |(_, tid)| tid)
         }
         fn pid(&self) -> Pid {
-            Pid::from_raw(1)
+            self.backend_ids.map_or(Pid::from_raw(1), |(pid, _)| pid)
         }
         fn ppid(&self) -> Option<Pid> {
             None
@@ -17264,7 +17401,11 @@ mod inject_fstat_scratch {
             &self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
-            panic!("fd registration must not read registers")
+            // SAFETY: every register is an integer; only the configured
+            // stack pointer is needed by these translation controls.
+            let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+            regs.rsp = self.rsp.expect("fd registration must not read registers") as u64;
+            regs
         }
         async fn stack(&mut self) -> Self::Stack {
             ScriptedStack {
@@ -17313,6 +17454,29 @@ mod inject_fstat_scratch {
                 }
                 return Ok(bytes.len() as i64);
             }
+            if matches!(
+                number,
+                Sysno::readlink | Sysno::readlinkat | Sysno::newfstatat
+            ) {
+                if number == Sysno::newfstatat {
+                    let path = PathPtr::from_ptr(args.arg1 as *const libc::c_char).unwrap();
+                    self.statat_paths
+                        .push(path.read(&self.memory())?.into_os_string().into_vec());
+                }
+                // SAFETY: the tests own every non-null input/output buffer;
+                // null buffers and invalid descriptors are checked by Linux.
+                return Errno::result(unsafe {
+                    libc::syscall(
+                        number as libc::c_long,
+                        args.arg0,
+                        args.arg1,
+                        args.arg2,
+                        args.arg3,
+                        args.arg4,
+                        args.arg5,
+                    )
+                });
+            }
             // SAFETY: each arm runs the syscall Detcore asked for against this
             // process, on addresses Detcore obtained from this guest.
             let raw = match Syscall::from_raw(number, args) {
@@ -17360,6 +17524,12 @@ mod inject_fstat_scratch {
                     }
                 }
                 Syscall::Fstat(call) => {
+                    // Model the same owner guard as a real Guest, while
+                    // keeping readlink a real kernel call. Before the fix,
+                    // this error arrives after the link wrote its output.
+                    if self.is_runtime_owned_fd(call.fd()) {
+                        return Err(Errno::EBADF);
+                    }
                     let buffer = call.stat().expect("fstat without a buffer").0.as_raw();
                     self.fstat_buffers.push(buffer);
                     self.fstat_guard_live
@@ -17429,6 +17599,482 @@ mod inject_fstat_scratch {
         }
         fn read_clock(&mut self) -> Result<u64, Error> {
             panic!("fd registration must not read a clock")
+        }
+    }
+
+    mod runtime_readlink_tests {
+        use std::ffi::CStr;
+        use std::ffi::CString;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        use super::*;
+
+        fn local_guest() -> (Detcore, ScriptedGuest) {
+            let (_, mut guest) = ScriptedGuest::new(true, false);
+            let pid = std::process::id() as i32;
+            // SAFETY: gettid has no arguments or memory operands.
+            let tid = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
+            guest.backend_ids = Some((Pid::from_raw(pid), Pid::from_raw(tid)));
+            guest.thread.detpid = Some(DetPid::from_raw(pid));
+            guest.thread.dettid = DetTid::from_raw(tid);
+            guest.config.backend = reverie::BackendCapabilities::DBT;
+            guest.config.virtualize_metadata = false;
+            let tool = <Detcore as Tool>::new(Pid::from_raw(pid), &guest.config);
+            (tool, guest)
+        }
+
+        fn record_directory(guest: &ScriptedGuest, fd: RawFd, path: &str) {
+            guest
+                .thread
+                .add_fd(
+                    fd,
+                    OFlag::O_RDONLY | OFlag::O_DIRECTORY,
+                    FdType::Regular,
+                    None,
+                )
+                .unwrap();
+            guest
+                .thread
+                .with_detfd(fd, |detfd| detfd.set_path(path))
+                .unwrap();
+        }
+
+        async fn read_link(
+            tool: &Detcore,
+            guest: &mut ScriptedGuest,
+            dirfd: Option<RawFd>,
+            path: Option<&CStr>,
+            buffer: Option<AddrMut<'_, libc::c_char>>,
+            size: usize,
+        ) -> Result<i64, Error> {
+            let path = path.and_then(|path| PathPtr::from_ptr(path.as_ptr()));
+            match dirfd {
+                None => {
+                    tool.handle_readlink(
+                        guest,
+                        syscalls::Readlink::new()
+                            .with_path(path)
+                            .with_buf(buffer)
+                            .with_bufsize(size),
+                    )
+                    .await
+                }
+                Some(dirfd) => {
+                    tool.handle_readlinkat(
+                        guest,
+                        syscalls::Readlinkat::new()
+                            .with_dirfd(dirfd)
+                            .with_path(path)
+                            .with_buf(buffer)
+                            .with_buf_len(size),
+                    )
+                    .await
+                }
+            }
+        }
+
+        fn errno(result: Result<i64, Error>, expected: Errno) {
+            assert!(
+                matches!(result, Err(Error::Errno(actual)) if actual == expected),
+                "{result:?}"
+            );
+        }
+
+        /// Exercise real cwd-relative lookup without changing the process's
+        /// cwd while unrelated unit tests may be running.
+        fn relative_to_cwd(path: &Path) -> String {
+            let mut relative = PathBuf::new();
+            for _ in std::env::current_dir().unwrap().components().skip(1) {
+                relative.push("..");
+            }
+            relative.push(path.strip_prefix("/").unwrap());
+            relative.to_str().unwrap().to_owned()
+        }
+
+        /// A live socket, rather than an absent magic descriptor, supplies
+        /// the Guest's ownership fact. Exercise the public shared handlers,
+        /// including their real kernel readlink and protected-fstat boundary.
+        #[tokio::test]
+        async fn runtime_fd_links_are_absent_before_any_target_read_or_write() {
+            let (tool, mut guest) = local_guest();
+            let (socket, _peer) = UnixStream::pair().unwrap();
+            let ordinary = std::fs::File::open("/dev/null").unwrap();
+            let process = std::fs::File::open("/proc/self/fd").unwrap();
+            let thread = std::fs::File::open("/proc/thread-self/fd").unwrap();
+            let aliases = tempfile::tempdir().unwrap();
+            let alias = aliases.path().join("descriptors");
+            std::os::unix::fs::symlink("/proc/thread-self/fd", &alias).unwrap();
+            record_directory(&guest, process.as_raw_fd(), "/proc/self/fd");
+            record_directory(&guest, thread.as_raw_fd(), "/proc/thread-self/fd");
+            guest.runtime_fd = Some(socket.as_raw_fd());
+            assert!(
+                std::fs::read_link(format!("/proc/thread-self/fd/{}", socket.as_raw_fd()))
+                    .unwrap()
+                    .as_os_str()
+                    .as_bytes()
+                    .starts_with(b"socket:[")
+            );
+
+            for fd in [socket.as_raw_fd(), ordinary.as_raw_fd()] {
+                for (dirfd, path) in [
+                    (None, format!("/proc/self/fd/{fd}")),
+                    (None, format!("/proc/thread-self/fd/{fd}")),
+                    (None, format!("/dev/fd/{fd}")),
+                    (None, format!("/proc/./self/fd/{fd}")),
+                    (None, format!("/proc/self/../self/fd/{fd}")),
+                    (
+                        None,
+                        relative_to_cwd(Path::new(&format!("/proc/self/fd/{fd}"))),
+                    ),
+                    (None, relative_to_cwd(&alias.join(fd.to_string()))),
+                    (Some(-1), format!("/proc/self/fd/{fd}")),
+                    (Some(libc::AT_FDCWD), format!("/proc/thread-self/fd/{fd}")),
+                    (
+                        Some(libc::AT_FDCWD),
+                        relative_to_cwd(&alias.join(fd.to_string())),
+                    ),
+                    (Some(process.as_raw_fd()), fd.to_string()),
+                    (Some(thread.as_raw_fd()), fd.to_string()),
+                    (Some(thread.as_raw_fd()), format!("./{fd}")),
+                ] {
+                    let path = CString::new(path).unwrap();
+                    let mut bytes = [0xa5; 128];
+                    guest.injected.clear();
+                    let result = read_link(
+                        &tool,
+                        &mut guest,
+                        dirfd,
+                        Some(&path),
+                        AddrMut::from_raw(bytes.as_mut_ptr() as usize),
+                        bytes.len(),
+                    )
+                    .await;
+                    if fd == socket.as_raw_fd() {
+                        errno(result, Errno::ENOENT);
+                        assert_eq!(bytes, [0xa5; 128], "{path:?}");
+                        assert!(
+                            !guest.injected.iter().any(|call| matches!(
+                                call,
+                                Sysno::readlink | Sysno::readlinkat | Sysno::fstat
+                            )),
+                            "{path:?}: {:?}",
+                            guest.injected
+                        );
+                    } else {
+                        assert_eq!(result.unwrap(), 9, "{path:?}");
+                        assert_eq!(&bytes[..9], b"/dev/null");
+                        assert_eq!(&bytes[9..], &[0xa5; 119]);
+                        assert!(
+                            guest
+                                .injected
+                                .iter()
+                                .any(|call| matches!(call, Sysno::readlink | Sysno::readlinkat))
+                        );
+                    }
+                }
+            }
+            assert_eq!(guest.mapped, guest.unmapped);
+
+            // The owner withdraws its fact and the same live slot is reused
+            // by a guest file. Neither the number nor a past query hides it.
+            assert_eq!(
+                unsafe { libc::dup2(ordinary.as_raw_fd(), socket.as_raw_fd()) },
+                socket.as_raw_fd()
+            );
+            guest.runtime_fd = None;
+            let path = CString::new(format!("/proc/self/fd/{}", socket.as_raw_fd())).unwrap();
+            let mut bytes = [0xa5; 128];
+            assert_eq!(
+                read_link(
+                    &tool,
+                    &mut guest,
+                    None,
+                    Some(&path),
+                    AddrMut::from_raw(bytes.as_mut_ptr() as usize),
+                    bytes.len()
+                )
+                .await
+                .unwrap(),
+                9
+            );
+            assert_eq!(&bytes[..9], b"/dev/null");
+            assert_eq!(&bytes[9..], &[0xa5; 119]);
+        }
+
+        #[tokio::test]
+        async fn runtime_fd_parent_translation_preserves_overlapping_output() {
+            let (tool, mut guest) = local_guest();
+            let (physical_pid, physical_tid) = guest.backend_ids.unwrap();
+            // These are this modeled task's guest IDs; the RPC maps them to
+            // the real process/thread executing every injected lookup. Choose
+            // two IDs that cannot accidentally equal either physical ID.
+            let mut modeled_ids = [37, 41, 43, 47]
+                .into_iter()
+                .filter(|id| ![physical_pid.as_raw(), physical_tid.as_raw()].contains(id));
+            let (pid, tid) = (modeled_ids.next().unwrap(), modeled_ids.next().unwrap());
+            assert_ne!(physical_pid.as_raw(), pid);
+            assert_ne!(physical_tid.as_raw(), tid);
+            guest.backend_ids = Some((Pid::from_raw(pid), Pid::from_raw(tid)));
+            guest.thread.detpid = Some(DetPid::from_raw(pid));
+            guest.thread.dettid = DetTid::from_raw(tid);
+            guest.thread.physical_tid = Some(physical_tid.as_raw());
+            guest.procfs_ids = Some([(pid, physical_pid.as_raw()), (tid, physical_tid.as_raw())]);
+            let (socket, _peer) = UnixStream::pair().unwrap();
+            let ordinary = std::fs::File::open("/dev/null").unwrap();
+            guest.runtime_fd = Some(socket.as_raw_fd());
+            assert!(Detcore::translates_procfs_numbers(&guest));
+
+            // The original output is a legitimate live buffer exactly where
+            // the synthetic lookup used to stage its translated parent.
+            // This arena is distinct from ScriptedStack's stat/path scratch.
+            let mut arena = Box::new([0xa5u8; 4096]);
+            let start = arena.as_mut_ptr() as usize;
+            let rsp = start + 2048;
+            guest.rsp = Some(rsp);
+            for (parent, physical_parent) in [
+                (
+                    format!("/proc/{pid}/fd"),
+                    format!("/proc/{}/fd", physical_pid.as_raw()),
+                ),
+                (
+                    format!("/proc/{pid}/task/{tid}/fd"),
+                    format!(
+                        "/proc/{}/task/{}/fd",
+                        physical_pid.as_raw(),
+                        physical_tid.as_raw()
+                    ),
+                ),
+            ] {
+                // Match stage_in_scratch: 1088 bytes below rsp, NUL included,
+                // rounded down to 16-byte alignment. Old parent translation
+                // sees only its own stat/path operands, not this output.
+                let output = (rsp - 1088 - physical_parent.len() - 1) & !15;
+                let offset = output.checked_sub(start).unwrap();
+                assert!(offset + 128 <= arena.len());
+                for fd in [socket.as_raw_fd(), ordinary.as_raw_fd()] {
+                    for dirfd in [None, Some(libc::AT_FDCWD)] {
+                        arena.fill(0xa5);
+                        guest.injected.clear();
+                        guest.statat_paths.clear();
+                        let path = CString::new(format!("{parent}/{fd}")).unwrap();
+                        let result = read_link(
+                            &tool,
+                            &mut guest,
+                            dirfd,
+                            Some(&path),
+                            AddrMut::from_raw(output),
+                            128,
+                        )
+                        .await;
+                        assert_eq!(
+                            guest.statat_paths,
+                            vec![physical_parent.as_bytes().to_vec()]
+                        );
+                        let bytes = &arena[offset..offset + 128];
+                        if fd == socket.as_raw_fd() {
+                            errno(result, Errno::ENOENT);
+                            assert_eq!(bytes, &[0xa5; 128]);
+                            assert!(!guest.injected.iter().any(|call| matches!(
+                                call,
+                                Sysno::readlink | Sysno::readlinkat | Sysno::fstat
+                            )));
+                        } else {
+                            assert_eq!(result.unwrap(), 9);
+                            assert_eq!(&bytes[..9], b"/dev/null");
+                            assert_eq!(&bytes[9..], &[0xa5; 119]);
+                        }
+                    }
+                }
+            }
+            // Translation pages nest inside parent-stat pages, so release
+            // order is the reverse of allocation order.
+            guest.mapped.sort_unstable();
+            guest.unmapped.sort_unstable();
+            assert_eq!(guest.mapped, guest.unmapped);
+        }
+
+        #[tokio::test]
+        async fn runtime_fd_links_keep_size_path_buffer_and_dirfd_precedence() {
+            let (tool, mut guest) = local_guest();
+            let (socket, _peer) = UnixStream::pair().unwrap();
+            let ordinary = std::fs::File::open("/dev/null").unwrap();
+            guest.runtime_fd = Some(socket.as_raw_fd());
+            let hidden = CString::new(format!("/proc/self/fd/{}", socket.as_raw_fd())).unwrap();
+            let visible = CString::new(format!("/proc/self/fd/{}", ordinary.as_raw_fd())).unwrap();
+            for dirfd in [None, Some(libc::AT_FDCWD)] {
+                for size in [0, 1 << 31, 1 << 32] {
+                    guest.injected.clear();
+                    errno(
+                        read_link(&tool, &mut guest, dirfd, None, None, size).await,
+                        Errno::EINVAL,
+                    );
+                    assert!(guest.injected.is_empty());
+                }
+                errno(
+                    read_link(&tool, &mut guest, dirfd, None, None, 128).await,
+                    Errno::EFAULT,
+                );
+                errno(
+                    read_link(&tool, &mut guest, dirfd, Some(&hidden), None, 128).await,
+                    Errno::ENOENT,
+                );
+                errno(
+                    read_link(&tool, &mut guest, dirfd, Some(&visible), None, 128).await,
+                    Errno::EFAULT,
+                );
+                let mut bytes = [0xa5; 128];
+                assert_eq!(
+                    read_link(
+                        &tool,
+                        &mut guest,
+                        dirfd,
+                        Some(&visible),
+                        AddrMut::from_raw(bytes.as_mut_ptr() as usize),
+                        (1 << 32) + 5
+                    )
+                    .await
+                    .unwrap(),
+                    5
+                );
+                assert_eq!(&bytes[..5], b"/dev/");
+                assert_eq!(&bytes[5..], &[0xa5; 123]);
+            }
+            let relative = CString::new(socket.as_raw_fd().to_string()).unwrap();
+            for (dirfd, expected) in [(-1, Errno::EBADF), (ordinary.as_raw_fd(), Errno::ENOTDIR)] {
+                let mut bytes = [0xa5; 128];
+                errno(
+                    read_link(
+                        &tool,
+                        &mut guest,
+                        Some(dirfd),
+                        Some(&relative),
+                        AddrMut::from_raw(bytes.as_mut_ptr() as usize),
+                        bytes.len(),
+                    )
+                    .await,
+                    expected,
+                );
+                assert_eq!(bytes, [0xa5; 128]);
+            }
+            assert_eq!(guest.mapped, guest.unmapped);
+        }
+
+        #[tokio::test]
+        async fn runtime_fd_links_require_the_live_parent_and_callers_table() {
+            let (tool, mut guest) = local_guest();
+            let (socket, _peer) = UnixStream::pair().unwrap();
+            guest.runtime_fd = Some(socket.as_raw_fd());
+            let directory = tempfile::tempdir().unwrap();
+            let name = socket.as_raw_fd().to_string();
+            std::os::unix::fs::symlink("/dev/null", directory.path().join(&name)).unwrap();
+            let wrong_parent = std::fs::File::open(directory.path()).unwrap();
+            // A recorded spelling is deliberately stale. Its actual object
+            // must win; no kernel read of the private socket is involved.
+            record_directory(&guest, wrong_parent.as_raw_fd(), "/proc/self/fd");
+            let path = CString::new(name).unwrap();
+            let mut bytes = [0xa5; 128];
+            let result = read_link(
+                &tool,
+                &mut guest,
+                Some(wrong_parent.as_raw_fd()),
+                Some(&path),
+                AddrMut::from_raw(bytes.as_mut_ptr() as usize),
+                bytes.len(),
+            )
+            .await;
+            // This guard must decline the different object. Do not pin
+            // the old canonicalizer's errno or any bytes it may leak.
+            assert!(
+                !matches!(&result, Err(Error::Errno(error)) if *error == Errno::ENOENT),
+                "{result:?}"
+            );
+            assert!(guest.injected.contains(&Sysno::readlinkat));
+            assert_eq!(guest.mapped, guest.unmapped);
+
+            // No proof that this nonleader shares the process's table:
+            // /proc/self/fd must not borrow its current-thread owner fact.
+            assert_ne!(guest.thread.dettid, guest.thread.detpid.unwrap());
+            guest.thread.process_files = None;
+            guest.injected.clear();
+            let path = CString::new(format!("/proc/self/fd/{}", socket.as_raw_fd())).unwrap();
+            bytes.fill(0xa5);
+            let result = read_link(
+                &tool,
+                &mut guest,
+                None,
+                Some(&path),
+                AddrMut::from_raw(bytes.as_mut_ptr() as usize),
+                bytes.len(),
+            )
+            .await;
+            assert!(
+                !matches!(&result, Err(Error::Errno(error)) if *error == Errno::ENOENT),
+                "{result:?}"
+            );
+            assert!(guest.injected.contains(&Sysno::readlink));
+            assert_eq!(guest.mapped, guest.unmapped);
+        }
+
+        #[tokio::test]
+        async fn runtime_fd_links_leave_empty_and_trailing_lookups_to_linux() {
+            let (tool, mut guest) = local_guest();
+            let (socket, _peer) = UnixStream::pair().unwrap();
+            guest.runtime_fd = Some(socket.as_raw_fd());
+            let path = CString::new(format!("/proc/self/fd/{}", socket.as_raw_fd())).unwrap();
+            // SAFETY: a valid path and no creation-mode argument is needed.
+            let link = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            assert!(link >= 0);
+            use std::os::fd::FromRawFd;
+            let link = unsafe { std::os::fd::OwnedFd::from_raw_fd(link) };
+            let mut bytes = [0xa5; 128];
+            let result = read_link(
+                &tool,
+                &mut guest,
+                Some(link.as_raw_fd()),
+                Some(c""),
+                AddrMut::from_raw(bytes.as_mut_ptr() as usize),
+                bytes.len(),
+            )
+            .await;
+            // Empty-path O_PATH lookup stays on the original route. Do not
+            // require the socket identity or a particular result from it.
+            assert!(guest.injected.contains(&Sysno::readlinkat));
+            assert!(guest.mapped.is_empty());
+            match result {
+                Ok(size) => {
+                    let size = usize::try_from(size).unwrap();
+                    assert!(size <= bytes.len());
+                    assert!(bytes[size..].iter().all(|byte| *byte == 0xa5));
+                }
+                Err(_) => assert_eq!(bytes, [0xa5; 128]),
+            }
+            for suffix in ["/", "/.", "/.."] {
+                let path =
+                    CString::new(format!("/proc/self/fd/{}{suffix}", socket.as_raw_fd())).unwrap();
+                bytes.fill(0xa5);
+                guest.injected.clear();
+                let _result = read_link(
+                    &tool,
+                    &mut guest,
+                    None,
+                    Some(&path),
+                    AddrMut::from_raw(bytes.as_mut_ptr() as usize),
+                    bytes.len(),
+                )
+                .await;
+                // The guard declines these raw trailing forms. Preserve the
+                // no-write check without pinning an existence-revealing errno.
+                assert!(guest.injected.contains(&Sysno::readlink));
+                assert!(guest.mapped.is_empty());
+                assert_eq!(bytes, [0xa5; 128]);
+            }
+            assert_eq!(guest.mapped, guest.unmapped);
         }
     }
 

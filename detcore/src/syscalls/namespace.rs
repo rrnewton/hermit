@@ -127,7 +127,7 @@ fn decimal_u32(component: &OsStr) -> Option<u32> {
         .then(|| value.parse().ok())?
 }
 
-fn decimal_fd(component: &OsStr) -> Option<i32> {
+pub(crate) fn decimal_fd(component: &OsStr) -> Option<i32> {
     let value = component.to_str()?;
     // procfs names descriptors without leading zeros (`name_to_int`).
     (!value.is_empty()
@@ -2104,6 +2104,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Readlink,
         path: PathBuf,
     ) -> Result<i64, Error> {
+        if self
+            .readlink_names_runtime_fd(guest, libc::AT_FDCWD, &path)
+            .await
+        {
+            return Err(Errno::ENOENT.into());
+        }
         if let Some(result) = self
             .readlink_rendered_procfs(guest, &path, call.buf(), call.bufsize())
             .await?
@@ -2273,6 +2279,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             lexical.clone()
         };
+        if self
+            .readlink_names_runtime_fd(guest, call.dirfd(), &path)
+            .await
+        {
+            return Err(Errno::ENOENT.into());
+        }
         // The directory names a task or a kernel path Detcore knows.
         let named_by_directory = below_directory && observed_path != lexical;
         if let Some(result) = self
