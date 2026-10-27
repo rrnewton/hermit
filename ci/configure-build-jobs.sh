@@ -2951,8 +2951,16 @@ fi
 # CARRY TO 08a0b573eb8a6256c77655a42e8ea6a1fe9209a8: SDK/native inputs and limits
 # are unchanged; Counter1 runtime reporting changed. See the matching source
 # carry in run-with-reverie-dbt-budget.sh; no new SDK calibration is claimed.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 08a0b573eb8a6256c77655a42e8ea6a1fe9209a8 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 08a0b573eb8a6256c77655a42e8ea6a1fe9209a8 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO b64a10cc1a99e66df5b195d7304ccee4a517d131 (2026-10-27): from
+# 08a0b573eb8a6256c77655a42e8ea6a1fe9209a8. DBT now accepts a borrowed GlobalRPC
+# endpoint while preserving the existing constructor and runtime transport.
+# SDK build.rs ff1eeb32b140, vendor tree 4ab89708f2e9, and native tree
+# 164356b3ab65 are byte-identical. Rust source and tests change; the DBT
+# inventory grows from 1012 to 1013. Existing SDK width and 1050 effective-job-
+# second limits carry without recalibration; Rust compatibility is checked
+# separately. This is not whole-DBT source or runtime equivalence.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b64a10cc1a99e66df5b195d7304ccee4a517d131 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie b64a10cc1a99e66df5b195d7304ccee4a517d131 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
