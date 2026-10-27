@@ -4062,6 +4062,16 @@ impl GlobalState {
             );
             return (None, R::PublishSignalDispositions(held));
         }
+        // Where the sender's ending timeslice's timer was armed
+        // (`publish_instruction_offset`): the same kind of message.
+        if let GlobalRequest::PublishInstructionOffset(offset) = request {
+            let taken = self
+                .sched
+                .lock()
+                .unwrap()
+                .publish_instruction_offset(dtid, request_mm, offset);
+            return (None, R::PublishInstructionOffset(taken));
+        }
         // A thread's mask from Detcore's copy
         // (`syscalls::signal_shadow::publish_mask`): the same kind of message.
         if let GlobalRequest::PublishSignalMask(mask) = request {
@@ -4413,6 +4423,9 @@ impl GlobalState {
             }
             GlobalRequest::PublishSignalMask(_) => {
                 unreachable!("a published mask is answered before clock accounting")
+            }
+            GlobalRequest::PublishInstructionOffset(_) => {
+                unreachable!("a published instruction offset is answered before clock accounting")
             }
             GlobalRequest::PublishRuntimePrivateMemory(_) => {
                 unreachable!("private-memory publication precedes clock accounting")
@@ -6961,7 +6974,6 @@ impl GlobalState {
                     priority_row: None,
                     slice_expired: false,
                     zero_length_sleep: false,
-                    instruction_offset: None,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {
@@ -8990,6 +9002,11 @@ pub enum GlobalRequest {
     /// `Scheduler::post_crash_step`), answered before any clock or scheduler
     /// accounting. Appended last.
     PostCrash(crate::post_crash::PostCrashEvent),
+    /// Where the timer of the sender's ending timeslice was armed
+    /// (`--chaos-instruction-offset`), for the change point it files next
+    /// (`Scheduler::publish_instruction_offset`). Answered before any clock or
+    /// scheduler accounting. Appended last.
+    PublishInstructionOffset(crate::resources::InstructionOffset),
 }
 
 /// Responses from the global object
@@ -9389,6 +9406,9 @@ pub enum GlobalResponse {
     /// resumes from a grant, once the switch is taken (`crate::post_crash`).
     /// Appended last.
     WithPostCrashBound(std::num::NonZeroU64, Box<GlobalResponse>),
+    /// Whether the scheduler took the offset (it takes nothing from a thread
+    /// it does not know, one killed, or a retired incarnation). Appended last.
+    PublishInstructionOffset(bool),
 }
 
 /// Read only the mapping predicate through a backend's synchronous external
@@ -10286,6 +10306,33 @@ where
         guest.send_rpc(message).await.1,
         GlobalResponse::PublishSignalMask(true)
     )
+}
+
+/// Tell the scheduler where the timer of the calling thread's ending timeslice
+/// was armed (`--chaos-instruction-offset`), just before the change point
+/// that ends it, which records it (`Scheduler::publish_instruction_offset`).
+/// Sent like [`publish_signal_mask`], only for a timeslice armed with an
+/// offset, so that a run without the option sends nothing more.
+pub(crate) async fn publish_instruction_offset<G, T>(
+    guest: &mut G,
+    offset: crate::resources::InstructionOffset,
+) where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let state = guest.thread_state();
+    let message = (
+        state.thread_logical_time.clone(),
+        state.mm_id,
+        GlobalRequest::PublishInstructionOffset(offset),
+    );
+    // A refusal means the thread is gone or retired: it files no change
+    // point that could record the offset.
+    let answer = guest.send_rpc(message).await.1;
+    debug_assert!(matches!(
+        answer,
+        GlobalResponse::PublishInstructionOffset(_)
+    ));
 }
 
 async fn publish_runtime_private_memory<G, T>(guest: &mut G)
