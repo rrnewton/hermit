@@ -2922,7 +2922,15 @@ fi
 # width and 1050 effective-job-second limits carry without recalibration;
 # Reviewed source premises and native freshness include the retained owner;
 # this is not whole-runtime equivalence or a new cold-SDK timing sample.
-expected_pin=1a242a33b927d14a50aeca9488950eac1ad3b4c6
+# CARRY TO 6374a2078d108cfb218c7d267f835012b4f9821f (2026-10-27): from
+# 1a242a33b927d14a50aeca9488950eac1ad3b4c6. The caller-owned native DBT
+# lifecycle adds ABI16 callbacks and fixtures. SDK build.rs ff1eeb32b140
+# and vendor/dynamorio tree 4ab89708f2e9 are byte-identical; the native
+# client tree changes and requires rebuilt current runtime/client artifacts.
+# The committed DBT inventory grows from 1015 to 1035. Existing SDK width
+# and 1050 effective-job-second limits carry without recalibration. This is
+# not whole-runtime equivalence or a new cold-SDK timing sample.
+expected_pin=6374a2078d108cfb218c7d267f835012b4f9821f
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

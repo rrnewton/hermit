@@ -101,9 +101,12 @@ const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | l
 /// Version 14 grows the private-memory snapshot pointee from 96 to 176 bytes
 /// for authenticated bootstrap LOAD pages; the callback table remains 80 bytes.
 /// Installing the callback does not enable instrumentation or shared time.
-// Version 15 appends the cooperative mapping-capture callback at offset 80.
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 15;
-const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 88;
+/// Version 15 appends the cooperative mapping-capture callback at offset 80.
+/// Version 16 appends terminal admission at offset 88 and optional fatal RPC
+/// transport handling at offset 96, and versions image, readiness and terminal
+/// records. Detcore keeps caller capabilities clear.
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 16;
+const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 104;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-644): Review the inherited DBT report descriptor.
@@ -139,7 +142,19 @@ fn upgrade_runtime_callbacks_v1(
         runtime_private_memory: unavailable_private_memory,
         branch_fact: unavailable_branch_fact,
         mapping_capture: unavailable_mapping_capture,
+        admit_terminal: unavailable_terminal_admission,
+        rpc_transport_fatal: None,
     }
+}
+
+/// Legacy startup cannot reserve an explicit caller terminal action.
+unsafe extern "C" fn unavailable_terminal_admission(
+    _context: usize,
+    _sysno: i64,
+    _args: *const u64,
+    _output: *mut reverie_dbt::caller_abi::TerminalFact,
+) -> i32 {
+    0
 }
 
 unsafe extern "C" fn unavailable_mapping_capture(
@@ -1408,10 +1423,12 @@ fn build_native_client(
     Ok(client)
 }
 
-/// Begins a new DynamoRIO application image and returns its generation.
+/// Begins a new DynamoRIO image with the capability-clear Detcore contract.
 #[unsafe(no_mangle)]
-pub extern "C" fn reverie_dbt_runtime_image_init() -> u64 {
-    IMAGE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+pub extern "C" fn reverie_dbt_runtime_image_init() -> reverie_dbt::caller_abi::ImageDescriptor {
+    reverie_dbt::caller_abi::ImageDescriptor::legacy(
+        IMAGE_GENERATION.fetch_add(1, Ordering::SeqCst) + 1,
+    )
 }
 
 unsafe fn runtime_background_init(
@@ -1680,14 +1697,38 @@ fn emit_determinism_loss_record(emit: Emitter, loss: Option<String>) {
 }
 
 /// Reports whether the Detcore global scheduler is ready for this image.
+///
+/// A ready snapshot contains only its size and owner generation: Detcore does
+/// not advertise caller event-selection or configuration-digest authority.
+/// Pending readiness leaves the snapshot untouched.
+///
+/// # Safety
+///
+/// A non-null `snapshot` must point to writable, aligned storage for one
+/// [`reverie_dbt::caller_abi::ReadySnapshot`] when the image is ready. A null
+/// pointer is permitted and does not change the readiness result.
 #[unsafe(no_mangle)]
 // TODO-HUMAN-REVIEW(PR-587): Confirm image-generation readiness ordering.
-pub extern "C" fn reverie_dbt_runtime_ready(image_generation: u64) -> i32 {
-    i32::from(
+pub unsafe extern "C" fn reverie_dbt_runtime_ready(
+    image_generation: u64,
+    snapshot: *mut reverie_dbt::caller_abi::ReadySnapshot,
+) -> i32 {
+    let ready = i32::from(
         READY_IMAGE.load(Ordering::Acquire) == image_generation
             && !RUNTIME_PAUSE_REQUESTED.load(Ordering::Acquire)
             && !RUNTIME_PAUSED.load(Ordering::Acquire),
-    )
+    );
+    if ready == 1 && !snapshot.is_null() {
+        // SAFETY: the caller supplies writable fixed-size storage when ready.
+        unsafe {
+            snapshot.write(reverie_dbt::caller_abi::ReadySnapshot {
+                size: std::mem::size_of::<reverie_dbt::caller_abi::ReadySnapshot>() as u32,
+                owner_generation: image_generation,
+                ..Default::default()
+            });
+        }
+    }
+    ready
 }
 
 /// Initializes native per-thread scratch state and registers the application
@@ -2194,6 +2235,9 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_created(
 
 /// Releases Detcore state owned by a DynamoRIO application thread.
 ///
+/// The capability-clear native path supplies no terminal fact. Its legacy
+/// cleanup returns zero without producing an explicit-terminal receipt.
+///
 /// # Safety
 ///
 /// `scratch` must be the pointer initialized by
@@ -2204,10 +2248,11 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_exit(
     context: *mut c_void,
     _tid: i32,
     invoke_syscall: SyscallInvoker,
-) {
+    _fact: *const reverie_dbt::caller_abi::TerminalFact,
+) -> i32 {
     let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
     if scratch.runtime_state.is_null() {
-        return;
+        return 0;
     }
     let ThreadRuntime {
         tid,
@@ -2235,6 +2280,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_thread_exit(
             ExitStatus::SUCCESS,
         );
     }
+    0
 }
 
 fn resume_paused_runtime() {
@@ -3880,8 +3926,12 @@ mod tests {
 
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 15);
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE, 88);
+        use reverie_dbt::caller_abi::ImageDescriptor;
+        use reverie_dbt::caller_abi::ReadySnapshot;
+        use reverie_dbt::caller_abi::TerminalFact;
+
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 16);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE, 104);
         assert_eq!(
             std::mem::offset_of!(reverie_dbt::DbtRuntimeCallbacks, branch_fact),
             72
@@ -3903,6 +3953,47 @@ mod tests {
             std::mem::size_of::<reverie_dbt::NativePrivateMemorySnapshot>(),
             176
         );
+        assert_eq!(
+            std::mem::offset_of!(reverie_dbt::DbtRuntimeCallbacks, mapping_capture),
+            80,
+        );
+        assert_eq!(
+            std::mem::offset_of!(reverie_dbt::DbtRuntimeCallbacks, admit_terminal),
+            88,
+        );
+        assert_eq!(
+            std::mem::offset_of!(reverie_dbt::DbtRuntimeCallbacks, rpc_transport_fatal),
+            96,
+        );
+        assert_eq!(std::mem::size_of::<ImageDescriptor>(), 56);
+        assert_eq!(std::mem::align_of::<ImageDescriptor>(), 8);
+        assert_eq!(std::mem::offset_of!(ImageDescriptor, size), 0);
+        assert_eq!(std::mem::offset_of!(ImageDescriptor, abi), 4);
+        assert_eq!(std::mem::offset_of!(ImageDescriptor, capabilities), 8);
+        assert_eq!(std::mem::offset_of!(ImageDescriptor, image_generation), 16);
+        assert_eq!(
+            std::mem::offset_of!(ImageDescriptor, runtime_input_identity),
+            24
+        );
+        assert_eq!(std::mem::size_of::<ReadySnapshot>(), 48);
+        assert_eq!(std::mem::align_of::<ReadySnapshot>(), 8);
+        assert_eq!(std::mem::offset_of!(ReadySnapshot, size), 0);
+        assert_eq!(std::mem::offset_of!(ReadySnapshot, selected_event_bits), 4);
+        assert_eq!(std::mem::offset_of!(ReadySnapshot, raw_config_digest), 8);
+        assert_eq!(std::mem::offset_of!(ReadySnapshot, owner_generation), 40);
+        assert_eq!(std::mem::size_of::<TerminalFact>(), 104);
+        assert_eq!(std::mem::align_of::<TerminalFact>(), 8);
+        assert_eq!(std::mem::offset_of!(TerminalFact, size), 0);
+        assert_eq!(std::mem::offset_of!(TerminalFact, kind), 4);
+        assert_eq!(std::mem::offset_of!(TerminalFact, image), 8);
+        assert_eq!(std::mem::offset_of!(TerminalFact, context), 16);
+        assert_eq!(std::mem::offset_of!(TerminalFact, pid), 24);
+        assert_eq!(std::mem::offset_of!(TerminalFact, tid), 28);
+        assert_eq!(std::mem::offset_of!(TerminalFact, sysno), 32);
+        assert_eq!(std::mem::offset_of!(TerminalFact, args), 40);
+        assert_eq!(std::mem::offset_of!(TerminalFact, cookie), 88);
+        assert_eq!(std::mem::offset_of!(TerminalFact, origin), 96);
+        assert_eq!(std::mem::offset_of!(TerminalFact, reserved), 100);
         // The native client's dbt_signal_event_t (ABI version 7).
         assert_eq!(std::mem::size_of::<DbtSignalEvent>(), 200);
         assert_eq!(std::mem::align_of::<DbtSignalEvent>(), 8);
@@ -3929,6 +4020,64 @@ mod tests {
     }
 
     #[test]
+    fn capability_clear_image_readiness_preserves_legacy_conditions() {
+        use reverie_dbt::caller_abi::ReadySnapshot;
+
+        let first = reverie_dbt_runtime_image_init();
+        let descriptor = reverie_dbt_runtime_image_init();
+        assert!(first.is_valid());
+        assert!(descriptor.is_valid());
+        assert_eq!(descriptor.image_generation, first.image_generation + 1);
+        assert_eq!(descriptor.capabilities, 0);
+        assert_eq!(descriptor.runtime_input_identity, [0; 32]);
+
+        let previous_ready = READY_IMAGE.load(Ordering::Acquire);
+        let previous_requested = RUNTIME_PAUSE_REQUESTED.load(Ordering::Acquire);
+        let previous_paused = RUNTIME_PAUSED.load(Ordering::Acquire);
+        let generation = descriptor.image_generation;
+        for (ready_image, requested, paused, expected) in [
+            (generation, false, false, 1),
+            (generation + 1, false, false, 0),
+            (generation, true, false, 0),
+            (generation, false, true, 0),
+        ] {
+            READY_IMAGE.store(ready_image, Ordering::Release);
+            RUNTIME_PAUSE_REQUESTED.store(requested, Ordering::Release);
+            RUNTIME_PAUSED.store(paused, Ordering::Release);
+            let original = ReadySnapshot {
+                size: u32::MAX,
+                selected_event_bits: u32::MAX,
+                raw_config_digest: [0xa5; 32],
+                owner_generation: u64::MAX,
+            };
+            let mut snapshot = original;
+            assert_eq!(
+                unsafe { reverie_dbt_runtime_ready(generation, &mut snapshot) },
+                expected,
+            );
+            assert_eq!(
+                snapshot,
+                if expected == 1 {
+                    ReadySnapshot {
+                        size: 48,
+                        owner_generation: generation,
+                        ..Default::default()
+                    }
+                } else {
+                    original
+                },
+            );
+            assert_eq!(
+                unsafe { reverie_dbt_runtime_ready(generation, std::ptr::null_mut()) },
+                expected,
+            );
+        }
+        READY_IMAGE.store(previous_ready, Ordering::Release);
+        RUNTIME_PAUSE_REQUESTED.store(previous_requested, Ordering::Release);
+        RUNTIME_PAUSED.store(previous_paused, Ordering::Release);
+    }
+
+    #[test]
     fn version_one_callbacks_upgrade_without_changing_existing_channels_or_policy() {
         let legacy = DbtRuntimeCallbacksV1 {
             emit: test_emit,
@@ -3946,6 +4095,8 @@ mod tests {
         assert_eq!(current.emit_stdout as *const (), test_stdout as *const ());
         assert_eq!(current.emit_evidence as *const (), test_emit as *const ());
         assert_eq!(current.evidence_log_level, 0);
+        assert!(current.rpc_transport_fatal.is_none());
+        let _: Option<unsafe extern "C" fn(usize) -> !> = current.rpc_transport_fatal;
 
         let mut guest_word = 7_u32;
         let mut observed = 0xa5a5_a5a5_u32;
@@ -3987,6 +4138,26 @@ mod tests {
         unsafe { std::ptr::write_bytes(&mut branch, 0xa5, 1) };
         assert_eq!(unsafe { (current.branch_fact)(0, &mut branch) }, 0);
         assert_eq!(branch, reverie_dbt::NativeBranchFact::default());
+        let mut terminal = reverie_dbt::caller_abi::TerminalFact::default();
+        // SAFETY: the fixed record contains only integer fields.
+        unsafe { std::ptr::write_bytes(&mut terminal, 0xa5, 1) };
+        let original_terminal = terminal;
+        assert_eq!(
+            unsafe { (current.admit_terminal)(0, libc::SYS_exit, std::ptr::null(), &mut terminal) },
+            0,
+        );
+        assert_eq!(terminal, original_terminal);
+        assert_eq!(
+            unsafe {
+                (current.admit_terminal)(
+                    0,
+                    libc::SYS_exit_group,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0,
+        );
     }
 
     #[test]
@@ -4004,7 +4175,10 @@ mod tests {
             runtime_private_memory: unavailable_private_memory,
             branch_fact: unavailable_branch_fact,
             mapping_capture: unavailable_mapping_capture,
+            admit_terminal: unavailable_terminal_admission,
+            rpc_transport_fatal: None,
         };
+        assert!(callbacks.rpc_transport_fatal.is_none());
         let (diagnostic, evidence, level) = runtime_callback_channels(&callbacks);
 
         assert_eq!(diagnostic as *const (), test_emit as *const ());
@@ -4100,7 +4274,8 @@ mod tests {
 
     #[test]
     fn current_exports_match_the_native_client_signatures() {
-        let _: extern "C" fn() -> u64 = reverie_dbt_runtime_image_init;
+        let _: extern "C" fn() -> reverie_dbt::caller_abi::ImageDescriptor =
+            reverie_dbt_runtime_image_init;
         let _: unsafe extern "C" fn(
             *mut c_void,
             *mut c_void,
@@ -4127,8 +4302,13 @@ mod tests {
             RegisterReader,
             RegisterWriter,
         ) -> i32 = reverie_dbt_runtime_thread_created_v2;
-        let _: unsafe extern "C" fn(*mut c_void, *mut c_void, i32, SyscallInvoker) =
-            reverie_dbt_runtime_thread_exit;
+        let _: unsafe extern "C" fn(
+            *mut c_void,
+            *mut c_void,
+            i32,
+            SyscallInvoker,
+            *const reverie_dbt::caller_abi::TerminalFact,
+        ) -> i32 = reverie_dbt_runtime_thread_exit;
         let _: unsafe extern "C" fn(*mut c_void, i32) = reverie_dbt_runtime_exec_failed;
         let _: unsafe extern "C" fn(
             *mut c_void,
@@ -4168,7 +4348,8 @@ mod tests {
         ) -> i32 = reverie_dbt_runtime_pre_syscall;
         let _: unsafe extern "C" fn(*mut c_void) = reverie_dbt_runtime_background_init_v2;
         let _: extern "C" fn() = reverie_dbt_runtime_process_exit;
-        let _: extern "C" fn(u64) -> i32 = reverie_dbt_runtime_ready;
+        let _: unsafe extern "C" fn(u64, *mut reverie_dbt::caller_abi::ReadySnapshot) -> i32 =
+            reverie_dbt_runtime_ready;
         let _: extern "C" fn() -> *const libc::c_char = reverie_dbt_runtime_name;
         let _: extern "C" fn() -> u8 = reverie_dbt_runtime_kind_code;
         let _: unsafe extern "C" fn(*mut u64, *mut u64, *mut u64, *mut u64) =
@@ -5718,6 +5899,19 @@ mod tests {
         assert_eq!(scratch.virtual_tid, 3);
         assert_eq!(scratch.pending_virtual_child, 4);
         assert_eq!(scratch.pending_clone_flags, libc::CLONE_THREAD as u64);
+        assert_eq!(
+            unsafe {
+                reverie_dbt_runtime_thread_exit(
+                    std::ptr::from_mut(&mut scratch).cast(),
+                    std::ptr::null_mut(),
+                    7,
+                    invoke_syscall,
+                    std::ptr::null(),
+                )
+            },
+            0,
+        );
+        assert!(scratch.runtime_state.is_null());
     }
 
     #[test]

@@ -1051,6 +1051,8 @@ pub(crate) mod native {
             rv.join("reverie-liteinst-artifact/tests/fixtures/selected_init_v12.json"),
             rv.join("reverie-inguest/src"),
             rv.join("reverie/src/tool_configuration.rs"),
+            rv.join("reverie/src/tool_process.rs"),
+            rv.join("reverie/src/tool_outcome.rs"),
             rv.join("reverie-inguest/native_exec"),
             rv.join("reverie-liteinst/src"),
             rv.join("reverie-loader/src"),
