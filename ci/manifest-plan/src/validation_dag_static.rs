@@ -4509,7 +4509,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Re-derived with the node's own selection at the head of the aarch64
     // exclusive-loop stack (#4735, #4740, #4779, #4795), whose rewriter tests
     // moved from hermit-cli into Detcore and grew there: 749, listed.
-    ("test.cli", 749),
+    // And this branch's CLI tests: 748.
+    ("test.cli", 748),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5086,7 +5087,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Re-derived with the node's own selection at the head of the aarch64
     // exclusive-loop stack (#4735, #4740, #4779, #4795), whose rewriter tests
     // moved from hermit-cli into Detcore and grew there: 668, listed.
-    ("test.cli_on_host", 668),
+    // And the same tests: 667.
+    ("test.cli_on_host", 667),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1932 - 14 = 1918, re-measured 2026-10-31.
     // Kept equal to the second test.regular_crates_on_host entry below: 1920.
@@ -5999,7 +6001,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Re-derived with the node's own selection at the head of the aarch64
     // exclusive-loop stack (#4735, #4740, #4779, #4795), whose rewriter tests
     // moved from hermit-cli into Detcore and grew there: 1286, listed.
-    ("test.hermit_unit_on_host", 1302),
+    // And the same unit tests as test.hermit_unit: 1287.
+    ("test.hermit_unit_on_host", 1287),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
