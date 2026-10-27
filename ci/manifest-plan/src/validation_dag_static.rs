@@ -1991,8 +1991,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main e8e0f9a1c: 1348 + 6 = 1354.
     // Rebased onto main ffe313b16: 1212 + 6 = 1218.
     // Rebased onto main fbf9d5f0c: 1213 + 6 = 1219.
-    // Rebased onto main fcd62385f: 1221 + 6 = 1227.
-    ("test.hermit_unit", 1227),
+    // host_input_change's snapshot-copy unit: 1341 + 6 = 1347, listed.
+    // Rebased onto main e8e0f9a1c: 1354 + 6 = 1360.
+    // Rebased onto main ffe313b16: 1218 + 6 = 1224.
+    // Rebased onto main fbf9d5f0c: 1219 + 6 = 1225.
+    // Rebased onto main fcd62385f: 1221 + 12 = 1233.
+    ("test.hermit_unit", 1233),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3388,7 +3392,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // property file not refused; a file the area gained after its snapshot
     // refused): 212.
     // Rebased onto main e8e0f9a1c: 209 + 4 = 213.
-    ("test.detcore_misc", 213),
+    // And a file without a copy refused through an outside hard link: 213.
+    // Rebased onto main e8e0f9a1c: 213 + 1 = 214.
+    ("test.detcore_misc", 214),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -5411,7 +5417,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same seventeen SCM_RIGHTS queue tests: 191 + 17 = 208.
     // And the four property snapshot tests: 212.
     // Rebased onto main e8e0f9a1c: 209 + 4 = 213.
-    ("test.detcore_misc_on_host", 213),
+    // And the uncopied-file alias refusal: 213.
+    // Rebased onto main e8e0f9a1c: 213 + 1 = 214.
+    ("test.detcore_misc_on_host", 214),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -6278,8 +6286,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main e8e0f9a1c: 1342 + 6 = 1348.
     // Rebased onto main ffe313b16: 1206 + 6 = 1212.
     // Rebased onto main fbf9d5f0c: 1207 + 6 = 1213.
-    // Rebased onto main fcd62385f: 1215 + 6 = 1221.
-    ("test.hermit_unit_on_host", 1221),
+    // And the same six property snapshot units: 1319.
+    // And the same twelve property snapshot units: 1335 + 6 = 1341.
+    // Rebased onto main e8e0f9a1c: 1348 + 6 = 1354.
+    // Rebased onto main ffe313b16: 1212 + 6 = 1218.
+    // Rebased onto main fbf9d5f0c: 1213 + 6 = 1219.
+    // Rebased onto main fcd62385f: 1215 + 12 = 1227.
+    ("test.hermit_unit_on_host", 1227),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
