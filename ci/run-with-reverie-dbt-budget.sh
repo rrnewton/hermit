@@ -2888,7 +2888,22 @@ fi
 # inventory grows from 1012 to 1013. Existing SDK width and 1050 effective-job-
 # second limits carry without recalibration; Rust compatibility is checked
 # separately. This is not whole-DBT source or runtime equivalence.
-expected_pin=b64a10cc1a99e66df5b195d7304ccee4a517d131
+# CARRY TO edda7ede9bc5f869974ee7eed81abf3cb3c9fa6b (2026-10-27): from
+# b64a10cc1a99e66df5b195d7304ccee4a517d131. One commit (signals lane): A5 3c.1e
+# sub-slice B re-applied, patch-id identical to 013008c3 and 6d1bc2a3. It
+# changes reverie-inguest/src (guest/runtime_mask.rs new; continuation, host,
+# instruction, mod, sigalrm, signal, tool_install; signal.rs),
+# reverie-liteinst's rpc_tool guest and test, and nine source-catalog rows in
+# reverie-liteinst-artifact/src/lib.rs (two changed and seven added, as the
+# liteinst lane's review dh-a64vi gave them). git diff is empty under
+# reverie-dbt/ and third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml; both repository inputs to the DynamoRIO content key are
+# byte-identical by git object id:
+#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
+#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
+# so the inventory (1013), SDK and native inputs, calibrated budget, job width
+# and limits carry unchanged from the b64a10cc entry.
+expected_pin=edda7ede9bc5f869974ee7eed81abf3cb3c9fa6b
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
