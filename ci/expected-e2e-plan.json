@@ -42613,64 +42613,7 @@
         "ptrace",
         "cc"
       ],
-      "test": "c-programs/inotify-blocking-faults",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "in-guest-trap",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/inotify-blocking-faults",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/inotify-blocking-faults",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/inotify-blocking-faults",
+      "test": "c-programs/dbt-prlimit-self",
       "timeout_seconds": 57
     },
     {
@@ -42687,101 +42630,7 @@
         "ptrace",
         "cc"
       ],
-      "test": "c-programs/inotify-faults",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "in-guest-trap",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/inotify-faults",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "liteinst",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/inotify-faults",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "verify",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/inotify-faults",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "dbt",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "custom",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "test": "c-programs/inotify-protection-key-fault",
-      "timeout_seconds": 57
-    },
-    {
-      "backend": "ptrace",
-      "category": "c-programs",
-      "classification": "required",
-      "cpu_timeout_seconds": 22,
-      "lane": "portable",
-      "mode": "custom",
-      "requires": [
-        "linux",
-        "x86_64",
-        "userns",
-        "ptrace",
-        "cc"
-      ],
-      "requires_host_capabilities": [
-        "cpuid-faulting"
-      ],
-      "test": "c-programs/inotify-protection-key-fault",
+      "test": "c-programs/get-robust-list-thread",
       "timeout_seconds": 57
     },
     {
@@ -42798,11 +42647,11 @@
         "ptrace",
         "cc"
       ],
-      "test": "c-programs/inotify-protection-key-fault",
+      "test": "c-programs/nanosleep-threads-nocrash",
       "timeout_seconds": 57
     },
     {
-      "backend": "ptrace",
+      "backend": "dbt",
       "category": "c-programs",
       "classification": "required",
       "cpu_timeout_seconds": 22,
@@ -42815,11 +42664,11 @@
         "ptrace",
         "cc"
       ],
-      "test": "c-programs/inotify-protection-key-fault",
+      "test": "c-programs/printf-with-threads",
       "timeout_seconds": 57
     },
     {
-      "backend": "kvm",
+      "backend": "dbt",
       "category": "c-programs",
       "classification": "required",
       "cpu_timeout_seconds": 22,
@@ -42832,14 +42681,11 @@
         "ptrace",
         "cc"
       ],
-      "requires_host_capabilities": [
-        "kvm"
-      ],
-      "test": "c-programs/signalfd-threads",
+      "test": "c-programs/procfs-identity-agreement",
       "timeout_seconds": 57
     },
     {
-      "backend": "ptrace",
+      "backend": "dbt",
       "category": "c-programs",
       "classification": "required",
       "cpu_timeout_seconds": 22,
@@ -42852,7 +42698,245 @@
         "ptrace",
         "cc"
       ],
-      "test": "c-programs/signalfd-threads",
+      "test": "c-programs/pthread-lifecycle",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/sched-yield-progress",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/sigtimedwait-timeout-0s",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/so-incoming-cpu-tcp4",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/so-incoming-cpu-tcp6",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/socket-epoll-ordering",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/tcp-info-accept6",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/tcp-info-client4",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/thread-self-procfs-handoff",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "c-programs",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "c-programs/threadexhaustion",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "chaos-c",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "chaos-c/lock-granularity",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "determinism-stress",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "determinism-stress/order-violation",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "determinism-stress-c",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "determinism-stress-c/lock-free",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "determinism-stress-c",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "determinism-stress-c/signal-order",
+      "timeout_seconds": 57
+    },
+    {
+      "backend": "dbt",
+      "category": "system-utils",
+      "classification": "required",
+      "cpu_timeout_seconds": 22,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace",
+        "cc"
+      ],
+      "test": "system-utils/startup-surface-identity",
       "timeout_seconds": 57
     }
   ],
