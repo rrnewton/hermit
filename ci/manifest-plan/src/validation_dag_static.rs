@@ -3177,7 +3177,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_prehook_switch_hands_a_backgrounded_call_its_turn_before_deferred_threads
     // and only_a_prehook_switch_leaves_its_thread_a_call_to_carry_out: 3057,
     // listed.
-    ("test.detcore_unit", 3057),
+    // And the background-start units
+    // preemptions::tests::background_starts_follow_their_events_and_version_the_record,
+    // replayer::tests::a_recorded_background_start_is_the_next_decision_after_its_events,
+    // replayer::tests::recorded_background_starts_keep_their_order_through_the_last_event,
+    // replayer::tests::a_fast_forward_retires_the_starts_it_skips,
+    // only_a_legacy_recording_notes_its_background_starts
+    // and a_recorded_background_start_begins_its_call_where_the_recording_did:
+    // 3063, listed.
+    ("test.detcore_unit", 3063),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5598,7 +5606,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same record-serde round-trip unit: 3048.
     // And the same seven popped-event readmission units: 3055.
     // And the same two prehook-handoff scheduler units: 3057, listed.
-    ("test.detcore_unit_on_host", 3057),
+    // And the same six background-start units: 3063, listed.
+    ("test.detcore_unit_on_host", 3063),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
