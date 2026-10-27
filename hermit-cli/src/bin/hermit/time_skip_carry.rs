@@ -103,10 +103,11 @@ impl TimeSkipSources {
     /// Remember `record`. One that made no jump counts as much as one that
     /// did: a trial that repeats it furthest makes no jump either. It counts
     /// by its timing format (`PreemptionRecord::timing_format`), below the
-    /// instruction-offset format
-    /// (`detcore::preemptions::format_without_instruction_offsets`): that
-    /// format and the one below it share their timing rules, and a trial
-    /// whose rows hold offsets states it again when it is written
+    /// instruction-offset formats
+    /// (`detcore::preemptions::format_without_instruction_offsets`): those
+    /// formats and the one below them share their timing rules, and a trial
+    /// whose rows or schedule hold offsets states its format again when it is
+    /// written
     /// (`PreemptionRecord::with_format`), so a recording with offsets and a
     /// trial's record without them share one format here.
     pub fn remember(&mut self, record: &PreemptionRecord) {

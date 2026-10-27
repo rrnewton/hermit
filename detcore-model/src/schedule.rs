@@ -26,9 +26,22 @@ pub mod boundary;
 // Scheduler events
 //--------------------------------------------------------------------------------
 
+/// Where a chaos timeslice with `--chaos-instruction-offset` ends: `instructions`
+/// single steps after the thread's conditional-branch counter reaches
+/// `rcb_target`. Straight-line code can return to an address without a
+/// conditional branch (a repeated call, a backward jump, a `rep` instruction),
+/// so the step count, not an address, names the point.
+#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize, Hash)]
+pub struct InstructionOffset {
+    /// The thread's absolute PMU branch count the timer was armed for.
+    pub rcb_target: u64,
+    /// Single steps past that count, at least one.
+    pub instructions: u64,
+}
+
 /// A scheduled action by one thread in the system.  This can be recorded, or replayed to guide the
 /// schedule.
-#[derive(PartialEq, Debug, Eq, Clone, Hash, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Clone, Hash, Deserialize)]
 pub struct SchedEvent {
     /// The thread that originated the event.
     pub dettid: DetTid,
@@ -43,6 +56,62 @@ pub struct SchedEvent {
     /// An optional snapshot of the thread logical time at this point.
     /// This includes time waiting on the global scheduler.
     pub end_time: Option<LogicalTime>,
+    /// For a batch of branches that a timer armed with
+    /// `--chaos-instruction-offset` ended past its branch target: where that
+    /// timer was armed. A schedule replay arms the same timer for the event
+    /// (`Some` only on an `Op::Branch` event, whose following
+    /// `Op::OtherInstructions` event names the address it stopped at). `None`
+    /// on every other event, and on every event of a schedule recorded without
+    /// the option or before the field existed; a written schedule then omits
+    /// it (see `Serialize`), so it is byte for byte what it was before.
+    #[serde(default)]
+    pub instruction_offset: Option<InstructionOffset>,
+}
+
+/// Written by hand only to leave out an empty instruction offset from a written
+/// (human-readable) schedule, so that a schedule recorded without
+/// `--chaos-instruction-offset` is byte for byte what it was before the field
+/// existed. `SchedEvent` also crosses Detcore's RPC, whose encoding is not
+/// self-describing and needs every field, in declaration order.
+impl Serialize for SchedEvent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let omit_offset = serializer.is_human_readable() && self.instruction_offset.is_none();
+        let mut fields =
+            serializer.serialize_struct("SchedEvent", if omit_offset { 6 } else { 7 })?;
+        fields.serialize_field("dettid", &self.dettid)?;
+        fields.serialize_field("op", &self.op)?;
+        fields.serialize_field("count", &self.count)?;
+        fields.serialize_field("start_rip", &self.start_rip)?;
+        fields.serialize_field("end_rip", &self.end_rip)?;
+        fields.serialize_field("end_time", &self.end_time)?;
+        if omit_offset {
+            fields.skip_field("instruction_offset")?;
+        } else {
+            fields.serialize_field("instruction_offset", &self.instruction_offset)?;
+        }
+        fields.end()
+    }
+}
+
+/// Written by hand, as `Serialize` is, so that an event without an
+/// instruction offset prints exactly as it did before the field existed:
+/// INFO and DEBUG lines that show an event stay unchanged.
+impl fmt::Debug for SchedEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut event = f.debug_struct("SchedEvent");
+        event
+            .field("dettid", &self.dettid)
+            .field("op", &self.op)
+            .field("count", &self.count)
+            .field("start_rip", &self.start_rip)
+            .field("end_rip", &self.end_rip)
+            .field("end_time", &self.end_time);
+        if let Some(offset) = &self.instruction_offset {
+            event.field("instruction_offset", offset);
+        }
+        event.finish()
+    }
 }
 
 /// A more compact printing.
@@ -61,6 +130,13 @@ impl fmt::Display for SchedEvent {
         if let Some(time) = self.end_time {
             write!(f, " time={}", time)?;
         }
+        if let Some(offset) = self.instruction_offset {
+            write!(
+                f,
+                " offset=+{}@rcb{}",
+                offset.instructions, offset.rcb_target
+            )?;
+        }
         write!(f, " {:?})", self.op)?;
         Ok(())
     }
@@ -77,6 +153,7 @@ impl SchedEvent {
             start_rip: None,
             end_rip: None,
             end_time: None,
+            instruction_offset: None,
         }
     }
 
@@ -89,6 +166,7 @@ impl SchedEvent {
             start_rip: None, // TODO: track the start of the interval as well.
             end_rip: None,
             end_time: None,
+            instruction_offset: None,
         }
     }
 
@@ -113,6 +191,13 @@ impl SchedEvent {
     /// Set the end_rip field.  The instruction pointer after the event completed.
     pub fn with_end_rip(mut self, end_rip: InstructionPointer) -> Self {
         self.end_rip = Some(end_rip);
+        self
+    }
+
+    /// Set the instruction_offset field: where the timer that ended this
+    /// batch of branches was armed past its branch target.
+    pub fn with_instruction_offset(mut self, offset: Option<InstructionOffset>) -> Self {
+        self.instruction_offset = offset;
         self
     }
 }
@@ -309,6 +394,86 @@ mod sigwrapper_tests {
         assert_eq!(by_name, SigWrapper::from(Signal::SIGUSR1));
         let by_number: SigWrapper = serde_json::from_str("\"SIG40\"").expect("number");
         assert_eq!(by_number, SigWrapper(40));
+    }
+}
+
+#[cfg(test)]
+mod instruction_offset_tests {
+    use super::*;
+
+    /// `SchedEvent` as it was before `instruction_offset` existed, with the
+    /// derived `Serialize` and `Debug` it had then.
+    mod before {
+        use super::*;
+
+        #[derive(Debug, Serialize)]
+        pub struct SchedEvent {
+            pub dettid: DetTid,
+            pub op: Op,
+            pub count: u32,
+            pub start_rip: Option<InstructionPointer>,
+            pub end_rip: Option<InstructionPointer>,
+            pub end_time: Option<LogicalTime>,
+        }
+    }
+
+    fn branch(offset: Option<InstructionOffset>) -> SchedEvent {
+        SchedEvent::branches(DetTid::from_raw(3), 7)
+            .with_end_rip(NonZeroUsize::new(4096).unwrap())
+            .with_time(LogicalTime::from_nanos(70))
+            .with_instruction_offset(offset)
+    }
+
+    /// An event without an instruction offset is written, and printed, exactly
+    /// as it was before the field existed; one with an offset keeps it through
+    /// JSON, and the RPC's encoding carries the field either way. A schedule
+    /// written before the field existed reads as events without offsets.
+    #[test]
+    fn an_absent_offset_leaves_an_event_unchanged_and_a_present_one_round_trips() {
+        let plain = branch(None);
+        let old = before::SchedEvent {
+            dettid: plain.dettid,
+            op: plain.op,
+            count: plain.count,
+            start_rip: plain.start_rip,
+            end_rip: plain.end_rip,
+            end_time: plain.end_time,
+        };
+        let json = serde_json::to_string(&plain).unwrap();
+        assert_eq!(json, serde_json::to_string(&old).unwrap());
+        assert_eq!(
+            serde_json::to_string_pretty(&plain).unwrap(),
+            serde_json::to_string_pretty(&old).unwrap()
+        );
+        assert_eq!(serde_json::from_str::<SchedEvent>(&json).unwrap(), plain);
+        assert_eq!(format!("{plain:?}"), format!("{old:?}"));
+        assert_eq!(format!("{plain:#?}"), format!("{old:#?}"));
+        assert!(!format!("{plain}").contains("offset"));
+
+        let offset = InstructionOffset {
+            rcb_target: 40,
+            instructions: 5,
+        };
+        let with = branch(Some(offset));
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(
+            json.ends_with(r#","instruction_offset":{"rcb_target":40,"instructions":5}}"#),
+            "{json}"
+        );
+        assert_eq!(serde_json::from_str::<SchedEvent>(&json).unwrap(), with);
+        assert_ne!(with, plain);
+        assert!(format!("{with:?}").ends_with(
+            "instruction_offset: InstructionOffset { rcb_target: 40, instructions: 5 } }"
+        ));
+        assert!(format!("{with}").contains(" offset=+5@rcb40 "), "{with}");
+
+        for event in [plain, with] {
+            let config = bincode::config::standard();
+            let encoded = bincode::serde::encode_to_vec(&event, config).unwrap();
+            let (decoded, _): (SchedEvent, usize) =
+                bincode::serde::decode_from_slice(&encoded, config).unwrap();
+            assert_eq!(decoded, event);
+        }
     }
 }
 

@@ -211,7 +211,7 @@ impl Scheduler {
                 self.requeue_with_new_priority(next, REPLAY_FOREGROUND_PRIORITY);
                 // The expectation rides the existing grant. No old leader's
                 // legacy duration may leak into this new-format continuation.
-                self.timeslices.remove(&next);
+                self.forget_replay_timeslice(&next);
                 !now
             }
             _ => unreachable!("the boundary cursor cannot resync or infer a logical duration"),
@@ -221,6 +221,7 @@ impl Scheduler {
             print_stack,
             event_ix: index as u64,
             timeslice_remaining: None,
+            instruction_offset: None,
         })
     }
 }
