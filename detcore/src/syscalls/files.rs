@@ -7089,9 +7089,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                     call.buf().map_or(0, |buf| buf.as_raw()),
                     call.len(),
                 );
+                let queued = crate::syscalls::inotify::queued_before(guest, call.fd(), call).await;
                 let result = self.execute_nonblockable_fd_syscall(guest, call).await;
-                crate::syscalls::inotify::finish(guest, Sysno::read, Some(destination), result)
-                    .await
+                crate::syscalls::inotify::finish(
+                    guest,
+                    Sysno::read,
+                    call.fd(),
+                    Some(destination),
+                    queued,
+                    result,
+                )
+                .await
             }
             FdType::Memfd | FdType::Pidfd | FdType::Userfaultfd | FdType::Epoll => {
                 trace!("Read call on unusual fd {}, type {:?}", call.fd(), fd_type);
@@ -8586,10 +8594,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.iov().map_or(0, |iov| iov.as_raw()),
                 call.len(),
             );
+            let queued = crate::syscalls::inotify::queued_before(guest, call.fd(), call).await;
             let result = self
                 .record_or_replay_preserving_tool_errors(guest, call)
                 .await;
-            crate::syscalls::inotify::finish(guest, Sysno::readv, destination, result).await
+            crate::syscalls::inotify::finish(
+                guest,
+                Sysno::readv,
+                call.fd(),
+                destination,
+                queued,
+                result,
+            )
+            .await
         } else {
             self.record_or_replay_preserving_tool_errors(guest, call)
                 .await
@@ -8793,10 +8810,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 call.iov().map_or(0, |iov| iov.as_raw()),
                 call.iov_len() as usize,
             );
+            let queued = crate::syscalls::inotify::queued_before(guest, call.fd(), call).await;
             let result = self
                 .record_or_replay_preserving_tool_errors(guest, call)
                 .await;
-            crate::syscalls::inotify::finish(guest, Sysno::preadv2, destination, result).await
+            crate::syscalls::inotify::finish(
+                guest,
+                Sysno::preadv2,
+                call.fd(),
+                destination,
+                queued,
+                result,
+            )
+            .await
         } else {
             self.record_or_replay_preserving_tool_errors(guest, call)
                 .await
