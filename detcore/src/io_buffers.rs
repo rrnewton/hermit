@@ -2014,8 +2014,13 @@ mod event_tests {
         );
     }
 
+    /// A pipe `readv` whose iovec array another thread rewrites while it
+    /// waits moves its bytes through the array it began with, as Linux
+    /// imports it once (`EntryImport`): each nonblocking attempt is made with
+    /// that array put back, the other thread's array is restored after it,
+    /// and the observer hashes the destination the bytes went to.
     #[tokio::test(flavor = "current_thread")]
-    async fn pipe_readv_event_observes_destination_imported_after_retry_wait() {
+    async fn pipe_readv_event_observes_the_destination_the_call_began_with_across_a_retry_wait() {
         let logs = BufferLog::default();
         let _subscriber = tracing::subscriber::set_default(logs.clone());
         let (parked_tx, parked_rx) = oneshot::channel();
@@ -2040,19 +2045,20 @@ mod event_tests {
         .await
         .expect("readv did not cross its retry resource wait");
         assert_eq!(result.unwrap(), 4);
-        assert_eq!(guest.injected_iovecs, [(FIRST_DEST, 8), (RETRY_DEST, 8)]);
+        assert_eq!(guest.injected_iovecs, [(FIRST_DEST, 8), (FIRST_DEST, 8)]);
         assert_eq!(*guest.polls.lock().unwrap(), [0, 1]);
         assert_eq!(*guest.releases.lock().unwrap(), 1);
         assert_eq!(guest.thread.stats.syscall_count, 1);
-        assert_eq!(memory.bytes(FIRST_DEST, 8), [CANARY; 8]);
+        assert_eq!(memory.iovec(0), (RETRY_DEST, 8));
         assert_eq!(
-            memory.bytes(RETRY_DEST, 4).as_slice(),
+            memory.bytes(FIRST_DEST, 4).as_slice(),
             PIPE_BYTES.as_slice()
         );
-        assert_eq!(memory.bytes(RETRY_DEST + 4, 4), [CANARY; 4]);
+        assert_eq!(memory.bytes(FIRST_DEST + 4, 4), [CANARY; 4]);
+        assert_eq!(memory.bytes(RETRY_DEST, 8), [CANARY; 8]);
         let messages = logs.0.lock().unwrap();
         assert_eq!(messages.len(), 1, "{messages:?}");
-        assert_extent(&messages[0], RETRY_DEST, PIPE_BYTES);
+        assert_extent(&messages[0], FIRST_DEST, PIPE_BYTES);
     }
 
     /// An ordinary readv whose observation fails after the call returns that

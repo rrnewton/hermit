@@ -4386,6 +4386,14 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) receive_geometry: Option<Option<crate::syscalls::scm_rights::ReceiveGeometry>>,
 
+    /// The memory the vectored call this thread just ran copied when it
+    /// began (`EntryImport`), when another thread has rewritten it since: the
+    /// observers that read the call's arguments after it returns
+    /// (`--detlog-io-buffers`) read them as the kernel's copy held them. Set
+    /// as the call's internal polling ends and taken as the call returns.
+    #[serde(skip)]
+    pub(crate) entry_import: Option<Box<crate::syscalls::entry_import::EntryImport>>,
+
     /// The `sendmsg` or `sendmmsg` this thread is running, while its
     /// `SCM_RIGHTS` descriptors matter to the `/proc` directories Detcore
     /// serves on placeholders: `Some` from the handler's inspection
@@ -5553,6 +5561,7 @@ impl<T> ThreadState<T> {
             signal_task_identity: None,
             open_file_creator: None,
             receive_geometry: None,
+            entry_import: None,
             send_inspection: None,
             mm_id: MmId::initial(pid),
             memory_metadata: Arc::new(Mutex::new(MemoryMetadata::new())),

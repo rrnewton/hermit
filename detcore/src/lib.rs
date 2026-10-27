@@ -4295,6 +4295,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     signal_task_identity: None,
                     open_file_creator: None,
                     receive_geometry: None,
+                    entry_import: None,
                     send_inspection: None,
                     mm_id: MmId::for_clone(
                         pts.1.mm_id,
@@ -5278,6 +5279,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // Only an emulated RNG readv supplies authoritative imported geometry.
         // A generic pre-dispatch snapshot would become stale across pipe waits.
         let mut rng_readv_output = None;
+        // A vectored call's memory as it began, if its handler keeps it
+        // (`ThreadState::entry_import`): never an earlier call's.
+        guest.thread_state_mut().entry_import = None;
         // Signal phase 1: a process that handles SIGALRM runs only the calls
         // its table places (`sigalrm_phase1`).
         let sigalrm_refusal = if guest.thread_state().sigalrm_handled {
@@ -6381,8 +6385,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // With asynchronous exit completion, a descriptor that would make this
         // guest serve another guest's exit ends the run before anything
         // observes the result (crate::exit_dependencies).
-        if let Ok(ret) = res {
-            self.refuse_exit_dependencies(guest, &call, ret).await;
+        // It reads a received message's descriptors from the call's header,
+        // so it reads it as the kernel's view holds it (`EntryImport`).
+        // Boxed: it keeps the view across an await, which would otherwise
+        // grow every syscall's future (`hot_path_futures_stay_small`).
+        if let Ok(ret) = res
+            && let Err(error) =
+                Box::pin(self.refuse_exit_dependencies_in_view(guest, &call, ret)).await
+        {
+            let res = Err(error);
+            self.publish_posthook_checkpoint(guest, new_count, &res, interrupted)
+                .await;
+            return self.complete_syscall(guest, res).await;
         }
 
         // The guest resumes with this result in its return register (A5 step
@@ -6445,20 +6459,31 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // arguments, so it does not matter whether the buffer lives on the stack, in the brk
         // heap, in BSS or in an anonymous mmap -- the last two of which neither mapping hash
         // can see. Only successful calls moved anything.
+        // A vectored call moved its bytes through its memory as it began
+        // (`EntryImport`), so the observer reads the call's arguments with
+        // the kernel's view put back for the read, and another thread's
+        // rewrite restored after it. No guest thread runs in between.
         if let Ok(ret) = &res
             && self.cfg.detlog_io_buffers
-            && let Err(error) = io_buffers::detlog_io_buffers(
+        {
+            let entry = entry_view(guest, &call);
+            let view = entry
+                .as_deref()
+                .map(|entry| (entry, entry.reinstate_returned(&mut guest.memory())));
+            let observed = io_buffers::detlog_io_buffers(
                 guest,
                 &call,
                 *ret,
                 dettid,
                 rng_readv_output.as_deref(),
-            )
-        {
-            let res = Err(error);
-            self.publish_posthook_checkpoint(guest, new_count, &res, interrupted)
-                .await;
-            return self.complete_syscall(guest, res).await;
+            );
+            let restored = restore_entry_view(guest, view);
+            if let Err(error) = restored.and(observed) {
+                let res = Err(error);
+                self.publish_posthook_checkpoint(guest, new_count, &res, interrupted)
+                    .await;
+                return self.complete_syscall(guest, res).await;
+            }
         }
 
         if sequentialize_threads && self.cfg.observes_schedevents() {
@@ -6711,6 +6736,50 @@ mod group_signal_tests {
         assert!(!signal_ends_thread_group(&ExitStatus::Exited(0)));
         assert!(!signal_ends_thread_group(&ExitStatus::Exited(1)));
     }
+}
+
+/// The memory `call` copied when it began, if its handler kept it because
+/// another thread has rewritten it since (`ThreadState::entry_import`), for a
+/// reader of the call's arguments after it returns.
+fn entry_view<T: crate::record_or_replay::RecordOrReplay, G: Guest<Detcore<T>>>(
+    guest: &G,
+    call: &Syscall,
+) -> Option<Box<crate::syscalls::entry_import::EntryImport>> {
+    let entry = guest.thread_state().entry_import.clone()?;
+    if entry.call() != *call {
+        tracing::debug!(
+            "dropping the entry view of {:?}, which is not {:?}",
+            entry.call(),
+            call
+        );
+        return None;
+    }
+    Some(entry)
+}
+
+/// Restore another thread's rewrite of a call's memory after a reader that
+/// saw the kernel's view of it (`EntryImport::reinstate_returned`). A failure
+/// leaves the guest's memory as the call began, so it is logged and ends the
+/// call.
+fn restore_entry_view<G: Guest<T>, T: Tool>(
+    guest: &mut G,
+    view: Option<(
+        &crate::syscalls::entry_import::EntryImport,
+        crate::syscalls::entry_import::Displaced,
+    )>,
+) -> Result<(), Error> {
+    let Some((entry, displaced)) = view else {
+        return Ok(());
+    };
+    entry
+        .put_back(&mut guest.memory(), displaced, false)
+        .map_err(|errno| {
+            tracing::error!(
+                "Detcore could not restore the guest's rewrite of {:?} after reading the call: {errno}",
+                entry.call()
+            );
+            Error::from(errno)
+        })
 }
 
 #[cfg(test)]

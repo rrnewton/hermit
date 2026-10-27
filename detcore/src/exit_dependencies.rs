@@ -183,6 +183,26 @@ pub fn held_exit_dependency(
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// [`Self::refuse_exit_dependencies`] with the call's memory as the
+    /// kernel's view of it holds it (`EntryImport::reinstate_returned`), when
+    /// another thread has rewritten it since (`ThreadState::entry_import`),
+    /// and that rewrite restored after: it reads a received message's
+    /// descriptors from the call's header. Fails only if the rewrite cannot
+    /// be restored.
+    pub(crate) async fn refuse_exit_dependencies_in_view<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+        ret: i64,
+    ) -> Result<(), reverie::Error> {
+        let entry = crate::entry_view(guest, call);
+        let view = entry
+            .as_deref()
+            .map(|entry| (entry, entry.reinstate_returned(&mut guest.memory())));
+        self.refuse_exit_dependencies(guest, call, ret).await;
+        crate::restore_entry_view(guest, view)
+    }
+
     /// Ends the run, by name, when `call`, which returned `ret`, gave the guest
     /// a descriptor that would make it serve another guest's exit; see the
     /// module documentation. Does nothing unless process exits complete

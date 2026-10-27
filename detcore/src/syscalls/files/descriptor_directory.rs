@@ -1688,8 +1688,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// [`Self::inspect_placeholder_send`]) must not be made, read right
     /// before it: its messages now pass other placeholders over `SCM_RIGHTS`
     /// than they did when Detcore counted their copies (another thread
-    /// rewrote them, or replaced what a descriptor number names, while an
-    /// earlier attempt waited for room), or they can no longer be read in full
+    /// replaced what a descriptor number names while an earlier attempt
+    /// waited for room; a rewrite of the messages themselves is undone for
+    /// each attempt, as Linux copied them when the call began, `EntryImport`),
+    /// or they can no longer be read in full
     /// while this process holds a placeholder and the socket passes
     /// descriptors. `None` where the attempt passes the placeholders
     /// inspected, and nothing Detcore cannot see.
