@@ -16261,12 +16261,18 @@ struct SnapshotDirectoryIdentity {
 impl SnapshotDirectoryIdentity {
     fn from_path_identity(identity: SnapshotPathIdentity) -> Self {
         // Creating or renaming a sibling output changes directory timestamps
-        // and size without replacing the held directory. The snapshot file
-        // itself still uses the complete metadata identity and byte digest.
+        // and size without replacing the held directory. So does a chmod:
+        // the held directories include every ancestor of an evidence file,
+        // `/` among them, and other actors on a shared host change their
+        // permission bits (a host's `/` has been seen switching between 0555
+        // and 0755), which failed the check with "evidence directory changed:
+        // /". Only the file type stays in the identity, beside the device and
+        // inode that name the directory. The snapshot file itself still uses
+        // the complete metadata identity and byte digest.
         Self {
             device: identity.device,
             inode: identity.inode,
-            mode: identity.mode,
+            mode: identity.mode & libc::S_IFMT,
         }
     }
 }
@@ -39919,6 +39925,32 @@ mod attempt_binding_tests {
             .comparison_attempt_bindings_v1 = comparison_attempt_bindings(&tracked).cloned();
         preserve_attempt_bindings(&tracked, &rewritten).unwrap();
         validate_attempt_bindings(&rewritten, Some(&events)).unwrap();
+    }
+
+    /// A permission change on a held directory, as another actor's chmod of
+    /// an ancestor such as `/`, does not replace it, so verification still
+    /// passes; a directory replaced at the same path still fails it.
+    #[test]
+    fn a_held_directory_survives_a_chmod_but_not_a_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let held_directory = directory.path().join("evidence");
+        fs::create_dir(&held_directory).unwrap();
+        let path = held_directory.join("results.jsonl");
+        fs::write(&path, b"{}\n").unwrap();
+        let held = HeldEvidenceFile::open(&path, None).unwrap();
+        for mode in [0o555, 0o755] {
+            fs::set_permissions(&held_directory, fs::Permissions::from_mode(mode)).unwrap();
+            held.verify().unwrap();
+        }
+        fs::rename(&held_directory, directory.path().join("moved")).unwrap();
+        fs::create_dir(&held_directory).unwrap();
+        fs::copy(directory.path().join("moved/results.jsonl"), &path).unwrap();
+        assert_eq!(
+            held.verify().unwrap_err(),
+            format!("evidence directory changed: {}", held_directory.display())
+        );
     }
 
     #[test]
