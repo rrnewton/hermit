@@ -21652,6 +21652,36 @@ exit "$(cat "$PWD/exit-status")"
                  8192), so its guest prints F_GETPIPE_SZ without asserting Detcore's pin",
             ),
             (
+                "c-programs/proc-own-links",
+                "dbt",
+                "`--no-leader-exit`, `--no-exe-changes` and `--base-exe-truncation` skip the \
+                 process whose leader exits, whose remaining thread's readlinks fail with ESRCH \
+                 under DBT (https://github.com/rrnewton/hermit/issues/4697), and the exec'd copy's \
+                 changes to its own image, whose exe link DBT refuses by name, and check its exe \
+                 answer for a short buffer as DBT's base EINVAL \
+                 (https://github.com/rrnewton/hermit/issues/4711), both as at the base",
+            ),
+            (
+                "c-programs/proc-own-links",
+                "kvm",
+                "`--no-leader-exit` and `--no-fs-threads` skip the process whose leader exits, \
+                 whose join of the exited leader waits in one run and not in another under KVM \
+                 (https://github.com/rrnewton/hermit/issues/4563), and the thread created without \
+                 CLONE_FS, which KVM refuses (https://github.com/rrnewton/hermit/issues/4698)",
+            ),
+            (
+                "c-programs/proc-own-links",
+                "liteinst",
+                "`--no-threads` and `--no-exec` skip the thread, the process whose leader exits \
+                 and the exec'd copy: in-guest LiteInst creates no threads and runs no exec",
+            ),
+            (
+                "c-programs/proc-own-links",
+                "in-guest-trap",
+                "`--no-threads` and `--no-exec` skip the thread, the process whose leader exits \
+                 and the exec'd copy: in-guest LiteInst creates no threads and runs no exec",
+            ),
+            (
                 "c-programs/proc-fd-directory",
                 "kvm",
                 "`--no-private-tables` and `--no-fifo-threads` skip the two checks KVM cannot \

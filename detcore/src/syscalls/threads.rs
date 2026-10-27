@@ -3595,6 +3595,83 @@ impl<T: RecordOrReplay> Detcore<T> {
         crate::exec_record::ExecRecord::resolve(&root, &cwd, &spelled)
     }
 
+    /// [`Self::exec_image`] where the tool cannot read the guest's procfs
+    /// directory but sees the guest's files in its own filesystem view
+    /// (`Detcore::exec_record_root` is `/`: KVM, whose executor opens every
+    /// absolute guest path in the tool's own view), resolved as that
+    /// executor resolves the exec (reverie-linuxemu's
+    /// `resolve_guest_exec_image`): an absolute path as it is, a relative one
+    /// with a slash from the working directory the calling thread's own
+    /// `getcwd` gives, and an exec of the caller's own `exe` link spelled
+    /// under `/proc` the image it executes. Only an ELF image is recorded:
+    /// `None` for a script (the executor reads its interpreter its own way),
+    /// for a name without a slash (which the executor searches on `PATH`,
+    /// where Linux does not), for a path relative to a directory descriptor
+    /// or empty (`AT_EMPTY_PATH`), for any other path under `/proc` (the
+    /// tool's `/proc` is not the guest's), in a nested PID namespace, and for
+    /// the tool's own image, which a path through the tool's `/proc` could
+    /// have led to. Without a record the new image's `exe` link is the
+    /// executor's, as before (`Detcore::readlink_own_task_link`); with one,
+    /// Detcore answers only while it names the image exactly, and the
+    /// executor holds the image open, so its inode cannot be reused meanwhile.
+    async fn exec_image_without_procfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &syscalls::Execveat,
+    ) -> Option<crate::exec_record::ExecRecord> {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::MetadataExt;
+        if crate::procfs_inode::tool_can_name_guest_descriptors(&self.cfg.backend)
+            || guest.thread_state().nested_pid_namespace
+        {
+            return None;
+        }
+        let root = self.exec_record_root(guest)?;
+        let path: std::path::PathBuf = call.path()?.read(&guest.memory()).ok()?;
+        if path.as_os_str().is_empty()
+            || (!path.is_absolute() && call.dirfd() != libc::AT_FDCWD)
+            || (!path.is_absolute() && path.components().count() < 2)
+        {
+            return None;
+        }
+        let cwd = if path.is_absolute() {
+            None
+        } else {
+            let directory = self.injected_working_directory(guest, None, 0).await.ok()?;
+            Some(std::path::PathBuf::from(
+                <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(directory),
+            ))
+            .filter(|directory| directory.is_absolute())
+        };
+        let spelled = match &cwd {
+            Some(cwd) => cwd.join(&path),
+            None => path.clone(),
+        };
+        let own_pid = self.own_detpid(guest).as_raw();
+        if spelled.starts_with("/proc") {
+            return match crate::syscalls::namespace::exe_link_subject(
+                spelled.as_os_str().as_bytes(),
+                own_pid,
+            ) {
+                Some(crate::syscalls::namespace::ExeLinkSubject::Own) => {
+                    guest.thread_state().exe.as_deref().cloned()
+                }
+                _ => None,
+            };
+        }
+        let record = crate::exec_record::ExecRecord::resolve_from(&root, cwd.as_deref(), &path)?;
+        // The file the path names itself, which the record is only where it
+        // is no script (a script's record is its interpreter's).
+        let named = std::fs::metadata(root.join(spelled.strip_prefix("/").ok()?))
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        let tool_image = std::fs::metadata("/proc/self/exe")
+            .ok()
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        (Some(record.identity()) == named && Some(record.identity()) != tool_image)
+            .then_some(record)
+    }
+
     /// Execveat system call.  Doesn't return if successful.
     pub async fn handle_execveat<G: Guest<Self>>(
         &self,
@@ -3623,7 +3700,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             )
         };
         let preserve_exec_fd_status = guest.config().backend.rediscovers_descriptors_after_exec;
-        let exe = self.exec_image(guest, &call);
+        let exe = match self.exec_image(guest, &call) {
+            Some(exe) => Some(exe),
+            None => self.exec_image_without_procfs(guest, &call).await,
+        };
 
         prepare_exec(
             guest,
