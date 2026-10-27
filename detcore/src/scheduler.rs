@@ -4724,6 +4724,15 @@ impl Scheduler {
         self.signal_death_victims.contains(&process)
     }
 
+    /// Retire `leader` at its own exit as `retire_exited_leader` does on
+    /// ptrace, with its exit granted (test setup).
+    #[cfg(test)]
+    pub(crate) fn retire_test_exited_leader(&mut self, leader: DetTid, mm: MmId) -> bool {
+        self.models_signal_targets = true;
+        self.committed_exits.insert(leader);
+        self.retire_exited_leader(leader, mm)
+    }
+
     /// Whether a committed SIGKILL doomed `process`, and whether one with an
     /// unnamed victim was seen (test observation of the record above).
     #[cfg(test)]
@@ -6752,9 +6761,17 @@ impl Scheduler {
     /// its process's end a second time, at this host-timed moment (deciding
     /// again whether its parent reaps it automatically, and waking the
     /// parent's waiters again).
-    pub(crate) fn retire_deregistered_thread(&mut self, dettid: DetTid, detpid: DetPid, mm: MmId) {
+    ///
+    /// Returns false for such a leader, whose death this deregistration
+    /// reports only after its exit was already accounted.
+    pub(crate) fn retire_deregistered_thread(
+        &mut self,
+        dettid: DetTid,
+        detpid: DetPid,
+        mm: MmId,
+    ) -> bool {
         if self.take_retired_exited_leader(dettid) {
-            return;
+            return false;
         }
         self.hold_turns_until_the_kernel_ends(dettid, mm);
         if !self.defer_exec_sibling_retirement(dettid, detpid, mm)
@@ -6762,6 +6779,7 @@ impl Scheduler {
         {
             self.logically_kill_thread(&dettid, &detpid, mm);
         }
+        true
     }
 
     /// `dettid`, a thread of `detpid`, died of a signal that ends its whole
@@ -6777,7 +6795,15 @@ impl Scheduler {
     /// an empty run queue waits for (`awaiting_namespace_zap`). Each thread is
     /// still retired at its own deregistration, which keeps the order a robust
     /// list's owner deaths are accounted in.
+    ///
+    /// A process a guest's SIGKILL owns (`sigkill_owns_process`) is not one:
+    /// that send retires its threads at its kill turn, and noting a death the
+    /// kill caused here, at a host-timed deregistration, would log and wait at
+    /// a host-chosen moment (https://github.com/rrnewton/hermit/issues/4445).
     pub(crate) fn note_signal_killed_group(&mut self, dettid: DetTid, detpid: DetPid) {
+        if self.sigkill_owns_process(detpid) {
+            return;
+        }
         let others_live = self
             .live_group_members(detpid)
             .into_iter()

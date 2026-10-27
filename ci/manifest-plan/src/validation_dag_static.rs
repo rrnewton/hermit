@@ -3040,7 +3040,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and
     // tool_global::tests::sigkill_deregistration_tests::a_sigkill_deregistration_waits_for_the_rest_of_its_group:
     // 2685, listed.
-    ("test.detcore_unit", 2685),
+    // And sigkill_deregistration_tests::a_death_already_accounted_waits_for_nothing
+    // (a death a SIGKILL or an earlier exit accounts for is not waited for):
+    // 2686, listed.
+    ("test.detcore_unit", 2686),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -5272,7 +5275,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Fixed 0.5.4 rebase recount also retains the priority-history regressions.
     // And the same 3c.1e B unit: 2682, listed.
     // And the same three signal-death units: 2685, listed.
-    ("test.detcore_unit_on_host", 2685),
+    // And the same already-accounted death unit: 2686, listed.
+    ("test.detcore_unit_on_host", 2686),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

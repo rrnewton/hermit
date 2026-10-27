@@ -6625,9 +6625,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
 /// gives each the same status). The one exception is SIGSYS, which seccomp's
 /// `SECCOMP_RET_KILL_THREAD` uses to end a single thread (`__seccomp_filter`
 /// calls `do_exit(SIGSYS)`), so a SIGSYS death never makes the scheduler wait
-/// for the rest of the group (`Scheduler::note_signal_killed_group`).
+/// for the rest of the group (`Scheduler::note_signal_killed_group`). A
+/// death by a signal nix cannot name (`SignaledRaw`, a real-time signal) is a
+/// group exit too: no real-time signal is SIGSYS.
 fn signal_ends_thread_group(status: &ExitStatus) -> bool {
-    matches!(status, ExitStatus::Signaled(signal, _) if *signal != Signal::SIGSYS)
+    match status {
+        ExitStatus::Signaled(signal, _) => *signal != Signal::SIGSYS,
+        ExitStatus::SignaledRaw(..) => true,
+        ExitStatus::Exited(_) => false,
+    }
 }
 
 #[cfg(test)]
@@ -6650,6 +6656,11 @@ mod group_signal_tests {
         assert!(!signal_ends_thread_group(&ExitStatus::Signaled(
             Signal::SIGSYS,
             true
+        )));
+        // A real-time signal's default action (terminate) ends the group too.
+        assert!(signal_ends_thread_group(&ExitStatus::SignaledRaw(
+            libc::SIGRTMIN() + 1,
+            false
         )));
         assert!(!signal_ends_thread_group(&ExitStatus::Exited(0)));
         assert!(!signal_ends_thread_group(&ExitStatus::Exited(1)));
