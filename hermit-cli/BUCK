@@ -84,7 +84,8 @@ rust_library(
                 "categories": [
                     "development-tools::debugging",
                     "development-tools::testing"
-                ]
+                ],
+                "metadata": {"hermit": {"build-identity": "source"}},
             },
             "dependencies_override": {
                 "dependencies": {
@@ -94,8 +95,12 @@ rust_library(
                     "reverie-rpc-transport": {"optional": True},
                     "reverie-sabre-stats": {"optional": True},
                 },
+                "build-dependencies": {
+                    "toml": {"version": "0.8.23"},
+                },
                 "dev-dependencies": {
                     "reverie-inguest": {"default-features": False, "features": ["exec-stop"]},
+                    "toml": {"version": "0.8.23"},
                 },
             },
             "features": {
@@ -190,7 +195,8 @@ rust_binary(
                 "categories": [
                     "development-tools::debugging",
                     "development-tools::testing"
-                ]
+                ],
+                "metadata": {"hermit": {"build-identity": "source"}},
             },
             "dependencies_override": {
                 "dependencies": {
@@ -200,8 +206,12 @@ rust_binary(
                     "reverie-rpc-transport": {"optional": True},
                     "reverie-sabre-stats": {"optional": True},
                 },
+                "build-dependencies": {
+                    "toml": {"version": "0.8.23"},
+                },
                 "dev-dependencies": {
                     "reverie-inguest": {"default-features": False, "features": ["exec-stop"]},
+                    "toml": {"version": "0.8.23"},
                 },
             },
             "features": {

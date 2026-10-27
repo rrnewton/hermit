@@ -12,6 +12,7 @@
 // (https://github.com/rrnewton/hermit/issues/3967); an edit changes both guest
 // preloads.
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[path = "../../common/inguest/glibc_compat.rs"]
 mod glibc_compat;
 
 use std::ffi::CString;

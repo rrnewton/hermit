@@ -2628,11 +2628,10 @@ fn dbt_unavailable_reason() -> Option<String> {
     Some(dbt_disabled_build_reason(cfg!(hermit_registry_build)))
 }
 
-/// `registry_build`: this crate was built from a manifest that declares no
-/// `dbt` feature, as the crates.io projection of `hermit-run` does
-/// (`cfg(hermit_registry_build)`, set by build.rs). A source build of main
-/// declares one, and only needs to enable it. The package name cannot tell
-/// them apart: both are `hermit-run`.
+/// `registry_build`: this crate's package metadata explicitly identifies the
+/// registry projection (`cfg(hermit_registry_build)`, set by build.rs). A core
+/// source build stays a source build regardless of its backend features. The
+/// package name cannot tell them apart: both are `hermit-run`.
 #[cfg(not(feature = "dbt"))]
 fn dbt_disabled_build_reason(registry_build: bool) -> String {
     if registry_build {
@@ -8476,8 +8475,8 @@ mod tests {
         let source_reason = super::dbt_disabled_build_reason(false);
         assert!(source_reason.contains("rebuild with `--features dbt`"));
         assert!(!source_reason.contains("not included in this registry release"));
-        // This tree's manifest declares `dbt`, so build.rs must have judged it
-        // a source build, whatever the package is called.
+        // This tree's package metadata says `source`, independently of the
+        // package name and the backend features it declares.
         const { assert!(!cfg!(hermit_registry_build)) };
     }
 
