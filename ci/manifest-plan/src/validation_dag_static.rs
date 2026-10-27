@@ -1994,7 +1994,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the root and path-length refusals, stale and held copies) and
     // host_input_change's snapshot-copy unit (PR #4791):
     // 1249 + 6 = 1255.
-    ("test.hermit_unit", 1260),
+    // 1249 + 12 = 1261.
+    ("test.hermit_unit", 1266),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3407,7 +3408,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // property file not refused; a file the area gained after its snapshot
     // refused): 212.
     // Rebased onto main e8e0f9a1c: 209 + 4 = 213.
-    ("test.detcore_misc", 213),
+    // And a file without a copy refused through an outside hard link: 213.
+    // Rebased onto main e8e0f9a1c: 213 + 1 = 214.
+    ("test.detcore_misc", 214),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -5493,7 +5496,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same seventeen SCM_RIGHTS queue tests: 191 + 17 = 208.
     // And the four property snapshot tests: 212.
     // Rebased onto main e8e0f9a1c: 209 + 4 = 213.
-    ("test.detcore_misc_on_host", 213),
+    // And the uncopied-file alias refusal: 213.
+    // Rebased onto main e8e0f9a1c: 213 + 1 = 214.
+    ("test.detcore_misc_on_host", 214),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -6360,7 +6365,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 5 recount (same growth as test.hermit_unit), composed on measured main: 1206 + 1 = 1207.
     // And the same six property snapshot units (PR #4791):
     // 1243 + 6 = 1249.
-    ("test.hermit_unit_on_host", 1254),
+    // And the same twelve property snapshot units (PR #4791):
+    // 1243 + 12 = 1255.
+    ("test.hermit_unit_on_host", 1260),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
