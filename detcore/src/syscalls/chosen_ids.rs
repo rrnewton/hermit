@@ -347,6 +347,8 @@ pub(crate) struct ChosenId {
     size: usize,
     /// The guest's call passed `CLONE_UNTRACED`, which `args` no longer do.
     untraced: bool,
+    /// The array begins with entries of the guest's own.
+    guest_entries: bool,
 }
 
 /// How a clone-family call is issued, as [`Detcore::plan_clone_id`] decides.
@@ -414,7 +416,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // the plan, so that no other call inherits it.
         let restarted = guest.thread_state_mut().restarted_clone_id.take();
         let tid = guest.tid().as_raw();
-        let (args, size, set_tid) = match form {
+        let (args, size, set_tid, guest_entries) = match form {
             ChosenIdCall::Clone3 { args, size } => {
                 let flags = u64::from_ne_bytes(args[..8].try_into().unwrap());
                 // The new task's ID in each namespace inside Hermit's: none,
@@ -446,7 +448,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .host_id_planned(guest, sysno, why, refuse_host_ids, untraced)
                         .await;
                 }
-                (args, size, inner)
+                (args, size, inner, false)
             }
             ChosenIdCall::GuestChosen { args, size } => {
                 // An array the kernel cannot read, or whose address and size
@@ -471,10 +473,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                             args,
                             size,
                             untraced,
+                            guest_entries: true,
                         }));
                     }
                     // One short: Detcore adds the ID in Hermit's namespace.
-                    Some(depth) if tids.len() == depth && depth < MAX_SET_TID => (args, size, tids),
+                    Some(depth) if tids.len() == depth && depth < MAX_SET_TID => {
+                        (args, size, tids, true)
+                    }
                     Some(depth) => {
                         let why = format!(
                             "its set_tid names {} ID(s), but its task is created {depth} PID \
@@ -540,6 +545,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             args,
             size,
             untraced,
+            guest_entries,
         }))
     }
 
@@ -694,6 +700,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             args,
             size,
             untraced,
+            guest_entries,
         } = chosen;
         // An ID at or above pid_max is EINVAL from set_tid (alloc_pid), which
         // the guest's own call would not get; decided here, before any call.
@@ -732,7 +739,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .with_size(size);
                 let result = guest.inject(rewritten).await;
                 drop(scratch);
-                let held = |id: i32| std::path::Path::new(&format!("/proc/{id}")).exists();
                 match result {
                     Ok(child) => {
                         debug!(
@@ -750,11 +756,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                         }
                         return Err(errno);
                     }
-                    Err(errno) => match id.and_then(|id| set_tid_failure(errno, held(id))) {
+                    Err(errno) => match id.and_then(|_| set_tid_failure(errno)) {
                         None => return Err(errno),
                         Some(SetTidFailure::Taken) => {
                             let id = id.unwrap();
-                            let cause = format!("ID {id} is taken: {}", holder_of(id));
+                            let cause = if guest_entries {
+                                format!(
+                                    "ID {id}, or one of the guest's own set_tid entries, is \
+                                     taken (EEXIST); ID {id}: {}",
+                                    holder_of(id)
+                                )
+                            } else {
+                                format!("ID {id} is taken: {}", holder_of(id))
+                            };
                             if refuse_host_ids {
                                 refuse_host_id(
                                     guest,
@@ -769,9 +783,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                             cause
                         }
                         Some(SetTidFailure::NotPermitted) => format!(
-                            "the guest task may not choose ID {} in Hermit's PID namespace \
-                             (EPERM: it lacks CAP_SYS_ADMIN and CAP_CHECKPOINT_RESTORE there, \
-                             for example in a user namespace of its own)",
+                            "the rewrite with ID {} in Hermit's PID namespace failed with EPERM, \
+                             taken as the guest task's lacking CAP_SYS_ADMIN and \
+                             CAP_CHECKPOINT_RESTORE there (for example in a user namespace of its \
+                             own)",
                             id.unwrap()
                         ),
                     },
@@ -859,39 +874,44 @@ fn without_untraced(mut args: [u8; CLONE_ARGS_SIZE_VER2]) -> [u8; CLONE_ARGS_SIZ
     args
 }
 
-/// The host's pid_max, read once: an ID at or above it is not one `set_tid`
-/// can give.
+/// The host's pid_max, read at each call, since it can change: an ID at or
+/// above it is not one `set_tid` can give.
 fn pid_max() -> Option<i32> {
-    static PID_MAX: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
-    *PID_MAX.get_or_init(|| {
-        std::fs::read_to_string("/proc/sys/kernel/pid_max")
-            .ok()?
-            .trim()
-            .parse()
-            .ok()
-    })
+    std::fs::read_to_string("/proc/sys/kernel/pid_max")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
-/// How the rewritten `clone3` failed because of the ID Detcore added to its
-/// `set_tid` array, if it did.
+/// How the rewritten `clone3` may have failed because of the ID Detcore
+/// added to its `set_tid` array. Both are taken as that ID's, the
+/// conservative side: a run that needs every ID chosen then ends, and any
+/// other run issues the guest's own call, which gets its own answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SetTidFailure {
-    /// `EEXIST`, and a task holds the ID.
+    /// `EEXIST`: the ID is still allocated, as a live task's or only as an
+    /// exited task's process group or session, which no procfs scan can
+    /// rule out (alloc_pid refuses any ID still in the namespace's IDR).
+    /// Linux's own clone picks a free ID, so without entries of the guest's
+    /// it is always the added ID's; with them, one of the guest's own may be
+    /// the one taken.
     Taken,
     /// `EPERM`: choosing an ID in Hermit's namespace takes `CAP_SYS_ADMIN`
     /// or `CAP_CHECKPOINT_RESTORE` over it, which the guest's own call may
     /// not need (a task in a user namespace of its own has both there, not
-    /// in Hermit's), so `EPERM` is always taken as the added ID's.
+    /// in Hermit's). Another cause of the call's own (a guest entry, an LSM)
+    /// cannot be told from it.
     NotPermitted,
 }
 
-/// Which of `errno`'s causes the added ID is, if any, with `held` saying
-/// whether a task holds that ID. Once the ID is below pid_max, an added
-/// entry can make the kernel fail only with `EEXIST` or `EPERM` (alloc_pid);
-/// any other error is the call's own, which the guest's call gets as well.
-fn set_tid_failure(errno: Errno, held: bool) -> Option<SetTidFailure> {
+/// Whether `errno` may be the added ID's. Once the ID is below pid_max, an
+/// added entry can make the kernel fail only with `EEXIST` or `EPERM`
+/// (alloc_pid); any other error is the call's own, which the guest's call
+/// gets as well.
+fn set_tid_failure(errno: Errno) -> Option<SetTidFailure> {
     match errno {
-        Errno::EEXIST if held => Some(SetTidFailure::Taken),
+        Errno::EEXIST => Some(SetTidFailure::Taken),
         Errno::EPERM => Some(SetTidFailure::NotPermitted),
         _ => None,
     }
@@ -931,9 +951,11 @@ fn guest_set_tid_shape(args: &[u8; CLONE_ARGS_SIZE_VER2]) -> Option<(u64, usize)
 /// by thread `tid` creates its task in Hermit's own is: 0 for Hermit's, one
 /// more with `CLONE_NEWPID`, and the depth of a namespace the guest made for
 /// its children (`pid_for_children`), walked up with `NS_GET_PARENT`. A
-/// kernel without PID namespaces (no `/proc/self/ns/pid`) has only the one.
-/// `None` if a namespace cannot be read, or the walk does not reach
-/// Hermit's within the kernel's nesting limit.
+/// kernel without PID namespaces (`/proc/self/ns` without `pid`) has only
+/// the one. `None` if a namespace cannot be read (no `/proc/self/ns` at
+/// all), or the walk does not reach Hermit's within the kernel's nesting
+/// limit; a depth beyond that limit, where Linux would refuse a
+/// `CLONE_NEWPID` with `ENOSPC`, also takes the host-ID path.
 fn pid_namespace_depth(tid: i32, flags: u64) -> Option<usize> {
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;
@@ -942,7 +964,9 @@ fn pid_namespace_depth(tid: i32, flags: u64) -> Option<usize> {
     const NS_GET_PARENT: u64 = 0xb702;
     let new = usize::from(flags & libc::CLONE_NEWPID as u64 != 0);
     let Ok(own) = std::fs::metadata("/proc/self/ns/pid") else {
-        return Some(new);
+        return std::path::Path::new("/proc/self/ns")
+            .is_dir()
+            .then_some(new);
     };
     let mut namespace = std::fs::File::open(format!("/proc/{tid}/ns/pid_for_children")).ok()?;
     for depth in 0..=MAX_SET_TID {
@@ -1313,19 +1337,17 @@ mod tests {
         assert_ne!(call, RestartedCloneId::call(Sysno::clone, &args, 88));
     }
 
-    /// The ID Detcore adds can fail the call only with EEXIST, when a task
-    /// holds it, or EPERM; every other error, and EEXIST for a free ID (one of
-    /// the guest's own entries), is the call's own.
+    /// The ID Detcore adds may fail the call only with EEXIST or EPERM, both
+    /// taken as that ID's; every other error is the call's own.
     #[test]
-    fn only_eexist_for_a_held_id_and_eperm_are_the_added_ids() {
+    fn only_eexist_and_eperm_may_be_the_added_ids() {
         use super::SetTidFailure;
         assert_eq!(
-            super::set_tid_failure(Errno::EEXIST, true),
+            super::set_tid_failure(Errno::EEXIST),
             Some(SetTidFailure::Taken)
         );
-        assert_eq!(super::set_tid_failure(Errno::EEXIST, false), None);
         assert_eq!(
-            super::set_tid_failure(Errno::EPERM, false),
+            super::set_tid_failure(Errno::EPERM),
             Some(SetTidFailure::NotPermitted)
         );
         for errno in [
@@ -1336,7 +1358,7 @@ mod tests {
             Errno::EAGAIN,
             Errno::EINTR,
         ] {
-            assert_eq!(super::set_tid_failure(errno, true), None, "{errno}");
+            assert_eq!(super::set_tid_failure(errno), None, "{errno}");
         }
     }
 
