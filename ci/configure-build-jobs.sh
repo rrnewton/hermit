@@ -3036,7 +3036,7 @@ fi
 # so the SDK and native inputs, calibrated budget, job width and the 1050
 # effective-job-second limits carry unchanged from the 66196746 entry. This is
 # not whole-runtime equivalence or a new cold-SDK timing sample.
-# CARRY TO a90e2acd50051c1dbc5551001fad447b95678810 (2026-10-27): from
+# CARRY TO f476f9ad53342759bfa11117811d80dcca096640 (2026-10-27): from
 # 38c3e024cae8063ff9d1433452b1d36b8c511133. Six commits. Three from
 # another team: 75520cbe (the ptracer host is checked again only after a
 # waker callback; reverie-ptrace/src/timer.rs and safeptrace), 016de7d3
@@ -3051,8 +3051,8 @@ fi
 # rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
 # calibrated budget, job width and limits carry unchanged from the 38c3e024
 # entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a90e2acd50051c1dbc5551001fad447b95678810 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a90e2acd50051c1dbc5551001fad447b95678810 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != f476f9ad53342759bfa11117811d80dcca096640 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie f476f9ad53342759bfa11117811d80dcca096640 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
