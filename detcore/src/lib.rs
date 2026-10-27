@@ -1665,6 +1665,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         end_rip: None,
                         end_time: None,
                         stopless: false,
+                        instruction_offset: None,
                     },
                 );
                 let ev = with_guest_rip(guest, ev).await;
@@ -1809,6 +1810,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         &self,
         guest: &mut G,
         precise_branch: bool,
+        timer_event: bool,
     ) -> Option<Vec<SchedEvent>> {
         if self.cfg.max_timeslice.is_some() {
             let precise_timers = !guest.config().imprecise_timers;
@@ -1879,6 +1881,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             if self.cfg.use_rcb_time() && self.cfg.observes_schedevents() {
                 let mut vec = Vec::new();
+                // A PMU timer armed past its branch target
+                // (`--chaos-instruction-offset`) that stopped the thread at or
+                // past that target ended these branches: the batch records
+                // where the timer was armed, so a schedule replay arms it again
+                // (`trace_schedevent`). Only the timer's own event: a syscall
+                // or trap among its steps ends the batch where the guest
+                // decides, which a replay reaches without the timer.
+                let instruction_offset = timer_event
+                    .then_some(guest.thread_state().armed_instruction_offset)
+                    .flatten()
+                    .filter(|offset| clock_value >= offset.rcb_target);
                 let ev = with_guest_time(
                     guest,
                     SchedEvent::branches(
@@ -1886,7 +1899,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                         delta_rcbs
                             .try_into()
                             .expect("should not have more than 2^32 branches at once"),
-                    ),
+                    )
+                    .with_instruction_offset(instruction_offset),
                 );
                 let ev = if guest.thread_state().replaying_lone_slice_end.is_some() {
                     // A slice end taken without a stop: the guest stopped
@@ -1921,6 +1935,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             end_rip: None,
                             end_time: None,
                             stopless: false,
+                            instruction_offset: None,
                         },
                     );
                     // Fill in end_rip because current rip represents the end of this event.
@@ -2288,6 +2303,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     end_rip: None,
                     end_time: Some(nanos),
                     stopless: false,
+                    instruction_offset: None,
                 },
                 true,
                 access,
@@ -2383,6 +2399,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     end_rip: None,
                     end_time: Some(nanos),
                     stopless: false,
+                    instruction_offset: None,
                 },
                 true,
                 access,
@@ -2621,6 +2638,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     now - thread_state_committed,
                     target - thread_state_committed,
                 );
+                // The timer re-armed here takes no steps, so the batch it
+                // ends records no offset (`update_logical_time_rcbs`).
+                guest.thread_state_mut().armed_instruction_offset = None;
                 TimerSchedule::Rcbs(1)
             }
         };
@@ -2723,6 +2743,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         boundary: CheckIn,
         entry: Option<slice_boundary::callbacks::Callback>,
     ) -> Option<preemptions::callback_history::Token> {
+        let timer_event = matches!(entry, Some(slice_boundary::callbacks::Callback::PmuTimer));
         let mut token = preemptions::callback_history::begin(guest.thread_state_mut(), entry)
             .unwrap_or_else(|error| crate::scheduler::exit_on_scheduler_refusal(&error));
         // A handler that left early (an error return) may not have cleared
@@ -2732,7 +2753,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest.thread_state_mut().yield_after_futex_wake = false;
         guest.thread_state_mut().returned_from_sigreturn = false;
         let dettid = guest.thread_state().dettid;
-        let evs = self.update_logical_time_rcbs(guest, precise_branch).await;
+        let evs = self
+            .update_logical_time_rcbs(guest, precise_branch, timer_event)
+            .await;
 
         if guest.thread_state().replaying_lone_slice_end.is_some() {
             // The guest is stopped later, not at this end: its registers are
@@ -3309,6 +3332,35 @@ impl<T: RecordOrReplay> Detcore<T> {
                     LogicalTime::ZERO
                 };
                 (logical_remaining, target - current_pmu_rcbs)
+            } else if let Some(offset) =
+                replay_offset.filter(|_| self.cfg.replay_schedule_from.is_some())
+            {
+                // A schedule replay of a preemption recorded past its branch
+                // target (`trace_schedevent`): the replayer's timeslice runs
+                // to the end of the recorded batch of branches, which can lie
+                // up to one branch per step beyond the target, so the timer is
+                // armed at the recorded target and steps instead, exactly as
+                // it was recorded. At or past the target, the recorded point
+                // can no longer be reached, as in a preemption replay.
+                let logical_remaining = max_timeslice_end - current_time;
+                let rcbs =
+                    match replay_timer_target(Some(offset), offset.rcb_target, current_pmu_rcbs) {
+                        ReplayTimer::Recorded(target) => target - current_pmu_rcbs,
+                        ReplayTimer::InsideOffset(offset) => {
+                            report_replay_inside_offset(
+                                self.cfg.panic_on_rcb_overshoot,
+                                offset,
+                                current_pmu_rcbs,
+                            );
+                            replay_offset = None;
+                            guest.thread_state_mut().replay_instruction_offset = None;
+                            // The timer fires at the next branch, without
+                            // steps, and the slice runs on to the replayer's
+                            // deadline, in a run already marked.
+                            1
+                        }
+                    };
+                (logical_remaining, rcbs)
             } else {
                 let logical_remaining = max_timeslice_end - current_time;
                 (
@@ -3362,7 +3414,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // never is.
                 let armed_offset = if !timer_is_max {
                     None
-                } else if replay_rcb_end.is_some() {
+                } else if replay_rcb_end.is_some() || self.cfg.replay_schedule_from.is_some() {
+                    // A preemption replay's row, or a schedule replay's
+                    // recorded batch of branches (`None` for one recorded at
+                    // its branch target).
                     replay_offset
                 } else {
                     let instructions = guest.thread_state().slice_instruction_offset;
@@ -4642,6 +4697,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         end_rip: None,
                         end_time: Some(nanos),
                         stopless: false,
+                        instruction_offset: None,
                     },
                     true,
                 )
@@ -4733,6 +4789,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                         end_rip: None,
                         end_time: None,
                         stopless: false,
+                        instruction_offset: None,
                     },
                 );
                 trace_schedevent(guest, ev, true).await;

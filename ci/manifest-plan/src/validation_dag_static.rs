@@ -1279,7 +1279,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // only_a_chaos_instruction_offset_needs_a_stop_at_every_slice_end
     // (--chaos-instruction-offset): 1958.
     // And chaos_instruction_offset_never_enters_the_legacy_form: 1959.
-    ("test.regular_crates", 1959),
+    // And detcore-model's
+    // an_absent_offset_leaves_an_event_unchanged_and_a_present_one_round_trips
+    // (schedule events carry --chaos-instruction-offset's offsets): 1963.
+    // And hermit-verify's
+    // a_split_keeps_the_instruction_offset_on_the_fragment_that_ends_the_batch
+    // and split_branches_in_file_leaves_an_offset_batch_whole: 1963.
+    // And hermit-verify's
+    // interpolation_refuses_a_newer_record_before_reading_its_settings: 1963.
+    ("test.regular_crates", 1963),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -2013,7 +2021,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 1338.
     // And rundata's
     // a_prefix_trial_of_offset_rows_keeps_its_timing_at_every_length: 1227.
-    ("test.hermit_unit", 1227),
+    // And three units of --chaos-instruction-offset in analyze: phases'
+    // analyze_carries_instruction_offsets_through_its_trials, minimize's
+    // minimizing_keeps_each_rows_branch_target_and_instruction_offset and
+    // schedule_search's
+    // a_spliced_branch_batch_keeps_its_instruction_offset_with_its_end: 1232.
+    // And bisect_replays_offset_schedules_without_chaos and
+    // an_offset_batch_is_not_split: 1232.
+    ("test.hermit_unit", 1232),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -3328,7 +3343,19 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // rows_alone_with_instruction_offsets_follow_format_one_timing: 3486.
     // And a_record_that_drops_its_background_starts_keeps_its_offsets_format_and_says_so: 3487.
     // And a_record_that_drops_its_starts_drops_its_stopless_marks_and_keeps_its_offsets: 3488.
-    ("test.detcore_unit", 3488),
+    // And six units of schedule-trace instruction offsets: preemptions'
+    // format stamping and minimized rows, the replayer's offset beside its
+    // timeslice and its desync, the scheduler's hand-off with a grant, and the
+    // hooks arming a schedule replay's recorded offset: 3500.
+    // And a_record_is_read_only_in_a_format_this_hermit_reads and
+    // an_edit_of_a_rows_only_record_keeps_it_rows_only: 3500.
+    // And a_resume_exec_answer_carries_its_grants_offset_and_a_start_grant_drops_it:
+    // 3052.
+    // And a_boundary_recording_holding_an_instruction_offset_is_malformed:
+    // 3053.
+    // And a_control_answer_leaves_the_replay_pair_staged_together and
+    // an_envelope_states_its_format_only_inside_it: 3500.
+    ("test.detcore_unit", 3500),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -4708,7 +4735,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (tests/c/branch_free_race.c, x86_64 only): 789. Both need strict exact
     // PMU stops, so they are skipped by exact name here and run in
     // privileged-test.pmu_cli_cases: 789 - 2 = 787, listed.
-    ("test.cli", 794),
+    // And an_instruction_offset_record_replays_from_its_schedule_and_analyze_verifies_its_endpoints
+    // (tests/c/branch_free_race.c, x86_64 only): 795.
+    ("test.cli", 795),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5346,7 +5375,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two --chaos-instruction-offset tests, not excluded: 715.
     // And the same two --chaos-instruction-offset tests: 708, skipped by
     // exact name as in test.cli: 708 - 2 = 706, listed.
-    ("test.cli_on_host", 713),
+    // And the same schedule-replay and analyze offset test, not excluded: 714.
+    ("test.cli_on_host", 714),
     // The hosted twin carries the local regular_crates selection minus its
     // 14 PMU/timer/replay skips: 1959 - 14 = 1945 (run1470 recount).
     // The same two composite-verdict units: 1945 + 2 = 1947 (carried).
@@ -5366,8 +5396,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same detcore-model builder unit: 1937 + 1 = 1938.
     // Rebased onto main c1f3085da: 1941 + 1 = 1942.
     // Rebased onto main fcd62385f: 1942 + 1 = 1943.
-    // And the cases added since, as this twin's entry further down counts: 1945.
-    ("test.regular_crates_on_host", 1945),
+    // And the cases added since, as this twin's entry further down counts: 1949.
+    ("test.regular_crates_on_host", 1949),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
@@ -5934,7 +5964,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two record-format fence units: 3486.
     // And a_record_that_drops_its_background_starts_keeps_its_offsets_format_and_says_so: 3487.
     // And a_record_that_drops_its_starts_drops_its_stopless_marks_and_keeps_its_offsets: 3488.
-    ("test.detcore_unit_on_host", 3488),
+    // And the same six schedule-trace offset units: 3500.
+    // And the same two record-format units: 3500.
+    // And the same replay-grant unit: 3500.
+    // And the same malformed boundary-recording unit: 3500.
+    // And the same control-answer and envelope-format units: 3500.
+    ("test.detcore_unit_on_host", 3500),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -6367,7 +6402,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two --chaos-instruction-offset run units: 1219.
     // And the same time_skip_carry rows-alone unit: 1220.
     // And the same rundata prefix-timing unit: 1221.
-    ("test.hermit_unit_on_host", 1221),
+    // And the same three analyze offset units: 1226.
+    // And the same bisect and splitting units: 1226.
+    ("test.hermit_unit_on_host", 1226),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -6616,7 +6653,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Rebased onto main fcd62385f: 1942 + 1 = 1943.
     // And the same --chaos-instruction-offset detcore-model unit: 1944.
     // And the same legacy-form unit: 1945.
-    ("test.regular_crates_on_host", 1945),
+    // And the same schedule-event offset unit: 1949.
+    // And the same two hermit-verify splitting units: 1949.
+    // And the same hermit-verify interpolation unit: 1949.
+    ("test.regular_crates_on_host", 1949),
     // The local 192 less the PMU-timer case the hosted twin excludes by name
     // (validation_dag::HOSTED_PORTABLE_PMU_TIMER_RR_TESTS): 191.
     // Less the case the 2026-10-17 test audit deleted: 190.

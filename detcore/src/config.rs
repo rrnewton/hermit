@@ -425,14 +425,14 @@ mod tests {
         // added to it, or a change to which fields its `Serialize` writes,
         // changes the digest; a doc line does not.
         let grown = schedule.replacen(
-            "    pub stopless: bool,\n}",
-            "    pub stopless: bool,\n    pub added: u32,\n}",
+            "    pub instruction_offset: Option<InstructionOffset>,\n}",
+            "    pub instruction_offset: Option<InstructionOffset>,\n    pub added: u32,\n}",
             1,
         );
         assert_ne!(grown, schedule);
         assert_ne!(definition_digest(source, payload, &grown, replayer), digest);
         let carried = schedule.replacen(
-            "let written_stopless = *stopless || !serializer.is_human_readable();",
+            "let written_stopless = *stopless || binary;",
             "let written_stopless = *stopless;",
             1,
         );
