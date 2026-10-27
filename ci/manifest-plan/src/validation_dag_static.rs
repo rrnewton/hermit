@@ -1854,7 +1854,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // two_agreeing_replays_classify_a_schedule_after_an_outlier}: 1191.
     // And phases::tests::a_prefix_trial_keeps_the_target_checkpoints_within_its_prefix
     // (a prefix trial keeps the callback checkpoints its events reach): 1192.
-    ("test.hermit_unit", 1192),
+    // (a prefix trial keeps the callback checkpoints of the slices its events
+    // end): 1106.
+    // And phases::tests::a_prefix_report_says_when_both_stacks_are_one_thread: 1193.
+    ("test.hermit_unit", 1193),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -5757,7 +5760,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Train 6 recount (measured on 21f770f6 base): 1181.
     // And the same four analyze --prefix-search tests: 1185.
     // And the same prefix-trial checkpoint test: 1186.
-    ("test.hermit_unit_on_host", 1186),
+    // And the same one-thread prefix report test: 1187.
+    ("test.hermit_unit_on_host", 1187),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

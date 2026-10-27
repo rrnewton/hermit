@@ -153,15 +153,20 @@ fn workloads() -> &'static AnalyzeWorkloads {
     })
 }
 
-/// Runs `hermit analyze --search` over `guest` and returns the combined
-/// stdout+stderr, asserting a successful exit and that at least one guest stack
-/// trace was printed. `expected_output`, when non-empty, must also appear (used
-/// to pin the blamed source line).
+/// Runs `hermit analyze --search` over `guest` and returns its report file,
+/// asserting a successful exit and that at least one guest stack trace was
+/// printed. `expected_output`, when non-empty, must also appear in the
+/// combined stdout+stderr (used to pin the blamed source line).
 ///
 /// Mirrors `tests/util/hermit_analyze_test.sh`: `--analyze-seed=0 --search`,
 /// then a chaotic run with a tight preemption timeout so the search has enough
 /// scheduling change points to expose the race.
-fn run_analyze(label: &str, guest: &Path, analyze_opts: &[&str], expected_output: &str) {
+fn run_analyze(
+    label: &str,
+    guest: &Path,
+    analyze_opts: &[&str],
+    expected_output: &str,
+) -> serde_json::Value {
     let _guard = analyze_lock();
     let report_dir = tempfile::tempdir().expect("failed to create analyze report directory");
     let report_file = report_dir.path().join("report.json");
@@ -215,6 +220,10 @@ fn run_analyze(label: &str, guest: &Path, analyze_opts: &[&str], expected_output
         warnings.first().copied(),
         "{label}: {report}\n{combined}"
     );
+    let report = fs::read_to_string(&report_file)
+        .unwrap_or_else(|error| panic!("{label}: no report file: {error}\n{combined}"));
+    serde_json::from_str(&report)
+        .unwrap_or_else(|error| panic!("{label}: unreadable report file: {error}\n{report}"))
 }
 
 /// Exercises analyze's fail-closed endpoint check for a workload whose target
@@ -284,11 +293,14 @@ fn analyze_racewrite_nostdlib() {
 
 /// `--prefix-search` finds the same race from the target schedule alone: the
 /// deciding event is the parent's return from fork, and the thread the
-/// scheduler would run there instead is the child at its racing write.
+/// scheduler would run there instead is the child at its racing write. The
+/// parent's slice ends right after that return in the target schedule, and a
+/// trial that stops there leaves that slice end to the scheduler; one that
+/// replayed it would name the parent's next event, one too late.
 #[test]
 #[ignore = "slow: bisecting chaos schedules; requires PMU branch counters and working mount namespaces"]
 fn analyze_racewrite_nostdlib_prefix_search() {
-    run_analyze(
+    let report = run_analyze(
         "analyze racewrite_nostdlib --prefix-search",
         &workloads().racewrite_nostdlib,
         &[
@@ -298,6 +310,16 @@ fn analyze_racewrite_nostdlib_prefix_search() {
             "--target-stdout=foobar",
         ],
         "racewrite_nostdlib.c:35",
+    );
+    let header = report["header"].as_str().unwrap_or_default();
+    assert!(header.contains("Syscall(fork, Posthook)"), "{report}");
+    let thread = |event: &str| report[event]["stack"]["thread_id"].as_i64();
+    assert!(thread("critical_event1").is_some(), "{report}");
+    assert!(thread("critical_event2").is_some(), "{report}");
+    assert_ne!(
+        thread("critical_event1"),
+        thread("critical_event2"),
+        "{report}"
     );
 }
 

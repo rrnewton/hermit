@@ -163,11 +163,19 @@ impl PreemptionRecord {
     /// does not run, progress-0 ones included.
     ///
     /// Progress alone places a checkpoint, so one taken at exactly the
-    /// progress a thread reaches at the prefix end is kept. That is the
-    /// checkpoint which ended the thread's last slice in the prefix; another
-    /// one at the same progress, from a later callback of the same handler
-    /// after other threads ran past the prefix, is kept too, and the replay
-    /// applies it only when its recorded time and branch count are reached.
+    /// progress a thread reaches at the prefix end is kept: it ended the
+    /// thread's last slice in the prefix. Another one at the same progress,
+    /// from a later callback of the same handler after other threads ran past
+    /// the prefix, is kept too, and the replay applies it only when its
+    /// recorded time and branch count are reached.
+    ///
+    /// The thread that runs the prefix's last event is the exception while
+    /// another event follows: its checkpoints at the progress that event
+    /// reaches end its slice at the prefix's own end, which decides what runs
+    /// next, so they belong to the event after the prefix and are dropped. A
+    /// replay of the prefix then lets that thread run on, as it does past any
+    /// event the prefix leaves out. A prefix of the whole schedule keeps the
+    /// record's checkpoints.
     ///
     /// The per-thread histories stay whole, for the rows the checkpoints
     /// name; a schedule replay reads only the events and the checkpoints.
@@ -180,6 +188,7 @@ impl PreemptionRecord {
             signal_state_copy,
             callback_checkpoints,
         } = self;
+        let followed = len < global.len();
         let global = global[..len.min(global.len())].to_vec();
         let mut reached = BTreeMap::<DetTid, callback_history::Progress>::new();
         for event in &global {
@@ -188,13 +197,26 @@ impl PreemptionRecord {
                 .or_default()
                 .observe_event(event);
         }
+        // The thread whose slice is still running at the prefix's end: the
+        // last event's, when that event advances it and another one follows.
+        let running = global
+            .last()
+            .filter(|last| followed && last.count > 0)
+            .map(|last| last.dettid);
         let callback_checkpoints = callback_checkpoints
             .iter()
             .filter_map(|(tid, points)| {
                 let reached = reached.get(tid)?.count;
+                let within = |progress: u64| {
+                    if running == Some(*tid) {
+                        progress < reached
+                    } else {
+                        progress <= reached
+                    }
+                };
                 let kept: Vec<_> = points
                     .iter()
-                    .filter(|point| point.origin.progress <= reached)
+                    .filter(|point| within(point.origin.progress))
                     .cloned()
                     .collect();
                 (!kept.is_empty()).then_some((*tid, kept))
@@ -1314,11 +1336,12 @@ mod tests {
     }
 
     /// A replay of a schedule's first events keeps the callback checkpoints
-    /// those events reach, for the threads they run, and no later ones; the
-    /// result still validates, and lends its checkpoints to a schedule that
-    /// replayed it and went on.
+    /// of the slices those events end, for the threads they run, and no later
+    /// ones: the slice end at the prefix's own end belongs to the event after
+    /// it. The result still validates, and lends its checkpoints to a
+    /// schedule that replayed it and went on.
     #[test]
-    fn a_schedule_prefix_keeps_the_checkpoints_its_events_reach() {
+    fn a_schedule_prefix_keeps_the_checkpoints_of_the_slices_its_events_end() {
         use callback_history::Checkpoint;
         use callback_history::Origin;
         use callback_history::Site;
@@ -1362,6 +1385,8 @@ mod tests {
             point(main, 0, 10, Op::Branch),
             point(main, 1, 11, Op::OtherInstructions),
             point(main, 2, 21, Op::Branch),
+            // A later callback at the same progress, after the schedule ends.
+            point(main, 3, 21, Op::Branch),
         ];
         let other_points = vec![point(other, 0, 4, Op::Branch)];
         let late_points = vec![point(late, 0, 6, Op::Branch)];
@@ -1383,15 +1408,31 @@ mod tests {
             prefix.callback_checkpoints
         };
         assert!(kept(0).is_empty());
-        assert_eq!(kept(1), BTreeMap::from([(main, main_points[..1].to_vec())]));
+        // Each prefix of 1 to 4 events stops where its last event's slice
+        // ends (main's at 10, other's at 4, main's at 11, main's two at 21),
+        // so it drops those checkpoints and keeps the earlier ones.
+        assert!(kept(1).is_empty());
+        assert_eq!(kept(2), BTreeMap::from([(main, main_points[..1].to_vec())]));
         assert_eq!(
             kept(3),
+            BTreeMap::from([
+                (main, main_points[..1].to_vec()),
+                (other, other_points.clone()),
+            ])
+        );
+        assert_eq!(
+            kept(4),
             BTreeMap::from([
                 (main, main_points[..2].to_vec()),
                 (other, other_points.clone()),
             ])
         );
+        // The whole schedule has no event after it, nor has a longer prefix.
         assert_eq!(kept(5), record.callback_checkpoints);
+        assert_eq!(
+            record.schedule_prefix(9).callback_checkpoints,
+            record.callback_checkpoints
+        );
 
         // A schedule that replayed the prefix and went on takes the prefix's
         // checkpoints; one whose events they do not fit does not.
