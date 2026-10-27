@@ -115,6 +115,8 @@ mod tests {
         (12, "ab01c6abb5daa6d7", "dafaa96d8b8cb3ad"), // Adds `GlobalRequest::SigkillDyingThreads`, `GlobalRequest::RecordSigkillRobustLists`, `GlobalRequest::TakeSigkillRobustList` and the matching responses
         // (https://github.com/rrnewton/hermit/pull/4760, renumbered to 13 at landing).
         (13, "78e513d0fe279099", "dafaa96d8b8cb3ad"),
+        (14, "edaba1a0186b437c", "dafaa96d8b8cb3ad"), // Adds `GlobalRequest::NextGuestId`, `GlobalRequest::GaveHostId`; adds `GlobalResponse::NextGuestId`, `GlobalResponse::GaveHostId`
+        // (https://github.com/rrnewton/hermit/pull/4725, renumbered to 14 at integration; digest measured at this head).
     ];
 
     /// The lines of code, without comments or blank lines, of the type that
