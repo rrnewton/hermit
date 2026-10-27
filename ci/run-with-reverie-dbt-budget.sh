@@ -2965,7 +2965,22 @@ fi
 # so the SDK and native inputs, calibrated budget, job width and the 1050
 # effective-job-second limits carry unchanged from the 66196746 entry. This is
 # not whole-runtime equivalence or a new cold-SDK timing sample.
-expected_pin=38c3e024cae8063ff9d1433452b1d36b8c511133
+# CARRY TO a90e2acd50051c1dbc5551001fad447b95678810 (2026-10-27): from
+# 38c3e024cae8063ff9d1433452b1d36b8c511133. Six commits. Three from
+# another team: 75520cbe (the ptracer host is checked again only after a
+# waker callback; reverie-ptrace/src/timer.rs and safeptrace), 016de7d3
+# (reverie-process spawns a child with a chosen process ID) and 2b524fe1
+# (kernels built without PID namespaces are accepted). Three LiteInst
+# publication commits (c784ee8d, 7aba0ad0, a90e2acd): Tool publication uses
+# private non-inlined scalar boundaries and the artifact qualifier
+# authenticates the complete emitted compositions for the HOST and pinned
+# compilers (reverie-inguest/src/guest/tool_region*.rs and
+# reverie-liteinst-artifact/src/lib.rs). git diff is empty under
+# reverie-dbt/ and third-party/ and for the root Cargo.toml, Cargo.lock and
+# rust-toolchain.toml, so the inventory (1015), SDK and native inputs,
+# calibrated budget, job width and limits carry unchanged from the 38c3e024
+# entry.
+expected_pin=a90e2acd50051c1dbc5551001fad447b95678810
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
