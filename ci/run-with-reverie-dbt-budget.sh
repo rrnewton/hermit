@@ -2862,7 +2862,15 @@ fi
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory, SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the ad1af851 entry.
-expected_pin=a28d74243feca0fd7231a4baf0da3de7658dc39f
+# CARRY TO 6e4a9cdd0cb920577eedc37edbf1830692cb5404 (2026-10-27): from
+# a28d74243feca0fd7231a4baf0da3de7658dc39f. Counter1 reporting now follows
+# configured RPC ownership; examples share client discovery and CI prepares it.
+# The runtime Rust source changes, so this is not whole-DBT-tree equivalence.
+# SDK inputs remain vendor/dynamorio tree 4ab89708f2e9 and build.rs blob
+# ff1eeb32b140; native sources and inventory are unchanged. Existing SDK budget,
+# width and limits carry without recalibration. Fresh focused Counter1 runtime
+# controls are retained separately; this carry makes no Hermit runtime claim.
+expected_pin=6e4a9cdd0cb920577eedc37edbf1830692cb5404
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

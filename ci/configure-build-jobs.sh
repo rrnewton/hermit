@@ -2938,8 +2938,11 @@ fi
 #     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
 # so the inventory, SDK and native inputs, calibrated budget, job width
 # and limits carry unchanged from the ad1af851 entry.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a28d74243feca0fd7231a4baf0da3de7658dc39f ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a28d74243feca0fd7231a4baf0da3de7658dc39f (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 6e4a9cdd0cb920577eedc37edbf1830692cb5404: SDK/native inputs and limits
+# are unchanged; Counter1 runtime reporting changed. See the matching source
+# carry in run-with-reverie-dbt-budget.sh; no new SDK calibration is claimed.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6e4a9cdd0cb920577eedc37edbf1830692cb5404 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 6e4a9cdd0cb920577eedc37edbf1830692cb5404 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
