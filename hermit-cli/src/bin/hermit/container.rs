@@ -3322,6 +3322,7 @@ pub(super) mod declared_inputs {
     mod tests {
         use super::super::super::native_exec_inputs::OpenedGuestRoot;
         use super::*;
+        use crate::container_clone::CheckedClone;
 
         fn requested_copy(path: &[u8], source: &File, executable: bool) -> RootCopy {
             let source_identity = checked_file_identity(source, executable, true).unwrap();
@@ -3387,6 +3388,9 @@ pub(super) mod declared_inputs {
 
         #[test]
         fn actual_readonly_root_backings_group_aliases_and_refuse_changed_owners() {
+            if crate::test_isolation::rerun_alone() {
+                return;
+            }
             let inputs = data_inputs();
             let source =
                 super::super::super::native_exec_inputs::seal_bytes(b"same bytes", InputRole::Data)
@@ -3433,7 +3437,7 @@ pub(super) mod declared_inputs {
             let mut container = super::super::default_container(false);
             plan.configure(&mut container).unwrap();
             let result: Result<(), String> = container
-                .run(|| {
+                .checked_run(|| {
                     let mut work = || -> Result<()> {
                         let prepared = unsafe { plan.materialize()? };
                         let a_path = GuestPath::new(b"/a".to_vec())?;
@@ -3793,6 +3797,9 @@ pub(super) mod declared_inputs {
             use std::os::unix::fs::FileTypeExt;
             use std::os::unix::net::UnixListener;
 
+            if crate::test_isolation::rerun_alone() {
+                return;
+            }
             use super::super::super::native_exec_run::NativeEndpoints;
 
             fn socket_view(path: &Path) -> (u64, u64, u32, libc::c_ulong) {
@@ -3883,7 +3890,7 @@ pub(super) mod declared_inputs {
             let mut container = super::super::default_container(false);
             plan.configure(&mut container).unwrap();
             container
-                .run(|| {
+                .checked_run(|| {
                     let namespace = std::fs::metadata("/proc/self/ns/mnt").unwrap();
                     assert_ne!((namespace.dev(), namespace.ino()), parent_namespace);
                     for (kind, source) in expected {
@@ -3918,7 +3925,9 @@ pub(super) mod declared_inputs {
             let _replacement = UnixListener::bind(&short_rpc).unwrap();
             let mut container = super::super::default_container(false);
             replaced.configure(&mut container).unwrap();
-            match container.run(|| -> () { panic!("replacement endpoint reached workload") }) {
+            match container
+                .checked_run(|| -> () { panic!("replacement endpoint reached workload") })
+            {
                 Err(reverie::process::RunError::Spawn(error)) => {
                     assert_eq!(error.context(), reverie::process::Context::Mount);
                     assert_eq!(
@@ -3933,6 +3942,9 @@ pub(super) mod declared_inputs {
 
         #[test]
         fn actual_common_container_materializes_readonly_data_and_same_task_proc() {
+            if crate::test_isolation::rerun_alone() {
+                return;
+            }
             // Filesystem component only: no Tool installation/native filter,
             // InstalledExecDomain or native exec success is represented here.
             // Init builds the graph; a real forked guest child binds its proc.
@@ -3941,7 +3953,7 @@ pub(super) mod declared_inputs {
             let mut container = super::super::default_container(false);
             plan.configure(&mut container).unwrap();
             let result: Result<(i32, i32, [u8; 8]), String> = container
-                .run(|| {
+                .checked_run(|| {
                     let mut work = || -> Result<_> {
                         let mut prepared = unsafe { plan.materialize()? };
                         assert_ne!(prepared.mount_id(), 0);
@@ -5406,6 +5418,7 @@ mod readonly_proc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::container_clone::CheckedClone;
 
     /// A rewrite for a mount the snapshot lacks (a user bind's recursive copy
     /// whose host directory was removed, detaching it) is dropped; every
@@ -5492,7 +5505,7 @@ mod tests {
         T: serde::Serialize + serde::de::DeserializeOwned,
     {
         Container::new()
-            .run(body)
+            .checked_run(body)
             .expect("the isolated test process should run to completion")
             .unwrap_or_else(|error| panic!("{error}"))
     }
@@ -5926,12 +5939,15 @@ mod tests {
     /// (`mnt_already_visible`).
     #[test]
     fn the_placeholder_directory_mounts_and_leaves_procfs_mountable() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let facts = Container::new()
-            .run(|| {
+            .checked_run(|| {
                 let mut container = default_container(false);
                 container.mount(directory_placeholder_mount(DIRECTORY_PLACEHOLDER));
                 container
-                    .run(placeholder_directory_facts)
+                    .checked_run(placeholder_directory_facts)
                     .map_err(|error| format!("{error:?}"))?
             })
             .unwrap()
@@ -5957,10 +5973,10 @@ mod tests {
         }
         // The outer child confines the irreversible seccomp filter to this test.
         let (mounts, status) = Container::new()
-            .run(|| {
+            .checked_run(|| {
                 readonly_proc::deny_writable_mounts().map_err(|error| error.to_string())?;
                 default_container(false)
-                    .run(namespace_proc_contents)
+                    .checked_run(namespace_proc_contents)
                     .map_err(|error| format!("{error:?}"))?
             })
             .unwrap()
@@ -5983,7 +5999,7 @@ mod tests {
         }
 
         let (mounts, status) = Container::new()
-            .run(|| {
+            .checked_run(|| {
                 readonly_proc::deny_writable_mounts().map_err(|error| error.to_string())?;
                 let (mut container, _identity) =
                     image_container(rootfs.path(), tmpfs.path(), false, true, true)
@@ -5991,7 +6007,7 @@ mod tests {
                 // This closure is already loaded, so the image needs no executable
                 // or libraries. It reads the proc mount after entering the chroot.
                 container
-                    .run(namespace_proc_contents)
+                    .checked_run(namespace_proc_contents)
                     .map_err(|error| format!("{error:?}"))?
             })
             .unwrap()
@@ -6035,7 +6051,7 @@ mod tests {
         let flags = Container::new()
             .map_root()
             .mount(Mount::tmpfs(&base_path).flags(MountFlags::MS_NOSUID | MountFlags::MS_NODEV))
-            .run(move || -> Result<(bool, bool, bool), String> {
+            .checked_run(move || -> Result<(bool, bool, bool), String> {
                 let rootfs = base_path.join("rootfs");
                 let tmpfs = base_path.join("scratch");
                 for directory in ["proc", "tmp", "dev/pts"] {
@@ -6049,7 +6065,7 @@ mod tests {
                     image_container(&rootfs, &tmpfs, false, true, true)
                         .map_err(|error| error.to_string())?;
                 container
-                    .run(root_mount_flags)
+                    .checked_run(root_mount_flags)
                     .map_err(|error| format!("{error:?}"))?
             })
             .expect("run the outer namespace holding the nosuid,nodev filesystem")

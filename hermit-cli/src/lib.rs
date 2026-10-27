@@ -10,6 +10,11 @@
 #![doc = include_str!("../README.md")]
 #![deny(clippy::all)]
 #![allow(clippy::uninlined_format_args)]
+// hermit-cli/clippy.toml sends every container clone through
+// bin/hermit/container_clone.rs, which checks that a unit test of the hermit
+// binary clones alone in its process. This library's own unit tests, a test
+// binary of their own, still clone directly.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
 
 // This host library retains LiteInst code without becoming an in-guest Tool
 // image. Declare its historical backing explicitly and keep the host allocator;

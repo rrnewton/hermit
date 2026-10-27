@@ -9511,6 +9511,8 @@ impl RunOpts {
         let Some(skid_margin) = self.skid_margin else {
             return Ok(());
         };
+        #[cfg(test)]
+        crate::test_isolation::assert_alone_before_setting_the_skid_margin();
         reverie_ptrace::set_skid_margin_override(skid_margin).map_err(|_| {
             anyhow::anyhow!(
                 "Reverie PMU configuration was initialized before --skid-margin could be applied"
@@ -13408,6 +13410,7 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+    use crate::container_clone::CheckedClone;
 
     /// The outer package gate owns source/qualification binding. This selected
     /// test requires its actual installation and the regular-file stdin-cat
@@ -14021,6 +14024,9 @@ mod tests {
     #[test]
     #[cfg(feature = "native-exec")]
     fn native_observer_plan_reaches_eof_while_parent_waits() {
+        if crate::test_isolation::rerun_alone() {
+            return;
+        }
         let options = forwarding_plan_options(true);
         let staging = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
         let endpoints =
@@ -14365,7 +14371,7 @@ mod tests {
         let path = dir.path().join("verify.json");
         write_pending_verification_json(&path).unwrap();
         let output = run_verification_execution(Some(&path), VerificationRun::Run1, || {
-            super::super::container::classify_container_result(Container::new().run(|| {
+            super::super::container::classify_container_result(Container::new().checked_run(|| {
                 Ok::<_, hermit::SerializableError>(Output {
                     status: ExitStatus::Signaled(reverie::process::Signal::SIGALRM, false),
                     stdout: b"returned guest output".to_vec(),
