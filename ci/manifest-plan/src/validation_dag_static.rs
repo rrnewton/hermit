@@ -1924,7 +1924,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // H1 host-input evidence adds one hermit-run unit: 1289 + 1 = 1290.
     // The integrated chain adds twenty-nine hermit-run units: 1290 + 29 =
     // 1319, re-measured at 4892f76e6a (1319 passed in the full validate).
-    ("test.hermit_unit", 1319),
+    // And bisect::tests::bisect_replays_with_the_guest_random_seed_its_schedules_were_recorded_under
+    // and analyze::phases::tests::analyze_replays_records_with_the_guest_random_seed_they_were_recorded_under
+    // and analyze::phases::tests::analyze_trials_of_a_seeded_target_take_its_guest_random_seed
+    // (https://github.com/rrnewton/hermit/issues/4868): 1322.
+    ("test.hermit_unit", 1322),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -6023,7 +6027,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same PR 4912 unit: 1282 + 1 = 1283.
     // The same H1 path-fallback unit: 1283 + 1 = 1284.
     // The same twenty-nine integrated-chain units: 1284 + 29 = 1313.
-    ("test.hermit_unit_on_host", 1313),
+    // And the same three trial-guest-random-seed units: 1316.
+    ("test.hermit_unit_on_host", 1316),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -11336,7 +11341,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"super"########,
         job: r########"weekly_portable_chaos_cases"########,
         desc: r########"Weekly portable chaos cases"########,
-        description: r########"Runs the non-ignored tests of hermit-cli/tests/stress_suite.rs on one thread: chaos_finds_and_reproduces_order_violation and schedule_bisect_localizes_publish_ordering_race (the --skip of slow_cas_search_and_replay has no effect, as that test is ignored). Both use `hermit run --base-env=minimal --chaos --sched-heuristic=random --max-timeslice=disabled --no-virtualize-cpuid --seed=N` on the default ptrace backend with a 10-second timeout per run, so no PMU is needed. The first requires tests/chaos/order_violation.c to print "Hello world!" without chaos, one of seeds 0-15 to expose the race, and the first such seed to reproduce "ERROR! global_str is null at use." twice. It names no seed, because the seed depends on the guest binary: 9 when built on the validation host, 8 in the pinned validate root. The second records preemptions, under one fixed epoch, for a passing and a failing publish-ordering seed among seeds 0-39 (all of 0-9 expose the race in the pinned root), then requires `hermit bisect` to localize the divergence to two adjacent events with stack traces. The binary also runs in test.hermit_integration. A failure is blocking for the super validation."########,
+        description: r########"Runs the non-ignored tests of hermit-cli/tests/stress_suite.rs on one thread: chaos_finds_and_reproduces_order_violation and schedule_bisect_localizes_publish_ordering_race (the --skip of slow_cas_search_and_replay has no effect, as that test is ignored). Both use `hermit run --base-env=minimal --chaos --sched-heuristic=random --max-timeslice=disabled --no-virtualize-cpuid --seed=N` on the default ptrace backend with a 10-second timeout per run, so no PMU is needed. The first requires tests/chaos/order_violation.c to print "Hello world!" without chaos, one of seeds 0-15 to expose the race, and the first such seed to reproduce "ERROR! global_str is null at use." twice. It names no seed, because the seed depends on the guest binary: 9 when built on the validation host, 8 in the pinned validate root. The second records preemptions, under one fixed epoch and with --rng-seed=0 (bisect refuses records made under two guest random seeds), for a passing and a failing publish-ordering seed among seeds 0-39 (all of 0-9 exposed the race in the pinned root when measured without --rng-seed; the guest reads no randomness), then requires `hermit bisect` to localize the divergence to two adjacent events with stack traces. The binary also runs in test.hermit_integration. A failure is blocking for the super validation."########,
         labels: &[r########"super"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit-run --features third-party-backends --test stress_suite -j 1 -- --skip slow_cas_search_and_replay"########,
         cmdtype: CmdType::Unknown,

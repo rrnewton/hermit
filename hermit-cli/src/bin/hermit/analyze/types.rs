@@ -145,7 +145,9 @@ pub struct AnalyzeOpts {
     pub run1_schedule: Option<PathBuf>,
 
     /// Optionally use a second chaos seed to identify the baseline run that
-    /// does NOT meet the target criteria.
+    /// does NOT meet the target criteria. It seeds the baseline's schedule
+    /// only: the baseline gives the guest the target run's random seed, as
+    /// every trial does.
     #[clap(
         long,
         conflicts_with = "run2_preemptions",
