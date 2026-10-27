@@ -2880,7 +2880,15 @@ fi
 # ff1eeb32b140; native sources and inventory are unchanged. Existing SDK budget,
 # width and limits carry without recalibration. Prior focused Counter1 runtime
 # controls are retained separately; this rebase makes no new runtime claim.
-expected_pin=08a0b573eb8a6256c77655a42e8ea6a1fe9209a8
+# CARRY TO b64a10cc1a99e66df5b195d7304ccee4a517d131 (2026-10-27): from
+# 08a0b573eb8a6256c77655a42e8ea6a1fe9209a8. DBT now accepts a borrowed GlobalRPC
+# endpoint while preserving the existing constructor and runtime transport.
+# SDK build.rs ff1eeb32b140, vendor tree 4ab89708f2e9, and native tree
+# 164356b3ab65 are byte-identical. Rust source and tests change; the DBT
+# inventory grows from 1012 to 1013. Existing SDK width and 1050 effective-job-
+# second limits carry without recalibration; Rust compatibility is checked
+# separately. This is not whole-DBT source or runtime equivalence.
+expected_pin=b64a10cc1a99e66df5b195d7304ccee4a517d131
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
