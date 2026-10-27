@@ -8252,6 +8252,41 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/signalfd-threads",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/signalfd-threads",
+          "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/signalfd-threads",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/signalfd-threads",
+          "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/signalfd-threads",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigpipe-siginfo",
           "mode": "verify",
           "backend": "dbt"
@@ -29162,6 +29197,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/signalfd-threads",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigpipe-siginfo",
           "mode": "verify",
           "backend": "ptrace"
@@ -35967,6 +36009,20 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/signalfd-create",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/signalfd-threads",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/signalfd-threads",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -56464,6 +56520,41 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/signalfd-create",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/signalfd-threads",
+          "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/signalfd-threads",
+          "mode": "verify",
+          "backend": "in-guest-trap"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/signalfd-threads",
+          "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/signalfd-threads",
+          "mode": "verify",
+          "backend": "liteinst"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/signalfd-threads",
           "mode": "verify",
           "backend": "ptrace"
         },
