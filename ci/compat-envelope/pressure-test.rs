@@ -3019,7 +3019,6 @@ fn run() -> Result<(), String> {
             println!("DAG: {}", output.display());
             println!("Results: {}", results.display());
             println!("Cell runs: {}", planned_cell_run_tags(&metadata).len());
-            print_manifest_guest_memory(&metadata);
             print_unavailable(&metadata);
             println!("Whole-run bound: {}s", metadata.run_timeout_seconds);
             print_sample(&metadata);
@@ -3082,7 +3081,6 @@ fn run() -> Result<(), String> {
             let output = results.join("dag.json");
             let run_result = (|| {
                 let (metadata, dag) = write_plan(execution_root, &results, &output, &selection)?;
-                print_manifest_guest_memory(&metadata);
                 print_unavailable(&metadata);
                 print_sample(&metadata);
                 if exact_cell {
@@ -3621,32 +3619,31 @@ fn print_sample(metadata: &RunMetadata) {
     }
 }
 
-fn print_manifest_guest_memory(metadata: &RunMetadata) {
-    let budget = metadata
-        .manifest_guest_memory_budget_bytes
-        .map_or_else(|| "unknown".into(), |bytes| bytes.to_string());
-    let required = metadata
-        .manifest_guest_memory_required_bytes
-        .map_or_else(|| "unknown".into(), |bytes| bytes.to_string());
-    let max_safe = metadata
-        .manifest_guest_max_safe_cap
-        .map_or_else(|| "unknown".into(), |cap| cap.to_string());
-    let max_safe_kvm = metadata
-        .kvm_guest_max_safe_cap
-        .map_or_else(|| "unknown".into(), |cap| cap.to_string());
-    println!(
+fn manifest_guest_memory_line(
+    manifest_guest_cap: i64,
+    kvm_guest_cap: i64,
+    required: Option<i64>,
+    headroom: Option<i64>,
+    budget: Option<i64>,
+    jobs: i64,
+    max_safe_cap: Option<i64>,
+    max_safe_kvm_cap: Option<i64>,
+) -> String {
+    let budget = budget.map_or_else(|| "unknown".into(), |bytes| bytes.to_string());
+    let required = required.map_or_else(|| "unknown".into(), |bytes| bytes.to_string());
+    let max_safe = max_safe_cap.map_or_else(|| "unknown".into(), |cap| cap.to_string());
+    let max_safe_kvm = max_safe_kvm_cap.map_or_else(|| "unknown".into(), |cap| cap.to_string());
+    format!(
         "Manifest guests: cap {} (KVM cap {}), declared peak {} bytes including retained {}-byte control headroom; observed budget {} bytes; highest safe caps at -j {}: manifest={}, KVM={}",
-        metadata.manifest_guest_cap,
-        metadata.kvm_guest_cap,
+        manifest_guest_cap,
+        kvm_guest_cap,
         required,
-        metadata
-            .manifest_guest_control_plane_headroom_bytes
-            .unwrap_or(CONTROL_PLANE_HEADROOM_BYTES),
+        headroom.unwrap_or(CONTROL_PLANE_HEADROOM_BYTES),
         budget,
-        metadata.jobs,
+        jobs,
         max_safe,
         max_safe_kvm,
-    );
+    )
 }
 
 fn print_unavailable(metadata: &RunMetadata) {
@@ -4986,6 +4983,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
             manifest_facts: &all_facts,
             preparation_by_test: &preparation_by_test,
             cell_timeout_seconds: selection.cell_timeout_seconds,
+            no_retry: selection.no_retry,
             run_timeout_seconds: limit,
             fixture_seconds: compat_fixture_seconds(&canonical)?,
         };
@@ -5250,21 +5248,36 @@ fn decode_budgets(
 /// deadline. Internal runs/seeds share the execution budget; they do not multiply
 /// it. Allow the existing 10s TERM/KILL grace per attempt, then 30s for reporting.
 /// `budget` already contains the separately resolved CPU and wall limits.
-fn outer_timeout(budget: &CellBudget) -> Result<i64, String> {
+///
+/// The attempt count follows the run's retry setting: under `--no-retry` the
+/// harness runs every repetition as exactly one attempt, so the enclosing
+/// lifecycle declares one attempt; otherwise it declares the framework's
+/// [`MAX_ATTEMPTS_PER_CELL`]. Counting the retry attempts a `--no-retry` run
+/// can never make would overstate every such run's declared occupancy.
+fn outer_timeout(budget: &CellBudget, no_retry: bool) -> Result<i64, String> {
     budget.attempts.ok_or(
         "cannot derive a wall cap for a cell whose manifest has no executable attempt recipe",
     )?;
+    let attempts = if no_retry {
+        1
+    } else {
+        MAX_ATTEMPTS_PER_CELL as i64
+    };
     budget
         .timeout_seconds
         .checked_mul(2)
         .and_then(|seconds| seconds.checked_add(10))
-        .and_then(|seconds| seconds.checked_mul(MAX_ATTEMPTS_PER_CELL as i64))
+        .and_then(|seconds| seconds.checked_mul(attempts))
         .and_then(|seconds| seconds.checked_add(30))
         .ok_or_else(|| "cell retry lifecycle exceeds the supported integer range".into())
 }
 
-fn pressure_timeout(budget: &CellBudget, selected_cap: Option<i64>) -> Result<i64, String> {
-    let required = outer_timeout(budget)?;
+fn pressure_timeout(
+    budget: &CellBudget,
+    selected_cap: Option<i64>,
+    no_retry: bool,
+) -> Result<i64, String> {
+    let required = outer_timeout(budget, no_retry)?;
     if let Some(cap) = selected_cap {
         if cap < required {
             return Err(format!(
@@ -5753,6 +5766,7 @@ fn require_cell_occupancy_fits(
     exclusive: &dyn Fn(&CellId) -> Vec<String>,
     budgets: &BTreeMap<(String, String, String), CellBudget>,
     selected_cap: Option<i64>,
+    no_retry: bool,
     run_timeout_seconds: i64,
     repetitions: usize,
     jobs: i64,
@@ -5781,7 +5795,7 @@ fn require_cell_occupancy_fits(
                     tracked.id.test, tracked.id.mode, tracked.id.backend
                 )
             })?;
-        let seconds = pressure_timeout(budget, selected_cap)?;
+        let seconds = pressure_timeout(budget, selected_cap, no_retry)?;
         let seconds = seconds.checked_mul(repetitions).ok_or_else(|| {
             "--repetitions makes the declared pressure-test occupancy exceed the supported integer range"
                 .to_string()
@@ -5991,6 +6005,7 @@ struct DeclaredChain<'a> {
     manifest_facts: &'a BTreeMap<(String, String, String), ManifestCellFacts>,
     preparation_by_test: &'a BTreeMap<String, CellId>,
     cell_timeout_seconds: Option<i64>,
+    no_retry: bool,
     run_timeout_seconds: i64,
     fixture_seconds: i64,
 }
@@ -6016,7 +6031,7 @@ impl DeclaredChain<'_> {
             Some(prepared_with) => preparation_node_timeout(self.budget(prepared_with)?)?,
             None => 0,
         };
-        let run = pressure_timeout(self.budget(cell)?, self.cell_timeout_seconds)?;
+        let run = pressure_timeout(self.budget(cell)?, self.cell_timeout_seconds, self.no_retry)?;
         let total = fixture
             .checked_add(preparation)
             .and_then(|seconds| seconds.checked_add(run))
@@ -6358,6 +6373,7 @@ fn write_plan_after_scorecard_check(
         manifest_facts: &manifest_facts,
         preparation_by_test: &preparation_by_test,
         cell_timeout_seconds: selection.cell_timeout_seconds,
+        no_retry: selection.no_retry,
         run_timeout_seconds,
         fixture_seconds: compat_fixture_seconds(&canonical)?,
     };
@@ -6376,6 +6392,7 @@ fn write_plan_after_scorecard_check(
             &exclusive,
             &budgets,
             selection.cell_timeout_seconds,
+            selection.no_retry,
             run_timeout_seconds,
             selection.run_count(),
             selection.scheduler_jobs(),
@@ -6422,17 +6439,10 @@ fn write_plan_after_scorecard_check(
         preparation_by_test.len(),
         required_builds.len() + usize::from(reads_compat_fixtures),
     )?;
-    require_cell_occupancy_fits(
-        &cells,
-        &exclusive,
-        &budgets,
-        selection.cell_timeout_seconds,
-        run_timeout_seconds,
-        selection.run_count(),
-        selection.scheduler_jobs(),
-        selection.manifest_guest_cap(),
-        selection.kvm_guest_cap(),
-    )?;
+    // The whole-population occupancy guard runs below, after the graph's
+    // declared memory has been validated: a caller sizing its width from this
+    // plan's highest safe caps (pressure_schedule's `memory_safe_guests`)
+    // must see those caps even when the occupancy guard refuses the plan.
     declared.require_cells_fit(&sampled, reads_compat_fixtures)?;
     fs::create_dir_all(results).map_err(|e| format!("cannot create {}: {e}", results.display()))?;
     // Validation creates its VALIDATE_RUN_STATE before any node runs.
@@ -6729,7 +6739,8 @@ fn write_plan_after_scorecard_check(
                 incomplete = INCOMPLETE_ATTEMPT_STATUS,
                 preparation_guard = preparation_guard,
             );
-            let wall = pressure_timeout(budget, selection.cell_timeout_seconds)?;
+            let wall =
+                pressure_timeout(budget, selection.cell_timeout_seconds, selection.no_retry)?;
             cell_timeouts.insert(tag.clone(), wall);
             // KVM's canonical privileged nodes are boxed at 16 GiB even when the
             // manifest cell itself is in the portable lane. Preserve that safety
@@ -6907,6 +6918,35 @@ fn write_plan_after_scorecard_check(
         checked_scorecard
             .memory_budget_override
             .or_else(observed_manifest_guest_memory_budget),
+    )?;
+    // Print the highest safe caps before the occupancy guard can refuse:
+    // a width-sizing caller reads them from a refused plan exactly as from
+    // a fitting one, and otherwise falls back to a width nothing checked.
+    // `plan` and `run` print this line here, not again from the metadata.
+    println!(
+        "{}",
+        manifest_guest_memory_line(
+            selection.manifest_guest_cap(),
+            selection.kvm_guest_cap(),
+            Some(manifest_guest_memory_required_bytes),
+            Some(CONTROL_PLANE_HEADROOM_BYTES),
+            manifest_guest_memory_budget_bytes,
+            selection.scheduler_jobs(),
+            manifest_guest_max_safe_cap,
+            kvm_guest_max_safe_cap,
+        )
+    );
+    require_cell_occupancy_fits(
+        &cells,
+        &exclusive,
+        &budgets,
+        selection.cell_timeout_seconds,
+        selection.no_retry,
+        run_timeout_seconds,
+        selection.run_count(),
+        selection.scheduler_jobs(),
+        selection.manifest_guest_cap(),
+        selection.kvm_guest_cap(),
     )?;
     let expected_runs = cells.len().saturating_mul(selection.run_count());
     audit_dag(&dag, expected_runs, run_timeout_seconds, &cell_timeouts)?;
@@ -7337,6 +7377,7 @@ fn validate_run_contract(
                 manifest_facts: &pressure_cells.manifest_facts,
                 preparation_by_test: &preparation,
                 cell_timeout_seconds: metadata.cell_timeout_seconds,
+                no_retry: metadata.no_retry,
                 run_timeout_seconds: metadata.run_timeout_seconds,
                 fixture_seconds: compat_fixture_seconds(&canonical)?,
             };
@@ -7357,6 +7398,7 @@ fn validate_run_contract(
                     &exclusive,
                     &budgets,
                     metadata.cell_timeout_seconds,
+                    metadata.no_retry,
                     metadata.run_timeout_seconds,
                     metadata.repetitions.unwrap_or(1),
                     metadata.jobs,
@@ -7569,7 +7611,7 @@ fn validate_run_contract(
             expected_cell_timeouts.insert(
                 format!("cell.{}", cell_run_slug(cell, repetition)),
                 if metadata.timeout_policy.is_some() {
-                    pressure_timeout(budget, metadata.cell_timeout_seconds)?
+                    pressure_timeout(budget, metadata.cell_timeout_seconds, metadata.no_retry)?
                 } else {
                     legacy_pressure_timeout(budget, metadata.cell_timeout_seconds)?
                 },
@@ -12803,16 +12845,28 @@ fn pressure_timeout_self_test() -> Result<(), String> {
         let budget = &budgets[&key];
         if budget.cpu_timeout_seconds != expected_cpu
             || budget.timeout_seconds != expected_wall
-            || outer_timeout(budget)? != expected_outer
-            || pressure_timeout(budget, Some(expected_outer))? != expected_outer
-            || pressure_timeout(budget, Some(expected_outer + 1))? != expected_outer
+            || outer_timeout(budget, false)? != expected_outer
+            || pressure_timeout(budget, Some(expected_outer), false)? != expected_outer
+            || pressure_timeout(budget, Some(expected_outer + 1), false)? != expected_outer
             || preparation_node_timeout(budget)? != expected_wall + 60
         {
             return Err(format!(
                 "independent pressure timeout resolution changed for CPU={cpu} wall={wall}"
             ));
         }
-        let error = pressure_timeout(budget, Some(expected_outer - 1))
+        // Under `--no-retry` every repetition is exactly one harness attempt,
+        // so the enclosing lifecycle declares one attempt, not the framework's
+        // retry count: (wall * 2 + 10) * 1 + 30.
+        let expected_outer_no_retry = (expected_wall * 2 + 10) + 30;
+        if outer_timeout(budget, true)? != expected_outer_no_retry
+            || pressure_timeout(budget, Some(expected_outer_no_retry), true)?
+                != expected_outer_no_retry
+        {
+            return Err(format!(
+                "--no-retry pressure timeout counted retry attempts for CPU={cpu} wall={wall}"
+            ));
+        }
+        let error = pressure_timeout(budget, Some(expected_outer - 1), false)
             .expect_err("short caller cap must refuse before launch");
         if !error.contains("refusing before launch") {
             return Err(format!(
@@ -12821,7 +12875,9 @@ fn pressure_timeout_self_test() -> Result<(), String> {
         }
         let mut many_internal_runs = budget.clone();
         many_internal_runs.attempts = Some(32);
-        if outer_timeout(&many_internal_runs)? != expected_outer {
+        if outer_timeout(&many_internal_runs, false)? != expected_outer
+            || outer_timeout(&many_internal_runs, true)? != expected_outer_no_retry
+        {
             return Err("internal runs multiplied the aggregate execution timeout".into());
         }
     }
@@ -12864,12 +12920,16 @@ fn pressure_timeout_self_test() -> Result<(), String> {
     }
     let mut missing_recipe = raw.clone();
     missing_recipe.attempts = None;
-    if outer_timeout(&missing_recipe).is_ok() {
+    if outer_timeout(&missing_recipe, false).is_ok() || outer_timeout(&missing_recipe, true).is_ok()
+    {
         return Err("an unavailable cell acquired a timeout-derived execution recipe".into());
     }
     let mut overflow = raw;
     overflow.timeout_seconds = i64::MAX;
-    if outer_timeout(&overflow).is_ok() || preparation_node_timeout(&overflow).is_ok() {
+    if outer_timeout(&overflow, false).is_ok()
+        || outer_timeout(&overflow, true).is_ok()
+        || preparation_node_timeout(&overflow).is_ok()
+    {
         return Err("overflowing lifecycle arithmetic was accepted".into());
     }
     if require_generated_node_count(99_989, 1, 1, 9)? != 100_000 {
@@ -13640,7 +13700,7 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         for repetition in 1..=10 {
             expected_timeouts.insert(
                 format!("cell.{}", cell_run_slug(cell, Some(repetition))),
-                outer_timeout(budget)?,
+                outer_timeout(budget, false)?,
             );
         }
     }
@@ -15271,6 +15331,29 @@ fn self_test(root: &Path) -> Result<(), String> {
     safe_ci_scope::self_test()?;
     log_tail_self_test()?;
     pressure_timeout_self_test()?;
+    // The width-sizing caller (pressure_schedule's `memory_safe_guests`)
+    // reads the highest safe caps from this exact line, including from a
+    // plan the occupancy guard refused. Keep its shape matched to that
+    // reader: `highest safe caps at -j <jobs>: manifest=<cap>, KVM=<cap>`.
+    {
+        let line = manifest_guest_memory_line(
+            144,
+            4,
+            Some(123),
+            Some(CONTROL_PLANE_HEADROOM_BYTES),
+            Some(456),
+            144,
+            Some(96),
+            Some(3),
+        );
+        if !line.contains("highest safe caps at -j 144: manifest=96, KVM=3")
+            || !line.contains("cap 144 (KVM cap 4)")
+        {
+            return Err(format!(
+                "manifest guest memory line lost the safe-cap shape its width-sizing reader parses: {line}"
+            ));
+        }
+    }
     flake_verdict_self_test()?;
     if series_run_index("a-cell-repetition-0004") != 4
         || series_run_index("a-cell-with-no-suffix") != 0
@@ -16920,7 +17003,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         for repetition in 1..=2 {
             cells_file_expected_timeouts.insert(
                 format!("cell.{}", cell_run_slug(cell, Some(repetition))),
-                outer_timeout(budget)?,
+                outer_timeout(budget, false)?,
             );
         }
     }
@@ -17812,7 +17895,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
     let mut green_replay_declared = 0_i64;
     for budget in green_replay_budgets.values() {
-        green_replay_declared = pressure_timeout(budget, None)?
+        green_replay_declared = pressure_timeout(budget, None, false)?
             .checked_mul(2)
             .and_then(|runs| green_replay_declared.checked_add(runs))
             .ok_or("the green replay population's declared occupancy overflows")?;
@@ -28740,7 +28823,9 @@ mod pressure_planning_tests {
             timeout_seconds: 2,
             attempts: Some(1),
         };
-        assert_eq!(pressure_timeout(&budget, None), Ok(58));
+        assert_eq!(pressure_timeout(&budget, None, false), Ok(58));
+        // Under `--no-retry` the same budget declares one attempt, not two.
+        assert_eq!(pressure_timeout(&budget, None, true), Ok(44));
         assert_eq!(PRESSURE_RUN_TIMEOUT_SECONDS, 7_200);
         let budgets = same
             .iter()
@@ -28763,6 +28848,21 @@ mod pressure_planning_tests {
                 &|cell| dbt_host_tmp_resource(cell).into_iter().collect(),
                 &budgets,
                 None,
+                false,
+                run_timeout_seconds,
+                100,
+                4,
+                4,
+                4,
+            )
+        };
+        let fits_no_retry = |cells: &[TrackedCell], run_timeout_seconds: i64| {
+            require_cell_occupancy_fits(
+                cells,
+                &|cell| dbt_host_tmp_resource(cell).into_iter().collect(),
+                &budgets,
+                None,
+                true,
                 run_timeout_seconds,
                 100,
                 4,
@@ -28795,6 +28895,18 @@ mod pressure_planning_tests {
             );
         }
         assert_eq!(fits(&same, 11_601), Ok(()));
+        // Under `--no-retry` each of the 200 runs declares 44s, not 58s, so
+        // the same serial population holds the grant for 8,800s: it fits a
+        // bound the retry accounting refused above, and still refuses a
+        // bound at or below its own honest floor.
+        let Err(error) = fits_no_retry(&same, 8_800) else {
+            panic!("--no-retry admission accepted 8,800s of serial runs under an 8,800s bound");
+        };
+        assert!(
+            error.contains("selected 200 cell run(s) have at least 8800s"),
+            "{error}"
+        );
+        assert_eq!(fits_no_retry(&same, 8_801), Ok(()));
         // The same runs spread over two tests, or on a backend that gives each
         // guest a private /tmp, share the four guest slots and fit.
         assert_eq!(fits(&split, PRESSURE_RUN_TIMEOUT_SECONDS), Ok(()));
