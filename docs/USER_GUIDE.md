@@ -708,6 +708,160 @@ Run `hermit analyze --help` before using this workflow. Search, minimization,
 and schedule replay can perform many guest executions and require a reliably
 reproducible target condition.
 
+Analyze keeps every run's schedules, logs, output and reproducer command in a
+workspace, a `hermit_analyze*` directory it creates in `--tmp-dir`, or else in
+`$TMPDIR` (`/tmp` when TMPDIR is unset); the paths it prints name that
+directory. Analyze removes the workspace when it exits: after its report,
+after an error, and when SIGTERM, SIGINT or SIGHUP stops it (a budget's
+partial report keeps it, see below). A stop signal
+ends the run in progress and starts no other; analyze then removes the
+workspace and that run's own temporary directories, and dies of the signal,
+so a shell reports 128 plus its number (143 for SIGTERM). Pass `--keep-tmp` to
+keep the workspace, for example to rerun a reproducer; `--verbose` keeps it
+too, since the per-run logs it adds are written there. The report file
+(`--report-file`) and the `--tmp-dir` directory itself are never removed.
+
+Analyze cannot clean up after SIGKILL, nor after a stop signal it does not
+handle: a signal it inherits as ignored stays ignored (SIGINT in a shell's
+background job, SIGHUP under `nohup`), and an analyze that is PID 1 of its PID
+namespace, as in `docker run IMAGE hermit analyze ...` without `--init`, keeps
+the default actions, which Linux discards for a namespace's init. Analyze also
+leaves the stop signals to kill it at once, as before, when `/proc` is not its
+own PID namespace's (analyze started by another process inside `unshare -pf`
+without `--mount-proc`) or when it inherited more than 64 children, since it
+could not then find the run to stop. `hermit
+bisect` keeps its workspace and names it when it exits.
+
+A replayed or spliced schedule can leave the guest spinning or waiting for an
+event that never comes, so once the target run has been measured, every later
+run is bounded: by default at max(60 s, 10 times the slowest endpoint run, 4
+times the slowest run that finished so far), which analyze prints
+(`--trial-timeout=SECONDS|auto|off`). The last term lets the bound follow a
+continuation without chaos, which can run far slower than the endpoint runs.
+With `--run1-preemptions` there is no target run to measure, so pass an
+explicit `--trial-timeout`; on a backend that does not enforce `--timeout`,
+bound the whole analysis from outside.
+
+This bound stops a trial at a time the host decides, so a trial it stops has
+no outcome when the trial is a `--prefix-search` trial, a default-search
+(bisection) trial or the baseline run. Such a trial runs again at once, as
+`<trial>_retry`, with 4 times the bound (within the run arguments' own
+`--timeout` and the time budget left), and the rerun's outcome counts. If the
+rerun is stopped too, the guest hangs (for example in a deadlock while other
+threads keep polling) or needs longer still. A hang is a third outcome, not a
+run that misses, so analyze ends with a partial report (exit 120,
+`HERMIT_ANALYZE_PARTIAL class=trial-inconclusive`, below) that names the
+trial, its prefix and both bounds, and gives the command that continues with a
+longer `--trial-timeout`. In those searches and the baseline run, which trials
+finish within analyze's bound never changes what analyze finds, only where it
+stops. With `--continuation-timeslice=auto`, a continuation one of whose two
+endpoint trials is stopped twice ends the analysis the same way: moving on to
+the next, coarser continuation would let a slower host answer at another
+timeslice. The partial report also gives the command that searches at that
+next continuation, a new analysis you may choose instead.
+
+A trial that a `--timeout` in the run arguments ends counts as not meeting the
+target: that bound is yours, and analyze does not rerun it. It is a wall-clock
+bound too, so on a slower or busier host it can stop a trial that finishes on
+another, and change what analyze finds; leave it room, or leave the bounding
+to analyze's own. When a prefix search settles next to such a trial, the
+report calls it a hang and notes that the boundary rests on a wall-clock bound.
+Elsewhere (`--search` rounds, `--minimize`'s knock-outs and the stack-trace
+runs) analyze's own bound still counts a run it stops as not meeting the
+target. A trial that Hermit refuses when its guest reaches an operation Hermit
+does not support (exit 122) counts as not meeting the target too, with a
+warning; a refused target run still ends the analysis.
+
+By default analyze bisects between the failing schedule and a passing one from
+another run. When the two runs differ in events only one of them executed (for
+example timeslices that end at other points, or extra iterations of a polling
+loop), no single swap may separate the outcomes. `--prefix-search` searches
+within the failing schedule instead: each trial replays its first K events and
+then schedules without chaos, and a binary search finds the event at which the
+outcome flips. The continuation runs at the run's own `--max-timeslice`; a race
+found only at a short timeslice often shows without chaos at that timeslice
+too, and then the search continues at 200 ms instead
+(`--continuation-timeslice`). The report shows the stack of the thread the
+failing schedule runs at that event and of the thread that runs there
+otherwise. When both continuations run the same thread there, the decision is
+how long that thread runs: the report then shows its stack, and the stacks of
+the threads that run after it with and without the event:
+
+```bash
+hermit analyze --prefix-search --run1-seed=1 --target-stdout='FAILED' \
+  --target-exit-code=any --report-file=analysis.json -- --chaos -- PROGRAM
+```
+
+A long analysis can be bounded, and it then reports its best answer so far
+instead of nothing. `--time-budget=DURATION` (`1800`, `30m`, `2h`) bounds the
+invocation's wall-clock time, and `--trial-budget=N` the number of runs it
+starts. The budget is checked before every run, and each run's `--timeout` is
+shortened to the time left; a run the budget cuts short is thrown away rather
+than counted as not meeting the target, so the budget decides only when
+analyze stops, never what it finds. When it runs out, analyze exits **120**
+after the stderr line `HERMIT_ANALYZE_PARTIAL class=time-budget` (or
+`class=trial-budget`, or `class=trial-inconclusive` for a trial analyze's
+bound stopped twice) and a report that says it is partial, why, and which
+phase was running:
+
+- The default search reports the closest pair of schedules it found, a
+  schedule whose replay misses the target and one whose replay meets it
+  (`interval_passing.events` and `interval_failing.events` in the workspace),
+  their edit and swap distances, and the first event at which they differ: the
+  deciding event is that one or a later one. It takes the two schedules'
+  stacks there when two replays as slow as the slowest endpoint run fit
+  min(120 s, 5% of `--time-budget`) after the budget ran out, and says so when
+  they do not.
+- `--prefix-search` reports its bracket. Short prefixes miss the target and
+  long ones meet it, so the report names the longest prefix whose replay
+  finished and missed, the shortest whose replay met it, and the range of
+  events between them that holds the deciding event.
+- A budget that runs out after the search decided, during its stack-trace
+  runs, still reports the decision, in the fields a complete report uses:
+  `deciding_event` for `--prefix-search` and `critical_event1` and
+  `critical_event2` for the default search, without stacks (`partial.stacks`
+  says why); `--resume` takes them. On the prefix path both critical events
+  name the deciding event too, until the stack-trace runs place them: which
+  shape the complete report takes (critical events at the deciding event, or
+  a timing decision with `deciding_event` and the critical events at
+  continuation positions) is known only after those runs. So in a partial
+  report `deciding_event`'s presence does not mean a timing decision; a
+  script reads `partial` first.
+
+Analyze stops itself only between runs, and the default search's computation
+between runs and the stack replays after the budget can take a little longer,
+so give a harness's own kill bound (a test timeout, `timeout(1)`) room above
+`--time-budget` plus min(120 s, 5% of it), for example a few minutes more.
+Analyze then stops itself first and writes its partial report and resume
+command, which an outer kill would lose.
+
+Analyze writes its progress into the workspace as it goes: every finished
+run's outcome (`analyze-journal.jsonl`), what the analysis is of
+(`analyze-checkpoint.json`) and the search's interval or bracket
+(`analyze-progress.json`). When a budget ends it, the workspace is kept even
+without `--keep-tmp`, and the report gives the command that continues it: the
+same arguments plus `--resume=WORKSPACE`. A resumed analysis runs again from
+its start, and every run in the journal takes its recorded outcome instead of
+running. The default search restarts at the pass whose interval the progress
+names, from that interval's two schedules in the workspace, rather than
+replaying its earlier passes, which would need every trial's schedules. So the
+resumed analysis makes the same decisions and reports what an uninterrupted
+analysis would. It refuses (exit 122), naming each difference, when the hermit
+binary, the guest program, the run arguments, the target criteria, the search
+options and `--max-log-bytes`, the record or schedule files given as runs, or
+`--analyze-seed` differ from the recorded ones; to start over anyway, run the
+command without `--resume`. A workspace that `--keep-tmp` kept, or that a
+SIGKILL left, can be resumed the same way. A resumed analysis that errors or
+is stopped keeps the workspace, whatever its retention, so that it can be
+resumed again.
+
+```bash
+hermit analyze --prefix-search --time-budget=30m --run1-seed=1 \
+  --target-stdout='FAILED' -- --chaos -- PROGRAM          # exits 120 if the budget runs out
+hermit analyze --prefix-search --time-budget=30m --run1-seed=1 \
+  --target-stdout='FAILED' --resume=/tmp/hermit_analyzeXXXX -- --chaos -- PROGRAM
+```
+
 ## Common Run Options
 
 ### Scheduling And Determinism

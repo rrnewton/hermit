@@ -138,6 +138,107 @@ impl PreemptionRecord {
         self
     }
 
+    /// The record a replay of only the first `len` scheduled events of this
+    /// one follows: those events, and the callback checkpoints they reach.
+    ///
+    /// A checkpoint names the callback that ended one of a thread's slices
+    /// and the thread's progress there (the sum of its events' counts, as
+    /// replay counts it, [`callback_history::Progress`]). The checkpoints of
+    /// threads the prefix runs, up to the progress each thread reaches in it,
+    /// end the prefix's slices where the recording did, so a replay of the
+    /// prefix keeps the software-expiry turns they mark. A schedule replayed
+    /// without them has no record of those turns, and its virtual time drifts
+    /// from the recording's. The scheduler runs freely after the prefix, so
+    /// later checkpoints are dropped, and so are those of threads the prefix
+    /// does not run, progress-0 ones included.
+    ///
+    /// Progress alone places a checkpoint, so one taken at exactly the
+    /// progress a thread reaches at the prefix end is kept: it ended the
+    /// thread's last slice in the prefix. Another one at the same progress,
+    /// from a later callback of the same handler after other threads ran past
+    /// the prefix, is kept too, and the replay applies it only when its
+    /// recorded time and branch count are reached.
+    ///
+    /// The thread that runs the prefix's last event is the exception while
+    /// another event follows: its checkpoints at the progress that event
+    /// reaches end its slice at the prefix's own end, which decides what runs
+    /// next, so they belong to the event after the prefix and are dropped. A
+    /// replay of the prefix then lets that thread run on, as it does past any
+    /// event the prefix leaves out. A prefix of the whole schedule keeps the
+    /// record's checkpoints.
+    ///
+    /// The per-thread histories stay whole, for the rows the checkpoints
+    /// name; a schedule replay reads only the events and the checkpoints.
+    pub fn schedule_prefix(&self, len: usize) -> PreemptionRecord {
+        let PreemptionRecord {
+            per_thread,
+            global,
+            epoch,
+            pipe_wake_latency,
+            signal_state_copy,
+            cap_preemption_charge,
+            callback_checkpoints,
+            rng_seed,
+            expired_wait_runs_charged_once,
+        } = self;
+        let followed = len < global.len();
+        let global = global[..len.min(global.len())].to_vec();
+        let mut reached = BTreeMap::<DetTid, callback_history::Progress>::new();
+        for event in &global {
+            reached
+                .entry(event.dettid)
+                .or_default()
+                .observe_event(event);
+        }
+        // The thread whose slice is still running at the prefix's end: the
+        // last event's, when that event advances it and another one follows.
+        let running = global
+            .last()
+            .filter(|last| followed && last.count > 0)
+            .map(|last| last.dettid);
+        let callback_checkpoints = callback_checkpoints
+            .iter()
+            .filter_map(|(tid, points)| {
+                let reached = reached.get(tid)?.count;
+                let within = |progress: u64| {
+                    if running == Some(*tid) {
+                        progress < reached
+                    } else {
+                        progress <= reached
+                    }
+                };
+                let kept: Vec<_> = points
+                    .iter()
+                    .filter(|point| within(point.origin.progress))
+                    .cloned()
+                    .collect();
+                (!kept.is_empty()).then_some((*tid, kept))
+            })
+            .collect();
+        PreemptionRecord {
+            per_thread: per_thread.clone(),
+            global,
+            epoch: *epoch,
+            pipe_wake_latency: *pipe_wake_latency,
+            signal_state_copy: *signal_state_copy,
+            cap_preemption_charge: *cap_preemption_charge,
+            callback_checkpoints,
+            rng_seed: *rng_seed,
+            expired_wait_runs_charged_once: *expired_wait_runs_charged_once,
+        }
+    }
+
+    /// The same record with `events` as its schedule, or `None` if its
+    /// callback checkpoints do not fit those events (see [`Self::validate`]).
+    /// For a schedule that replayed this record's events and went on past
+    /// them: its own recording keeps no checkpoints, since a replay records
+    /// none, but the replayed part ended its slices where this record did.
+    pub fn with_schedule(&self, events: Vec<SchedEvent>) -> Option<PreemptionRecord> {
+        let mut record = self.clone();
+        record.global = events;
+        record.validate().is_ok().then_some(record)
+    }
+
     /// The same record, stating the `--pipe-wake-latency` of the trials it
     /// came from. Every record analyze, minimize or bisect writes from trials
     /// carries it, so that a replay under another value is refused.
@@ -486,7 +587,14 @@ impl PreemptionRecord {
         Ok(())
     }
 
-    /// Normalize priorities for readibility.
+    /// Normalize priorities for readability: renumber them from
+    /// `DEFAULT_PRIORITY` up, and drop the threads that keep the default
+    /// priority. For display only: the renumbered record does not replay the
+    /// same, because the scheduler compares these priorities with fixed ones
+    /// (the default priority of a thread the record does not name, among
+    /// others) and derives others from them. A record with more distinct
+    /// priorities than `DEFAULT_PRIORITY..=LAST_PRIORITY` holds (a long chaos
+    /// run) keeps its own.
     pub fn normalize(&self) -> PreemptionRecord {
         let mut clone = self.clone();
 
@@ -497,9 +605,11 @@ impl PreemptionRecord {
                 let _ = priomap.insert(*prio, 0);
             }
         }
+        if priomap.len() > usize::try_from(LAST_PRIORITY - DEFAULT_PRIORITY + 1).unwrap() {
+            return clone.without_default_threads();
+        }
 
         for (cur_prio, val) in (DEFAULT_PRIORITY..).zip(priomap.values_mut()) {
-            assert!(cur_prio <= LAST_PRIORITY);
             *val = cur_prio;
         }
         for history in clone.per_thread.values_mut() {
@@ -510,16 +620,21 @@ impl PreemptionRecord {
         }
 
         // One more pass to remove anything that just has default priority its whole lifetime.
-        let mut finalmap = BTreeMap::new();
-        for (tid, history) in clone.per_thread.into_iter() {
-            if history.final_prio != DEFAULT_PRIORITY
+        clone.without_default_threads()
+    }
+
+    /// The same record without the threads that keep the default priority
+    /// their whole lifetime, with no priority change or chaos epoch. Replay
+    /// gives a thread the record does not name that same priority, so the
+    /// record replays the same (Detcore warns once per such thread); unlike
+    /// [`Self::normalize`], no priority is renumbered.
+    pub fn without_default_threads(&self) -> PreemptionRecord {
+        let mut clone = self.clone();
+        clone.per_thread.retain(|_, history| {
+            history.final_prio != DEFAULT_PRIORITY
                 || !history.prio_changes.is_empty()
                 || !history.chaos_epochs.is_empty()
-            {
-                assert!(finalmap.insert(tid, history).is_none());
-            }
-        }
-        clone.per_thread = finalmap;
+        });
         clone
     }
 
@@ -1140,6 +1255,34 @@ mod tests {
         assert_eq!(pr, pr2);
     }
 
+    /// A record with more distinct priorities than the renumbering range
+    /// holds keeps its own instead of panicking (a long chaos run of six
+    /// threads reached 9978 distinct priorities). One that fits is still
+    /// renumbered, up to `LAST_PRIORITY`.
+    #[test]
+    fn a_record_too_varied_to_renumber_keeps_its_priorities() {
+        let record_of = |count: Priority| {
+            let changes: Vec<(LogicalTime, Priority)> = (FIRST_PRIORITY..FIRST_PRIORITY + count)
+                .enumerate()
+                .map(|(index, prio)| (LogicalTime::from_nanos(index as u64), prio))
+                .collect();
+            PreemptionRecord::from_vecs(&BTreeMap::from([(DetTid::from_raw(3), changes)]))
+        };
+        let slots = LAST_PRIORITY - DEFAULT_PRIORITY + 1;
+        let fits = record_of(slots).normalize();
+        fits.validate().unwrap();
+        let highest = fits
+            .as_vecs()
+            .values()
+            .flat_map(|history| history.iter().map(|(_, prio)| *prio))
+            .max();
+        assert_eq!(highest, Some(LAST_PRIORITY));
+        let too_many = record_of(slots + 1);
+        let kept = too_many.normalize();
+        kept.validate().unwrap();
+        assert_eq!(kept, too_many.without_default_threads());
+    }
+
     #[test]
     fn normalize_preemption_record() {
         let str = r#"{"per_thread":{
@@ -1221,6 +1364,119 @@ mod tests {
 
         pr_with_latest_removed.validate().unwrap();
         self::assert_eq!(pr_with_latest_removed, expected_pr);
+    }
+
+    /// A replay of a schedule's first events keeps the callback checkpoints
+    /// of the slices those events end, for the threads they run, and no later
+    /// ones: the slice end at the prefix's own end belongs to the event after
+    /// it. The result still validates, and lends its checkpoints to a
+    /// schedule that replayed it and went on.
+    #[test]
+    fn a_schedule_prefix_keeps_the_checkpoints_of_the_slices_its_events_end() {
+        use callback_history::Checkpoint;
+        use callback_history::Origin;
+        use callback_history::Site;
+
+        use crate::slice_boundary::callbacks::Callback;
+        let (main, other, late) = (
+            DetTid::from_raw(3),
+            DetTid::from_raw(5),
+            DetTid::from_raw(7),
+        );
+        // Progress per thread: main 10, 11 (after the OtherInstructions), 21;
+        // other 4; late 6.
+        let mut record = PreemptionRecord::from_sched_events(vec![
+            SchedEvent::branches(main, 10),
+            SchedEvent::branches(other, 4),
+            SchedEvent {
+                op: Op::OtherInstructions,
+                ..SchedEvent::branches(main, 1)
+            },
+            SchedEvent::branches(main, 10),
+            SchedEvent::branches(late, 6),
+        ]);
+        let mut point = |tid: DetTid, row: usize, progress: u64, last_op: Op| {
+            let time = LogicalTime::from_nanos(100 * (row as u64 + 1));
+            let history = record.per_thread.entry(tid).or_default();
+            history.prio_changes.push((time, 1000));
+            history.preemption_rcbs.push(progress);
+            Checkpoint {
+                history_index: row,
+                origin: Origin {
+                    callback: Callback::PmuTimer,
+                    site: Site::Prehook,
+                    progress,
+                    last_op: Some(last_op),
+                    time,
+                    rcbs: progress,
+                },
+            }
+        };
+        let main_points = vec![
+            point(main, 0, 10, Op::Branch),
+            point(main, 1, 11, Op::OtherInstructions),
+            point(main, 2, 21, Op::Branch),
+            // A later callback at the same progress, after the schedule ends.
+            point(main, 3, 21, Op::Branch),
+        ];
+        let other_points = vec![point(other, 0, 4, Op::Branch)];
+        let late_points = vec![point(late, 0, 6, Op::Branch)];
+        record
+            .callback_checkpoints
+            .insert(main, main_points.clone());
+        record
+            .callback_checkpoints
+            .insert(other, other_points.clone());
+        record
+            .callback_checkpoints
+            .insert(late, late_points.clone());
+        record.validate().unwrap();
+
+        let kept = |len: usize| {
+            let prefix = record.schedule_prefix(len);
+            prefix.validate().unwrap();
+            assert_eq!(prefix.global, record.global[..len]);
+            prefix.callback_checkpoints
+        };
+        assert!(kept(0).is_empty());
+        // Each prefix of 1 to 4 events stops where its last event's slice
+        // ends (main's at 10, other's at 4, main's at 11, main's two at 21),
+        // so it drops those checkpoints and keeps the earlier ones.
+        assert!(kept(1).is_empty());
+        assert_eq!(kept(2), BTreeMap::from([(main, main_points[..1].to_vec())]));
+        assert_eq!(
+            kept(3),
+            BTreeMap::from([
+                (main, main_points[..1].to_vec()),
+                (other, other_points.clone()),
+            ])
+        );
+        assert_eq!(
+            kept(4),
+            BTreeMap::from([
+                (main, main_points[..2].to_vec()),
+                (other, other_points.clone()),
+            ])
+        );
+        // The whole schedule has no event after it, nor has a longer prefix.
+        assert_eq!(kept(5), record.callback_checkpoints);
+        assert_eq!(
+            record.schedule_prefix(9).callback_checkpoints,
+            record.callback_checkpoints
+        );
+
+        // A schedule that replayed the prefix and went on takes the prefix's
+        // checkpoints; one whose events they do not fit does not.
+        let prefix = record.schedule_prefix(3);
+        let mut continued = record.global[..3].to_vec();
+        continued.push(SchedEvent::branches(other, 9));
+        assert_eq!(
+            prefix
+                .with_schedule(continued.clone())
+                .map(|record| (record.global, record.callback_checkpoints)),
+            Some((continued, prefix.callback_checkpoints.clone()))
+        );
+        assert!(prefix.with_schedule(Vec::new()).is_none());
     }
 
     #[test]
