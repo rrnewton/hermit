@@ -1002,6 +1002,13 @@ impl GlobalTime {
         self.inherited_time.get(&dtid).copied().unwrap_or_default()
     }
 
+    /// The absolute clock inherited when this thread started. Its first
+    /// report can arrive after scheduler registration; work since startup is
+    /// the current thread clock minus this baseline, not minus the epoch.
+    pub fn threads_inherited_time(&self, dtid: DetTid) -> LogicalTime {
+        self.starting_nanos + self.inherited_duration(dtid)
+    }
+
     /// Project a thread's local duration, including inherited history but
     /// excluding the epoch. This is the duration used by scheduler replay;
     /// aggregate time separately excludes the inherited part.

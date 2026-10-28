@@ -26,6 +26,7 @@
  * timeslice, so the rounds take about one.
  */
 
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -37,6 +38,15 @@
 static atomic_int stop;
 static int rounds = 10;
 static int writer_sleeps;
+static int completed_sleeps;
+static long long shortest_sleep_us = LLONG_MAX;
+static long long longest_sleep_us;
+
+static long long monotonic_us(void) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (long long)now.tv_sec * 1000000 + now.tv_nsec / 1000;
+}
 
 static void write_rounds(void) {
   for (int round = 0; round < rounds; round++) {
@@ -48,7 +58,15 @@ static void write_rounds(void) {
     }
     if (writer_sleeps) {
       struct timespec pause = {0, 2000000};
-      nanosleep(&pause, NULL);
+      long long start = monotonic_us();
+      if (nanosleep(&pause, NULL) != 0) {
+        perror("nanosleep");
+        exit(1);
+      }
+      long long elapsed = monotonic_us() - start;
+      completed_sleeps++;
+      if (elapsed < shortest_sleep_us) shortest_sleep_us = elapsed;
+      if (elapsed > longest_sleep_us) longest_sleep_us = elapsed;
     }
   }
 }
@@ -96,6 +114,13 @@ int main(int argc, char** argv) {
     atomic_store(&stop, 1);
   }
   pthread_join(other, NULL);
-  printf("rounds took %lld ms\n", monotonic_ms() - start);
+  long long elapsed = monotonic_ms() - start;
+  printf("rounds took %lld ms\n", elapsed);
+  // Report only after the original measurement: an extra write while the
+  // spinner runs would itself give up a scheduler turn.
+  if (writer_sleeps) {
+    printf("sleeps %d min_us %lld max_us %lld\n", completed_sleeps,
+           shortest_sleep_us, longest_sleep_us);
+  }
   return 0;
 }

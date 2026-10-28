@@ -2466,7 +2466,7 @@ pub struct Scheduler {
 
     /// Each thread's clock at the last scheduler pass, read while every
     /// thread was parked, for [`Self::order_continuation_fairly`].
-    continuation_clocks: BTreeMap<DetTid, LogicalTime>,
+    continuation_clocks: BTreeMap<DetTid, Option<fair_continuation::Clock>>,
 
     /// Count record_event calls which determines the event number if we're recording a schedule
     /// event trace.
@@ -18001,14 +18001,22 @@ impl Scheduler {
         // O3: every turn of an observable process has quiesced, and no pop or
         // grant of the next pass has run yet.
         self.reconcile_inactive_alarms(self.committed_time);
-        // Every thread is parked, so its clock is frozen.
+        // Capture parked threads' clocks. A new child's first report can
+        // still race registration; keep its slot even before that report.
         if self.fair_continuation.is_some() && self.replay_priorities_released {
             let gtime = global_time.lock().unwrap();
             self.continuation_clocks = self
                 .priorities
                 .keys()
-                .filter(|dettid| gtime.contains_thread(**dettid))
-                .map(|&dettid| (dettid, gtime.threads_time(dettid)))
+                .map(|&dettid| {
+                    let clock = gtime
+                        .contains_thread(dettid)
+                        .then(|| fair_continuation::Clock {
+                            current: gtime.threads_time(dettid),
+                            inherited: gtime.threads_inherited_time(dettid),
+                        });
+                    (dettid, clock)
+                })
                 .collect();
         }
     }
@@ -18985,8 +18993,9 @@ impl Scheduler {
     /// Called before each selection, beside `hb_flush_wakes` and for the same
     /// reason: it moves queue entries. The clocks are those every parked
     /// thread had at this pass's step 1 ([`Self::bump_global_time`]); a thread
-    /// admitted since without a clock yet is placed at the floor. Reads only
-    /// those clocks, the run queue and the order of past selections.
+    /// admitted since without a clock yet starts at the floor and retains
+    /// its selections until that clock arrives. Reads only those clocks,
+    /// registration, the run queue and the order of past selections.
     fn order_continuation_fairly(&mut self) {
         if !self.replay_priorities_released {
             return;
@@ -18994,6 +19003,14 @@ impl Scheduler {
         let Some(fair) = self.fair_continuation.as_mut() else {
             return;
         };
+        // Registration and first-clock publication race in host time. Keep a
+        // slot for every registered thread, including admissions after step
+        // 1, so clock arrival cannot decide account lifetime or selections.
+        self.continuation_clocks
+            .retain(|tid, _| self.priorities.contains_key(tid));
+        for &tid in self.priorities.keys() {
+            self.continuation_clocks.entry(tid).or_insert(None);
+        }
         let runnable = self.run_queue.round_robin_tids();
         let run_times = fair.run_times(&self.continuation_clocks, &runnable);
         self.run_queue.order_by_run_time(&run_times);
@@ -24233,6 +24250,84 @@ mod test {
                 "fair {fair}, schedule exhausted {exhausted}"
             );
         }
+    }
+
+    /// The child's startup RPC can report its inherited clock on either side
+    /// of step 1, or after step 3 has selected its first turn. Registration
+    /// and that first turn must charge the same work in every arrival order.
+    #[test]
+    fn a_fair_continuation_charges_a_child_whichever_side_its_clock_arrives() {
+        let (parent, child) = (DetTid::from_raw(3), DetTid::from_raw(5));
+        let mut selected = Vec::new();
+        for (front, registration_before_snapshot, arrival) in
+            [false, true].into_iter().flat_map(|front| {
+                [false, true].into_iter().flat_map(move |registered| {
+                    (0..3).map(move |arrival| (front, registered, arrival))
+                })
+            })
+        {
+            let cfg = Config {
+                replay_continue_fairly: true,
+                ..Default::default()
+            };
+            let mut sched = Scheduler::new(&cfg);
+            sched.replay_priorities_released = true;
+            sched.register_thread_for_test(parent);
+            sched.run_queue.push_back(parent, DEFAULT_PRIORITY);
+            let mut gtime = GlobalTime::new(&cfg);
+            let epoch = gtime.as_nanos();
+            let inherited = LogicalTime::from_nanos(1_000_000);
+            gtime.update_global_time(parent, epoch + inherited, LogicalTime::ZERO);
+            let time = Mutex::new(gtime);
+            sched.bump_global_time(&time, &Err(SkipTurn));
+            sched.order_continuation_fairly();
+
+            // The parent has cloned the child; registration and the child's
+            // StartNewThread clock update can each precede or follow step 1.
+            if registration_before_snapshot {
+                sched.register_thread_for_test(child);
+            }
+            let report_start = || {
+                time.lock()
+                    .unwrap()
+                    .update_global_time(child, epoch + inherited, inherited);
+            };
+            if arrival == 0 {
+                report_start();
+            }
+            sched.bump_global_time(&time, &Ok(Resources::new(parent)));
+            if !registration_before_snapshot {
+                sched.register_thread_for_test(child);
+            }
+            if arrival == 1 {
+                report_start();
+            }
+            // Child-first admission is at the front; parent-first admission
+            // is in ordinary turn order. With no own-clock advance the latter
+            // isolates selection history from the run-time charge.
+            if front {
+                sched.run_queue.push_front(child, DEFAULT_PRIORITY);
+            } else {
+                sched.run_queue.push_back(child, DEFAULT_PRIORITY);
+            }
+            assert_eq!(sched.select_test_turn().map(|(tid, _, _)| tid), Some(child));
+            if arrival == 2 {
+                // Selection may precede StartNewThread, but granting its turn
+                // waits for the request that the RPC fills.
+                report_start();
+            }
+            assert_eq!(sched.run_queue.commit_tentative_pop_completed_turn(), child);
+            let ran = if front { 20_000_000 } else { 0 };
+            time.lock().unwrap().update_global_time(
+                child,
+                epoch + inherited + LogicalTime::from_nanos(ran),
+                inherited,
+            );
+            sched.run_queue.push_back(child, DEFAULT_PRIORITY);
+            sched.bump_global_time(&time, &Ok(Resources::new(child)));
+            selected.push(sched.select_test_turn().map(|(tid, _, _)| tid));
+        }
+        assert_eq!(selected, vec![Some(parent); 12]);
     }
 
     /// Only a leader retired at its own exit while its group lives on counts

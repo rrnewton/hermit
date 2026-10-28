@@ -28,6 +28,8 @@
 //! of the threads that were runnable (the floor), so a new or long-blocked
 //! thread does not keep the CPU until it has caught up with the others; a
 //! thread whose clock the scheduler has not seen yet is placed at the floor.
+//! Its selections are still recorded, and its first reported work is charged
+//! from the clock inherited at creation, whichever pass first sees that clock.
 //! Equal run times go to the thread selected least recently, and a thread
 //! runnable again counts as never selected, so a thread raised to the floor
 //! goes ahead of the thread that holds it.
@@ -45,11 +47,18 @@ use std::collections::BTreeMap;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
 
+/// A parked thread's reported clock and its deterministic startup baseline.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Clock {
+    pub(super) current: LogicalTime,
+    pub(super) inherited: LogicalTime,
+}
+
 /// One thread's account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Account {
-    /// The thread's clock when the account was last brought up to date.
-    clock: LogicalTime,
+    /// The last reported clock, or None until the first startup RPC arrives.
+    clock: Option<LogicalTime>,
     /// Virtual nanoseconds the thread has run since the continuation began,
     /// raised to the floor when it became runnable.
     run_time: u64,
@@ -71,19 +80,21 @@ pub(super) struct FairContinuation {
 }
 
 impl FairContinuation {
-    /// Bring the accounts up to date with `clocks`, each live thread's
-    /// current clock, and return the sort key of each thread in `runnable`
+    /// Bring the accounts up to date with `clocks`, one slot per registered
+    /// thread, and return the sort key of each thread in `runnable`
     /// (sorted by thread): its run time, then when it was last selected.
-    /// Accounts of threads without a clock are dropped (the thread exited);
-    /// a runnable thread without one yet is placed at the floor.
+    /// Drop accounts only when registration ends, not while waiting for the
+    /// first clock. A new thread without a clock starts at the floor, and
+    /// its first report charges work since its inherited startup clock.
     ///
-    /// A thread's clock is fully reported whenever it is queued: every queued
-    /// thread has filed its request, and the request carries its clock. So
-    /// charging the clock's advance before raising a newly runnable thread to
-    /// the floor charges work done before it blocked, not after.
+    /// Established runnable threads have published their request's clock, so
+    /// charging its advance before raising a newly runnable thread to the
+    /// floor charges work done before it blocked, not after. Startup admission
+    /// can precede the first request: that pending account keeps its selections
+    /// and uses the inherited baseline when a later snapshot sees the clock.
     pub(super) fn run_times(
         &mut self,
-        clocks: &BTreeMap<DetTid, LogicalTime>,
+        clocks: &BTreeMap<DetTid, Option<Clock>>,
         runnable: &[DetTid],
     ) -> Vec<(DetTid, (u64, u64))> {
         let floor = self.floor;
@@ -91,15 +102,23 @@ impl FairContinuation {
         for (&tid, &clock) in clocks {
             let is_runnable = runnable.binary_search(&tid).is_ok();
             let account = self.accounts.entry(tid).or_insert(Account {
-                clock,
+                clock: clock.map(|reported| reported.current),
                 run_time: floor,
                 runnable: false,
                 last_selected: 0,
             });
-            // A clock never goes back; an exec reload restores the same one.
-            let ran = clock.as_nanos().saturating_sub(account.clock.as_nanos());
-            account.run_time = account.run_time.saturating_add(ran);
-            account.clock = clock;
+            if let Some(reported) = clock {
+                // A clock never goes back; an exec reload restores the same
+                // one. A delayed first report includes the child's first
+                // turn, which must be charged exactly as with an early RPC.
+                let previous = account.clock.unwrap_or(reported.inherited);
+                let ran = reported
+                    .current
+                    .as_nanos()
+                    .saturating_sub(previous.as_nanos());
+                account.run_time = account.run_time.saturating_add(ran);
+                account.clock = Some(reported.current);
+            }
             if is_runnable && !account.runnable {
                 account.run_time = account.run_time.max(floor);
                 // A thread back in turn has waited: it goes ahead of the
@@ -125,10 +144,9 @@ impl FairContinuation {
         keys
     }
 
-    /// Note that `tid` was selected and had a turn. A thread without an
-    /// account yet (it had no clock) is not noted; its account starts at the
-    /// floor of the pass that first sees its clock, so that turn is not
-    /// charged either.
+    /// Note that `tid` was selected and had a turn, including when its first
+    /// clock was absent from the preceding snapshot. The turn that exhausted
+    /// replay can precede the first account snapshot and is not charged.
     pub(super) fn note_selected(&mut self, tid: DetTid) {
         self.selections += 1;
         if let Some(account) = self.accounts.get_mut(&tid) {
@@ -157,10 +175,18 @@ impl FairContinuation {
 mod tests {
     use super::*;
 
-    fn clocks(entries: &[(DetTid, u64)]) -> BTreeMap<DetTid, LogicalTime> {
+    fn clocks(entries: &[(DetTid, u64)]) -> BTreeMap<DetTid, Option<Clock>> {
         entries
             .iter()
-            .map(|&(tid, ns)| (tid, LogicalTime::from_nanos(ns)))
+            .map(|&(tid, ns)| {
+                (
+                    tid,
+                    Some(Clock {
+                        current: LogicalTime::from_nanos(ns),
+                        inherited: LogicalTime::ZERO,
+                    }),
+                )
+            })
             .collect()
     }
 
@@ -221,19 +247,33 @@ mod tests {
                 (late, (90_000_000, 0))
             ]
         );
-        // A runnable thread without a clock yet is placed at the floor, and
-        // the accounts of threads gone from the clocks are dropped.
+        // A registered thread without a clock yet keeps an account at the
+        // floor; accounts of threads whose registration ended are dropped.
+        let pending = DetTid::from_raw(9);
+        let mut registered = clocks(&[(writer, 30_000_001)]);
+        registered.insert(pending, None);
         assert_eq!(
-            fair.run_times(
-                &clocks(&[(writer, 30_000_001)]),
-                &[writer, DetTid::from_raw(9)]
-            ),
-            vec![
-                (writer, (90_000_001, 0)),
-                (DetTid::from_raw(9), (90_000_000, 0))
-            ]
+            fair.run_times(&registered, &[writer, pending]),
+            vec![(writer, (90_000_001, 0)), (pending, (90_000_000, 0))]
         );
-        assert_eq!(fair.accounts.len(), 1);
+        assert_eq!(fair.accounts.len(), 2);
+        assert_eq!(fair.accounts[&pending].clock, None);
+        assert!(!fair.accounts.contains_key(&spinner));
+        assert!(!fair.accounts.contains_key(&late));
+        fair.note_selected(pending);
+        // Reporting the inherited clock contributes no work and keeps that
+        // selection, even though the inherited duration is greater than zero.
+        registered.insert(
+            pending,
+            Some(Clock {
+                current: LogicalTime::from_nanos(1_000),
+                inherited: LogicalTime::from_nanos(1_000),
+            }),
+        );
+        assert_eq!(
+            fair.run_times(&registered, &[writer, pending]),
+            vec![(writer, (90_000_001, 0)), (pending, (90_000_000, 1))]
+        );
     }
 
     /// Equal run times go to the thread selected least recently, a thread

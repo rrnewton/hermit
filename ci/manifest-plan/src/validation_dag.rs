@@ -6224,6 +6224,46 @@ sys.exit(37)
         refuse(OUTPUT, "the file", text);
     }
 
+    /// This guest spins without committing calls: only a PMU preemption
+    /// ends its slice. Both authored and generated DAGs must select it in
+    /// the PMU lane and exclude it from the ordinary CLI lanes.
+    #[test]
+    fn fair_continuation_cli_case_runs_only_with_pmu() {
+        let case = "a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write";
+        for (origin, dag) in [
+            (
+                "validation_dag_static",
+                crate::validation_dag_static::config(),
+            ),
+            (
+                OUTPUT,
+                dag_from_json(include_str!("../../dag/validate.json")).unwrap(),
+            ),
+        ] {
+            for tag in ["test.cli", "test.cli_on_host"] {
+                let step = dag.steps.iter().find(|step| step.tag() == tag).unwrap();
+                assert!(
+                    step.cmd.contains(&format!("--skip {case}")),
+                    "{origin}: {tag}"
+                );
+            }
+            let pmu = dag
+                .steps
+                .iter()
+                .find(|step| step.tag() == "privileged-test.pmu_cli_cases")
+                .unwrap();
+            assert!(
+                pmu.cmd.contains(&format!("test(={case})")),
+                "{origin}: PMU filter"
+            );
+            assert!(
+                !pmu.cmd.contains(&format!("--skip {case}")),
+                "{origin}: PMU skip"
+            );
+            assert!(pmu.description.contains(case), "{origin}: PMU description");
+        }
+    }
+
     #[test]
     fn steps_sharing_a_result_file_never_run_in_one_run_type() {
         // e2e.manifest_compat, portablecompat.manifest_compat,

@@ -25114,10 +25114,12 @@ fn a_recorded_schedule_replays_its_threads_under_their_recorded_ids() {
 /// to back once the spinner has had its timeslice: the rounds take less than
 /// two (26 ms). When the main thread spins and a second thread writes,
 /// sleeping 2 ms after each line, taking turns costs the writer a spinner
-/// slice after each line and one during each sleep (211 ms); in the fair
+/// slice after each line. Each sleep caps the spinner's next slice at the
+/// pending deadline, as in
+/// `a_replay_past_its_schedule_ends_slices_as_a_run_without_one_does`, so the
+/// sleep must finish before another whole 20 ms slice elapses. In the fair
 /// order the woken writer is raised to the floor, ties with the spinner and
-/// goes first, so only the slice during each sleep remains, since a wake does
-/// not preempt (108 ms; 211 ms when the tie went to the lower thread id). The schedule has no events and no per-thread history, as a
+/// goes first. The schedule has no events and no per-thread history, as a
 /// prefix-search trial of an empty prefix of a run without one, so the replay
 /// runs out at its first event and nothing guides the rest of the run.
 #[test]
@@ -25133,6 +25135,19 @@ fn a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write() {
     .unwrap();
     let replay = format!("--replay-schedule-from={}", schedule.display());
     let rounds_took_ms = |mode: &[&str], extra: &[&str]| -> u64 {
+        let mode_name = if mode.is_empty() {
+            "writer-main"
+        } else {
+            "spinner-main"
+        };
+        let order = if extra.contains(&"--replay-continue-fairly") {
+            "fair"
+        } else {
+            "in-turn"
+        };
+        let report = directory
+            .path()
+            .join(format!("{mode_name}-{order}-verify.json"));
         let mut args = vec![
             "run",
             "--strict",
@@ -25141,10 +25156,27 @@ fn a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write() {
             &replay,
         ];
         args.extend_from_slice(extra);
+        args.extend([
+            "--verify",
+            "--verify-strict",
+            "--verify-json",
+            report.to_str().unwrap(),
+        ]);
         args.extend(["--", guest.to_str().unwrap(), "5"]);
         args.extend_from_slice(mode);
         let output = hermit(&args);
         assert_success(&output, &args);
+        let verdict: serde_json::Value = serde_json::from_slice(
+            &fs::read(&report).expect("strict verification wrote no verdict"),
+        )
+        .expect("strict verification verdict is valid JSON");
+        assert_eq!(verdict["bitwise_parity"], true, "{verdict}");
+        for side in ["left", "right"] {
+            assert!(
+                verdict["compared_log_messages"][side].as_u64().unwrap_or(0) > 0,
+                "no INFO messages compared: {verdict}"
+            );
+        }
         let out = stdout(&output);
         assert_eq!(
             out.lines()
@@ -25153,6 +25185,28 @@ fn a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write() {
             5,
             "{out}"
         );
+        if !mode.is_empty() {
+            let sleeps = out
+                .lines()
+                .find_map(|line| line.strip_prefix("sleeps "))
+                .unwrap_or_else(|| panic!("no sleep measurements in:\n{out}"))
+                .split_whitespace()
+                .collect::<Vec<_>>();
+            assert_eq!(sleeps.len(), 5, "{out}");
+            assert_eq!(sleeps[1], "min_us", "{out}");
+            assert_eq!(sleeps[3], "max_us", "{out}");
+            assert_eq!(sleeps[0].parse::<u64>().unwrap(), 5, "{out}");
+            let shortest = sleeps[2].parse::<u64>().unwrap();
+            let longest = sleeps[4].parse::<u64>().unwrap();
+            assert!(shortest >= 2_000, "a 2 ms sleep returned early:\n{out}");
+            // The main deadline-cap regression above uses the same 20,000 us
+            // upper bound. Here it is also the configured 20 ms timeslice:
+            // no 2 ms sleep may wait out a full spinner slice after replay.
+            assert!(
+                longest < 20_000,
+                "a 2 ms sleep waited for a full spinner slice ({mode_name}, {order}):\n{out}"
+            );
+        }
         out.lines()
             .find_map(|line| line.strip_prefix("rounds took "))
             .and_then(|rest| rest.strip_suffix(" ms"))
@@ -25165,7 +25219,6 @@ fn a_fair_continuation_does_not_hand_a_spinner_a_timeslice_per_write() {
     assert!(fair < 40, "the fair continuation took {fair} ms");
     let spinner_main = ["spinner-main"];
     let in_turn = rounds_took_ms(&spinner_main, &[]);
-    assert!(in_turn >= 150, "spinning main: in turn took {in_turn} ms");
     let fair = rounds_took_ms(&spinner_main, &["--replay-continue-fairly"]);
     assert!(
         fair * 3 <= in_turn * 2,
