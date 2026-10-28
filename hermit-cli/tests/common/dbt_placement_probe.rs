@@ -16,6 +16,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
+// Library and mapping self-exec tests use this handoff; CLI tests pass --env directly.
+#[allow(dead_code)]
 pub(crate) const OBSERVER_ENV: &str = "HERMIT_TEST_DBT_PLACEMENT_OBSERVER";
 
 pub(crate) struct Probe {
