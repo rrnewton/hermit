@@ -249,6 +249,14 @@ pub struct RunSummary {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub exclusive_pairs: BTreeMap<String, u64>,
 
+    /// aarch64: of `exclusive_pairs`, those counted in bytes not known to be
+    /// code (neither marked `$x` by the file's mapping symbols nor covered
+    /// by its unwind table, nor marked `$d`), so they may be data, by guest
+    /// path, for the files that have any. A function of the files' bytes, so it is in the INFO
+    /// view. Empty elsewhere.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub exclusive_pairs_unverified: BTreeMap<String, u64>,
+
     /// aarch64: the reads of the generic timer's virtual counter from EL0
     /// (`MRS Xt, CNTVCT_EL0` or `CNTVCTSS_EL0`) in the guest's executable
     /// file mappings, by guest path, for the files that have any. Such a
@@ -443,6 +451,7 @@ impl RunSummary {
             host_inputs: _,
             host_inputs_changed: _,
             exclusive_pairs,
+            exclusive_pairs_unverified,
             counter_reads,
             exclusive_rewrites,
             exclusive_rewrite_cache_peak,
@@ -517,7 +526,13 @@ impl RunSummary {
                 exclusive_pairs.len()
             )?;
             for (path, pairs) in exclusive_pairs {
-                writeln!(f, "  {path}: {pairs}")?;
+                match exclusive_pairs_unverified.get(path) {
+                    Some(unverified) => writeln!(
+                        f,
+                        "  {path}: {pairs} ({unverified} unverified: in bytes not known to be code)"
+                    )?,
+                    None => writeln!(f, "  {path}: {pairs}")?,
+                }
             }
         }
         if !counter_reads.is_empty() {
@@ -940,6 +955,26 @@ mod tests {
                        /bin/guest: 2\n  /lib64/libc.so.6: 38\n";
         assert!(pairs.info(None).to_string().contains(listing));
         assert!(pairs.to_string().contains(listing));
+        assert!(
+            serde_json::to_value(&pairs)
+                .unwrap()
+                .get("exclusive_pairs_unverified")
+                .is_none()
+        );
+
+        // Pairs counted where nothing told code from data are labelled, in
+        // both views.
+        let unverified = RunSummary {
+            exclusive_pairs_unverified: BTreeMap::from([("/bin/guest".to_owned(), 2)]),
+            ..pairs.clone()
+        };
+        let labelled = "  /bin/guest: 2 (2 unverified: in bytes not known to be code)\n  /lib64/libc.so.6: 38\n";
+        assert!(unverified.info(None).to_string().contains(labelled));
+        assert!(unverified.to_string().contains(labelled));
+        assert_eq!(
+            serde_json::to_value(&unverified).unwrap()["exclusive_pairs_unverified"],
+            serde_json::json!({"/bin/guest": 2})
+        );
 
         for (counts, line, json) in [
             (
