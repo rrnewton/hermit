@@ -441,6 +441,52 @@ impl Graph {
         Ok(package)
     }
 
+    /// Select the actual core library, rather than its same-named executable.
+    /// Cargo reports this explicitly declared rlib as kind `rlib`, not `lib`.
+    pub fn core_library_unit(&self) -> Result<&Unit, String> {
+        let core = self.named("hermit-run")?;
+        let directory = core
+            .manifest_path
+            .parent()
+            .ok_or_else(|| "actual core manifest has no directory".to_owned())?;
+        let source = canonical_source_file(&directory.join("src/lib.rs"))?;
+        let declared: Vec<_> = core
+            .targets
+            .iter()
+            .filter(|target| {
+                target.name == "hermit" && target.kind == ["rlib"] && target.crate_types == ["rlib"]
+            })
+            .collect();
+        if declared.len() != 1 || canonical_source_file(&declared[0].src_path)? != source {
+            return Err("actual core has no unique declared hermit rlib source".to_owned());
+        }
+        let declared = declared[0];
+        let units: Vec<_> = self.units[&core.id]
+            .iter()
+            .filter(|unit| {
+                unit.package == core.name
+                    && unit.version == core.version
+                    && unit.target == declared.name
+                    && unit.kind == declared.kind
+                    && unit.crate_types == declared.crate_types
+            })
+            .collect();
+        if units.len() != 1 {
+            return Err("producer did not build exactly one core library feature unit".to_owned());
+        }
+        let unit = units[0];
+        let locators = self
+            .source_locators
+            .get(&(core.id.clone(), unit.key()?))
+            .ok_or_else(|| "actual core library has no bound source locators".to_owned())?;
+        if canonical_source_file(&locators.declared)? != source
+            || canonical_source_file(&locators.emitted)? != source
+        {
+            return Err("actual core library source differs from its declaration".to_owned());
+        }
+        Ok(unit)
+    }
+
     pub fn closure(&self, id: &str) -> Result<BTreeSet<String>, String> {
         let mut found = BTreeSet::new();
         let mut todo = vec![id.to_owned()];
@@ -460,6 +506,143 @@ impl Graph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn core_library_unit_uses_declared_rlib_and_refuses_wrong_kind_or_duplicates() {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-core-library-unit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("src/bin")).unwrap();
+        struct Owned(PathBuf);
+        impl Drop for Owned {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).unwrap();
+            }
+        }
+        let _owned = Owned(root.clone());
+        let source = root.join("src/lib.rs");
+        let binary = root.join("src/bin/hermit.rs");
+        let unrelated = root.join("src/unrelated.rs");
+        std::fs::write(
+            root.join("Cargo.toml"),
+            b"[package]\nname='hermit-run'\nversion='0.5.4'\n[lib]\nname='hermit'\ncrate-type=['rlib']\n",
+        )
+        .unwrap();
+        std::fs::write(&source, b"pub fn core() {}\n").unwrap();
+        std::fs::write(&binary, b"fn main() {}\n").unwrap();
+        std::fs::write(&unrelated, b"pub fn other() {}\n").unwrap();
+        let core = Package {
+            id: "core".to_owned(),
+            name: "hermit-run".to_owned(),
+            version: "0.5.4".to_owned(),
+            source: None,
+            manifest_path: root.join("Cargo.toml"),
+            targets: vec![
+                Target {
+                    name: "hermit".to_owned(),
+                    kind: vec!["rlib".to_owned()],
+                    crate_types: vec!["rlib".to_owned()],
+                    src_path: source.clone(),
+                },
+                Target {
+                    name: "hermit".to_owned(),
+                    kind: vec!["bin".to_owned()],
+                    crate_types: vec!["bin".to_owned()],
+                    src_path: binary.clone(),
+                },
+            ],
+        };
+        let library = serde_json::json!({
+            "reason":"compiler-artifact", "package_id":"core",
+            "target":{"name":"hermit", "kind":["rlib"], "crate_types":["rlib"], "src_path":source},
+            "features":["default"], "profile":{"opt_level":"0","test":false},
+            "filenames":[root.join("libhermit.rlib")], "executable":null,
+        });
+        let executable = serde_json::json!({
+            "reason":"compiler-artifact", "package_id":"core",
+            "target":{"name":"hermit", "kind":["bin"], "crate_types":["bin"], "src_path":binary},
+            "features":["default"], "profile":{"opt_level":"0","test":false},
+            "filenames":[root.join("hermit")], "executable":root.join("hermit"),
+        });
+        let stream = |artifacts: Vec<serde_json::Value>| {
+            let mut bytes = Vec::new();
+            for artifact in artifacts
+                .into_iter()
+                .chain([serde_json::json!({"reason":"build-finished","success":true})])
+            {
+                bytes.extend(serde_json::to_vec(&artifact).unwrap());
+                bytes.push(b'\n');
+            }
+            bytes
+        };
+        let mut graph = Graph {
+            packages: metadata_packages(vec![core]).unwrap(),
+            edges: BTreeMap::new(),
+            units: BTreeMap::new(),
+            executables: BTreeMap::new(),
+            artifacts: BTreeMap::new(),
+            source_locators: BTreeMap::new(),
+            build_outputs: BTreeMap::new(),
+        };
+        graph
+            .read_artifacts(&stream(vec![library.clone(), executable.clone()]))
+            .unwrap();
+        let actual = graph.core_library_unit().unwrap();
+        assert_eq!(actual.target, "hermit");
+        assert_eq!(actual.kind, ["rlib"]);
+        assert_eq!(actual.crate_types, ["rlib"]);
+        assert_eq!(actual.features, ["default"]);
+        assert_eq!(actual.profile, library["profile"]);
+
+        graph
+            .read_artifacts(&stream(vec![executable.clone()]))
+            .unwrap();
+        assert!(graph.core_library_unit().is_err(), "a bin is not a library");
+
+        let mut second_feature_unit = library.clone();
+        second_feature_unit["features"] = serde_json::json!(["default", "liteinst"]);
+        second_feature_unit["filenames"] = serde_json::json!([root.join("libhermit-other.rlib")]);
+        graph
+            .read_artifacts(&stream(vec![library.clone(), second_feature_unit]))
+            .unwrap();
+        assert!(
+            graph.core_library_unit().is_err(),
+            "two actual library feature units must refuse"
+        );
+
+        let mut wrong_source = library.clone();
+        wrong_source["target"]["src_path"] = serde_json::json!(unrelated);
+        graph.read_artifacts(&stream(vec![wrong_source])).unwrap();
+        assert!(
+            graph.core_library_unit().is_err(),
+            "an existing different source is not the declared core library"
+        );
+
+        graph.packages.get_mut("core").unwrap().targets[0].kind = vec!["lib".to_owned()];
+        graph.packages.get_mut("core").unwrap().targets[0].crate_types = vec!["lib".to_owned()];
+        let mut wrong_kind = library.clone();
+        wrong_kind["target"]["kind"] = serde_json::json!(["lib"]);
+        wrong_kind["target"]["crate_types"] = serde_json::json!(["lib"]);
+        graph.read_artifacts(&stream(vec![wrong_kind])).unwrap();
+        assert!(
+            graph.core_library_unit().is_err(),
+            "an undeclared alternate library kind must not be guessed"
+        );
+
+        let core = graph.packages.get_mut("core").unwrap();
+        core.targets[0].kind = vec!["rlib".to_owned()];
+        core.targets[0].crate_types = vec!["rlib".to_owned()];
+        core.targets.push(core.targets[0].clone());
+        assert!(
+            graph.read_artifacts(&stream(vec![library])).is_err(),
+            "duplicate target declarations must refuse"
+        );
+    }
 
     #[test]
     fn leased_manifest_alias_is_injective_and_unbuilt_targets_stay_declared() {
