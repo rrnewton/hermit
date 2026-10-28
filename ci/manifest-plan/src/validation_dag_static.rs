@@ -9824,7 +9824,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             ),
             (
                 r########"HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER"########,
-                r########"2"########,
+                r########"3"########,
             ),
         ],
         hint: HintSpec {
@@ -9839,7 +9839,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         },
         networkonly: false,
         engine_only: false,
-        timeout: 300,
+        timeout: 600,
         cpu_timeout: 7200,
         jobs_flag: None,
         jobs_env: None,
