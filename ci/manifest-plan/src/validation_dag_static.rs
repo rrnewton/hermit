@@ -4462,7 +4462,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4679: re-measured at this integration head by the cli binary's own
     // list under the node's skip filters, minus ignored cases: 738.
     // PR 4738 adds three cli cases: 738 + 3 = 741, re-measured at this integration head.
-    ("test.cli", 741),
+    // And this change's CLI test: 742.
+    ("test.cli", 742),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -5024,7 +5025,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // PR 4679: the same re-measurement as test.cli with the hosted
     // exclusions applied: 657.
     // The same three PR 4738 cases: 657 + 3 = 660.
-    ("test.cli_on_host", 660),
+    // And the same test: 661.
+    ("test.cli_on_host", 661),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     // run_kvm_futex_wait_on_an_unreadable_word_matches_linux
