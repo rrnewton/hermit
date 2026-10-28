@@ -3103,8 +3103,18 @@ fi
 # publication source-boundary repair; DBT recipe inputs unchanged, inventory 1015.
 # CARRY TO a461e8bf71fabef52f92ffd9c7369b2bbf8f0064 (2026-10-27): from afe9ad846f782471600ad1cf745f3a106b80d52e;
 # publication source-boundary repair; DBT recipe inputs unchanged, inventory 1015.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != a461e8bf71fabef52f92ffd9c7369b2bbf8f0064 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie a461e8bf71fabef52f92ffd9c7369b2bbf8f0064 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 44f07af7468099a43ce30fc29dbc6023f4ed45b3 (2026-10-27): from
+# a461e8bf71fabef52f92ffd9c7369b2bbf8f0064. Reverie 6374a207 (dbt lane)
+# replayed onto a461e8bf: the caller-owned native DBT lifecycle adds ABI16
+# callbacks and fixtures. SDK build.rs ff1eeb32b140 and vendor/dynamorio
+# tree 4ab89708f2e9 are byte-identical; the native client tree changes
+# (164356b3ab65 -> 0e9ffd386dbf) and requires rebuilt current runtime/client
+# artifacts. The committed DBT inventory grows from 1015 to 1035. Existing
+# SDK width and 1050 effective-job-second limits carry without
+# recalibration. This is not whole-runtime equivalence or a new cold-SDK
+# timing sample.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 44f07af7468099a43ce30fc29dbc6023f4ed45b3 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 44f07af7468099a43ce30fc29dbc6023f4ed45b3 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
