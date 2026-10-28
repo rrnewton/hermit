@@ -147,11 +147,20 @@ FINAL_DEVELOPMENT_054 = (
     ('R', 'reverie-loader/src/mapped_inputs.rs', 17803, '81cd7474215ff617fb1bc16b236461d4deb33697c7d559130f4bdb98b0f0e2c2'),
     ('R', 'reverie-loader/src/musl_tls.rs', 7478, '84011bb8505fa3357908e7445b1305f54303bae32ddb9d393546da8e309ee1ea'),
 )
+# Same complete 0.5.4 source cohort, with the ordinary assembly function in
+# its own exact section. This literal identity is reviewed source data, never
+# a hash inferred from the source tree during a build.
+FINAL_FUNCTION_SECTIONS_054 = tuple(
+    ('R', 'reverie-inguest/src/trap.rs', 49885, '91c07be60ab719c9d353991a0230c058b22a457676d05f3866aab943ea55d6eb')
+    if (row[0], row[1]) == ('R', 'reverie-inguest/src/trap.rs') else row
+    for row in FINAL_DEVELOPMENT_054
+)
 COHORTS = (("historical-bounded-bootstrap", HISTORICAL),
            ("merged-runtime-content-v1", CURRENT_MERGED),
            ("final-candidate-content-v1", FINAL_CANDIDATE_V1),
            ("development-051-content-v1", FINAL_DEVELOPMENT_051),
-           ("development-054-content-v1", FINAL_DEVELOPMENT_054))
+           ("development-054-content-v1", FINAL_DEVELOPMENT_054),
+           ("function-sections-054-content-v1", FINAL_FUNCTION_SECTIONS_054))
 
 
 def need(ok, message):

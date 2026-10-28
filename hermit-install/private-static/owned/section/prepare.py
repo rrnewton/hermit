@@ -77,12 +77,12 @@ def ordinary_selector(rows,objects,symbol_inputs,runtime_archive):
  sections=[row for row in rows if all(row.get(k)==v for k,v in obj.items()) and row['index']==index]
  need(len(sections)==1,'ordinary physical section absent/duplicate')
  section=sections[0]
- need(section['name']=='.text' and section['type']==1 and section['flags']==6 and section['align']==16 and (section['size'],offset) in ((177,0),(289,112)),'ordinary section is not a closed text shape')
+ need(section['type']==1 and section['flags']==6 and section['align']==16 and (section['name'],section['size'],offset) in (('.text',177,0),('.text',289,112),('.text.reverie_inguest_trusted_syscall',44,0)),'ordinary section is not a closed text shape')
  # A file selector uses the member name, so prove it denotes exactly this
  # physical section, not another section/member with an equal printable name.
- matches=[row for row in rows if row['archive']==archive and row['member']==member and row['name']=='.text']
+ matches=[row for row in rows if row['archive']==archive and row['member']==member and row['name']==section['name']]
  need(matches==[section],'ordinary exact selector matches ambiguous physical sections')
- return {'object':obj,'section':section,'roles':selected,'owner_offset':offset,'input_description':'"'+archive+':'+member+'"(.text)','scope':'PREPARATION_PLACEMENT_COORDINATES_NOT_QUALIFICATION'}
+ return {'object':obj,'section':section,'roles':selected,'owner_offset':offset,'input_description':'"'+archive+':'+member+'"('+section['name']+')','scope':'PREPARATION_PLACEMENT_COORDINATES_NOT_QUALIFICATION'}
 
 def script(rows,helper,symbol_inputs,objects,runtime_archive):
  ordinary=ordinary_selector(rows,objects,symbol_inputs,runtime_archive)

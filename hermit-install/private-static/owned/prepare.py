@@ -29,7 +29,7 @@ PRIVATE_INVENTORY_SHA256 = 'f825b66769fb55bee298b0a41277b38767970e5cad4beca8400f
 CODEGEN = '-C relocation-model=pic -C code-model=small -C target-feature=+crt-static -C link-self-contained=yes'
 STREAM = 64 * 1024 * 1024
 RUNTIME_COHORT = D / 'runtime_cohort.py'
-RUNTIME_COHORT_SHA256 = '3e8303fe0eb6f4132bea9962329323e2f5362e3cd7e65ce6708f307bb6f9fdcb'
+RUNTIME_COHORT_SHA256 = 'fe8e6cec39c0ea76212833d5e453603dffc71d305fcdd919a7f5cde9cf5622ae'
 REQUIRED_HANDOFF_SOURCE_SHA256 = '85abd905256f3bc5b526840cf3cd5e090238e4aa770f03d320c2ae907ee7ae75'
 
 
@@ -319,6 +319,56 @@ def runtime_handoff_preflight(c):
     return identity
 
 
+def publication_module(c):
+    path = D / 'publish.py'
+    need(c['files'].get(str(path)) == sha(path), 'bound package publication reader changed')
+    spec = importlib.util.spec_from_file_location('owned_package_publication', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+
+def bind_package_roles(c, x, prepared):
+    # The fixed marker requests the same Rust owner's additional proof. Neither
+    # an absent marker nor an absent digest can select it implicitly.
+    need((x.package_roles is None) == (x.package_roles_module_sha256 is None),
+         'source-owned package role mode/module digest must be paired')
+    c['files'][str(D / 'publish.py')] = sha(D / 'publish.py')
+    if x.package_roles is None:
+        return
+    reader = publication_module(c)
+    need(x.package_roles == reader.PACKAGE_ROLE_SCHEMA and
+         re.fullmatch('[0-9a-f]{64}', x.package_roles_module_sha256),
+         'independent source-owned package role mode/module digest required')
+    module = Path(c['R']) / 'reverie-liteinst-artifact/src/private_static/selected_initializers/package_roles.rs'
+    need(file_fact(module)['sha256'] == x.package_roles_module_sha256,
+         'actual reviewed package-role module differs')
+    # Reuse the original archive owner's already closed Cargo metadata. The
+    # runtime dependency may live in Cargo's pinned source cache, not H/reverie.
+    metadata = [Path(path) for path,digest in c['files'].items()
+                if digest == prepared['metadata_sha256']]
+    need(len(metadata) == 1 and file_fact(metadata[0])['bytes'] <= 128*1024*1024,
+         'source-owned runtime metadata absent/ambiguous/unbounded')
+    md = json.loads(metadata[0].read_text())
+    packages = [p for p in md['packages'] if p['name'] == 'reverie-inguest']
+    need(len(packages) == 1, 'source-owned runtime package absent/ambiguous')
+    source_root = Path(packages[0]['manifest_path']).parent
+    source_paths = [source_root / 'src/guest/continuation.rs'] + [
+        Path(c['link_paths']['musl_source_authority']) / 'musl-1.2.5-selected/src/env' / name
+        for name in ['__libc_start_main.c','__init_tls.c']]
+    sources = []
+    for path in source_paths:
+        need(path.is_absolute() and path.resolve() == path, 'package role source coordinate differs')
+        fact = file_fact(path)
+        sources.append(dict(path=str(path),sha256=fact['sha256']))
+        c['files'][str(path)] = fact['sha256']
+    c['files'][str(module)] = x.package_roles_module_sha256
+    c['package_roles'] = dict(schema=x.package_roles, module_path=str(module),
+                             module_sha256=x.package_roles_module_sha256, sources=sources)
+
+
+
 def bind_prepared(c, x):
     path = Path(x.prepared_result)
     need(path.is_relative_to(Path(c['evidence_root'])) and path.resolve() == path, 'prepared receipt outside owned evidence')
@@ -353,6 +403,7 @@ def bind_prepared(c, x):
     need(not Path(paths['output_directory']).exists() and
          not Path(paths['output_directory']).with_suffix('.negative-inputs').exists(), 'fresh sole-target link/control directories required')
     c['link_paths'] = paths
+    bind_package_roles(c, x, prepared)
     c['prepared_directory'] = str(path.parent)
     need(re.fullmatch('[0-9a-f]{64}', x.initializer_module_sha256), 'independent actual reviewed module SHA required')
     module = Path(c['R']) / 'reverie-liteinst-artifact/src/private_static/selected_initializers.rs'
@@ -541,6 +592,8 @@ def main():
     a.add_argument('--terminal-module-sha256', required=True)
     a.add_argument('--view-site-module-sha256', required=True)
     a.add_argument('--view-table-module-sha256', required=True)
+    a.add_argument('--package-roles')
+    a.add_argument('--package-roles-module-sha256')
     a.add_argument('--elf')
     a.add_argument('--objdump')
     a.add_argument('--elf-h-head')
@@ -797,6 +850,9 @@ def main():
                 c['native_leaf_sources']['memset'], c['native_leaf_sources']['set_thread_area'], c['native_leaf_module_sha256'],
                 c['optional_sources']['std_weak'], c['optional_sources']['std_destructors'], c['optional_sources']['musl_dl_iterate'], c['ordinary_gate_module_sha256'],
                 c['view_site_module_sha256'], c['view_table_module_sha256']]
+        if 'package_roles' in c:
+            argv += ['--package-roles',c['package_roles']['schema'],
+                     '--package-roles-module-sha256',c['package_roles']['module_sha256']]
         owned_error = None
         view_leaf_error = None
         diagnostic = ''
@@ -940,6 +996,8 @@ def main():
                 need(obs['runtime_archive'] == {'path':c['prepared_archive']['path'],'sha256':c['prepared_archive']['sha256']} and
                      obs['explicit_structural']['archive'] == obs['runtime_archive'] and
                      obs['explicit_structural']['artifact'] == obs['artifact'], 'structural actual archive/artifact binding differs')
+                publication_module(c).package_role_receipt(c,receipt,
+                    lambda p: dict(path=str(p),sha256=file_fact(p)['sha256']))
                 produced[str(structural_path)] = file_fact(structural_path)
                 result['explicit_structural_source_closed_receipt'] = receipt
                 result['explicit_structural_receipt_file'] = produced[str(structural_path)]
@@ -1022,8 +1080,14 @@ def main():
                      provider['link_map'] == {'path':expected_map,'sha256':produced[expected_map]['sha256']},
                      'ordinary actual runtime archive/ELF/map identity differs')
                 result['ordinary_gate_physical_members'] = {'identity_policy':provider['identity_policy'], **physical_members}
+                trap_sources = {
+                    'LegacyE3': '5c9249419574f00c540dec767359181c8ac03a47aa2df0f19e5cef0a59b5755b',
+                    'CheckedHandoff5b3': '5c9249419574f00c540dec767359181c8ac03a47aa2df0f19e5cef0a59b5755b',
+                    'DedicatedFunction': '91c07be60ab719c9d353991a0230c058b22a457676d05f3866aab943ea55d6eb',
+                }
+                need(provider['cohort'] in trap_sources, 'ordinary unknown source/section cohort')
                 source_roles = [
-                    ('reverie-inguest/src/trap.rs','5c9249419574f00c540dec767359181c8ac03a47aa2df0f19e5cef0a59b5755b'),
+                    ('reverie-inguest/src/trap.rs',trap_sources[provider['cohort']]),
                     ('reverie-inguest/src/trap/fixed_gates.rs','ff3f6f6c46e872734ae921e869dbccc0ce1aeefe4bc3af8f29363cf276501e54')]
                 need(len(provider['sources']) == 2, 'ordinary actual source roles incomplete')
                 for value,(suffix,digest) in zip(provider['sources'],source_roles):

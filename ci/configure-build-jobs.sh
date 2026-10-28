@@ -3140,76 +3140,12 @@ fi
 #     reverie-dbt/native            0e9ffd386dbf -> 0e9ffd386dbf
 # so the SDK and native inputs, calibrated budget, job width and limits
 # carry unchanged from the a39a5ca1 entry.
-# CARRY TO e9c54de934df30175dbbfff162b1a4fcfa7670e7 (2026-10-28): from
-# 82482ba80a1638d36ebf50d9518dfdfc6bb91185. Two commits, each replayed
-# with an identical patch-id: 85336d95 (kvm lane, timer slice T1b-2: the
-# dormant KVM timer delivers precise timer events by single-stepping, in
-# reverie-kvm, one function of reverie-kvm-core/src/bootstrap.rs and the
-# root Cargo.lock's reverie-kvm entry, which gains iced-x86; the capability
-# stays false), then e9c54de9 (dbt lane: native startup failure completes
-# through its application owner, in reverie-dbt/native/client.c,
-# reverie-dbt/src/tools.rs, the launcher's startup-failure tests, and the
-# evidence.rs and caller_native_source.rs source-contract tests). The new
-# test module raises the reverie-dbt inventory from 1037 to 1038. The SDK
-# inputs to the DynamoRIO content key are byte-identical by git object id:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          ff1eeb32b140 -> ff1eeb32b140
-# while reverie-dbt/native moves 0e9ffd386dbf -> c1f267db81c8 (client.c
-# only), so native artifacts are rebuilt; rust-toolchain.toml and
-# third-party/ are unchanged. The calibrated SDK budget, job width and
-# limits carry unchanged from the 82482ba8 entry; this carries SDK cost
-# only, not native byte equivalence or a cold-build timing sample.
-# BUDGET TO a4a654ac9ce45e7fd40eacaee22a2a1adcc75a2b (2026-10-28): from
-# e9c54de934df30175dbbfff162b1a4fcfa7670e7. Four commits, each replayed with
-# an identical patch-id: f709c401 and e7847776 (kvm lane, timer slice T1c:
-# the dormant KVM timer delivers pending signals at timer boundaries, in
-# reverie-kvm only; the capability stays false), then 44f1f4f5 and a4a654ac
-# (dbt lane, authored as d7d871a3 and 39a18b9c: DBT executable selection
-# follows PATH, checks execute access before script rewriting, keeps
-# launch error ordering and refuses unreadable images). The explicit
-# executable frontend and attested drrun digest change the SDK inputs:
-#     reverie-dbt/vendor/dynamorio  4ab89708f2e9 -> 2cc9d19b9a35
-#     reverie-dbt/build.rs          ff1eeb32b140 -> 3f2abba1b74a
-# while reverie-dbt/native stays c1f267db81c8; rust-toolchain.toml and
-# third-party/ are unchanged. These SDK inputs are object-identical to the
-# dbt lane's measured tree 39a18b9c, whose new SDK recipe
-# 2047197043f8f22b7be0ad1ecfbf80876f9b5ab075f2d819c4b748093e45f410 completed
-# its source build in 56.55 seconds at two jobs (113.10 job-seconds) in one
-# bounded local sample. That does not recalibrate hosted-runner budgets; the
-# numeric limits and job width stay. Four reverie-dbt test files move under
-# src/launcher/tests without changing the 1038-file inventory, and the
-# LiteInst source catalog stays 73 rows. This is not native byte
-# equivalence or proof of Hermit native behavior.
-# CARRY TO 688a542d75af8310c4ddd97eadbf2434abb067ff (2026-10-28): from
-# a4a654ac9ce45e7fd40eacaee22a2a1adcc75a2b. One commit, 688a542d, reverts the
-# dbt lane's executable selection (44f1f4f5, a4a654ac): its attested-frontend
-# refusal failed four Hermit DBT tests. Its tree is the T1c tree e7847776, so
-# the SDK inputs return to the e9c54de9 objects:
-#     reverie-dbt/vendor/dynamorio  2cc9d19b9a35 -> 4ab89708f2e9
-#     reverie-dbt/build.rs          3f2abba1b74a -> ff1eeb32b140
-# and reverie-dbt/native stays c1f267db81c8. The calibrated SDK budget, job
-# width and limits carry unchanged from the e9c54de9 entry; inventory stays
-# 1038 and the LiteInst source catalog 73 rows.
-# CARRY TO 90f9928cf3a2f6dde48bcd5cba7a52f6669faa76 (2026-10-28): forward reland
-# of the reviewed executable-selection source on the revert688a542d.
-# Its complete tree equals a4a654ac9ce45e7fd40eacaee22a2a1adcc75a2b,
-# restoring that entry's qualified SDK204 recipe; vendor/build.rs/native
-# are object-identical. The calibrated numeric budgets and widths are
-# unchanged. This is source/SDK-budget carry, not fresh Hermit execution;
-# the companion fixture repair requires its own actual controls.
-# BUDGET TO e99426e3b2b0728905f935dbf9d7301422cf7652 (2026-10-28): private
-# libc read/write adapters now translate raw errors into that thread's errno.
-# The vendor loader changes, so this is not unchanged-SDK-input carry. The new
-# SDK recipe 84595fbb0161561a90ec12c2bffca4149649ef4ba5611b283edd8687f8479617
-# completed its source build in 50.45 seconds at two jobs (100.89 job-seconds)
-# in one bounded local sample; the 107-file installation was verified. This
-# sample does not recalibrate hosted-runner budgets: numeric limits and width
-# remain unchanged. build.rs/native/toolchain are unchanged; current native
-# images still require their own producer. Five added regression fixture/test
-# files raise the tracked DBT inventory to 1043. The LiteInst source catalog
-# remains 73 rows. No Hermit runtime result is inferred from this budget binding.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != e99426e3b2b0728905f935dbf9d7301422cf7652 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie e99426e3b2b0728905f935dbf9d7301422cf7652 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 56bc0f896d0fbcd7cf370082bb262fe4ef41fdc8 (2026-10-28): from 82482ba80a1638d36ebf50d9518dfdfc6bb91185.
+# The reverie-dbt tree, root Cargo.toml/Cargo.lock and rust-toolchain.toml
+# are byte-identical. Inventory remains 1037. Shared stdio and private package
+# proofs changed; the existing SDK budget carries, not runtime equivalence.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 56bc0f896d0fbcd7cf370082bb262fe4ef41fdc8 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 56bc0f896d0fbcd7cf370082bb262fe4ef41fdc8 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

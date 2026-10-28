@@ -19,7 +19,19 @@ def cancellation(pending, error):
     return pending if pending is not None or isinstance(error, Exception) else error
 
 
-def validate_roles(roles):
+PACKAGE_ROLE_SCHEMA = 'hermit.private-static-package-roles.source-owned.v1'
+PACKAGE_OBSERVATION_SCHEMA = 'reverie.private-static-package-role-observation.v1'
+PACKAGE_ROLE_SCOPE = 'THREE_COMPLETE_SOURCE_MEMBER_RELOCATED_BODIES_AND_FINITE_SITE_IDENTITIES_ONLY'
+PACKAGE_ROLES = (
+    ('fallback_entry', 48, (6,14,19), ((44,39,0),),
+     {'fallback_completion_syscall':44, 'fallback_completion_return':46}),
+    ('__init_libc', 413, (31,60,106,126,138,150,157,184,222,235,330,400),
+     ((302,7,3),(388,2,4)), {}),
+    ('__init_tp', 107, (8,20,40,52,80), ((44,218,2),), {}),
+)
+
+
+def _validate_legacy_roles(roles):
     """Check closed conditional DATA expectations, not source authority."""
     need(type(roles) is dict and set(roles) == {'fallback_entry','completion_syscall','sites'},
          'unknown/missing role DATA')
@@ -39,6 +51,192 @@ def validate_roles(roles):
         need(type(owner['offset']) is int and 0 <= owner['offset'] < 256*1024 and
              type(owner['owner_sha256']) is str and re.fullmatch('[0-9a-f]{64}',owner['owner_sha256']),
              'bounded exact owner offset/hash required')
+
+
+
+def _validate_hashed_owner(owner):
+    need(type(owner) is dict and set(owner) == {'symbol','offset','owner_sha256'}, 'owner DATA shape')
+    need(type(owner['symbol']) is str and owner['symbol'] and len(owner['symbol']) <= 16384 and
+         not any(v in owner['symbol'] for v in ['\0','\n','\r']), 'bounded exact owner symbol required')
+    need(type(owner['offset']) is int and 0 <= owner['offset'] < 256*1024 and
+         type(owner['owner_sha256']) is str and re.fullmatch('[0-9a-f]{64}',owner['owner_sha256']),
+         'bounded exact owner offset/hash required')
+
+
+
+def validate_roles(roles):
+    """Disjoint requests: legacy output hashes or a fresh three-body proof."""
+    if type(roles) is not dict or 'schema' not in roles:
+        return _validate_legacy_roles(roles)
+    need(set(roles) == {'schema','fallback_entry','completion_syscall','sites'} and
+         roles['schema'] == PACKAGE_ROLE_SCHEMA, 'unknown/missing source-owned role DATA')
+    need(roles['fallback_entry'] == {'symbol':'fallback_entry','offset':0} and
+         roles['completion_syscall'] == {'symbol':'fallback_entry','offset':44} and
+         type(roles['fallback_entry']['offset']) is int and
+         type(roles['completion_syscall']['offset']) is int,
+         'source-owned fallback role coordinates differ')
+    need(type(roles['sites']) is list and len(roles['sites']) == 4, 'exactly four native DATA rows')
+    expected = {2:('__init_tp',44,218), 3:('__init_libc',302,7), 4:('__init_libc',388,2)}
+    kinds = []
+    for row in roles['sites']:
+        need(type(row) is dict and set(row) == {'owner','number','operation'} and
+             type(row['operation']) is int and type(row['number']) is int,
+             'native DATA row shape')
+        kinds.append((row['operation'],row['number']))
+        owner = row['owner']
+        if row['operation'] in expected:
+            name,offset,number = expected[row['operation']]
+            need(type(owner) is dict and set(owner) == {'symbol','offset'} and
+                 type(owner['offset']) is int and owner == {'symbol':name,'offset':offset} and
+                 row['number'] == number, 'source-owned native role coordinates differ')
+        else:
+            _validate_hashed_owner(owner)
+            if row['operation'] == 1:
+                need(owner['symbol'] == '__set_thread_area' and owner['offset'] == 13,
+                     'native DATA owner must be exact __set_thread_area')
+    need(sorted(kinds) == [(1,158),(2,218),(3,7),(4,2)],
+         'native DATA source-contract roles differ')
+
+
+
+def source_owned_roles(roles):
+    validate_roles(roles)
+    return 'schema' in roles
+
+
+
+def validate_package_role_projection(value, module_sha256, identities, sources):
+    """Consume the sealed Rust projection; never resolve relocations in Python."""
+    def shape(row, keys, label):
+        need(type(row) is dict and set(row) == set(keys.split()), label+' shape differs')
+    def uint(value, label):
+        need(type(value) is int and 0 <= value < 2**64, label+' integer differs')
+    def digest(value):
+        need(type(value) is str and re.fullmatch('[0-9a-f]{64}',value), 'package role digest differs')
+    def text(value):
+        need(type(value) is str and 0 < len(value) <= 16384 and
+             not any(c in value for c in '\0\r\n'), 'package role text differs')
+    def identity(row):
+        shape(row, 'path sha256', 'package role file identity')
+        text(row['path']); digest(row['sha256'])
+        need(Path(row['path']).is_absolute(), 'package role path is not absolute')
+    shape(value, 'schema scope implementation_sha256 runtime_archive libc_archive artifact link_map sources roles merged_literals ssp_override',
+          'package role projection')
+    need(len(json.dumps(value).encode()) <= 65536, 'package role projection exceeds bound')
+    digest(module_sha256)
+    need(value['schema'] == PACKAGE_OBSERVATION_SCHEMA and value['scope'] == PACKAGE_ROLE_SCOPE and
+         value['implementation_sha256'] == module_sha256, 'package role module/schema/scope differs')
+    need(set(identities) == {'runtime_archive','libc_archive','artifact','link_map'},
+         'package role transaction identity set differs')
+    for key,expected in identities.items():
+        identity(value[key]); identity(expected)
+        need(value[key] == expected, 'package role transaction differs: '+key)
+    need(type(sources) is list and len(sources) == 3 and value['sources'] == sources,
+         'package role source identities differ')
+    for row in sources: identity(row)
+    need(len({row['path'] for row in sources}) == 3, 'package role sources overlap')
+    need(type(value['roles']) is list and len(value['roles']) == 3, 'exact three package roles required')
+    rows = {}
+    for row,(name,size,offsets,sites,aliases) in zip(value['roles'],PACKAGE_ROLES):
+        shape(row, 'symbol member_name member_ordinal member_header member_sha256 input_section input_offset complete_bytes input_body_sha256 final_entry final_body_sha256 relocations sites aliases', 'package role')
+        need(row['symbol'] == name and type(row['complete_bytes']) is int and row['complete_bytes'] == size,
+             'package role order/complete extent differs')
+        text(row['member_name'])
+        for key in ['member_ordinal','member_header','input_section','input_offset','final_entry']:
+            uint(row[key], 'package role '+key)
+        need(row['input_offset'] == 0 and 0 < row['final_entry'] < 2**64-size,
+             'package role input offset/address bound differs')
+        for key in ['member_sha256','input_body_sha256','final_body_sha256']: digest(row[key])
+        need(type(row['sites']) is list and row['sites'] ==
+             [dict(offset=o,number=n,operation=p) for o,n,p in sites] and
+             all(type(v) is int for s in row['sites'] for v in s.values()) and
+             type(row['aliases']) is dict and row['aliases'] == aliases and
+             all(type(v) is int for v in row['aliases'].values()), 'package role sites/aliases differ')
+        need(type(row['relocations']) is list and len(row['relocations']) == len(offsets),
+             'package role complete relocation count differs')
+        for relocation,offset in zip(row['relocations'],offsets):
+            shape(relocation, 'offset kind addend source_symbol_index source_symbol selected_target selection final_symbol_index final_symbol_value final_addend', 'package role relocation')
+            for key in ['offset','kind','source_symbol_index','selected_target','final_symbol_index','final_symbol_value']:
+                uint(relocation[key], 'package relocation '+key)
+            need(relocation['offset'] == offset and relocation['kind'] < 2**32 and
+                 all(type(relocation[k]) is int and -(2**63) <= relocation[k] < 2**63
+                     for k in ['addend','final_addend']), 'package relocation fields differ')
+            text(relocation['source_symbol'])
+            need(relocation['selection'] in ('map_selected_input','selected_strong_ssp','anchored_merged_literal'),
+                 'package relocation target selection differs')
+        if name == 'fallback_entry':
+            need([(r['kind'],r['addend']) for r in row['relocations']] == [(2,-4),(4,-4),(4,-4)],
+                 'fallback relocation inventory differs')
+        rows[name] = row
+    need(type(value['merged_literals']) is list and len(value['merged_literals']) == 2,
+         'exact two merged literals required')
+    for row,(name,offset,body) in zip(value['merged_literals'], [('.LC0',0,b'\0'),('.LC1',1,b'/dev/null\0')]):
+        shape(row, 'source_symbol input_symbol_index input_section input_offset bytes sha256 file_symbol_index final_symbol_index final_address final_section final_file_offset anchor_symbol_index anchor_address', 'package merged literal')
+        for key in set(row)-{'source_symbol','sha256'}: uint(row[key], 'package literal '+key)
+        need(row['source_symbol'] == name and row['input_section'] == 6 and row['input_offset'] == offset and
+             row['bytes'] == len(body) and row['sha256'] == hashlib.sha256(body).hexdigest() and
+             row['anchor_address'] == rows['__init_libc']['final_entry'], 'package merged literal identity differs')
+    row = value['ssp_override']
+    shape(row, 'source_symbol_index source_section selected_member_name selected_member_ordinal selected_member_header selected_member_sha256 final_entry complete_bytes', 'package SSP override')
+    text(row['selected_member_name']); digest(row['selected_member_sha256'])
+    for key in set(row)-{'selected_member_name','selected_member_sha256'}: uint(row[key], 'package SSP '+key)
+    need(row['source_section'] == 5 and row['complete_bytes'] > 0, 'package SSP source/extent differs')
+    return rows
+
+
+
+def package_role_bodies(rows, symbol, span, decoded):
+    """Recheck complete actual RX bodies and exactly their decoded syscall set."""
+    need(set(rows) == {v[0] for v in PACKAGE_ROLES}, 'package role body set differs')
+    entries = {}; ranges = []
+    for name,size,_,sites,aliases in PACKAGE_ROLES:
+        row = rows[name]; owner = symbol(name)
+        need(owner['name'] == name and owner['type'] == 2 and owner['binding'] == 0 and
+             owner['visibility'] == 2 and owner['size'] == size == row['complete_bytes'] and
+             owner['value'] == row['final_entry'], 'package role final symbol differs')
+        start = owner['value']; end = start+size
+        need(all(end <= a or b <= start for a,b in ranges), 'package role body spans overlap')
+        ranges.append((start,end))
+        body = span(start,size,5)
+        need(len(body) == size and hashlib.sha256(body).hexdigest() == row['final_body_sha256'],
+             'package role complete final body differs')
+        need({post for post in decoded if start <= post-2 < end} ==
+             {start+offset+2 for offset,_,_ in sites}, 'package role decoded syscall set differs')
+        need(all(body[offset:offset+2] == b'\x0f\x05' for offset,_,_ in sites),
+             'package role actual syscall bytes differ')
+        for alias,offset in aliases.items():
+            need(symbol(alias)['value'] == start+offset, 'package role actual alias differs')
+        entries[name] = start
+    return entries
+
+
+
+def package_role_receipt(c, receipt, file_identity):
+    """Require presence or absence in the original source-closed receipt."""
+    if 'package_roles' not in c:
+        need('package_roles' not in receipt, 'legacy transaction has unsolicited package roles')
+        return None
+    selected = c['package_roles']
+    need(type(selected) is dict and set(selected) == {'schema','module_path','module_sha256','sources'} and
+         selected['schema'] == PACKAGE_ROLE_SCHEMA and
+         c['files'].get(selected['module_path']) == selected['module_sha256'] and
+         file_identity(selected['module_path']) == dict(path=selected['module_path'],sha256=selected['module_sha256']),
+         'bound package role module differs')
+    for expected in selected['sources']:
+        need(c['files'].get(expected['path']) == expected['sha256'] and file_identity(expected['path']) == expected,
+             'bound package role source changed')
+    paths = c['link_paths']; out = Path(paths['output_directory'])
+    identities = dict(runtime_archive=dict(path=c['prepared_archive']['path'],sha256=c['prepared_archive']['sha256']),
+                      libc_archive=file_identity(paths['libc']),
+                      artifact=file_identity(out/'initializer-definitions.not-qualified.elf'),
+                      link_map=file_identity(out/'initializer-definitions.map'))
+    need(receipt['source_factory_close'] == receipt['archive_close'] == 'PASS' and
+         receipt['observation']['runtime_archive'] == identities['runtime_archive'] and
+         receipt['observation']['artifact'] == identities['artifact'] and
+         receipt['observation']['link_map'] == identities['link_map'],
+         'package role original transaction/close differs')
+    return validate_package_role_projection(receipt.get('package_roles'), selected['module_sha256'],
+                                            identities, selected['sources'])
 
 
 def fixed_gate_data(symbol, span, file_offset, gate, reference, decoded, closed_digest):
@@ -103,7 +301,8 @@ def zero_set_thread_area_data(observed, owner, expectation, artifact, link_map,
 
 def publish(m, c, result_path, coordinates_path, roles, destination, close_pipeline):
     """Use existing ELF readers and exact closed output identities only."""
-    validate_roles(roles)
+    source_owned = source_owned_roles(roles)
+    need(source_owned == ('package_roles' in c), 'package role request/bound mode differs')
     result = json.loads(result_path.read_text())
     coordinates = json.loads(coordinates_path.read_text())
     need(result['state'] == 'PASS_OWNED_FINAL_LINK_INSPECTION_ONLY' and
@@ -172,6 +371,9 @@ def publish(m, c, result_path, coordinates_path, roles, destination, close_pipel
             need(len(found) == 1, 'package symbol absent/duplicate: ' + name)
             return found[0]
         def site(expectation, zero_native=False):
+            if source_owned and expectation['symbol'] in package_entries:
+                need(set(expectation) == {'symbol','offset'}, 'source-owned site DATA shape differs')
+                return package_entries[expectation['symbol']] + expectation['offset']
             need(set(expectation) == {'symbol','offset','owner_sha256'}, 'closed site DATA shape differs')
             owner = symbol(expectation['symbol'])
             if zero_native and owner['size'] == 0:
@@ -249,6 +451,10 @@ def publish(m, c, result_path, coordinates_path, roles, destination, close_pipel
         need(structural == result['explicit_structural_source_closed_receipt'] and
              structural['source_factory_close'] == 'PASS' and
              structural['archive_close'] == 'PASS', 'actual structural close differs')
+        package_rows = package_role_receipt(c,structural,
+            lambda p: dict(path=str(p),sha256=m.file_fact(p)['sha256']))
+        package_entries = (package_role_bodies(package_rows,symbol,span,decoded)
+                           if source_owned else {})
         inspection = structural['observation']['explicit_structural']
         need(inspection['artifact'] == {'path':str(original),'sha256':result['elf']['sha256']},
              'closed gate observation belongs to another artifact')
@@ -256,7 +462,8 @@ def publish(m, c, result_path, coordinates_path, roles, destination, close_pipel
                                          inspection['gate_sha256'])
         ordinary = sorted(set(decoded) - expected_gates)
         need(0 < len(ordinary) <= 4096, 'ordinary decoded table bound')
-        need(set(roles) == {'fallback_entry','completion_syscall','sites'}, 'unknown/missing role DATA')
+        need(set(roles) == {'fallback_entry','completion_syscall','sites'} |
+             ({'schema'} if source_owned else set()), 'unknown/missing role DATA')
         fallback = site(roles['fallback_entry'])
         completion = site(roles['completion_syscall'])
         need(fallback < completion and span(completion,4,5) == b'\x0f\x05\x0f\x0b' and

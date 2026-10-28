@@ -40,9 +40,9 @@
     "sha256": "32f40e1ebd50c2d0273d8d90e91c01cc015717a5e975814f6b7ac8be93da48c3"
   },
   {
-    "bytes": 25963,
+    "bytes": 28037,
     "path": "main.rs",
-    "sha256": "06970cc58ab5dc98bbcd41b09e12aa7df942df7affd5e7dde5bb232e093592b7"
+    "sha256": "4f6ab82ba4170b16af71c96fa5665b0f91a0594935085f154733bbae1998728d"
   },
   {
     "bytes": 13538,
@@ -65,29 +65,29 @@
     "sha256": "9dde3b702aad0a114b5f32c4ee3c2adedec7a166be7ac2ebc6fa273f7bcbd270"
   },
   {
-    "bytes": 15253,
+    "bytes": 15882,
     "path": "pipeline.py",
-    "sha256": "13634c788c65fb34dd895f7166f90199aa4ff1827a1d470b8324c1ad1cd14514"
+    "sha256": "253995016045689b554052770077be487c48acd6c0abd4f8d4a6eed002346e51"
   },
   {
-    "bytes": 82389,
+    "bytes": 86006,
     "path": "prepare.py",
-    "sha256": "42cad58519fa2d1ef7b46bb9a6e892221f1ed7cdd2d6c40f9463fbe931b70638"
+    "sha256": "81dd48f4d6dd49309ea7fb84f83611092b6011dd9e42afd2edd193af93551bab"
   },
   {
-    "bytes": 20942,
+    "bytes": 34384,
     "path": "publish.py",
-    "sha256": "ac644e1342fc537a9a41b1e6dead1d940b8c5724236e3935ac7406af7d4ebbf7"
+    "sha256": "7393e2a1069cf3b01f9610f9ab56813512993a251433a1feee783c8379dd454c"
   },
   {
-    "bytes": 25659,
+    "bytes": 26211,
     "path": "runtime_cohort.py",
-    "sha256": "3e8303fe0eb6f4132bea9962329323e2f5362e3cd7e65ce6708f307bb6f9fdcb"
+    "sha256": "fe8e6cec39c0ea76212833d5e453603dffc71d305fcdd919a7f5cde9cf5622ae"
   },
   {
-    "bytes": 27950,
+    "bytes": 28022,
     "path": "section/prepare.py",
-    "sha256": "8fec6a557ea7a810045455861e4e7e4c111dcadd70873789be580394b623c9ba"
+    "sha256": "ffde3cad022a668b703ff37c16cfd4217b9d68d3b92641b4c4965774e668c3a8"
   },
   {
     "bytes": 4716,
@@ -100,29 +100,29 @@
     "sha256": "8f78379193e766fbcd2480cf1b1c5dfe654f27cc306c203841430f15e5b37009"
   },
   {
-    "bytes": 44839,
+    "bytes": 44945,
     "path": "test_cancellation.py",
-    "sha256": "70f08d98801d0c4a6973501324f052d153166a3af282ae50171eb1a2fbefed4c"
+    "sha256": "356be6518b0bca9a879cd208904a4d88c7349c1e3d864792048273c9064718a4"
   },
   {
     "bytes": 5438,
     "path": "test_handoff_cohort.py",
-    "sha256": "d862196021abf46d9f98dcc5db39076e60e9080015ede3c01c6194fa2d7e07e3"
+    "sha256": "ffbc06862da7923642439789d37966d97144bb3fcb052afcb3b219a8b6f10274"
   },
   {
     "bytes": 2749,
     "path": "test_inventory_identity.py",
-    "sha256": "1594a03d9b4f6e1e21cd9cb45f6e9f7b49b8eb9f97ab62a1a4af4d86d12a83a9"
+    "sha256": "b532e450a71650589b3e6732cf09a396feb6d2f8c20601e794b5689636309f4f"
   },
   {
-    "bytes": 5204,
+    "bytes": 38940,
     "path": "test_pipeline.py",
-    "sha256": "860ceab3b121c7f8307727a39c851470457b61a3c4b11f35e6bfc92c4f3c2289"
+    "sha256": "4b10d0316a9f4eec0263234308f8289442999e3c4b11d74362e0d8dba9ad97b7"
   },
   {
-    "bytes": 6273,
+    "bytes": 11421,
     "path": "test_runtime_cohort.py",
-    "sha256": "c0d6b2ad23b3870a17c3af7223dd38a70a6d23db0c88d14b7e3b47dda4029eca"
+    "sha256": "033adc0f05644a1e164f5da82d9136cf64b35cef55184e2e7a1b5007292a6107"
   },
   {
     "bytes": 14642,

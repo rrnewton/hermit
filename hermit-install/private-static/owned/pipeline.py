@@ -96,7 +96,10 @@ def validate_config(c):
         need(path.is_absolute() and path.resolve() == path and path.exists(), 'canonical existing input: '+name)
     needed = {'native_inputs','inspection_tools','runner','initializer_module','tls_source_module',
               'native_leaf_module','ordinary_gate_module','terminal_module','view_site_module','view_table_module'}
-    need(set(c['digests']) == needed and
+    package_requested = type(c['data_roles']) is dict and 'schema' in c['data_roles']
+    need(('package_roles_module' in c['digests']) == package_requested,
+         'source-owned package role request/module digest must be paired')
+    need(set(c['digests']) == needed | ({'package_roles_module'} if package_requested else set()) and
          all(re.fullmatch('[0-9a-f]{64}',v) for v in c['digests'].values()), 'closed expected digest config')
     for role,name in [('native_inputs','native_inputs_json'),('inspection_tools','inspection_tools_json'),('runner','runner')]:
         need(sha(c['paths'][name]) == c['digests'][role], 'explicit native/tool input differs: '+role)
@@ -119,6 +122,7 @@ def main():
              sha(config_path) == args.config_sha256, 'explicit input config differs')
         c = json.loads(config_path.read_text())
         validate_config(c)
+        module('publish.py',sources).validate_roles(c['data_roles'])
         owned = module('prepare.py',sources)
         owned.runtime_content_preflight({'H': c['paths']['H']})
         root = Path(args.evidence_root)
@@ -157,6 +161,7 @@ def main():
     owned = module('prepare.py',sources)
     observer = module('observe_coordinates.py',sources)
     publisher = module('publish.py',sources)
+    package_requested = publisher.source_owned_roles(c['data_roles'])
     owned.runtime_content_preflight({'H': c['paths']['H']})
     out = Path(bound['out']); out.mkdir()
     paths,heads,digests = c['paths'],c['heads'],c['digests']
@@ -209,6 +214,9 @@ def main():
         for name in ['initializer_module','tls_source_module','native_leaf_module','ordinary_gate_module',
                      'terminal_module','view_site_module','view_table_module']:
             link_args += ['--'+name.replace('_','-')+'-sha256',digests[name]]
+        if package_requested:
+            link_args += ['--package-roles',publisher.PACKAGE_ROLE_SCHEMA,
+                          '--package-roles-module-sha256',digests['package_roles_module']]
         for name in ['optional_std_weak_source','optional_std_destructors_source','optional_musl_dl_iterate_source']:
             link_args += ['--'+name.replace('_','-'),paths[name]]
         invoke(owned,link_args)

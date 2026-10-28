@@ -13,13 +13,39 @@ use reverie_liteinst_artifact::private_static::{SourceExpectation, VerifiedStati
 use reverie_liteinst_artifact::private_static::selected_initializers::{InitializerLinkInputs, implementation_sha256, NativeLeafInputs, native_leaf_implementation_sha256};
 use reverie_liteinst_artifact::{FileIdentity, Runner, qualifier_source_sha256, sha256, write_new};
 
+// The marker requests stronger proof from the same transaction. The expected
+// digest comes from the independently bound source catalog, never this binary.
+fn take_package_roles_suffix(a: &mut Vec<String>) -> Result<Option<String>, String> {
+    if !a.iter().any(|value| value == "--package-roles" || value == "--package-roles-module-sha256") {
+        return Ok(None);
+    }
+    let n = a.len();
+    if n < 5 || a[n - 4] != "--package-roles"
+        || a[n - 3] != "hermit.private-static-package-roles.source-owned.v1"
+        || a[n - 2] != "--package-roles-module-sha256"
+        || a[..n - 4].iter().any(|value| value == "--package-roles" || value == "--package-roles-module-sha256")
+        || a[n - 1].len() != 64
+        || !a[n - 1].bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) {
+        return Err("expected one explicit source-owned package-role mode/module digest suffix".into());
+    }
+    let digest = a[n - 1].clone();
+    a.truncate(n - 4);
+    Ok(Some(digest))
+}
+
 fn run() -> Result<(), String> {
-    let a: Vec<String> = std::env::args().collect();
+    let mut a: Vec<String> = std::env::args().collect();
+    let package_roles_module = take_package_roles_suffix(&mut a)?;
     if a.len() != 31 {
         return Err("expected H H_HEAD RUNTIME_R_PIN CARGO RUSTC TARGET LOGS TOOL_R_HEAD QUALIFIER_SHA MODULE_SHA LLD SCRIPT LIBC LIBUNWIND MEMCPY_SOURCE MUSL_AUTHORITY SSP_SOURCE OUTPUT PREPARED_ARCHIVE_SHA PREPARED_ARCHIVE_BYTES OBJDUMP MEMSET_SOURCE SET_THREAD_AREA_SOURCE NATIVE_LEAF_MODULE_SHA OPTIONAL_STD_WEAK OPTIONAL_STD_DESTRUCTORS OPTIONAL_MUSL_DL_ITERATE ORDINARY_GATE_MODULE_SHA VIEW_SITE_MODULE_SHA VIEW_TABLE_MODULE_SHA".into());
     }
     if qualifier_source_sha256() != a[9] || implementation_sha256() != a[10] {
         return Err("compiled qualifier/module differs from independently bound tool source".into());
+    }
+    if let Some(expected) = &package_roles_module {
+        if reverie_liteinst_artifact::private_static::selected_initializers::package_role_implementation_sha256() != *expected {
+            return Err("compiled package-role module differs from independently bound tool source".into());
+        }
     }
     if native_leaf_implementation_sha256() != a[24] {
         return Err("compiled native leaf module differs from bound actual tool source".into());
@@ -89,7 +115,12 @@ fn run() -> Result<(), String> {
         if controls != 5 { return Err("actual five factory controls incomplete".into()); }
         // The sole positive LLD invocation remains inside this same source and
         // its actual StaticArchive owner. No old JSON can construct either.
-        match source.link_and_join_initializer_definitions(&archive, &input, runner) {
+        let selected = if package_roles_module.is_some() {
+            source.link_and_join_initializer_definitions_with_package_roles(&archive, &input, runner)
+        } else {
+            source.link_and_join_initializer_definitions(&archive, &input, runner)
+        };
+        match selected {
             Ok(selected) => match selected.verify() {
                 Ok(()) => { joined = true; join_detail = format!("Ok({selected:#?})"); selected_proof = Some(selected); }
                 Err(error) => { join_detail = format!("POST_JOIN_CUSTODY_REFUSED: {error}"); }
@@ -351,7 +382,7 @@ fn run() -> Result<(), String> {
     let structural = structural.as_ref().ok_or("structural attempt absent")?;
     structural_observation::require_complete(structural)?;
     let executable = FileIdentity::read(&std::env::current_exe().map_err(|e|e.to_string())?)?;
-    let receipt = serde_json::json!({
+    let mut receipt = serde_json::json!({
         "schema":1,"state":"SOURCE_CLOSED_EXPLICIT_STRUCTURAL_OBSERVATION_ONLY",
         "tool_R_head":a[8],"runtime_H_head":a[2],"runtime_R_pin":a[3],
         "qualifier_sha256":a[9],"initializer_module_sha256":a[10],
@@ -369,6 +400,13 @@ fn run() -> Result<(), String> {
         "qualification":"NOT_PROVEN","pre_fs_closure":"NOT_PROVEN",
         "readiness":"NOT_PROVEN","guest_release":false,"guests_executed":0,
     });
+    if package_roles_module.is_some() {
+        let selected = selected_proof.as_ref().ok_or("package roles require this actual successful selected join")?;
+        let bytes = selected.package_role_observation()?.to_json_pretty()?;
+        if bytes.len() > 65536 { return Err("package role observation exceeds bound".into()); }
+        receipt["package_roles"] = serde_json::from_slice::<serde_json::Value>(&bytes)
+            .map_err(|error| error.to_string())?;
+    }
     let receipt_path=logs.join("explicit-structural.source-closed.json");
     let receipt_bytes=serde_json::to_vec_pretty(&receipt).map_err(|e|e.to_string())?;
     write_new(&receipt_path,&receipt_bytes)?;
