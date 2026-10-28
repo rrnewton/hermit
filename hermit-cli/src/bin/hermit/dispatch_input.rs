@@ -778,6 +778,23 @@ fn read_frame(fd: RawFd) -> Result<Frame> {
     Ok(frame)
 }
 
+fn restore_original_stdin_closedness(original: i32) -> Result<()> {
+    if original != -libc::EBADF - 1 {
+        return Ok(());
+    }
+    // Only the fully authenticated handoff's exact original EBADF encoding
+    // authorizes this close. Rust startup may have replaced fd0 with /dev/null,
+    // even when the preceding exec inherited a physically closed descriptor.
+    // Never retry close: on Linux an error can follow descriptor retirement.
+    if unsafe { libc::close(libc::STDIN_FILENO) } < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EBADF) {
+            return Err(error).context("cannot restore original closed stdin after dispatch");
+        }
+    }
+    Ok(())
+}
+
 /// Target-side entry, before fbinit/private handlers/retirement. This never
 /// reads fd0 and never adopts a shared-input manifest. The returned environment
 /// is the exact original environment, excluding only our appended locator.
@@ -858,6 +875,7 @@ pub(super) fn adopt(
         let _ = original.into_raw_fd();
     }
     super::STARTUP_STDIN.store(frame.original, Ordering::Release);
+    restore_original_stdin_closedness(frame.original)?;
     drop(frame_owner);
     Ok(original_environment)
 }
@@ -954,5 +972,79 @@ mod tests {
         assert!(locator(OsStr::new("205x")).is_err());
         assert!(locator(OsStr::new("-2")).is_err());
         assert_eq!(locator(OsStr::new("205")).unwrap(), 205);
+    }
+
+    #[test]
+    fn closed_original_stdin_restoration_preserves_other_errors_and_unread_owner() {
+        const CHILD: &str = "HERMIT_TEST_DISPATCH_CLOSED_STDIN_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let mut pipe = [-1; 2];
+            assert_eq!(
+                unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            let read = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+            let mut write = unsafe { File::from_raw_fd(pipe[1]) };
+            let input = b"original input\0is not consumed\n";
+            write.write_all(input).unwrap();
+            drop(write);
+            assert_eq!(unsafe { libc::dup2(read.as_raw_fd(), 0) }, 0);
+            let reservation = unsafe { libc::fcntl(0, libc::F_DUPFD_CLOEXEC, 3) };
+            assert!(reservation >= 3);
+            let mut reservation = unsafe { File::from_raw_fd(reservation) };
+            drop(read);
+            let before = descriptor_identity(0).unwrap();
+            let flags = descriptor_flags(0).unwrap();
+            for error in [libc::EIO, libc::EMFILE, libc::EINVAL] {
+                restore_original_stdin_closedness(-error - 1).unwrap();
+                assert_eq!(descriptor_identity(0).unwrap(), before);
+                assert_eq!(descriptor_flags(0).unwrap(), flags);
+            }
+            restore_original_stdin_closedness(-libc::EBADF - 1).unwrap();
+            assert_eq!(unsafe { libc::fcntl(0, libc::F_GETFD) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::EBADF)
+            );
+            restore_original_stdin_closedness(-libc::EBADF - 1).unwrap();
+            assert_eq!(
+                descriptor_identity(reservation.as_raw_fd()).unwrap(),
+                before
+            );
+            let mut unread = Vec::new();
+            std::io::Read::read_to_end(&mut reservation, &mut unread).unwrap();
+            assert_eq!(unread, input);
+            return;
+        }
+
+        // A fresh unit-test process owns fd0; no multithreaded runner is forked
+        // and no Hermit application or guest is entered by this control.
+        let module = module_path!().split_once("::").unwrap().1;
+        let name = format!(
+            "{module}::closed_original_stdin_restoration_preserves_other_errors_and_unread_owner"
+        );
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env(CHILD, "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let output = child.wait_with_output().unwrap();
+                panic!("closed-stdin control exceeded 5s: {output:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "closed-stdin control failed: {output:?}"
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 }
