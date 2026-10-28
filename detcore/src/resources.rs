@@ -635,6 +635,9 @@ pub struct Resources {
     /// (`DetFd::is_guest_held`). Once a descriptor may have left the guest
     /// (`passes_descriptors_out`), the scheduler no longer counts such a poll
     /// as waiting on guest state only (`Scheduler::polls_only_guest_state`).
+    /// Retry loops also capture the actual operands and open file identities
+    /// and permanently clear this proof when a granted retry no longer names
+    /// the same guest-held targets (`GuestHeldPollProof`).
     #[serde(default)]
     pub(crate) relies_on_guest_held_marks: bool,
     /// Set on a thread's first request after it may have passed descriptors

@@ -60,6 +60,7 @@ fn deregistration(tid: DetTid, sigkilled: bool) -> ThreadDeregistration {
         syscall_histogram: Default::default(),
         chaos_epochs: Vec::new(),
         killed_by_group_signal: sigkilled,
+        passed_descriptors_out: false,
     }
 }
 

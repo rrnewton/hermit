@@ -4584,19 +4584,22 @@ impl GlobalState {
                     R::ThreadExited
                 }
             }
-            GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask) => R::FutexAction(
-                self.recv_futex_action(
-                    RpcIncarnation {
-                        dettid,
-                        mm: request_mm,
-                    },
-                    action,
-                    futexid,
-                    init_read,
-                    mask,
+            GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask, passed_out) => {
+                R::FutexAction(
+                    self.recv_futex_action(
+                        RpcIncarnation {
+                            dettid,
+                            mm: request_mm,
+                        },
+                        action,
+                        futexid,
+                        init_read,
+                        mask,
+                        passed_out,
+                    )
+                    .await,
                 )
-                .await,
-            ),
+            }
             GlobalRequest::RobustListWakes(wakes) => {
                 R::RobustListWakes(self.recv_robust_list_wakes(dtid, wakes))
             }
@@ -6409,6 +6412,7 @@ impl GlobalState {
             syscall_histogram,
             chaos_epochs,
             killed_by_group_signal,
+            passed_descriptors_out,
         } = deregistration;
         if !sched.rpc_incarnation_matches(dettid, mm) {
             debug!(
@@ -6429,6 +6433,12 @@ impl GlobalState {
                 dettid
             );
             return;
+        }
+        // This consuming owner may have been cancelled before any request
+        // published its export. Keep the final fact behind incarnation and
+        // receipt admission, but before either SIGKILL routing or retirement.
+        if passed_descriptors_out {
+            sched.revoke_guest_held_marks(dettid);
         }
         if let Some(writer) = &mut sched.preemption_writer {
             for transition in chaos_epochs {
@@ -6468,6 +6478,7 @@ impl GlobalState {
         futexid: FutexID,
         init_read: i32,
         mask: u32,
+        passed_descriptors_out: bool,
     ) -> Option<SchedValue> {
         let RpcIncarnation { dettid, mm } = caller;
         trace!("[detcore, dtid {}] Futex action: {:?}", &dettid, action);
@@ -6491,6 +6502,12 @@ impl GlobalState {
                 );
                 return Some(SchedValue::Value(nix::errno::Errno::EINTR as u64));
             };
+            // A direct futex wait has no Resources request to carry this
+            // fact. Only a live, admitted owner may publish it, before that
+            // owner's wait can leave other threads as the only pollers.
+            if passed_descriptors_out {
+                sched.revoke_guest_held_marks(dettid);
+            }
             match action {
                 FutexAction::WaitRequest(maybe_timeout, signal_watch) => {
                     if sched.child_tid_was_cleared(futexid, init_read) {
@@ -7110,6 +7127,9 @@ pub struct ThreadDeregistration {
     /// The thread died of a signal that ends its whole thread group
     /// (`signal_ends_thread_group`, `Scheduler::note_signal_killed_group`).
     pub(crate) killed_by_group_signal: bool,
+    /// A descriptor may have escaped before cancellation prevented its
+    /// owner's next request from publishing the fact.
+    pub(crate) passed_descriptors_out: bool,
 }
 
 /// A question about, or a record in, the scheduler's ledger of guest-handled
@@ -7407,8 +7427,9 @@ pub enum GlobalRequest {
     RecordGuestMarkerSignal,
 
     /// Notify scheduler before/after futex action.
-    /// The last two arguments are the initial contents of the memory word, and the mask.
-    FutexAction(DetTid, FutexAction, FutexID, i32, u32),
+    /// The final arguments are the initial memory word, the mask, and
+    /// whether the caller may have passed descriptors outside the guest.
+    FutexAction(DetTid, FutexAction, FutexID, i32, u32, bool),
 
     /// Translate nondeterministic to deterministic inode, and report what the
     /// caller observed of the host mtime (see `ObservedMtime`), how it
@@ -9554,11 +9575,10 @@ where
         guest.thread_state().in_uncharged_bootstrap_syscall && guest.is_backend_runtime_bootstrap();
     // A descriptor this thread may have passed out of the guest reaches the
     // scheduler with its next request, before it makes another decision
-    // (`Resources::passes_descriptors_out`).
-    if std::mem::take(&mut guest.thread_state_mut().passed_descriptors_out_unreported) {
-        r.passes_descriptors_out = true;
-        guest.thread_state_mut().passed_descriptors_out_reported = true;
-    }
+    // (`Resources::passes_descriptors_out`). Keep the local fact: publication
+    // can suspend before the request reaches the scheduler, and cancellation
+    // must leave it available to the consuming exit hook.
+    r.passes_descriptors_out |= guest.thread_state().passed_descriptors_out_unreported;
     // Any turn of its own is a hand-off under `--pipe-wake-latency`: the
     // thread goes back behind the pollers it readied (`crate::pipe_wake`).
     guest.thread_state_mut().pipe_handoff_due = None;
@@ -10156,7 +10176,14 @@ where
 {
     assert!(guest.config().sequentialize_threads);
     let dettid = guest.thread_state().dettid;
-    let req = GlobalRequest::FutexAction(dettid, futex_action, *futexid, init_read, mask);
+    let req = GlobalRequest::FutexAction(
+        dettid,
+        futex_action,
+        *futexid,
+        init_read,
+        mask,
+        guest.thread_state().passed_descriptors_out_unreported,
+    );
     trace!(
         "BLOCKING on futex_action: sending request to scheduler: {:?}",
         req
@@ -13595,6 +13622,7 @@ mod tests {
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
                     killed_by_group_signal: false,
+                    passed_descriptors_out: false,
                 },
             );
             assert_eq!(
@@ -15416,6 +15444,7 @@ mod tests {
         thread: crate::ThreadState<()>,
         requests: Mutex<Vec<GlobalRequest>>,
         retired: std::sync::atomic::AtomicBool,
+        hold_private_memory_publication: bool,
     }
 
     #[reverie::tool]
@@ -15425,6 +15454,15 @@ mod tests {
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
             self.requests.lock().unwrap().push(message.2.clone());
+            if self.hold_private_memory_publication
+                && matches!(message.2, GlobalRequest::PublishRuntimePrivateMemory(_))
+            {
+                // DbtGuest::send_rpc waits for a stopped caller before
+                // forwarding to its endpoint (reverie-dbt/src/lib.rs:
+                // wait_if_caller_stopped). Model that supported suspension
+                // at the pre-request publication, not ptrace's inline RPC.
+                futures::future::pending::<()>().await;
+            }
             self.global
                 .receive_rpc(Tid::from_raw(self.thread.dettid.as_raw()), message)
                 .await
@@ -15462,6 +15500,11 @@ mod tests {
 
         fn thread_state(&self) -> &crate::ThreadState<()> {
             &self.thread
+        }
+
+        fn runtime_private_memory_regions(&self) -> Option<reverie::RuntimePrivateMemory> {
+            self.hold_private_memory_publication
+                .then_some(reverie::RuntimePrivateMemory::Unavailable)
         }
 
         async fn regs(&mut self) -> libc::user_regs_struct {
@@ -15516,6 +15559,155 @@ mod tests {
         }
     }
 
+    /// A supported asynchronous transport can suspend while publishing
+    /// runtime memory before it forwards RequestResources. Cancellation must
+    /// leave the descriptor export available to the real consuming exit hook.
+    #[tokio::test]
+    async fn a_cancelled_request_preserves_descriptor_exports_for_its_exit() {
+        use reverie::Tool;
+
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let reader = DetTid::from_raw(3);
+        let sender = DetTid::from_raw(5);
+        let tool: Detcore = Detcore::new(Tid::from_raw(sender.as_raw()), &config);
+        let mut thread = crate::ThreadState::new(sender, &config, ());
+        thread.detpid = Some(sender);
+        thread.passed_descriptors_out_unreported = true;
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.thread_tree.add_child(reader, reader, true);
+            sched.thread_tree.add_child(reader, sender, true);
+            for tid in [reader, sender] {
+                sched.register_thread_for_test(tid);
+                sched.install_test_exec_incarnation(tid, MmId::initial(tid));
+            }
+        }
+        let mut guest = RetirementGuest {
+            global: &state,
+            config: &config,
+            thread,
+            requests: Mutex::new(Vec::new()),
+            retired: std::sync::atomic::AtomicBool::new(false),
+            hold_private_memory_publication: true,
+        };
+        {
+            let request = super::resource_request(&mut guest, Resources::new(sender));
+            let mut request = std::pin::pin!(request);
+            assert!(futures::poll!(request.as_mut()).is_pending());
+            // Dropping the actual request future models backend cancellation
+            // while the pre-request RPC has not reached the global tool.
+        }
+        assert!(matches!(
+            guest.requests.lock().unwrap().as_slice(),
+            [GlobalRequest::PublishRuntimePrivateMemory(
+                reverie::RuntimePrivateMemory::Unavailable
+            )]
+        ));
+        assert!(
+            state.sched.lock().unwrap().next_turns[&sender]
+                .req
+                .try_read()
+                .is_none(),
+            "no resource request reached the scheduler"
+        );
+        assert!(
+            guest.thread.passed_descriptors_out_unreported,
+            "cancellation before publication must retain the export for exit"
+        );
+        let thread = guest.thread.clone();
+        tool.on_exit_thread(
+            Tid::from_raw(sender.as_raw()),
+            &guest,
+            thread,
+            reverie::ExitStatus::Signaled(reverie::Signal::SIGKILL, false),
+        )
+        .await
+        .unwrap();
+        {
+            let sched = state.sched.lock().unwrap();
+            assert!(!sched.next_turns.contains_key(&sender));
+            assert_eq!(sched.turn, 0, "exit publication must not take a turn");
+        }
+        super::robust_exit_clock_tests::assert_reader_after_sender_exit(&state, reader, true).await;
+    }
+
+    /// FUTEX_WAIT files its own RPC rather than a Resources request. Its
+    /// admission must publish an earlier descriptor export before parking
+    /// the sender and leaving a separate process as the only runnable reader.
+    #[tokio::test]
+    async fn a_direct_futex_wait_publishes_descriptor_exports_before_parking() {
+        for exported in [false, true] {
+            let config = Config {
+                sequentialize_threads: true,
+                ..Config::default()
+            };
+            let state = GlobalState::initialize(&config, false);
+            let reader = DetTid::from_raw(3);
+            let sender = DetTid::from_raw(5);
+            let mut thread = crate::ThreadState::new(sender, &config, ());
+            thread.detpid = Some(sender);
+            thread.passed_descriptors_out_unreported = exported;
+            {
+                let mut sched = state.sched.lock().unwrap();
+                sched.thread_tree.add_child(reader, reader, true);
+                sched.thread_tree.add_child(reader, sender, true);
+                for tid in [reader, sender] {
+                    sched.register_thread_for_test(tid);
+                    sched.install_test_exec_incarnation(tid, MmId::initial(tid));
+                    sched.default_signal_state_for_test(tid);
+                }
+                sched.runqueue_push_back(sender);
+            }
+            let mut guest = RetirementGuest {
+                global: &state,
+                config: &config,
+                thread,
+                requests: Mutex::new(Vec::new()),
+                retired: std::sync::atomic::AtomicBool::new(false),
+                hold_private_memory_publication: false,
+            };
+            let futex = FutexID::private(MmId::initial(sender), 0x1000);
+            {
+                let request = super::futex_action(
+                    &mut guest,
+                    FutexAction::WaitRequest(
+                        None,
+                        Some(super::FutexSignalWatch {
+                            unblocked: u64::MAX,
+                            defers_default_stops: false,
+                            pid: sender.as_raw(),
+                            tid: sender.as_raw(),
+                        }),
+                    ),
+                    &futex,
+                    0,
+                    u32::MAX,
+                );
+                let mut request = std::pin::pin!(request);
+                assert!(futures::poll!(request.as_mut()).is_pending());
+                {
+                    let sched = state.sched.lock().unwrap();
+                    assert_eq!(sched.blocked.futex_waiters[&futex].len(), 1);
+                    assert_eq!(sched.futex_waiters_for_test(futex), [sender]);
+                    assert!(!sched.run_queue.contains_tid(sender));
+                    assert_eq!(sched.turn, 0, "export publication must not take a turn");
+                }
+                super::robust_exit_clock_tests::assert_reader_after_sender_exit(
+                    &state, reader, exported,
+                )
+                .await;
+            }
+            assert!(matches!(
+                guest.requests.lock().unwrap().as_slice(),
+                [GlobalRequest::FutexAction(..)]
+            ));
+        }
+    }
+
     /// While the caller's own process handles SIGALRM, every SIGALRM send and
     /// producer arming the handlers check is refused with EPERM before the
     /// kernel: the guest injects nothing (`RetirementGuest` panics on an
@@ -15541,6 +15733,7 @@ mod tests {
             thread,
             requests: Mutex::new(Vec::new()),
             retired: std::sync::atomic::AtomicBool::new(false),
+            hold_private_memory_publication: false,
         };
         let (raw_pid, raw_tid) = (pid.as_raw(), tid.as_raw());
         let eperm = |result: Result<i64, reverie::Error>, what: &str| {
@@ -15623,6 +15816,7 @@ mod tests {
             thread,
             requests: Mutex::new(Vec::new()),
             retired: std::sync::atomic::AtomicBool::new(false),
+            hold_private_memory_publication: false,
         };
         let raw = |sysno, a0, a1| Syscall::from_raw(sysno, SyscallArgs::new(a0, a1, 0, 0, 0, 0));
 
@@ -15697,6 +15891,7 @@ mod tests {
             thread,
             requests: Mutex::new(Vec::new()),
             retired: std::sync::atomic::AtomicBool::new(false),
+            hold_private_memory_publication: false,
         };
         for lease in [libc::F_RDLCK, libc::F_WRLCK] {
             let fcntl = syscalls::Fcntl::new()
@@ -15772,6 +15967,7 @@ mod tests {
                 thread,
                 requests: Mutex::new(Vec::new()),
                 retired: std::sync::atomic::AtomicBool::new(false),
+                hold_private_memory_publication: false,
             };
             {
                 let mut rejoin = Resources::new(victim);
@@ -15876,6 +16072,7 @@ mod tests {
             thread,
             requests: Mutex::new(Vec::new()),
             retired: std::sync::atomic::AtomicBool::new(false),
+            hold_private_memory_publication: false,
         };
         let mut rejoin = Resources::new(victim);
         rejoin.insert(
@@ -16197,6 +16394,7 @@ mod tests {
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
                     killed_by_group_signal: false,
+                    passed_descriptors_out: false,
                 };
                 for _ in 0..2 {
                     let (_, done) = state
@@ -16294,6 +16492,7 @@ mod tests {
                 thread,
                 requests: Mutex::new(Vec::new()),
                 retired: std::sync::atomic::AtomicBool::new(false),
+                hold_private_memory_publication: false,
             };
             let token = state
                 .sched
@@ -16324,6 +16523,7 @@ mod tests {
                             syscall_histogram: Default::default(),
                             chaos_epochs: Vec::new(),
                             killed_by_group_signal: false,
+                            passed_descriptors_out: false,
                         }),
                     ),
                 )
@@ -16410,6 +16610,7 @@ mod tests {
                 thread,
                 requests: Mutex::new(Vec::new()),
                 retired: std::sync::atomic::AtomicBool::new(false),
+                hold_private_memory_publication: false,
             };
             let before = guest.thread.thread_logical_time.as_nanos();
             {
@@ -18431,6 +18632,7 @@ mod tests {
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
                     killed_by_group_signal: false,
+                    passed_descriptors_out: false,
                 },
             )
             .await;
@@ -18593,6 +18795,7 @@ mod tests {
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
                         killed_by_group_signal: false,
+                        passed_descriptors_out: false,
                     }),
                 ),
             )
@@ -20004,6 +20207,7 @@ mod tests {
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
                     killed_by_group_signal: false,
+                    passed_descriptors_out: false,
                 },
             )
             .await;
@@ -20033,6 +20237,7 @@ mod tests {
                     syscall_histogram: Default::default(),
                     chaos_epochs: Vec::new(),
                     killed_by_group_signal: false,
+                    passed_descriptors_out: false,
                 },
             )
             .await;
@@ -20201,6 +20406,7 @@ mod tests {
                 FutexID::private(MmId::initial(detpid), 0x1000),
                 0,
                 u32::MAX,
+                true,
             )
             .await;
 
@@ -20208,6 +20414,13 @@ mod tests {
             response,
             Some(SchedValue::Value(value)) if value == nix::errno::Errno::EINTR as u64
         ));
+        assert!(
+            !state
+                .sched
+                .lock()
+                .unwrap()
+                .guest_held_marks_revoked_for_test()
+        );
     }
 
     #[tokio::test]
@@ -20260,6 +20473,7 @@ mod tests {
                 futex,
                 child.as_raw(),
                 u32::MAX,
+                false,
             )
             .await;
 
@@ -20350,6 +20564,7 @@ mod tests {
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
                         killed_by_group_signal: false,
+                        passed_descriptors_out: false,
                     }),
                 ),
             )
@@ -20387,6 +20602,7 @@ mod tests {
                         syscall_histogram: Default::default(),
                         chaos_epochs: Vec::new(),
                         killed_by_group_signal: false,
+                        passed_descriptors_out: false,
                     }),
                 ),
             )
@@ -20771,6 +20987,7 @@ mod tests {
                     FutexID::private(MmId::initial(detpid), 0x1000),
                     0,
                     u32::MAX,
+                    false,
                 ),
             ),
         );
@@ -22607,6 +22824,8 @@ mod robust_exit_clock_tests {
     use crate::ThreadState;
     use crate::config::Config;
     use crate::ivar::Ivar;
+    use crate::resources::Permission;
+    use crate::resources::ResourceID;
     use crate::resources::Resources;
     use crate::scheduler::DEFAULT_PRIORITY;
     use crate::scheduler::SkipTurn;
@@ -22703,6 +22922,137 @@ mod robust_exit_clock_tests {
 
         fn config(&self) -> &Config {
             &self.state.cfg
+        }
+    }
+
+    /// A send may complete before a host SIGKILL cancels its callback. The
+    /// real exit hook must publish its pending export before dropping the
+    /// owner, even when no later resource request carries that fact. The
+    /// surviving reader is another process, so sender teardown cannot itself
+    /// exempt the reader from the terminal deadlock check.
+    #[tokio::test]
+    async fn an_exit_publishes_pending_descriptor_exports_before_retirement() {
+        for exported in [false, true] {
+            let config = Config {
+                sequentialize_threads: true,
+                ..Config::default()
+            };
+            let state = GlobalState::initialize(&config, false);
+            let reader = DetTid::from_raw(3);
+            let sender = DetTid::from_raw(5);
+            let tool: Detcore = Detcore::new(Tid::from_raw(sender.as_raw()), &config);
+            let mut thread = ThreadState::new(sender, &config, ());
+            thread.detpid = Some(sender);
+            thread.passed_descriptors_out_unreported = exported;
+            {
+                let mut sched = state.sched.lock().unwrap();
+                sched.thread_tree.add_child(reader, reader, true);
+                sched.thread_tree.add_child(reader, sender, true);
+                for tid in [reader, sender] {
+                    sched.register_thread_for_test(tid);
+                    sched.install_test_exec_incarnation(tid, MmId::initial(tid));
+                }
+            }
+            let observations = Mutex::new(Vec::new());
+            let rpc_observations = Mutex::new(Vec::new());
+            let rpc = ExitRpc {
+                state: &state,
+                sender,
+                observations: &observations,
+                rpc_observations: &rpc_observations,
+            };
+            tool.on_exit_thread(
+                Tid::from_raw(sender.as_raw()),
+                &rpc,
+                thread,
+                ExitStatus::Signaled(Signal::SIGKILL, false),
+            )
+            .await
+            .unwrap();
+            {
+                let sched = state.sched.lock().unwrap();
+                assert!(!sched.next_turns.contains_key(&sender));
+                assert!(sched.next_turns.contains_key(&reader));
+                assert_eq!(sched.turn, 0, "exit publication must not take a turn");
+                let rpcs = rpc_observations.lock().unwrap();
+                assert_eq!(rpcs.len(), 1, "reuse the existing exit notification");
+                assert_eq!(rpcs[0].kind, "deregister");
+                assert!(rpcs[0].accepted);
+            }
+            assert_reader_after_sender_exit(&state, reader, exported).await;
+        }
+    }
+
+    pub(super) async fn assert_reader_after_sender_exit(
+        state: &GlobalState,
+        reader: DetTid,
+        exported: bool,
+    ) {
+        let mut poll = Resources::new(reader);
+        poll.insert(ResourceID::InternalIOPolling, Permission::W);
+        poll.polls_guest_state_only = true;
+        poll.relies_on_guest_held_marks = true;
+        // This export fixture has no signal handlers; record that fact
+        // explicitly rather than relying on absent interruption metadata.
+        poll.set_signal_interrupt_errno(reverie::syscalls::Errno::ERESTARTSYS);
+        poll.signal_state_task = Some((reader.as_raw(), reader.as_raw()));
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.default_signal_state_for_test(reader);
+            sched.queue_request_for_test(reader, poll.clone());
+        }
+        // One post-exit attempt fails; its next request retries the same
+        // read after every possible guest action has completed.
+        let first = crate::scheduler::do_a_turn_blocking(
+            state.sched.clone(),
+            state.global_time.clone(),
+            &Err(SkipTurn),
+        )
+        .await;
+        assert!(first.is_ok(), "the first read must get an attempt");
+        poll.poll_attempt = 2;
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.next_turns[&reader].req.put(Ok(poll));
+            if !sched.run_queue.contains_tid(reader) {
+                sched.runqueue_push_back(reader);
+            }
+        }
+        // A live polling retry first backs off, then is granted. A
+        // terminal verdict never grants it. Bound the scripted drain
+        // without a host clock or a timeout-based success condition.
+        let mut last = first;
+        let mut granted = false;
+        for _ in 0..3 {
+            last = crate::scheduler::do_a_turn_blocking(
+                state.sched.clone(),
+                state.global_time.clone(),
+                &last,
+            )
+            .await;
+            if last.is_ok() {
+                granted = true;
+                break;
+            }
+        }
+        assert_eq!(
+            granted, exported,
+            "a host-held peer must keep the surviving reader polling; without an export it must diagnose the deadlock"
+        );
+        let sched = state.sched.lock().unwrap();
+        let report = sched.terminal_deadlock_for_test();
+        if exported {
+            assert_eq!(report, None, "an exported peer prevents a terminal verdict");
+        } else {
+            let headline = if sched.blocked.futex_waiters.is_empty() {
+                "Deadlock detected: thread(s) retrying a pipe or socket-pair call no remaining thread can satisfy, but no runnable threads left."
+            } else {
+                "Deadlock detected: thread(s) waiting on futex, and thread(s) retrying a pipe or socket-pair call no remaining thread can satisfy, but no runnable threads left."
+            };
+            assert_eq!(
+                report.and_then(|report| report.lines().next()),
+                Some(headline)
+            );
         }
     }
 

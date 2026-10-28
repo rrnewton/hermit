@@ -52,6 +52,7 @@ use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::syscalls::files::SocketRole;
 #[cfg(target_arch = "x86_64")]
 use crate::syscalls::helpers::KernelPollDeadline;
+use crate::syscalls::helpers::GuestHeldPollProof;
 use crate::syscalls::helpers::KernelSignalWait;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::PublishedWaitMask;
@@ -59,6 +60,7 @@ use crate::syscalls::helpers::REAL_TIME_SIGNALS;
 #[cfg(target_arch = "x86_64")]
 use crate::syscalls::helpers::RestartCall;
 use crate::syscalls::helpers::act_on_pending_real_time;
+use crate::syscalls::helpers::guest_signal_state_task;
 use crate::syscalls::helpers::is_accepted_connection;
 #[cfg(target_arch = "x86_64")]
 use crate::syscalls::helpers::keep_restart_block;
@@ -2848,6 +2850,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut rsrc = Resources::new(guest.thread_state().dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("ppoll");
+        rsrc.set_signal_interrupt_errno(Errno::EINTR);
+        rsrc.signal_state_task = guest_signal_state_task(guest);
         rsrc.relies_on_guest_held_marks = poll_targets_guest_held(
             guest,
             call.fds().map(|fds| fds.as_raw()),
@@ -2922,13 +2926,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         // As for pselect6: a scheduler `Signaled` answer wakes the wait, and
         // the probe and the kernel's state decide whether a signal ends it.
         rsrc.set_signal_interrupt_errno(Errno::EINTR);
+        rsrc.signal_state_task = guest_signal_state_task(guest);
         // Between probes the kernel holds the guest's own mask, while Linux's
         // `blocked` is the temporary one for the whole call.
+        let mut guest_held = GuestHeldPollProof::capture(guest, probe.into(), &mut rsrc);
         let mut published = PublishedWaitMask::default();
         publish_wait_mask(guest, signals.effective_mask(), &mut published).await;
         let result = loop {
             crate::syscalls::helpers::refresh_guest_poll_state(guest, probe.into(), &mut rsrc);
             resource_request(guest, rsrc.clone()).await;
+            guest_held.revalidate(guest, &mut rsrc);
             // Virtual timerfds first (`crate::syscalls::timerfd`), in the
             // staged cells' scratch while they hold the stack.
             let next_timerfd =
@@ -2970,6 +2977,17 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         publish_wait_mask(guest, None, &mut published).await;
         refuse_held_signal_loss(guest, Sysno::ppoll, result).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn masked_ppoll_probe_for_test<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        probe: syscalls::Ppoll,
+        mask: usize,
+    ) -> Result<i64, Error> {
+        self.wait_on_masked_ppoll_probe(guest, probe, mask, None, None)
+            .await
     }
 
     pub(super) async fn write_ppoll_remaining<G: Guest<Self>>(
@@ -3035,6 +3053,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut rsrc = Resources::new(guest.thread_state().dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("poll");
+        rsrc.set_signal_interrupt_errno(Errno::EINTR);
+        rsrc.signal_state_task = guest_signal_state_task(guest);
         rsrc.relies_on_guest_held_marks = poll_targets_guest_held(
             guest,
             call.fds().map(|fds| fds.as_raw()),
@@ -4228,7 +4248,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(refusal) => return refusal,
         };
         let in_turn = self.completes_in_turn(guest, call);
-        self.note_descriptors_passed_out(guest, call.fd(), &headers);
+        Self::note_descriptors_passed_out(guest, call.fd(), Some(&headers), outside_turn);
         self.note_sockets_passed_out(guest, &headers);
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
         guest.thread_state_mut().send_inspection = None;
@@ -4305,47 +4325,56 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok((copies, outside_turn))
     }
 
-    /// Note, for the scheduler, that messages at `headers` may pass
-    /// descriptors over `SCM_RIGHTS` on socket `sockfd` to a process outside
+    /// Note, for the scheduler, that a send on `sockfd` may pass
+    /// descriptors over `SCM_RIGHTS` to a process outside
     /// the guest (`ThreadState::passed_descriptors_out_unreported`). A passed
     /// descriptor may be, or reach, an object some guest holds a guest-held
     /// description of, in any process's table, which a process outside
     /// Detcore's view could then make ready; so from then on the scheduler
     /// trusts no guest-held mark (`Scheduler::polls_only_guest_state`), and
-    /// that covers polls already waiting. Messages on a guest-held socket go
-    /// to a guest, so they change nothing: it is a stream or seqpacket
-    /// connection, which sends only to its peer whatever `msg_name` says. As
-    /// for `mark_exported_listeners`, this runs before the send and whatever
-    /// it returns, and a message whose control data Detcore cannot read counts
-    /// as passing descriptors.
-    ///
-    /// This reads the messages once, before the call. A send polled in the
-    /// caller's turns inspects the actual injection view before every attempt
-    /// (`passes_descriptors_out_now`): sendmsg keeps its captured entry bytes,
-    /// while the descriptor table and uncaptured sendmmsg input may change. One passed through runs once in
-    /// this same turn. A send that runs outside the turn counts as passing
-    /// descriptors whatever it names, decided where it leaves the turn
-    /// (`passes_descriptors_out_outside_the_turn`). A descriptor passed out
-    /// is no longer a socket only guests hold (`DetFd::clear_guest_created`).
+    /// that covers polls already waiting. Control data read at entry cannot
+    /// prove that no descriptor will be sent: a sibling may rewrite it before
+    /// a later attempt. Linux imports each attempt's current msghdr and control
+    /// data (`copy_msghdr_from_user`, `____sys_sendmsg`, Linux v6.12
+    /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/socket.c?h=v6.12#n2529>).
+    /// A guest-held channel sends only to its guest peer, whatever `msg_name`
+    /// says, but that exception requires an in-turn attempt: outside the turn
+    /// even the destination descriptor may change before Linux imports it.
+    /// Each in-turn retry checks the channel again immediately before sending.
+    /// Revoke before the call regardless of its eventual result: sendmmsg can
+    /// send a message before failing to write its length back to guest memory
+    /// (Linux v6.12 `__sys_sendmmsg`,
+    /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/net/socket.c?h=v6.12#n2747>).
     pub(crate) fn note_descriptors_passed_out<G: Guest<Self>>(
-        &self,
         guest: &mut G,
         sockfd: RawFd,
-        headers: &[usize],
+        headers: Option<&[usize]>,
+        outside_turn: bool,
     ) {
         let reaches_a_guest = guest
             .thread_state()
             .with_detfd(sockfd, |detfd| detfd.is_guest_held())
             .unwrap_or(false);
-        if reaches_a_guest {
+        if !outside_turn && reaches_a_guest {
             return;
         }
-        let (sent, unread) = sent_descriptors(guest, headers);
-        crate::reserved_input::before_descriptor_export(guest, &sent, unread)
-            .unwrap_or_else(|error| panic!("reserved-input export publication failed: {error}"));
-        if !sent.is_empty() || unread {
-            guest.thread_state_mut().passed_descriptors_out_unreported = true;
-            clear_guest_created(guest, &sent);
+        match headers {
+            Some(headers) => {
+                let (sent, unread) = sent_descriptors(guest, headers);
+                crate::reserved_input::before_descriptor_export(guest, &sent, unread)
+                    .unwrap_or_else(|error| {
+                        panic!("reserved-input export publication failed: {error}")
+                    });
+                if outside_turn || !sent.is_empty() || unread {
+                    guest.thread_state_mut().passed_descriptors_out_unreported = true;
+                }
+                if !outside_turn {
+                    clear_guest_created(guest, &sent);
+                }
+            }
+            None => {
+                guest.thread_state_mut().passed_descriptors_out_unreported = true;
+            }
         }
     }
 
@@ -4653,7 +4682,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(refusal) => return refusal,
         };
         let in_turn = self.completes_in_turn(guest, call);
-        self.note_descriptors_passed_out(guest, call.sockfd(), &headers);
+        Self::note_descriptors_passed_out(guest, call.sockfd(), Some(&headers), outside_turn);
         self.note_sockets_passed_out(guest, &headers);
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
         guest.thread_state_mut().send_inspection = None;
@@ -5356,6 +5385,37 @@ mod tests {
     }
 
     #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn an_external_send_revokes_marks_before_mutable_control_data_is_read() {
+        use std::os::fd::AsRawFd;
+
+        let mut guest = crate::syscalls::helpers::kernel_signal_wait_failures::fd_test_guest();
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd = socket.as_raw_fd();
+        guest
+            .thread_state_mut()
+            .add_fd(fd, nix::fcntl::OFlag::O_RDWR, FdType::Socket, None)
+            .unwrap();
+        // No control data at entry proves nothing about what another thread
+        // can install while this send is descheduled before a later attempt.
+        Detcore::note_descriptors_passed_out(&mut guest, fd, None, false);
+        assert!(guest.thread_state().passed_descriptors_out_unreported);
+
+        // A stable guest-held channel cannot export even changed control data.
+        guest.thread_state_mut().passed_descriptors_out_unreported = false;
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.set_guest_held())
+            .unwrap();
+        Detcore::note_descriptors_passed_out(&mut guest, fd, None, false);
+        assert!(!guest.thread_state().passed_descriptors_out_unreported);
+
+        // Outside the turn, even a channel's descriptor identity can change
+        // before the kernel imports it. Revoke before handing the call off.
+        Detcore::note_descriptors_passed_out(&mut guest, fd, None, true);
+        assert!(guest.thread_state().passed_descriptors_out_unreported);
+    }
+
     #[test]
     fn a_kernel_poll_without_a_deadline_restarts_by_running_again() {
         // Linux's code, and a signal that stopped the call before it ran.

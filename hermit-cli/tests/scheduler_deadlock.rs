@@ -9,6 +9,12 @@
 #[path = "common/hermit_binary.rs"]
 mod hermit_test;
 
+#[path = "scheduler_deadlock/escaped_descriptor.rs"]
+mod escaped_descriptor;
+
+#[path = "scheduler_deadlock/poll_self_pipe_signal.rs"]
+mod poll_self_pipe_signal;
+
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::fs;

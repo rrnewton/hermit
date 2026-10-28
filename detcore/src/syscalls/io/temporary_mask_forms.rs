@@ -90,6 +90,7 @@ use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::syscalls::helpers::GuestHeldPollProof;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::TemporaryMaskCheck;
 use crate::syscalls::helpers::kernel_run_entry_refusal;
@@ -1323,6 +1324,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         rsrc.polls_guest_state_only = rsrc.relies_on_guest_held_marks;
         rsrc.set_signal_interrupt_errno(Errno::EINTR);
         rsrc.blocked_signal_mask = Some(mask);
+        let mut guest_held = GuestHeldPollProof::capture(guest, probe.into(), &mut rsrc);
         // IR-23: the entry, before the expired-timerfd publication's RPC,
         // which observes the deadline first with an armed virtual timerfd
         // (IR-23(c)); D37's R2 as the result is decided.
@@ -1340,6 +1342,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 crate::syscalls::helpers::refresh_guest_poll_state(guest, probe.into(), &mut rsrc);
                 resource_request(guest, rsrc.clone()).await;
             }
+            guest_held.revalidate(guest, &mut rsrc);
             first = false;
             let next_timerfd =
                 crate::syscalls::timerfd::publish_expired_in(guest, staged.timerfd_scratch).await;

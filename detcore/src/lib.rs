@@ -7522,8 +7522,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // full slice.
         let now = thread_state.thread_logical_time.as_nanos();
         thread_state.stats.close_final_timeslice(now);
-        // Ptrace keeps its exit event stopped while this hook runs. KVM runs
-        // this owner hook after worker joins and child waitability publication.
+        // Ptrace invokes this hook after consuming the final kernel exit status,
+        // when the kernel has closed the thread's descriptors. KVM runs this
+        // owner hook after worker joins and child waitability publication.
         // Publish final CPU in this synchronous prefix: serial KVM waitid waits
         // for that owned notification before consuming, not for the hook tail.
         // DETERMINISTIC RECOVERY (TODO-HUMAN-REVIEW(PR-1147)). `ThreadState::detpid`
@@ -7641,6 +7642,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             syscall_histogram: (&thread_state.stats.syscall_histogram).into(),
             chaos_epochs: pending_chaos_epochs,
             killed_by_group_signal: signal_ends_thread_group(&exit_status),
+            passed_descriptors_out: thread_state.passed_descriptors_out_unreported,
         };
         if transferred_exec {
             tool_global::retire_exec(

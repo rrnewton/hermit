@@ -5201,8 +5201,9 @@ pub struct ThreadState<T> {
     pub(crate) in_uncharged_bootstrap_syscall: bool,
 
     /// Set when this thread may have passed descriptors over `SCM_RIGHTS` on
-    /// a socket that is not guest-held, until its next resource request
-    /// carries that to the scheduler (`Resources::passes_descriptors_out`).
+    /// a socket that is not guest-held. Requests and the consuming exit
+    /// carry it to the scheduler. It stays set for this owner's lifetime:
+    /// cancellation can drop a request before its publication is received.
     #[serde(default)]
     pub(crate) passed_descriptors_out_unreported: bool,
 

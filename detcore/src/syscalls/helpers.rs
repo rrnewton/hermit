@@ -616,9 +616,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         tracing::trace!(
             "NonblockableSyscall: converting to nonblocking syscall (internal polling): writev"
         );
-        let mut resources = pipe_writev_resources(guest.thread_state().dettid, call);
-        resources.polls_guest_state_only = self.cfg.recordreplay_modes;
+        let guest_held = syscall_targets_guest_held_fd(guest, call.into());
+        let mut resources = pipe_writev_resources(guest.thread_state().dettid, call, guest_held);
         resources.polls_a_named_fifo = is_named_fifo(guest, call.fd());
+        resources.polls_guest_state_only |= resources.polls_a_named_fifo;
         resources.polls_channel = self
             .pipe_channel_end(guest, call.fd())
             .map(|end| Box::new((end.channel, crate::pipe_wake::Wants::Space)));
@@ -971,9 +972,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // A pipe write: a recorded private `SIGCHLD` ends it as on Linux
         // (`Resources::private_sigchld_decides`).
         resources.private_sigchld_decides = true;
-        resources.polls_guest_state_only = self.cfg.recordreplay_modes;
-        refresh_guest_poll_state(guest, call.into(), &mut resources);
         resources.polls_a_named_fifo = is_named_fifo(guest, call.fd());
+        resources.relies_on_guest_held_marks = syscall_targets_guest_held_fd(guest, call.into());
+        resources.polls_guest_state_only =
+            resources.relies_on_guest_held_marks || resources.polls_a_named_fifo;
         resources.polls_channel = self
             .pipe_channel_end(guest, call.fd())
             .map(|end| Box::new((end.channel, crate::pipe_wake::Wants::Space)));
@@ -1041,7 +1043,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 match turn_signals_with_block(
                     guest,
                     &mut turn_wait,
-                    resources.poll_attempt > 0,
+                    if resources.poll_attempt > 0 {
+                        ProbeMaskPolicy::PendingSignals
+                    } else {
+                        ProbeMaskPolicy::Guest
+                    },
                     committed,
                     resources.private_sigchld_decides,
                     &mut published,
@@ -1619,6 +1625,127 @@ fn pollfd_descriptors(bytes: &[u8]) -> Vec<i32> {
         .collect()
 }
 
+/// The descriptors an in-flight call's guest-held proof actually describes.
+/// A scheduled sibling can replace a descriptor or a pollfd operand while a
+/// request waits. `Scheduler::latest_progress` and `note_committed_turn` make
+/// the poller retry after such a turn before it can prove terminal deadlock;
+/// each granted retry must therefore validate this capture before probing.
+/// Once lost, the proof stays lost for this call, even if the old slot returns.
+///
+/// This does not retain the original Linux open file description across
+/// private probes. Linux's `do_readv` retains its `fd_pos` reference through
+/// `vfs_readv` (fs/read_write.c, v7.1.3), whereas each injected call looks up
+/// the slot again. Likewise `do_sys_poll` copies its pollfd array per syscall
+/// (fs/select.c). This guard only prevents a stale terminal-deadlock proof.
+pub(crate) struct GuestHeldPollProof {
+    call: Syscall,
+    targets: Option<GuestHeldPollTargets>,
+}
+
+#[derive(PartialEq, Eq)]
+enum GuestHeldPollTargets {
+    Single(i32, OpenFileId),
+    Poll {
+        address: usize,
+        entries: Vec<(i32, Option<OpenFileId>)>,
+    },
+}
+
+impl GuestHeldPollProof {
+    pub(crate) fn capture<T, G>(guest: &mut G, call: Syscall, resources: &mut Resources) -> Self
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        let targets = resources
+            .relies_on_guest_held_marks
+            .then(|| Self::read_targets(guest, call))
+            .flatten();
+        // No proof needed (for example a named FIFO) differs from a failed
+        // capture of a proof the caller claimed. Unknown must clear the latter
+        // before its very first request is published.
+        if resources.relies_on_guest_held_marks && targets.is_none() {
+            Self::clear(resources);
+        }
+        Self { call, targets }
+    }
+
+    pub(crate) fn revalidate<T, G>(&mut self, guest: &mut G, resources: &mut Resources)
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        if self.targets.is_some() && Self::read_targets(guest, self.call) != self.targets {
+            self.targets = None;
+            Self::clear(resources);
+        }
+    }
+
+    fn clear(resources: &mut Resources) {
+        resources.polls_guest_state_only = false;
+        resources.relies_on_guest_held_marks = false;
+    }
+
+    fn identity<T, G>(guest: &mut G, fd: i32) -> Option<OpenFileId>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        guest
+            .thread_state()
+            .with_detfd(fd, |entry| {
+                entry.is_guest_held().then(|| entry.open_file_id())
+            })
+            .ok()
+            .flatten()
+    }
+
+    fn read_targets<T, G>(guest: &mut G, call: Syscall) -> Option<GuestHeldPollTargets>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        let (address, nfds) = match call {
+            Syscall::Poll(call) => (call.fds()?.as_raw(), call.nfds() as usize),
+            Syscall::Ppoll(call) => (call.fds()?.as_raw(), call.nfds() as usize),
+            _ => {
+                let fd = get_fd(call)?;
+                return Some(GuestHeldPollTargets::Single(fd, Self::identity(guest, fd)?));
+            }
+        };
+        if nfds == 0 || nfds > GUEST_HELD_POLL_MAX_FDS {
+            return None;
+        }
+        let mut bytes = vec![0; nfds * std::mem::size_of::<libc::pollfd>()];
+        guest
+            .memory()
+            .read_exact(Addr::from_raw(address)?, &mut bytes)
+            .ok()?;
+        let mut entries = Vec::with_capacity(nfds);
+        for entry in bytes
+            .as_chunks::<{ std::mem::size_of::<libc::pollfd>() }>()
+            .0
+        {
+            let fd = i32::from_ne_bytes([entry[0], entry[1], entry[2], entry[3]]);
+            entries.push((
+                fd,
+                if fd < 0 {
+                    None
+                } else {
+                    Some(Self::identity(guest, fd)?)
+                },
+            ));
+        }
+        // Keep negative operands too: changing one into a live descriptor
+        // changes the target set. Ignore revents, which the kernel writes,
+        // and events: interest bits do not change who can ready these OFDs.
+        entries
+            .iter()
+            .any(|(fd, _)| *fd >= 0)
+            .then_some(GuestHeldPollTargets::Poll { address, entries })
+    }
+}
+
 /// Whether descriptor `fd` is a named FIFO that joined internal polling
 /// (`Resources::polls_a_named_fifo`).
 fn is_named_fifo<G: Guest<Detcore<T>>, T: RecordOrReplay>(guest: &mut G, fd: i32) -> bool {
@@ -1992,7 +2119,11 @@ fn interrupted_write_result<C: NonblockableSyscall>(
     }
 }
 
-fn pipe_writev_resources(dettid: DetTid, call: reverie::syscalls::Writev) -> Resources {
+fn pipe_writev_resources(
+    dettid: DetTid,
+    call: reverie::syscalls::Writev,
+    guest_held: bool,
+) -> Resources {
     let mut resources = Resources::new(dettid);
     resources.insert(ResourceID::InternalIOPolling, Permission::W);
     resources.fyi(call.name());
@@ -2001,8 +2132,8 @@ fn pipe_writev_resources(dettid: DetTid, call: reverie::syscalls::Writev) -> Res
     // disposition itself after a `Signaled` wake, so the scheduler's drain
     // must not filter by the kernel mask (`execute_blocking_pipe_writev`).
     resources.decides_signal_interruption_itself = true;
-    // The caller fills descriptor provenance immediately before requesting
-    // a turn; constructing a pipe request alone proves no closed membership.
+    resources.polls_guest_state_only = guest_held;
+    resources.relies_on_guest_held_marks = guest_held;
     resources
 }
 
@@ -3008,7 +3139,7 @@ where
 async fn retry_nonblocking_syscall_helper<T, G, C>(
     guest: &mut G,
     call0: C,
-    rsrc: Resources,
+    mut rsrc: Resources,
     maybe_timeout: Option<(LogicalTime, Result<i64, Errno>)>,
     subtool: Option<&Detcore<T>>,
 ) -> Result<i64, Error>
@@ -3017,6 +3148,7 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
+    let mut guest_held = GuestHeldPollProof::capture(guest, call0.into(), &mut rsrc);
     // The signals the wait takes from the queue (rt_sigtimedwait's set).
     let consumed = call0.signals_consumed_by_wait(&guest.memory());
     // The memory a vectored call copies when it begins (its iovec array, and
@@ -3030,7 +3162,6 @@ where
     // The stack-allocated memory here needs to live across the loop, which means
     // surviving multiple syscall injections:
     let (mut call, mut maybe_stackguard) = call0.into_nonblocking(guest).await;
-    let mut rsrc = rsrc.clone();
     rsrc.poll_deadline = poll_deadline_for(guest, maybe_timeout.map(|(deadline, _)| deadline));
     // A restartable call parked in internal IO polling, such as a `read` of an
     // empty pipe, is interrupted by a signal another task sends, as a parked
@@ -3061,13 +3192,15 @@ where
     let checks_at_turn = !gated
         && rsrc.signal_interrupt_errno() == Some(Errno::ERESTARTSYS.into_raw())
         && decides_interruption_at_turn(guest, rsrc.signal_state_task);
-    // Where the turn decides, the call owns the guest's mask while it blocks
-    // every blockable signal (`KernelSignalWait::block_in_place`), from the
-    // first turn that finds a pending signal a private injection could take
-    // until the call returns: two such signals once stopped the probe and
-    // its retry in turn, and the backend's single held slot kept only the
-    // second, so one handler never ran (Claude review of the R2b-2 design,
-    // F1; https://github.com/rrnewton/hermit/issues/4273, stage 2).
+    // Where the turn decides, each probe owns the guest's mask while it blocks
+    // every blockable signal (`KernelSignalWait::block_in_place`). The mask
+    // goes back before a retry yields, so target selection still sees which
+    // signals the guest admits. Even an empty pending
+    // snapshot needs that protection: a signal arriving afterward could
+    // stop the probe, move into the backend's held slot, and disappear from
+    // every later pending read while inject_with_retry kept polling. Two
+    // such signals could also replace one another in the single held slot
+    // (https://github.com/rrnewton/hermit/issues/4273, stage 2).
     let mut turn_wait = checks_at_turn
         .then(|| KernelSignalWait::new(guest, 0, false, call.signal_interrupt_errno()));
     let mut published = PublishedWaitMask::default();
@@ -3084,6 +3217,7 @@ where
             }
             _ => resource_request(guest, rsrc.clone()).await,
         };
+        guest_held.revalidate(guest, &mut rsrc);
         // The turn's signals, read before its first injection
         // (`read_turn_signals`): the timerfd publication and the real-time
         // action below may inject, and a pending copy could stop that
@@ -3094,13 +3228,13 @@ where
         // observation of a signal (`Signaled(None)`) is trusted as it is: that
         // signal has already left the kernel's queue.
         // Once the call blocks, the turn decides under the guest's own mask,
-        // which the call owns, never under the full one now installed (Codex
+        // which the call owns during each probe, never under the full one installed (Codex
         // review of the R2b-2 design rev3, P2-1).
         let turn = if checks_at_turn && !matches!(resumed, ResumeStatus::Signaled(None)) {
             match turn_signals_with_block(
                 guest,
                 &mut turn_wait,
-                true,
+                ProbeMaskPolicy::PrivateProbe,
                 committed_signals(&resumed),
                 rsrc.private_sigchld_decides,
                 &mut published,
@@ -3205,6 +3339,18 @@ where
             )
             .await;
         }
+        // A sibling may have replaced the destination descriptor while this
+        // attempt waited for its turn. Recheck the channel immediately before
+        // each send, independently of the mutable control data.
+        match call.into() {
+            Syscall::Sendmsg(send) => {
+                Detcore::<T>::note_descriptors_passed_out(guest, send.fd(), None, false);
+            }
+            Syscall::Sendmmsg(send) => {
+                Detcore::<T>::note_descriptors_passed_out(guest, send.sockfd(), None, false);
+            }
+            _ => {}
+        }
         // Read actual metadata after reinstatement and all earlier awaits.
         // Observation adds no reads or allocation when buffer logging is off.
         let attempt_observation =
@@ -3280,6 +3426,19 @@ where
             }
         }
         if call.syscall_would_have_blocked(syscall_result) {
+            if let Some(wait) = turn_wait.as_mut() {
+                // Both observing time and tracing a retry can yield to the
+                // scheduler. Its ptrace signal-target selection must see the
+                // guest's mask, not this probe's private all-blocked mask.
+                // Only the no-execution setter is safe here: an injected
+                // restoration could hide a pending signal in the backend's
+                // held slot before another probe. A refusal ends this call
+                // before any such yield; final cleanup may still restore it.
+                if let Err(error) = wait.release_probe_mask_in_place(guest).await {
+                    break Err(error);
+                }
+                publish_wait_mask(guest, None, &mut published).await;
+            }
             rsrc.poll_attempt += 1;
             if let Some((timeout, timeout_result)) = maybe_timeout {
                 let new_time = thread_observe_time(guest).await;
@@ -3632,12 +3791,25 @@ where
     TurnSignals { pending, ..before }
 }
 
+/// Which private mask a turn may install. The scalar writer retains its
+/// existing pending-only policy after its first guest attempt. A generic
+/// read probe needs protection even when its preceding snapshot was empty.
+#[derive(Clone, Copy)]
+enum ProbeMaskPolicy {
+    Guest,
+    PendingSignals,
+    PrivateProbe,
+}
+
 /// A restartable poll's turn on a pipe or a socket that decides at its turn:
 /// read the thread's signal state before the turn's first injection, block
-/// every blockable signal in place if one pending could stop that injection
-/// and `may_block` (`KernelSignalWait::block_in_place`, stage 2 of
+/// every blockable signal in place according to `mask_policy`
+/// (`KernelSignalWait::block_in_place`, stage 2 of
 /// https://github.com/rrnewton/hermit/issues/4273), then decide the turn's
 /// signals under the guest's own mask, which the call owns once it blocks.
+/// `PrivateProbe` also protects an empty snapshot: a signal arriving after it
+/// stays in the kernel's queue for the next turn, rather than being held by
+/// a private injection and hidden from subsequent pending-state reads.
 ///
 /// A `SIGCHLD` a guest sent the thread, which the schedule recorded in its
 /// private queue, ends the call where `private_decides`
@@ -3651,7 +3823,7 @@ where
 async fn turn_signals_with_block<T, G>(
     guest: &mut G,
     wait: &mut Option<KernelSignalWait>,
-    may_block: bool,
+    mask_policy: ProbeMaskPolicy,
     committed: KernelSigset,
     private_decides: bool,
     published: &mut PublishedWaitMask,
@@ -3668,11 +3840,14 @@ where
         // Block before the publication and the probe, so neither can be
         // stopped by a blockable signal, and every pending one stays in the
         // kernel's queue until the guest resumes.
-        if may_block
-            && wait.needs_block()
-            && pending_could_stop_injection(&state)
-            && wait.block_in_place(guest, host_timed).await?
-        {
+        let needs_protection = match mask_policy {
+            ProbeMaskPolicy::Guest => false,
+            ProbeMaskPolicy::PendingSignals => {
+                state.pending & !state.blocked & blocked_signal_mask() != 0
+            }
+            ProbeMaskPolicy::PrivateProbe => true,
+        };
+        if needs_protection && wait.needs_block() && wait.block_in_place(guest, host_timed).await? {
             publish_wait_mask(guest, wait.effective_mask(), published).await;
         }
         if private_decides
@@ -3693,15 +3868,6 @@ where
         private,
     )
     .await)
-}
-
-/// Whether a private injection could be stopped by a signal pending in
-/// `state`: one pending, on the thread's or the process's queue, that the
-/// thread's current mask leaves unblocked and that a mask can block. Such a
-/// stop moves the signal into the backend's single held slot, where a second
-/// stop replaces it (https://github.com/rrnewton/hermit/issues/4273, stage 2).
-fn pending_could_stop_injection(state: &KernelSignalState) -> bool {
-    state.pending & !state.blocked & blocked_signal_mask() != 0
 }
 
 /// [`TurnSignals`] from the thread's state (`state`), the call's mask (`mask`),
@@ -4386,7 +4552,7 @@ where
 pub(crate) async fn retry_blocking_wait_under_mask<T, G, C>(
     guest: &mut G,
     call0: C,
-    rsrc: Resources,
+    mut rsrc: Resources,
     maybe_timeout: Option<(LogicalTime, Result<i64, Errno>)>,
     wait_mask: Option<KernelSigset>,
 ) -> (Result<i64, Error>, bool)
@@ -4395,6 +4561,7 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
+    let mut guest_held = GuestHeldPollProof::capture(guest, call0.into(), &mut rsrc);
     let mut signals = KernelSignalWait::new(
         guest,
         call0.signals_consumed_by_wait(&guest.memory()),
@@ -4407,7 +4574,6 @@ where
     let mut deliver_under_wait_mask = false;
     let mut published = PublishedWaitMask::default();
     publish_wait_mask(guest, signals.effective_mask(), &mut published).await;
-    let mut rsrc = rsrc.clone();
     rsrc.poll_deadline = poll_deadline_for(guest, maybe_timeout.map(|(deadline, _)| deadline));
     let (mut call, mut guard) = call0.into_nonblocking(guest).await;
     let mut first_turn = true;
@@ -4421,6 +4587,7 @@ where
         // A scheduler `Signaled` answer only says a signal may be pending. The kernel's
         // state below decides whether it ends the wait.
         let resumed = resource_request(guest, rsrc.clone()).await;
+        guest_held.revalidate(guest, &mut rsrc);
         // Read in this turn, before any injection: another thread may have
         // armed a host-timed source since the last turn, and none can until
         // this turn ends. The same round trip gives the `SIGCHLD` a guest sent
@@ -6064,7 +6231,7 @@ impl KernelSignalWait {
         }
     }
 
-    /// Block every blockable signal for the rest of the wait, as `block` does,
+    /// Block every blockable signal until restored, as `block` does,
     /// but through `Guest::set_blocked_signals`: no guest code runs, so no
     /// pending signal is taken from the kernel's queues, and every one stays
     /// there for the kernel to deliver, in its own order, once `restore` puts
@@ -6136,6 +6303,61 @@ impl KernelSignalWait {
                 last_error,
             },
         ))
+    }
+
+    /// Release an in-place probe mask before yielding, without executing guest
+    /// code. Linux's `PTRACE_SETSIGMASK` updates the stopped task's mask and
+    /// leaves pending recalculation until resume (`kernel/ptrace.c`, v7.1.3),
+    /// so a queued signal stays visible for the next protected probe.
+    ///
+    /// Unlike final `restore`, this cannot fall back to an injection: a signal
+    /// stopping that injection could disappear into the backend's held slot
+    /// before the next turn reads it. A known-unchanged refusal retains the
+    /// saved state for final cleanup but is fatal to this retry loop. An unknown
+    /// mask is fatal without any further speculative restoration.
+    async fn release_probe_mask_in_place<T, G>(&mut self, guest: &mut G) -> Result<(), Error>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        let Some(guest_mask) = self.saved_mask else {
+            // An initial refusal to block still takes the original unmasked
+            // fallback; there is no private mask to release in that case.
+            return Ok(());
+        };
+        if !self.blocked_in_place {
+            return Err(self.mask_not_restored(0, None));
+        }
+        match guest.set_blocked_signals(guest_mask).await {
+            Ok(_) => {
+                self.saved_mask = None;
+                self.blocked_in_place = false;
+                Ok(())
+            }
+            Err(MaskChangeRefused::Gone) => {
+                self.saved_mask = None;
+                self.blocked_in_place = false;
+                // The same unobserved outcome as read_wait_signal_state for
+                // a vanished task. Do not hand off or probe it again merely
+                // to rediscover the exit through procfs.
+                Err(Errno::ERESTARTNOINTR.into())
+            }
+            Err(MaskChangeRefused::Failed {
+                errno,
+                mask_unknown: true,
+            }) => {
+                self.saved_mask = None;
+                self.blocked_in_place = false;
+                Err(self.mask_not_restored(1, Some(errno)))
+            }
+            Err(refused) => {
+                let errno = match refused {
+                    MaskChangeRefused::Failed { errno, .. } => Some(errno),
+                    _ => None,
+                };
+                Err(self.mask_not_restored(1, errno))
+            }
+        }
     }
 
     /// Put back the guest's mask, if `block` replaced it. A signal can stop the guest
@@ -6332,8 +6554,9 @@ impl KernelSignalWait {
 /// The wait's result once `restore` has put the guest's mask back. A
 /// [`HeldSignalRefusal`] from the restoration (`HeldSignalLoss::Restoration`)
 /// replaces `result`, as a loss during the wait does, unless `result` is
-/// already such a refusal, which came first; the caller then applies the
-/// unsupported-operation policy (`refuse_held_signal_loss`). Every other
+/// already such a refusal, which came first, or a fatal mask-restoration
+/// failure. Cleanup must not turn that failure into an unsupported-operation
+/// restart through `refuse_held_signal_loss`. Every other
 /// restoration error, such as [`BlockedWaitSignalError::MaskNotRestored`], is
 /// returned as the error that ends the run, as before.
 pub(crate) fn result_after_restore(
@@ -6342,10 +6565,16 @@ pub(crate) fn result_after_restore(
 ) -> Result<Result<i64, Error>, Error> {
     let is_refusal =
         |error: &Error| matches!(error, Error::Tool(error) if error.is::<HeldSignalRefusal>());
+    let is_mask_failure = |error: &Error| {
+        matches!(error, Error::Tool(error) if matches!(
+            error.downcast_ref::<BlockedWaitSignalError>(),
+            Some(BlockedWaitSignalError::MaskNotRestored { .. })
+        ))
+    };
     match restored {
         Ok(()) => Ok(result),
         Err(refusal) if is_refusal(&refusal) => match &result {
-            Err(error) if is_refusal(error) => Ok(result),
+            Err(error) if is_refusal(error) || is_mask_failure(error) => Ok(result),
             _ => Ok(Err(refusal)),
         },
         Err(error) => Err(error),
@@ -7043,7 +7272,7 @@ mod tests {
     fn pipe_writev_requests_signal_disposition() {
         let dettid = DetTid::from_raw(42);
         let call = reverie::syscalls::Writev::new();
-        let request = pipe_writev_resources(dettid, call);
+        let request = pipe_writev_resources(dettid, call, true);
 
         assert_eq!(
             request.signal_interrupt_errno(),
@@ -7051,6 +7280,16 @@ mod tests {
         );
         assert!(request.decides_signal_interruption_itself);
         assert_eq!(request.resources.len(), 1);
+        assert!(
+            request.relies_on_guest_held_marks,
+            "an escaped read end can make a blocked pipe writev progress"
+        );
+        let external = pipe_writev_resources(dettid, call, false);
+        assert!(
+            !external.polls_guest_state_only,
+            "a pipe imported from outside may have a host reader without any guest export"
+        );
+        assert!(!external.relies_on_guest_held_marks);
     }
 }
 
@@ -7060,7 +7299,7 @@ mod tests {
 /// resume with every signal blocked
 /// (https://github.com/rrnewton/hermit/issues/3146).
 #[cfg(test)]
-mod kernel_signal_wait_failures {
+pub(crate) mod kernel_signal_wait_failures {
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -7068,6 +7307,7 @@ mod kernel_signal_wait_failures {
     use reverie::GlobalRPC;
     use reverie::GlobalTool;
     use reverie::Pid;
+    use reverie::Signal;
     use reverie::syscalls::LocalMemory;
 
     use super::*;
@@ -7121,8 +7361,23 @@ mod kernel_signal_wait_failures {
         taken: Vec<i32>,
         /// Errors for the next reads, one per read.
         read_failures: VecDeque<Errno>,
+        /// The backend confirmed exit; every later proc read sees ESRCH.
+        gone: bool,
         /// Outcomes for the next `rt_sigprocmask` calls; `Apply` once empty.
         outcomes: VecDeque<MaskOutcome>,
+        /// Enable an empty nonblocking read, counting the probes that actually
+        /// run. A signal stop before the probe returns ERESTARTSYS instead,
+        /// so Guest's real default retry wrapper must retry it.
+        empty_read_probes: Option<usize>,
+        /// Bound an actual retry-loop test by making this probe ready, if a
+        /// lost signal prevents the earlier interruption it must observe.
+        read_ready_after: Option<usize>,
+        /// Physical masks at the private read probes that actually execute.
+        read_probe_masks: Vec<KernelSigset>,
+        /// Bounded scalar-write probes and their physical masks. A signal
+        /// posted after the first attempt is first visible on its retry turn.
+        write_probe_masks: Option<Vec<KernelSigset>>,
+        pending_after_first_write: KernelSigset,
         /// Every mask the guest was asked to set, in order.
         requested: Vec<KernelSigset>,
         /// How many more signals that stop an injection are sent again, as by
@@ -7130,7 +7385,8 @@ mod kernel_signal_wait_failures {
         /// again from the read after the one that follows the stop, which still
         /// shows it gone, so the stop is identified (`pending_repost`).
         repost_after_take: usize,
-        /// The signals sent again, which the read after the next one shows.
+        /// The signals sent after the next snapshot, which the following read
+        /// shows. Also models a first arrival racing an empty pending snapshot.
         pending_repost: KernelSigset,
         /// The backend's one slot for a held signal: each signal that stops an
         /// injection (`taken`, `MaskOutcome::StoppedBy`) replaces the one there,
@@ -7218,6 +7474,7 @@ mod kernel_signal_wait_failures {
         commit_fails: bool,
         arena: Box<[u64; ARENA_WORDS]>,
         kernel: Kernel,
+        proof_script: Option<Arc<Mutex<ProofScript>>>,
     }
 
     impl WaitGuest {
@@ -7238,6 +7495,7 @@ mod kernel_signal_wait_failures {
                 commit_fails: false,
                 arena: Box::new([u64::MAX; ARENA_WORDS]),
                 kernel: kernel.clone(),
+                proof_script: None,
             };
             (guest, kernel)
         }
@@ -7363,6 +7621,81 @@ mod kernel_signal_wait_failures {
             assert_eq!(with_dontwait, once, "{name} with MSG_DONTWAIT, O_NONBLOCK");
             assert_eq!(without, once, "{name} without MSG_DONTWAIT, O_NONBLOCK");
         }
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ProofAction {
+        None,
+        Dup { from: i32, to: i32 },
+        Operand { address: usize, fd: i32 },
+        Mark { fd: i32, held: bool },
+    }
+
+    #[derive(Default)]
+    struct ProofScript {
+        requests: Vec<Resources>,
+        actions: VecDeque<ProofAction>,
+        probes: usize,
+        observe_retry_masks: bool,
+        published_mask: Option<KernelSigset>,
+        publications: Vec<Option<KernelSigset>>,
+        retry_boundaries: Vec<(&'static str, KernelSigset, Option<KernelSigset>)>,
+        route_child_on_retry: bool,
+    }
+
+    impl WaitGuest {
+        async fn proof_action(&self, action: ProofAction) {
+            match action {
+                ProofAction::None => {}
+                ProofAction::Dup { from, to } => {
+                    // Run the real mutation handler in a sibling sharing the
+                    // descriptor table while the reader awaits its next turn.
+                    let (mut sibling, _) = Self::new(Pid::from_raw(2), 0);
+                    sibling.config = self.config.clone();
+                    sibling.thread.dettid = DetTid::from_raw(2);
+                    sibling.thread.detpid = self.thread.detpid;
+                    sibling.thread.file_metadata = self.thread.file_metadata.clone();
+                    sibling.proof_script = Some(Arc::new(Mutex::new(ProofScript::default())));
+                    let tool = Detcore {
+                        detpid: self.thread.detpid.unwrap(),
+                        cfg: self.config.clone(),
+                        record_or_replay: crate::record_or_replay::NoopTool,
+                    };
+                    assert_eq!(
+                        tool.handle_dup2(
+                            &mut sibling,
+                            syscalls::Dup2::new().with_oldfd(from).with_newfd(to),
+                        )
+                        .await
+                        .unwrap(),
+                        i64::from(to)
+                    );
+                }
+                ProofAction::Operand { address, fd } => {
+                    // A sibling can change the shared pollfd array without
+                    // changing either descriptor-table entry.
+                    LocalMemory::new()
+                        .write_value(AddrMut::<i32>::from_raw(address).unwrap(), &fd)
+                        .unwrap();
+                }
+                ProofAction::Mark { fd, held } => {
+                    self.thread
+                        .with_detfd(fd, |entry| {
+                            if held {
+                                entry.set_guest_held();
+                            } else {
+                                entry.clear_guest_held();
+                            }
+                        })
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    /// Reuse the local-memory guest for descriptor guards that need no injections.
+    pub(crate) fn fd_test_guest() -> impl Guest<Detcore> {
+        WaitGuest::live(0).0
     }
 
     #[test]
@@ -7573,7 +7906,11 @@ mod kernel_signal_wait_failures {
         let kernel = kernel.clone();
         signal_state_read_seam::install(move |_, _| {
             let mut kernel = kernel.lock().unwrap();
-            let read = match kernel.read_failures.pop_front() {
+            let read = match kernel
+                .gone
+                .then_some(Errno::ESRCH)
+                .or_else(|| kernel.read_failures.pop_front())
+            {
                 Some(errno) => Err(errno),
                 None => Ok(KernelSignalState {
                     pending: kernel.pending,
@@ -7595,6 +7932,95 @@ mod kernel_signal_wait_failures {
             &self,
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
+            if let Some(script) = &self.proof_script {
+                use crate::tool_global::GlobalRequest;
+                use crate::tool_global::GlobalResponse;
+                match &message.2 {
+                    GlobalRequest::RequestResources(resources, _) => {
+                        let (action, signal) = {
+                            let mut script = script.lock().unwrap();
+                            assert!(script.requests.len() < 4, "unbounded retry fixture");
+                            script.requests.push(resources.clone());
+                            let mut signal = None;
+                            if script.observe_retry_masks {
+                                let mut kernel = self.kernel.lock().unwrap();
+                                let published = script.published_mask;
+                                script.retry_boundaries.push((
+                                    "request",
+                                    kernel.blocked,
+                                    published,
+                                ));
+                                // Model the ptrace target selector: a caught
+                                // child notification is sent only to a task
+                                // whose physical mask admits it at this yield.
+                                if script.route_child_on_retry
+                                    && script.requests.len() == 2
+                                    && kernel.blocked & kernel_sigset_bit(libc::SIGCHLD) == 0
+                                {
+                                    kernel.pending |= kernel_sigset_bit(libc::SIGCHLD);
+                                    signal = Some(crate::types::SigWrapper::from(Signal::SIGCHLD));
+                                }
+                            }
+                            (
+                                script.actions.pop_front().unwrap_or(ProofAction::None),
+                                signal,
+                            )
+                        };
+                        self.proof_action(action).await;
+                        return (
+                            None,
+                            GlobalResponse::RequestResources(
+                                signal.map_or(ResumeStatus::Normal, |signal| {
+                                    ResumeStatus::Signaled(Some(vec![signal]))
+                                }),
+                            ),
+                        );
+                    }
+                    GlobalRequest::ReleasePort(_) => {
+                        return (None, GlobalResponse::ReleasePort(None));
+                    }
+                    GlobalRequest::HostTimedAndPrivateSigchld(_) => {
+                        return (None, GlobalResponse::HostTimedAndPrivateSigchld(0, 0));
+                    }
+                    GlobalRequest::SetSavedGuestSigmask(mask) => {
+                        let mut script = script.lock().unwrap();
+                        script.published_mask = *mask;
+                        script.publications.push(*mask);
+                        return (None, GlobalResponse::SetSavedGuestSigmask(()));
+                    }
+                    GlobalRequest::TraceSchedEvent(_, _, _) => {
+                        let mut script = script.lock().unwrap();
+                        assert!(script.observe_retry_masks);
+                        let blocked = self.kernel.lock().unwrap().blocked;
+                        let published = script.published_mask;
+                        script.retry_boundaries.push(("trace", blocked, published));
+                        return (
+                            None,
+                            GlobalResponse::TraceSchedEvent(
+                                serde_json::from_value(serde_json::json!({
+                                    "print_stack_strace": null,
+                                    "timeslice": null,
+                                    "schedule_released": false,
+                                    "schedule_over": false,
+                                }))
+                                .unwrap(),
+                            ),
+                        );
+                    }
+                    GlobalRequest::DiscardedSignal(_) => {
+                        return (
+                            None,
+                            GlobalResponse::DiscardedSignal(
+                                crate::scheduler::discarded_at_send::DiscardedSignalAnswer::Bits {
+                                    thread: 0,
+                                    process: 0,
+                                },
+                            ),
+                        );
+                    }
+                    _ => panic!("unexpected proof fixture RPC: {:?}", message.2),
+                }
+            }
             match (&message.2, self.kernel.lock().unwrap().private_record) {
                 (
                     crate::tool_global::GlobalRequest::HostTimedAndPrivateSigchld(_),
@@ -7637,6 +8063,15 @@ mod kernel_signal_wait_failures {
             &self.thread
         }
         async fn regs(&mut self) -> libc::user_regs_struct {
+            if self
+                .proof_script
+                .as_ref()
+                .is_some_and(|script| script.lock().unwrap().observe_retry_masks)
+            {
+                let mut regs: libc::user_regs_struct = unsafe { std::mem::zeroed() };
+                regs.rip = self.arena.as_ptr() as u64;
+                return regs;
+            }
             panic!("a blocked wait must not read registers")
         }
         async fn stack(&mut self) -> Self::Stack {
@@ -7650,6 +8085,71 @@ mod kernel_signal_wait_failures {
         }
         async fn inject<S: SyscallInfo>(&mut self, syscall: S) -> Result<i64, Errno> {
             let (number, args) = syscall.into_parts();
+            if let Some(script) = &self.proof_script {
+                match Syscall::from_raw(number, args) {
+                    Syscall::Dup2(call) => {
+                        // These descriptors are owned by this test. The real
+                        // handler performs the corresponding model update.
+                        let result = unsafe { libc::dup2(call.oldfd(), call.newfd()) };
+                        assert!(result >= 0, "owned fixture descriptor duplication failed");
+                        return Ok(i64::from(result));
+                    }
+                    Syscall::Readv(_) | Syscall::Poll(_) | Syscall::Ppoll(_) => {
+                        let mut script = script.lock().unwrap();
+                        script.probes += 1;
+                        return if script.probes == 4 {
+                            Ok(1)
+                        } else if matches!(Syscall::from_raw(number, args), Syscall::Readv(_)) {
+                            Err(Errno::EAGAIN)
+                        } else {
+                            Ok(0)
+                        };
+                    }
+                    _ => {}
+                }
+            }
+            if matches!(Syscall::from_raw(number, args), Syscall::Read(_)) {
+                let mut kernel = self.kernel.lock().unwrap();
+                assert!(kernel.empty_read_probes.is_some(), "unexpected read probe");
+                let deliverable = kernel.pending & !kernel.blocked;
+                if kernel.stops_for_pending && deliverable != 0 {
+                    let signal = deliverable.trailing_zeros() as i32 + 1;
+                    kernel.pending &= !kernel_sigset_bit(signal);
+                    kernel.taken.push(signal);
+                    kernel.hold(signal);
+                    return Err(Errno::ERESTARTSYS);
+                }
+                *kernel.empty_read_probes.as_mut().unwrap() += 1;
+                let blocked = kernel.blocked;
+                kernel.read_probe_masks.push(blocked);
+                if kernel
+                    .read_ready_after
+                    .is_some_and(|ready| kernel.empty_read_probes.unwrap() >= ready)
+                {
+                    return Ok(1);
+                }
+                return Err(Errno::EAGAIN);
+            }
+            if matches!(Syscall::from_raw(number, args), Syscall::Write(_)) {
+                let mut kernel = self.kernel.lock().unwrap();
+                let blocked = kernel.blocked;
+                let probes = kernel
+                    .write_probe_masks
+                    .as_mut()
+                    .expect("unexpected write probe");
+                probes.push(blocked);
+                let attempt = probes.len();
+                assert!(attempt <= 3, "unbounded scalar-write fixture");
+                if attempt == 1 {
+                    let pending = std::mem::take(&mut kernel.pending_after_first_write);
+                    kernel.pending |= pending;
+                }
+                return if attempt == 3 {
+                    Ok(1)
+                } else {
+                    Err(Errno::EAGAIN)
+                };
+            }
             let Syscall::RtSigprocmask(call) = Syscall::from_raw(number, args) else {
                 panic!("a blocked wait injected {number}, not rt_sigprocmask")
             };
@@ -7689,7 +8189,12 @@ mod kernel_signal_wait_failures {
             kernel.set_calls.push(mask);
             match kernel.setter.pop_front() {
                 Some(None) => Ok(std::mem::replace(&mut kernel.blocked, mask)),
-                Some(Some(refused)) => Err(refused),
+                Some(Some(refused)) => {
+                    if matches!(refused, MaskChangeRefused::Gone) {
+                        kernel.gone = true;
+                    }
+                    Err(refused)
+                }
                 None => Err(MaskChangeRefused::Unsupported),
             }
         }
@@ -7706,6 +8211,710 @@ mod kernel_signal_wait_failures {
         fn read_clock(&mut self) -> Result<u64, Error> {
             panic!("a blocked wait must not read a clock")
         }
+    }
+
+    /// Exercise the actual retry/publication path. The host owns the second
+    /// pipe's writer; replacing the slot or poll operand can therefore make
+    /// the next physical probe depend on input from outside the guest.
+    async fn proof_requests(case: &str, kernel_wait: bool, masked_ppoll: bool) -> Vec<Resources> {
+        use std::os::fd::AsRawFd;
+
+        let (mut guest, kernel) = WaitGuest::new(Pid::from_raw(3), 0);
+        guest.config.sequentialize_threads = true;
+        guest.config.backend.kernel_signal_targets_are_predictable = false;
+        guest.thread.dettid = DetTid::from_raw(3);
+        guest.thread.detpid = Some(DetPid::from_raw(3));
+        let _proc = scripted_proc(&kernel);
+        let (internal, _internal_writer) =
+            nix::unistd::pipe2(nix::fcntl::OFlag::O_NONBLOCK).unwrap();
+        let (external, _external_writer) =
+            nix::unistd::pipe2(nix::fcntl::OFlag::O_NONBLOCK).unwrap();
+        let saved = nix::unistd::dup(&internal).unwrap();
+        let fd = internal.as_raw_fd();
+        let external_fd = external.as_raw_fd();
+        for raw in [fd, external_fd] {
+            guest
+                .thread
+                .add_fd(raw, nix::fcntl::OFlag::O_RDONLY, FdType::Pipe, None)
+                .unwrap();
+            guest
+                .thread
+                .with_detfd(raw, |entry| entry.set_physically_nonblocking())
+                .unwrap();
+        }
+        guest
+            .thread
+            .with_detfd(fd, |entry| entry.set_guest_held())
+            .unwrap();
+        if case == "dup-guest" {
+            guest
+                .thread
+                .with_detfd(external_fd, |entry| entry.set_guest_held())
+                .unwrap();
+        }
+        guest
+            .thread
+            .dup_fd(fd, saved.as_raw_fd(), nix::fcntl::OFlag::empty())
+            .unwrap();
+        let original = guest
+            .thread
+            .with_detfd(fd, |entry| entry.open_file_id())
+            .unwrap();
+        let mut operands = [libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        }];
+        let address = operands.as_mut_ptr() as usize;
+        let (change, restore) = match case {
+            "same" => (ProofAction::None, ProofAction::None),
+            "noop-dup" => (ProofAction::Dup { from: fd, to: fd }, ProofAction::None),
+            "dup" | "dup-guest" => (
+                ProofAction::Dup {
+                    from: external_fd,
+                    to: fd,
+                },
+                ProofAction::Dup {
+                    from: saved.as_raw_fd(),
+                    to: fd,
+                },
+            ),
+            "operand" => (
+                ProofAction::Operand {
+                    address,
+                    fd: external_fd,
+                },
+                ProofAction::Operand { address, fd },
+            ),
+            "mark" => (
+                ProofAction::Mark { fd, held: false },
+                ProofAction::Mark { fd, held: true },
+            ),
+            "unknown" => {
+                guest.thread.remove_fd(fd);
+                (ProofAction::None, ProofAction::None)
+            }
+            _ => panic!("unknown proof case {case}"),
+        };
+        let script = Arc::new(Mutex::new(ProofScript {
+            actions: [ProofAction::None, change, restore, ProofAction::None].into(),
+            ..Default::default()
+        }));
+        guest.proof_script = Some(script.clone());
+        let mut resources = Resources::new(guest.thread.dettid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        resources.polls_guest_state_only = true;
+        resources.relies_on_guest_held_marks = true;
+        // Match the real unmasked poll/ppoll producers. Readv's generic
+        // retry helper itself supplies its restart errno and task identity.
+        if kernel_wait || matches!(case, "operand" | "unknown") {
+            resources.set_signal_interrupt_errno(Errno::EINTR);
+            resources.signal_state_task = guest_signal_state_task(&guest);
+        }
+        let mask = 0_u64;
+        let zero_timeout = reverie::syscalls::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let result = if masked_ppoll {
+            let tool = Detcore {
+                detpid: guest.thread.detpid.unwrap(),
+                cfg: guest.config.clone(),
+                record_or_replay: crate::record_or_replay::NoopTool,
+            };
+            tool.masked_ppoll_probe_for_test(
+                &mut guest,
+                syscalls::Ppoll::new()
+                    .with_fds(AddrMut::from_raw(address))
+                    .with_nfds(1)
+                    .with_timeout(AddrMut::from_raw(&zero_timeout as *const _ as usize))
+                    .with_sigmask(Addr::from_raw(&mask as *const _ as usize))
+                    .with_sigsetsize(KERNEL_SIGSET_SIZE),
+                &mask as *const _ as usize,
+            )
+            .await
+        } else if kernel_wait {
+            retry_blocking_wait_under_mask(
+                &mut guest,
+                syscalls::Poll::new()
+                    .with_fds(AddrMut::from_raw(address))
+                    .with_nfds(1)
+                    .with_timeout(-1),
+                resources,
+                None,
+                None,
+            )
+            .await
+            .0
+        } else if matches!(case, "operand" | "unknown") {
+            retry_nonblocking_syscall_helper(
+                &mut guest,
+                syscalls::Poll::new()
+                    .with_fds(AddrMut::from_raw(address))
+                    .with_nfds(1)
+                    .with_timeout(-1),
+                resources,
+                None,
+                None,
+            )
+            .await
+        } else {
+            retry_nonblocking_syscall_helper(
+                &mut guest,
+                syscalls::Readv::new().with_fd(fd),
+                resources,
+                None,
+                None,
+            )
+            .await
+        };
+        assert_eq!(result.unwrap(), 1, "retry syscall result is unchanged");
+        let script = script.lock().unwrap();
+        assert_eq!(script.probes, 4);
+        assert_eq!(
+            script
+                .requests
+                .iter()
+                .map(|r| r.poll_attempt)
+                .collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        if case != "unknown" {
+            assert_eq!(
+                guest
+                    .thread
+                    .with_detfd(fd, |entry| entry.open_file_id())
+                    .unwrap(),
+                original
+            );
+            assert!(
+                guest
+                    .thread
+                    .with_detfd(fd, |entry| entry.is_guest_held())
+                    .unwrap()
+            );
+            assert_eq!(
+                operands[0].fd, fd,
+                "restored operands cannot restore a lost proof"
+            );
+        }
+        script.requests.clone()
+    }
+
+    #[tokio::test]
+    async fn a_retried_descriptor_proof_does_not_survive_sibling_replacement() {
+        for kernel_wait in [false, true] {
+            for case in ["same", "noop-dup", "dup", "dup-guest", "mark"] {
+                let requests = proof_requests(case, kernel_wait, false).await;
+                let valid = matches!(case, "same" | "noop-dup");
+                assert!(requests[0].polls_guest_state_only);
+                assert!(requests[1].polls_guest_state_only);
+                for request in &requests[2..] {
+                    assert_eq!(
+                        crate::scheduler::request_reports_idle_deadlock_for_test(request.clone()),
+                        valid,
+                        "{case}, kernel_wait={kernel_wait}: actual published request's terminal verdict"
+                    );
+                    assert_eq!(
+                        request.polls_guest_state_only, valid,
+                        "{case}, kernel_wait={kernel_wait}"
+                    );
+                    assert_eq!(
+                        request.relies_on_guest_held_marks, valid,
+                        "{case}, kernel_wait={kernel_wait}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retried_poll_proof_does_not_survive_sibling_operand_replacement() {
+        for kernel_wait in [false, true] {
+            let requests = proof_requests("operand", kernel_wait, false).await;
+            assert!(requests[0].polls_guest_state_only);
+            assert!(requests[1].polls_guest_state_only);
+            for request in &requests[2..] {
+                assert!(
+                    !crate::scheduler::request_reports_idle_deadlock_for_test(request.clone()),
+                    "kernel_wait={kernel_wait}: replaced operand cannot prove terminal deadlock"
+                );
+                assert!(!request.polls_guest_state_only, "kernel_wait={kernel_wait}");
+                assert!(
+                    !request.relies_on_guest_held_marks,
+                    "kernel_wait={kernel_wait}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retried_descriptor_proof_requires_an_initial_identity() {
+        for kernel_wait in [false, true] {
+            for request in proof_requests("unknown", kernel_wait, false).await {
+                if request.poll_attempt > 0 {
+                    assert!(
+                        !crate::scheduler::request_reports_idle_deadlock_for_test(request.clone()),
+                        "kernel_wait={kernel_wait}: missing identity cannot prove terminal deadlock"
+                    );
+                }
+                assert!(!request.polls_guest_state_only, "kernel_wait={kernel_wait}");
+                assert!(
+                    !request.relies_on_guest_held_marks,
+                    "kernel_wait={kernel_wait}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_masked_ppoll_proof_does_not_survive_sibling_replacement() {
+        for case in ["same", "noop-dup", "dup", "dup-guest", "operand", "mark"] {
+            let requests = proof_requests(case, false, true).await;
+            let valid = matches!(case, "same" | "noop-dup");
+            assert!(requests[0].polls_guest_state_only);
+            assert!(requests[1].polls_guest_state_only);
+            for request in &requests[2..] {
+                assert_eq!(
+                    crate::scheduler::request_reports_idle_deadlock_for_test(request.clone()),
+                    valid,
+                    "{case}: masked ppoll's actual published request"
+                );
+                assert_eq!(request.polls_guest_state_only, valid);
+                assert_eq!(request.relies_on_guest_held_marks, valid);
+            }
+        }
+    }
+
+    /// Protect the generic loop's first-turn call site, independently of
+    /// turn_signals_with_block's internal mask-install condition. A signal
+    /// arrives after its first empty snapshot and before the private read.
+    #[tokio::test]
+    async fn a_generic_reads_first_probe_keeps_a_late_signal_visible() {
+        use std::os::fd::AsRawFd;
+
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        for (sent, blocked) in [(true, false), (false, false), (true, true)] {
+            let own_mask = guest_mask() | if blocked { usr1 } else { 0 };
+            let (mut guest, kernel) = WaitGuest::new(Pid::from_raw(3), own_mask);
+            guest.config.sequentialize_threads = true;
+            guest.config.backend.kernel_signal_targets_are_predictable = true;
+            guest.thread.dettid = DetTid::from_raw(3);
+            guest.thread.detpid = Some(DetPid::from_raw(3));
+            let (reader, _writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_NONBLOCK).unwrap();
+            let fd = reader.as_raw_fd();
+            guest
+                .thread
+                .add_fd(fd, nix::fcntl::OFlag::O_RDONLY, FdType::Pipe, None)
+                .unwrap();
+            guest
+                .thread
+                .with_detfd(fd, |entry| entry.set_physically_nonblocking())
+                .unwrap();
+            let script = Arc::new(Mutex::new(ProofScript::default()));
+            guest.proof_script = Some(script.clone());
+            {
+                let mut kernel = kernel.lock().unwrap();
+                kernel.caught = usr1;
+                kernel.pending_repost = if sent { usr1 } else { 0 };
+                kernel.stops_for_pending = true;
+                kernel.empty_read_probes = Some(0);
+                kernel.read_ready_after = Some(4);
+                // A successful in-place setter remains available on every
+                // probe and restoration, not just the first and final ones.
+                kernel.setter.extend(std::iter::repeat_n(None, 8));
+            }
+            let _proc = scripted_proc(&kernel);
+            let mut resources = Resources::new(guest.thread.dettid);
+            resources.insert(ResourceID::InternalIOPolling, Permission::W);
+            let result = retry_nonblocking_syscall_helper(
+                &mut guest,
+                syscalls::Read::new().with_fd(fd).with_len(1),
+                resources,
+                None,
+                None,
+            )
+            .await
+            .map_err(|error| error.into_errno().expect("guest errno"));
+            let kernel = kernel.lock().unwrap();
+            assert_eq!(
+                kernel.blocked, own_mask,
+                "the original guest mask is restored"
+            );
+            assert_eq!(
+                result,
+                if sent && !blocked {
+                    Err(Errno::ERESTARTSYS)
+                } else {
+                    Ok(1)
+                },
+                "sent={sent}, blocked={blocked}, pending={:#x}, held={:?}, taken={:?}",
+                kernel.pending,
+                kernel.held_slot,
+                kernel.taken
+            );
+            assert_eq!(kernel.held_slot, None);
+            assert_eq!(kernel.pending, if sent { usr1 } else { 0 });
+            assert_eq!(
+                kernel.empty_read_probes,
+                Some(if sent && !blocked { 2 } else { 4 })
+            );
+            assert_eq!(
+                script.lock().unwrap().requests.len(),
+                if sent && !blocked { 2 } else { 4 }
+            );
+        }
+    }
+
+    /// Run the real generic read loop, including its retry TraceSchedEvent.
+    /// A fourth ready probe bounds a broken implementation without a timeout.
+    async fn read_observing_retry_masks(
+        route_child: bool,
+        late_signal: bool,
+        setter: Vec<Option<MaskChangeRefused>>,
+        outcomes: Vec<MaskOutcome>,
+    ) -> (Result<i64, Error>, Kernel, Arc<Mutex<ProofScript>>) {
+        use std::os::fd::AsRawFd;
+
+        let own_mask = guest_mask();
+        let (mut guest, kernel) = WaitGuest::new(Pid::from_raw(3), own_mask);
+        guest.config.sequentialize_threads = true;
+        guest.config.record_preemptions = true;
+        guest.config.panic_on_unsupported_syscalls = false;
+        guest.config.backend.kernel_signal_targets_are_predictable = true;
+        guest.thread.dettid = DetTid::from_raw(3);
+        guest.thread.detpid = Some(DetPid::from_raw(3));
+        let (reader, _writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_NONBLOCK).unwrap();
+        let fd = reader.as_raw_fd();
+        guest
+            .thread
+            .add_fd(fd, nix::fcntl::OFlag::O_RDONLY, FdType::Pipe, None)
+            .unwrap();
+        guest
+            .thread
+            .with_detfd(fd, |entry| entry.set_physically_nonblocking())
+            .unwrap();
+        let script = Arc::new(Mutex::new(ProofScript {
+            observe_retry_masks: true,
+            route_child_on_retry: route_child,
+            ..ProofScript::default()
+        }));
+        guest.proof_script = Some(script.clone());
+        {
+            let mut kernel = kernel.lock().unwrap();
+            kernel.caught = kernel_sigset_bit(libc::SIGCHLD) | kernel_sigset_bit(libc::SIGUSR1);
+            kernel.pending_repost = if late_signal {
+                kernel_sigset_bit(libc::SIGUSR1)
+            } else {
+                0
+            };
+            kernel.stops_for_pending = true;
+            kernel.empty_read_probes = Some(0);
+            kernel.read_ready_after = Some(4);
+            kernel.setter.extend(setter);
+            kernel.outcomes.extend(outcomes);
+        }
+        let _proc = scripted_proc(&kernel);
+        let mut resources = Resources::new(guest.thread.dettid);
+        resources.insert(ResourceID::InternalIOPolling, Permission::W);
+        let result = retry_nonblocking_syscall_helper(
+            &mut guest,
+            syscalls::Read::new().with_fd(fd).with_len(1),
+            resources,
+            None,
+            None,
+        )
+        .await;
+        (result, kernel, script)
+    }
+
+    #[tokio::test]
+    async fn a_generic_read_restores_its_mask_before_retry_yields() {
+        for (route_child, late_signal) in [(true, false), (false, true), (false, false)] {
+            let (result, kernel, script) =
+                read_observing_retry_masks(route_child, late_signal, vec![None; 8], vec![]).await;
+            let kernel = kernel.lock().unwrap();
+            let script = script.lock().unwrap();
+            assert_eq!(
+                result.map_err(|error| error.into_errno().expect("guest errno")),
+                if route_child || late_signal {
+                    Err(Errno::ERESTARTSYS)
+                } else {
+                    Ok(1)
+                },
+                "route_child={route_child}, late_signal={late_signal}",
+            );
+            let attempts = if route_child || late_signal { 2 } else { 4 };
+            assert_eq!(script.requests.len(), attempts);
+            assert_eq!(kernel.empty_read_probes, Some(attempts));
+            assert_eq!(
+                kernel.read_probe_masks,
+                vec![blocked_signal_mask() | guest_mask(); attempts]
+            );
+            assert_eq!(script.retry_boundaries.len(), attempts * 2 - 1);
+            for (boundary, blocked, published) in &script.retry_boundaries {
+                assert_eq!(
+                    *blocked,
+                    guest_mask(),
+                    "{boundary} must see the guest's mask"
+                );
+                assert_eq!(
+                    *published, None,
+                    "{boundary} must not keep a private-mask publication"
+                );
+            }
+            assert_eq!(
+                script.publications,
+                [Some(guest_mask()), None].repeat(attempts)
+            );
+            assert_eq!(kernel.blocked, guest_mask());
+            assert_eq!(
+                kernel.pending,
+                if route_child {
+                    kernel_sigset_bit(libc::SIGCHLD)
+                } else if late_signal {
+                    kernel_sigset_bit(libc::SIGUSR1)
+                } else {
+                    0
+                }
+            );
+            assert_eq!(kernel.held_slot, None);
+            assert!(kernel.taken.is_empty());
+            assert!(kernel.lost.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_generic_read_does_not_retry_after_an_in_place_release_refusal() {
+        for refused in [
+            MaskChangeRefused::Unsupported,
+            MaskChangeRefused::RestorePending {
+                saved: guest_mask(),
+                effective: blocked_signal_mask() | guest_mask(),
+            },
+            MaskChangeRefused::Failed {
+                errno: Errno::EIO,
+                mask_unknown: false,
+            },
+        ] {
+            let (result, kernel, script) =
+                read_observing_retry_masks(false, false, vec![None, Some(refused), None], vec![])
+                    .await;
+            assert!(matches!(
+                diagnostic(result),
+                BlockedWaitSignalError::MaskNotRestored { attempts: 1, .. }
+            ));
+            let kernel = kernel.lock().unwrap();
+            let script = script.lock().unwrap();
+            assert_eq!(kernel.empty_read_probes, Some(1));
+            assert_eq!(script.requests.len(), 1);
+            assert_eq!(
+                script.retry_boundaries,
+                vec![("request", guest_mask(), None)]
+            );
+            assert_eq!(
+                kernel.blocked,
+                guest_mask(),
+                "final cleanup still restores the mask"
+            );
+            assert_eq!(script.publications, vec![Some(guest_mask()), None]);
+            assert!(
+                kernel.requested.is_empty(),
+                "no injected restoration was needed"
+            );
+            assert_eq!(kernel.held_slot, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_generic_read_stops_immediately_when_release_leaves_the_mask_unknown() {
+        let (result, kernel, script) = read_observing_retry_masks(
+            false,
+            false,
+            vec![
+                None,
+                Some(MaskChangeRefused::Failed {
+                    errno: Errno::EIO,
+                    mask_unknown: true,
+                }),
+            ],
+            vec![],
+        )
+        .await;
+        assert!(matches!(
+            diagnostic(result),
+            BlockedWaitSignalError::MaskNotRestored {
+                attempts: 1,
+                last_error: Some(Errno::EIO),
+                ..
+            }
+        ));
+        let kernel = kernel.lock().unwrap();
+        let script = script.lock().unwrap();
+        assert_eq!(kernel.empty_read_probes, Some(1));
+        assert_eq!(script.requests.len(), 1);
+        assert_eq!(
+            script.retry_boundaries,
+            vec![("request", guest_mask(), None)]
+        );
+        assert_eq!(
+            kernel.set_calls.len(),
+            2,
+            "an unknown mask is not probed or restored speculatively"
+        );
+        assert!(kernel.requested.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_generic_read_keeps_a_release_failure_fatal_after_loss_during_cleanup() {
+        let (result, kernel, script) = read_observing_retry_masks(
+            false,
+            false,
+            vec![
+                None,
+                Some(MaskChangeRefused::Unsupported),
+                Some(MaskChangeRefused::Unsupported),
+            ],
+            vec![
+                MaskOutcome::StoppedBy(libc::SIGUSR1),
+                MaskOutcome::StoppedBy(libc::SIGUSR2),
+                MaskOutcome::Apply,
+            ],
+        )
+        .await;
+        // allow-unsupported must not turn this failed atomic release into the
+        // HeldSignalRefusal policy's transparent ERESTARTNOINTR retry.
+        assert!(matches!(
+            diagnostic(result),
+            BlockedWaitSignalError::MaskNotRestored { attempts: 1, .. }
+        ));
+        let kernel = kernel.lock().unwrap();
+        let script = script.lock().unwrap();
+        assert_eq!(kernel.empty_read_probes, Some(1));
+        assert_eq!(script.requests.len(), 1);
+        assert_eq!(
+            script.retry_boundaries,
+            vec![("request", guest_mask(), None)]
+        );
+        assert_eq!(kernel.blocked, guest_mask());
+        assert_eq!(kernel.requested, vec![guest_mask(); 3]);
+        assert_eq!(kernel.lost, vec![libc::SIGUSR1]);
+        assert_eq!(kernel.held_slot, Some(libc::SIGUSR2));
+    }
+
+    #[tokio::test]
+    async fn a_scalar_write_keeps_its_pending_only_probe_mask_policy() {
+        use std::os::fd::AsRawFd;
+
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        for (sent, blocked) in [(false, false), (true, false), (true, true)] {
+            let own_mask = guest_mask() | if blocked { usr1 } else { 0 };
+            let (mut guest, kernel) = WaitGuest::new(Pid::from_raw(3), own_mask);
+            guest.config.sequentialize_threads = true;
+            guest.config.backend.kernel_signal_targets_are_predictable = true;
+            guest.thread.dettid = DetTid::from_raw(3);
+            guest.thread.detpid = Some(DetPid::from_raw(3));
+            let (_reader, writer) = nix::unistd::pipe2(nix::fcntl::OFlag::O_NONBLOCK).unwrap();
+            let fd = writer.as_raw_fd();
+            guest
+                .thread
+                .add_fd(fd, nix::fcntl::OFlag::O_WRONLY, FdType::Pipe, None)
+                .unwrap();
+            let open_file = guest
+                .thread
+                .with_detfd(fd, |entry| {
+                    entry.set_physically_nonblocking();
+                    entry.open_file_id()
+                })
+                .unwrap();
+            let script = Arc::new(Mutex::new(ProofScript::default()));
+            guest.proof_script = Some(script.clone());
+            {
+                let mut kernel = kernel.lock().unwrap();
+                kernel.caught = usr1;
+                kernel.write_probe_masks = Some(vec![]);
+                kernel.pending_after_first_write = if sent { usr1 } else { 0 };
+                kernel.setter.extend([None, None]);
+            }
+            let _proc = scripted_proc(&kernel);
+            let tool = Detcore {
+                detpid: guest.thread.detpid.unwrap(),
+                cfg: guest.config.clone(),
+                record_or_replay: crate::record_or_replay::NoopTool,
+            };
+            let byte = 0u8;
+            let result = tool
+                .execute_blocking_pipe_write(
+                    &mut guest,
+                    syscalls::Write::new()
+                        .with_fd(fd)
+                        .with_buf(Addr::from_ptr(&byte))
+                        .with_len(1),
+                    open_file,
+                )
+                .await
+                .map_err(|error| error.into_errno().expect("guest errno"));
+            let kernel = kernel.lock().unwrap();
+            let script = script.lock().unwrap();
+            if sent && !blocked {
+                assert_eq!(result, Err(Errno::ERESTARTSYS));
+                assert_eq!(
+                    kernel.write_probe_masks.as_deref(),
+                    Some([own_mask, blocked_signal_mask() | own_mask].as_slice())
+                );
+                assert_eq!(
+                    kernel.set_calls,
+                    vec![blocked_signal_mask() | own_mask, own_mask]
+                );
+                assert_eq!(script.publications, vec![Some(own_mask), None]);
+                assert_eq!(script.requests.len(), 1);
+            } else {
+                assert_eq!(result, Ok(1));
+                assert_eq!(
+                    kernel.write_probe_masks.as_deref(),
+                    Some([own_mask; 3].as_slice()),
+                    "sent={sent}, blocked={blocked}"
+                );
+                assert!(
+                    kernel.set_calls.is_empty(),
+                    "an empty or guest-blocked snapshot must not change the scalar writer's mask"
+                );
+                assert!(script.publications.is_empty());
+                assert_eq!(script.requests.len(), 2);
+            }
+            assert_eq!(kernel.blocked, own_mask);
+            assert_eq!(kernel.pending, if sent { usr1 } else { 0 });
+            assert_eq!(kernel.held_slot, None);
+            assert!(kernel.lost.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_generic_read_does_not_handoff_after_release_reports_exit() {
+        let (result, kernel, script) = read_observing_retry_masks(
+            false,
+            false,
+            vec![None, Some(MaskChangeRefused::Gone)],
+            vec![],
+        )
+        .await;
+        // read_wait_signal_state uses this same outcome for a confirmed
+        // vanished thread; no thread observes it (threads.rs).
+        assert_eq!(
+            result.map_err(|error| error.into_errno().expect("gone-thread errno")),
+            Err(Errno::ERESTARTNOINTR)
+        );
+        let kernel = kernel.lock().unwrap();
+        let script = script.lock().unwrap();
+        assert!(kernel.gone);
+        assert_eq!(kernel.empty_read_probes, Some(1));
+        assert_eq!(script.requests.len(), 1);
+        assert_eq!(
+            script.retry_boundaries,
+            vec![("request", guest_mask(), None)]
+        );
+        assert_eq!(kernel.set_calls.len(), 2);
+        assert!(kernel.requested.is_empty());
     }
 
     /// The guest's own mask in these tests.
@@ -9146,10 +10355,86 @@ mod kernel_signal_wait_failures {
         assert!(kernel.lock().unwrap().set_calls.is_empty());
     }
 
+    /// A host signal can arrive after a pipe turn read an empty pending set.
+    /// The private probe must not take it into the backend's held slot and
+    /// retry to EAGAIN: later /proc reads cannot see that slot, and the guest
+    /// cannot run its handler until the polling call returns. This uses the
+    /// real Guest::inject_with_retry, with the ptrace outcome modeled by
+    /// WaitGuest: the first stopped attempt holds the signal and returns
+    /// ERESTARTSYS; a retried empty probe returns EAGAIN.
+    #[tokio::test]
+    async fn a_signal_after_an_empty_pipe_turn_snapshot_still_interrupts() {
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        for (sent, blocked) in [(true, false), (false, false), (true, true)] {
+            let own_mask = guest_mask() | if blocked { usr1 } else { 0 };
+            let (mut guest, kernel) = WaitGuest::new(Pid::from_raw(1), own_mask);
+            {
+                let mut kernel = kernel.lock().unwrap();
+                kernel.caught = usr1;
+                kernel.pending_repost = if sent { usr1 } else { 0 };
+                kernel.stops_for_pending = true;
+                kernel.empty_read_probes = Some(0);
+                kernel.private_record = Some((0, 0));
+                kernel.setter.extend([None, None]);
+            }
+            let _proc = scripted_proc(&kernel);
+            let mut wait = Some(KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS));
+            let mut published = PublishedWaitMask(Some(own_mask));
+            let read = syscalls::Read::new()
+                .with_fd(3)
+                .with_buf(AddrMut::from_raw(guest.arena.as_mut_ptr() as usize))
+                .with_len(1);
+            let first = turn_signals_with_block(
+                &mut guest,
+                &mut wait,
+                ProbeMaskPolicy::PrivateProbe,
+                0,
+                false,
+                &mut published,
+            )
+            .await
+            .unwrap();
+            assert!(!first.ends(false), "the snapshot preceded the signal");
+            assert_eq!(
+                guest.inject_with_retry(read).await,
+                Err(Errno::EAGAIN),
+                "an empty nonblocking read transfers no bytes"
+            );
+            let next = turn_signals_with_block(
+                &mut guest,
+                &mut wait,
+                ProbeMaskPolicy::PrivateProbe,
+                0,
+                false,
+                &mut published,
+            )
+            .await
+            .unwrap();
+            wait.as_mut()
+                .unwrap()
+                .restore(&mut guest, None)
+                .await
+                .unwrap();
+            let kernel = kernel.lock().unwrap();
+            assert_eq!(kernel.blocked, own_mask, "the guest's mask is restored");
+            assert_eq!(kernel.empty_read_probes, Some(1));
+            assert_eq!(
+                next.ends(false),
+                sent && !blocked,
+                "sent={sent}, blocked={blocked}, pending={:#x}, held={:?}, taken={:?}",
+                kernel.pending,
+                kernel.held_slot,
+                kernel.taken
+            );
+            assert_eq!(kernel.pending, if sent { usr1 } else { 0 });
+            assert_eq!(kernel.held_slot, None, "the signal stays kernel-pending");
+        }
+    }
+
     /// A pipe turn (`turn_signals_with_block`) counts the recorded private
     /// `SIGCHLD` only where the gate holds, a block is in force and the
     /// thread's own queue holds it. Not on the scalar writer's first attempt,
-    /// the guest's own write, which blocks nothing (`may_block` false): an
+    /// the guest's own write, which blocks nothing (`ProbeMaskPolicy::Guest`): an
     /// injection of that turn could take the copy into the backend's single
     /// held slot. Not without the gate, as on a socket. Not from the shared
     /// queue alone (R2b-2 stage 3).
@@ -9170,11 +10455,21 @@ mod kernel_signal_wait_failures {
             let _proc = scripted_proc(&kernel);
             let mut wait = Some(KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS));
             let mut published = PublishedWaitMask(Some(guest_mask()));
-            let pending =
-                turn_signals_with_block(&mut guest, &mut wait, may_block, 0, gate, &mut published)
-                    .await
-                    .unwrap()
-                    .pending;
+            let pending = turn_signals_with_block(
+                &mut guest,
+                &mut wait,
+                if may_block {
+                    ProbeMaskPolicy::PendingSignals
+                } else {
+                    ProbeMaskPolicy::Guest
+                },
+                0,
+                gate,
+                &mut published,
+            )
+            .await
+            .unwrap()
+            .pending;
             if let Some(wait) = wait.as_mut() {
                 wait.restore(&mut guest, None).await.unwrap();
             }

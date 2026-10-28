@@ -6204,12 +6204,8 @@ impl Scheduler {
         // restarts and re-issues a fresh request on the next turn. Any other
         // double-put still panics, preserving the write-once Ivar invariant.
         // Mirrors the `try_put` guard in `logically_kill_thread` (PR-845).
-        if rs.passes_descriptors_out && !self.guest_held_marks_revoked {
-            info!(
-                "[sched] dettid {} may have passed descriptors out of the guest: guest-held marks no longer count",
-                rs.tid
-            );
-            self.guest_held_marks_revoked = true;
+        if rs.passes_descriptors_out {
+            self.revoke_guest_held_marks(rs.tid);
         }
         let continuation =
             (rs.continues_sigreturn && Self::is_inbound_signal_turn(&rs)).then_some(rs.tid);
@@ -7861,6 +7857,37 @@ impl Scheduler {
         &mut self,
     ) -> Option<(DetTid, Ivar<SchedRequest>, Ivar<SchedResponse>)> {
         self.step3_peek()
+    }
+
+    /// An admitted request or consuming exit reports that a descriptor may
+    /// be held outside the guest. Publish this before parking or retiring its
+    /// owner, so already waiting readers cannot rely on guest-held marks.
+    pub(crate) fn revoke_guest_held_marks(&mut self, dettid: DetTid) {
+        if !self.guest_held_marks_revoked {
+            info!(
+                "[sched] dettid {} may have passed descriptors out of the guest: guest-held marks no longer count",
+                dettid
+            );
+            self.guest_held_marks_revoked = true;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn guest_held_marks_revoked_for_test(&self) -> bool {
+        self.guest_held_marks_revoked
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_deadlock_for_test(&self) -> Option<&str> {
+        self.terminal_deadlock.as_deref()
+    }
+
+    /// A scripted closed-world fixture whose task has only default signal
+    /// dispositions. Unknown-state regressions must not use this setter.
+    #[cfg(test)]
+    pub(crate) fn default_signal_state_for_test(&mut self, dettid: DetTid) {
+        self.test_kernel_signal_states
+            .insert(dettid, KernelSignalState::default());
     }
 
     /// Registers `dettid` with an empty request slot, as a thread that has
@@ -17899,6 +17926,100 @@ impl Scheduler {
                 .is_some_and(|hb| hb.parked.contains(&tid))
     }
 
+    /// Whether an outside signal could run a waiting thread's handler,
+    /// making guest-held descriptors ready. This is a terminal
+    /// deadlock check, not a check for a signal that is pending now: pending
+    /// bits depend on host timing and cannot prove that a future handler is
+    /// impossible. The guest is quiesced here, so its dispositions and its
+    /// published mask are stable until another turn is granted.
+    ///
+    /// Linux excludes blocked signals from delivery and runs a handler only
+    /// for a caught disposition, not SIG_IGN or SIG_DFL
+    /// (<https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/signal.c?h=v7.1.3#n946>,
+    /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/kernel/signal.c?h=v7.1.3#n2935>).
+    /// A caught handler can write a pipe before an interrupted read restarts
+    /// or returns EINTR; Linux's empty-pipe read returns ERESTARTSYS and its
+    /// signal path applies SA_RESTART
+    /// (<https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/fs/pipe.c?h=v7.1.3#n388>,
+    /// <https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/tree/arch/x86/kernel/signal.c?h=v7.1.3#n272>).
+    /// Missing state keeps polling. A non-host-task backend must not consult
+    /// an unrelated host task. Private rules that hold SIGCHLD or host-timed
+    /// signals until a wait ends do not prove native handlers impossible;
+    /// only the guest's blocked set and dispositions can establish that.
+    fn task_may_run_external_handler(
+        &self,
+        tid: DetTid,
+        task: Option<(i32, i32)>,
+        guest_mask: Option<u64>,
+    ) -> bool {
+        if self.unknown_guest_sigmasks.contains(&tid)
+            || !crate::procfs_inode::guest_tids_name_host_tasks(&self.backend, None)
+        {
+            return true;
+        }
+        let Some((pid, host_tid)) = task else {
+            return true;
+        };
+        // Scripted unit states must never fall back to an actual host task.
+        #[cfg(test)]
+        let state = {
+            let _ = (pid, host_tid);
+            self.test_kernel_signal_states.get(&tid).copied()
+        };
+        #[cfg(not(test))]
+        let state = read_kernel_signal_state(
+            reverie::Pid::from_raw(pid),
+            reverie::Pid::from_raw(host_tid),
+        )
+        .ok();
+        let Some(state) = state else {
+            return true;
+        };
+        let blocked = guest_mask.unwrap_or(state.blocked);
+        let reserved = kernel_signal_bit(reverie::PERF_EVENT_SIGNAL as i32)
+            | if self.in_guest_signal_delivery {
+                self.in_guest_reserved_signals
+            } else {
+                0
+            };
+        state.caught & !state.ignored & !blocked & !reserved != 0
+    }
+
+    fn poller_may_run_external_handler(&self, tid: DetTid, rs: &Resources) -> bool {
+        if rs.signal_interrupt_errno().is_none() || rs.blocked_signal_mask_unknown {
+            return true;
+        }
+        let published_mask = self.saved_guest_sigmasks.get(&tid).copied();
+        // A writev poll with an unpublished private mask cannot establish
+        // the guest's blocked set from the kernel's temporary mask.
+        if rs.decides_signal_interruption_itself && published_mask.is_none() {
+            return true;
+        }
+        self.task_may_run_external_handler(
+            tid,
+            rs.signal_state_task,
+            rs.blocked_signal_mask.or(published_mask),
+        )
+    }
+
+    fn parked_thread_may_run_external_handler(&self, tid: DetTid) -> bool {
+        let Some(watch) = self
+            .parked_futex_waiter(tid)
+            .and_then(|waiter| waiter.signal_watch)
+        else {
+            // Other parked kinds provide no trusted guest mask and task
+            // identity here; being parked does not make a handler impossible.
+            return true;
+        };
+        // Only this thread can change its mask, so the watch remains valid
+        // while parked. Dispositions are shared and must still be read live.
+        self.task_may_run_external_handler(
+            tid,
+            Some((watch.pid, watch.tid)),
+            Some(!watch.unblocked),
+        )
+    }
+
     /// Whether no thread can make progress although threads are queued: each
     /// queued thread is an idle guest-state poller (`is_idle_guest_poller`,
     /// with progress counted from every thread's grants and retirements)
@@ -17906,8 +18027,10 @@ impl Scheduler {
     /// not of a named FIFO, which a process outside the container may also
     /// hold (`Resources::polls_a_named_fifo`), and is not a FIFO open, which
     /// waits in the kernel instead
-    /// (`Resources::waits_until_nothing_else_can_run`); every other thread is
-    /// parked (`is_parked`); and no thread's process is doomed
+    /// (`Resources::waits_until_nothing_else_can_run`), and cannot run a
+    /// caught external signal's handler (`poller_may_run_external_handler`);
+    /// every other thread is parked (`is_parked`) and also cannot run such a
+    /// handler (`parked_thread_may_run_external_handler`); no process is doomed
     /// (`thread_is_doomed`), as its exit would close its descriptors at a
     /// host-timed moment. Each poller's latest attempt then failed after
     /// everything any thread did, and its next attempt finds the same guest
@@ -17923,6 +18046,7 @@ impl Scheduler {
                         && rs.poll_deadline.is_none()
                         && !rs.polls_a_named_fifo
                         && !rs.waits_until_nothing_else_can_run
+                        && !self.poller_may_run_external_handler(tid, rs)
                 })
             });
         if !pollers_wait {
@@ -17933,7 +18057,8 @@ impl Scheduler {
             .tids()
             .all(|&tid| self.attempted_since(tid, progress))
             && self.next_turns.keys().all(|&tid| {
-                (self.run_queue.contains_tid(tid) || self.is_parked(tid))
+                (self.run_queue.contains_tid(tid)
+                    || self.is_parked(tid) && !self.parked_thread_may_run_external_handler(tid))
                     && !self.thread_is_doomed(tid)
                     && !self.process_is_going_down(tid)
             })
@@ -20809,6 +20934,9 @@ pub(crate) fn assert_poll_export_revocation_for_test(request: Resources, guest_o
 }
 
 #[cfg(test)]
+pub(crate) use test::request_reports_idle_deadlock_for_test;
+
+#[cfg(test)]
 mod test {
     use reverie::syscalls::Sysno;
 
@@ -21028,6 +21156,9 @@ mod test {
         resources.insert(ResourceID::InternalIOPolling, Permission::W);
         resources.poll_attempt = 1;
         resources.polls_guest_state_only = guest_state_only;
+        resources.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+        resources.signal_state_task = Some((tid.as_raw(), tid.as_raw()));
+        sched.default_signal_state_for_test(tid);
         sched.next_turns[&tid].req.put(Ok(resources));
         sched.run_queue.push_poller(tid, DEFAULT_PRIORITY, 1);
         sched.last_commit_at.insert(tid, sched.progress_epoch);
@@ -21578,15 +21709,14 @@ mod test {
         queued_poller(&mut sched, reader, true);
         let writer = DetTid::from_raw(5);
         register_known_thread(&mut sched, writer);
-        let mut wait = Resources::new(writer);
-        wait.insert(ResourceID::FutexWait, Permission::R);
-        sched.next_turns[&writer].req.put(Ok(wait));
-        sched
-            .blocked
-            .futex_waiters
-            .entry(FutexID::private(MmId::initial(writer), 0x404100))
-            .or_default()
-            .push(futex_waiter(5, u32::MAX));
+        sched.sleep_futex_waiter(
+            &writer,
+            FutexID::private(MmId::initial(writer), 0x404100),
+            None,
+            u32::MAX,
+            Some(signal_watch(u64::MAX)),
+        );
+        sched.default_signal_state_for_test(writer);
         sched.thread_tree.add_child(reader, reader, true);
         sched.thread_tree.add_child(reader, writer, true);
         (sched, global_time)
@@ -21596,10 +21726,403 @@ mod test {
         reader_beside_a_blocked_writer_with(&Config::default())
     }
 
+    /// Feed a request captured from a real retry loop into the terminal
+    /// predicate, with a separate process parked and no caught handlers.
+    /// Keep the request's provenance and signal metadata unchanged.
+    pub(crate) fn request_reports_idle_deadlock_for_test(request: Resources) -> bool {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        let reader = DetTid::from_raw(3);
+        assert_eq!(request.tid, reader);
+        assert!(request.poll_attempt > 0);
+        sched.next_turns.get_mut(&reader).unwrap().req = Ivar::full(Ok(request));
+        sched
+            .test_kernel_signal_states
+            .insert(reader, KernelSignalState::default());
+        sched.saved_guest_sigmasks.insert(reader, 0);
+        let result = sched.step2d_handle_empty_queue(&global_time);
+        match sched.take_terminal_deadlock() {
+            Some(report) => {
+                assert!(result.is_err());
+                assert!(
+                    report.starts_with(
+                        "Deadlock detected: thread(s) waiting on futex, and thread(s) retrying a pipe \
+                         or socket-pair call no remaining thread can satisfy, but no runnable threads \
+                         left.\n"
+                    ),
+                    "{report}"
+                );
+                true
+            }
+            None => {
+                assert!(result.is_ok());
+                false
+            }
+        }
+    }
+
+    fn guest_poll_request(tid: DetTid, attempt: u32) -> Resources {
+        let mut request = Resources::new(tid);
+        request.insert(ResourceID::InternalIOPolling, Permission::W);
+        request.polls_guest_state_only = true;
+        request.poll_attempt = attempt;
+        request.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+        request.signal_state_task = Some((tid.as_raw(), tid.as_raw()));
+        request
+    }
+
+    fn grant_guest_poll(sched: &mut Scheduler, tid: DetTid, attempt: u32) {
+        sched.run_queue.remove_tid(tid);
+        register_known_thread(sched, tid);
+        sched.default_signal_state_for_test(tid);
+        sched.next_turns[&tid]
+            .req
+            .put(Ok(guest_poll_request(tid, attempt)));
+        assert!(matches!(
+            turn_answer(sched, tid),
+            Some(SchedResponse::Go(_))
+        ));
+    }
+
+    fn queue_guest_poll(sched: &mut Scheduler, tid: DetTid, attempt: u32) {
+        sched.next_turns[&tid]
+            .req
+            .put(Ok(guest_poll_request(tid, attempt)));
+        sched.run_queue.push_poller(tid, DEFAULT_PRIORITY, attempt);
+    }
+
+    /// A sibling can finish its polling call and replace a descriptor before
+    /// parking directly, without another resource grant. Its completed grant
+    /// must force the reader through the retry loop's identity check first.
+    #[test]
+    fn a_completed_poll_before_direct_futex_park_requires_a_fresh_reader_attempt() {
+        let mut sched = Scheduler::new(&Config::default());
+        let reader = DetTid::from_raw(3);
+        let sibling = DetTid::from_raw(5);
+        sched.thread_tree.add_child(reader, reader, true);
+        sched.thread_tree.add_child(reader, sibling, true);
+        grant_guest_poll(&mut sched, reader, 0);
+        queue_guest_poll(&mut sched, reader, 1);
+        grant_guest_poll(&mut sched, sibling, 0);
+        let sibling_grant = sched.progress_epoch;
+        sched.sleep_futex_waiter(
+            &sibling,
+            FutexID::private(MmId::initial(sibling), 0x404100),
+            None,
+            u32::MAX,
+            Some(signal_watch(u64::MAX)),
+        );
+        assert!(sched.is_parked(sibling));
+        assert_eq!(sched.latest_progress(None), sibling_grant);
+        assert!(!sched.only_idle_guest_pollers_remain());
+        // An unchanged descriptor is still diagnosed after a fresh failed
+        // attempt; a changed descriptor must withdraw its proof in that turn.
+        grant_guest_poll(&mut sched, reader, 1);
+        queue_guest_poll(&mut sched, reader, 2);
+        assert!(sched.only_idle_guest_pollers_remain());
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        assert!(sched.step2d_handle_empty_queue(&global_time).is_err());
+        assert!(sched.take_terminal_deadlock().is_some());
+    }
+
+    /// A second call's initial attempt and first retry preserve the previous
+    /// completed call as progress, even after that second call reaches retry 2.
+    #[test]
+    fn a_completed_poll_before_a_new_call_keeps_progress_through_its_retries() {
+        let mut sched = Scheduler::new(&Config::default());
+        let reader = DetTid::from_raw(3);
+        let sibling = DetTid::from_raw(5);
+        sched.thread_tree.add_child(reader, reader, true);
+        sched.thread_tree.add_child(reader, sibling, true);
+        grant_guest_poll(&mut sched, reader, 0);
+        queue_guest_poll(&mut sched, reader, 1);
+        grant_guest_poll(&mut sched, sibling, 0);
+        let completed_grant = sched.progress_epoch;
+        for attempt in [0, 1, 2] {
+            queue_guest_poll(&mut sched, sibling, attempt);
+            assert!(
+                sched.latest_progress(None) >= completed_grant,
+                "retry {attempt}"
+            );
+            assert!(!sched.only_idle_guest_pollers_remain(), "retry {attempt}");
+            if attempt < 2 {
+                grant_guest_poll(&mut sched, sibling, attempt);
+            }
+        }
+        grant_guest_poll(&mut sched, reader, 1);
+        queue_guest_poll(&mut sched, reader, 2);
+        assert!(sched.only_idle_guest_pollers_remain());
+    }
+
+    /// Retirement can close descriptors after a completed polling call and
+    /// must also force a fresh reader attempt before a terminal decision.
+    #[test]
+    fn a_completed_poll_before_exit_requires_a_fresh_reader_attempt() {
+        let mut sched = Scheduler::new(&Config::default());
+        let reader = DetTid::from_raw(3);
+        let sibling = DetTid::from_raw(5);
+        sched.thread_tree.add_child(reader, reader, true);
+        sched.thread_tree.add_child(reader, sibling, true);
+        grant_guest_poll(&mut sched, reader, 0);
+        queue_guest_poll(&mut sched, reader, 1);
+        grant_guest_poll(&mut sched, sibling, 0);
+        sched.logically_kill_thread(&sibling, &DetPid::from_raw(5), MmId::initial(sibling));
+        assert!(!sched.next_turns.contains_key(&sibling));
+        assert!(sched.retired_at > sched.last_attempt_at[&reader]);
+        assert!(!sched.only_idle_guest_pollers_remain());
+        grant_guest_poll(&mut sched, reader, 1);
+        queue_guest_poll(&mut sched, reader, 2);
+        assert!(sched.only_idle_guest_pollers_remain());
+    }
+
     /// Whether step2d let the run go on: no deadlock report.
     fn polls_on(sched: &mut Scheduler, global_time: &Arc<Mutex<GlobalTime>>) -> bool {
         sched.step2d_handle_empty_queue(global_time).is_ok()
             && sched.take_terminal_deadlock().is_none()
+    }
+
+    fn idle_interruptible_reader(
+        state: Option<KernelSignalState>,
+    ) -> (Scheduler, Arc<Mutex<GlobalTime>>) {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        let reader = DetTid::from_raw(3);
+        let mut request = sched.next_turns[&reader].req.try_read().unwrap().unwrap();
+        request.set_signal_interrupt_errno(Errno::ERESTARTSYS);
+        request.signal_state_task = Some((3, 3));
+        sched.next_turns.get_mut(&reader).unwrap().req = Ivar::full(Ok(request));
+        if let Some(state) = state {
+            sched.test_kernel_signal_states.insert(reader, state);
+        } else {
+            sched.test_kernel_signal_states.remove(&reader);
+        }
+        (sched, global_time)
+    }
+
+    /// No signal is pending yet: an outside sender can still run the caught
+    /// handler, which may write the pipe. Pending bits must not decide whether
+    /// the scheduler declares the run deadlocked.
+    #[test]
+    fn an_idle_reader_with_an_unblocked_handler_polls_on() {
+        for pending in [0, kernel_signal_bit(libc::SIGUSR1)] {
+            let (mut sched, global_time) = idle_interruptible_reader(Some(KernelSignalState {
+                caught: kernel_signal_bit(libc::SIGUSR1),
+                pending,
+                ..Default::default()
+            }));
+            assert!(polls_on(&mut sched, &global_time), "pending={pending:#x}");
+        }
+    }
+
+    /// The polling machinery's private mask is not the guest's mask: the
+    /// original mask is published while the machinery blocks signals.
+    #[test]
+    fn an_idle_reader_uses_its_published_guest_mask_for_possible_handlers() {
+        let signal = kernel_signal_bit(libc::SIGUSR1);
+        let (mut sched, global_time) = idle_interruptible_reader(Some(KernelSignalState {
+            caught: signal,
+            blocked: signal,
+            ..Default::default()
+        }));
+        sched.saved_guest_sigmasks.insert(DetTid::from_raw(3), 0);
+        assert!(polls_on(&mut sched, &global_time));
+    }
+
+    /// Neither a blocked handler nor SIG_IGN can write the pipe. Default
+    /// fatal actions are not a prospective handler that can make progress.
+    #[test]
+    fn blocked_ignored_and_default_signals_do_not_hide_an_idle_reader_deadlock() {
+        let signal = kernel_signal_bit(libc::SIGUSR1);
+        for state in [
+            KernelSignalState {
+                caught: signal,
+                blocked: signal,
+                ..Default::default()
+            },
+            KernelSignalState {
+                ignored: signal,
+                ..Default::default()
+            },
+            KernelSignalState::default(),
+        ] {
+            let (mut sched, global_time) = idle_interruptible_reader(Some(state));
+            assert!(!polls_on(&mut sched, &global_time), "{state:?}");
+        }
+    }
+
+    /// A missing host-task identity (writev and non-host-task backends), an
+    /// unreadable state, or an unknown private mask cannot prove deadlock.
+    #[test]
+    fn an_idle_reader_with_unknown_signal_eligibility_polls_on() {
+        for kind in ["task", "state", "mask", "private mask"] {
+            let state = (kind != "state").then(KernelSignalState::default);
+            let (mut sched, global_time) = idle_interruptible_reader(state);
+            let reader = DetTid::from_raw(3);
+            let mut request = sched.next_turns[&reader].req.try_read().unwrap().unwrap();
+            match kind {
+                "task" => request.signal_state_task = None,
+                "mask" => request.blocked_signal_mask_unknown = true,
+                "private mask" => request.decides_signal_interruption_itself = true,
+                _ => {}
+            }
+            sched.next_turns.get_mut(&reader).unwrap().req = Ivar::full(Ok(request));
+            assert!(polls_on(&mut sched, &global_time), "unknown {kind}");
+        }
+    }
+
+    /// A missing producer annotation is unknown signal behavior, even when
+    /// the request otherwise claims that only guest actions can satisfy it.
+    #[test]
+    fn an_idle_poller_without_interruption_metadata_cannot_prove_deadlock() {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        let reader = DetTid::from_raw(3);
+        let mut request = Resources::new(reader);
+        request.insert(ResourceID::InternalIOPolling, Permission::W);
+        request.poll_attempt = 1;
+        request.polls_guest_state_only = true;
+        request.signal_state_task = Some((3, 3));
+        assert_eq!(request.signal_interrupt_errno(), None);
+        sched.next_turns.get_mut(&reader).unwrap().req = Ivar::full(Ok(request));
+        sched
+            .test_kernel_signal_states
+            .insert(reader, signal_state(kernel_signal_bit(libc::SIGUSR1), 0));
+        assert!(polls_on(&mut sched, &global_time));
+    }
+
+    /// Both threads share dispositions. Only the reader blocks the caught
+    /// signal; the real futex wait's captured mask can let its sibling run
+    /// the handler and write the reader's pipe, with no signal pending yet.
+    fn idle_reader_with_parked_signal_sibling(
+        state: KernelSignalState,
+        watch: Option<FutexSignalWatch>,
+    ) -> (Scheduler, Arc<Mutex<GlobalTime>>) {
+        let config = Config::default();
+        let mut sched = Scheduler::new(&config);
+        let reader = DetTid::from_raw(3);
+        let sibling = DetTid::from_raw(5);
+        queued_poller(&mut sched, reader, true);
+        register_known_thread(&mut sched, sibling);
+        sched.thread_tree.add_child(reader, reader, true);
+        sched.thread_tree.add_child(reader, sibling, false);
+        sched.sleep_futex_waiter(
+            &sibling,
+            FutexID::private(MmId::initial(reader), 0x404100),
+            None,
+            u32::MAX,
+            watch,
+        );
+        sched.test_kernel_signal_states.insert(
+            reader,
+            KernelSignalState {
+                blocked: u64::MAX,
+                ..state
+            },
+        );
+        sched.test_kernel_signal_states.insert(sibling, state);
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
+        (sched, global_time)
+    }
+
+    #[test]
+    fn a_parked_futex_handler_can_make_an_idle_read_ready() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        for physical_mask in [0, u64::MAX] {
+            let (mut sched, global_time) = idle_reader_with_parked_signal_sibling(
+                KernelSignalState {
+                    caught: usr1,
+                    blocked: physical_mask,
+                    pending: 0,
+                    ..Default::default()
+                },
+                Some(signal_watch(usr1)),
+            );
+            assert!(
+                polls_on(&mut sched, &global_time),
+                "guest mask allows the handler despite physical mask {physical_mask:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_parked_futex_with_unknown_signal_state_cannot_prove_deadlock() {
+        for missing in ["watch", "state", "guest mask"] {
+            let (mut sched, global_time) = idle_reader_with_parked_signal_sibling(
+                KernelSignalState::default(),
+                (missing != "watch").then(|| signal_watch(u64::MAX)),
+            );
+            let sibling = DetTid::from_raw(5);
+            if missing == "state" {
+                sched.test_kernel_signal_states.remove(&sibling);
+            } else if missing == "guest mask" {
+                sched.unknown_guest_sigmasks.insert(sibling);
+            }
+            assert!(polls_on(&mut sched, &global_time), "unknown {missing}");
+        }
+    }
+
+    #[test]
+    fn blocked_ignored_and_default_parked_futex_signals_still_allow_deadlock() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        for (state, unblocked) in [
+            (signal_state(usr1, 0), 0),
+            (signal_state(0, usr1), usr1),
+            (KernelSignalState::default(), usr1),
+        ] {
+            let (mut sched, global_time) =
+                idle_reader_with_parked_signal_sibling(state, Some(signal_watch(unblocked)));
+            assert!(sched.step2d_handle_empty_queue(&global_time).is_err());
+            let report = sched
+                .take_terminal_deadlock()
+                .expect("closed signal state deadlocks");
+            assert_eq!(
+                report.lines().next(),
+                Some(
+                    "Deadlock detected: thread(s) waiting on futex, and thread(s) retrying a pipe or socket-pair call no remaining thread can satisfy, but no runnable threads left."
+                ),
+                "{state:?}, unblocked={unblocked:#x}"
+            );
+            assert!(report.contains("  run queue: 1 polling with no possible progress: dtid 3\n"));
+        }
+    }
+
+    /// Holding SIGCHLD privately until a syscall ends is an implementation
+    /// rule, not proof that a caught native handler cannot write the pipe.
+    #[test]
+    fn caught_sigchld_is_possible_progress_for_an_idle_reader() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let (mut sched, global_time) = idle_interruptible_reader(Some(signal_state(chld, 0)));
+        assert_eq!(
+            sched.futex_wait_held_signals(DetTid::from_raw(3)) & chld,
+            chld
+        );
+        assert!(polls_on(&mut sched, &global_time));
+    }
+
+    #[test]
+    fn a_caught_host_timed_signal_is_possible_progress_for_an_idle_reader() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let (mut sched, global_time) = idle_interruptible_reader(Some(signal_state(usr1, 0)));
+        let reader = DetTid::from_raw(3);
+        sched.record_host_timed_signals(reader, HostTimedSignalScope::Caller, usr1);
+        assert_eq!(sched.futex_wait_held_signals(reader) & usr1, usr1);
+        assert!(polls_on(&mut sched, &global_time));
+    }
+
+    #[test]
+    fn an_idle_reader_beside_an_unknown_parked_wait_polls_on() {
+        let (mut sched, global_time) = reader_beside_a_blocked_writer();
+        let sibling = DetTid::from_raw(5);
+        assert!(sched.remove_futex_waiter(&sibling));
+        let mut pause = Resources::new(sibling);
+        pause.insert(
+            ResourceID::SleepUntil(LogicalTime::INDEFINITE),
+            Permission::W,
+        );
+        sched.next_turns.get_mut(&sibling).unwrap().req = Ivar::full(Ok(pause));
+        sched
+            .blocked
+            .timed_waiters
+            .insert(LogicalTime::INDEFINITE, sibling);
+        assert!(sched.is_parked(sibling));
+        assert!(polls_on(&mut sched, &global_time));
     }
 
     /// No attempt of the reader's can succeed until the writer runs, and

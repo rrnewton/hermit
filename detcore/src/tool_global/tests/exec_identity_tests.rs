@@ -411,6 +411,7 @@ impl Fixture {
         duplicate.dettid = LEADER;
         duplicate.syscall_count = 999;
         duplicate.timeslice_stats.record(999);
+        duplicate.passed_descriptors_out = true;
         let response = self
             .state
             .receive_rpc(
@@ -425,6 +426,14 @@ impl Fixture {
         assert_eq!(response, (None, GlobalResponse::DeregisterThread(())));
         self.assert_final_stats(true);
         self.assert_final_clock(LEADER);
+        assert!(
+            !self
+                .state
+                .sched
+                .lock()
+                .unwrap()
+                .guest_held_marks_revoked_for_test()
+        );
     }
 }
 
@@ -440,6 +449,7 @@ fn deregistration(thread: &ThreadState<()>) -> ThreadDeregistration {
         syscall_histogram: Default::default(),
         chaos_epochs: Vec::new(),
         killed_by_group_signal: false,
+        passed_descriptors_out: thread.passed_descriptors_out_unreported,
     }
 }
 
@@ -1237,9 +1247,20 @@ async fn retired_exec_former_rpc_cannot_recreate_clock_or_account_twice() {
         let mut payload = deregistration(&fixture.worker);
         payload.mm = mm;
         payload.syscall_count = 999;
+        payload.passed_descriptors_out = true;
+        let mut resource_export = Resources::new(WORKER);
+        resource_export.passes_descriptors_out = true;
         for request in [
             GlobalRequest::GlobalTimeLowerBound,
-            GlobalRequest::RequestResources(Resources::new(WORKER), LEADER),
+            GlobalRequest::RequestResources(resource_export, LEADER),
+            GlobalRequest::FutexAction(
+                WORKER,
+                FutexAction::WaitRequest(None, None),
+                FutexID::private(mm, 0x1000),
+                0,
+                u32::MAX,
+                true,
+            ),
             GlobalRequest::DeregisterThread(payload),
         ] {
             let expected = if matches!(&request, GlobalRequest::DeregisterThread(_)) {
@@ -1277,6 +1298,7 @@ async fn retired_exec_former_rpc_cannot_recreate_clock_or_account_twice() {
                 assert!(!sched.per_thread_syscalls.contains_key(&WORKER));
                 assert!(!sched.per_thread_timeslice.contains_key(&WORKER));
                 assert!(sched.next_turns[&LEADER].req.try_read().is_none());
+                assert!(!sched.guest_held_marks_revoked_for_test());
             }
             assert!(
                 fixture
