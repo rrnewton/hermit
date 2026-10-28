@@ -868,7 +868,12 @@ impl RecordVersion {
 // record and in replay, so such a signal no longer ends it with a restart
 // code. An older recording holds the restarts and was made under the
 // guest's own mask; it is refused here.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18c);
+// 0x18c -> 0x18f (ledger-assigned for this change; 0x18d is 4676's and 0x18e
+// is reassigned by the ledger): a descriptor received over SCM_RIGHTS joins
+// the open file its send modeled, named without asking the kernel, instead of
+// getting a description of its own. An older recording's table holds other
+// descriptions for those descriptors, so it is refused here.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18f);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -893,7 +898,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x18c);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x18c;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x18f;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
