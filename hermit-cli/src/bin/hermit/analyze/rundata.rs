@@ -1668,6 +1668,11 @@ mod tests {
     /// validation DAG does.
     #[test]
     fn analyze_installs_the_trials_skid_margin() {
+        if crate::run_in_fresh_process(
+            "analyze::rundata::tests::analyze_installs_the_trials_skid_margin",
+        ) {
+            return;
+        }
         let argv = [
             "hermit",
             "analyze",

@@ -4481,6 +4481,9 @@ fn skid_margin_override_keeps_the_keep_margin_up_to_the_table_largest() {
 /// test in a process of its own, as the validation DAG does.
 #[test]
 fn run_installs_its_skid_margin() {
+    if crate::run_in_fresh_process("run::run_installs_its_skid_margin") {
+        return;
+    }
     let mut opts = RunOpts::parse_from(["fakehermit", "--skid-margin=7777", "fakeprog"]);
     opts.validate_args_with_perf_support(true).unwrap();
     opts.install_pmu_config().unwrap();
@@ -13079,6 +13082,11 @@ mod tests {
 
     #[test]
     fn forwarded_detlog_plan_record_reaches_eof_while_parent_waits() {
+        if crate::run_in_fresh_process(
+            "run::tests::forwarded_detlog_plan_record_reaches_eof_while_parent_waits",
+        ) {
+            return;
+        }
         let options = forwarding_plan_options(true);
         let plan = options.forwarded_detlog_plan().unwrap();
         assert!(plan.requires_socket());
@@ -13107,6 +13115,11 @@ mod tests {
 
     #[test]
     fn forwarded_detlog_plan_duplicate_writer_blocks_eof() {
+        if crate::run_in_fresh_process(
+            "run::tests::forwarded_detlog_plan_duplicate_writer_blocks_eof",
+        ) {
+            return;
+        }
         use std::os::fd::FromRawFd;
 
         let options = forwarding_plan_options(true);
@@ -13137,6 +13150,11 @@ mod tests {
 
     #[test]
     fn forwarded_detlog_plan_nonforwarded_opens_no_channel() {
+        if crate::run_in_fresh_process(
+            "run::tests::forwarded_detlog_plan_nonforwarded_opens_no_channel",
+        ) {
+            return;
+        }
         let options = forwarding_plan_options(false);
         let plan = options.forwarded_detlog_plan().unwrap();
         assert!(!plan.requires_socket());
@@ -13151,6 +13169,11 @@ mod tests {
 
     #[test]
     fn forwarded_detlog_plan_two_runs_keep_streams_independent() {
+        if crate::run_in_fresh_process(
+            "run::tests::forwarded_detlog_plan_two_runs_keep_streams_independent",
+        ) {
+            return;
+        }
         let options = forwarding_plan_options(true);
         let plans = (
             options.forwarded_detlog_plan().unwrap(),
@@ -13355,6 +13378,11 @@ mod tests {
 
     #[test]
     fn malformed_typed_plain_info_sink_latches_refusal_without_source_reentry() {
+        if crate::run_in_fresh_process(
+            "run::tests::malformed_typed_plain_info_sink_latches_refusal_without_source_reentry",
+        ) {
+            return;
+        }
         const NAME: &str =
             "run::tests::malformed_typed_plain_info_sink_latches_refusal_without_source_reentry";
         const CHILD: &str = "HERMIT_PLAIN_INFO_SINK_TEST";
@@ -13540,6 +13568,11 @@ mod tests {
 
     #[test]
     fn real_returned_guest_disposition_still_uses_first_run_rejected() {
+        if crate::run_in_fresh_process(
+            "run::tests::real_returned_guest_disposition_still_uses_first_run_rejected",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("verify.json");
         write_pending_verification_json(&path).unwrap();

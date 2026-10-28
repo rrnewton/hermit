@@ -96,6 +96,31 @@ fn run_five_times_without_hashing_buffers(guest: fn()) {
 }
 
 fn run_five_times_under<S: Sync>(setup: impl Fn() -> S, guest: impl Fn(&S) + Sync, config: Config) {
+    // Every run below drives Detcore in this process, whose directory-stream
+    // state, detlog forwarder, and soft RLIMIT_NOFILE are process-global: a
+    // sibling test's stream state can leave this test's listing empty, its
+    // forwarder changes what this test hashes, and the full-table test's
+    // lowered descriptor limit makes this test's setup fail with EMFILE.
+    // Each test therefore runs in a child process of its own, as nextest
+    // already runs it.
+    const CHILD: &str = "HERMIT_READDIR_ORDER_CHILD";
+    let case = std::thread::current()
+        .name()
+        .unwrap_or_default()
+        .to_string();
+    if std::env::var_os(CHILD).as_deref() != Some(std::ffi::OsStr::new(&case)) {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &case, "--nocapture", "--test-threads=1"])
+            .env(CHILD, &case)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{output:?}"
+        );
+        return;
+    }
     let mut expected = None;
 
     for run in 1..=RUNS {
