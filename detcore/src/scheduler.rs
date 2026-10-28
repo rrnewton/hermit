@@ -4296,9 +4296,10 @@ impl Scheduler {
                             .collect();
                         let vec = record.into_global();
                         trace!("Trace loaded, length {}", vec.len());
-                        // Indices are schedule positions (`Replayer::stacktrace_position`),
-                        // so no recorded event is kept to match against, and one at or
-                        // past the end names the events the run makes after the
+                        // Indices are traced (observed) event counts, the same
+                        // counting `hermit analyze` uses for the events it names,
+                        // so no recorded event is kept to match against, and one at
+                        // or past the end names the events the run makes after the
                         // schedule runs out.
                         let toprint = cfg
                             .stacktrace_event
@@ -5293,14 +5294,16 @@ impl Scheduler {
     /// Try to pop the next event from the sorted list of stacktrace_events, if it matches the given
     /// index.  This is idempotent, because subsequent attempts will just fizzle.
     ///
-    /// The index is the traced count when recording, and the schedule position
-    /// (`Replayer::stacktrace_position`) under `--replay-schedule-from`.
+    /// The index is the traced (observed) event count, when recording and
+    /// under `--replay-schedule-from` alike: it is the counting
+    /// `hermit analyze` names critical events by, including a pair a flipped
+    /// schedule cannot consume in flipped order at a thread's exit.
     ///
-    /// A replay can pass a requested position without running it: a
-    /// fast-forward drops recorded events to resync (`check_fast_forward`).
-    /// Every requested index below `current_ix` is then reported as missed and
-    /// discarded, so it neither disappears silently nor stays at the head of
-    /// the list and blocks every later index.
+    /// A run can pass a requested index without printing it: the list can be
+    /// installed after events were already consumed. Every requested index
+    /// below `current_ix` is then reported as missed and discarded, so it
+    /// neither disappears silently nor stays at the head of the list and
+    /// blocks every later index.
     fn try_pop_stacktrace_event(
         &mut self,
         current_ix: u64,
@@ -5402,13 +5405,12 @@ impl Scheduler {
         debug_assert!(self.replayer.is_some());
         let mytid = observed.dettid;
 
-        if let Some((ix, action, position)) = self.replayer.as_mut().map(|r| {
+        if let Some((ix, action)) = self.replayer.as_mut().map(|r| {
             let current_ix = r.traced_event_count;
             let action = r.observe_event(observed);
-            (current_ix, action, r.stacktrace_position(current_ix))
+            (current_ix, action)
         }) {
-            let print_stack =
-                position.and_then(|position| self.try_pop_stacktrace_event(position, observed));
+            let print_stack = self.try_pop_stacktrace_event(ix, observed);
             debug!("Next ReplayAction = {:?}", action);
             self.release_replay_priorities_if_exhausted();
 
@@ -19658,12 +19660,13 @@ mod test {
         assert!(sched.replay_left_its_record());
     }
 
-    /// Under a schedule replay a `--stacktrace-event` index is a schedule
-    /// position: an event the replay observes that the recording lacks (a
-    /// timeslice split by a few branches) neither prints the stack nor shifts
-    /// the recorded event that does.
+    /// Under a schedule replay a `--stacktrace-event` index is a traced
+    /// (observed) event count, the counting `hermit analyze` names the
+    /// critical events of a schedule bisect by: the second of a pair at a
+    /// thread's exit still prints when a flipped schedule cannot consume
+    /// the pair in flipped order.
     #[test]
-    fn a_replayed_stacktrace_event_prints_at_its_schedule_position() {
+    fn a_replayed_stacktrace_event_prints_at_its_traced_index() {
         let mut sched = Scheduler::new(&Config::default());
         let tid = DetTid::from_raw(3);
         let at = LogicalTime::from_nanos;
@@ -19672,23 +19675,23 @@ mod test {
         let second =
             SchedEvent::syscall(tid, Sysno::getpid, SyscallPhase::Posthook).with_time(at(20_000));
         sched.replayer = Some(Replayer::new(vec![first.clone(), second.clone()]));
-        sched.stacktrace_events = Some(vec![(1, None, None)].into_iter().peekable());
+        sched.stacktrace_events = Some(vec![(2, None, None)].into_iter().peekable());
         assert_eq!(sched.consume_schedevent(&first).print_stack, None);
         let extra = SchedEvent::branches(tid, 2).with_time(at(15_000));
+        assert_eq!(sched.consume_schedevent(&extra).print_stack, None);
         assert_eq!(
-            sched.consume_schedevent(&extra).print_stack,
-            None,
-            "the second observed event is not recorded event #1"
+            sched.consume_schedevent(&second).print_stack,
+            Some(None),
+            "the third observed event is traced event #2"
         );
-        assert_eq!(sched.consume_schedevent(&second).print_stack, Some(None));
     }
 
-    /// A replay that fast-forwards past a requested schedule position (it
-    /// drops recorded events to resync) reports that index as missed instead
-    /// of leaving it at the head of the list, so the next requested index
-    /// still prints at its own position.
+    /// A requested index the run has already passed (the list was installed
+    /// after those events were consumed) is reported as missed and discarded
+    /// instead of staying at the head of the list, so the next requested
+    /// index still prints at its own traced index.
     #[test]
-    fn a_skipped_stacktrace_position_is_reported_and_the_next_one_prints() {
+    fn a_skipped_stacktrace_index_is_reported_and_the_next_one_prints() {
         let mut sched = Scheduler::new(&Config::default());
         let tid = DetTid::from_raw(3);
         let at = LogicalTime::from_nanos;
@@ -19701,17 +19704,18 @@ mod test {
                 })
                 .collect();
         sched.replayer = Some(Replayer::new(schedule.clone()));
+        // Traced events #0 and #1 are consumed before the list is installed.
+        assert_eq!(sched.consume_schedevent(&schedule[0]).print_stack, None);
+        assert_eq!(sched.consume_schedevent(&schedule[1]).print_stack, None);
         sched.stacktrace_events = Some(
             vec![(1, None, None), (2, None, None)]
                 .into_iter()
                 .peekable(),
         );
-        assert_eq!(sched.consume_schedevent(&schedule[0]).print_stack, None);
-        // The replay runs recorded event #2 next, skipping #1.
         assert_eq!(
             sched.consume_schedevent(&schedule[2]).print_stack,
             Some(None),
-            "recorded event #2 prints although #1 was skipped"
+            "traced event #2 prints although #1 was skipped"
         );
         assert!(
             sched.stacktrace_events.as_mut().unwrap().peek().is_none(),
