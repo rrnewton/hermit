@@ -15,8 +15,12 @@
  *
  * Port provenance: this is a one-to-one Rust port of the gVisor syscall
  * acceptance tests in test/syscalls/linux/eventfd.cc at gVisor commit
- * 012cf0b0b14d7b8aa2a4424867ecec8e6121e69d (2026-07-26), from the checkout
- * at dev-hermit/experiments/gvisor. Dependencies: libc and googletest
+ * 012cf0b0b14d7b8aa2a4424867ecec8e6121e69d (2026-07-26).
+ * This file was translated from C++ to Rust and modified: the
+ * googletest harness is replaced by a small built-in runner using
+ * googletest matchers (assert_that!), operating-system calls go
+ * through the libc crate, and the cases named as excluded below
+ * are omitted. Dependencies: libc and googletest
  * (matchers only), both already used by this workspace; no gVisor code,
  * submodule, or build is involved. googletest is used through its
  * assert_that!/eq-style matchers inside this guest's own runner (the

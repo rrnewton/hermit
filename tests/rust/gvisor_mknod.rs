@@ -1,5 +1,5 @@
 /*
- * Copyright 2019 The gVisor Authors.
+ * Copyright 2018 The gVisor Authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,12 @@
  * limitations under the License.
  *
  * Port provenance: Rust port of gVisor's test/syscalls/linux/mknod.cc
- * at gVisor commit 012cf0b0b14d7b8aa2a4424867ecec8e6121e69d (2026-07-26),
- * from dev-hermit/experiments/gvisor. libc + googletest matchers only.
+ * at gVisor commit 012cf0b0b14d7b8aa2a4424867ecec8e6121e69d (2026-07-26).
+ * This file was translated from C++ to Rust and modified: the
+ * googletest harness is replaced by a small built-in runner using
+ * googletest matchers (assert_that!), operating-system calls go
+ * through the libc crate, and the cases named as excluded below
+ * are omitted. libc + googletest matchers only.
  * Calls go through SYS_mknod.
  *
  * Mapping: MknodTest.RegularFile, MknodTest.RegularFilePermissions
