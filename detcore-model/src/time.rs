@@ -654,6 +654,12 @@ impl DetTime {
         self.rcbs
     }
 
+    /// The multiplier this clock applies to every time advance
+    /// (`--clock-multiplier`).
+    pub fn multiplier(&self) -> f64 {
+        self.multiplier
+    }
+
     /// Project deterministic logical time into a rough number of nanoseconds.
     pub fn as_nanos(&self) -> LogicalTime {
         // Note: these counts could be pre-collapsed into scalar within the DetTime

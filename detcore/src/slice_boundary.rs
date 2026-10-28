@@ -68,6 +68,13 @@ pub struct ClosedSlice {
 }
 
 impl Observations {
+    /// Whether a strict slice-boundary replay's grant is pending for this
+    /// owner (`grant::install`), whose budget then sets the thread's replayed
+    /// RCB count only for a slice the PMU timer ended.
+    pub(crate) fn has_expected_budget(&self) -> bool {
+        self.expected_budget.is_some()
+    }
+
     /// Construct counters from an authenticated scheduler lifecycle identity.
     /// This path never consumes an expected boundary to choose an owner.
     fn from_owner<T>(thread: &ThreadState<T>, owner: Owner) -> anyhow::Result<Self> {
@@ -372,6 +379,7 @@ pub(crate) fn adopt_owner<T>(
     thread.slice_boundary = Some(candidate);
     // A previous image's precise target cannot govern the replacement image.
     thread.replay_rcb_end = None;
+    thread.replay_ends_at_check_in = false;
     Ok(())
 }
 

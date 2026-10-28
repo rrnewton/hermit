@@ -702,15 +702,21 @@ fn assert_artifact_log(
             "replay must actually consume worker history"
         );
         for line in consumed {
-            let (deadline, priority, rcbs) = expected
-                .next_with_rcbs()
+            let end = expected
+                .next_slice_end()
                 .expect("each consumed boundary belongs to the recording");
-            assert!(rcbs.is_some(), "the recording contains exact PMU targets");
             assert!(
-                line.contains(&format!("set by recording to {deadline:?} ")),
+                end.rcbs.is_some(),
+                "the recording contains exact PMU targets"
+            );
+            assert!(
+                line.contains(&format!("set by recording to {:?} ", end.time)),
                 "{line}"
             );
-            assert!(line.ends_with(&format!(", priority {priority}")), "{line}");
+            assert!(
+                line.ends_with(&format!(", priority {}", end.priority)),
+                "{line}"
+            );
         }
     }
     log.contains(PREEMPTION_REFUSAL)

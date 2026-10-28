@@ -411,6 +411,32 @@ pub(crate) mod tests {
         assert_eq!(pending.finish(tid, mm, true, false).unwrap(), None);
     }
 
+    /// A strict slice-boundary replay's grant sets the replayed count only for
+    /// a slice the PMU timer ended, so that count keeps its exact stop and
+    /// ends its slice, whatever the live slice's end time says: the re-landed
+    /// preemption-replay rules for a recorded check-in end
+    /// (`ThreadState::replay_slice_can_end_on_a_branch`, `timeslice_expired`)
+    /// read a preemption history's end time, which a boundary grant has none
+    /// of.
+    #[test]
+    fn a_boundary_grants_pmu_count_keeps_its_exact_stop() {
+        let cfg = Config::default();
+        let tid = DetTid::from_raw(3);
+        let mut thread = ThreadState::new(tid, &cfg, ());
+        thread.next_timeslice(&cfg);
+        thread.slice_boundary = Some(Observations::new(&thread, 0));
+        thread.committed_clock_value = 7;
+        // A live slice end far beyond what the 12 branches to the count take.
+        thread.end_of_timeslice =
+            Some(thread.thread_logical_time.as_nanos() + std::time::Duration::from_secs(10));
+        let hint = budget(tid, thread.mm_id, 19);
+        install(&mut thread, hint).unwrap();
+        assert!(thread.replay_slice_can_end_on_a_branch(true));
+        thread.thread_logical_time.add_rcbs(12);
+        thread.committed_clock_value = 19;
+        assert!(thread.timeslice_expired());
+    }
+
     #[test]
     fn grant_is_guest_rcbs_not_turn_time_and_never_changes_deadline_or_maximum() {
         let cfg = Config::default();
